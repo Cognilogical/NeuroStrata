@@ -1260,22 +1260,18 @@ pub fn recorded_graph_queries_for_tests() -> Vec<(String, String, String)> {
 /// to its enclosing worktree/project root so `.NeuroStrata/active_session.json`
 /// and `.NeuroStrata/session_queries.json` are always read and written at the
 /// worktree root rather than a nested subdirectory.
+///
+/// A project root is marked by `.git` (directory or worktree file). A bare
+/// `.NeuroStrata` in an *ancestor* is not authority: anything can create one
+/// in a shared parent, including this resolver's own earlier fallback writes,
+/// and adopting it silently redirects session state for every caller below
+/// (issue #322). The given directory itself still counts when it carries
+/// `.NeuroStrata`, so non-git projects whose cwd is the root are unaffected.
 pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
     if let Some(wt) = gate::GateScope::capture(dir).worktree {
         return std::path::PathBuf::from(wt);
     }
-    let mut cur = if dir.is_dir() {
-        Some(dir)
-    } else {
-        dir.parent()
-    };
-    while let Some(d) = cur {
-        if d.join(".git").exists() || d.join(".NeuroStrata").exists() {
-            return d.to_path_buf();
-        }
-        cur = d.parent().filter(|p| !p.as_os_str().is_empty());
-    }
-    dir.to_path_buf()
+    crate::formal_kernel::resolve_session_root(None, dir)
 }
 
 /// Walk a candidate root up to the enclosing `.git`/`.NeuroStrata` marker.
@@ -3662,7 +3658,7 @@ pub(crate) const SCAFFOLDED_PRE_PUSH_HOOK: &str = r#"#!/bin/bash
 # directory git actually runs hooks from, core.hooksPath honored — one
 # hook text for both install paths, so they cannot drift.)
 
-command -v neurostrata-mcp >/dev/null 2>&1 || { echo "warning: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 0; }
+command -v neurostrata-mcp >/dev/null 2>&1 || { echo "error: neurostrata-mcp not found — gate NOT run for this push" >&2; exit 1; }
 if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     echo "NeuroStrata task gate: skipped (NEUROSTRATA_SKIP_GATE=1) — the gate did NOT run for this push" >&2
     exit 0
@@ -3677,15 +3673,12 @@ NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 neurostrata-mcp task gate "$NAMESPACE" --strict
 code=$?
 if [ $code -eq 1 ]; then
-    echo "Push blocked: resolve the tasks above, or NEUROSTRATA_SKIP_GATE=1 git push" >&2
+    echo "Push blocked: resolve the tasks above" >&2
     exit 1
 fi
-# A 2 here is never a verdict: under --strict the gate itself exits
-# only 0 or 1, so a 2 means the binary that answered was stale,
-# foreign, or died before it could report. Announced, never silent —
-# and it still does not block (0 and 2 pass, per the exit line below).
-if [ $code -eq 2 ]; then
-    echo "warning: neurostrata-mcp task gate exited 2 — the gate could NOT run for this push; proceeding without it" >&2
+if [ $code -ne 0 ]; then
+    echo "error: neurostrata-mcp task gate exited $code — the gate could NOT run for this push" >&2
+    exit 1
 fi
 
 # ── project guards (add yours here) ────────────────────────────────────────
@@ -3705,8 +3698,8 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
     done
 fi
 
-exit 0   # 0 and 2 both pass here unless --strict flips 2 to blocking
-# neurostrata-hook-sha256: cb1c385835cfe2ddc026878074e34ea3661674f44d314679c8c85764ef7d70b7
+exit 0   # the gate passed and all project guards passed
+# neurostrata-hook-sha256: fde963068fb4002b941dd0f6aa4b4c110aaf6bbb86ded582c8bc7cf33b790688
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -5828,6 +5821,33 @@ mod tests {
         assert!(
             checked_in.contains("scripts/check-staged-quality.sh"),
             "the pre-commit hook must delegate to the project's staged-quality runner"
+        );
+    }
+
+    /// `neurostrata-mcp hooks install` and `scripts/install-hooks.sh` must
+    /// install the same fail-closed gate; a stale checked-in copy would let
+    /// one install path bypass the task gate (audit #317).
+    #[test]
+    fn pre_push_hook_sources_stay_byte_identical() {
+        let checked_in = include_str!("../../scripts/hooks/pre-push");
+        if SCAFFOLDED_PRE_PUSH_HOOK != checked_in {
+            panic!(
+                "embedded pre-push hook ({} bytes) differs from scripts/hooks/pre-push ({} bytes)",
+                SCAFFOLDED_PRE_PUSH_HOOK.len(),
+                checked_in.len()
+            );
+        }
+        assert!(
+            !checked_in.contains("NEUROSTRATA_SKIP_GATE=1 git push"),
+            "the blocked message must not advertise the escape hatch"
+        );
+        assert!(
+            checked_in.contains("error: neurostrata-mcp not found"),
+            "a missing gate binary must block the push"
+        );
+        assert!(
+            checked_in.contains("if [ $code -ne 0 ]"),
+            "a non-zero gate exit must block the push"
         );
     }
 

@@ -33,16 +33,36 @@ pub enum KernelWorkflowTransitionVerdict {
 #[async_trait]
 pub trait MemoryPort: Send + Sync {
     /// Retrieve one memory payload under ReBAC.
-    async fn get_visible_memory(&self, namespace: &str, id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>>;
+    async fn get_visible_memory(
+        &self,
+        namespace: &str,
+        id: &str,
+        principal: Option<&str>,
+    ) -> Result<Option<MemoryPayload>>;
 
     /// Register a new `data_pointer` in the private registry.
-    async fn register_data_pointer(&self, namespace: &str, record: &DataPointerRecord, principal: Option<&str>) -> Result<DataPointerRecord>;
+    async fn register_data_pointer(
+        &self,
+        namespace: &str,
+        record: &DataPointerRecord,
+        principal: Option<&str>,
+    ) -> Result<DataPointerRecord>;
 
     /// Load a pointer for trusted kernel use (no ReBAC) or for caller (ReBAC).
-    async fn get_data_pointer(&self, namespace: &str, pointer_id: &str, principal: Option<&str>) -> Result<Option<DataPointerRecord>>;
+    async fn get_data_pointer(
+        &self,
+        namespace: &str,
+        pointer_id: &str,
+        principal: Option<&str>,
+    ) -> Result<Option<DataPointerRecord>>;
 
     /// List pointers, optionally filtered by pool id and ReBAC.
-    async fn list_data_pointers(&self, namespace: &str, pool_id: Option<&str>, principal: Option<&str>) -> Result<Vec<DataPointerRecord>>;
+    async fn list_data_pointers(
+        &self,
+        namespace: &str,
+        pool_id: Option<&str>,
+        principal: Option<&str>,
+    ) -> Result<Vec<DataPointerRecord>>;
 
     /// Persist a `DataPoolSchema` (and optional initial in-memory records) in the private registry.
     async fn register_data_pool(
@@ -72,10 +92,19 @@ pub trait MemoryPort: Send + Sync {
 #[async_trait]
 pub trait ExecutivePort: Send + Sync {
     /// List tasks visible to the principal.
-    async fn list_tasks(&self, namespace: &str, principal: Option<&str>) -> Result<Vec<TaskSummaryRow>>;
+    async fn list_tasks(
+        &self,
+        namespace: &str,
+        principal: Option<&str>,
+    ) -> Result<Vec<TaskSummaryRow>>;
 
     /// Load a single task row under ReBAC.
-    async fn get_task(&self, namespace: &str, task_id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>>;
+    async fn get_task(
+        &self,
+        namespace: &str,
+        task_id: &str,
+        principal: Option<&str>,
+    ) -> Result<Option<MemoryPayload>>;
 
     /// Count live extractions for a task (Lock‑2 enforcement).
     async fn verify_task_extraction_count(&self, namespace: &str, task_id: &str) -> Result<usize>;
@@ -83,20 +112,41 @@ pub trait ExecutivePort: Send + Sync {
     /// Evaluate a workflow transition as a high‑level gate. The `gate_passed`
     /// boolean represents whether the specific guard for the transition is
     /// satisfied (e.g., `has_valid_scope`, `mutations_since_note_after`).
-    async fn evaluate_workflow_transition(&self, from: WorkflowStage, to: WorkflowStage, gate_passed: bool) -> KernelWorkflowTransitionVerdict;
+    async fn evaluate_workflow_transition(
+        &self,
+        from: WorkflowStage,
+        to: WorkflowStage,
+        gate_passed: bool,
+    ) -> KernelWorkflowTransitionVerdict;
 }
 
 /// §3.2.3 – Ontology interface over action receipts and static entities.
 #[async_trait]
 pub trait OntologyPort: Send + Sync {
     /// List ontology entities under ReBAC filtering.
-    async fn list_ontology_entities(&self, namespace: &str, memory_types: &[&str], principal: Option<&str>) -> Result<Vec<(String, MemoryPayload)>>;
+    async fn list_ontology_entities(
+        &self,
+        namespace: &str,
+        memory_types: &[&str],
+        principal: Option<&str>,
+    ) -> Result<Vec<(String, MemoryPayload)>>;
 
     /// Load a single ontology entity under ReBAC.
-    async fn get_ontology_entity(&self, namespace: &str, id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>>;
+    async fn get_ontology_entity(
+        &self,
+        namespace: &str,
+        id: &str,
+        principal: Option<&str>,
+    ) -> Result<Option<MemoryPayload>>;
 
     /// Inspect an action receipt’s kinetic state (bound, reverted, etc.).
-    async fn verify_active_action_receipt(&self, namespace: &str, receipt_id: &str, pointer_id: &str, pool_id: &str) -> Result<KernelActionReceiptState>;
+    async fn verify_active_action_receipt(
+        &self,
+        namespace: &str,
+        receipt_id: &str,
+        pointer_id: &str,
+        pool_id: &str,
+    ) -> Result<KernelActionReceiptState>;
 
     /// Zero-mutation ontology change-impact plan (spec §3.2). Read-only: never
     /// commits to the store, scenarios, tasks, edges or the ontology cache.
@@ -130,7 +180,12 @@ impl LadybugMemoryPort {
     }
 
     /// ReBAC‑checked path – returns `None` when principal lacks visibility.
-    async fn rebac_get_memory(&self, namespace: &str, id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>> {
+    async fn rebac_get_memory(
+        &self,
+        namespace: &str,
+        id: &str,
+        principal: Option<&str>,
+    ) -> Result<Option<MemoryPayload>> {
         let lb = self.ladybug_store();
         let Some(payload) = lb.get_memory_by_id(namespace, id).await? else {
             return Ok(None);
@@ -184,7 +239,12 @@ fn is_retired_data_metadata(metadata: &Value, now: i64) -> bool {
 
 #[async_trait]
 impl MemoryPort for LadybugMemoryPort {
-    async fn get_visible_memory(&self, namespace: &str, id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>> {
+    async fn get_visible_memory(
+        &self,
+        namespace: &str,
+        id: &str,
+        principal: Option<&str>,
+    ) -> Result<Option<MemoryPayload>> {
         // None means trusted kernel internal read – bypass ReBAC.
         match principal {
             None => self.trusted_get_memory(namespace, id).await,
@@ -192,14 +252,22 @@ impl MemoryPort for LadybugMemoryPort {
         }
     }
 
-    async fn register_data_pointer(&self, namespace: &str, record: &DataPointerRecord, principal: Option<&str>) -> Result<DataPointerRecord> {
+    async fn register_data_pointer(
+        &self,
+        namespace: &str,
+        record: &DataPointerRecord,
+        principal: Option<&str>,
+    ) -> Result<DataPointerRecord> {
         let lb = self.ladybug_store();
         // Namespace‑level write gate via ReBAC (§5.4 / §5.6).
         if !crate::rebac::can_write_namespace(lb, namespace, principal) {
             anyhow::bail!("write denied for namespace '{}'", namespace);
         }
         // Reject duplicate active pointer IDs in the namespace.
-        if let Some(existing) = self.trusted_get_memory(namespace, &record.pointer_id).await? {
+        if let Some(existing) = self
+            .trusted_get_memory(namespace, &record.pointer_id)
+            .await?
+        {
             if !is_retired_data_metadata(&existing.metadata, chrono::Utc::now().timestamp()) {
                 anyhow::bail!("pointer_id '{}' already exists", record.pointer_id);
             }
@@ -216,7 +284,10 @@ impl MemoryPort for LadybugMemoryPort {
         // Store owner = authenticated principal; empty → unauthenticated (private data pointer).
         let user_id = principal.unwrap_or("");
         let payload = MemoryPayload {
-            content: format!("data pointer {} -> {}", record.pointer_id, record.pointer_uri),
+            content: format!(
+                "data pointer {} -> {}",
+                record.pointer_id, record.pointer_uri
+            ),
             user_id: user_id.to_string(),
             memory_type: "data_pointer".to_string(),
             agent_name: None,
@@ -224,11 +295,18 @@ impl MemoryPort for LadybugMemoryPort {
             location_lines: String::new(),
             metadata,
         };
-        self.ladybug_store().put_scoped_memory(namespace, &record.pointer_id, &payload).await?;
+        self.ladybug_store()
+            .put_scoped_memory(namespace, &record.pointer_id, &payload)
+            .await?;
         Ok(record.clone())
     }
 
-    async fn get_data_pointer(&self, namespace: &str, pointer_id: &str, principal: Option<&str>) -> Result<Option<DataPointerRecord>> {
+    async fn get_data_pointer(
+        &self,
+        namespace: &str,
+        pointer_id: &str,
+        principal: Option<&str>,
+    ) -> Result<Option<DataPointerRecord>> {
         let Some(payload) = self.trusted_get_memory(namespace, pointer_id).await? else {
             return Ok(None);
         };
@@ -253,14 +331,21 @@ impl MemoryPort for LadybugMemoryPort {
         Ok(Some(record))
     }
 
-    async fn list_data_pointers(&self, namespace: &str, pool_id: Option<&str>, principal: Option<&str>) -> Result<Vec<DataPointerRecord>> {
+    async fn list_data_pointers(
+        &self,
+        namespace: &str,
+        pool_id: Option<&str>,
+        principal: Option<&str>,
+    ) -> Result<Vec<DataPointerRecord>> {
         let mut out = Vec::new();
         let lb = self.ladybug_store();
         // Retired rows are history, not live connector locators. Capture the
         // query instant before materializing rows for consistent filtering.
         let now = chrono::Utc::now().timestamp();
         // List all memory_type == "data_pointer" in the namespace.
-        let rows = lb.list_memories_by_types(namespace, &["data_pointer"]).await?;
+        let rows = lb
+            .list_memories_by_types(namespace, &["data_pointer"])
+            .await?;
         for (_id, payload) in rows {
             if is_retired_data_metadata(&payload.metadata, now) {
                 continue;
@@ -273,10 +358,14 @@ impl MemoryPort for LadybugMemoryPort {
                 None => true,
                 Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
             };
-            if !include { continue; }
+            if !include {
+                continue;
+            }
             let rec: DataPointerRecord = serde_json::from_value(pointer_val.clone())?;
             if let Some(pid) = pool_id {
-                if rec.pool_id != pid { continue; }
+                if rec.pool_id != pid {
+                    continue;
+                }
             }
             out.push(rec);
         }
@@ -347,7 +436,9 @@ impl MemoryPort for LadybugMemoryPort {
         let mut out = Vec::new();
         let lb = self.ladybug_store();
         let now = chrono::Utc::now().timestamp();
-        let rows = lb.list_memories_by_types(namespace, &["data_pointer"]).await?;
+        let rows = lb
+            .list_memories_by_types(namespace, &["data_pointer"])
+            .await?;
         for (_id, payload) in rows {
             if is_retired_data_metadata(&payload.metadata, now) {
                 continue;
@@ -398,22 +489,42 @@ impl LadybugExecutivePort {
         LadybugExecutivePort { store }
     }
 
-    fn transition_event(from: WorkflowStage, to: WorkflowStage, gate_passed: bool) -> crate::workflow::machine::WorkflowEvent {
+    fn transition_event(
+        from: WorkflowStage,
+        to: WorkflowStage,
+        gate_passed: bool,
+    ) -> crate::workflow::machine::WorkflowEvent {
         use crate::workflow::machine::WorkflowEvent as WE;
         use WorkflowStage::*;
         // Map the simplified (from, to, gate_passed) abstraction to the richer WorkflowEvent.
         match (from, to) {
             (Unpreflighted, ContextLoaded) => WE::LoadContext,
             (ContextLoaded, ContextLoaded) => WE::LoadContext,
-            (Claimed | Mutating, Claimed) => WE::ClaimTask { has_valid_scope: gate_passed },
-            (Claimed | Mutating, Mutating) => WE::Mutate { mutations_since_note_after: 0, breath_limit: 5 },
-            (Claimed | Mutating, BreathRequired) => WE::Mutate { mutations_since_note_after: 5, breath_limit: 5 },
+            (Claimed | Mutating, Claimed) => WE::ClaimTask {
+                has_valid_scope: gate_passed,
+            },
+            (Claimed | Mutating, Mutating) => WE::Mutate {
+                mutations_since_note_after: 0,
+                breath_limit: 5,
+            },
+            (Claimed | Mutating, BreathRequired) => WE::Mutate {
+                mutations_since_note_after: 5,
+                breath_limit: 5,
+            },
             (BreathRequired, Mutating) => WE::RecordBreathNote,
-            (Claimed | Mutating, PreCheckpoint) => WE::TriggerPreCheckpoint { has_receipt: gate_passed },
+            (Claimed | Mutating, PreCheckpoint) => WE::TriggerPreCheckpoint {
+                has_receipt: gate_passed,
+            },
             (PreCheckpoint, Mutating) => WE::CheckpointPassed,
-            (Claimed | Mutating | PreCheckpoint, PrePublish) => WE::TriggerPrePublish { task_gate_ok: gate_passed, doc_gate_ok: gate_passed },
+            (Claimed | Mutating | PreCheckpoint, PrePublish) => WE::TriggerPrePublish {
+                task_gate_ok: gate_passed,
+                doc_gate_ok: gate_passed,
+            },
             (PrePublish, Mutating) => WE::PublishPassed,
-            (Claimed | Mutating | PreCheckpoint | PrePublish, Completed) => WE::CompleteTask { has_extracted_memory: gate_passed, dirty_targets: 0 },
+            (Claimed | Mutating | PreCheckpoint | PrePublish, Completed) => WE::CompleteTask {
+                has_extracted_memory: gate_passed,
+                dirty_targets: 0,
+            },
             _ => WE::LoadContext,
         }
     }
@@ -427,7 +538,11 @@ impl LadybugExecutivePort {
 
 #[async_trait]
 impl ExecutivePort for LadybugExecutivePort {
-    async fn list_tasks(&self, namespace: &str, principal: Option<&str>) -> Result<Vec<TaskSummaryRow>> {
+    async fn list_tasks(
+        &self,
+        namespace: &str,
+        principal: Option<&str>,
+    ) -> Result<Vec<TaskSummaryRow>> {
         let lb = self.ladybug_store();
         let rows = lb.list_task_rows(namespace).await?;
         let mut filtered = Vec::new();
@@ -436,29 +551,57 @@ impl ExecutivePort for LadybugExecutivePort {
                 None => false,
                 Some(p) => can_read_memory(p, row.payload.user_id.as_str(), &row.payload.metadata),
             };
-            if visible { filtered.push(row); }
+            if visible {
+                filtered.push(row);
+            }
         }
         Ok(filtered)
     }
 
-    async fn get_task(&self, namespace: &str, task_id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>> {
-        if let Some(payload) = self.ladybug_store().load_task_row(namespace, task_id).await? {
+    async fn get_task(
+        &self,
+        namespace: &str,
+        task_id: &str,
+        principal: Option<&str>,
+    ) -> Result<Option<MemoryPayload>> {
+        if let Some(payload) = self
+            .ladybug_store()
+            .load_task_row(namespace, task_id)
+            .await?
+        {
             let visible = match principal {
                 None => false,
                 Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
             };
-            if visible { Ok(Some(payload)) } else { Ok(None) }
-        } else { Ok(None) }
+            if visible {
+                Ok(Some(payload))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     async fn verify_task_extraction_count(&self, namespace: &str, task_id: &str) -> Result<usize> {
-        self.ladybug_store().count_extracted_memories_for_task(namespace, task_id).await
+        self.ladybug_store()
+            .count_extracted_memories_for_task(namespace, task_id)
+            .await
     }
 
-    async fn evaluate_workflow_transition(&self, from: WorkflowStage, to: WorkflowStage, gate_passed: bool) -> KernelWorkflowTransitionVerdict {
+    async fn evaluate_workflow_transition(
+        &self,
+        from: WorkflowStage,
+        to: WorkflowStage,
+        gate_passed: bool,
+    ) -> KernelWorkflowTransitionVerdict {
         let event = Self::transition_event(from, to, gate_passed);
         let outcome = crate::workflow::machine::evaluate_workflow_transition(from, event);
-        if outcome.allowed && outcome.to == Some(to) { KernelWorkflowTransitionVerdict::AllowTransition } else { KernelWorkflowTransitionVerdict::DenyTransition }
+        if outcome.allowed && outcome.to == Some(to) {
+            KernelWorkflowTransitionVerdict::AllowTransition
+        } else {
+            KernelWorkflowTransitionVerdict::DenyTransition
+        }
     }
 }
 
@@ -486,18 +629,34 @@ impl LadybugOntologyPort {
 
 #[async_trait]
 impl OntologyPort for LadybugOntologyPort {
-    async fn list_ontology_entities(&self, namespace: &str, memory_types: &[&str], principal: Option<&str>) -> Result<Vec<(String, MemoryPayload)>> {
+    async fn list_ontology_entities(
+        &self,
+        namespace: &str,
+        memory_types: &[&str],
+        principal: Option<&str>,
+    ) -> Result<Vec<(String, MemoryPayload)>> {
         let lb = self.ladybug_store();
         let mut rows = lb.list_memories_by_types(namespace, memory_types).await?;
         // ReBAC filtering – if principal is None, treat as unauthenticated (no reads).
         if let Some(p) = principal {
-            rows.retain(|(_, payload)| can_read_memory(p, payload.user_id.as_str(), &payload.metadata));
-        } else { rows.clear(); }
+            rows.retain(|(_, payload)| {
+                can_read_memory(p, payload.user_id.as_str(), &payload.metadata)
+            });
+        } else {
+            rows.clear();
+        }
         Ok(rows)
     }
 
-    async fn get_ontology_entity(&self, namespace: &str, id: &str, principal: Option<&str>) -> Result<Option<MemoryPayload>> {
-        let Some(payload) = self.ladybug_store().get_memory_by_id(namespace, id).await? else { return Ok(None); };
+    async fn get_ontology_entity(
+        &self,
+        namespace: &str,
+        id: &str,
+        principal: Option<&str>,
+    ) -> Result<Option<MemoryPayload>> {
+        let Some(payload) = self.ladybug_store().get_memory_by_id(namespace, id).await? else {
+            return Ok(None);
+        };
         let visible = match principal {
             None => false,
             Some(p) => can_read_memory(p, payload.user_id.as_str(), &payload.metadata),
@@ -505,29 +664,53 @@ impl OntologyPort for LadybugOntologyPort {
         Ok(visible.then_some(payload))
     }
 
-    async fn verify_active_action_receipt(&self, namespace: &str, receipt_id: &str, pointer_id: &str, pool_id: &str) -> Result<KernelActionReceiptState> {
+    async fn verify_active_action_receipt(
+        &self,
+        namespace: &str,
+        receipt_id: &str,
+        pointer_id: &str,
+        pool_id: &str,
+    ) -> Result<KernelActionReceiptState> {
         if receipt_id.trim().is_empty() {
             return Ok(KernelActionReceiptState::MissingOrNotFound);
         }
-        let Some(payload) = self.ladybug_store().get_memory_by_id(namespace, receipt_id).await? else {
+        let Some(payload) = self
+            .ladybug_store()
+            .get_memory_by_id(namespace, receipt_id)
+            .await?
+        else {
             return Ok(KernelActionReceiptState::MissingOrNotFound);
         };
         if payload.memory_type != "action_receipt" {
             return Ok(KernelActionReceiptState::MissingOrNotFound);
         }
-        if payload.metadata.get("reverted_at").is_some_and(|v| !v.is_null())
-            || payload.metadata.get("valid_to").is_some_and(|v| !v.is_null())
-            || payload.metadata.get("tx_to").is_some_and(|v| !v.is_null()) {
+        if payload
+            .metadata
+            .get("reverted_at")
+            .is_some_and(|v| !v.is_null())
+            || payload
+                .metadata
+                .get("valid_to")
+                .is_some_and(|v| !v.is_null())
+            || payload.metadata.get("tx_to").is_some_and(|v| !v.is_null())
+        {
             return Ok(KernelActionReceiptState::RevertedOrSuperseded);
         }
-        let (metadata_pointer_id, metadata_pool_id) = match (payload.metadata.get("pointer_id").and_then(|v| v.as_str()), payload.metadata.get("pool_id").and_then(|v| v.as_str())) {
+        let (metadata_pointer_id, metadata_pool_id) = match (
+            payload.metadata.get("pointer_id").and_then(|v| v.as_str()),
+            payload.metadata.get("pool_id").and_then(|v| v.as_str()),
+        ) {
             (Some(pid), Some(p)) => (pid, p),
             _ => return Ok(KernelActionReceiptState::TargetMismatch),
         };
         if metadata_pointer_id == pointer_id && metadata_pool_id == pool_id {
             return Ok(KernelActionReceiptState::ActiveBound);
         }
-        if let Some(target_pointer) = payload.metadata.get("target_pointer_id").and_then(|v| v.as_str()) {
+        if let Some(target_pointer) = payload
+            .metadata
+            .get("target_pointer_id")
+            .and_then(|v| v.as_str())
+        {
             if let Some(target_receipt) = payload.metadata.get("receipt").and_then(|v| v.as_str()) {
                 if target_pointer == pointer_id && target_receipt == receipt_id {
                     return Ok(KernelActionReceiptState::ActiveBound);

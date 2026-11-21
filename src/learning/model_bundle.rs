@@ -1,7 +1,7 @@
 //! Validated ONNX model bundle: manifest, checkpoint, calibration tier.
-use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// A bundle of ONNX artifacts produced by the bridge probe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +50,9 @@ impl ModelBundle {
             if let Some(t) = manifest.get("calibration_tier").and_then(|x| x.as_str()) {
                 calibration_tier = match t {
                     "gold" | "Gold" | "GoldShipped" => crate::judgment::CalibrationTier::Gold,
-                    "proxy_internal" | "ProxyInternal" | "DatasetCalibrated" | "Uncalibrated" => crate::judgment::CalibrationTier::ProxyInternal,
+                    "proxy_internal" | "ProxyInternal" | "DatasetCalibrated" | "Uncalibrated" => {
+                        crate::judgment::CalibrationTier::ProxyInternal
+                    }
                     other => {
                         tracing::warn!(
                             "unknown calibration_tier '{other}' in {}, defaulting to ProxyInternal",
@@ -77,7 +79,8 @@ impl ModelBundle {
             if !embedder_id.is_empty() && manifest_emb != embedder_id {
                 return Err(anyhow::anyhow!(
                     "Manifest embedder_id '{}' does not match expected '{}'",
-                    manifest_emb, embedder_id
+                    manifest_emb,
+                    embedder_id
                 ));
             }
         }
@@ -116,10 +119,17 @@ mod tests {
     #[test]
     fn load_parses_manifest_version_and_tier() {
         let d = temp_bundle("version-tier");
-        fs::write(d.join("manifest.json"), r#"{"model_version":"v2.1.0","calibration_tier":"gold","embedder_id":"e1"}"#).unwrap();
+        fs::write(
+            d.join("manifest.json"),
+            r#"{"model_version":"v2.1.0","calibration_tier":"gold","embedder_id":"e1"}"#,
+        )
+        .unwrap();
         let b = ModelBundle::load(&d, "e1").unwrap();
         assert_eq!(b.version, "v2.1.0");
-        assert!(matches!(b.calibration_tier, crate::judgment::CalibrationTier::Gold));
+        assert!(matches!(
+            b.calibration_tier,
+            crate::judgment::CalibrationTier::Gold
+        ));
         assert_eq!(b.embedder_id, "e1");
         let _ = fs::remove_dir_all(&d);
     }
@@ -127,7 +137,11 @@ mod tests {
     #[test]
     fn load_rejects_embedder_id_mismatch() {
         let d = temp_bundle("mismatch");
-        fs::write(d.join("manifest.json"), r#"{"model_version":"v1","embedder_id":"other"}"#).unwrap();
+        fs::write(
+            d.join("manifest.json"),
+            r#"{"model_version":"v1","embedder_id":"other"}"#,
+        )
+        .unwrap();
         let res = ModelBundle::load(&d, "expected");
         assert!(res.is_err());
         let msg = format!("{}", res.unwrap_err());
@@ -146,7 +160,14 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(model_content);
         let expected = hex::encode(hasher.finalize());
-        fs::write(d.join("manifest.json"), format!(r#"{{"model_version":"v1","model_sha256":"{}","embedder_id":"e"}}"#, expected)).unwrap();
+        fs::write(
+            d.join("manifest.json"),
+            format!(
+                r#"{{"model_version":"v1","model_sha256":"{}","embedder_id":"e"}}"#,
+                expected
+            ),
+        )
+        .unwrap();
         let b = ModelBundle::load(&d, "e").unwrap();
         assert_eq!(b.version, "v1");
         // mismatch case

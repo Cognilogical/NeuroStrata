@@ -210,10 +210,7 @@ pub fn stale_memory_violations(memories: &[SearchResult], now: i64) -> Vec<Viola
 /// refuses to forgive. A row the gate still judges is at least still
 /// visible in `task_list`.
 pub(crate) fn is_retired(metadata: &Value, now: i64) -> bool {
-    crate::formal_kernel::is_retired_at(
-        metadata.get("valid_to").and_then(Value::as_i64),
-        now,
-    )
+    crate::formal_kernel::is_retired_at(metadata.get("valid_to").and_then(Value::as_i64), now)
 }
 
 /// The chain bound: a namespace is written by many hands, so a loop in the
@@ -1646,7 +1643,13 @@ mod tests {
         let scope = GateScope::capture(&subdirectory);
         assert_eq!(
             scope.worktree,
-            Some(dir.path().canonicalize().unwrap().to_string_lossy().into_owned())
+            Some(
+                dir.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )
         );
     }
 
@@ -1718,10 +1721,7 @@ mod tests {
             }),
         )];
         let report = evaluate_scoped(&memories, NOW, Some(&GateScope::default()));
-        assert!(report
-            .violations
-            .iter()
-            .any(|v| v.kind == "in_progress"));
+        assert!(report.violations.iter().any(|v| v.kind == "in_progress"));
     }
 
     #[test]
@@ -2146,7 +2146,15 @@ mod tests {
             .map(|v| v.id.as_str())
             .collect();
         stale.sort();
-        assert_eq!(stale, vec!["blocked-stale", "done-stale", "in_progress-stale", "open-stale"]);
+        assert_eq!(
+            stale,
+            vec![
+                "blocked-stale",
+                "done-stale",
+                "in_progress-stale",
+                "open-stale"
+            ]
+        );
     }
 
     /// Capability C: epoch seconds stale_after is parsed correctly.
@@ -2155,8 +2163,14 @@ mod tests {
         let epoch_past = (NOW - DAY).to_string();
         let epoch_future = (NOW + DAY).to_string();
         let memories = vec![
-            task("epoch-past", json!({ "status": "open", "stale_after": epoch_past })),
-            task("epoch-future", json!({ "status": "open", "stale_after": epoch_future })),
+            task(
+                "epoch-past",
+                json!({ "status": "open", "stale_after": epoch_past }),
+            ),
+            task(
+                "epoch-future",
+                json!({ "status": "open", "stale_after": epoch_future }),
+            ),
         ];
         let report = evaluate(&memories, NOW);
         let stale: Vec<&str> = report
@@ -2222,7 +2236,10 @@ mod tests {
             .iter()
             .find(|v| v.id == "numeric")
             .expect("numeric epoch must produce an advisory");
-        assert!(violation.detail.contains(&value.to_string()), "{violation:?}");
+        assert!(
+            violation.detail.contains(&value.to_string()),
+            "{violation:?}"
+        );
         assert!(!violation.detail.contains("malformed"), "{violation:?}");
     }
 
@@ -2238,10 +2255,7 @@ mod tests {
                 "bad-array",
                 json!({ "status": "open", "stale_after": [1, 2] }),
             ),
-            task(
-                "negative",
-                json!({ "status": "open", "stale_after": -1 }),
-            ),
+            task("negative", json!({ "status": "open", "stale_after": -1 })),
             task("epoch-zero", json!({ "status": "open", "stale_after": 0 })),
         ];
         let report = evaluate(&memories, NOW);
@@ -2316,7 +2330,9 @@ mod tests {
         );
         let report = evaluate(&[stale_fact], now);
         let json = report.validate_json();
-        let alias = json.get("stale_memories").expect("stale_memories alias present");
+        let alias = json
+            .get("stale_memories")
+            .expect("stale_memories alias present");
         let items = alias.as_array().expect("stale_memories is a list");
         assert_eq!(items.len(), 1);
         let rendered = items[0].to_string();

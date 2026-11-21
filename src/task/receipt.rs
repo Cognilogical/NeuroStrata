@@ -49,7 +49,12 @@ mod tests {
 
     #[test]
     fn receipt_matches_when_sha_and_hash_align() {
-        let r = Receipt { task_id: "t1".into(), worktree: "w".into(), head_sha: "a".into(), dirty_tree_hash: "b".into() };
+        let r = Receipt {
+            task_id: "t1".into(),
+            worktree: "w".into(),
+            head_sha: "a".into(),
+            dirty_tree_hash: "b".into(),
+        };
         assert!(r.is_current("a", "b"));
     }
 
@@ -64,7 +69,12 @@ mod tests {
             let mut cmd = std::process::Command::new("git");
             cmd.arg("-C").arg(&repo).args(args);
             let out = cmd.output().expect("git available in test env");
-            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
 
         run(&["init", "-q"]);
@@ -76,7 +86,10 @@ mod tests {
 
         let r = Receipt::capture("t1", Path::new(&repo));
         let (head_sha, dirty_hash) = compute_worktree_state(Path::new(&repo));
-        assert!(r.is_current(&head_sha, &dirty_hash), "fresh capture must be current");
+        assert!(
+            r.is_current(&head_sha, &dirty_hash),
+            "fresh capture must be current"
+        );
         assert_ne!(r.head_sha, "none");
 
         // A new commit moves HEAD, so a receipt bound to the old tree is stale.
@@ -85,7 +98,10 @@ mod tests {
         run(&["commit", "-m", "change"]);
 
         let (head_sha_after, dirty_hash_after) = compute_worktree_state(Path::new(&repo));
-        assert!(!r.is_current(&head_sha_after, &dirty_hash_after), "stale receipt must not be current");
+        assert!(
+            !r.is_current(&head_sha_after, &dirty_hash_after),
+            "stale receipt must not be current"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

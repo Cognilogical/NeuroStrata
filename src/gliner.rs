@@ -1,8 +1,8 @@
 //! GLiNER-style entity candidate emitter (review-only, deterministic).
-//! 
+//!
 //! Per spec `docs/superpowers/specs/2026-10-28-gliner-review-only-candidates-design.md`.
 //! Module path: `src/gliner.rs` (spec line 10). Not in dedup/guard/routing paths.
-//! 
+//!
 //! Constraints met:
 //! - Core module, no feature gate; GlinerEngine bundle loaded on demand
 //! - All candidates `review_only = true`, never auto-promoted
@@ -13,11 +13,11 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::Result;
+use ndarray::Array2;
 use ort::session::Session;
 use ort::value::TensorRef;
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
-use ndarray::Array2;
 
 /// A review-only GLiNER-style entity candidate emitted from text.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -30,7 +30,10 @@ pub struct GlinerCandidate {
 
 /// Check if a character is punctuation that terminates a phrase.
 fn is_punct(c: char) -> bool {
-    matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}')
+    matches!(
+        c,
+        ',' | '.' | ';' | ':' | '!' | '?' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}'
+    )
 }
 
 /// Strip leading/trailing punctuation from a word.
@@ -51,7 +54,11 @@ fn strip_punct(word: &str) -> String {
     while end > start && is_punct(chars[end - 1]) {
         end -= 1;
     }
-    if start >= end { String::new() } else { chars[start..end].iter().collect() }
+    if start >= end {
+        String::new()
+    } else {
+        chars[start..end].iter().collect()
+    }
 }
 
 /// Whether a raw token ends with punctuation (should end phrase after this word).
@@ -60,7 +67,7 @@ fn ends_with_punct(raw: &str) -> bool {
 }
 
 /// Extract capitalised entity-candidate phrases from text.
-/// 
+///
 /// Multi-word phrases: consecutive capitalised words (first char uppercase)
 /// are grouped into a single phrase. Phrase terminates on:
 ///   - non-capitalised word
@@ -72,25 +79,31 @@ pub fn extract_candidates(text: &str) -> Vec<GlinerCandidate> {
     let mut candidates = Vec::new();
     let words: Vec<&str> = text.split_whitespace().collect();
     let mut i = 0;
-    
+
     while i < words.len() {
         let raw = words[i];
         let word = strip_punct(raw);
-        
+
         if word.is_empty() {
-            i += 1; continue;
+            i += 1;
+            continue;
         }
-        
+
         // Capitalised if first char is ASCII uppercase.
-        let is_cap = word.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false);
+        let is_cap = word
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_uppercase())
+            .unwrap_or(false);
         if !is_cap {
-            i += 1; continue;
+            i += 1;
+            continue;
         }
-        
+
         // Build a multi-word phrase of consecutive capitalised words.
         let mut phrase = word.clone();
         let mut j = i + 1;
-        
+
         // If first word ends with punctuation, phrase ends here.
         if ends_with_punct(raw) {
             i = j; // advance past this word
@@ -102,47 +115,52 @@ pub fn extract_candidates(text: &str) -> Vec<GlinerCandidate> {
             });
             continue;
         }
-        
+
         while j < words.len() {
             let next_raw = words[j];
-            
+
             // Stop if next token is entirely punctuation
             if next_raw.chars().all(|c| is_punct(c)) {
                 break;
             }
-            
+
             let next = strip_punct(next_raw);
             if next.is_empty() {
-                j += 1; continue;
+                j += 1;
+                continue;
             }
-            
-            let next_is_cap = next.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false);
+
+            let next_is_cap = next
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_uppercase())
+                .unwrap_or(false);
             if !next_is_cap {
                 break;
             }
-            
+
             phrase.push(' ');
             phrase.push_str(&next);
-            
+
             // If this word ends with punctuation, include it but end phrase.
             if ends_with_punct(next_raw) {
                 j += 1; // consume this word
                 break;
             }
-            
+
             j += 1;
         }
-        
+
         candidates.push(GlinerCandidate {
             text: phrase,
             label: "ENTITY".to_string(),
             score: 1.0,
             review_only: true,
         });
-        
+
         i = j;
     }
-    
+
     candidates
 }
 
@@ -202,12 +220,18 @@ impl GlinerEngine {
                 Ok(mut builder) => match builder.commit_from_file(&model_path) {
                     Ok(session) => Some(Mutex::new(session)),
                     Err(e) => {
-                        tracing::warn!("GLiNER ONNX model at {} failed to load: {e}", model_path.display());
+                        tracing::warn!(
+                            "GLiNER ONNX model at {} failed to load: {e}",
+                            model_path.display()
+                        );
                         None
                     }
                 },
                 Err(e) => {
-                    tracing::warn!("GLiNER ONNX model at {} failed to load: {e}", model_path.display());
+                    tracing::warn!(
+                        "GLiNER ONNX model at {} failed to load: {e}",
+                        model_path.display()
+                    );
                     None
                 }
             }
@@ -218,21 +242,28 @@ impl GlinerEngine {
         let tokenizer = if tokenizer_path.exists() {
             let tok = Tokenizer::from_file(&tokenizer_path);
             if let Err(e) = &tok {
-                tracing::warn!("GLiNER tokenizer at {} failed to load: {e}", tokenizer_path.display());
+                tracing::warn!(
+                    "GLiNER tokenizer at {} failed to load: {e}",
+                    tokenizer_path.display()
+                );
             }
             tok.ok()
         } else {
             None
         };
-        
+
         Ok(Self { session, tokenizer })
     }
-    
+
     /// Extract candidates using ONNX when available, else deterministic fallback.
     /// Always sets `review_only = true` on returned candidates.
     pub fn extract(&self, text: &str, labels: &[&str]) -> Vec<GlinerCandidate> {
         // Spec default: the generic entity label when no labels are supplied.
-        let active_labels: &[&str] = if labels.is_empty() { &["ENTITY"] } else { labels };
+        let active_labels: &[&str] = if labels.is_empty() {
+            &["ENTITY"]
+        } else {
+            labels
+        };
 
         // Try ONNX path if both session and tokenizer loaded
         if let (Some(lock), Some(tokenizer)) = (&self.session, &self.tokenizer) {
@@ -246,18 +277,23 @@ impl GlinerEngine {
                                     // Inspect the output tensor: span confidence
                                     // scores come from the model output, labels
                                     // assigned from `labels` — never discarded.
-                                    let tensor_scores: Option<Vec<f32>> = outputs.iter().next().and_then(|(_name, value)| {
-                                        let (_, data) = value.try_extract_tensor::<f32>().ok()?;
-                                        Some(data.to_vec())
-                                    });
+                                    let tensor_scores: Option<Vec<f32>> =
+                                        outputs.iter().next().and_then(|(_name, value)| {
+                                            let (_, data) =
+                                                value.try_extract_tensor::<f32>().ok()?;
+                                            Some(data.to_vec())
+                                        });
                                     if let Some(scores) = tensor_scores.filter(|s| !s.is_empty()) {
                                         let mut cands = extract_candidates(text);
                                         for (i, cand) in cands.iter_mut().enumerate() {
                                             let raw = scores[i % scores.len()];
-                                            cand.label = active_labels[i % active_labels.len()].to_string();
+                                            cand.label =
+                                                active_labels[i % active_labels.len()].to_string();
                                             cand.score = sigmoid(raw);
                                         }
-                                        for c in &mut cands { c.review_only = true; }
+                                        for c in &mut cands {
+                                            c.review_only = true;
+                                        }
                                         return cands;
                                     }
                                 }
@@ -270,7 +306,9 @@ impl GlinerEngine {
 
         // Fallback: deterministic capitalised-phrase extraction
         let mut cands = extract_candidates(text);
-        for c in &mut cands { c.review_only = true; }
+        for c in &mut cands {
+            c.review_only = true;
+        }
         cands
     }
 }
@@ -284,14 +322,14 @@ fn sigmoid(x: f32) -> f32 {
 mod tests {
     use super::*;
     use std::fs;
-    
+
     fn make_temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("ns-gliner-{}", name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
-    
+
     #[test]
     fn extracts_capitalized() {
         let text = "The QUICK Brown FOX jumps over the LAZY dog";
@@ -302,19 +340,19 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("QUICK")));
         assert!(texts.iter().any(|t| t.contains("LAZY")));
     }
-    
+
     #[test]
     fn empty_for_lowercase() {
         assert!(extract_candidates("the quick brown fox").is_empty());
     }
-    
+
     #[test]
     fn multi_word_phrases() {
         let c = extract_candidates("New York City is a big place");
         let texts: Vec<String> = c.iter().map(|x| x.text.clone()).collect();
         assert!(texts.iter().any(|t| t == "New York City"));
     }
-    
+
     #[test]
     fn punctuation_handling() {
         let text = "John Smith, CEO, went to New York, USA. He arrived.";
@@ -328,7 +366,7 @@ mod tests {
         assert!(texts.iter().all(|t| !t.ends_with(',')));
         assert!(texts.iter().all(|t| !t.ends_with('.')));
     }
-    
+
     #[test]
     fn mixed_case() {
         let text = "MixedCase Word this IS NOT extracted";
@@ -337,12 +375,12 @@ mod tests {
         assert!(texts.iter().any(|t| t == "MixedCase Word"));
         assert!(texts.iter().any(|t| t == "IS NOT"));
     }
-    
+
     #[test]
     fn empty_text() {
         assert!(extract_candidates("").is_empty());
     }
-    
+
     #[test]
     fn single_word_extraction() {
         let c = extract_candidates("API endpoint HTTP");
@@ -350,14 +388,14 @@ mod tests {
         assert!(texts.contains(&"API".to_string()));
         assert!(texts.contains(&"HTTP".to_string()));
     }
-    
+
     #[test]
     fn single_capitalized_word() {
         let c = extract_candidates("Quick");
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].text, "Quick");
     }
-    
+
     #[test]
     fn phrase_ends_on_punctuation() {
         let text = "New York, USA. Smith & Jones";
@@ -370,38 +408,38 @@ mod tests {
         assert!(texts.iter().all(|t| !t.ends_with(',')));
         assert!(texts.iter().all(|t| !t.ends_with('.')));
     }
-    
+
     // New tests for verify_bundle_sha256
-    
+
     #[test]
     fn verify_bundle_sha256_matching() {
         let dir = make_temp_dir("match");
         let model_path = dir.join("model.onnx");
         let model_content = b"fake onnx model content for testing";
         fs::write(&model_path, model_content).unwrap();
-        
+
         let mut hasher = Sha256::new();
         hasher.update(model_content);
         let expected = hex::encode(hasher.finalize());
-        
+
         let result = verify_bundle_sha256(&dir, &expected).unwrap();
         assert!(result);
         let _ = fs::remove_dir_all(&dir);
     }
-    
+
     #[test]
     fn verify_bundle_sha256_mismatch() {
         let dir = make_temp_dir("mismatch");
         let model_path = dir.join("model.onnx");
         fs::write(&model_path, b"actual model content").unwrap();
-        
+
         let wrong_hash = "0000000000000000000000000000000000000000000000000000000000000000";
-        
+
         let result = verify_bundle_sha256(&dir, wrong_hash).unwrap();
         assert!(!result);
         let _ = fs::remove_dir_all(&dir);
     }
-    
+
     #[test]
     fn gliner_engine_fallback_extraction() {
         let dir = make_temp_dir("fallback");
@@ -426,21 +464,28 @@ mod tests {
         let cands = engine.extract(text, &[]);
 
         assert!(!cands.is_empty());
-        assert!(cands.iter().all(|c| c.label == "ENTITY"), "empty labels must default to ENTITY");
+        assert!(
+            cands.iter().all(|c| c.label == "ENTITY"),
+            "empty labels must default to ENTITY"
+        );
         assert!(cands.iter().all(|c| c.review_only));
         let _ = fs::remove_dir_all(&dir);
     }
-    
+
     #[test]
     fn gliner_engine_with_fake_bundle_fallbacks() {
         let dir = make_temp_dir("fakebundle");
         fs::write(dir.join("model.onnx"), b"not a real onnx model").unwrap();
-        fs::write(dir.join("tokenizer.json"), br#"{"model":{"type":"WordLevel","vocab":{"test":1}}}"#).unwrap();
-        
+        fs::write(
+            dir.join("tokenizer.json"),
+            br#"{"model":{"type":"WordLevel","vocab":{"test":1}}}"#,
+        )
+        .unwrap();
+
         let engine = GlinerEngine::load(&dir).unwrap();
         let text = "New York City is big";
         let cands = engine.extract(text, &["LOCATION"]);
-        
+
         assert!(!cands.is_empty());
         assert!(cands.iter().all(|c| c.review_only));
         let _ = fs::remove_dir_all(&dir);

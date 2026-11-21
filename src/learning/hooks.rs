@@ -86,11 +86,7 @@ fn string_array(v: Option<&Value>) -> Vec<String> {
 
 fn receipt_mentions_task(receipt: &ActionReceiptPayload, task_id: &str) -> bool {
     receipt.task_deltas.iter().any(|d| d.task_id == task_id)
-        || receipt
-            .params
-            .get("task_id")
-            .and_then(Value::as_str)
-            == Some(task_id)
+        || receipt.params.get("task_id").and_then(Value::as_str) == Some(task_id)
 }
 
 /// Recorded trigger token. Only an explicitly recorded, governed value is used;
@@ -118,7 +114,10 @@ fn recorded_trigger(task: &MemoryPayload, receipts: &[ActionReceiptPayload]) -> 
     String::new()
 }
 
-fn recorded_verification(task: &MemoryPayload, receipts: &[ActionReceiptPayload]) -> Option<String> {
+fn recorded_verification(
+    task: &MemoryPayload,
+    receipts: &[ActionReceiptPayload],
+) -> Option<String> {
     let task_obj = task.metadata.get("task");
     for v in [
         task.metadata.get("verification_gate"),
@@ -187,10 +186,7 @@ pub fn collect_evidence(rows: &[SearchResult]) -> Vec<TaskEvidence> {
             .map(|(_, r)| (r.executed_at, r.receipt_id.clone(), r.clone()))
             .collect();
         related.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        let receipts: Vec<ActionReceiptPayload> = related
-            .into_iter()
-            .map(|(_, _, r)| r)
-            .collect();
+        let receipts: Vec<ActionReceiptPayload> = related.into_iter().map(|(_, _, r)| r).collect();
         let trigger = recorded_trigger(&row.payload, &receipts);
         let verification = recorded_verification(&row.payload, &receipts);
         let steps: Vec<TrajectoryStep> = receipts
@@ -302,8 +298,12 @@ pub fn collect_reflection_targets(
 }
 
 fn session_queries_text(project_root: &Path) -> String {
-    std::fs::read_to_string(project_root.join(".NeuroStrata").join("session_queries.json"))
-        .unwrap_or_default()
+    std::fs::read_to_string(
+        project_root
+            .join(".NeuroStrata")
+            .join("session_queries.json"),
+    )
+    .unwrap_or_default()
 }
 
 /// Resolve a real receipt row by id, derive the governed rule/procedure ids it
@@ -425,7 +425,9 @@ async fn persist_procedure_candidate(
         .map_err(|e| format!("candidate pre-read: {e}"))?
     {
         if !learner_writable(&existing) {
-            return Err(format!("candidate id '{id}' is owned by a foreign principal"));
+            return Err(format!(
+                "candidate id '{id}' is owned by a foreign principal"
+            ));
         }
         if is_active_payload(&existing, current_action_timestamp()) {
             return Ok(false); // already persisted (idempotent)
@@ -437,7 +439,11 @@ async fn persist_procedure_candidate(
         .map_err(|e| format!("candidate embed: {e}"))?;
     let batch = ActionWriteSet {
         expected_heads: vec![ExpectedHead::AbsentOrInactive { row_id: id.clone() }],
-        writes: vec![StagedMemoryWrite { id, vector, payload }],
+        writes: vec![StagedMemoryWrite {
+            id,
+            vector,
+            payload,
+        }],
         edge_deltas: Vec::new(),
     };
     match store.commit_action_batch(namespace, batch).await {
@@ -459,7 +465,10 @@ fn action_candidate_id(definition: &ActionTypeDefinition, source_task_ids: &[Str
         location_lines: String::new(),
         metadata: json!({}),
     };
-    format!("learn-action-candidate-{}", &sha256_fingerprint(&probe)[..24])
+    format!(
+        "learn-action-candidate-{}",
+        &sha256_fingerprint(&probe)[..24]
+    )
 }
 
 /// Surface a mined action definition only as an INERT candidate row. It is never
@@ -525,7 +534,9 @@ async fn surface_action_candidate(
         .map_err(|e| format!("action candidate pre-read: {e}"))?
     {
         if !learner_writable(&existing) {
-            return Err(format!("action candidate id '{id}' is owned by a foreign principal"));
+            return Err(format!(
+                "action candidate id '{id}' is owned by a foreign principal"
+            ));
         }
         if is_active_payload(&existing, current_action_timestamp()) {
             return Ok(false);
@@ -567,7 +578,11 @@ pub async fn on_task_completed_with_judge(
         ..Default::default()
     };
     let Some(ls) = VectorStore::as_any(store.as_ref()).downcast_ref::<LadybugStore>() else {
-        err(&mut report.errors, "task hook", "store is not a LadybugStore");
+        err(
+            &mut report.errors,
+            "task hook",
+            "store is not a LadybugStore",
+        );
         return report;
     };
     let rows = match store.list(namespace, None, None).await {
@@ -595,8 +610,13 @@ pub async fn on_task_completed_with_judge(
     )
     .await;
     for candidate in &candidates {
-        match persist_procedure_candidate(ls, emb.as_ref(), namespace, candidate_to_memory(candidate))
-            .await
+        match persist_procedure_candidate(
+            ls,
+            emb.as_ref(),
+            namespace,
+            candidate_to_memory(candidate),
+        )
+        .await
         {
             Ok(true) => report.candidates_persisted += 1,
             Ok(false) => {}
@@ -733,8 +753,16 @@ pub async fn on_task_completed(
             }
         }
     });
-    on_task_completed_with_judge(store, emb, namespace, task_id, judge, threshold, project_root)
-        .await
+    on_task_completed_with_judge(
+        store,
+        emb,
+        namespace,
+        task_id,
+        judge,
+        threshold,
+        project_root,
+    )
+    .await
 }
 
 // ── Hook: kinetic apply (after commit, un-reverted, linked task completed) ────
@@ -747,7 +775,10 @@ pub async fn on_action_applied(
 ) -> ActionApplyHookReport {
     let mut report = ActionApplyHookReport::default();
     let (receipt_id, receipt) = match outcome {
-        ActionApplyOutcome::Applied { receipt_id, receipt } => (receipt_id, receipt),
+        ActionApplyOutcome::Applied {
+            receipt_id,
+            receipt,
+        } => (receipt_id, receipt),
         ActionApplyOutcome::Rejected { .. } => return report, // no hook on rejected/dry runs
     };
     report.receipt_id = receipt_id.clone();
@@ -991,14 +1022,14 @@ mod tests {
             forced_by: None,
             forced_at: None,
         };
-        memory(id, "action_receipt", j!({ "eligibility": "private", "action_receipt": ar }))
+        memory(
+            id,
+            "action_receipt",
+            j!({ "eligibility": "private", "action_receipt": ar }),
+        )
     }
 
-    async fn seed(
-        store: &LadybugStore,
-        namespace: &str,
-        rows: Vec<SearchResult>,
-    ) {
+    async fn seed(store: &LadybugStore, namespace: &str, rows: Vec<SearchResult>) {
         let writes: Vec<StagedMemoryWrite> = rows
             .into_iter()
             .map(|r| StagedMemoryWrite {
@@ -1072,12 +1103,10 @@ mod tests {
             task_id: id.to_string(),
             status: Status::Done,
             extracted_memory_ids: vec![format!("{id}-m")],
-            receipts: vec![
-                ActionReceiptPayload::from_payload(
-                    &receipt_row(&format!("r{id}"), id, "do-thing", reverted).payload,
-                )
-                .unwrap(),
-            ],
+            receipts: vec![ActionReceiptPayload::from_payload(
+                &receipt_row(&format!("r{id}"), id, "do-thing", reverted).payload,
+            )
+            .unwrap()],
             steps: vec![s.clone()],
         };
         let evidence = vec![mk("1", false), mk("2", true), mk("3", false)];
@@ -1089,7 +1118,10 @@ mod tests {
             Some(Arc::new(NoDup)),
             0.8,
         ));
-        assert!(candidates.is_empty(), "a reverted chain must block the pattern");
+        assert!(
+            candidates.is_empty(),
+            "a reverted chain must block the pattern"
+        );
     }
 
     #[test]
@@ -1134,7 +1166,9 @@ mod tests {
             j!({ "extracted_from": ["t1", "t2", "t3"] }),
         ));
         seed(
-            VectorStore::as_any(store_dyn.as_ref()).downcast_ref::<LadybugStore>().unwrap(),
+            VectorStore::as_any(store_dyn.as_ref())
+                .downcast_ref::<LadybugStore>()
+                .unwrap(),
             "ns-e",
             rows,
         )
@@ -1152,11 +1186,7 @@ mod tests {
             &root,
         )
         .await;
-        assert!(
-            r1.errors.is_empty(),
-            "hook errors: {:?}",
-            r1.errors
-        );
+        assert!(r1.errors.is_empty(), "hook errors: {:?}", r1.errors);
         assert_eq!(r1.evidence_tasks, 3);
         assert_eq!(r1.candidates_persisted, 1);
         assert_eq!(r1.action_candidates_surfaced, 1);
@@ -1196,7 +1226,11 @@ mod tests {
         seed(
             ls,
             "ns-e",
-            vec![memory("rule-gov", "rule", j!({ "governs_link": ["rule-gov"] }))],
+            vec![memory(
+                "rule-gov",
+                "rule",
+                j!({ "governs_link": ["rule-gov"] }),
+            )],
         )
         .await;
         let root = tmp_dir("root");
@@ -1251,10 +1285,7 @@ mod tests {
         seed(
             ls,
             "ns-e",
-            vec![
-                reverted,
-                memory("rule-gov", "rule", j!({})),
-            ],
+            vec![reverted, memory("rule-gov", "rule", j!({}))],
         )
         .await;
 
@@ -1285,7 +1316,11 @@ mod tests {
         };
         let root = tmp_dir("revert-root");
         let rep = on_action_reverted_with_root(ls, "ns-e", &outcome, &root).await;
-        assert!(rep.errors.is_empty(), "revert hook errors: {:?}", rep.errors);
+        assert!(
+            rep.errors.is_empty(),
+            "revert hook errors: {:?}",
+            rep.errors
+        );
         assert_eq!(rep.negative_reflections, 1);
         assert_eq!(rep.contradictions_queued, 1);
 
@@ -1358,7 +1393,10 @@ mod tests {
             location_lines: String::new(),
             metadata: j!({}),
         };
-        format!("learn-action-candidate-{}", &sha256_fingerprint(&probe)[..24])
+        format!(
+            "learn-action-candidate-{}",
+            &sha256_fingerprint(&probe)[..24]
+        )
     }
 
     fn receipt_governing(id: &str, task_id: &str, slug: &str, governs: &[&str]) -> SearchResult {
@@ -1399,11 +1437,20 @@ mod tests {
         let root = tmp_dir("f1-root");
         std::fs::create_dir_all(&root).unwrap();
         let rep = on_task_completed_with_judge(
-            &store_dyn, &emb, "ns-e", "t1", Some(Arc::new(NoDup)), 0.8, &root,
+            &store_dyn,
+            &emb,
+            "ns-e",
+            "t1",
+            Some(Arc::new(NoDup)),
+            0.8,
+            &root,
         )
         .await;
         assert!(rep.errors.is_empty(), "hook errors: {:?}", rep.errors);
-        assert_eq!(rep.negative_reflections, 1, "failed attempt must apply a negative outcome");
+        assert_eq!(
+            rep.negative_reflections, 1,
+            "failed attempt must apply a negative outcome"
+        );
 
         let (_, gov) = ls.get("ns-e", "rule-gov").await.unwrap().unwrap();
         assert_eq!(gov.metadata["outcome_stats"]["failures"], 1);
@@ -1414,7 +1461,13 @@ mod tests {
 
         // Idempotent: the same receipt id cannot double-count.
         let rep2 = on_task_completed_with_judge(
-            &store_dyn, &emb, "ns-e", "t1", Some(Arc::new(NoDup)), 0.8, &root,
+            &store_dyn,
+            &emb,
+            "ns-e",
+            "t1",
+            Some(Arc::new(NoDup)),
+            0.8,
+            &root,
         )
         .await;
         assert_eq!(rep2.negative_reflections, 0);
@@ -1446,7 +1499,10 @@ mod tests {
         )
         .await;
         let result = surface_action_candidate(&store, "ns-e", &def, &task_ids, 4).await;
-        assert!(result.is_err(), "foreign-owned inactive row must not be overwritten");
+        assert!(
+            result.is_err(),
+            "foreign-owned inactive row must not be overwritten"
+        );
     }
 
     // F2 — an existing active action-candidate row is an idempotent no-op.
@@ -1457,8 +1513,14 @@ mod tests {
         store.init("ns-e").await.unwrap();
         let def = valid_action_definition("learned-active");
         let task_ids = vec!["t1".to_string()];
-        assert!(surface_action_candidate(&store, "ns-e", &def, &task_ids, 4).await.unwrap());
-        assert!(!surface_action_candidate(&store, "ns-e", &def, &task_ids, 4).await.unwrap());
+        assert!(surface_action_candidate(&store, "ns-e", &def, &task_ids, 4)
+            .await
+            .unwrap());
+        assert!(
+            !surface_action_candidate(&store, "ns-e", &def, &task_ids, 4)
+                .await
+                .unwrap()
+        );
     }
 
     // F2 — an invalid definition is rejected before any write.
@@ -1472,7 +1534,10 @@ mod tests {
         let id = action_candidate_id_of(&def, &task_ids);
         let result = surface_action_candidate(&store, "ns-e", &def, &task_ids, 4).await;
         assert!(result.is_err(), "invalid definition must be rejected");
-        assert!(store.get("ns-e", &id).await.unwrap().is_none(), "nothing may be written");
+        assert!(
+            store.get("ns-e", &id).await.unwrap().is_none(),
+            "nothing may be written"
+        );
     }
 
     // P2 (Codex thread 4610878291) — an inert action candidate must carry a
@@ -1527,7 +1592,13 @@ mod tests {
         let root = tmp_dir("f3-root");
         std::fs::create_dir_all(&root).unwrap();
         let rep = on_task_completed_with_judge(
-            &store_dyn, &emb, "ns-e", "t1", Some(Arc::new(NoDup)), 0.8, &root,
+            &store_dyn,
+            &emb,
+            "ns-e",
+            "t1",
+            Some(Arc::new(NoDup)),
+            0.8,
+            &root,
         )
         .await;
         assert!(rep.errors.is_empty(), "hook errors: {:?}", rep.errors);
@@ -1596,10 +1667,19 @@ mod tests {
         let root = tmp_dir("f5-root");
         let rep = on_action_reverted_with_root(&store, "ns-e", &outcome, &root).await;
         assert!(rep.errors.is_empty(), "hook errors: {:?}", rep.errors);
-        assert_eq!(rep.negative_reflections, 0, "receipt already processed => CAS no-op");
-        assert_eq!(rep.contradictions_queued, 0, "no successful CAS => no queue entry");
+        assert_eq!(
+            rep.negative_reflections, 0,
+            "receipt already processed => CAS no-op"
+        );
+        assert_eq!(
+            rep.contradictions_queued, 0,
+            "no successful CAS => no queue entry"
+        );
         let queue = crate::judgment::laya_onnx::ContradictionQueue::new(&root);
-        assert!(queue.pending().unwrap().is_empty(), "no request may be appended");
+        assert!(
+            queue.pending().unwrap().is_empty(),
+            "no request may be appended"
+        );
     }
 
     // F6 — a retired procedure must not suppress a mined candidate.
@@ -1635,7 +1715,13 @@ mod tests {
         let root = tmp_dir("f6-root");
         std::fs::create_dir_all(&root).unwrap();
         let rep = on_task_completed_with_judge(
-            &store_dyn, &emb, "ns-e", "t1", Some(Arc::new(DupJudge)), 0.8, &root,
+            &store_dyn,
+            &emb,
+            "ns-e",
+            "t1",
+            Some(Arc::new(DupJudge)),
+            0.8,
+            &root,
         )
         .await;
         assert!(rep.errors.is_empty(), "hook errors: {:?}", rep.errors);

@@ -1,0 +1,116 @@
+{
+  "cases": [
+    {
+      "name": "push delete short -d",
+      "payload": "git push -d origin main",
+      "exempt": false
+    },
+    {
+      "name": "push delete short bundle -vd",
+      "payload": "git push -vd origin scratch",
+      "exempt": false
+    },
+    {
+      "name": "push empty-source refspec scratch",
+      "payload": "git push origin :refs/heads/scratch",
+      "exempt": false
+    },
+    {
+      "name": "push empty-source refspec main",
+      "payload": "git push origin :main",
+      "exempt": false
+    },
+    {
+      "name": "push quoted force",
+      "payload": "git push \"--force\"",
+      "exempt": false
+    },
+    {
+      "name": "push dele prefix",
+      "payload": "git push --dele origin scratch",
+      "exempt": false
+    },
+    {
+      "name": "push no-verify",
+      "payload": "git push --no-verify origin main",
+      "exempt": false
+    },
+    {
+      "name": "push -oformat false positive",
+      "payload": "git push -oformat=terse origin main",
+      "exempt": true
+    },
+    {
+      "name": "push trailing background",
+      "payload": "git push origin main &",
+      "exempt": false
+    },
+    {
+      "name": "status trailing background",
+      "payload": "git status &",
+      "exempt": false
+    },
+    {
+      "name": "gh api -XPOST",
+      "payload": "gh api -XPOST /repos/x",
+      "exempt": false
+    },
+    {
+      "name": "gh api -f attached",
+      "payload": "gh api -fbody=hi /x",
+      "exempt": false
+    },
+    {
+      "name": "gh api -F attached",
+      "payload": "gh api -Fbody=hi /x",
+      "exempt": false
+    },
+    {
+      "name": "post-task exempt push -u",
+      "payload": "git push -u origin fix/task-claim-push-scope",
+      "exempt": true
+    },
+    {
+      "name": "post-task exempt push chained",
+      "payload": "CARGO_TARGET_DIR=/tmp/target git push -u origin main && git status -s",
+      "exempt": true
+    },
+    {
+      "name": "post-task exempt pull push status",
+      "payload": "git pull --rebase && git push && git status",
+      "exempt": true
+    },
+    { "name": "basic push", "payload": "git push", "exempt": true },
+    {
+      "name": "basic push origin main",
+      "payload": "git push origin main",
+      "exempt": true
+    },
+    {
+      "name": "push bundled force + push-option -fometa",
+      "payload": "git push -fometa origin main",
+      "exempt": false
+    },
+    {
+      "name": "nested benign command must not shadow top-level cmd",
+      "payload": "{\"options\":{\"command\":\"git status\"},\"cmd\":\"git push --force origin main\"}",
+      "exempt": false
+    },
+    {
+      "name": "nested mutating command must not shadow top-level benign cmd",
+      "payload": "{\"options\":{\"command\":\"rm -rf /x\"},\"cmd\":\"git status\"}",
+      "exempt": true
+    },
+    { "name": "duplicate cmd last wins", "payload": "{\"cmd\":\"git status\",\"cmd\":\"git push --force origin main\"}", "exempt": false },
+    { "name": "duplicate cmd last non-string wins", "payload": "{\"cmd\":\"git status\",\"cmd\":42}", "exempt": false },
+    { "name": "empty command falls back to cmd", "payload": "{\"command\":\"\",\"cmd\":\"git status\"}", "exempt": true },
+    { "name": "malformed trailing JSON", "payload": "{\"cmd\":\"git status\"} trailing", "exempt": false },
+    { "name": "push force attached equals", "payload": "git push --force=true origin main", "exempt": false },
+    { "name": "stash list with exec option", "payload": "git stash list --exec=foo", "exempt": false },
+    { "name": "unicode-escaped chain", "payload": "{\"cmd\":\"git status \\u0026\\u0026 rm -rf /\"}", "exempt": false },
+    { "name": "malformed trailing comma", "payload": "{\"cmd\":\"git status\",}", "exempt": false },
+    { "name": "malformed missing separator", "payload": "{\"cmd\":\"git status\" \"x\":\"y\"}", "exempt": false },
+    { "name": "malformed invalid escape", "payload": "{\"cmd\":\"git status \\x\"}", "exempt": false },
+    { "name": "malformed invalid literal", "payload": "{\"cmd\":\"git status\",\"x\":truex}", "exempt": false }
+  ]
+}

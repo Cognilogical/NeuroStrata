@@ -1677,6 +1677,7 @@ impl LadybugStore {
     /// this only moves for the hits no edge query reached (the metadata
     /// fallback), and the fallback reads them all in one query. A test that
     /// seeds a large hit set asserts it does not grow.
+    #[cfg(test)]
     pub fn census_reads(&self) -> u64 {
         self.census_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -3506,7 +3507,10 @@ fn open_after_quarantine(
 /// flag's result discarded (`#207` C5, second call site).
 /// The checkpoint outcome is also persisted to the store-state sidecar
 /// (`#212`), so a fresh process reports the last real checkpoint.
-fn run_recovery_checkpoint(local_path: &std::path::Path, unverified_db: Database) -> Result<Database> {
+fn run_recovery_checkpoint(
+    local_path: &std::path::Path,
+    unverified_db: Database,
+) -> Result<Database> {
     let ckpt_started = std::time::Instant::now();
     run_recovery_checkpoint_with(
         unverified_db,
@@ -3763,7 +3767,12 @@ fn wal_refusal(
         verdict.slug(),
         verdict.sides().label()
     );
-    message.push_str(&preservation_tail(&restored, &unrestored, preserved, local_path));
+    message.push_str(&preservation_tail(
+        &restored,
+        &unrestored,
+        preserved,
+        local_path,
+    ));
     eprintln!("ERROR: DATA LOSS. {message}");
     anyhow::anyhow!(message)
 }
@@ -3854,7 +3863,12 @@ fn refuse_unrecognized_wal_failure(
     let mut message = format!(
         "Refusing to open: the verified open failed with {kind} ({err_msg}), so the write-ahead log accounting cannot prove that zero committed records were recovered. {accounting} ({pre_total} bytes before the failed open, {post_total} bytes after it, {scanned_total} bytes scanned). Refusing to checkpoint over the WAL."
     );
-    message.push_str(&preservation_tail(&restored, &unrestored, preserved, local_path));
+    message.push_str(&preservation_tail(
+        &restored,
+        &unrestored,
+        preserved,
+        local_path,
+    ));
     let prefix = match verdict {
         WalAccounting::CommittedLost { .. } | WalAccounting::Unknown { .. } => "ERROR: DATA LOSS.",
         _ => "ERROR: refusing to open.",
@@ -4126,10 +4140,7 @@ fn recover_from_wal_failure(
             return Err(error);
         }
         return Err(refuse_unrecognized_wal_failure(
-            local_path,
-            &err_msg,
-            pre,
-            preserved,
+            local_path, &err_msg, pre, preserved,
         ));
     }
 
@@ -4542,7 +4553,8 @@ impl FirstWriteFlip {
         match self.cached_store_state() {
             CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
                 recorded.has_data = true;
-                if let Err(e) = crate::model_choice::write_store_state_identity(&self.local_path, &recorded)
+                if let Err(e) =
+                    crate::model_choice::write_store_state_identity(&self.local_path, &recorded)
                 {
                     tracing::error!(
                         "store-state sidecar flip failed after a successful write; the store has data but its sidecar still reads pristine: {e}"
@@ -4569,7 +4581,8 @@ impl FirstWriteFlip {
                 };
                 if let Some(descriptor) = descriptor {
                     let state = crate::model_choice::StoreState::new(true, descriptor);
-                    if let Err(e) = crate::model_choice::write_store_state_identity(&self.local_path, &state)
+                    if let Err(e) =
+                        crate::model_choice::write_store_state_identity(&self.local_path, &state)
                     {
                         tracing::error!(
                             "store-state sidecar flip failed after a successful write; the store has data but no sidecar records it: {e}"
@@ -5158,7 +5171,10 @@ impl LadybugStore {
                 if let Some(serving) = self.serving_descriptor() {
                     if serving != recorded.descriptor && self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
-                        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
+                        match crate::model_choice::write_store_state_identity(
+                            &self.local_path,
+                            &state,
+                        ) {
                             Ok(()) => {
                                 self.set_cached_store_state(CachedStoreState::Recorded(state))
                             }
@@ -5173,7 +5189,10 @@ impl LadybugStore {
                 if let Some(serving) = self.serving_descriptor() {
                     if self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
-                        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
+                        match crate::model_choice::write_store_state_identity(
+                            &self.local_path,
+                            &state,
+                        ) {
                             Ok(()) => {
                                 self.set_cached_store_state(CachedStoreState::Recorded(state))
                             }
@@ -6916,14 +6935,8 @@ pub(crate) fn row_source_key(metadata: &Value) -> Option<&str> {
 /// Normative memory types that the recall path reserves result slots for.
 /// Stated once here so the search ranker and the task gate can agree on the
 /// same predicate (see the FEATURE-4 provenance contract in `src/traits.rs`).
-const NORMATIVE_MEMORY_TYPES: [&str; 6] = [
-    "rule",
-    "fact",
-    "decision",
-    "procedure",
-    "thesis",
-    "concept",
-];
+const NORMATIVE_MEMORY_TYPES: [&str; 6] =
+    ["rule", "fact", "decision", "procedure", "thesis", "concept"];
 
 /// Relevance floor (similarity) below which a normative candidate is eligible
 /// for a reserved search slot. Scores are distances (lower = better, [0.0, 1.0]
@@ -7764,7 +7777,10 @@ impl LadybugStore {
         let mut out = Vec::new();
         for m in memories {
             let mt = m.payload.memory_type.as_str();
-            if !matches!(mt, "code_ast" | "symbol" | "markdown" | "directory" | "file") {
+            if !matches!(
+                mt,
+                "code_ast" | "symbol" | "markdown" | "directory" | "file"
+            ) {
                 continue;
             }
             match crate::parser::ingest::split_scoped_id(&m.id) {
@@ -13476,6 +13492,17 @@ static BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
+std::thread_local! {
+    static BRIDGE_ENRICHMENT_TEST_ACTIVE: std::cell::Cell<bool> =
+        std::cell::Cell::new(false);
+}
+
+#[cfg(test)]
+pub fn set_bridge_enrichment_test_active(active: bool) {
+    BRIDGE_ENRICHMENT_TEST_ACTIVE.with(|flag| flag.set(active));
+}
+
+#[cfg(test)]
 pub fn reset_bridge_enrichment_counter_for_tests() {
     BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS.store(0, std::sync::atomic::Ordering::SeqCst);
 }
@@ -13528,7 +13555,10 @@ impl LadybugStore {
     ) {
         #[cfg(test)]
         if !hits.is_empty() {
-            BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if BRIDGE_ENRICHMENT_TEST_ACTIVE.with(|flag| flag.get()) {
+                BRIDGE_ENRICHMENT_COUNTER_FOR_TESTS
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             crate::server::context_plan_benchmark_instrumentation::record_bridge_enrichment_pass();
         }
 
@@ -16333,8 +16363,7 @@ eurostrata\src\daemon.rs",
     async fn retired_test_store() -> LadybugStore {
         let dir = std::env::temp_dir().join(format!("ns-retired-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp test dir");
-        let mut store =
-            LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        let mut store = LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
         store.test_cleanup_dir = Some(TestCleanupDir(dir));
         store.init("probe").await.expect("create the schema");
         store
@@ -16983,6 +17012,7 @@ eurostrata\src\daemon.rs",
     /// once per spelling -- the counter must read exactly 1 for two forms.
     #[tokio::test]
     async fn memories_for_file_forms_enriches_bridges_once_per_logical_file() {
+        crate::store::ladybug::set_bridge_enrichment_test_active(true);
         reset_bridge_enrichment_counter_for_tests();
         let form_a = "src/lib.rs";
         let form_b = "/tmp/ns-v1190-project/src/lib.rs";
@@ -17030,6 +17060,7 @@ eurostrata\src\daemon.rs",
             1,
             "bridge enrichment runs once per logical file, not once per form"
         );
+        crate::store::ladybug::set_bridge_enrichment_test_active(false);
     }
 
     /// Composite Recommendation #11: the first embedding descriptor recorded
@@ -17128,11 +17159,8 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap();
 
-        let lesson_payload = retired_test_payload(
-            "fact",
-            "agent",
-            json!({ "extracted_from": ["task-1"] }),
-        );
+        let lesson_payload =
+            retired_test_payload("fact", "agent", json!({ "extracted_from": ["task-1"] }));
         store
             .upsert("probe", "lesson-1", vec![0.0; 4], lesson_payload)
             .await
@@ -19920,8 +19948,7 @@ eurostrata\src\daemon.rs",
     async fn store_with_two_declarations() -> LadybugStore {
         let dir = std::env::temp_dir().join(format!("ns-relink-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp test dir");
-        let mut store =
-            LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
+        let mut store = LadybugStore::for_testing(dir.join("db"), 4).expect("open temp database");
         store.test_cleanup_dir = Some(TestCleanupDir(dir));
         store.init("probe").await.expect("create the schema");
 
@@ -22335,7 +22362,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
-        let _zero = vec![0.0f32; 4];
+        let _zero = [0.0f32; 4];
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
 
         // Primary: a fact that matches the query
@@ -22611,7 +22638,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
-        let _zero = vec![0.0f32; 4];
+        let _zero = [0.0f32; 4];
         let query_vec = vec![1.1, 0.0, 0.0, 0.0];
 
         // Two primaries that both connect to the same expansion candidate
@@ -23019,7 +23046,7 @@ eurostrata\src\daemon.rs",
     async fn family_independence_one_hop_does_not_crowd_out_siblings() {
         let store = episode_sibling_test_store().await;
         // Add many one-hop neighbors
-        let _zero = vec![0.0f32; 4];
+        let _zero = [0.0f32; 4];
         for i in 0..5 {
             store
                 .upsert(
@@ -24731,7 +24758,10 @@ eurostrata\src\daemon.rs",
         let v = vec![0.1, 0.2, 0.3, 0.4];
 
         for (id, location) in [
-            ("rule-windows", r"C:\Users\src-leak-sentinel\proj\src\lib.rs"),
+            (
+                "rule-windows",
+                r"C:\Users\src-leak-sentinel\proj\src\lib.rs",
+            ),
             ("rule-posix", "/home/src-leak-sentinel/proj/src/lib.rs"),
             ("rule-relative", "src/lib.rs"),
         ] {
@@ -24755,7 +24785,9 @@ eurostrata\src\daemon.rs",
         assert_eq!(source("rule-relative"), Some(json!("src/lib.rs")));
         // Neither absolute location (Windows nor POSIX) may leak a host path.
         for id in ["rule-windows", "rule-posix", "rule-relative"] {
-            let s = source(id).and_then(|v| v.as_str().map(str::to_string)).unwrap();
+            let s = source(id)
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap();
             assert!(!s.contains("src-leak-sentinel"), "{id} leaked a host path");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -25271,7 +25303,9 @@ eurostrata\src\daemon.rs",
             "unrelated bulky metadata must be dropped: {bounded}"
         );
         assert_eq!(bounded["truncated"], serde_json::json!(true));
-        let byte_len = serde_json::to_string(&bounded).expect("serialize bounded").len();
+        let byte_len = serde_json::to_string(&bounded)
+            .expect("serialize bounded")
+            .len();
         assert!(
             byte_len <= LadybugStore::MAX_NEIGHBOR_METADATA_BYTES,
             "bounded metadata must stay within budget: {byte_len}"
@@ -29129,7 +29163,9 @@ eurostrata\src\daemon.rs",
     fn release_handle_leaks_when_the_flag_call_is_not_known_to_succeed() {
         use std::sync::atomic::Ordering;
 
-        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-release-leak-{}-{}",
@@ -29167,7 +29203,9 @@ eurostrata\src\daemon.rs",
     fn release_handle_drops_when_the_flag_call_succeeds() {
         use std::sync::atomic::Ordering;
 
-        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-release-ok-{}-{}",
@@ -29207,7 +29245,9 @@ eurostrata\src\daemon.rs",
     fn recovery_checkpoint_failure_leaks_when_the_flag_call_is_not_known_to_succeed() {
         use std::sync::atomic::Ordering;
 
-        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-fail-leak-{}-{}",
@@ -29255,7 +29295,9 @@ eurostrata\src\daemon.rs",
     fn recovery_checkpoint_failure_drops_when_the_flag_call_succeeds() {
         use std::sync::atomic::Ordering;
 
-        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-fail-drop-{}-{}",
@@ -29296,7 +29338,9 @@ eurostrata\src\daemon.rs",
     fn recovery_checkpoint_success_returns_the_handle() {
         use std::sync::atomic::Ordering;
 
-        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = RECOVERY_HANDLE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let root = std::env::temp_dir().join(format!(
             "lbug-ckpt-ok-{}-{}",

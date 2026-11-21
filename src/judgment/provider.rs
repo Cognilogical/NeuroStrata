@@ -53,8 +53,10 @@ impl JudgmentProvider for HeuristicJudgmentProvider {
             }
 
             // Compute token-set Jaccard similarity
-            let new_tokens: std::collections::HashSet<String> = token_set_tokens(&new_memory.content);
-            let cand_tokens: std::collections::HashSet<String> = token_set_tokens(&cand.payload.content);
+            let new_tokens: std::collections::HashSet<String> =
+                token_set_tokens(&new_memory.content);
+            let cand_tokens: std::collections::HashSet<String> =
+                token_set_tokens(&cand.payload.content);
 
             let intersection = new_tokens
                 .intersection(&cand_tokens)
@@ -67,7 +69,11 @@ impl JudgmentProvider for HeuristicJudgmentProvider {
                 .collect::<std::collections::HashSet<_>>()
                 .len();
 
-            let jaccard = if union == 0 { 0.0 } else { intersection as f32 / union as f32 };
+            let jaccard = if union == 0 {
+                0.0
+            } else {
+                intersection as f32 / union as f32
+            };
 
             // Only consider duplicates if memory types match and jaccard >= threshold
             if new_memory.memory_type == cand.payload.memory_type && jaccard >= 0.85 {
@@ -96,9 +102,7 @@ fn token_set_tokens(content: &str) -> std::collections::HashSet<String> {
     content
         .to_lowercase()
         .split_whitespace()
-        .filter(|token| {
-            token.chars().all(|c| c.is_alphanumeric()) && token.len() >= 2
-        })
+        .filter(|token| token.chars().all(|c| c.is_alphanumeric()) && token.len() >= 2)
         .map(|token| token.to_string())
         .collect()
 }
@@ -136,7 +140,11 @@ mod tests {
         let res = p.judge_duplicates(&mem, &[cand.clone()]).await.unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].confidence, 1.0);
-        assert!(res[0].reason.as_ref().unwrap().contains("canonical-key-match"));
+        assert!(res[0]
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("canonical-key-match"));
     }
 
     #[tokio::test]
@@ -166,7 +174,18 @@ mod tests {
             evidence: None,
         };
         let res = p.judge_duplicates(&mem, &[cand]).await.unwrap();
-        let has_heuristic = res.iter().any(|j| j.reason.as_ref().unwrap().contains("heuristic-token-jaccard"));
-        assert!(has_heuristic || res.is_empty() || res.iter().any(|j| j.reason.as_ref().unwrap().contains("canonical-key-match")));
+        let has_heuristic = res.iter().any(|j| {
+            j.reason
+                .as_ref()
+                .unwrap()
+                .contains("heuristic-token-jaccard")
+        });
+        assert!(
+            has_heuristic
+                || res.is_empty()
+                || res
+                    .iter()
+                    .any(|j| j.reason.as_ref().unwrap().contains("canonical-key-match"))
+        );
     }
 }

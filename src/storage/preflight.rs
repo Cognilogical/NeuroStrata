@@ -18,8 +18,12 @@ pub fn check_free_space(store_path: &Path, projected_bytes: u64) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let available = fs2::available_space(dir)
-        .with_context(|| format!("upgrade preflight: cannot read free space for {}", dir.display()))?;
+    let available = fs2::available_space(dir).with_context(|| {
+        format!(
+            "upgrade preflight: cannot read free space for {}",
+            dir.display()
+        )
+    })?;
     if available < projected_bytes {
         bail!(
             "upgrade preflight: {} has {} bytes free but reindexing needs about {} bytes (store {}); free space or move the store before retrying",

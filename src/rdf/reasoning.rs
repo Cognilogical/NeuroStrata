@@ -1,7 +1,7 @@
-use crate::traits::{EvidenceEdge, EvidenceKind, MemoryPayload, SearchEvidence, SearchResult};
 use crate::rdf::ontology::ClosureResult;
 use crate::rdf::ontology::OntologyIndex;
 use crate::rdf::ontology::QueryBudget;
+use crate::traits::{EvidenceEdge, EvidenceKind, MemoryPayload, SearchEvidence, SearchResult};
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -36,11 +36,17 @@ pub struct ReasoningAdapter {
 
 impl ReasoningAdapter {
     pub fn new() -> Self {
-        Self { config: ReasoningConfig::default(), payloads: HashMap::new() }
+        Self {
+            config: ReasoningConfig::default(),
+            payloads: HashMap::new(),
+        }
     }
 
     pub fn new_with(config: ReasoningConfig) -> Self {
-        Self { config, payloads: HashMap::new() }
+        Self {
+            config,
+            payloads: HashMap::new(),
+        }
     }
 
     /// Builder: register a payload lookup map (id -> MemoryPayload).
@@ -51,7 +57,10 @@ impl ReasoningAdapter {
 
     /// Hydrate a payload for `id`, falling back to the empty stub.
     fn payload_for(&self, id: &str) -> MemoryPayload {
-        self.payloads.get(id).cloned().unwrap_or_else(Self::empty_payload)
+        self.payloads
+            .get(id)
+            .cloned()
+            .unwrap_or_else(Self::empty_payload)
     }
 
     fn empty_payload() -> MemoryPayload {
@@ -68,9 +77,7 @@ impl ReasoningAdapter {
 
     /// Expand domain via subClassOf* closure (RDFS §5.3 query-time expansion).
     pub fn expand_domain(&self, ontology: &OntologyIndex, domain: &str) -> Vec<String> {
-        if self.config.governs_max_hops == 0
-            || self.config.closure_budget.max_nodes == 0
-        {
+        if self.config.governs_max_hops == 0 || self.config.closure_budget.max_nodes == 0 {
             return vec![domain.to_string()];
         }
         ontology.expand_domain(domain)
@@ -100,7 +107,12 @@ impl ReasoningAdapter {
     }
 
     /// Bounded transitive GOVERNS closure (default 2 hops, §5.5).
-    pub fn closure_governs(&self, ontology: &OntologyIndex, root: &str, edges: &[String]) -> ClosureResult {
+    pub fn closure_governs(
+        &self,
+        ontology: &OntologyIndex,
+        root: &str,
+        edges: &[String],
+    ) -> ClosureResult {
         // GOVERNS closure expands over subPropertyOf*: an edge carrying any
         // sub-relation of GOVERNS (e.g. a strict-governs variant) participates.
         let governed_rels: Vec<String> = self
@@ -124,8 +136,8 @@ impl ReasoningAdapter {
             }
             // 2-part edges carry no explicit relation; 3-part "src::tgt::rel" must be a
             // GOVERNS sub-relation (lowercase compare) to participate.
-            let relates = parts.len() == 2
-                || governed_rels.iter().any(|r| *r == parts[2].to_lowercase());
+            let relates =
+                parts.len() == 2 || governed_rels.iter().any(|r| *r == parts[2].to_lowercase());
             if !relates {
                 continue;
             }
@@ -274,7 +286,10 @@ impl ReasoningAdapter {
             if d.is_empty() || !out.insert(d.clone()) {
                 continue;
             }
-            for r in index.closure_subclasses(d, &self.config.closure_budget).results {
+            for r in index
+                .closure_subclasses(d, &self.config.closure_budget)
+                .results
+            {
                 out.insert(r);
             }
             for p in index.expand_class(d) {
@@ -828,10 +843,17 @@ impl AuditGraph {
     fn new_with_base(all: Vec<oxrdf::Triple>, base: Vec<oxrdf::Triple>) -> Self {
         let mut by_pred: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, t) in all.iter().enumerate() {
-            by_pred.entry(t.predicate.as_str().to_string()).or_default().push(i);
+            by_pred
+                .entry(t.predicate.as_str().to_string())
+                .or_default()
+                .push(i);
         }
         let base_nts = base.iter().map(nt_triple).collect();
-        Self { all, by_pred, base_nts }
+        Self {
+            all,
+            by_pred,
+            base_nts,
+        }
     }
 
     fn is_base(&self, nt: &str) -> bool {
@@ -848,14 +870,12 @@ impl AuditGraph {
 
 /// Keep the lexicographically smallest (deterministic) premise tuple.
 fn pick_minimal(candidates: Vec<Vec<oxrdf::Triple>>) -> Option<Vec<oxrdf::Triple>> {
-    candidates
-        .into_iter()
-        .min_by(|a, b| {
-            a.iter()
-                .map(nt_triple)
-                .collect::<Vec<_>>()
-                .cmp(&b.iter().map(nt_triple).collect::<Vec<_>>())
-        })
+    candidates.into_iter().min_by(|a, b| {
+        a.iter()
+            .map(nt_triple)
+            .collect::<Vec<_>>()
+            .cmp(&b.iter().map(nt_triple).collect::<Vec<_>>())
+    })
 }
 
 fn mk_step(
@@ -1615,10 +1635,7 @@ fn audit_cls_int2(g: &AuditGraph, t: &oxrdf::Triple) -> Option<DerivationStep> {
             Some(v) => v,
             None => continue,
         };
-        if !members
-            .iter()
-            .any(|m| named_term(m.as_str()) == t.object)
-        {
+        if !members.iter().any(|m| named_term(m.as_str()) == t.object) {
             continue;
         }
         // premises: axiom + cells + membership triple T(t.subject, I)
@@ -1672,7 +1689,9 @@ fn audit_cls_uni(g: &AuditGraph, t: &oxrdf::Triple) -> Option<DerivationStep> {
 fn is_container_membership_iri(s: &str) -> bool {
     match s.strip_prefix(RDF_NS) {
         Some(rest) => {
-            !rest.is_empty() && rest.starts_with('_') && rest[1..].bytes().all(|b| b.is_ascii_digit())
+            !rest.is_empty()
+                && rest.starts_with('_')
+                && rest[1..].bytes().all(|b| b.is_ascii_digit())
         }
         None => false,
     }
@@ -2184,8 +2203,12 @@ mod tests {
             }
         }));
         let adapter = ReasoningAdapter::new_with(ReasoningConfig::default());
-        assert!(adapter.expand_domain(&idx, "auth").contains(&"tls".to_string()));
-        assert!(adapter.expand_identifiers(&idx, "ssl").contains(&"tls".to_string()));
+        assert!(adapter
+            .expand_domain(&idx, "auth")
+            .contains(&"tls".to_string()));
+        assert!(adapter
+            .expand_identifiers(&idx, "ssl")
+            .contains(&"tls".to_string()));
         assert!(!adapter.expand_relation(&idx, "GOVERNS").is_empty());
         let results = adapter.execute(&idx, "auth", "ssl", &["tls::src/tls.rs".to_string()]);
         assert!(results.iter().any(|r| r.id == "src/tls.rs"));
@@ -2214,8 +2237,8 @@ mod tests {
                 metadata: json!({"domain": "tls"}),
             },
         );
-        let adapter = ReasoningAdapter::new_with(ReasoningConfig::default())
-            .with_payloads(payloads);
+        let adapter =
+            ReasoningAdapter::new_with(ReasoningConfig::default()).with_payloads(payloads);
 
         let results = adapter.execute(&idx, "auth", "ssl", &["tls::src/tls.rs".to_string()]);
         let hit = results
@@ -2538,8 +2561,8 @@ mod tests {
             all.push(ex_tb(&cell, EX_REST, &next));
         }
         let g = AuditGraph::new(all);
-        let (members, cells) = walk_list(&g, &named_term("http://ex.org/l0"))
-            .expect("20-cell list must be walked");
+        let (members, cells) =
+            walk_list(&g, &named_term("http://ex.org/l0")).expect("20-cell list must be walked");
         assert_eq!(members.len(), n);
         assert_eq!(cells.len(), 2 * n);
 
@@ -2559,7 +2582,9 @@ mod tests {
             .expect("container closure must certify");
         all_inferred_are_certified(&out);
         let property = out.inferred_triples.iter().any(|t| {
-            nb_iri(&t.subject) == cm && t.predicate.as_str() == RDF_TYPE && t.object == named_term(RDF_PROPERTY)
+            nb_iri(&t.subject) == cm
+                && t.predicate.as_str() == RDF_TYPE
+                && t.object == named_term(RDF_PROPERTY)
         });
         assert!(property, "rdf:_n rdf:type rdf:Property must be inferred");
         assert!(out
@@ -2572,7 +2597,11 @@ mod tests {
     #[test]
     fn cls_com_is_diagnostic_only_no_emitted_triples() {
         let base = vec![
-            ex_tb("http://ex.org/A", "http://www.w3.org/2002/07/owl#complementOf", "http://ex.org/B"),
+            ex_tb(
+                "http://ex.org/A",
+                "http://www.w3.org/2002/07/owl#complementOf",
+                "http://ex.org/B",
+            ),
             ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/A"),
         ];
         let out = ReasoningAdapter::new()
@@ -2595,10 +2624,22 @@ mod tests {
         for q in &out.inferred_nquads {
             assert!(q.ends_with(&format!("<{graph}> .")));
         }
-        assert_eq!(out.rdf_star_annotations.len(), out.certificate.steps.len() * 2);
-        assert!(out.rdf_star_annotations.iter().any(|a| a.contains("derivedByRule")));
-        assert!(out.rdf_star_annotations.iter().any(|a| a.contains("certificateHash")));
-        assert!(out.rdf_star_annotations.iter().any(|a| a.contains(&out.certificate.certificate_sha256)));
+        assert_eq!(
+            out.rdf_star_annotations.len(),
+            out.certificate.steps.len() * 2
+        );
+        assert!(out
+            .rdf_star_annotations
+            .iter()
+            .any(|a| a.contains("derivedByRule")));
+        assert!(out
+            .rdf_star_annotations
+            .iter()
+            .any(|a| a.contains("certificateHash")));
+        assert!(out
+            .rdf_star_annotations
+            .iter()
+            .any(|a| a.contains(&out.certificate.certificate_sha256)));
     }
 
     #[test]
@@ -2606,7 +2647,11 @@ mod tests {
         let p = "http://ex.org/p";
         let mut base = vec![ex_tb(p, RDF_TYPE, EX_TRP)];
         for i in 0..13 {
-            base.push(ex_tb(&format!("http://ex.org/n{i}"), p, &format!("http://ex.org/n{}", i + 1)));
+            base.push(ex_tb(
+                &format!("http://ex.org/n{i}"),
+                p,
+                &format!("http://ex.org/n{}", i + 1),
+            ));
         }
         let out = ReasoningAdapter::new()
             .materialize_owl2_rl_with_proofs(&base, "test/ns", 50_000, ReasoningProfile::OwlRl)
@@ -2627,7 +2672,9 @@ mod tests {
         let out = ReasoningAdapter::new()
             .materialize_owl2_rl_with_proofs(&base, "test/ns", 50_000, ReasoningProfile::Rdfs)
             .expect("rdfs-labeled call must still materialize full owl-rl");
-        assert!(out.inferred_triples.contains(&ex_tb("http://ex.org/a", p, "http://ex.org/d")));
+        assert!(out
+            .inferred_triples
+            .contains(&ex_tb("http://ex.org/a", p, "http://ex.org/d")));
         let summary = out.materialization_summary();
         assert!(summary.contains("materialization=owl-rl"));
         assert!(summary.contains("profile_restricts_closure=false"));
@@ -2635,7 +2682,11 @@ mod tests {
 
     // ---- I2: independent persisted-certificate verification (RED-first) ----
 
-    fn persisted_fixture() -> (ReasoningProfile, Vec<oxrdf::Triple>, MaterializationCertificate) {
+    fn persisted_fixture() -> (
+        ReasoningProfile,
+        Vec<oxrdf::Triple>,
+        MaterializationCertificate,
+    ) {
         let profile = ReasoningProfile::OwlRl;
         let base = vec![
             ex_tb("http://ex.org/A", EX_SCO, "http://ex.org/B"),
@@ -2658,14 +2709,18 @@ mod tests {
     fn verify_persisted_certificate_rejects_tampered_step() {
         let (_profile, base, mut out) = persisted_fixture();
         out.certificate.steps[0].rule = Owl2RlRuleId::PrpDom;
-        assert!(verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base).is_err());
+        assert!(
+            verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base).is_err()
+        );
     }
 
     #[test]
     fn verify_persisted_certificate_rejects_tampered_digest() {
         let (_profile, base, mut out) = persisted_fixture();
         out.certificate.certificate_sha256 = "00".repeat(32);
-        assert!(verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base).is_err());
+        assert!(
+            verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base).is_err()
+        );
     }
 
     #[test]
@@ -2677,7 +2732,9 @@ mod tests {
             &out.certificate.steps,
             &out.certificate.disjointness_violations,
         ));
-        assert!(verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base).is_err());
+        assert!(
+            verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base).is_err()
+        );
     }
 
     #[test]
@@ -2702,7 +2759,9 @@ mod tests {
             &out.certificate.steps,
             &out.certificate.disjointness_violations,
         ));
-        assert!(verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base).is_err());
+        assert!(
+            verify_persisted_certificate(&out.certificate, &out.inferred_triples, &base).is_err()
+        );
     }
 
     #[test]
@@ -2829,7 +2888,11 @@ mod tests {
         assert_no_characteristic_entailment(
             "cls-com",
             vec![
-                ex_tb("http://ex.org/A", "http://www.w3.org/2002/07/owl#complementOf", "http://ex.org/B"),
+                ex_tb(
+                    "http://ex.org/A",
+                    "http://www.w3.org/2002/07/owl#complementOf",
+                    "http://ex.org/B",
+                ),
                 ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/A"),
             ],
             vec![ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/B")],
@@ -2840,7 +2903,11 @@ mod tests {
     fn i4_rdfs1_arbitrary_predicate_emits_no_property_typing() {
         assert_no_characteristic_entailment(
             "rdfs1",
-            vec![ex_tb("http://ex.org/x", "http://ex.org/p", "http://ex.org/y")],
+            vec![ex_tb(
+                "http://ex.org/x",
+                "http://ex.org/p",
+                "http://ex.org/y",
+            )],
             vec![ex_tb("http://ex.org/p", RDF_TYPE, RDF_PROPERTY)],
         );
     }
@@ -2850,7 +2917,11 @@ mod tests {
         let resource = "http://www.w3.org/2000/01/rdf-schema#Resource";
         assert_no_characteristic_entailment(
             "rdfs4a/rdfs4b",
-            vec![ex_tb("http://ex.org/x", "http://ex.org/p", "http://ex.org/y")],
+            vec![ex_tb(
+                "http://ex.org/x",
+                "http://ex.org/p",
+                "http://ex.org/y",
+            )],
             vec![
                 ex_tb("http://ex.org/x", RDF_TYPE, resource),
                 ex_tb("http://ex.org/y", RDF_TYPE, resource),
@@ -2866,7 +2937,11 @@ mod tests {
                 ex_tb("http://ex.org/p1", RDFS_SUBPROP_OF, "http://ex.org/p2"),
                 ex_tb("http://ex.org/p2", RDFS_SUBPROP_OF, "http://ex.org/p3"),
             ],
-            vec![ex_tb("http://ex.org/p1", RDFS_SUBPROP_OF, "http://ex.org/p3")],
+            vec![ex_tb(
+                "http://ex.org/p1",
+                RDFS_SUBPROP_OF,
+                "http://ex.org/p3",
+            )],
         );
     }
 
@@ -2874,7 +2949,11 @@ mod tests {
     fn i4_rdfs6_emits_no_property_typing() {
         assert_no_characteristic_entailment(
             "rdfs6",
-            vec![ex_tb("http://ex.org/p1", RDFS_SUBPROP_OF, "http://ex.org/p2")],
+            vec![ex_tb(
+                "http://ex.org/p1",
+                RDFS_SUBPROP_OF,
+                "http://ex.org/p2",
+            )],
             vec![ex_tb("http://ex.org/p1", RDF_TYPE, RDF_PROPERTY)],
         );
     }
@@ -2926,14 +3005,26 @@ mod tests {
     #[test]
     fn i5_scm_eqc_certifies_bidirectional_subclass() {
         let base = vec![ex_tb("http://ex.org/A", OWL_EQUIV_CLASS, "http://ex.org/B")];
-        assert_certified_rule(&base, &ex_tb("http://ex.org/A", EX_SCO, "http://ex.org/B"), Owl2RlRuleId::ScmEqc);
-        assert_certified_rule(&base, &ex_tb("http://ex.org/B", EX_SCO, "http://ex.org/A"), Owl2RlRuleId::ScmEqc);
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/A", EX_SCO, "http://ex.org/B"),
+            Owl2RlRuleId::ScmEqc,
+        );
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/B", EX_SCO, "http://ex.org/A"),
+            Owl2RlRuleId::ScmEqc,
+        );
     }
 
     #[test]
     fn i5_eq_sym_certifies_reversed_same_as() {
         let base = vec![ex_tb("http://ex.org/x", OWL_SAME_AS, "http://ex.org/y")];
-        assert_certified_rule(&base, &ex_tb("http://ex.org/y", OWL_SAME_AS, "http://ex.org/x"), Owl2RlRuleId::EqSym);
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/y", OWL_SAME_AS, "http://ex.org/x"),
+            Owl2RlRuleId::EqSym,
+        );
     }
 
     #[test]
@@ -2942,7 +3033,11 @@ mod tests {
             ex_tb("http://ex.org/x", OWL_SAME_AS, "http://ex.org/y"),
             ex_tb("http://ex.org/y", OWL_SAME_AS, "http://ex.org/z"),
         ];
-        assert_certified_rule(&base, &ex_tb("http://ex.org/x", OWL_SAME_AS, "http://ex.org/z"), Owl2RlRuleId::EqTrans);
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/x", OWL_SAME_AS, "http://ex.org/z"),
+            Owl2RlRuleId::EqTrans,
+        );
     }
 
     #[test]
@@ -2951,7 +3046,11 @@ mod tests {
             ex_tb("http://ex.org/x", OWL_SAME_AS, "http://ex.org/y"),
             ex_tb("http://ex.org/x", "http://ex.org/p", "http://ex.org/o"),
         ];
-        assert_certified_rule(&base, &ex_tb("http://ex.org/y", "http://ex.org/p", "http://ex.org/o"), Owl2RlRuleId::EqRepS);
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/y", "http://ex.org/p", "http://ex.org/o"),
+            Owl2RlRuleId::EqRepS,
+        );
     }
 
     #[test]
@@ -2960,7 +3059,11 @@ mod tests {
             ex_tb("http://ex.org/p1", OWL_SAME_AS, "http://ex.org/p2"),
             ex_tb("http://ex.org/s", "http://ex.org/p1", "http://ex.org/o"),
         ];
-        assert_certified_rule(&base, &ex_tb("http://ex.org/s", "http://ex.org/p2", "http://ex.org/o"), Owl2RlRuleId::EqRepP);
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/s", "http://ex.org/p2", "http://ex.org/o"),
+            Owl2RlRuleId::EqRepP,
+        );
     }
 
     #[test]
@@ -2969,7 +3072,11 @@ mod tests {
             ex_tb("http://ex.org/o1", OWL_SAME_AS, "http://ex.org/o2"),
             ex_tb("http://ex.org/s", "http://ex.org/p", "http://ex.org/o1"),
         ];
-        assert_certified_rule(&base, &ex_tb("http://ex.org/s", "http://ex.org/p", "http://ex.org/o2"), Owl2RlRuleId::EqRepO);
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/s", "http://ex.org/p", "http://ex.org/o2"),
+            Owl2RlRuleId::EqRepO,
+        );
     }
 
     #[test]
@@ -2979,25 +3086,49 @@ mod tests {
             ex_tb("http://ex.org/B", EX_SCO, "http://ex.org/C"),
             ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/A"),
         ];
-        assert_certified_rule(&base, &ex_tb("http://ex.org/A", EX_SCO, "http://ex.org/C"), Owl2RlRuleId::RdfsScoTrans);
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/A", EX_SCO, "http://ex.org/C"),
+            Owl2RlRuleId::RdfsScoTrans,
+        );
     }
 
     #[test]
     fn i5_cls_int1_certifies_intersection_membership() {
         let mut base = list_triples("http://ex.org/L", &["http://ex.org/A", "http://ex.org/B"]);
-        base.push(ex_tb("http://ex.org/I", OWL_INTERSECTION_OF, "http://ex.org/L_c0"));
+        base.push(ex_tb(
+            "http://ex.org/I",
+            OWL_INTERSECTION_OF,
+            "http://ex.org/L_c0",
+        ));
         base.push(ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/A"));
         base.push(ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/B"));
-        assert_certified_rule(&base, &ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/I"), Owl2RlRuleId::ClsInt1);
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/I"),
+            Owl2RlRuleId::ClsInt1,
+        );
     }
 
     #[test]
     fn i5_cls_int2_certifies_intersection_decomposition() {
         let mut base = list_triples("http://ex.org/L", &["http://ex.org/A", "http://ex.org/B"]);
-        base.push(ex_tb("http://ex.org/I", OWL_INTERSECTION_OF, "http://ex.org/L_c0"));
+        base.push(ex_tb(
+            "http://ex.org/I",
+            OWL_INTERSECTION_OF,
+            "http://ex.org/L_c0",
+        ));
         base.push(ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/I"));
-        assert_certified_rule(&base, &ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/A"), Owl2RlRuleId::ClsInt2);
-        assert_certified_rule(&base, &ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/B"), Owl2RlRuleId::ClsInt2);
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/A"),
+            Owl2RlRuleId::ClsInt2,
+        );
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/B"),
+            Owl2RlRuleId::ClsInt2,
+        );
     }
 
     #[test]
@@ -3005,23 +3136,43 @@ mod tests {
         let mut base = list_triples("http://ex.org/L", &["http://ex.org/A", "http://ex.org/B"]);
         base.push(ex_tb("http://ex.org/U", OWL_UNION_OF, "http://ex.org/L_c0"));
         base.push(ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/A"));
-        assert_certified_rule(&base, &ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/U"), Owl2RlRuleId::ClsUni);
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/U"),
+            Owl2RlRuleId::ClsUni,
+        );
     }
 
     #[test]
     fn i5_owl_universe_certifies_universal_membership() {
-        let base = vec![ex_tb("http://ex.org/x", "http://ex.org/p", "http://ex.org/y")];
-        assert_certified_rule(&base, &ex_tb("http://ex.org/x", RDF_TYPE, OWL_THING), Owl2RlRuleId::OwlUniverse);
+        let base = vec![ex_tb(
+            "http://ex.org/x",
+            "http://ex.org/p",
+            "http://ex.org/y",
+        )];
+        assert_certified_rule(
+            &base,
+            &ex_tb("http://ex.org/x", RDF_TYPE, OWL_THING),
+            Owl2RlRuleId::OwlUniverse,
+        );
     }
 
     #[test]
     fn i5_cls_int1_without_all_members_entails_nothing() {
         let mut base = list_triples("http://ex.org/L", &["http://ex.org/A", "http://ex.org/B"]);
-        base.push(ex_tb("http://ex.org/I", OWL_INTERSECTION_OF, "http://ex.org/L_c0"));
+        base.push(ex_tb(
+            "http://ex.org/I",
+            OWL_INTERSECTION_OF,
+            "http://ex.org/L_c0",
+        ));
         base.push(ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/A"));
         let out = ReasoningAdapter::new()
             .materialize_owl2_rl_with_proofs(&base, "test/ns", 50_000, ReasoningProfile::OwlRl)
             .expect("partial intersection still certifies its emitted closure");
-        assert!(!out.inferred_triples.contains(&ex_tb("http://ex.org/x", RDF_TYPE, "http://ex.org/I")));
+        assert!(!out.inferred_triples.contains(&ex_tb(
+            "http://ex.org/x",
+            RDF_TYPE,
+            "http://ex.org/I"
+        )));
     }
 }

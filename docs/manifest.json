@@ -42,8 +42,19 @@
       ]
     }
   },
-  "support_dirs": ["docs/releases", "docs/assets", "docs/archive", "docs/superpowers"],
-  "prohibited_filename_substrings": ["cognee", "oxirs", "mem0", "zep", "langmem"],
+  "support_dirs": [
+    "docs/releases",
+    "docs/assets",
+    "docs/archive",
+    "docs/superpowers"
+  ],
+  "prohibited_filename_substrings": [
+    "cognee",
+    "oxirs",
+    "mem0",
+    "zep",
+    "langmem"
+  ],
   "surface_rules": [
     {
       "id": "vision-core-thesis",
@@ -55,7 +66,11 @@
         "## Core Thesis",
         "## General-Purpose Project Memory & Ontology"
       ],
-      "required_tokens": ["SynapticGraph", "Central Executive", "WorkflowConnector"],
+      "required_tokens": [
+        "SynapticGraph",
+        "Central Executive",
+        "WorkflowConnector"
+      ],
       "require_co_change_on_touch": true
     },
     {
@@ -76,9 +91,11 @@
         "neurostrata_task_complete",
         "neurostrata_action",
         "neurostrata_taxonomy",
-        "neurostrata_twin",
+        "neurostrata_twin_get",
+        "neurostrata_vault_sync",
         "neurostrata_scenario",
-        "neurostrata_call_hierarchy"
+        "neurostrata_call_hierarchy",
+        "POST /vault-sync"
       ],
       "require_co_change_on_touch": true
     },
@@ -87,8 +104,17 @@
       "tier": "features_api",
       "watch_paths": ["src/main.rs"],
       "target_doc": "docs/features-api/cli-reference.md",
-      "required_headings": ["## Workflow, Documentation Gate & Ontology Commands"],
-      "required_tokens": ["doc-gate", "workflow", "action", "taxonomy", "scenario", "twin"],
+      "required_headings": [
+        "## Workflow, Documentation Gate & Ontology Commands"
+      ],
+      "required_tokens": [
+        "doc-gate",
+        "workflow",
+        "action",
+        "taxonomy",
+        "scenario",
+        "twin"
+      ],
       "require_co_change_on_touch": true
     },
     {
@@ -100,7 +126,12 @@
         "# Kinetic Action Types & Bitemporal Revert Log",
         "## 5-Stage Fail-Closed Gate"
       ],
-      "required_tokens": ["neurostrata_action", "ActionTypeDefinition", "SparqlAsk", "action_receipt"],
+      "required_tokens": [
+        "neurostrata_action",
+        "ActionTypeDefinition",
+        "SparqlAsk",
+        "action_receipt"
+      ],
       "require_co_change_on_touch": true
     },
     {
@@ -108,8 +139,15 @@
       "tier": "features_api",
       "watch_paths": ["src/rdf/taxonomy.rs"],
       "target_doc": "docs/features-api/subsystems/taxonomy-advisor.md",
-      "required_headings": ["# Subject-Matter Domain Expertise & SKOS Taxonomy Advisor"],
-      "required_tokens": ["neurostrata_taxonomy", "set_thesis", "upsert_concept", "advise"],
+      "required_headings": [
+        "# Subject-Matter Domain Expertise & SKOS Taxonomy Advisor"
+      ],
+      "required_tokens": [
+        "neurostrata_taxonomy",
+        "set_thesis",
+        "upsert_concept",
+        "advise"
+      ],
       "require_co_change_on_touch": true
     },
     {
@@ -143,7 +181,11 @@
         "# Agent Harness Plugin Interface",
         "## Implementing a New Harness Adapter"
       ],
-      "required_tokens": ["createHarnessPlugin", "handleHookEvent", "resolveProjectRoot"],
+      "required_tokens": [
+        "createHarnessPlugin",
+        "handleHookEvent",
+        "resolveProjectRoot"
+      ],
       "require_co_change_on_touch": true
     },
     {
@@ -152,13 +194,23 @@
       "watch_paths": ["src/traits.rs"],
       "target_doc": "docs/extend/providers-and-ontologies.md",
       "required_headings": ["# Custom Providers, Ontologies & Action Packs"],
-      "required_tokens": ["VectorStore", "Embedder", "JudgmentProvider", "ActionTypeDefinition"],
+      "required_tokens": [
+        "VectorStore",
+        "Embedder",
+        "JudgmentProvider",
+        "ActionTypeDefinition"
+      ],
       "require_co_change_on_touch": true
     },
     {
       "id": "central-agentic-kernel-surface",
       "tier": "features_api",
-      "watch_paths": ["src/kernel/mod.rs", "src/kernel/ports.rs", "src/connectors/mod.rs", "src/formal_kernel.rs"],
+      "watch_paths": [
+        "src/kernel/mod.rs",
+        "src/kernel/ports.rs",
+        "src/connectors/mod.rs",
+        "src/formal_kernel.rs"
+      ],
       "target_doc": "docs/features-api/agent-kernel-and-data-connectors.md",
       "required_headings": [
         "# Central Agentic Kernel & DataConnector",

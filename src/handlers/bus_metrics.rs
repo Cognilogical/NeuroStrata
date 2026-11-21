@@ -25,7 +25,10 @@ pub async fn handle_bus_metrics(bus: Arc<ThalamicBus>) -> String {
             "domain_filter".to_string(),
             crate::recall_metrics::domain_filter_snapshot(),
         );
-        obj.insert("recall".to_string(), crate::recall_metrics::recall_snapshot());
+        obj.insert(
+            "recall".to_string(),
+            crate::recall_metrics::recall_snapshot(),
+        );
     } else {
         tracing::warn!("bus.metrics() did not serialize to a JSON object");
     }
@@ -105,25 +108,33 @@ mod tests {
             "recursion_blocks",
         ] {
             assert!(
-                body.contains(&format!("\"{}\" ", field)) || body.contains(&format!("\"{}\"", field)),
+                body.contains(&format!("\"{}\" ", field))
+                    || body.contains(&format!("\"{}\"", field)),
                 "{field} must be in the body an operator reads: {body}"
             );
         }
 
-        let df = snapshot.get("domain_filter").expect("domain_filter section present");
+        let df = snapshot
+            .get("domain_filter")
+            .expect("domain_filter section present");
         for key in [
             "domain_queries_total",
             "domain_narrowed_hits",
             "domain_fallback_vector",
             "single_domain_bypasses",
         ] {
-            assert!(df.get(key).unwrap().is_number(), "{key} must be a number: {body}");
+            assert!(
+                df.get(key).unwrap().is_number(),
+                "{key} must be a number: {body}"
+            );
         }
 
         let rc = snapshot.get("recall").expect("recall section present");
         for key in ["recall_responses", "recall_promotions"] {
-            assert!(rc.get(key).unwrap().is_number(), "{key} must be a number: {body}");
+            assert!(
+                rc.get(key).unwrap().is_number(),
+                "{key} must be a number: {body}"
+            );
         }
     }
-
 }

@@ -33,7 +33,9 @@ pub struct TargetClassificationSummary {
     pub orphaned_targets: Vec<String>,
 }
 
-pub fn classify_namespace_targets(memories: &[crate::traits::SearchResult]) -> TargetClassificationSummary {
+pub fn classify_namespace_targets(
+    memories: &[crate::traits::SearchResult],
+) -> TargetClassificationSummary {
     let known = KnownIds::new(memories.iter().map(|m| m.id.as_str()));
     let mut summary = TargetClassificationSummary::default();
 
@@ -144,7 +146,10 @@ mod tests {
     #[test]
     fn classify_target_orphaned_when_unresolvable() {
         let known = KnownIds::new(["NeuroStrata::src/lib.rs"]);
-        assert_eq!(classify_target(&known, "docs/absent.md"), TargetClass::Orphaned);
+        assert_eq!(
+            classify_target(&known, "docs/absent.md"),
+            TargetClass::Orphaned
+        );
     }
 
     #[test]

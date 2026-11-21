@@ -544,7 +544,13 @@ impl WalScan {
             && self.header_verified
             && self.verified_frames == self.frames_parsed
             && !matches!(self.tail, WalTail::Corrupt)
-            && matches!(self.header, HeaderRead::Readable { checksums: true, .. })
+            && matches!(
+                self.header,
+                HeaderRead::Readable {
+                    checksums: true,
+                    ..
+                }
+            )
     }
 
     /// Whether these bytes prove that the WAL held **work the engine could
@@ -1031,7 +1037,9 @@ fn classify_side_with(
                 reason: UnknownReason::CommitEvidenceUnreadable,
             },
             crate::formal_kernel::KernelWalVerdict::NothingCommitted => {
-                SideVerdict::NothingCommitted { uncommitted_bytes: pre }
+                SideVerdict::NothingCommitted {
+                    uncommitted_bytes: pre,
+                }
             }
         };
     }
@@ -2175,18 +2183,19 @@ mod tests {
             ),
         ];
         for (name, post, scan, applied, expected) in rows {
-            let pair = WalPairObservation::new(SideObservation::empty(), side(942, post, Some(scan)))
-                .consumed(consumed_sides(
-                    &WalPairBytes {
-                        active: 0,
-                        frozen: 942,
-                    },
-                    &WalPairBytes {
-                        active: 0,
-                        frozen: post,
-                    },
-                    true,
-                ));
+            let pair =
+                WalPairObservation::new(SideObservation::empty(), side(942, post, Some(scan)))
+                    .consumed(consumed_sides(
+                        &WalPairBytes {
+                            active: 0,
+                            frozen: 942,
+                        },
+                        &WalPairBytes {
+                            active: 0,
+                            frozen: post,
+                        },
+                        true,
+                    ));
             let verdict = classify_pair_with_applied(pair, applied);
             assert_eq!(verdict.slug(), expected, "{name}");
         }

@@ -98,7 +98,11 @@ fn run_setup_linux(bin: &Path, script: &Path) -> Result<SetupReport> {
         println!("  NOTE: daemon did not become healthy; check journal above.");
     }
 
-    Ok(SetupReport { daemon_installed: true, backup_installed: verified, verified })
+    Ok(SetupReport {
+        daemon_installed: true,
+        backup_installed: verified,
+        verified,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -119,7 +123,11 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
         .status()
         .with_context(|| format!("systemctl --user {}", args.join(" ")))?;
     if !status.success() {
-        anyhow::bail!("systemctl --user {} exited with {:?}", args.join(" "), status.code());
+        anyhow::bail!(
+            "systemctl --user {} exited with {:?}",
+            args.join(" "),
+            status.code()
+        );
     }
     Ok(())
 }
@@ -201,7 +209,8 @@ fn run_setup_macos(bin: &Path, script: &Path) -> Result<SetupReport> {
     use std::fs;
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
     let launchd_dir = PathBuf::from(home).join("Library").join("LaunchAgents");
-    fs::create_dir_all(&launchd_dir).with_context(|| format!("create {}", launchd_dir.display()))?;
+    fs::create_dir_all(&launchd_dir)
+        .with_context(|| format!("create {}", launchd_dir.display()))?;
 
     let daemon_plist = launchd_dir.join("dev.neurostrata.daemon.plist");
     let backup_plist = launchd_dir.join("dev.neurostrata.backup.plist");
@@ -219,7 +228,8 @@ fn run_setup_macos(bin: &Path, script: &Path) -> Result<SetupReport> {
     // loaded agent is a no-op and leaves a stale definition active).
     if let Err(e) = std::process::Command::new("launchctl")
         .args(["unload", "-w", &daemon_plist.to_string_lossy()])
-        .status() {
+        .status()
+    {
         tracing::debug!("launchctl unload failed: {e}");
     }
 
@@ -354,7 +364,8 @@ fn run_setup_windows(bin: &Path, script: &Path, repo: &Path) -> Result<SetupRepo
     let service_name = "NeuroStrata";
     let install = std::process::Command::new(&nssm_exe)
         .args([
-            "install", service_name,
+            "install",
+            service_name,
             &format!("{}", bin.display()),
             "daemon",
         ])
@@ -367,17 +378,21 @@ fn run_setup_windows(bin: &Path, script: &Path, repo: &Path) -> Result<SetupRepo
     // Configure service properties
     let app_dir_status = std::process::Command::new(&nssm_exe)
         .args([
-            "set", service_name, "AppDirectory", &repo.display().to_string(),
+            "set",
+            service_name,
+            "AppDirectory",
+            &repo.display().to_string(),
         ])
         .status()
         .context("nssm set AppDirectory")?;
     if !app_dir_status.success() {
-        anyhow::bail!("nssm set AppDirectory exited with {:?}", app_dir_status.code());
+        anyhow::bail!(
+            "nssm set AppDirectory exited with {:?}",
+            app_dir_status.code()
+        );
     }
     let start_flag_status = std::process::Command::new(&nssm_exe)
-        .args([
-            "set", service_name, "Start", "SERVICE_AUTO_START",
-        ])
+        .args(["set", service_name, "Start", "SERVICE_AUTO_START"])
         .status()
         .context("nssm set Start")?;
     if !start_flag_status.success() {
@@ -385,8 +400,12 @@ fn run_setup_windows(bin: &Path, script: &Path, repo: &Path) -> Result<SetupRepo
     }
     let restart_status = std::process::Command::new(&nssm_exe)
         .args([
-            "set", service_name, "Restart", "on-failure",
-            "RestartSec", "5",
+            "set",
+            service_name,
+            "Restart",
+            "on-failure",
+            "RestartSec",
+            "5",
         ])
         .status()
         .context("nssm set Restart")?;
@@ -412,7 +431,10 @@ fn run_setup_windows(bin: &Path, script: &Path, repo: &Path) -> Result<SetupRepo
         .status()
         .context("nssm start NeuroStrata")?;
     if !start_status.success() {
-        anyhow::bail!("nssm start NeuroStrata exited with {:?}", start_status.code());
+        anyhow::bail!(
+            "nssm start NeuroStrata exited with {:?}",
+            start_status.code()
+        );
     }
 
     println!("NSSM service '{}' installed and started.", service_name);
@@ -423,10 +445,14 @@ fn run_setup_windows(bin: &Path, script: &Path, repo: &Path) -> Result<SetupRepo
     let schtasks = std::process::Command::new("schtasks")
         .args([
             "/create",
-            "/tn", "NeuroStrataBackup",
-            "/tr", &format!("\"{}\"", script_path),
-            "/sc", "daily",
-            "/st", "12:00",
+            "/tn",
+            "NeuroStrataBackup",
+            "/tr",
+            &format!("\"{}\"", script_path),
+            "/sc",
+            "daily",
+            "/st",
+            "12:00",
         ])
         .status()
         .with_context(|| format!("schtasks /create NeuroStrataBackup"))?;

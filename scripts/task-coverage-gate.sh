@@ -3,6 +3,13 @@
 # Pre-push guard: scan changed .md files for work-item language without task IDs.
 # Exits 1 if any untracked work items found; 0 otherwise.
 # Skips (exit 0) if git is not available — gate never blocks a non-git project.
+# Must run on stock macOS Bash 3.2: no associative arrays (see #320).
+
+if [ "${BASH_VERSINFO[0]}" -lt 3 ] ||
+   { [ "${BASH_VERSINFO[0]}" -eq 3 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+    echo "task-coverage-gate: ERROR: Bash 3.2+ required" >&2
+    exit 1
+fi
 
 command -v git >/dev/null 2>&1 || { echo "task-coverage-gate: no git — skipping"; exit 0; }
 
@@ -20,9 +27,14 @@ fi
 
 # Include renames so modified renames expose additions; R100 diffs have no added lines.
 CHANGED=$(git diff -M --name-only --diff-filter=AMR "$RANGE" | grep -E '\.md$' || true)
-declare -A RENAME_SOURCES=()
+# Parallel indexed arrays instead of `declare -A`: stock macOS Bash 3.2 has no
+# associative arrays, and a rejected declaration used to skip the Markdown scan
+# while still exiting 0 (#320).
+RENAME_NEW=()
+RENAME_OLD=()
 while IFS=$'\t' read -r _status old new; do
-    RENAME_SOURCES["$new"]="$old"
+    RENAME_NEW[${#RENAME_NEW[@]}]="$new"
+    RENAME_OLD[${#RENAME_OLD[@]}]="$old"
 done < <(git diff -M --name-status --diff-filter=R "$RANGE")
 
 COUNT=0
@@ -35,10 +47,13 @@ while IFS= read -r file; do
     # is intentionally un-cited and should never trigger the gate.
     [[ "$file" =~ ^docs/archive/ ]] && { continue; }
     diff_paths=("$file")
-    if [[ -n "${RENAME_SOURCES[$file]+present}" ]]; then
-        # Destination-only pathspecs hide the old side and turn R100 into an add.
-        diff_paths=("${RENAME_SOURCES[$file]}" "$file")
-    fi
+    for i in "${!RENAME_NEW[@]}"; do
+        if [ "${RENAME_NEW[$i]}" = "$file" ]; then
+            # Destination-only pathspecs hide the old side and turn R100 into an add.
+            diff_paths=("${RENAME_OLD[$i]}" "$file")
+            break
+        fi
+    done
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         if ! grep -qE '(ns|neurostrata)-[0-9a-zA-Z]{4,}' <<< "$line"; then

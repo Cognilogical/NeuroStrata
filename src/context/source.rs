@@ -89,7 +89,8 @@ pub fn resolve(path: impl AsRef<str>, project_root: impl AsRef<str>) -> SourceId
         })
         .unwrap_or_else(|| root_canonical.clone());
     let worktree_id = root_canonical;
-    let revision = git_output(root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
+    let revision =
+        git_output(root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     let dirty = git_output(root, &["status", "--porcelain"])
         .map(|s| !s.is_empty())
         .unwrap_or(false);

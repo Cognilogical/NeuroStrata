@@ -46,7 +46,7 @@ Several tools now append advisory metadata without changing existing result fiel
 
 Active-task resolution is session/worktree scoped: when the daemon returns several `in_progress` tasks, resolution prefers an explicit `preferredTaskId`, then a task whose `session_id` and `worktree` both match the caller's session and project root, then a session-only match, then a worktree-only match, and only then any in-progress task. A fallback task owned by a different session does not overwrite an already known `activeSessionId`.
 
-`neurostrata_guard_validate` unwraps a JSON shell payload via its `command`/`cmd` field when deciding whether a shell command is a read-only/verification exemption. The proxy caller's `cwd` (or `workdir`) is propagated into the guard request, with `worktree` defaulting to that `cwd`, so scope checks use the caller's real working tree rather than the daemon process directory.
+`neurostrata_guard_validate` unwraps a JSON shell payload via its `command`/`cmd` field when deciding whether a shell command is a read-only/verification exemption. The proxy caller's `cwd` (or `workdir`) is propagated into the guard request, with `worktree` defaulting to that `cwd`, so scope checks use the caller's real working tree rather than the daemon process directory. The `is_mutating` flag on the wire is client-supplied and untrusted; the daemon recomputes shell mutability from the raw payload and never trusts it.
 
 ## Code Intelligence & SCIP Call-Graph Tools
 
@@ -57,8 +57,8 @@ Active-task resolution is session/worktree scoped: when the daemon returns sever
 
 ## Enterprise Ontology, Digital Twins, Scenarios & Kinetic Actions
 
-- `neurostrata_twin` — manage digital twin state.
 - `neurostrata_scenario` — define counterfactual scenarios. Operations: `create`, `stage_memory`, `stage_twin`, `apply_action`, `evaluate_sparql`, `diff`, `plan_ontology_diff`, `commit`, `drop`, `list`.
+- `neurostrata_twin_get` / `neurostrata_twin_set` / `neurostrata_twin_diff` / `neurostrata_twin_list` — manage polymorphic digital twin state.
   - `plan_ontology_diff` is a zero-mutation dry run (`POST /scenario` shares this same handler). It clones the active namespace RDF — or the named `scenario_id` overlay — into an ephemeral in-memory dataset, applies `add_turtle` (Turtle/N-Quads) and `retract_triples` (canonical N-Triple/N-Quad patterns), validates the post-image against `candidate_shacl_turtle` (or the governing shapes) via `ontobug::validate::shacl_turtle`, and returns a `plan` report: certified Capability A `added_entailments` (`DerivationStep`s) and `removed_entailments`, `validation_conforms`, `new_shacl_violations`, `consistency_violations`, ReBAC-filtered `impacted_memories`/`impacted_files`/`impacted_action_slugs` (from changed governance facts and SPARQL ASK outcomes), and `schema_ddl_diff` from `ontobug::diff_ontologies` + `generate_cypher_ddl`. Nothing is committed to a store, scenario, task, edge or the ontology cache.
 - `neurostrata_action` — apply kinetic actions (state-machine mutations) via `POST /action`.
 
@@ -72,24 +72,26 @@ Active-task resolution is session/worktree scoped: when the daemon returns sever
 
 ## Subject-Matter Domain Expertise & SKOS Taxonomy
 
-- `neurostrata_taxonomy` — set up SKOS taxonomy (`set_thesis`, `upsert_concept`, `advise`, `validate_taxonomy_dag`).
+- `neurostrata_taxonomy` — set up SKOS taxonomy (`set_thesis`, `upsert_concept`, `tree`, `briefing`, `compare`, `gaps`, `advise`).
 
 ## HTTP Daemon Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/mcp` | Root MCP server entry point |
-| POST | `/ingest` | Ingest files/directories into the property graph |
-| POST | `/backup` | Backup current state to archive |
-| POST | `/export-graph` | Export the full knowledge graph (RDF/SPARQL) |
-| POST | `/tasks/gate` | Run documentation gate checks |
-| GET | `/twin` | Digital twin state retrieval |
-| POST | `/scenario` | Create a counterfactual scenario |
-| POST | `/action` | Apply a kinetic action (state machine mutation) |
-| POST | `/data-connector` | Execute a DataConnector command (list/describe/register-pointer/resolve/apply-effect/mediate) |
-| POST | `/vault-sync` | Bidirectional Vault-LD Markdown sync (export/import); `vault_path`/`output_dir` validated against the daemon startup root + `allowed_external_dirs` before any filesystem access |
-| GET | `/taxonomy` | Query SKOS concept graph |
-| POST | `/graphql` | Execute GraphQL queries over the ontology |
+| Method | Path              | Description                                                                                                                                                                      |
+| ------ | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/mcp`            | Root MCP server entry point                                                                                                                                                      |
+| POST   | `/ingest`         | Ingest files/directories into the property graph                                                                                                                                 |
+| POST   | `/backup`         | Backup current state to archive                                                                                                                                                  |
+| POST   | `/export-graph`   | Export the full knowledge graph (RDF/SPARQL)                                                                                                                                     |
+| POST   | `/tasks/gate`     | Run documentation gate checks                                                                                                                                                    |
+| POST   | `/scenario`       | Create a counterfactual scenario                                                                                                                                                 |
+| POST   | `/action`         | Apply a kinetic action (state machine mutation)                                                                                                                                  |
+| POST   | `/data-connector` | Execute a DataConnector command (list/describe/register-pointer/resolve/apply-effect/mediate)                                                                                    |
+| POST   | `/vault-sync`     | Bidirectional Vault-LD Markdown sync (export/import); `vault_path`/`output_dir` validated against the daemon startup root + `allowed_external_dirs` before any filesystem access |
+| GET    | `/taxonomy`       | Query SKOS concept graph                                                                                                                                                         |
+| POST   | `/taxonomy`       | Query SKOS concept graph                                                                                                                                                         |
+| POST   | `/graphql`        | Execute GraphQL queries over the ontology                                                                                                                                        |
+
+`POST /vault-sync` is the Vault-LD Markdown sync route; `vault_path` and `output_dir` are resolved against the daemon startup root or an explicit allowed external directory before any filesystem access.
 
 All endpoints are served by the **neurostrata-mcp daemon** on `127.0.0.1:34343`. Tauri acts as a lightweight HTTP client; Cursor MCP integration proxies stdio JSON-RPC requests.
 
@@ -97,4 +99,4 @@ All endpoints are served by the **neurostrata-mcp daemon** on `127.0.0.1:34343`.
 
 ## Storage Status Surfaces
 
-`storage status` has two provenance layers since #212. The path-only (no-open) surface — used by the CLI's dispatch and by callers that must not open the store — reports filesystem and store-state sidecar facts: `wal_bytes`, `wal_age_secs` (age of the active WAL, regular files only), `checkpoint_failures`, and the persisted `last_recovery { at, kind, wal_bytes }` history. The live-handle surface additionally owns `opened_via_recovery` and its kind *exclusively*: a verified live store never reports recovery because the sidecar holds a `last_recovery` entry. Identity writes (`has_data`, descriptor) and health writes (checkpoint health) are split (`write_store_state_identity` vs. the health writers), and a fresh process still reports the last real checkpoint because `record_checkpoint_outcome` persists to the sidecar (best effort, never propagated).
+`storage status` has two provenance layers since #212. The path-only (no-open) surface — used by the CLI's dispatch and by callers that must not open the store — reports filesystem and store-state sidecar facts: `wal_bytes`, `wal_age_secs` (age of the active WAL, regular files only), `checkpoint_failures`, and the persisted `last_recovery { at, kind, wal_bytes }` history. The live-handle surface additionally owns `opened_via_recovery` and its kind _exclusively_: a verified live store never reports recovery because the sidecar holds a `last_recovery` entry. Identity writes (`has_data`, descriptor) and health writes (checkpoint health) are split (`write_store_state_identity` vs. the health writers), and a fresh process still reports the last real checkpoint because `record_checkpoint_outcome` persists to the sidecar (best effort, never propagated).

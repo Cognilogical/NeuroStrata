@@ -1,10 +1,10 @@
 //! Learning status types and handlers for the daemon `learn status` surface.
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::config::DedupProviderMode;
 use crate::judgment::laya_onnx::RuntimeState;
-use crate::learning::trainer::{TrainingJobState, EvaluationReport};
+use crate::learning::trainer::{EvaluationReport, TrainingJobState};
 
 /// Status snapshot returned by the daemon learning status handler.
 ///

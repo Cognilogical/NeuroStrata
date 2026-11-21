@@ -263,7 +263,8 @@ mod tests {
             reliability_score: 0.625,
         };
         let value = serde_json::to_value(&stats).expect("OutcomeStats must serialize");
-        let back: OutcomeStats = serde_json::from_value(value).expect("OutcomeStats must deserialize");
+        let back: OutcomeStats =
+            serde_json::from_value(value).expect("OutcomeStats must deserialize");
         assert_eq!(stats, back);
     }
 
@@ -306,14 +307,9 @@ mod tests {
         let mut meta = json!({
             "outcome_stats": { "successes": 3, "reverts": 0, "failures": 0, "reliability_score": 0.8333333333333333 },
         });
-        let update = apply_negative_outcome(
-            &mut meta,
-            NegativeKind::Revert,
-            "rec-rev1",
-            "rule-42",
-            now,
-        )
-        .unwrap();
+        let update =
+            apply_negative_outcome(&mut meta, NegativeKind::Revert, "rec-rev1", "rule-42", now)
+                .unwrap();
         assert_eq!(update.stats.successes, 3);
         assert_eq!(update.stats.reverts, 1);
         assert_eq!(update.stats.failures, 0);
@@ -321,19 +317,18 @@ mod tests {
         assert!((update.stats.reliability_score - 0.625).abs() < 1e-12);
         assert!(update.contradiction_check.is_some());
         assert_eq!(
-            update.contradiction_check.as_ref().unwrap().target_memory_id,
+            update
+                .contradiction_check
+                .as_ref()
+                .unwrap()
+                .target_memory_id,
             "rule-42"
         );
         assert_eq!(update.stale_after.unwrap(), now + chrono::Duration::days(7));
 
-        let update2 = apply_negative_outcome(
-            &mut meta,
-            NegativeKind::Revert,
-            "rec-rev1",
-            "rule-42",
-            now,
-        )
-        .unwrap();
+        let update2 =
+            apply_negative_outcome(&mut meta, NegativeKind::Revert, "rec-rev1", "rule-42", now)
+                .unwrap();
         assert_eq!(update2.stats.successes, 3);
         assert_eq!(update2.stats.reverts, 1);
         assert!(update2.contradiction_check.is_none());
@@ -530,7 +525,8 @@ mod tests {
     fn stale_after_written_to_metadata() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().unwrap();
         let mut meta = json!({});
-        apply_negative_outcome(&mut meta, NegativeKind::Revert, "rec-stale", "proc-1", now).unwrap();
+        apply_negative_outcome(&mut meta, NegativeKind::Revert, "rec-stale", "proc-1", now)
+            .unwrap();
         let stale = meta.get("stale_after").and_then(|v| v.as_str());
         assert!(stale.is_some());
         let parsed: DateTime<Utc> = stale.unwrap().parse().unwrap();

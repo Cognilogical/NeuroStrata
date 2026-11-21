@@ -50,7 +50,8 @@ impl SandboxEvaluator {
     /// How many times this evaluator ran engine detection (0 until the first
     /// `evaluate`, then 1).
     pub fn engine_probe_count(&self) -> usize {
-        self.engine_probes.load(std::sync::atomic::Ordering::Relaxed)
+        self.engine_probes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn detected_engine(&self) -> (String, bool) {

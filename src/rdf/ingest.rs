@@ -64,7 +64,10 @@ pub enum IngestError {
     /// The candidate list was empty; an empty batch is never ingested.
     EmptyBatch,
     /// Pre-allocation cap on the number of candidates in one batch.
-    TooManyCandidates { count: usize, max: usize },
+    TooManyCandidates {
+        count: usize,
+        max: usize,
+    },
     /// Pre-allocation cap on a single IRI field's byte length.
     IriTooLong {
         field: &'static str,
@@ -72,19 +75,31 @@ pub enum IngestError {
         max: usize,
     },
     /// Pre-allocation cap on a literal value's byte length.
-    LiteralTooLong { length: usize, max: usize },
+    LiteralTooLong {
+        length: usize,
+        max: usize,
+    },
     UnknownDomain(String),
-    BudgetExhausted { visited: usize, max_nodes: usize },
+    BudgetExhausted {
+        visited: usize,
+        max_nodes: usize,
+    },
     /// The domain governs no classes or no predicates; fail closed.
     EmptyVocabulary(String),
     /// A candidate class term is not governed by the domain vocabulary.
     InventedClass(String),
     /// A candidate predicate term is not governed by the domain vocabulary.
     InventedPredicate(String),
-    MalformedIri { field: &'static str, value: String },
+    MalformedIri {
+        field: &'static str,
+        value: String,
+    },
     /// A datatype IRI outside the governed XSD allowlist.
     UnknownDatatype(String),
-    InvalidLiteral { field: &'static str, why: String },
+    InvalidLiteral {
+        field: &'static str,
+        why: String,
+    },
     /// SHACL validation of the emitted RDF graph reported violations.
     ShaclRejected(Vec<ShaclViolation>),
     /// SHACL graph validation itself failed (fail closed).
@@ -103,11 +118,9 @@ impl fmt::Display for IngestError {
             IngestError::TooManyCandidates { count, max } => {
                 write!(f, "candidate batch has {count} entries (cap {max})")
             }
-            IngestError::IriTooLong {
-                field,
-                length,
-                max,
-            } => write!(f, "{field} IRI is {length} bytes (cap {max})"),
+            IngestError::IriTooLong { field, length, max } => {
+                write!(f, "{field} IRI is {length} bytes (cap {max})")
+            }
             IngestError::LiteralTooLong { length, max } => {
                 write!(f, "literal value is {length} bytes (cap {max})")
             }
@@ -117,13 +130,22 @@ impl fmt::Display for IngestError {
                 "query budget exhausted after {visited} visited nodes (max {max_nodes})"
             ),
             IngestError::EmptyVocabulary(d) => {
-                write!(f, "domain {d:?} governs an empty vocabulary; failing closed")
+                write!(
+                    f,
+                    "domain {d:?} governs an empty vocabulary; failing closed"
+                )
             }
             IngestError::InventedClass(t) => {
-                write!(f, "class term is not governed by the domain vocabulary: {t}")
+                write!(
+                    f,
+                    "class term is not governed by the domain vocabulary: {t}"
+                )
             }
             IngestError::InventedPredicate(t) => {
-                write!(f, "predicate term is not governed by the domain vocabulary: {t}")
+                write!(
+                    f,
+                    "predicate term is not governed by the domain vocabulary: {t}"
+                )
             }
             IngestError::MalformedIri { field, value } => {
                 write!(f, "malformed absolute IRI in {field}: {value}")
@@ -135,13 +157,21 @@ impl fmt::Display for IngestError {
                 write!(f, "invalid literal ({field}): {why}")
             }
             IngestError::ShaclRejected(v) => {
-                write!(f, "SHACL validation rejected the emitted graph: {} violation(s)", v.len())
+                write!(
+                    f,
+                    "SHACL validation rejected the emitted graph: {} violation(s)",
+                    v.len()
+                )
             }
             IngestError::GraphValidationFailed(why) => {
                 write!(f, "SHACL graph validation failed: {why}")
             }
             IngestError::PayloadRejected(v) => {
-                write!(f, "SHACL validation rejected the memory payload: {} violation(s)", v.len())
+                write!(
+                    f,
+                    "SHACL validation rejected the memory payload: {} violation(s)",
+                    v.len()
+                )
             }
             IngestError::RdfSerialization(why) => write!(f, "RDF serialization failed: {why}"),
             IngestError::Embedding(why) => write!(f, "embedding failed: {why}"),
@@ -299,7 +329,11 @@ fn days_in_month(year: i64, month: u32) -> u32 {
         4 | 6 | 9 | 11 => 30,
         2 => {
             let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-            if leap { 29 } else { 28 }
+            if leap {
+                29
+            } else {
+                28
+            }
         }
         _ => 0,
     }
@@ -379,7 +413,8 @@ fn valid_datetime(s: &str) -> bool {
         stripped
     } else if rest.len() >= 6 && rest.is_char_boundary(rest.len() - 6) {
         let cand = &rest[rest.len() - 6..];
-        if cand.is_ascii() && (cand.starts_with('+') || cand.starts_with('-'))
+        if cand.is_ascii()
+            && (cand.starts_with('+') || cand.starts_with('-'))
             && cand[1..3].bytes().all(|b| b.is_ascii_digit())
             && cand.as_bytes()[3] == b':'
             && cand[4..6].bytes().all(|b| b.is_ascii_digit())
@@ -490,18 +525,19 @@ fn build_literal(lit: &CandidateLiteral) -> Result<Term, IngestError> {
             return Err(IngestError::UnknownDatatype(datatype.clone()));
         }
         validate_literal_lexical(datatype, &lit.value)?;
-        let datatype_node = NamedNode::new(datatype.clone()).map_err(|_| {
-            IngestError::MalformedIri {
+        let datatype_node =
+            NamedNode::new(datatype.clone()).map_err(|_| IngestError::MalformedIri {
                 field: "datatype",
                 value: datatype.clone(),
-            }
-        })?;
+            })?;
         return Ok(Term::Literal(Literal::new_typed_literal(
             lit.value.clone(),
             datatype_node,
         )));
     }
-    Ok(Term::Literal(Literal::new_simple_literal(lit.value.clone())))
+    Ok(Term::Literal(Literal::new_simple_literal(
+        lit.value.clone(),
+    )))
 }
 
 /// Canonical serialization of the whole batch as Turtle. Deterministic:
@@ -540,8 +576,8 @@ fn serialize_turtle(triples: &[Triple]) -> Result<(String, usize), IngestError> 
     let bytes = writer
         .finish()
         .map_err(|e| IngestError::RdfSerialization(e.to_string()))?;
-    let turtle = String::from_utf8(bytes)
-        .map_err(|e| IngestError::RdfSerialization(e.to_string()))?;
+    let turtle =
+        String::from_utf8(bytes).map_err(|e| IngestError::RdfSerialization(e.to_string()))?;
     Ok((turtle, sorted.len()))
 }
 
@@ -669,24 +705,21 @@ pub fn bounded_classify(
                 value: candidate.predicate.clone(),
             });
         }
-        let subject = NamedNode::new(candidate.subject.clone()).map_err(|_| {
-            IngestError::MalformedIri {
+        let subject =
+            NamedNode::new(candidate.subject.clone()).map_err(|_| IngestError::MalformedIri {
                 field: "subject",
                 value: candidate.subject.clone(),
-            }
-        })?;
-        let class = NamedNode::new(candidate.class.clone()).map_err(|_| {
-            IngestError::MalformedIri {
+            })?;
+        let class =
+            NamedNode::new(candidate.class.clone()).map_err(|_| IngestError::MalformedIri {
                 field: "class",
                 value: candidate.class.clone(),
-            }
-        })?;
-        let predicate = NamedNode::new(candidate.predicate.clone()).map_err(|_| {
-            IngestError::MalformedIri {
+            })?;
+        let predicate =
+            NamedNode::new(candidate.predicate.clone()).map_err(|_| IngestError::MalformedIri {
                 field: "predicate",
                 value: candidate.predicate.clone(),
-            }
-        })?;
+            })?;
         if !vocab.governs_class(&candidate.class) {
             return Err(IngestError::InventedClass(candidate.class.clone()));
         }
@@ -806,7 +839,10 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
         &legacy_ns_id,
         &legacy_content_id,
     ] {
-        if owned_existing.iter().any(|existing| existing == candidate_id) {
+        if owned_existing
+            .iter()
+            .any(|existing| existing == candidate_id)
+        {
             continue;
         }
         if let Some((_, payload)) = store
@@ -868,9 +904,9 @@ async fn retarget_sibling_references<S: VectorStore + ?Sized>(
     ];
 
     let is_sibling = |candidate: &str| -> bool {
-        siblings_to_remove.iter().any(|sib| {
-            candidate == sib || candidate == format!("{namespace}::{sib}")
-        })
+        siblings_to_remove
+            .iter()
+            .any(|sib| candidate == sib || candidate == format!("{namespace}::{sib}"))
     };
 
     let mut candidate_ids: Vec<String> = Vec::new();
@@ -1096,7 +1132,8 @@ mod tests {
         let mut idx = make_index();
         idx.shacl_shapes.clear();
         idx.shapes_ttl = None;
-        idx.load_shacl_shapes(STRICT_SHAPES_TTL).expect("shapes load");
+        idx.load_shacl_shapes(STRICT_SHAPES_TTL)
+            .expect("shapes load");
         idx
     }
 
@@ -1154,7 +1191,9 @@ mod tests {
             .expect("emitted turtle parses");
         assert_eq!(parsed.len(), 2);
         let rdf_type = oxrdf::vocab::rdf::TYPE;
-        assert!(parsed.iter().any(|t| t.predicate.as_str() == rdf_type.as_str()));
+        assert!(parsed
+            .iter()
+            .any(|t| t.predicate.as_str() == rdf_type.as_str()));
         assert!(parsed
             .iter()
             .any(|t| t.predicate.as_str() == format!("{NS}hasType")));
@@ -1169,7 +1208,10 @@ mod tests {
             Some("bounded-classifier")
         );
         assert_eq!(
-            payload.metadata.get("epistemic_tier").and_then(Value::as_str),
+            payload
+                .metadata
+                .get("epistemic_tier")
+                .and_then(Value::as_str),
             Some("unverified_agent")
         );
         assert!(payload.metadata.get("verified_by").is_none());
@@ -1295,34 +1337,52 @@ mod tests {
     fn malformed_iris_fail_closed() {
         let index = make_index();
         let cases: Vec<(&str, ClassificationCandidate)> = vec![
-            ("subject", ClassificationCandidate {
-                subject: "urn:x#a b".to_string(),
-                ..valid_candidate()
-            }),
-            ("subject", ClassificationCandidate {
-                subject: "relative/thing".to_string(),
-                ..valid_candidate()
-            }),
-            ("class", ClassificationCandidate {
-                class: "relative/class".to_string(),
-                ..valid_candidate()
-            }),
-            ("predicate", ClassificationCandidate {
-                predicate: "relative/pred".to_string(),
-                ..valid_candidate()
-            }),
-            ("object", ClassificationCandidate {
-                object: CandidateObject::Iri("relative/obj".to_string()),
-                ..valid_candidate()
-            }),
-            ("datatype", ClassificationCandidate {
-                object: CandidateObject::Literal(CandidateLiteral {
-                    value: "1".to_string(),
-                    datatype: Some("relative/dt".to_string()),
-                    language: None,
-                }),
-                ..valid_candidate()
-            }),
+            (
+                "subject",
+                ClassificationCandidate {
+                    subject: "urn:x#a b".to_string(),
+                    ..valid_candidate()
+                },
+            ),
+            (
+                "subject",
+                ClassificationCandidate {
+                    subject: "relative/thing".to_string(),
+                    ..valid_candidate()
+                },
+            ),
+            (
+                "class",
+                ClassificationCandidate {
+                    class: "relative/class".to_string(),
+                    ..valid_candidate()
+                },
+            ),
+            (
+                "predicate",
+                ClassificationCandidate {
+                    predicate: "relative/pred".to_string(),
+                    ..valid_candidate()
+                },
+            ),
+            (
+                "object",
+                ClassificationCandidate {
+                    object: CandidateObject::Iri("relative/obj".to_string()),
+                    ..valid_candidate()
+                },
+            ),
+            (
+                "datatype",
+                ClassificationCandidate {
+                    object: CandidateObject::Literal(CandidateLiteral {
+                        value: "1".to_string(),
+                        datatype: Some("relative/dt".to_string()),
+                        language: None,
+                    }),
+                    ..valid_candidate()
+                },
+            ),
         ];
         for (field, candidate) in cases {
             let err = bounded_classify(&index, &budget(), &request(vec![candidate])).unwrap_err();
@@ -1423,7 +1483,13 @@ mod tests {
             ..valid_candidate()
         };
         let err = bounded_classify(&index, &budget(), &request(vec![bad_tag])).unwrap_err();
-        assert!(matches!(&err, IngestError::InvalidLiteral { field: "language", .. }));
+        assert!(matches!(
+            &err,
+            IngestError::InvalidLiteral {
+                field: "language",
+                ..
+            }
+        ));
 
         let ok = ClassificationCandidate {
             object: CandidateObject::Literal(CandidateLiteral {
@@ -1443,12 +1509,8 @@ mod tests {
         let mut b = valid_candidate();
         b.subject = format!("{NS}thing:2");
 
-        let forward = bounded_classify(
-            &index,
-            &budget(),
-            &request(vec![a.clone(), b.clone()]),
-        )
-        .expect("forward batch classifies");
+        let forward = bounded_classify(&index, &budget(), &request(vec![a.clone(), b.clone()]))
+            .expect("forward batch classifies");
         let reversed = bounded_classify(&index, &budget(), &request(vec![b, a]))
             .expect("reversed batch classifies");
         assert_eq!(
@@ -1479,7 +1541,10 @@ mod tests {
             .and_then(Value::as_array)
             .expect("signals array")
             .clone();
-        assert!(!signals.is_empty(), "reason with todo: marker yields signals");
+        assert!(
+            !signals.is_empty(),
+            "reason with todo: marker yields signals"
+        );
         assert_eq!(
             signals[0].get("marker").and_then(Value::as_str),
             Some("todo:")
@@ -1494,8 +1559,8 @@ mod tests {
     #[test]
     fn shacl_graph_violation_rejects_batch() {
         let index = strict_index();
-        let err = bounded_classify(&index, &budget(), &request(vec![valid_candidate()]))
-            .unwrap_err();
+        let err =
+            bounded_classify(&index, &budget(), &request(vec![valid_candidate()])).unwrap_err();
         assert!(
             matches!(err, IngestError::ShaclRejected(_)),
             "minCount 2 with one triple must fail SHACL: {err:?}"
@@ -1702,7 +1767,11 @@ mod tests {
         let batch = bounded_classify(&make_index(), &budget(), &req)
             .expect("a case/whitespace variant of a governed domain must resolve");
         assert_eq!(
-            batch.memory_payload.metadata.get("domain").and_then(Value::as_str),
+            batch
+                .memory_payload
+                .metadata
+                .get("domain")
+                .and_then(Value::as_str),
             Some("memory"),
             "persist the resolved domain slug, not the raw request"
         );
@@ -1785,7 +1854,8 @@ mod tests {
         store.init("other-ns").await.expect("init schema");
 
         let req = request(vec![valid_candidate()]);
-        let batch = bounded_classify(&index, &budget(), &req).expect("governed candidate classifies");
+        let batch =
+            bounded_classify(&index, &budget(), &req).expect("governed candidate classifies");
         let legacy_id = format!(
             "bounded-ingest-{}",
             nquads_digest(&batch.memory_payload.content)
@@ -1803,7 +1873,12 @@ mod tests {
             .expect("seed legacy row");
 
         let outcome = ingest_bounded_classification(
-            &store, "test-ns", &index, &budget(), &req, &StubEmbedder,
+            &store,
+            "test-ns",
+            &index,
+            &budget(),
+            &req,
+            &StubEmbedder,
         )
         .await
         .expect("re-ingest into test-ns");
@@ -1816,12 +1891,18 @@ mod tests {
             .await
             .expect("search test-ns");
         assert_eq!(
-            hits.len(), 1,
+            hits.len(),
+            1,
             "re-ingest must update the legacy row in place, not create a duplicate"
         );
 
         let other_outcome = ingest_bounded_classification(
-            &store, "other-ns", &index, &budget(), &req, &StubEmbedder,
+            &store,
+            "other-ns",
+            &index,
+            &budget(),
+            &req,
+            &StubEmbedder,
         )
         .await
         .expect("ingest into other-ns");
@@ -1846,12 +1927,22 @@ mod tests {
         bob_req.user_id = "bob".to_string();
 
         let alice_out = ingest_bounded_classification(
-            &store, "test-ns", &index, &budget(), &alice_req, &StubEmbedder,
+            &store,
+            "test-ns",
+            &index,
+            &budget(),
+            &alice_req,
+            &StubEmbedder,
         )
         .await
         .expect("alice ingest");
         let bob_out = ingest_bounded_classification(
-            &store, "test-ns", &index, &budget(), &bob_req, &StubEmbedder,
+            &store,
+            "test-ns",
+            &index,
+            &budget(),
+            &bob_req,
+            &StubEmbedder,
         )
         .await
         .expect("bob ingest");
@@ -1941,7 +2032,12 @@ mod tests {
         let mut alice_req = request(vec![valid_candidate()]);
         alice_req.user_id = "alice".to_string();
         let alice_out = ingest_bounded_classification(
-            &store, "test-ns", &index, &budget(), &alice_req, &StubEmbedder,
+            &store,
+            "test-ns",
+            &index,
+            &budget(),
+            &alice_req,
+            &StubEmbedder,
         )
         .await
         .expect("un-padded alice ingest");
@@ -1976,7 +2072,12 @@ mod tests {
         let req = request(vec![valid_candidate()]);
         // 1. Head ingest creates the principal+namespace-scoped row.
         let head_first = ingest_bounded_classification(
-            &store, "test-ns", &index, &budget(), &req, &StubEmbedder,
+            &store,
+            "test-ns",
+            &index,
+            &budget(),
+            &req,
+            &StubEmbedder,
         )
         .await
         .expect("initial head ingest");
@@ -2023,7 +2124,12 @@ mod tests {
         // 3. Re-ingesting on head must keep the canonical head row, retarget
         // inbound references onto it, and retire the legacy sibling.
         let head_restored = ingest_bounded_classification(
-            &store, "test-ns", &index, &budget(), &req, &StubEmbedder,
+            &store,
+            "test-ns",
+            &index,
+            &budget(),
+            &req,
+            &StubEmbedder,
         )
         .await
         .expect("head re-ingest after downgrade");
@@ -2060,7 +2166,8 @@ mod tests {
             .await
             .expect("search test-ns");
         assert_eq!(
-            hits.len(), 2,
+            hits.len(),
+            2,
             "search must return only the canonical batch row and the referrer row"
         );
 

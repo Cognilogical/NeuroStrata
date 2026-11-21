@@ -48,4 +48,44 @@ if ! (cd "$pure_rename" && bash "$GATE"); then
     exit 1
 fi
 
+# Bash 3.2 compatibility leg (#320). Stock macOS /bin/bash rejects `declare -A`
+# and, without errexit, used to continue with an empty rename map and exit 0 —
+# silently skipping the Markdown scan. Shadow `declare` in a child bash so an
+# -A declaration aborts the gate; a regression then fails this test loudly.
+bash32_gate() {
+    (
+        cd "$1"
+        bash -c '
+            declare() {
+                case " $* " in
+                    *" -A "*) echo "declare: -A: invalid option" >&2; exit 3 ;;
+                esac
+                builtin declare "$@"
+            }
+            source "$1"
+        ' _ "$GATE"
+    )
+}
+
+compat_repo="$TMP/bash32-compat"
+new_repo "$compat_repo"
+printf 'TODO: untracked under bash 3.2\n' >> "$compat_repo/old.md"
+git -C "$compat_repo" add old.md
+git -C "$compat_repo" commit -q -m 'bash 3.2 work item'
+set +e
+compat_output=$(bash32_gate "$compat_repo" 2>&1)
+compat_status=$?
+set -e
+if [ "$compat_status" -ne 1 ] || ! grep -q 'old.md.*TODO: untracked under bash 3.2' <<< "$compat_output"; then
+    printf 'FAIL: bash 3.2 emulation must still run the Markdown scan\n%s\n' "$compat_output" >&2
+    exit 1
+fi
+
+compat_clean="$TMP/bash32-clean"
+new_repo "$compat_clean"
+if ! bash32_gate "$compat_clean"; then
+    echo 'FAIL: bash 3.2 emulation must pass a clean tree' >&2
+    exit 1
+fi
+
 echo 'task-coverage-gate tests passed'

@@ -12,8 +12,8 @@ use openssl::pkey::{PKey, Private};
 use crate::synaptic_mesh::attention::AttentionFilter;
 use crate::synaptic_mesh::conflict::{self, ConflictKind};
 use crate::synaptic_mesh::frame::{
-    strip_procedure_runtime_counters, validate_egress_candidate, validate_ingress_frame,
-    MeshFrame, MeshPayloadKind, SovereigntyGateError, SyncHello, TaskMeshAction,
+    strip_procedure_runtime_counters, validate_egress_candidate, validate_ingress_frame, MeshFrame,
+    MeshPayloadKind, SovereigntyGateError, SyncHello, TaskMeshAction,
 };
 use crate::synaptic_mesh::outbox::Outbox;
 use crate::synaptic_mesh::record::MeshRecord;
@@ -189,9 +189,9 @@ impl MeshReactor {
             kind,
             signature: String::new(),
         };
-        frame
-            .sign_frame(&self.privkey)
-            .map_err(|e| ReactorApplyError::Sovereignty(SovereigntyGateError::InvalidSignature(e)))?;
+        frame.sign_frame(&self.privkey).map_err(|e| {
+            ReactorApplyError::Sovereignty(SovereigntyGateError::InvalidSignature(e))
+        })?;
 
         self.outbox
             .append_frame(&frame)
@@ -403,9 +403,11 @@ impl MeshReactor {
                             preserved.lifecycle.superseded_by = None;
                             preserved.lifecycle.archived_at = None;
                             preserved.lifecycle.tombstoned_at = None;
-                            if !preserved.relationships.iter().any(|r| {
-                                r.kind == "references" && r.target == existing.id
-                            }) {
+                            if !preserved
+                                .relationships
+                                .iter()
+                                .any(|r| r.kind == "references" && r.target == existing.id)
+                            {
                                 preserved.relationships.push(
                                     crate::synaptic_mesh::record::Relationship {
                                         kind: "references".to_string(),
@@ -636,7 +638,10 @@ fn task_status_rank(status: &str) -> u8 {
     crate::formal_kernel::task_status_rank(k_status)
 }
 
-fn merge_task_json(existing: &serde_json::Value, incoming: &serde_json::Value) -> serde_json::Value {
+fn merge_task_json(
+    existing: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> serde_json::Value {
     let mut merged = incoming.clone();
     let old_status = existing
         .get("status")
@@ -1053,7 +1058,10 @@ mod tests {
         );
         // Applying f1 applies f1 AND drains buffered f2
         assert_eq!(
-            reactor_b.apply_inbound_frame(f1.clone(), 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(f1.clone(), 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::Applied
         );
         let (ver, vars) = reactor_b.get_twin_state("t-gap").unwrap();
@@ -1151,7 +1159,10 @@ mod tests {
         };
         frame_zero.sign_frame(&pkey_a).unwrap();
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_zero, 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(frame_zero, 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::NoOpDuplicate
         );
 
@@ -1200,7 +1211,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_active, 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(frame_active, 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::Applied
         );
 
@@ -1220,7 +1234,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_archived, 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(frame_archived, 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::Applied
         );
         let stored = reactor_b
@@ -1271,33 +1288,34 @@ mod tests {
             conflicts_b.clone(),
         );
 
-        let mk_record = |id: Uuid, state: LifecycleState, update_id: Uuid, content: serde_json::Value| {
-            MeshRecord {
-                schema_version: MESH_RECORD_SCHEMA_VERSION.into(),
-                id,
-                namespace: "ns".into(),
-                memory_type: "rule".into(),
-                lifecycle: Lifecycle {
-                    state,
-                    created_at: Utc::now(),
-                    created_by: did_a.clone(),
-                    superseded_by: None,
-                    archived_at: None,
-                    tombstoned_at: None,
-                },
-                content,
-                metadata: serde_json::json!({ "eligibility": "shareable" }),
-                rdf: None,
-                relationships: vec![],
-                update_id,
-                origin_mesh_epoch: 1,
-                trust: Trust::Trusted,
-                signature: None,
-                signer_did: Some(did_a.clone()),
-                public_key: None,
-                patch: None,
-            }
-        };
+        let mk_record =
+            |id: Uuid, state: LifecycleState, update_id: Uuid, content: serde_json::Value| {
+                MeshRecord {
+                    schema_version: MESH_RECORD_SCHEMA_VERSION.into(),
+                    id,
+                    namespace: "ns".into(),
+                    memory_type: "rule".into(),
+                    lifecycle: Lifecycle {
+                        state,
+                        created_at: Utc::now(),
+                        created_by: did_a.clone(),
+                        superseded_by: None,
+                        archived_at: None,
+                        tombstoned_at: None,
+                    },
+                    content,
+                    metadata: serde_json::json!({ "eligibility": "shareable" }),
+                    rdf: None,
+                    relationships: vec![],
+                    update_id,
+                    origin_mesh_epoch: 1,
+                    trust: Trust::Trusted,
+                    signature: None,
+                    signer_did: Some(did_a.clone()),
+                    public_key: None,
+                    patch: None,
+                }
+            };
         let publish = |record: MeshRecord| {
             let reactor = &reactor_a;
             async move {
@@ -1328,7 +1346,10 @@ mod tests {
         ))
         .await;
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_skip_1, 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(frame_skip_1, 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::Applied
         );
         let frame_skip_2 = publish(mk_record(
@@ -1339,7 +1360,10 @@ mod tests {
         ))
         .await;
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_skip_2, 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(frame_skip_2, 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::NoOpDuplicate
         );
         assert_eq!(
@@ -1362,7 +1386,10 @@ mod tests {
         rec_combo_archived.lifecycle.archived_at = Some(Utc::now());
         let frame_combo_1 = publish(rec_combo_archived).await;
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_combo_1, 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(frame_combo_1, 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::Applied
         );
         let frame_combo_2 = publish(mk_record(
@@ -1373,12 +1400,20 @@ mod tests {
         ))
         .await;
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_combo_2, 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(frame_combo_2, 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::Applied
         );
         {
-            let store = reactor_b.cognitive_records.lock().expect("cognitive_records lock");
-            let stored = store.get(&combo_id.to_string()).expect("combo record stored");
+            let store = reactor_b
+                .cognitive_records
+                .lock()
+                .expect("cognitive_records lock");
+            let stored = store
+                .get(&combo_id.to_string())
+                .expect("combo record stored");
             assert_eq!(stored.lifecycle.state, LifecycleState::Archived);
             assert_eq!(stored.content, serde_json::json!("combo rule EDITED"));
         }
@@ -1397,7 +1432,10 @@ mod tests {
         ))
         .await;
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_sw_1, 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(frame_sw_1, 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::Applied
         );
         let mut rec_sw_superseded = mk_record(
@@ -1409,11 +1447,17 @@ mod tests {
         rec_sw_superseded.lifecycle.superseded_by = Some(sw_update_1);
         let frame_sw_2 = publish(rec_sw_superseded).await;
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_sw_2, 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(frame_sw_2, 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::Applied
         );
         {
-            let store = reactor_b.cognitive_records.lock().expect("cognitive_records lock");
+            let store = reactor_b
+                .cognitive_records
+                .lock()
+                .expect("cognitive_records lock");
             let stored = store.get(&sw_id.to_string()).expect("sw record stored");
             assert_eq!(stored.lifecycle.state, LifecycleState::Superseded);
             let preserved = store
@@ -1424,9 +1468,10 @@ mod tests {
                         && r.content == serde_json::json!("supersede rule v1")
                 })
                 .expect("losing edit preserved as a new Active record");
-            assert!(preserved.relationships.iter().any(|r| {
-                r.kind == "references" && r.target == sw_id
-            }));
+            assert!(preserved
+                .relationships
+                .iter()
+                .any(|r| { r.kind == "references" && r.target == sw_id }));
         }
         let overlay = crate::synaptic_mesh::conflict::load_overlay(&conflicts_b);
         assert!(overlay
@@ -1455,7 +1500,10 @@ mod tests {
         rec_tomb.lifecycle.tombstoned_at = Some(Utc::now());
         let frame_tomb_1 = publish(rec_tomb).await;
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_tomb_1, 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(frame_tomb_1, 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::Applied
         );
         let frame_tomb_2 = publish(mk_record(
@@ -1466,11 +1514,17 @@ mod tests {
         ))
         .await;
         assert_eq!(
-            reactor_b.apply_inbound_frame(frame_tomb_2, 1000).await.unwrap(),
+            reactor_b
+                .apply_inbound_frame(frame_tomb_2, 1000)
+                .await
+                .unwrap(),
             ReactorApplyOutcome::NoOpDuplicate
         );
         {
-            let store = reactor_b.cognitive_records.lock().expect("cognitive_records lock");
+            let store = reactor_b
+                .cognitive_records
+                .lock()
+                .expect("cognitive_records lock");
             let stored = store.get(&tomb_id.to_string()).expect("tomb record stored");
             assert_eq!(stored.lifecycle.state, LifecycleState::Tombstoned);
         }

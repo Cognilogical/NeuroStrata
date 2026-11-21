@@ -1827,11 +1827,7 @@ pub async fn commit_scenario(
     for (uid, payload) in &scenario.staged_upserts {
         if matches!(
             payload.memory_type.as_str(),
-            "action_type"
-                | "digital_twin_schema"
-                | "ontology"
-                | "concept"
-                | "thesis"
+            "action_type" | "digital_twin_schema" | "ontology" | "concept" | "thesis"
         ) {
             refresh_ontology_needed = true;
         }
@@ -1867,10 +1863,12 @@ pub async fn commit_scenario(
     let expected_heads: Vec<crate::rdf::action::ExpectedHead> = scenario
         .base_fingerprints
         .iter()
-        .map(|(row_id, expected_fp)| crate::rdf::action::ExpectedHead::RowFingerprint {
-            row_id: row_id.clone(),
-            expected_fingerprint: fingerprint_digest_u64(expected_fp),
-        })
+        .map(
+            |(row_id, expected_fp)| crate::rdf::action::ExpectedHead::RowFingerprint {
+                row_id: row_id.clone(),
+                expected_fingerprint: fingerprint_digest_u64(expected_fp),
+            },
+        )
         .collect();
 
     let commit_outcome = store
@@ -1895,7 +1893,9 @@ pub async fn commit_scenario(
         }
         return Ok(ScenarioCommitOutcome::Rejected {
             scenario_id: scenario_id.to_string(),
-            decision: ScenarioCommitDecision::RejectedBaseConflict.as_tag().to_string(),
+            decision: ScenarioCommitDecision::RejectedBaseConflict
+                .as_tag()
+                .to_string(),
             base_conflicts,
             shacl_violations,
             message: format!(

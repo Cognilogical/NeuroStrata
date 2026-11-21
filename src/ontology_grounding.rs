@@ -13,8 +13,15 @@ pub struct OntologyConfig {
 pub fn resolve_config(registry_metadata: &Value) -> Option<OntologyConfig> {
     if let Some(cfg) = registry_metadata.get("ontology_config") {
         if let Some(path) = cfg.get("path").and_then(|v| v.as_str()) {
-            let mode = cfg.get("mode").and_then(|v| v.as_str()).unwrap_or("annotate").to_string();
-            return Some(OntologyConfig { path: path.to_string(), mode });
+            let mode = cfg
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("annotate")
+                .to_string();
+            return Some(OntologyConfig {
+                path: path.to_string(),
+                mode,
+            });
         }
     }
     let path = std::env::var("ONTOLOGY_FILE_PATH").ok()?;
@@ -25,10 +32,8 @@ pub fn resolve_config(registry_metadata: &Value) -> Option<OntologyConfig> {
 /// Read and parse a vocabulary file, keeping the failure kind distinct so
 /// callers can report `unreadable` (I/O) separately from `malformed` (JSON).
 fn load_vocabulary_classified(path: &str) -> Result<Value, (&'static str, String)> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| ("unreadable", e.to_string()))?;
-    serde_json::from_str(&content)
-        .map_err(|e| ("malformed", format!("invalid JSON: {e}")))
+    let content = std::fs::read_to_string(path).map_err(|e| ("unreadable", e.to_string()))?;
+    serde_json::from_str(&content).map_err(|e| ("malformed", format!("invalid JSON: {e}")))
 }
 
 /// Read and parse a vocabulary file. Returns parsed JSON on success.
@@ -74,13 +79,18 @@ pub fn concept_iris_from_vocabulary(vocab: &Value, domains: &[String]) -> Vec<St
     }
 
     for slug in domains {
-        let norm = crate::domain::normalize_domain_slug(slug).unwrap_or_else(|| slug.to_lowercase());
+        let norm =
+            crate::domain::normalize_domain_slug(slug).unwrap_or_else(|| slug.to_lowercase());
         for (entry_slug, iri, aliases) in &entries {
-            let entry_norm = crate::domain::normalize_domain_slug(entry_slug).unwrap_or_else(|| entry_slug.to_lowercase());
+            let entry_norm = crate::domain::normalize_domain_slug(entry_slug)
+                .unwrap_or_else(|| entry_slug.to_lowercase());
             let alias_match = aliases.iter().any(|a| {
                 crate::domain::normalize_domain_slug(a).unwrap_or_else(|| a.to_lowercase()) == norm
             });
-            if (entry_norm == norm || alias_match) && !iri.trim().is_empty() && seen.insert(iri.clone()) {
+            if (entry_norm == norm || alias_match)
+                && !iri.trim().is_empty()
+                && seen.insert(iri.clone())
+            {
                 out.push(iri.clone());
             }
         }
@@ -93,7 +103,11 @@ pub fn concept_iris_from_vocabulary(vocab: &Value, domains: &[String]) -> Vec<St
 fn aliases_of(v: &Value) -> Vec<String> {
     v.get("aliases")
         .and_then(|a| a.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -110,7 +124,11 @@ fn collect_entries_from_array(arr: &[Value], out: &mut Vec<(String, String, Vec<
                 .or_else(|| obj.get("iri"))
                 .or_else(|| obj.get("uri"))
                 .and_then(value_to_iri)
-                .or_else(|| at_id.map(|s| s.to_string()).filter(|s| !s.trim().is_empty()));
+                .or_else(|| {
+                    at_id
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.trim().is_empty())
+                });
             // The slug names the domain: label fields first, then the trailing
             // IRI segment of @id (`http://x/onto#auth` -> "auth").
             let slug = obj
@@ -192,8 +210,15 @@ pub async fn ontology_warnings(store: &LadybugStore, namespace: &str) -> Vec<Val
         if let Some(slug) = e.get("slug").and_then(|v| v.as_str()) {
             let iris = concept_iris_from_vocabulary(&vocab, &[slug.to_string()]);
             if iris.is_empty() {
-                out.push(Value::json_obj(namespace, "out_of_vocabulary", Some(cfg.path.clone()),
-                    format!("{warn_prefix}domain '{}' has no concept_iri in vocabulary", slug)));
+                out.push(Value::json_obj(
+                    namespace,
+                    "out_of_vocabulary",
+                    Some(cfg.path.clone()),
+                    format!(
+                        "{warn_prefix}domain '{}' has no concept_iri in vocabulary",
+                        slug
+                    ),
+                ));
             }
         }
     }
@@ -222,7 +247,9 @@ impl JsonObjExt for Value {
             "message": message,
         });
         if let Some(p) = path {
-            obj.as_object_mut().unwrap().insert("path".to_string(), serde_json::json!(p));
+            obj.as_object_mut()
+                .unwrap()
+                .insert("path".to_string(), serde_json::json!(p));
         }
         obj
     }
@@ -236,12 +263,14 @@ mod tests {
     #[test]
     fn test_f21_resolve_config_and_load_vocabulary() {
         // resolve_config from registry metadata
-        let meta_annotate = serde_json::json!({"ontology_config":{"path":"/tmp/vocab.json","mode":"annotate"}});
+        let meta_annotate =
+            serde_json::json!({"ontology_config":{"path":"/tmp/vocab.json","mode":"annotate"}});
         let cfg = resolve_config(&meta_annotate).unwrap();
         assert_eq!(cfg.path, "/tmp/vocab.json");
         assert_eq!(cfg.mode, "annotate");
 
-        let meta_strict = serde_json::json!({"ontology_config":{"path":"/tmp/vocab.json","mode":"strict"}});
+        let meta_strict =
+            serde_json::json!({"ontology_config":{"path":"/tmp/vocab.json","mode":"strict"}});
         let cfg_strict = resolve_config(&meta_strict).unwrap();
         assert_eq!(cfg_strict.mode, "strict");
 
@@ -288,7 +317,10 @@ mod tests {
         // The prefix is prepended to the emitted message text, keeping the
         // annotate-mode message identical to the pre-strict surface.
         let annotate_msg = "domain 'auth' has no concept_iri in vocabulary";
-        assert_eq!(format!("{}{annotate_msg}", strict_warn_prefix("annotate")), annotate_msg);
+        assert_eq!(
+            format!("{}{annotate_msg}", strict_warn_prefix("annotate")),
+            annotate_msg
+        );
         assert_eq!(
             format!("{}{annotate_msg}", strict_warn_prefix("strict")),
             format!("[strict] {annotate_msg}")

@@ -46,10 +46,7 @@ pub struct LabelRule {
 /// A rule matches an observation only when the rule is the wildcard `"*"`,
 /// or the rule id equals / is contained in the observation id.
 /// Returns empty when no rule matches (absence of follow-up = no DerivedLabel).
-pub fn derive_labels(
-    observation_ids: &[String],
-    rules: &[LabelRule],
-) -> Result<Vec<DerivedLabel>> {
+pub fn derive_labels(observation_ids: &[String], rules: &[LabelRule]) -> Result<Vec<DerivedLabel>> {
     let mut labels = Vec::new();
     for obs_id in observation_ids {
         for rule in rules {
@@ -102,10 +99,7 @@ mod tests {
 
         let labels = derive_labels(&obs_ids, &rules).expect("derive labels");
         // Observations must remain unchanged regardless of rule change
-        let labels_changed: Vec<_> = labels
-            .iter()
-            .map(|l| l.observation_id.as_str())
-            .collect();
+        let labels_changed: Vec<_> = labels.iter().map(|l| l.observation_id.as_str()).collect();
         assert_eq!(labels_changed, obs_ids);
     }
 
@@ -119,7 +113,11 @@ mod tests {
             fixed_probability: Some(1.0),
         }];
         let labels = derive_labels(&obs_ids, &rules).expect("derive labels");
-        assert_eq!(labels.len(), obs_ids.len(), "wildcard matches every observation");
+        assert_eq!(
+            labels.len(),
+            obs_ids.len(),
+            "wildcard matches every observation"
+        );
     }
 
     #[test]

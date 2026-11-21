@@ -25,19 +25,23 @@ impl TemperatureFitter {
         if pairs.is_empty() {
             return Ok(1.0);
         }
-        let logits: Vec<f64> = pairs.iter()
+        let logits: Vec<f64> = pairs
+            .iter()
             .map(|(p, _)| {
                 let pc = (*p as f64).clamp(1e-6, 1.0 - 1e-6);
                 (pc / (1.0 - pc)).ln()
             })
             .collect();
         // Gold targets: the pairs ARE the gold calibration data.
-        let targets: Vec<f64> = pairs.iter()
+        let targets: Vec<f64> = pairs
+            .iter()
             .map(|(_, is_dup)| if *is_dup { 1.0 } else { 0.0 })
             .collect();
 
         let nll = |t: f64| -> f64 {
-            logits.iter().zip(targets.iter())
+            logits
+                .iter()
+                .zip(targets.iter())
                 .map(|(&z, &y)| {
                     let s = 1.0 / (1.0 + (-z / t).exp());
                     let s = s.clamp(1e-12, 1.0 - 1e-12);
@@ -93,7 +97,9 @@ mod tests {
     #[test]
     fn test_cand_pairs() {
         let fitter = TemperatureFitter::new();
-        let t = fitter.fit(&[(0.8, true), (0.2, false)]).expect("fit failed");
+        let t = fitter
+            .fit(&[(0.8, true), (0.2, false)])
+            .expect("fit failed");
         // Both pairs are well-separated from 0.5, so sharpening (small T)
         // strictly improves NLL: the fit must land near the lower bound.
         assert!(t >= 0.1 && t <= 0.3, "t={:.4}", t);
@@ -102,7 +108,9 @@ mod tests {
     #[test]
     fn test_identical_pairs() {
         let fitter = TemperatureFitter::new();
-        let t = fitter.fit(&[(0.5, true), (0.5, false)]).expect("fit failed");
+        let t = fitter
+            .fit(&[(0.5, true), (0.5, false)])
+            .expect("fit failed");
         // z = 0 for p = 0.5, so sigmoid is flat in T: any valid T accepted.
         assert!(t >= 0.1 && t <= 10.0, "t={:.2}", t);
     }
@@ -112,7 +120,9 @@ mod tests {
         let fitter = TemperatureFitter::new();
         // Model says 0.99 but gold says non-duplicate: calibration must soften
         // (large T) rather than trust the overconfident probability.
-        let t = fitter.fit(&[(0.99, false), (0.01, true)]).expect("fit failed");
+        let t = fitter
+            .fit(&[(0.99, false), (0.01, true)])
+            .expect("fit failed");
         assert!(t > 5.0, "t={:.4}", t);
     }
 

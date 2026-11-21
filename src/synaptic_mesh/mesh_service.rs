@@ -50,7 +50,10 @@ pub fn resolve_node_id_at(home: &Path) -> String {
     let fresh = Uuid::new_v4().to_string();
     if let Some(dir) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            tracing::warn!("mesh-node-id dir {} could not be created: {e}", dir.display());
+            tracing::warn!(
+                "mesh-node-id dir {} could not be created: {e}",
+                dir.display()
+            );
         }
     }
     if let Err(e) = std::fs::write(&path, format!("{}\n", fresh)) {
@@ -309,21 +312,21 @@ impl MeshService {
                             // runtime (e.g. #[tokio::test]) has no multi-thread worker
                             // pool for block_in_place, so the probe runs on a scoped
                             // OS thread instead.
-                            let bearer =
-                                std::env::var("NEUROSTRATA_FEDERATION_BEARER_TOKEN")
-                                    .unwrap_or_default();
+                            let bearer = std::env::var("NEUROSTRATA_FEDERATION_BEARER_TOKEN")
+                                .unwrap_or_default();
                             let probe = if handle.runtime_flavor()
                                 == tokio::runtime::RuntimeFlavor::MultiThread
                             {
                                 tokio::task::block_in_place(|| {
-                                    handle.block_on(self.federated_remote_list(&remote, &ns, &bearer))
+                                    handle
+                                        .block_on(self.federated_remote_list(&remote, &ns, &bearer))
                                 })
                             } else {
                                 std::thread::scope(|s| {
                                     s.spawn(|| {
-                                        handle.clone().block_on(self.federated_remote_list(
-                                            &remote, &ns, &bearer,
-                                        ))
+                                        handle.clone().block_on(
+                                            self.federated_remote_list(&remote, &ns, &bearer),
+                                        )
                                     })
                                     .join()
                                     .map_err(|_| "federated probe thread panicked".to_string())
@@ -357,7 +360,12 @@ impl MeshService {
 
     /// Remote peer probe: used by `status_report` to inspect a configured
     /// HTTP federated peer in production, and by the test surface directly.
-    pub async fn federated_remote_list(&self, base_url: &str, namespace: &str, token: &str) -> Result<Vec<serde_json::Value>, String> {
+    pub async fn federated_remote_list(
+        &self,
+        base_url: &str,
+        namespace: &str,
+        token: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
         crate::synaptic_mesh::federation::remote_list(base_url, namespace, token).await
     }
 }
