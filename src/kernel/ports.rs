@@ -104,6 +104,32 @@ pub trait MemoryPort: Send + Sync {
         Ok(HashMap::new())
     }
 
+    /// One persisted effect receipt by its durable dedup key
+    /// `[action_receipt_id, pointer_uri, idempotency_key]`.
+    async fn pool_effect_receipt(
+        &self,
+        namespace: &str,
+        schema: &DataPoolSchema,
+        dedup_key: &str,
+    ) -> Result<Option<ExternalEffectReceipt>> {
+        let _ = (namespace, schema, dedup_key);
+        Ok(None)
+    }
+
+    /// Persist an applied effect receipt under its durable dedup key in the
+    /// same pool registry row #347 introduced (`pool_idempotency`).
+    async fn register_pool_effect_receipt(
+        &self,
+        namespace: &str,
+        schema: &DataPoolSchema,
+        dedup_key: &str,
+        receipt: &ExternalEffectReceipt,
+        principal: Option<&str>,
+    ) -> Result<()> {
+        let _ = (namespace, schema, dedup_key, receipt, principal);
+        Ok(())
+    }
+
     /// List persisted `DataPoolSchema` entries in the namespace, optionally filtered by `connector_id`.
     async fn list_data_pools(
         &self,
@@ -608,6 +634,103 @@ impl MemoryPort for LadybugMemoryPort {
             .get("pool_idempotency")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default())
+    }
+
+    async fn pool_effect_receipt(
+        &self,
+        namespace: &str,
+        schema: &DataPoolSchema,
+        dedup_key: &str,
+    ) -> Result<Option<ExternalEffectReceipt>> {
+        Ok(self
+            .pool_idempotency(namespace, schema)
+            .await?
+            .get(dedup_key)
+            .cloned())
+    }
+
+    async fn register_pool_effect_receipt(
+        &self,
+        namespace: &str,
+        schema: &DataPoolSchema,
+        dedup_key: &str,
+        receipt: &ExternalEffectReceipt,
+        principal: Option<&str>,
+    ) -> Result<()> {
+        let lb = self.ladybug_store();
+        if !crate::rebac::can_write_namespace(lb, namespace, principal) {
+            anyhow::bail!("write denied for namespace '{}'", namespace);
+        }
+        let row_id = format!(
+            "__data_pool__:{}:{}:{}",
+            namespace, schema.connector_id, schema.pool_id
+        );
+        let now = chrono::Utc::now().timestamp();
+        let stored = self.trusted_get_memory(namespace, &row_id).await?;
+        if let Some(row) = &stored {
+            if is_retired_data_metadata(&row.metadata, now) {
+                anyhow::bail!(
+                    "pool '{}:{}' is retired; refusing to persist a write-back receipt",
+                    schema.connector_id,
+                    schema.pool_id
+                );
+            }
+        }
+        let existing = stored.filter(|p| !is_retired_data_metadata(&p.metadata, now));
+        let stored_schema: Option<DataPoolSchema> = existing
+            .as_ref()
+            .and_then(|p| p.metadata.get("pool_schema"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        if let Some(stored_schema) = &stored_schema {
+            if stored_schema.access_mode == DataPoolAccessMode::ReadOnly {
+                anyhow::bail!(
+                    "pool '{}:{}' became read-only; refusing to persist a write-back receipt",
+                    schema.connector_id,
+                    schema.pool_id
+                );
+            }
+        }
+        let effective_schema = stored_schema.as_ref().unwrap_or(schema);
+        let mut idempotency: HashMap<String, ExternalEffectReceipt> = existing
+            .as_ref()
+            .and_then(|p| p.metadata.get("pool_idempotency"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        idempotency.insert(dedup_key.to_string(), receipt.clone());
+        let mut metadata = serde_json::json!({
+            "eligibility": "private",
+            "pool_schema": serde_json::to_value(effective_schema)?,
+            "pool_idempotency": serde_json::to_value(&idempotency)?,
+            "source": {
+                "kind": "data_connector_pool",
+                "ref": format!("{}:{}", effective_schema.connector_id, effective_schema.pool_id)
+            }
+        });
+        if let Some(records) = existing
+            .as_ref()
+            .and_then(|p| p.metadata.get("pool_records"))
+        {
+            metadata["pool_records"] = records.clone();
+        }
+        let payload = MemoryPayload {
+            content: format!(
+                "data pool {}:{} ({})",
+                effective_schema.connector_id,
+                effective_schema.pool_id,
+                effective_schema.description
+            ),
+            user_id: principal.unwrap_or("").to_string(),
+            memory_type: "data_pointer".to_string(),
+            agent_name: None,
+            location: format!(
+                "{}:{}",
+                effective_schema.connector_id, effective_schema.pool_id
+            ),
+            location_lines: String::new(),
+            metadata,
+        };
+        lb.put_scoped_memory(namespace, &row_id, &payload).await?;
+        Ok(())
     }
 
     async fn list_data_pools(
