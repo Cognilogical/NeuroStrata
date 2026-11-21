@@ -241,13 +241,34 @@ const CODEX_PRE_TOOL_USE_MATCHER: &str = "apply_patch|Bash";
 /// platform shell (PowerShell on Windows), so the namespace is an argument,
 /// not a `NAME=value` prefix that only POSIX shells understand.
 fn codex_hook_command(abs_runner: &str, namespace: &str) -> String {
-    format!("node \"{abs_runner}\" \"{namespace}\"")
+    if namespace.is_empty() {
+        // No namespace known (daemon boot): the runner discovers it.
+        format!("node \"{abs_runner}\"")
+    } else {
+        format!("node \"{abs_runner}\" \"{namespace}\"")
+    }
+}
+
+/// Split a command shaped like `codex_hook_command` into its runner path and
+/// namespace argument (empty when there is none).
+fn parse_codex_hook_command(command: &str) -> Option<(&str, &str)> {
+    let rest = command.strip_prefix("node \"")?;
+    let close = rest.find('"')?;
+    let (path, tail) = (&rest[..close], rest[close + 1..].trim());
+    if tail.is_empty() {
+        return Some((path, ""));
+    }
+    let ns = tail.strip_prefix('"')?.strip_suffix('"')?;
+    Some((path, ns))
 }
 
 /// Add the NeuroStrata PreToolUse and Stop hooks to `.codex/hooks.json`,
-/// keeping every other entry. A command the installer wrote for a runner
-/// that has since moved is pointed at the current runner. A hooks.json that
-/// is not a JSON object is left untouched.
+/// keeping every other entry. An installer-written command is recognized by
+/// its runner, whatever namespace argument it carries: it keeps that
+/// namespace (automatic refreshes such as `hook_hygiene` and daemon boot pass
+/// a folder-name guess or nothing) and is only pointed at the current runner
+/// if the runner moved. A hooks.json that cannot be read or is not a JSON
+/// object is left untouched.
 fn wire_codex_hooks(project_root: &Path, namespace: &str, abs_runner: &str) -> Option<String> {
     let hooks_path = project_root.join(".codex/hooks.json");
     let mut doc: Value = match std::fs::read_to_string(&hooks_path) {
@@ -255,7 +276,8 @@ fn wire_codex_hooks(project_root: &Path, namespace: &str, abs_runner: &str) -> O
             Ok(d) if d.is_object() => d,
             _ => return None,
         },
-        Err(_) => json!({}),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(_) => return None,
     };
     let cmd = codex_hook_command(abs_runner, namespace);
     let obj = doc.as_object_mut()?;
@@ -278,18 +300,17 @@ fn wire_codex_hooks(project_root: &Path, namespace: &str, abs_runner: &str) -> O
                 let Some(command) = hook.get("command").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                if command == cmd {
-                    present = true;
-                } else if let Some(old_path) = command
-                    .strip_prefix("node \"")
-                    .and_then(|rest| rest.strip_suffix(&format!("\" \"{namespace}\"")))
+                let Some((old_path, old_ns)) = parse_codex_hook_command(command) else {
+                    continue;
+                };
+                if path_basename(old_path) == path_basename(abs_runner)
+                    && runner_is_replaceable(old_path, project_root, abs_runner)
                 {
-                    if path_basename(old_path) == path_basename(abs_runner)
-                        && runner_is_replaceable(old_path, project_root, abs_runner)
-                    {
-                        hook["command"] = Value::String(cmd.clone());
-                        present = true;
+                    let repointed = codex_hook_command(abs_runner, old_ns);
+                    if repointed != command {
+                        hook["command"] = Value::String(repointed);
                     }
+                    present = true;
                 }
             }
         }
@@ -1561,5 +1582,55 @@ mod tests {
         std::fs::write(&path, "not json").expect("write");
         let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "not json");
+
+        // Neither is one that is not UTF-8 (e.g. saved as UTF-16).
+        let utf16: Vec<u8> = vec![0xFF, 0xFE, b'{', 0, b'}', 0];
+        std::fs::write(&path, &utf16).expect("write");
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
+        assert_eq!(std::fs::read(&path).expect("read"), utf16);
+    }
+
+    /// Automatic refreshes call the installer with another namespace:
+    /// `hook_hygiene` passes the checkout folder name and daemon boot passes
+    /// none. They must recognize the installer's own hooks, keep the
+    /// configured namespace and add nothing (Codex review on #368).
+    #[test]
+    fn codex_refresh_with_another_namespace_keeps_the_configured_hooks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).expect("create .codex");
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner")
+            .to_string();
+        let configured = format!("node \"{runner}\" \"TestProj\"");
+        let before = read_codex_hooks(tmp.path());
+
+        for other in ["folder-name", ""] {
+            let _ = auto_install_detected_plugins(tmp.path(), other, Some("codex"));
+            let doc = read_codex_hooks(tmp.path());
+            assert_eq!(doc, before, "refresh with {other:?} must change nothing");
+            assert_eq!(codex_commands(&doc, "PreToolUse"), vec![configured.clone()]);
+            assert_eq!(codex_commands(&doc, "Stop"), vec![configured.clone()]);
+        }
+
+        // A first install without a namespace leaves the argument off, and
+        // the runner discovers the namespace itself.
+        let fresh = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(fresh.path().join(".codex")).expect("create .codex");
+        let report = auto_install_detected_plugins(fresh.path(), "", Some("codex"));
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner")
+            .to_string();
+        let doc = read_codex_hooks(fresh.path());
+        assert_eq!(
+            codex_commands(&doc, "PreToolUse"),
+            vec![format!("node \"{runner}\"")]
+        );
+        // A later install with a namespace keeps that entry instead of
+        // adding a second one.
+        let _ = auto_install_detected_plugins(fresh.path(), "TestProj", Some("codex"));
+        assert_eq!(read_codex_hooks(fresh.path()), doc);
     }
 }
