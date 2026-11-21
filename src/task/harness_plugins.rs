@@ -64,7 +64,10 @@ async function main() {
   }
   const init = mod.initialize ?? plugin?.initialize ?? plugin?.setup;
   if (typeof init === "function") {
-    await init({ config: { namespace: process.env.NEUROSTRATA_NAMESPACE } });
+    // Pass the namespace only when it is set: an explicit undefined would
+    // override the one in .NeuroStrata/neurostrata-plugin.json.
+    const namespace = process.env.NEUROSTRATA_NAMESPACE;
+    await init({ config: namespace ? { namespace } : {} });
   }
   const handler =
     mod.handleHookEvent ??
@@ -311,7 +314,10 @@ fn wire_codex_hooks(project_root: &Path, abs_runner: &str) -> Option<String> {
                 let Some(command) = hook.get("command").and_then(|v| v.as_str()) else {
                     continue;
                 };
-                let Some((old_path, _)) = command
+                // Only a complete installer command is ours: a user command
+                // that runs the runner and then more (`&& policy-check`) is
+                // left as written.
+                let Some((old_path, "")) = command
                     .strip_prefix("node ")
                     .and_then(shell_literal_value)
                 else {
@@ -1643,5 +1649,51 @@ mod tests {
         } else {
             assert_eq!(shell_literal("a'b"), r"'a'\''b'");
         }
+    }
+
+    /// A user hook that runs the runner and then more is not the
+    /// installer's: refreshes must not strip its suffix (Codex review on
+    /// #368).
+    #[test]
+    fn codex_refresh_keeps_a_user_command_that_extends_the_runner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).expect("create .codex");
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner")
+            .to_string();
+        let ours = format!("node {}", shell_literal(&runner));
+        let custom = format!("{ours} && project-policy-check");
+        let user = json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "apply_patch|Bash", "hooks": [{ "type": "command", "command": custom }] }
+                ]
+            }
+        });
+        std::fs::write(
+            tmp.path().join(".codex/hooks.json"),
+            serde_json::to_string_pretty(&user).unwrap(),
+        )
+        .expect("write");
+
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
+        let doc = read_codex_hooks(tmp.path());
+        assert_eq!(
+            codex_commands(&doc, "PreToolUse"),
+            vec![custom, ours.clone()],
+            "the user command keeps its suffix"
+        );
+        assert_eq!(codex_commands(&doc, "Stop"), vec![ours]);
+    }
+
+    /// No runner may pass `namespace: undefined` to initialize: it would
+    /// override the namespace in .NeuroStrata/neurostrata-plugin.json when
+    /// the hook sets no NEUROSTRATA_NAMESPACE (Codex review on #368).
+    #[test]
+    fn installed_runner_passes_a_namespace_only_when_set() {
+        assert!(!CLI_HOOK_RUNNER_MJS.contains("{ namespace: process.env.NEUROSTRATA_NAMESPACE }"));
+        assert!(CLI_HOOK_RUNNER_MJS.contains("namespace ? { namespace } : {}"));
     }
 }

@@ -31,7 +31,10 @@ async function main() {
   } catch {
     process.exit(0);
   }
-  await initialize({ config: { namespace: process.env.NEUROSTRATA_NAMESPACE } });
+  // Pass the namespace only when it is set: an explicit undefined would
+  // override the one in .NeuroStrata/neurostrata-plugin.json.
+  const namespace = process.env.NEUROSTRATA_NAMESPACE;
+  await initialize({ config: namespace ? { namespace } : {} });
   const handler = plugin.handleHookEvent ?? plugin.handleClaudeHookEvent ?? plugin;
   if (typeof handler === "function") {
     const out = await handler(event);

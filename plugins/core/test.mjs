@@ -2943,6 +2943,60 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
     }
   })
 
+  it('hook runners keep the disk namespace when NEUROSTRATA_NAMESPACE is unset', async () => {
+    const { server, url, counters } = await createMockDaemonServer()
+    const projectDir = mkdtempSync(join(tmpdir(), 'ns-runner-diskns-'))
+    try {
+      mkdirSync(join(projectDir, '.NeuroStrata'), { recursive: true })
+      writeFileSync(
+        join(projectDir, '.NeuroStrata', 'neurostrata-plugin.json'),
+        JSON.stringify({
+          namespace: 'DiskNs',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: true
+        })
+      )
+      const env = { ...process.env }
+      delete env.NEUROSTRATA_NAMESPACE
+      const event = JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Write',
+        tool_input: { file_path: 'src/a.rs', content: 'x' },
+        cwd: projectDir
+      })
+      for (const harness of ['claude', 'codex', 'github-cli', 'opencode']) {
+        const runner = fileURLToPath(
+          new URL(`../${harness}/cli-hook.mjs`, import.meta.url)
+        )
+        const before = counters.guardArgs.length
+        await new Promise((resolveRun, rejectRun) => {
+          const child = spawn(process.execPath, [runner], {
+            cwd: projectDir,
+            env,
+            stdio: ['pipe', 'ignore', 'ignore']
+          })
+          child.on('error', rejectRun)
+          child.on('close', () => resolveRun())
+          child.stdin.end(event)
+        })
+        assert.ok(
+          counters.guardArgs.length > before,
+          `${harness}: guard_validate must be called`
+        )
+        assert.equal(
+          counters.guardArgs[counters.guardArgs.length - 1].namespace,
+          'DiskNs',
+          `${harness}: the namespace from neurostrata-plugin.json must survive`
+        )
+      }
+    } finally {
+      server.close()
+      resetModuleState()
+      rmSync(projectDir, { recursive: true, force: true })
+    }
+  })
+
   // A file name containing a double quote cannot exist on Windows.
   it(
     'pre-commit matches JSON-escaped unicode/quote paths and warns for unrecorded files without writing rows',
