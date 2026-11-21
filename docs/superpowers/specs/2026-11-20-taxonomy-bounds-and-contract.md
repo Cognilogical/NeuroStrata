@@ -1,9 +1,7 @@
 # 2026-11-20 — Taxonomy Bounds and Contract Hygiene (W-D)
 
-> **Baseline**: `cognilogical/main` @ `216e9d56`
-> **Issue**: #334 (P2: C1/C2/C3)
-> **Branch**: `fix/wd-taxonomy-bounds`
-> **Workflow**: spec → red evals → minimal fix → green evals → regression suites
+> **Baseline**: `cognilogical/main` @ `216e9d56` > **Issue**: #334 (P2: C1/C2/C3)
+> **Branch**: `fix/wd-taxonomy-bounds` > **Workflow**: spec → red evals → minimal fix → green evals → regression suites
 
 ---
 
@@ -52,7 +50,7 @@ aliases and MCP routing keys make strict rejection risky).
 
 - `max_hops` caps the tree depth below each root: `Some(n)` is clamped to
   `1..=4`; `None` keeps the current unlimited behavior. Shared DAG nodes are
-  revisited when a shorter path leaves a larger remaining budget, so a
+  revisited when a shorter path leaves a larger unspent budget, so a
   depth-limited tree does not lose descendants reachable by that path (the
   node may appear under both parents).
 - `limit` caps the number of returned root nodes: `Some(n)` is clamped to
