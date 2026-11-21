@@ -1826,7 +1826,7 @@ mod tests {
     /// a path/content/patch allowlist key; the decoded patch must still be
     /// scanned instead of short-circuited by the JSON early return.
     #[tokio::test(flavor = "multi_thread")]
-    async fn codex_apply_patch_exec_bridge_payload_extracts_target() {
+    async fn patch_exec_bridge_payload_extracts_target() {
         let (_store, validator) = validator_with(vec![rule(
             "global-no-python",
             &no_py_trigger(),
@@ -1919,18 +1919,18 @@ mod tests {
         )])
         .await;
 
-        let codex_envelope =
+        let envelope_patch =
             "*** Begin Patch\n*** Update File: scripts/run.py\n@@\n+print(1)\n*** End Patch\n";
-        let (v_codex, f_codex) = validator
-            .validate("apply_patch", codex_envelope, "/workspace", false)
+        let (v_envelope, f_envelope) = validator
+            .validate("apply_patch", envelope_patch, "/workspace", false)
             .await;
         assert_eq!(
-            f_codex,
+            f_envelope,
             vec!["global-no-python".to_string()],
-            "a Codex Begin Patch envelope must yield its target"
+            "an enveloped patch must yield its target"
         );
         assert!(matches!(
-            v_codex,
+            v_envelope,
             ValidateVerdict::DeterministicReject { .. }
         ));
 
@@ -1951,7 +1951,7 @@ mod tests {
 
         let json_envelope = serde_json::json!({
             "tool": "apply_patch",
-            "input": codex_envelope
+            "input": envelope_patch
         })
         .to_string();
         let (v_json, f_json) = validator
@@ -2033,6 +2033,38 @@ mod tests {
         assert!(matches!(
             v_huge,
             ValidateVerdict::DeterministicReject { .. }
+        ));
+    }
+
+    /// Review 6ad42c1d#r4650196713: edit search text must not become a patch
+    /// target; removing a patch example from a doc is documentation-only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn edit_search_text_is_not_scanned_as_a_patch() {
+        let (_store, validator) = validator_with(vec![rule(
+            "global-no-python",
+            &no_py_trigger(),
+            "Never use Python code",
+            "active",
+        )])
+        .await;
+
+        let payload = serde_json::json!({
+            "file_path": "/workspace/README.md",
+            "old_string": "*** Update File: scripts/demo.py\n+print(1)\n",
+            "new_string": ""
+        })
+        .to_string();
+        let (verdict, fired) = validator
+            .validate("edit", &payload, "/workspace", false)
+            .await;
+        assert!(
+            fired.is_empty(),
+            "an old_string patch example must not become a target: {:?}",
+            fired
+        );
+        assert!(matches!(
+            verdict,
+            ValidateVerdict::SandboxPassHighFidelity { .. }
         ));
     }
 }
