@@ -172,6 +172,13 @@ pub fn digest(raw: &str) -> String {
 /// Missing or malformed ledgers are normalized in place; legacy `queries[]`
 /// is never touched.
 pub fn ensure_events_section(doc: &mut Value) {
+    // A bare legacy `queries[]` array is wrapped losslessly: the rows survive
+    // verbatim and the object gains the additive events section below. This is
+    // the same normalization the ledger writer applies before it mutates.
+    if doc.is_array() {
+        let rows = std::mem::take(doc);
+        *doc = json!({ "queries": rows });
+    }
     if !doc.is_object() {
         *doc = json!({});
     }
@@ -181,6 +188,75 @@ pub fn ensure_events_section(doc: &mut Value) {
     }
     if !obj.get("events").map(Value::is_array).unwrap_or(false) {
         obj.insert("events".to_string(), json!([]));
+    }
+}
+
+/// The ONE ledger mutation path shared by every writer. It quarantines a
+/// corrupt file instead of clobbering it, normalizes a bare legacy array
+/// losslessly, and commits through a sibling temp file + atomic rename so a
+/// crashed process can never leave a half-written ledger behind.
+///
+/// `mutate` runs only on a freshly parsed (or normalized) document. If the
+/// original file is non-empty but not JSON, nothing is written at all: the
+/// caller's data is preserved at the original path and copied to
+/// `<ledger>.corrupt` for an operator to inspect.
+pub fn mutate_session_ledger<F>(path: &std::path::Path, namespace: &str, mutate: F)
+where
+    F: FnOnce(&mut Value),
+{
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let mut doc: Value = match std::fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => match serde_json::from_str::<Value>(&text) {
+            Ok(value) => value,
+            Err(err) => {
+                let corrupt = path.with_extension("json.corrupt");
+                if let Err(copy_err) = std::fs::copy(path, &corrupt) {
+                    tracing::warn!(
+                        "session ledger {} is corrupt ({err}); quarantine copy failed: {copy_err}",
+                        path.display()
+                    );
+                } else {
+                    tracing::warn!(
+                        "session ledger {} is corrupt ({err}); refusing to overwrite; quarantined to {}",
+                        path.display(),
+                        corrupt.display()
+                    );
+                }
+                return;
+            }
+        },
+        // Absent or empty file: start from a fresh, valid ledger document.
+        _ => json!({ "namespace": namespace, "queries": [] }),
+    };
+    if doc.is_array() {
+        let rows = std::mem::take(&mut doc);
+        doc = json!({ "namespace": namespace, "queries": rows });
+    } else if !doc.is_object() {
+        doc = json!({ "namespace": namespace, "queries": [] });
+    }
+    mutate(&mut doc);
+    let Ok(serialized) = serde_json::to_string_pretty(&doc) else {
+        return;
+    };
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "session_queries.json".to_string());
+    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+    if std::fs::write(&tmp, serialized).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(
+            "atomic rename of session ledger {} failed: {err}",
+            path.display()
+        );
     }
 }
 
@@ -639,17 +715,20 @@ pub fn trigger_context_from_result(result_text: &str) -> (String, Vec<String>) {
     )
 }
 
-/// Fill the two trigger-attribution fields from the REAL response, leaving a
-/// post-dispatch receipt otherwise untouched. No response actions means no
-/// trigger context — the advisory layer then honestly reports no applicable
-/// escalation instead of inventing one.
+/// Fill `prescribed_action_ids` from the REAL response actions, leaving the
+/// receipt's own `trigger_id` alone. A response's `next_actions` describe work
+/// the CALLER should do next; stamping one of those triggers onto the
+/// prescribing receipt would make an unresolved prescription look fulfilled.
+/// The only self-description we add is `T_PATH` for a `memories_for_file`
+/// receipt whose trigger slot is still empty — that receipt IS the genuine
+/// path lookup, not a prescription of one.
 pub fn attach_trigger_context(mut fields: ReceiptFields, result_text: &str) -> ReceiptFields {
-    let (trigger_id, action_ids) = trigger_context_from_result(result_text);
-    if !trigger_id.is_empty() {
-        fields.trigger_id = trigger_id;
-    }
+    let (_prescribed_trigger, action_ids) = trigger_context_from_result(result_text);
     if !action_ids.is_empty() {
         fields.prescribed_action_ids = action_ids;
+    }
+    if fields.trigger_id.trim().is_empty() && fields.tool == "neurostrata_memories_for_file" {
+        fields.trigger_id = "T_PATH".to_string();
     }
     fields
 }
@@ -851,5 +930,102 @@ mod tests {
         let empty = r#"{"recommendations":[],"gaps":[]}"#;
         assert_eq!(result_count(empty), 0);
         assert_eq!(derive_status(empty, false), ReceiptStatus::Empty);
+    }
+
+    // ---- Task 13 P1-2: a prescription never stamps its own trigger id ----
+    #[test]
+    fn attach_trigger_context_does_not_self_resolve() {
+        let base = build_dispatch_receipt(
+            "e".to_string(),
+            1,
+            "s".to_string(),
+            "ns".to_string(),
+            "neurostrata_memories_for_file".to_string(),
+            "q",
+            r#"{"memories":[]}"#,
+            false,
+            1,
+        );
+        // The response prescribes T_AMBIGUOUS; the prescribing receipt must
+        // still identify itself as the genuine T_PATH lookup.
+        let prescribing = r#"{"status":"empty","memories":[],"next_actions":[{"trigger_id":"T_AMBIGUOUS","action_id":"T_AMBIGUOUS:abc","tool":"neurostrata_locate"}]}"#;
+        let receipt = attach_trigger_context(base, prescribing);
+        assert_eq!(receipt.trigger_id, "T_PATH");
+        assert_eq!(receipt.prescribed_action_ids, vec!["T_AMBIGUOUS:abc"]);
+
+        // A receipt that already carries a genuine trigger keeps it.
+        let mut other = build_dispatch_receipt(
+            "e2".to_string(),
+            1,
+            "s".to_string(),
+            "ns".to_string(),
+            "neurostrata_related".to_string(),
+            "q",
+            r#"{"memories":[]}"#,
+            false,
+            1,
+        );
+        other.trigger_id = "T_HIGH_BLAST".to_string();
+        let other = attach_trigger_context(other, prescribing);
+        assert_eq!(other.trigger_id, "T_HIGH_BLAST");
+    }
+
+    // ---- Task 13 P1-5: corrupt-ledger quarantine + bare-array wrap ----
+    #[test]
+    fn mutate_session_ledger_quarantines_corrupt_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".NeuroStrata/session_queries.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "{ this is not json ";
+        std::fs::write(&path, original).unwrap();
+        mutate_session_ledger(&path, "ns", |doc| {
+            doc["events"] = json!([{"event_id": "should-never-land"}]);
+        });
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "a corrupt ledger must never be clobbered"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.corrupt")).unwrap(),
+            original,
+            "quarantine copy must hold the untouched original"
+        );
+    }
+
+    #[test]
+    fn mutate_session_ledger_wraps_bare_array_losslessly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("session_queries.json");
+        std::fs::write(&path, r#"[{"tool":"neurostrata_related","query":"x.rs"}]"#).unwrap();
+        mutate_session_ledger(&path, "ns", |doc| {
+            append_event(doc, json!({"event_id": "e1"}));
+        });
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["queries"][0]["tool"],
+            json!("neurostrata_related"),
+            "legacy rows survive verbatim"
+        );
+        assert_eq!(doc["namespace"], json!("ns"));
+        assert_eq!(doc["events"][0]["event_id"], json!("e1"));
+        // No sibling temp file is left behind after an atomic commit.
+        assert_eq!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().contains("tmp-"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn ensure_events_section_wraps_bare_array() {
+        let mut doc = json!([{"tool":"neurostrata_locate"}]);
+        ensure_events_section(&mut doc);
+        assert_eq!(doc["queries"][0]["tool"], json!("neurostrata_locate"));
+        assert_eq!(doc["events_version"], json!(EVENTS_VERSION));
+        assert!(doc["events"].as_array().unwrap().is_empty());
     }
 }

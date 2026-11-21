@@ -289,6 +289,22 @@ fn empty_lookup_routes_to_locate() {
 }
 
 #[test]
+fn empty_lookup_without_usable_seed_abstains() {
+    // P2: an empty lookup with no seed cannot form a schema-valid `query`;
+    // it must abstain with a suppressed_reason, not emit a locate with "".
+    let resp = recommended_next_actions(0, &[], 0, true, "NeuroStrata", None);
+    assert_eq!(resp["status"], "empty");
+    assert_eq!(resp["next_actions"].as_array().unwrap().len(), 0);
+    let reason = resp["suppressed_reason"].as_str().expect("suppressed_reason");
+    assert!(
+        reason.contains("no usable") && reason.contains("narrow"),
+        "reason was {reason:?}"
+    );
+    let blank = recommended_next_actions(0, &[], 0, true, "NeuroStrata", Some("   "));
+    assert_eq!(blank["next_actions"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn ordinary_single_file_edit_does_not_escalate() {
     // blast radius 3, no bridges -> no escalation; one-hop data is already
     // present in the response. suppressed_reason explains the abstention.

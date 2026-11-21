@@ -1,5 +1,7 @@
 #[path = "../../src/search.rs"]
 mod search;
+#[path = "../../src/task/routing.rs"]
+mod routing;
 
 use search::{
     append_search_contract_line, passes_filters, SearchFilters, SearchMemoryContract,
@@ -148,8 +150,9 @@ fn search_memory_contract_prefers_explicit_include_references() {
 // Tracked sites, including the generation source for the harness skill
 // (`.agents/.../SKILL.md`, pulled in via include_str! in harness_plugins.rs).
 // These are ALWAYS asserted — a missing tracked file is a failure, not a skip.
-const GRAPH_CONTRACT_TRACKED_SITES: [&str; 5] = [
+const GRAPH_CONTRACT_TRACKED_SITES: [&str; 6] = [
     "AGENTS.md",
+    ".agents/agents/NeuroStrata-Task.md",
     ".agents/skills/neurostrata/SKILL.md",
     "src/task/mod.rs",
     "src/task/wiring.rs",
@@ -199,4 +202,35 @@ fn prompt_sites_have_no_stale_graph_contract() {
     if generated.exists() {
         assert_graph_contract(&root, GENERATED_SKILL_SITE);
     }
+}
+
+// Task 13 P1-6: tool names + drift-prone required args in the canonical R4
+// contract must match the static agent prompt site.
+#[test]
+fn routing_contract_tool_names_match_agent_prompt() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let agent_prompt = fs::read_to_string(
+        root.join(".agents/agents/NeuroStrata-Task.md"),
+    )
+    .expect("agent prompt");
+    let contract = routing::agent_routing_contract_json();
+    for trigger in contract["triggers"].as_array().expect("triggers array") {
+        let tool = trigger["tool"].as_str().expect("tool");
+        // Only tools the Graph-First reflex documents belong in that prompt;
+        // every documented contract tool must still be named there.
+        if ["neurostrata_memories_for_file", "neurostrata_related", "neurostrata_sparql_query"]
+            .contains(&tool)
+        {
+            assert!(agent_prompt.contains(tool), "agent prompt missing tool {tool}");
+        }
+    }
+    // The two known drift points: related uses `max_hops`, not `depth`; search
+    // documents hybrid as default with `include_references`, never the removed
+    // `include_related` flag.
+    assert!(agent_prompt.contains("neurostrata_related"));
+    assert!(agent_prompt.contains("max_hops"), "related must document max_hops");
+    assert!(!agent_prompt.contains("`depth`"), "related must not document depth");
+    assert!(agent_prompt.contains("\"hybrid\"") && agent_prompt.contains("(default)"));
+    assert!(agent_prompt.contains("include_references: true"));
+    assert!(!agent_prompt.contains("include_related"));
 }

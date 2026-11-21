@@ -294,15 +294,20 @@ pub fn recommended_next_actions(
     let mut actions: Vec<Value> = Vec::new();
 
     if empty {
-        let args = json!({ "namespace": namespace, "query": seed_id.unwrap_or("") });
-        actions.push(next_action(
-            "T_AMBIGUOUS",
-            "neurostrata_locate",
-            &args,
-            &[],
-            "Empty lookup: narrow to a concrete symbol/path and re-run the path lookup.",
-            EXPECTED_AMBIGUOUS,
-        ));
+        // An empty lookup prescribes T_AMBIGUOUS only when there is a usable
+        // seed to narrow. With no seed there is no schema-valid `query` arg,
+        // so abstain (suppressed_reason is set when next_actions is empty).
+        if let Some(seed) = seed_id.filter(|id| !id.trim().is_empty()) {
+            let args = json!({ "namespace": namespace, "query": seed });
+            actions.push(next_action(
+                "T_AMBIGUOUS",
+                "neurostrata_locate",
+                &args,
+                &[],
+                "Empty lookup: narrow to a concrete symbol/path and re-run the path lookup.",
+                EXPECTED_AMBIGUOUS,
+            ));
+        }
     } else {
         if blast_radius_count >= HIGH_BLAST_THRESHOLD {
             // `routing::next_action` likewise refuses an empty seed id: a
@@ -321,7 +326,7 @@ pub fn recommended_next_actions(
                 ));
             }
         }
-        if let Some(bridge_id) = bridge_ids.iter().find(|id| !id.is_empty()) {
+        if let Some(bridge_id) = bridge_ids.iter().find(|id| !id.trim().is_empty()) {
             let args = json!({ "namespace": namespace, "id": bridge_id });
             actions.push(next_action(
                 "T_SEED_EDGE",
@@ -354,11 +359,14 @@ pub fn recommended_next_actions(
         .is_some_and(Vec::is_empty)
     {
         // State the *conditions* for escalation, not the observed values: a
-        // high-radius lookup with no usable seed also lands here.
-        response["suppressed_reason"] = Value::String(
+        // high-radius lookup with no usable seed, or an empty lookup with no
+        // seed to narrow, also lands here.
+        let reason = if empty {
+            "Empty lookup with no usable symbol/path seed: no schema-valid graph action to prescribe; narrow the query and re-run the path lookup."
+        } else {
             "Single-file lookup already carries 1-hop related memories; no trigger fired (high-blast needs radius >= 15 and a usable seed, no conceptual bridge, staged scope < 3)."
-                .to_string(),
-        );
+        };
+        response["suppressed_reason"] = Value::String(reason.to_string());
     }
     response
 }

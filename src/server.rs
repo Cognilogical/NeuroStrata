@@ -1988,10 +1988,15 @@ pub async fn process_mcp_request(
                         // `arguments` was moved into the handler; read the
                         // original params value instead.
                         let args_ref = params.get("arguments");
-                        if let Some(ns_arg) = args_ref
-                            .and_then(|a| a.get("namespace"))
-                            .and_then(Value::as_str)
                         {
+                            // P1-7: a failed MCP tools/call with no namespace
+                            // still records a receipt under "global" — MCP
+                            // post-dispatch receipt completeness is 100%.
+                            // Daemon REST/CLI are out of scope (spec §2).
+                            let ns_arg = args_ref
+                                .and_then(|a| a.get("namespace"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("global");
                             let query_raw = args_ref
                                 .and_then(|a| {
                                     a.get("query")
@@ -2093,7 +2098,9 @@ pub async fn process_mcp_request(
                                 .and_then(|a| {
                                     a.get("query")
                                         .or_else(|| a.get("path"))
+                                        .or_else(|| a.get("file_path"))
                                         .or_else(|| a.get("id"))
+                                        .or_else(|| a.get("memory_id"))
                                         .or_else(|| a.get("question"))
                                         .or_else(|| a.get("goal"))
                                 })
@@ -3534,6 +3541,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                 "unsupported": !graph_read,
                 "path": path,
                 "error": format!("{e:#}"),
+                "status": "failed",
+                "next_actions": [],
+                "suppressed_reason": "Path resolution failed; no graph lookup ran, so no escalation is prescribed.",
             });
             if e.downcast_ref::<crate::paths::UnresolvablePathError>()
                 .is_some()
@@ -3559,6 +3569,7 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
             "path": original_path,
             "status": "unsupported",
             "next_actions": [],
+            "suppressed_reason": "Graph-read backend unavailable; no lookup ran, so no escalation is prescribed.",
         })
         .to_string();
     };
@@ -5613,13 +5624,10 @@ fn apply_doctor_version(state: &mut Value, version: &str, allowed: bool) {
 /// `queries[]` rows are excluded from this metric by design (spec R6), so the
 /// thin wrapper delegates to the pure helper after parsing.
 fn active_task_graph_tool_names(
-    root: Option<&str>,
+    root: &std::path::Path,
     active_task_ids: &std::collections::BTreeSet<String>,
 ) -> Vec<String> {
-    let Some(root) = root else {
-        return Vec::new();
-    };
-    let path = std::path::Path::new(root).join(".NeuroStrata/session_queries.json");
+    let path = root.join(".NeuroStrata/session_queries.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -6495,9 +6503,14 @@ async fn handle_get_snapshot(
         .collect();
     let active_task_ids =
         crate::task::snapshot_readiness::active_task_ids(&active_task_status_rows);
+    // P1-8: snapshot readiness must read the SAME root the recorder writes.
+    // Route the hint through the shared receipt_ledger_root policy (validated
+    // worktree marker -> registry -> directory rows -> daemon CWD).
+    let ledger_root =
+        crate::task::receipt_ledger_root(inferred_root.as_deref(), &store, namespace).await;
     let readiness_input = crate::task::snapshot_readiness::ReadinessInput {
         concepts: readiness_concepts,
-        graph_tool_names: active_task_graph_tool_names(inferred_root.as_deref(), &active_task_ids),
+        graph_tool_names: active_task_graph_tool_names(&ledger_root, &active_task_ids),
         has_thesis,
     };
     let readiness_section =
@@ -11111,8 +11124,12 @@ async fn handle_search_memory(
         let registry_root = match crate::registry::cached_project_root(&store, namespace).await {
             Ok(root) => root,
             Err(e) => {
-                return format!(
-                    "ERROR [PATH_PREFIX]: failed to read namespace registry root for '{namespace}': {e}"
+                return crate::search::append_search_contract_line(
+                    format!(
+                        "ERROR [PATH_PREFIX]: failed to read namespace registry root for '{namespace}': {e}"
+                    ),
+                    &arguments,
+                    vec![],
                 );
             }
         };
@@ -11122,7 +11139,13 @@ async fn handle_search_memory(
             registry_root.as_deref(),
         ) {
             Ok(forms) => forms,
-            Err(e) => return format!("ERROR [PATH_PREFIX]: {e}"),
+            Err(e) => {
+                return crate::search::append_search_contract_line(
+                    format!("ERROR [PATH_PREFIX]: {e}"),
+                    &arguments,
+                    vec![],
+                )
+            }
         };
         search_filters.path_prefix_forms = prefix_forms;
     }
@@ -11214,7 +11237,11 @@ async fn handle_search_memory(
         let outcome = match outcome_res {
             Ok(outcome) => outcome,
             Err(error) => {
-                return format!("Failed to search the lexical index: {error}");
+                return crate::search::append_search_contract_line(
+                    format!("Failed to search the lexical index: {error}"),
+                    &arguments,
+                    vec![],
+                );
             }
         };
 
@@ -20733,6 +20760,45 @@ mod tests {
             !required_names.contains(&"namespace"),
             "namespace must not be in required: {:?}",
             required_names
+        );
+    }
+
+    /// Task 13 P1-7: a failed MCP tools/call with no `namespace` still writes a
+    /// post-dispatch receipt (under "global") — MCP completeness is 100%.
+    #[tokio::test]
+    async fn tools_call_without_namespace_still_records_receipt() {
+        let root = std::env::temp_dir().join(format!("ns-mcp-no-ns-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".git")).expect("worktree marker");
+        let store = Arc::new(MockStore::new());
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_search_memory",
+                "arguments": { "project_root": root.display().to_string() }
+            })),
+        };
+        let (bus, _seen) = recording_bus();
+        let _ = process_mcp_request(
+            request,
+            Arc::new(StubEmbedder),
+            store,
+            ingests,
+            None,
+            bus,
+        )
+        .await;
+        let ledger = root.join(".NeuroStrata").join("session_queries.json");
+        let text = std::fs::read_to_string(&ledger)
+            .unwrap_or_else(|e| panic!("no receipt ledger at {}: {e}", ledger.display()));
+        let doc: serde_json::Value = serde_json::from_str(&text).expect("ledger json");
+        let events = doc["events"].as_array().expect("events");
+        assert!(
+            events.iter().any(|e| e["tool"] == "neurostrata_search_memory"
+                && e["namespace"] == "global"),
+            "missing-namespace call must still record a receipt: {events:?}"
         );
     }
 

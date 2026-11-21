@@ -706,6 +706,112 @@ pub fn persist_active_session_file(
     }
 }
 
+/// The single rendered prompt used for BOTH the budget measurement and the
+/// final output, so a prompt that measures under 3,500 chars cannot grow past
+/// it in the copy that is actually emitted. Golden Rule ids/never dropped:
+/// shedding only tightens their snippet after hits/bridges/taxonomy are gone.
+fn render_subagent_prompt(
+    namespace: &str,
+    task_id: &str,
+    goal: &str,
+    golden_lines: &[String],
+    kept_hits: &[String],
+    bridges_prompt: &str,
+    taxonomy_prompt: &str,
+) -> String {
+    let mut combined: Vec<String> = golden_lines.to_vec();
+    combined.extend(kept_hits.iter().cloned());
+    let hits_block = if combined.is_empty() {
+        "  - (no pre-existing memories matched; run neurostrata_search_memory / neurostrata_memories_for_file as you explore)".to_string()
+    } else {
+        combined.join("\n")
+    };
+    format!(
+        "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
+         - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
+         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}{}\n\
+         - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `mode`: `hybrid` (default) + `include_references`: true / `neurostrata_sparql_query`).\n\
+         - Formal Verification Reflex: When adding or modifying a state machine, gate, sovereignty/ACL check, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to extract the pure decision into `src/formal_kernel.rs`, prove its theorems in `proofs/NeuroStrata/*.lean` (zero `sorry`/`axiom`), and extend `tests/lean_parity_test.rs`.",
+        namespace, task_id, goal, hits_block, bridges_prompt, taxonomy_prompt
+    )
+}
+
+/// Rebuild the Golden Rule prompt lines at a shorter snippet length. Every
+/// rule keeps its id and its line — only the snippet shrinks (240 -> 60 min).
+fn golden_prompt_lines(golden_rules: &[SearchResult], snippet_len: usize) -> Vec<String> {
+    golden_rules
+        .iter()
+        .map(|r| {
+            let snippet: String = r.payload.content.chars().take(snippet_len).collect();
+            let presented = crate::rdf::provenance::decorate_content(&snippet, &r.payload.metadata);
+            format!(
+                "  - [GOLDEN {}] `{}`: {}",
+                r.payload.memory_type,
+                r.id,
+                presented.replace('\n', " ")
+            )
+        })
+        .collect()
+}
+
+/// Map task metadata into the canonical R4 `TaskContext` so
+/// `routing::evaluate_triggers` has a production caller at task-context build
+/// time. Absent/neutral metadata fires nothing (honest abstention).
+fn task_routing_triggers(namespace: &str, metadata: &Value) -> Vec<crate::task::routing::RouteTrigger> {
+    let flag = |key: &str| metadata.get(key).and_then(Value::as_bool).unwrap_or(false);
+    crate::task::routing::evaluate_triggers(crate::task::routing::TaskContext {
+        namespace: namespace.to_string(),
+        known_path: None,
+        ambiguous_query: None,
+        blast_radius_count: 0,
+        blast_id: None,
+        staged_file_count: 0,
+        diff_text: None,
+        git_ref: None,
+        task_type: metadata
+            .get("task_type")
+            .and_then(Value::as_str)
+            .unwrap_or("task")
+            .to_string(),
+        design_review: flag("design_review"),
+        strategic: flag("strategic"),
+        cross_row_invariant: flag("cross_row_invariant"),
+        invariant_query: None,
+    })
+}
+
+/// Pure R4 seed-expansion leg. Only a seed with at least one real related
+/// edge earns a `T_SEED_EXPAND` next hop; a seed with no edges abstains
+/// honestly. The id is deliberately distinct from `T_SEED_EDGE`, which is the
+/// `object_view` prescription emitted by `memories_for_file` for conceptual
+/// bridges — the two response-derived seed triggers must never cross-resolve.
+fn seed_expand_next_hops(namespace: &str, seeds: &[String], edges: &[Value]) -> Vec<Value> {
+    let mut actions = Vec::new();
+    for seed in seeds.iter().take(3) {
+        if seed.trim().is_empty() {
+            continue;
+        }
+        let has_edge = edges.iter().any(|edge| {
+            edge.get("source").and_then(Value::as_str) == Some(seed.as_str())
+                || edge.get("target").and_then(Value::as_str) == Some(seed.as_str())
+        });
+        if !has_edge {
+            continue;
+        }
+        let trigger = crate::task::routing::RouteTrigger {
+            id: "T_SEED_EXPAND",
+            tool: "neurostrata_related",
+            args: json!({"namespace": namespace, "id": seed, "max_hops": 2}),
+            reason: "Seed has a real related edge; expand two hops before editing.".to_string(),
+        };
+        actions.push(crate::task::routing::next_action(&trigger, &[seed.clone()]));
+        if actions.len() >= 3 {
+            break;
+        }
+    }
+    actions
+}
+
 /// Auto-retrieve relevant governing rules, memories, code symbols, and 1-hop
 /// graph edges for a task, and format a ready-to-paste subagent prompt block.
 pub async fn build_task_graph_context(
@@ -717,19 +823,14 @@ pub async fn build_task_graph_context(
 ) -> (Value, String) {
     let golden_rules = collect_golden_rules(store, namespace, None).await;
     let mut golden_json = Vec::new();
-    let mut prompt_lines = Vec::new();
+    let mut golden_lines = golden_prompt_lines(&golden_rules, 240);
+    let mut golden_snippet_len = 240usize;
     let mut seen_ids: HashSet<String> = HashSet::new();
 
     for r in &golden_rules {
         seen_ids.insert(r.id.clone());
         let snippet: String = r.payload.content.chars().take(240).collect();
         let presented = crate::rdf::provenance::decorate_content(&snippet, &r.payload.metadata);
-        prompt_lines.push(format!(
-            "  - [GOLDEN {}] `{}`: {}",
-            r.payload.memory_type,
-            r.id,
-            presented.replace('\n', " ")
-        ));
         let mut entry = json!({
             "id": r.id,
             "memory_type": r.payload.memory_type,
@@ -832,15 +933,6 @@ pub async fn build_task_graph_context(
         }
     }
     let mut kept_hits = hit_lines.clone();
-    let mut hits_block = {
-        let mut combined: Vec<String> = prompt_lines.clone();
-        combined.extend(kept_hits.clone());
-        if combined.is_empty() {
-            "  - (no pre-existing memories matched; run neurostrata_search_memory / neurostrata_memories_for_file as you explore)".to_string()
-        } else {
-            combined.join("\n")
-        }
-    };
     // Partition the retrieved items into reserved normative memories and structural anchors.
     let normative_memories: Vec<Value> = hits_json
         .iter()
@@ -864,7 +956,7 @@ pub async fn build_task_graph_context(
     let conceptual_bridges = synthesize_conceptual_bridges(store, namespace, &hits_json).await;
 
     // Context-budgeted (<= 1200 chars) unrestricted Project Thesis & matched SKOS concepts (`neurostrata-f0bn`).
-    let (project_thesis, domain_concepts, taxonomy_prompt) =
+    let (project_thesis, domain_concepts, mut taxonomy_prompt) =
         if let Some(lb) = VectorStore::as_any(&**store).downcast_ref::<LadybugStore>() {
             crate::rdf::taxonomy::build_task_taxonomy_context(lb, namespace, &payload.content).await
         } else {
@@ -968,17 +1060,23 @@ pub async fn build_task_graph_context(
         }
     }
 
-    // next_hop_calls: <=3 copy-pasteable related calls derived from returned IDs.
-    // Honest trigger: do not claim T_HIGH_BLAST without a real blast_radius_count.
-    let mut next_hop_calls: Vec<Value> = Vec::new();
-    for seed in seeds.iter().take(3) {
-        let trigger = crate::task::routing::RouteTrigger {
-            id: "T_SEED_EDGE",
-            tool: "neurostrata_related",
-            args: json!({"namespace": namespace, "id": "", "max_hops": 2}),
-            reason: "seed edge from hybrid expansion".to_string(),
-        };
-        next_hop_calls.push(crate::task::routing::next_action(&trigger, &[seed.clone()]));
+    // next_hop_calls: <=3 copy-pasteable related calls derived from returned
+    // IDs. `T_SEED_EXPAND` is the task-context leg; it fires only for seeds
+    // with a real related edge and never claims a blast-radius signal.
+    let mut next_hop_calls = seed_expand_next_hops(namespace, &seeds, &related_edges);
+    // Task-level R4 triggers give `routing::evaluate_triggers` a production
+    // caller. Default task metadata fires nothing, so existing context tests
+    // are unchanged; the overall cap stays at three actions (§5).
+    let task_triggers = task_routing_triggers(namespace, &payload.metadata);
+    let lookup_ids: Vec<String> = hits_json
+        .iter()
+        .filter_map(|h| h.get("id").and_then(Value::as_str).map(String::from))
+        .collect();
+    for trigger in task_triggers {
+        if next_hop_calls.len() >= 3 {
+            break;
+        }
+        next_hop_calls.push(crate::task::routing::next_action(&trigger, &lookup_ids));
     }
 
     let expansion_error_value = expansion_error
@@ -1018,44 +1116,47 @@ pub async fn build_task_graph_context(
         })
         .unwrap_or_default();
 
-    // Full-prompt budget enforcement (Task 3 fix round 1).
-    let mut taxonomy_prompt_budget = taxonomy_prompt.clone();
+    // Full-prompt budget enforcement (Task 13 P1-9): one renderer for both
+    // measuring and output. Cap the Goal line, then shed in R2.4 order.
+    let goal: String = payload.content.chars().take(240).collect();
     loop {
-        let candidate = format!(
-            "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
-             - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
-             - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}{}\n\
-             - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `mode`: `hybrid` (default) + `include_references`: true / `neurostrata_sparql_query`).\n\
-             - Formal Verification Reflex: When adding or modifying a state machine, gate, sovereignty/ACL check, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to extract the pure decision into `src/formal_kernel.rs`, prove its theorems in `proofs/NeuroStrata/*.lean` (zero `sorry`/`axiom`), and extend `tests/lean_parity_test.rs`.",
-            namespace, task_id, payload.content, hits_block, bridges_prompt, taxonomy_prompt_budget
+        let candidate = render_subagent_prompt(
+            namespace,
+            task_id,
+            &goal,
+            &golden_lines,
+            &kept_hits,
+            &bridges_prompt,
+            &taxonomy_prompt,
         );
-        if candidate.chars().count() <= 3500 || kept_hits.is_empty() {
+        if candidate.chars().count() <= 3500 {
             break;
         }
-        kept_hits.pop();
-        let mut combined: Vec<String> = prompt_lines.clone();
-        combined.extend(kept_hits.clone());
-        hits_block = if combined.is_empty() {
-            "  - (no pre-existing memories matched; run neurostrata_search_memory / neurostrata_memories_for_file as you explore)".to_string()
+        if !kept_hits.is_empty() {
+            kept_hits.pop();
+        } else if !bridges_prompt.is_empty() {
+            bridges_prompt = String::new();
+        } else if !taxonomy_prompt.is_empty() {
+            taxonomy_prompt = String::new();
+        } else if golden_snippet_len > 60 {
+            golden_snippet_len = std::cmp::max(60, golden_snippet_len.saturating_sub(30));
+            golden_lines = golden_prompt_lines(&golden_rules, golden_snippet_len);
         } else {
-            combined.join("\n")
-        };
+            break;
+        }
     }
-    if format!("{}{}{}", hits_block, bridges_prompt, taxonomy_prompt_budget).chars().count() > 3500 {
-        bridges_prompt = String::new();
-    }
-    if format!("{}{}", hits_block, taxonomy_prompt_budget).chars().count() > 3500 {
-        taxonomy_prompt_budget = String::new();
-    }
-    let taxonomy_prompt = taxonomy_prompt_budget;
-
-    let subagent_prompt = format!(
-        "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
-         - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
-         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}{}\n\
-         - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `mode`: `hybrid` (default) + `include_references`: true / `neurostrata_sparql_query`).\
-         \n- Formal Verification Reflex: When adding or modifying a state machine, gate, sovereignty/ACL check, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to extract the pure decision into `src/formal_kernel.rs`, prove its theorems in `proofs/NeuroStrata/*.lean` (zero `sorry`/`axiom`), and extend `tests/lean_parity_test.rs`.",
-        namespace, task_id, payload.content, hits_block, bridges_prompt, taxonomy_prompt
+    let subagent_prompt = render_subagent_prompt(
+        namespace,
+        task_id,
+        &goal,
+        &golden_lines,
+        &kept_hits,
+        &bridges_prompt,
+        &taxonomy_prompt,
+    );
+    assert!(
+        subagent_prompt.chars().count() <= 3500,
+        "rendered subagent prompt exceeded the 3,500-char bound"
     );
     (auto_retrieved_context, subagent_prompt)
 }
@@ -1297,13 +1398,20 @@ fn has_worktree_marker(root: &std::path::Path) -> bool {
 /// the namespace registry's `project_root` then registered directory rows, and
 /// only fall back to the daemon CWD last. Mirrors `record_graph_query_with_root`
 /// so a daemon running outside the checkout writes and reads the same ledger.
-async fn receipt_ledger_root(
+pub(crate) async fn receipt_ledger_root(
     caller_root: Option<&str>,
     store: &Arc<dyn VectorStore>,
     namespace: &str,
 ) -> std::path::PathBuf {
     if let Some(hint) = caller_root.map(str::trim).filter(|s| !s.is_empty()) {
-        return walk_to_worktree_marker(resolve_session_root_dir(std::path::Path::new(hint)));
+        let candidate = walk_to_worktree_marker(resolve_session_root_dir(std::path::Path::new(hint)));
+        // A caller hint is only trusted when it actually resolves inside a
+        // worktree (`.git`/`.NeuroStrata`). A scratch dir with no marker must
+        // fall through to the registry/directory rows and daemon CWD, never
+        // become the ledger root.
+        if has_worktree_marker(&candidate) {
+            return candidate;
+        }
     }
     let ns = crate::server::resolve_namespace(store, namespace).await;
     if let Ok(Some((_, registry))) = store.get(&ns, &crate::registry::registry_row_id(&ns)).await {
@@ -1513,32 +1621,24 @@ pub async fn record_graph_query_with_root(
     };
     if let Some(root) = project_root {
         let ledger_path = std::path::Path::new(&root).join(".NeuroStrata/session_queries.json");
-        if let Some(parent) = ledger_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut doc: Value = std::fs::read_to_string(&ledger_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| json!({ "namespace": ns, "queries": [] }));
-        if let Some(arr) = doc.get_mut("queries").and_then(|v| v.as_array_mut()) {
-            // Legacy rows stay for compatibility; every quality-metric reader
-            // ignores them in favour of attributed `events[]` receipts.
-            arr.push(json!({
-                "ts": now,
-                "tool": tool_name,
-                "query": query_hint,
-                "governed_prefixes": [governed_prefix],
-            }));
-        }
         // NOTE (spec §6 R6.2): this is the PRE-dispatch legacy path. It writes
         // only the legacy `queries[]` row + task stamp above; it must NOT write
         // an `events[]` receipt, because no outcome exists yet. Receipts are
         // written exclusively by `record_tool_receipt` after the handler returns.
         // `attributed_task_id` is intentionally unused here now.
         let _ = attributed_task_id;
-        if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
-            let _ = std::fs::write(&ledger_path, serialized);
-        }
+        tool_receipts::mutate_session_ledger(&ledger_path, &ns, |doc| {
+            if let Some(arr) = doc.get_mut("queries").and_then(|v| v.as_array_mut()) {
+                // Legacy rows stay for compatibility; every quality-metric
+                // reader ignores them in favour of `events[]` receipts.
+                arr.push(json!({
+                    "ts": now,
+                    "tool": tool_name,
+                    "query": query_hint,
+                    "governed_prefixes": [governed_prefix],
+                }));
+            }
+        });
     }
 }
 
@@ -1575,9 +1675,13 @@ pub async fn record_tool_receipt(
     // Those counters are stamped exclusively by the handler-internal ledger
     // recorders; incrementing them here double-counts a single dispatch.
     if fields.task_id.is_empty() {
+        let now = chrono::Utc::now().timestamp();
         if let Ok(rows) = store.list(&ns, None, Some("task")).await {
             for r in &rows {
-                if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
+                if gate::is_task(r)
+                    && !gate::is_retired(&r.payload.metadata, now)
+                    && gate::task_status(r) == Status::InProgress
+                {
                     fields.task_id = r.id.clone();
                     break;
                 }
@@ -1596,19 +1700,11 @@ pub async fn record_tool_receipt(
         return;
     }
     let ledger_path = root.join(".NeuroStrata/session_queries.json");
-    if let Some(parent) = ledger_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let mut doc: Value = std::fs::read_to_string(&ledger_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({ "namespace": ns, "queries": [] }));
     let tool = fields.tool.clone();
-    tool_receipts::append_event(&mut doc, fields.to_value());
-    tool_receipts::bump_tool_invocation(&mut doc, &tool);
-    if let Ok(serialized) = serde_json::to_string_pretty(&doc) {
-        let _ = std::fs::write(&ledger_path, serialized);
-    }
+    tool_receipts::mutate_session_ledger(&ledger_path, &ns, |doc| {
+        tool_receipts::append_event(doc, fields.to_value());
+        tool_receipts::bump_tool_invocation(doc, &tool);
+    });
 }
 
 // ── tool: neurostrata_task_create ──────────────────────────────────────────
@@ -3291,6 +3387,7 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
         &memories
             .iter()
             .filter(|r| gate::is_task(r))
+            .filter(|r| !gate::is_retired(&r.payload.metadata, chrono::Utc::now().timestamp()))
             .map(|r| (r.id.clone(), gate::task_status(r).as_str().to_string()))
             .collect::<Vec<_>>(),
     );
@@ -5651,6 +5748,38 @@ mod tests {
             receipt_ledger_root(None, &store, ns).await,
             worktree,
             "validation reads the same root the recorder wrote"
+        );
+    }
+
+    /// Task 13 P1-8: a caller root hint without a worktree marker is untrusted;
+    /// resolution falls through to the registry root instead of using the hint.
+    #[tokio::test]
+    async fn ledger_root_ignores_caller_hint_without_worktree_marker() {
+        let store = temp_store().await;
+        let ns = "HintRootNs";
+        store.init(ns).await.expect("init namespace schema");
+        let scratch = std::env::temp_dir().join(format!(
+            "ns-scratch-hint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert!(!has_worktree_marker(&scratch));
+        let worktree = std::env::temp_dir().join(format!(
+            "ns-real-worktree-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        crate::registry::cache_project_root(
+            &store,
+            Some(&emb()),
+            ns,
+            worktree.to_str().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            receipt_ledger_root(Some(scratch.to_str().unwrap()), &store, ns).await,
+            worktree,
+            "unmarked scratch hint must fall through to the registry root"
         );
     }
 
@@ -9354,7 +9483,11 @@ mod tests {
             ),
             &result_text,
         );
-        assert_eq!(fields.trigger_id, "T_HIGH_BLAST");
+        // P1-2: a prescribing receipt identifies the tool that actually ran
+        // (T_PATH for memories_for_file); it never stamps a downstream
+        // prescribed trigger onto its own trigger_id. The prescription lives
+        // only in prescribed_action_ids and is resolved by the executing tool.
+        assert_eq!(fields.trigger_id, "T_PATH");
         assert!(fields
             .prescribed_action_ids
             .iter()
@@ -10414,6 +10547,38 @@ mod tests {
         let calls = ctx["next_hop_calls"].as_array().expect("next_hop_calls array");
         assert!(!calls.is_empty(), "next_hop_calls must be non-empty");
         assert_eq!(calls[0]["tool"], "neurostrata_related");
+        assert_eq!(calls[0]["trigger_id"], "T_SEED_EXPAND");
+    }
+
+    // Task 13 P1-4: no edges -> no action; with edge -> T_SEED_EXPAND; ids do
+    // not cross-resolve. P1-6: task metadata fires real R4 triggers.
+    #[test]
+    fn seed_expand_only_for_seeds_with_edges() {
+        let none = seed_expand_next_hops("ns", &["s1".to_string()], &[]);
+        assert!(none.is_empty(), "a seed with no edges must abstain");
+        let edges = vec![json!({"source":"s1","relation":"GOVERNS","target":"s2"})];
+        let some = seed_expand_next_hops("ns", &["s1".to_string(), "s9".to_string()], &edges);
+        assert_eq!(some.len(), 1, "only the seeded-with-edge id fires");
+        assert_eq!(some[0]["trigger_id"], "T_SEED_EXPAND");
+        assert_eq!(some[0]["tool"], "neurostrata_related");
+        assert_eq!(some[0]["args"]["id"], "s1");
+        assert!(some[0]["action_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("T_SEED_EXPAND:"));
+    }
+
+    #[test]
+    fn task_routing_triggers_use_canonical_contract() {
+        assert!(task_routing_triggers("ns", &json!({})).is_empty());
+        let routes = task_routing_triggers(
+            "ns",
+            &json!({"task_type": "feature", "strategic": true}),
+        );
+        let ids: Vec<&str> = routes.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec!["T_DOMAIN_NEW", "T_STRATEGIC"]);
+        assert_eq!(routes[1].tool, "neurostrata_taxonomy");
+        assert_eq!(routes[1].args["operation"], "advise");
     }
 
     #[tokio::test]
@@ -10473,6 +10638,55 @@ mod tests {
         assert!(prompt.contains("golden-1"), "golden rule must survive truncation: {prompt}");
         let golden = ctx["golden_rules"].as_array().expect("golden_rules");
         assert!(!golden.is_empty(), "golden_rules must remain present");
+    }
+
+    // Task 13 P1-9: a 2,500-char goal + many golden rules still renders under
+    // 3,500 chars with every Golden Rule id preserved.
+    #[tokio::test]
+    async fn subagent_prompt_bounded_with_long_goal_and_many_golden_rules() {
+        let store = temp_store().await;
+        store.init("probe").await.expect("init probe");
+        let mut ids = Vec::new();
+        for i in 0..15 {
+            let id = format!("golden-{i}");
+            ids.push(id.clone());
+            store
+                .upsert(
+                    "probe",
+                    &id,
+                    vec![0.5f32; 4],
+                    MemoryPayload {
+                        content: format!("rule {i}: {}", "g".repeat(200)),
+                        user_id: "owner".to_string(),
+                        memory_type: "rule".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: json!({"pinned": true, "access_count": 0}),
+                    },
+                )
+                .await
+                .expect("seed golden");
+        }
+        let payload = MemoryPayload {
+            content: "G".repeat(2500),
+            user_id: "owner".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        };
+        let (_ctx, prompt) =
+            build_task_graph_context(&store, "probe", "task-bound", &[0.5f32; 4], &payload).await;
+        assert!(
+            prompt.chars().count() <= 3500,
+            "prompt too long: {}",
+            prompt.chars().count()
+        );
+        for id in &ids {
+            assert!(prompt.contains(id), "golden rule id {id} was dropped");
+        }
     }
 
     // ── Capability C: task views + task_validate production surfaces ──────

@@ -16,10 +16,20 @@ pub const W_ONTOLOGY_STRATEGIC_MISS: &str = "W_ONTOLOGY_STRATEGIC_MISS";
 pub const T_HIGH_BLAST: &str = "T_HIGH_BLAST";
 pub const T_DIFF: &str = "T_DIFF";
 pub const T_STRATEGIC: &str = "T_STRATEGIC";
+pub const T_PATH: &str = "T_PATH";
+pub const T_AMBIGUOUS: &str = "T_AMBIGUOUS";
+pub const T_SEED_EDGE: &str = "T_SEED_EDGE";
+pub const T_SEED_EXPAND: &str = "T_SEED_EXPAND";
+pub const T_DOMAIN_NEW: &str = "T_DOMAIN_NEW";
+pub const T_INVARIANT: &str = "T_INVARIANT";
 
+const PATH_TOOL: &str = "neurostrata_memories_for_file";
+const AMBIGUOUS_TOOL: &str = "neurostrata_locate";
+const SEED_EDGE_TOOL: &str = "neurostrata_object_view";
 const HIGH_BLAST_TOOL: &str = "neurostrata_related";
 const DIFF_TOOL: &str = "neurostrata_diff_tour";
 const TAXONOMY_TOOL: &str = "neurostrata_taxonomy";
+const INVARIANT_TOOL: &str = "neurostrata_sparql_query";
 /// `empty` is a valid lookup outcome: a real tool ran and honestly found
 /// nothing. `unsupported`/`failed` are not genuine coverage.
 const GENUINE_STATUSES: &[&str] = &["success", "empty"];
@@ -79,6 +89,19 @@ fn events(ledger: &Value) -> &[Value] {
         .unwrap_or(&[])
 }
 
+/// Receipts carrying the same non-empty `event_id` are one lookup, even when
+/// the ledger replays them. A missing/empty id is counted once per row.
+fn unique_events(ledger: &Value) -> Vec<&Value> {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    events(ledger)
+        .iter()
+        .filter(|event| match event.get("event_id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => seen.insert(id),
+            _ => true,
+        })
+        .collect()
+}
+
 fn attributed(event: &Value, active_ids: &BTreeSet<String>) -> bool {
     event
         .get("task_id")
@@ -101,7 +124,7 @@ pub fn applicable_triggers_from_ledger(
     active_ids: &BTreeSet<String>,
 ) -> Vec<String> {
     let mut found = BTreeSet::new();
-    for event in events(ledger) {
+    for event in unique_events(ledger) {
         if !attributed(event, active_ids) {
             continue;
         }
@@ -149,15 +172,19 @@ pub fn compute_advisories(input: &AdvisoryInput<'_>) -> AdvisoryReport {
     // digest-only, so depth/seed cannot be parsed back out of a receipt; only
     // the action-id digest can prove the prescribed call actually ran.
     let mut expected_action_ids: BTreeSet<&str> = BTreeSet::new();
-    for event in events(input.ledger) {
-        if !attributed(event, input.active_task_ids)
-            || event.get("trigger_id").and_then(Value::as_str) != Some(T_HIGH_BLAST)
-        {
+    for event in unique_events(input.ledger) {
+        if !attributed(event, input.active_task_ids) {
             continue;
         }
+        // Prescriptions live in `prescribed_action_ids` as `<TRIGGER>:<hash>`;
+        // a prescribing receipt never claims the trigger in its own
+        // `trigger_id` (that slot identifies the tool that actually ran).
         if let Some(ids) = event.get("prescribed_action_ids").and_then(Value::as_array) {
             for value in ids {
-                if let Some(id) = value.as_str().filter(|s| !s.trim().is_empty()) {
+                if let Some(id) = value
+                    .as_str()
+                    .filter(|s| s.starts_with("T_HIGH_BLAST:"))
+                {
                     expected_action_ids.insert(id);
                 }
             }
@@ -170,7 +197,7 @@ pub fn compute_advisories(input: &AdvisoryInput<'_>) -> AdvisoryReport {
     let mut diff_resolved = false;
     let mut strategic_resolved = false;
 
-    for event in events(input.ledger) {
+    for event in unique_events(input.ledger) {
         if !attributed(event, input.active_task_ids) {
             continue;
         }
@@ -185,16 +212,21 @@ pub fn compute_advisories(input: &AdvisoryInput<'_>) -> AdvisoryReport {
             continue;
         }
         distinct_tools.insert(tool.to_string());
-        if let Some(id) = event.get("trigger_id").and_then(Value::as_str) {
-            // A T_HIGH_BLAST trigger id on a receipt marks the prescription
-            // (e.g. memories_for_file), not the expansion itself. Only exact
-            // followed-proof may resolve it.
-            if id != T_HIGH_BLAST {
-                resolved.insert(id);
-            }
-        }
+        // Resolve each trigger ONLY by the receipt of the tool that actually
+        // executes it. A prescribing receipt's `trigger_id` and
+        // `prescribed_action_ids` prove applicability, never follow-through.
         match tool {
+            PATH_TOOL => {
+                resolved.insert(T_PATH);
+            }
+            AMBIGUOUS_TOOL => {
+                resolved.insert(T_AMBIGUOUS);
+            }
+            SEED_EDGE_TOOL => {
+                resolved.insert(T_SEED_EDGE);
+            }
             HIGH_BLAST_TOOL => {
+                resolved.insert(T_SEED_EXPAND);
                 let proved = !expected_action_ids.is_empty()
                     && event
                         .get("followed_action_ids")
@@ -214,9 +246,18 @@ pub fn compute_advisories(input: &AdvisoryInput<'_>) -> AdvisoryReport {
                 diff_resolved = true;
                 resolved.insert(T_DIFF);
             }
-            TAXONOMY_TOOL if event.get("operation").and_then(Value::as_str) == Some("advise") => {
-                strategic_resolved = true;
-                resolved.insert(T_STRATEGIC);
+            TAXONOMY_TOOL => match event.get("operation").and_then(Value::as_str) {
+                Some("advise") => {
+                    strategic_resolved = true;
+                    resolved.insert(T_STRATEGIC);
+                }
+                Some("briefing") | Some("gaps") => {
+                    resolved.insert(T_DOMAIN_NEW);
+                }
+                _ => {}
+            },
+            INVARIANT_TOOL => {
+                resolved.insert(T_INVARIANT);
             }
             _ => {}
         }
@@ -393,5 +434,91 @@ mod tests {
             .unwrap()
             .iter()
             .any(|t| t == T_STRATEGIC));
+    }
+
+    // Task 13 P1-2: a prescribing receipt never resolves its own prescription.
+    #[test]
+    fn advisory_prescription_never_self_resolves_until_executing_tool() {
+        let active = active();
+        let applicable = vec![T_AMBIGUOUS.to_string()];
+        let allowed = vec![PATH_TOOL, AMBIGUOUS_TOOL];
+        let prescribing = json!({
+            "events": [{
+                "event_id": "prescription",
+                "task_id": "t-active",
+                "tool": PATH_TOOL,
+                "trigger_id": T_PATH,
+                "status": "empty",
+                "prescribed_action_ids": ["T_AMBIGUOUS:abc"]
+            }]
+        });
+        let report_for = |ledger: &Value| {
+            compute_advisories(&AdvisoryInput {
+                ledger,
+                active_task_ids: &active,
+                allowed_graph_tools: &allowed,
+                applicable_trigger_ids: &applicable,
+                taxonomy_available: false,
+                concept_grounding_linked: false,
+            })
+        };
+        let alone = report_for(&prescribing);
+        assert!(
+            alone.unresolved_trigger_ids.iter().any(|t| t == T_AMBIGUOUS),
+            "prescription alone must stay unresolved"
+        );
+        let mut with_locate = prescribing.clone();
+        with_locate["events"].as_array_mut().unwrap().push(json!({
+            "event_id": "locate",
+            "task_id": "t-active",
+            "tool": AMBIGUOUS_TOOL,
+            "trigger_id": T_AMBIGUOUS,
+            "status": "success"
+        }));
+        let resolved = report_for(&with_locate);
+        assert!(
+            resolved.unresolved_trigger_ids.iter().all(|t| t != T_AMBIGUOUS),
+            "a genuine locate receipt resolves T_AMBIGUOUS"
+        );
+    }
+
+    // Task 13 P1-8: replayed event_id counted once, not twice.
+    #[test]
+    fn advisory_replayed_event_id_deduped() {
+        let active = active();
+        let applicable = vec![T_HIGH_BLAST.to_string()];
+        let allowed = vec![PATH_TOOL, HIGH_BLAST_TOOL];
+        let ledger = json!({
+            "events": [
+                {
+                    "event_id": "same",
+                    "task_id": "t-active",
+                    "tool": PATH_TOOL,
+                    "status": "success",
+                    "trigger_id": T_PATH,
+                    "prescribed_action_ids": ["T_HIGH_BLAST:proof"]
+                },
+                {
+                    "event_id": "same",
+                    "task_id": "t-active",
+                    "tool": PATH_TOOL,
+                    "status": "success",
+                    "trigger_id": T_PATH,
+                    "prescribed_action_ids": ["T_HIGH_BLAST:proof"]
+                }
+            ]
+        });
+        let report = compute_advisories(&AdvisoryInput {
+            ledger: &ledger,
+            active_task_ids: &active,
+            allowed_graph_tools: &allowed,
+            applicable_trigger_ids: &applicable,
+            taxonomy_available: false,
+            concept_grounding_linked: false,
+        });
+        assert_eq!(
+            report.distinct_graph_tools, 1,
+            "a replayed event_id must not raise tool diversity"
+        );
     }
 }

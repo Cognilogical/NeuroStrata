@@ -545,16 +545,39 @@ fn snapshot_readiness_done_task_receipts_excluded() {
 
     let ledger = serde_json::json!({
         "events": [
-            { "task_id": "done-task", "tool": "neurostrata_related" },
-            { "task_id": "inprog-task", "tool": "neurostrata_sparql_query" },
-            { "task_id": "inprog-task", "tool": "neurostrata_related" },
-            { "tool": "neurostrata_locate" }
+            { "task_id": "done-task", "tool": "neurostrata_related", "status": "success" },
+            { "task_id": "inprog-task", "tool": "neurostrata_sparql_query", "status": "success" },
+            { "task_id": "inprog-task", "tool": "neurostrata_related", "status": "success" },
+            { "tool": "neurostrata_locate", "status": "success" }
         ]
     });
     assert_eq!(
         graph_tools_from_ledger(&ledger, &ids),
         vec!["neurostrata_related", "neurostrata_sparql_query"],
         "done-task and unattributed receipts must not count"
+    );
+}
+
+/// Task 13 P1-3: failed/unsupported receipts are not genuine coverage, and a
+/// replayed non-empty `event_id` is one lookup, not two.
+#[test]
+fn snapshot_readiness_failed_and_replayed_events_excluded() {
+    use snapshot_readiness::{active_task_ids, graph_tools_from_ledger};
+
+    let active = active_task_ids(&[("t1".to_string(), "in_progress".to_string())]);
+    let ledger = serde_json::json!({
+        "events": [
+            { "event_id": "e1", "task_id": "t1", "tool": "neurostrata_related", "status": "failed" },
+            { "event_id": "e2", "task_id": "t1", "tool": "neurostrata_locate", "status": "unsupported" },
+            { "event_id": "e3", "task_id": "t1", "tool": "neurostrata_sparql_query", "status": "empty" },
+            { "event_id": "e3", "task_id": "t1", "tool": "neurostrata_sparql_query", "status": "empty" },
+            { "event_id": "e4", "task_id": "t1", "tool": "neurostrata_related", "status": "success" }
+        ]
+    });
+    assert_eq!(
+        graph_tools_from_ledger(&ledger, &active),
+        vec!["neurostrata_related", "neurostrata_sparql_query"],
+        "failed/unsupported excluded; replayed e3 counted once"
     );
 }
 

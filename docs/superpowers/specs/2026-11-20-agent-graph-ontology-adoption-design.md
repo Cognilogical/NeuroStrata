@@ -86,7 +86,7 @@ This spec defines the remediation. It is implemented by `docs/superpowers/plans/
 | `T_PATH`       | known path before edit                                | `neurostrata_memories_for_file` | `namespace`, `path`, `include_ast_edges:true`   |
 | `T_AMBIGUOUS`  | unknown path/symbol or empty file lookup              | `neurostrata_locate`            | `namespace`, `query`                            |
 | `T_HIGH_BLAST` | `blast_radius_count >= 15`                            | `neurostrata_related`           | `namespace`, `id`, `max_hops:2`                 |
-| `T_DIFF`       | ≥3 staged files / PR review                           | `neurostrata_diff_tour`         | `namespace`, `git_ref`                          |
+| `T_DIFF`       | ≥3 staged files / PR review                           | `neurostrata_diff_tour`         | `namespace`, `diff_text`                        |
 | `T_DOMAIN_NEW` | `task_type` feature/epic or design review             | `neurostrata_taxonomy`          | `namespace`, `operation:"briefing"` then `gaps` |
 | `T_STRATEGIC`  | explicit strategic-improvement request                | `neurostrata_taxonomy`          | `namespace`, `operation:"advise"`, `top_k:5`    |
 | `T_INVARIANT`  | cross-row invariant not answered by bounded traversal | `neurostrata_sparql_query`      | `namespace`, `query` from template              |
@@ -94,6 +94,17 @@ This spec defines the remediation. It is implemented by `docs/superpowers/plans/
 2. `agent_routing_contract_json()` returns canonical JSON used by prompt builders and tests.
 3. `AGENTS.md` §3d/§10, both SKILL.md files, and generated prompt constants render from or are parity-checked against this contract. A test fails on drift (missing/renamed tool, wrong arg).
 4. Abstention: if no trigger matches, emit no action and no warning.
+
+**R4 erratum (Task 13):** `diff_tour` declares no `git_ref` arg; `T_DIFF`
+carries only `namespace` + `diff_text` (a raw ref belongs in `reason` text only).
+Two distinct response-derived seed triggers coexist and never cross-resolve:
+`T_SEED_EDGE` is the `neurostrata_object_view` prescription emitted by
+`memories_for_file` for a non-empty conceptual bridge (only for a non-blank
+bridge id); `T_SEED_EXPAND` is the `neurostrata_related(namespace, id,
+max_hops:2)` next hop emitted by `build_task_graph_context` ONLY for a seed that
+actually has ≥1 related edge (no edges → no action, honest abstention). Each
+is resolved on the receipt of its own executing tool, never on a prescribing
+receipt.
 
 ### R5 — Snapshot readiness (MCP payload only)
 
@@ -104,7 +115,7 @@ This spec defines the remediation. It is implemented by `docs/superpowers/plans/
 ### R6 — Honest telemetry
 
 1. Remove F6 fabrication entirely. `.NeuroStrata/session_queries.json` gains a versioned `events[]` section; legacy `queries[]` and `tool:"pre-commit"` rows are retained for compatibility but excluded from all quality metrics.
-2. Extend `record_graph_query_with_root` into a post-dispatch recorder used by all in-scope graph/ontology handlers. Fields: `event_id`, `ts`, `session_id`, `task_id`, `namespace`, `tool`, `operation`, `trigger_id`, `route_class`, `schema_valid`, `status` (`success|empty|unsupported|failed`), `latency_ms`, `result_count`, `returned_ids` (bounded), `prescribed_action_ids`, `followed_action_ids`, `query_digest`, `content_digest`.
+2. Extend the recorder into a post-dispatch recorder used by all in-scope graph/ontology handlers. Fields: `event_id`, `ts`, `session_id`, `task_id`, `namespace`, `tool`, `operation`, `trigger_id`, `route_class`, `schema_valid`, `status` (`success|empty|unsupported|failed`), `latency_ms`, `result_count`, `returned_ids` (bounded), `prescribed_action_ids`, `followed_action_ids`, `query_digest`, `content_digest`. "Digest-only" is scoped to `events[]`: the legacy `queries[]` section still holds raw query text by design. Recording scope is MCP `tools/call` post-dispatch only — daemon HTTP REST and CLI are operator/UI surfaces and are NOT recorded (spec §2 Non-Goals).
 3. Advanced subsystems get additive `tool_invocations: {tool: count}` counters only. No gates, quotas, or nudges.
 4. Receipts are private/local; verify zero receipt rows in SynapticMesh export.
 
@@ -124,7 +135,7 @@ This spec defines the remediation. It is implemented by `docs/superpowers/plans/
 | Metric                                                            | Threshold                          |
 | ----------------------------------------------------------------- | ---------------------------------- |
 | Contract drift (stale names/args in prompts)                      | 0                                  |
-| Post-dispatch receipt completeness                                | 100%                               |
+| MCP `tools/call` post-dispatch receipt completeness               | 100%                               |
 | Synthetic `pre-commit` lookup rows                                | 0                                  |
 | Applicable route coverage                                         | ≥95%                               |
 | Nonempty graph / ontology follow-through                          | ≥80% each                          |

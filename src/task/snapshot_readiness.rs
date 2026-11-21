@@ -43,6 +43,11 @@ pub fn active_task_ids(rows: &[(String, String)]) -> BTreeSet<String> {
         .collect()
 }
 
+/// Genuine outcomes: a real tool ran and either found something or honestly
+/// found nothing. `failed`/`unsupported` are not coverage and never count
+/// toward tool diversity.
+const GENUINE_STATUSES: &[&str] = &["success", "empty"];
+
 /// Distinct allowlisted graph tools from attributed post-dispatch events only.
 /// Legacy `queries[]` rows are ignored by design (spec R6 excludes them from
 /// quality metrics), so a ledger containing only legacy rows yields an empty
@@ -52,6 +57,7 @@ pub fn graph_tools_from_ledger(ledger: &Value, active_ids: &BTreeSet<String>) ->
         return Vec::new();
     };
     let mut tools: BTreeSet<String> = BTreeSet::new();
+    let mut seen_event_ids: BTreeSet<&str> = BTreeSet::new();
     for event in events {
         let attributed = event
             .get("task_id")
@@ -60,6 +66,20 @@ pub fn graph_tools_from_ledger(ledger: &Value, active_ids: &BTreeSet<String>) ->
             .unwrap_or(false);
         if !attributed {
             continue;
+        }
+        let status = event.get("status").and_then(Value::as_str).unwrap_or("");
+        if !GENUINE_STATUSES.contains(&status) {
+            continue;
+        }
+        // A replayed receipt (same non-empty event_id) is one lookup, not two.
+        if let Some(event_id) = event
+            .get("event_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            if !seen_event_ids.insert(event_id) {
+                continue;
+            }
         }
         if let Some(tool) = event.get("tool").and_then(Value::as_str) {
             if GRAPH_TOOLS.contains(&tool) {

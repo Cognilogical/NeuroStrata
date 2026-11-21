@@ -1,11 +1,14 @@
 //! Canonical agent routing contract (design spec §6 R4).
 //!
 //! This module is pure data plus deterministic evaluation: no store access, no
-//! I/O, no clock, no randomness. Prompt builders and tests render from
-//! `agent_routing_contract_json()` so tool names and required arguments cannot
-//! drift between the contract and its consumers. When no condition matches,
-//! `evaluate_triggers` returns an empty vector: abstention emits no action and
-//! no warning (R4.4).
+//! I/O, no clock, no randomness. `agent_routing_contract_json()` is the
+//! canonical R4 table; tests check the static prompt sites stay in sync with
+//! it (`GRAPH_CONTRACT_TRACKED_SITES` in `tests/search/upgraded_search_test.rs`
+//! plus a contract/site parity test) because the harness prompt files are
+//! authored prose, not generated from this table. `build_task_graph_context`
+//! calls `evaluate_triggers` for task-level triggers. When no condition
+//! matches it returns an empty vector: abstention emits no action and no
+//! warning (R4.4).
 
 use serde_json::{json, Value};
 
