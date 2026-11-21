@@ -5790,6 +5790,73 @@ mod tests {
         );
     }
 
+    /// #334/C2 review follow-up (4650591458): a shorter path to a shared DAG
+    /// node must be allowed to expand even after a longer path marked it.
+    #[tokio::test]
+    async fn tree_revisits_shared_nodes_with_a_larger_budget() {
+        fn contains_slug(node: &Value, slug: &str) -> bool {
+            if node.get("slug").and_then(Value::as_str) == Some(slug) {
+                return true;
+            }
+            node.get("children")
+                .and_then(Value::as_array)
+                .map(|children| children.iter().any(|child| contains_slug(child, slug)))
+                .unwrap_or(false)
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-shared";
+        store.init(ns).await.expect("init");
+
+        for (slug, broader) in [
+            ("alpha", None),
+            ("beta", Some(vec!["alpha"])),
+            ("charlie", Some(vec!["beta", "alpha"])),
+            ("delta", Some(vec!["charlie"])),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("shared DAG fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    broader: broader.map(|list| {
+                        list.into_iter().map(|item| item.to_string()).collect()
+                    }),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed shared DAG");
+        }
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                root_slug: Some("alpha".to_string()),
+                max_hops: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree over a shared DAG");
+        assert!(
+            contains_slug(&tree["roots"][0], "delta"),
+            "delta is two hops from alpha via the direct alpha→charlie edge: {tree}"
+        );
+    }
+
     /// #334/C2: `limit` must cap the number of returned roots.
     #[tokio::test]
     async fn tree_honours_limit() {
