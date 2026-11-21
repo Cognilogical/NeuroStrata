@@ -383,8 +383,39 @@ pub struct TaxonomyRequest {
     pub top_k: Option<usize>,
 }
 
+/// Keys accepted by `TaxonomyRequest`, for unknown-field visibility (#334/C3).
+/// Derived from a default serialization so new struct fields are picked up
+/// automatically, plus the serde aliases that are accepted but not emitted.
+pub fn unknown_taxonomy_request_fields(value: &Value) -> Vec<String> {
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    if let Ok(Value::Object(defaults)) = serde_json::to_value(TaxonomyRequest::default()) {
+        known.extend(defaults.keys().cloned());
+    }
+    for alias in ["action", "alt_labels", "related"] {
+        known.insert(alias.to_string());
+    }
+    let Some(obj) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = obj
+        .keys()
+        .filter(|key| !known.contains(*key))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
+}
+
 /// Typed response wrapper for `neurostrata_taxonomy`.
 pub type TaxonomyResponse = Value;
+
+/// Hard caps for `compare`: caller-controlled collections must not drive
+/// pairwise/ancestor work without a bound (#334/C1).
+pub const MAX_COMPARE_SLUGS: usize = 64;
+pub const MAX_COMPARE_AXES: usize = 32;
+/// Tree query controls (#334/C2).
+pub const MAX_TREE_HOPS: usize = 4;
+pub const MAX_TREE_ROOTS: usize = 50;
 
 fn normalize_slug_vec(raw: &[String]) -> Vec<String> {
     let mut set = BTreeSet::new();
@@ -2059,16 +2090,25 @@ fn build_tree_node(
     concepts: &BTreeMap<String, HydratedConcept>,
     allowed_set: &BTreeSet<String>,
     visited: &mut BTreeSet<String>,
+    remaining_hops: Option<usize>,
 ) -> Option<TaxonomyTreeNode> {
     if !visited.insert(slug.to_string()) {
         return None;
     }
     let c = concepts.get(slug)?;
     let mut children = Vec::new();
-    for child_slug in &c.narrower {
-        if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
-            if let Some(child_node) = build_tree_node(child_slug, concepts, allowed_set, visited) {
-                children.push(child_node);
+    if remaining_hops != Some(0) {
+        for child_slug in &c.narrower {
+            if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
+                if let Some(child_node) = build_tree_node(
+                    child_slug,
+                    concepts,
+                    allowed_set,
+                    visited,
+                    remaining_hops.map(|hops| hops.saturating_sub(1)),
+                ) {
+                    children.push(child_node);
+                }
             }
         }
     }
@@ -2151,11 +2191,21 @@ async fn execute_tree(
     };
 
     let mut visited = BTreeSet::new();
+    let max_hops = req.max_hops.map(|hops| hops.clamp(1, MAX_TREE_HOPS));
     let mut roots = Vec::new();
     for r_slug in root_slugs {
-        if let Some(node) = build_tree_node(&r_slug, &view.concepts, &allowed_slugs, &mut visited) {
+        if let Some(node) = build_tree_node(
+            &r_slug,
+            &view.concepts,
+            &allowed_slugs,
+            &mut visited,
+            max_hops,
+        ) {
             roots.push(node);
         }
+    }
+    if let Some(limit) = req.limit.map(|limit| limit.clamp(1, MAX_TREE_ROOTS)) {
+        roots.truncate(limit);
     }
 
     Ok(json!({
@@ -2552,6 +2602,12 @@ async fn execute_compare(
     if slugs.len() < 2 {
         return Err("compare requires at least 2 distinct concept slugs".to_string());
     }
+    if slugs.len() > MAX_COMPARE_SLUGS {
+        return Err(format!(
+            "compare supports at most {MAX_COMPARE_SLUGS} concept slugs (got {})",
+            slugs.len()
+        ));
+    }
 
     let now_ts = chrono::Utc::now().timestamp();
     let (active_rows, active_edges) = load_active_rows_and_edges(store, namespace, now_ts).await?;
@@ -2651,6 +2707,12 @@ async fn execute_compare(
         }
         union_axes.into_iter().collect()
     };
+    if axes.len() > MAX_COMPARE_AXES {
+        return Err(format!(
+            "compare supports at most {MAX_COMPARE_AXES} evaluation axes (got {})",
+            axes.len()
+        ));
+    }
 
     let mut axis_matrix: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for axis in &axes {
@@ -5774,5 +5836,23 @@ mod tests {
             1,
             "limit=1 must return one root: {tree}"
         );
+    }
+
+    /// #334/C3: unknown request keys are reported; aliases are recognised.
+    #[test]
+    fn unknown_taxonomy_request_fields_reports_only_unrecognised_keys() {
+        let value = json!({
+            "operation": "tree",
+            "namespace": "ns",
+            "limit": 1,
+            "typo_field": true,
+            "action": "tree",
+            "related": []
+        });
+        assert_eq!(
+            unknown_taxonomy_request_fields(&value),
+            vec!["typo_field".to_string()]
+        );
+        assert!(unknown_taxonomy_request_fields(&json!({})).is_empty());
     }
 }

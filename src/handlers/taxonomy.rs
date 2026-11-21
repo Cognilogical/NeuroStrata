@@ -107,6 +107,15 @@ pub async fn handle_taxonomy_with_auth_and_bus(
         })
         .to_string();
     }
+    let unknown_fields = crate::rdf::taxonomy::unknown_taxonomy_request_fields(arguments);
+    if !unknown_fields.is_empty() {
+        tracing::debug!(
+            operation = %req.operation,
+            namespace = %namespace,
+            unknown_fields = ?unknown_fields,
+            "taxonomy request contains unrecognised fields (ignored)"
+        );
+    }
 
     let requested_principal = req.principal.clone().or_else(|| {
         arguments
