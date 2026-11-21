@@ -12,7 +12,7 @@
 //! split, a split committed in another clone and a hand-added marker are all
 //! found from the push itself.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::root_marker::{self, MarkerRead, ROOT_CONFIG_REL};
@@ -183,14 +183,16 @@ fn depth(rel: &str) -> usize {
     }
 }
 
-/// Reads markers for one push, each (commit, folder) and each working-tree
-/// folder at most once.
+/// Reads markers for one push: each pushed commit's tree is listed once, and
+/// each (commit, folder) and each working-tree folder is read at most once.
 struct Resolver<'a> {
     git: &'a dyn GitRunner,
     top: PathBuf,
     canonical_top: PathBuf,
     /// (sha, folder) -> the committed marker in that folder of that commit.
     committed: HashMap<(String, String), Option<String>>,
+    /// sha -> the folders of that commit's tree that hold a marker file.
+    marker_folders: HashMap<String, HashSet<String>>,
     /// folder -> the deepest working-tree / main-checkout marker for it.
     worktree: HashMap<String, Option<(String, String)>>,
 }
@@ -208,19 +210,13 @@ impl Resolver<'_> {
         } else {
             format!("{folder}/{ROOT_CONFIG_REL}")
         };
-        // `ls-tree` needs only the commit's trees and prints nothing when the
-        // file is absent. Any failure there, or a failed `git show` of a file
-        // the tree lists (a blob missing from a partial clone, say), is an
-        // error: a marker that cannot be read must not drop its namespace.
-        let listed = self
-            .git
-            .git(&self.top, &["ls-tree", "-z", sha, "--", &rel])
-            .map_err(|e| {
-                format!("cannot look for the project marker {rel} in pushed commit {sha}: {e}")
-            })?;
-        let found = match listed.is_empty() {
-            true => None,
-            false => {
+        // A failed tree listing, or a failed `git show` of a file the tree
+        // lists (a blob missing from a partial clone, say), is an error: a
+        // marker that cannot be read must not drop its namespace.
+        let listed = self.marker_folders_of(sha, &rel)?.contains(folder);
+        let found = match listed {
+            false => None,
+            true => {
                 let bytes = self
                     .git
                     .git(&self.top, &["show", &format!("{sha}:{rel}")])
@@ -241,6 +237,32 @@ impl Resolver<'_> {
         };
         self.committed.insert(key, found.clone());
         Ok(found)
+    }
+
+    /// The folders of commit `sha` that hold a marker file, from one
+    /// `git ls-tree -r` of the commit (it needs only the commit's trees, not
+    /// its blobs). `rel` names the file asked for, for the error.
+    fn marker_folders_of(&mut self, sha: &str, rel: &str) -> Result<&HashSet<String>, String> {
+        if !self.marker_folders.contains_key(sha) {
+            let listed = self
+                .git
+                .git(&self.top, &["ls-tree", "-r", "-z", "--name-only", sha])
+                .map_err(|e| {
+                    format!("cannot look for the project marker {rel} in pushed commit {sha}: {e}")
+                })?;
+            let suffix = format!("/{ROOT_CONFIG_REL}");
+            let folders = nul_paths(listed)
+                .filter_map(|path| {
+                    if path == ROOT_CONFIG_REL {
+                        Some(String::new())
+                    } else {
+                        path.strip_suffix(&suffix).map(str::to_string)
+                    }
+                })
+                .collect();
+            self.marker_folders.insert(sha.to_string(), folders);
+        }
+        Ok(&self.marker_folders[sha])
     }
 
     /// The deepest committed marker at or above `folder` in commit `sha`:
@@ -369,6 +391,7 @@ pub fn namespaces_for_push_with(
         top,
         canonical_top,
         committed: HashMap::new(),
+        marker_folders: HashMap::new(),
         worktree: HashMap::new(),
     };
     for r in refs {
@@ -680,12 +703,46 @@ mod tests {
         // Folders: "" (README.md), a, a/b, a/.NeuroStrata (the marker).
         let got = namespaces_for_push_with(&counting, &dir, &new_branch(&sha, "main")).unwrap();
         assert_eq!(got, set(&["proj", "a-ns"]));
-        assert_eq!(
-            counting.lookups.get(),
-            4,
-            "one lookup per folder of the pushed commit"
-        );
+        assert_eq!(counting.lookups.get(), 1, "one tree listing per pushed commit");
         assert_eq!(counting.shows.get(), 1, "one git show per marker found");
+
+        // Two pushed refs at different commits: one listing each, however
+        // many folders.
+        write(&dir, "c/d/w.rs", "w");
+        let second = commit_all(&dir, "more");
+        let counting = CountingGit {
+            lookups: Cell::new(0),
+            shows: Cell::new(0),
+        };
+        let mut refs = new_branch(&sha, "main");
+        refs.extend(new_branch(&second, "other"));
+        let got = namespaces_for_push_with(&counting, &dir, &refs).unwrap();
+        assert_eq!(got, set(&["proj", "a-ns"]));
+        assert_eq!(counting.lookups.get(), 2, "one tree listing per pushed commit");
+    }
+
+    /// Real git, except that every `git ls-tree` fails.
+    struct LsTreeFailsGit;
+
+    impl GitRunner for LsTreeFailsGit {
+        fn git(&self, dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+            if args.first() == Some(&"ls-tree") {
+                return Err("fatal: not a tree object".to_string());
+            }
+            SystemGit.git(dir, args)
+        }
+    }
+
+    #[test]
+    fn failed_tree_listing_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        marker(&dir, "pkg", "pkg-ns");
+        write(&dir, "pkg/a.rs", "a");
+        let sha = commit_all(&dir, "split");
+        let err =
+            namespaces_for_push_with(&LsTreeFailsGit, &dir, &new_branch(&sha, "main")).unwrap_err();
+        assert!(err.contains("cannot look for the project marker"), "{err}");
     }
 
     #[test]

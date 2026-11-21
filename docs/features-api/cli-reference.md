@@ -194,7 +194,9 @@ Prints the namespace configured for a project. Order: the `namespace` of the pro
 `hooks install`, `get_snapshot`'s hook refresh and the daemon's startup install refresh the harness plugin files. Apart from `hooks install`'s `--namespace` or marker namespace (above), they write a namespace into a harness config only when it came from a harness config or, for `hooks install` and the CLI, `NEUROSTRATA_NAMESPACE` (the daemon does not read its own environment: one daemon serves every project); a ledger or folder-name answer is never written there. Each config keeps a usable namespace it already names, a config that cannot be read is left as it is, and a config with no namespace to write is not written. Config files are written through a temporary file and a rename. When the project marker cannot be read, `hooks install` and `get_snapshot`'s refresh write no new namespace into any config and say so; the daemon's startup install logs one warning naming the file and keeps each config's own namespace.
 ```bash
 neurostrata-mcp namespace resolve [dir]
+neurostrata-mcp namespace resolve --pushed [dir]
 ```
+With `--pushed` it reads the pre-push hook's stdin (`<local ref> <local sha> <remote ref> <remote sha>` lines) and prints, one per line, every namespace the push must pass the task gate for: the checkout's folder name, the resolved namespace, and the namespace of the marker over each path the pushed commits change, read from the pushed commit. It exits 1 on an unreadable marker on a pushed path, or when a committed and an untracked marker disagree.
 
 ### `root show`, `root set` & `root audit`
 Read and write the project marker `.NeuroStrata/config.json` (see [Project root](ops/project-root.md)).
