@@ -903,7 +903,8 @@ pub(crate) enum TaskCommands {
 pub(crate) enum NamespaceCommands {
     /// Print the namespace configured for a project: the project marker
     /// (.NeuroStrata/config.json), else the harness settings the installer
-    /// wrote (.claude/settings.local.json, the opencode, codex, hermes,
+    /// wrote (Claude's .NeuroStrata/plugins/claude/neurostrata.json, else
+    /// .claude/settings.local.json; then the opencode, codex, hermes,
     /// openclaw or GitHub CLI plugin config) in the checkout or its main
     /// checkout, else NEUROSTRATA_NAMESPACE, else the namespace in
     /// .NeuroStrata/session_queries.json, else the main checkout's folder

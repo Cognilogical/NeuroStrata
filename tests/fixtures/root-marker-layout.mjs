@@ -65,6 +65,9 @@ export function buildLayout(base, entries) {
       mkdirSync(path, { recursive: true })
     } else if (kind.startsWith('marker:')) {
       writeMarker(path, kind.slice('marker:'.length))
+    } else if (kind.startsWith('marker-text:')) {
+      mkdirSync(join(path, '.NeuroStrata'), { recursive: true })
+      writeFileSync(join(path, '.NeuroStrata', 'config.json'), kind.slice('marker-text:'.length))
     } else if (kind.startsWith('git-file:')) {
       mkdirSync(path, { recursive: true })
       writeFileSync(join(path, '.git'), `gitdir: ${kind.slice('git-file:'.length)}\n`)

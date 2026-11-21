@@ -13,11 +13,12 @@ LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 # The namespace configured for this project (harness settings; folder name
 # last), resolved in one place: `neurostrata-mcp namespace resolve`. The
 # ledger's own field and the folder name are fallbacks when the binary is
-# not on PATH or the lookup fails.
+# not on PATH or the lookup fails; a failed lookup's reason (an unreadable
+# project marker or harness config) stays on stderr.
 NAMESPACE=""
 RESOLVED=""
 if command -v neurostrata-mcp >/dev/null 2>&1; then
-    if NAMESPACE=$(neurostrata-mcp namespace resolve 2>/dev/null) && [ -n "$NAMESPACE" ]; then
+    if NAMESPACE=$(neurostrata-mcp namespace resolve) && [ -n "$NAMESPACE" ]; then
         RESOLVED=1
     else
         NAMESPACE=""

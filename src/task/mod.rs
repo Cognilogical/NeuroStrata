@@ -4040,11 +4040,12 @@ LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 # The namespace configured for this project (harness settings; folder name
 # last), resolved in one place: `neurostrata-mcp namespace resolve`. The
 # ledger's own field and the folder name are fallbacks when the binary is
-# not on PATH or the lookup fails.
+# not on PATH or the lookup fails; a failed lookup's reason (an unreadable
+# project marker or harness config) stays on stderr.
 NAMESPACE=""
 RESOLVED=""
 if command -v neurostrata-mcp >/dev/null 2>&1; then
-    if NAMESPACE=$(neurostrata-mcp namespace resolve 2>/dev/null) && [ -n "$NAMESPACE" ]; then
+    if NAMESPACE=$(neurostrata-mcp namespace resolve) && [ -n "$NAMESPACE" ]; then
         RESOLVED=1
     else
         NAMESPACE=""
@@ -6237,7 +6238,8 @@ mod tests {
 
     /// The pre-commit hook files the ledger under the namespace `namespace
     /// resolve` answered: an older ledger naming another one is updated, its
-    /// recorded lookups kept; a failed lookup leaves the ledger as it is.
+    /// recorded lookups kept; a failed lookup leaves the ledger as it is and
+    /// its reason reaches the hook's stderr.
     #[test]
     fn pre_commit_hook_updates_the_ledger_namespace_to_the_resolved_one() {
         let Some(bash) = hook_bash() else {
@@ -6272,7 +6274,7 @@ mod tests {
         std::fs::create_dir_all(&stub_dir).unwrap();
         write_exec_hook(
             &stub_dir.join("neurostrata-mcp"),
-            "#!/bin/sh\nif [ \"$1\" = namespace ]; then\n    [ -n \"$STUB_RESOLVE_EXIT\" ] && exit \"$STUB_RESOLVE_EXIT\"\n    echo alpha\n    exit 0\nfi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$1\" = namespace ]; then\n    if [ -n \"$STUB_RESOLVE_EXIT\" ]; then\n        echo 'error: namespace resolve: the project marker could not be read' >&2\n        exit \"$STUB_RESOLVE_EXIT\"\n    fi\n    echo alpha\n    exit 0\nfi\nexit 0\n",
         );
         let run = |resolve_exit: Option<&str>| {
             let mut dirs = vec![stub_dir.clone()];
@@ -6290,12 +6292,17 @@ mod tests {
             }
             let out = cmd.output().expect("the hook runs");
             assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stderr).to_string()
         };
         let read = || -> Value {
             serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap()
         };
-        run(Some("1"));
+        let stderr = run(Some("1"));
         assert_eq!(std::fs::read_to_string(&ledger).unwrap(), seeded, "a failed lookup changes nothing");
+        assert!(
+            stderr.contains("the project marker could not be read"),
+            "a failed lookup says why: {stderr}"
+        );
         run(None);
         let doc = read();
         assert_eq!(doc["namespace"], json!("alpha"));
@@ -8086,6 +8093,106 @@ mod tests {
                 .any(|v| v.kind == "in_progress"),
             "other worktree must not be blocked: {:?}",
             other_report.violations
+        );
+    }
+
+    /// Claim scope from a linked worktree of a marked namespace (design 6.5):
+    /// the registry root is the main checkout, so a claim without `worktree`
+    /// is stamped with the main checkout's branch; the plugins pass the
+    /// session's folder as `worktree`, and the claim keeps the linked
+    /// worktree's branch and worktree.
+    #[tokio::test]
+    async fn claim_from_a_linked_worktree_of_a_marked_namespace_keeps_its_scope_with_worktree() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let main = base.join("example-project");
+        let linked = base.join("example-project-wt");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(
+            &main,
+            &["worktree", "add", "-q", "-b", "feature/linked", &linked.to_string_lossy()],
+        );
+        crate::root_marker::replace_marker(&main, &crate::root_marker::RootConfig::new("MyProj"))
+            .unwrap();
+
+        let store = store_with_namespace("MyProj").await;
+        let rid = crate::registry::registry_row_id("MyProj");
+        let reg_vec = StubEmbedder.embed("registry").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &rid,
+                reg_vec,
+                MemoryPayload {
+                    content: "registry".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "structural".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "project_root": main.to_string_lossy().to_string() }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let claim = |id: String, extra: Value| {
+            let store = store.clone();
+            async move {
+                let mut args = json!({
+                    "namespace": "MyProj",
+                    "id": id,
+                    "assignee": "agent-a",
+                    "session_id": "ses_wt"
+                });
+                if let (Some(args), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+                    args.extend(extra.clone());
+                }
+                let reply = handle_task_claim(args, store).await;
+                assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+            }
+        };
+        let stamped = |id: String| {
+            let store = store.clone();
+            async move {
+                let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+                (
+                    payload.metadata["task"]["branch"].clone(),
+                    payload.metadata["task"]["worktree"].clone(),
+                )
+            }
+        };
+
+        // With the session's folder as `worktree`: the linked worktree's scope.
+        let with_wt = create_task(&store, "MyProj", "linked work", 2).await;
+        claim(with_wt.clone(), json!({ "worktree": linked.to_string_lossy() })).await;
+        let expected = gate::GateScope::capture(&linked);
+        assert_eq!(expected.branch.as_deref(), Some("feature/linked"));
+        assert_eq!(
+            stamped(with_wt).await,
+            (json!(expected.branch), json!(expected.worktree))
+        );
+
+        // Without it: the registry root, the main checkout.
+        let without = create_task(&store, "MyProj", "unscoped work", 2).await;
+        claim(without.clone(), json!({})).await;
+        let main_scope = gate::GateScope::capture(&main);
+        assert_eq!(main_scope.branch.as_deref(), Some("main"));
+        assert_eq!(
+            stamped(without).await,
+            (json!(main_scope.branch), json!(main_scope.worktree))
         );
     }
 

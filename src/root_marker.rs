@@ -1024,6 +1024,8 @@ mod tests {
             };
             if let Some(ns) = kind.strip_prefix("marker:") {
                 write_raw(&path, format!(r#"{{"version":1,"namespace":"{ns}"}}"#).as_bytes());
+            } else if let Some(text) = kind.strip_prefix("marker-text:") {
+                write_raw(&path, text.as_bytes());
             } else if let Some(gitdir) = kind.strip_prefix("git-file:") {
                 std::fs::create_dir_all(&path).unwrap();
                 std::fs::write(path.join(".git"), format!("gitdir: {gitdir}\n")).unwrap();
@@ -1067,8 +1069,18 @@ mod tests {
                 eprintln!("skipped {name:?}: the temp folder is inside a git checkout");
                 continue;
             }
-            let got = find_root_marker(&under(tmp.path(), case["query"].as_str().unwrap()))
-                .unwrap_or_else(|(path, reason)| panic!("{name}: unreadable {path:?}: {reason}"));
+            let got = find_root_marker(&under(tmp.path(), case["query"].as_str().unwrap()));
+            if let Some(folder) = expect["unreadable"].as_str() {
+                let (path, _) = got.expect_err(name);
+                let want = under(&base, folder).join(".NeuroStrata").join("config.json");
+                assert_eq!(
+                    dunce::canonicalize(&path).unwrap_or(path),
+                    dunce::canonicalize(&want).unwrap_or(want),
+                    "{name}"
+                );
+                continue;
+            }
+            let got = got.unwrap_or_else(|(path, reason)| panic!("{name}: unreadable {path:?}: {reason}"));
             match expect["root"].as_str() {
                 None => assert_eq!(got, None, "{name}"),
                 Some(root) => {

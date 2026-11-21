@@ -223,7 +223,59 @@ export interface FoundRootMarker {
   via: RootMarkerVia
 }
 
-type MarkerRead = { valid: true; namespace: string } | { valid: false }
+type MarkerRead =
+  | { valid: true; namespace: string }
+  | { valid: false; path: string; reason: string }
+
+/** Marker files already warned about in this process: one line each. */
+const warnedMarkers = new Set<string>()
+
+/**
+ * Says on stderr, once per file, that the project marker at `path` cannot be
+ * read and is skipped: the namespace then comes from the other sources, as
+ * `neurostrata-mcp` does with its own warning (design section 5).
+ */
+function warnUnreadableMarker(path: string, reason: string): void {
+  if (warnedMarkers.has(path)) return
+  warnedMarkers.add(path)
+  console.error(
+    `[NeuroStrata] warning: the project marker ${path} could not be read (${reason}); it is skipped`
+  )
+}
+
+/**
+ * The raw spelling of every top-level `version` value in a JSON object text
+ * that already parsed. JSON.parse reads `1.0` as 1, but the daemon's reader
+ * (an unsigned integer) refuses it, so the spelling is checked here.
+ */
+function topLevelVersionSpellings(text: string): string[] {
+  const found: string[] = []
+  let depth = 0
+  let i = 0
+  while (i < text.length) {
+    const c = text[i]
+    if (c === '"') {
+      let j = i + 1
+      while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1
+      const literal = text.slice(i, j + 1)
+      i = j + 1
+      if (depth !== 1) continue
+      let k = i
+      while (k < text.length && /\s/.test(text[k])) k++
+      if (text[k] !== ':' || JSON.parse(literal) !== 'version') continue
+      k++
+      while (k < text.length && /\s/.test(text[k])) k++
+      const number = /^-?[0-9][0-9.eE+-]*/.exec(text.slice(k))
+      found.push(number ? number[0] : text[k] ?? '')
+      i = k
+      continue
+    }
+    if (c === '{' || c === '[') depth++
+    else if (c === '}' || c === ']') depth--
+    i++
+  }
+  return found
+}
 
 const NAMESPACE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/
 
@@ -369,33 +421,37 @@ function linkedMainCheckout(top: string): string | null {
 
 /** The marker in `dir`: valid, unreadable, or null when there is none. */
 function readRootMarker(dir: string): MarkerRead | null {
+  const path = join(dir, '.NeuroStrata', 'config.json')
+  const unreadable = (reason: string): MarkerRead => ({ valid: false, path, reason })
   let text: string
   try {
-    text = readFileSync(join(dir, '.NeuroStrata', 'config.json'), 'utf8')
+    text = readFileSync(path, 'utf8')
   } catch (err) {
     return (err as { code?: string })?.code === 'ENOENT'
       ? null
-      : { valid: false }
+      : unreadable(String((err as Error)?.message ?? err))
   }
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1)
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
   } catch {
-    return { valid: false }
+    return unreadable('it is not valid JSON')
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    return { valid: false }
+    return unreadable('it is not a JSON object')
   }
   const doc = parsed as Record<string, unknown>
   const sourceId = doc.source_id
-  if (
-    doc.version !== 1 ||
-    typeof doc.namespace !== 'string' ||
-    !NAMESPACE_PATTERN.test(doc.namespace) ||
-    (sourceId !== undefined && sourceId !== null && typeof sourceId !== 'string')
-  ) {
-    return { valid: false }
+  const versions = topLevelVersionSpellings(text)
+  if (doc.version !== 1 || versions.length !== 1 || versions[0] !== '1') {
+    return unreadable('its version is not 1')
+  }
+  if (typeof doc.namespace !== 'string' || !NAMESPACE_PATTERN.test(doc.namespace)) {
+    return unreadable('its namespace is missing or not a namespace')
+  }
+  if (sourceId !== undefined && sourceId !== null && typeof sourceId !== 'string') {
+    return unreadable('its source_id is not a string')
   }
   return { valid: true, namespace: doc.namespace }
 }
@@ -433,8 +489,9 @@ function depthBelow(dir: string, top: string): number {
  *     never entering a folder with its own `.git`. Steps 1 and 2 both run;
  *     the deeper marker wins, at equal depth the own checkout's.
  *  3. Outside git: the first marker above the start folder.
- * When the winning marker cannot be read the answer is null: the caller
- * falls back to the other namespace sources, never to a marker further up.
+ * When the winning marker cannot be read the answer is null, with one
+ * warning line naming the file: the caller falls back to the other namespace
+ * sources, never to a marker further up.
  */
 export function findRootMarker(startDir: string): FoundRootMarker | null {
   if (typeof startDir !== 'string' || !isHostAbsolute(startDir)) return null
@@ -445,8 +502,11 @@ export function findRootMarker(startDir: string): FoundRootMarker | null {
     root: string,
     read: MarkerRead,
     via: RootMarkerVia
-  ): FoundRootMarker | null =>
-    read.valid ? { root, namespace: read.namespace, via } : null
+  ): FoundRootMarker | null => {
+    if (read.valid) return { root, namespace: read.namespace, via }
+    warnUnreadableMarker(read.path, read.reason)
+    return null
+  }
 
   const top = checkoutTop(start)
   if (top === null) {
@@ -1254,6 +1314,52 @@ let mcpClient!: NeuroStrataMCPClient
  */
 let pluginCtx: OpenClawPluginContext | null = null
 
+/** The project folder this session runs in, from the host or the runner. */
+let sessionProjectDir: string | undefined
+
+/** The NeuroStrata tools whose scope follows the session's project folder. */
+const SESSION_SCOPED_TOOLS = ['neurostrata_task_claim', 'neurostrata_get_snapshot']
+
+/**
+ * Whether `toolName` is one of SESSION_SCOPED_TOOLS, bare or as a host
+ * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
+ * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
+ * A copy of core's `isSessionScopedTool`.
+ */
+export function isSessionScopedTool(toolName: string): boolean {
+  const name = String(toolName ?? '')
+  return SESSION_SCOPED_TOOLS.some(
+    (tool) =>
+      name === tool ||
+      (name.endsWith(tool) && /[_.:]$/.test(name.slice(0, -tool.length)))
+  )
+}
+
+/**
+ * Claim scope from a linked worktree (design 6.5): passes the session's
+ * project folder as `worktree` on `neurostrata_task_claim` and
+ * `neurostrata_get_snapshot` calls that carry no `worktree`, `project_root`
+ * or `cwd`, which the daemon would otherwise scope to the namespace's
+ * registry root (the main checkout when a marker applies). Changes `args`
+ * in place; true when it did. A copy of core's `addSessionWorktree`.
+ */
+export function addSessionWorktree(
+  toolName: string,
+  args: Record<string, unknown>,
+  projectDir: string | undefined
+): boolean {
+  if (!isSessionScopedTool(toolName) || !projectDir) return false
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return false
+  if (
+    asString(args.worktree) ||
+    asString(args.project_root) ||
+    asString(args.cwd)
+  )
+    return false
+  args.worktree = projectDir
+  return true
+}
+
 function requireCtx(): OpenClawPluginContext {
   if (!pluginCtx) {
     throw new Error('NeuroStrata plugin used before initialize()')
@@ -1265,10 +1371,8 @@ export async function initialize(
   ctx: (Partial<OpenClawPluginContext> & Record<string, unknown>) | undefined
 ): Promise<void> {
   pluginCtx = (ctx as OpenClawPluginContext) ?? null
-  config = resolveConfig(
-    ctx?.config ?? ctx ?? {},
-    asString(ctx?.projectDir) ?? process.cwd()
-  )
+  sessionProjectDir = asString(ctx?.projectDir) ?? process.cwd()
+  config = resolveConfig(ctx?.config ?? ctx ?? {}, sessionProjectDir)
 
   const token = config.bearerToken ?? loadDaemonToken(config.tokenFile)
   mcpClient = new NeuroStrataMCPClient({
@@ -1503,11 +1607,17 @@ export async function handleHookEvent(
       await runActionGuard(toolName, JSON.stringify(toolInput))
     )
   }
+  const scoped = addSessionWorktree(
+    toolName,
+    toolInput,
+    sessionProjectDir ?? asString(event.cwd) ?? process.cwd()
+  )
   return {
     continue: true,
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
-      permissionDecision: 'allow'
+      permissionDecision: 'allow',
+      ...(scoped ? { updatedInput: toolInput } : {})
     }
   }
 }

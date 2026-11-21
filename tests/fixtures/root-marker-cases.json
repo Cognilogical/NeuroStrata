@@ -5,6 +5,7 @@
     "Each case is built in its own empty temporary folder; every path below is relative to that folder and uses '/'.",
     "layout: entries created in order. An entry is '<path>' (create the folder) or '<path> <kind>', split at the first space:",
     "  marker:<ns>          write <path>/.NeuroStrata/config.json as {\"version\":1,\"namespace\":\"<ns>\"}",
+    "  marker-text:<text>   write <text> (the rest of the entry, as is) to <path>/.NeuroStrata/config.json",
     "  neurostrata-dir      create <path>/.NeuroStrata as an empty folder (no config.json: not a marker)",
     "  neurostrata-link:<t> make <path>/.NeuroStrata a link to the folder <t> (a symlink, or a junction on Windows): not a marker",
     "  git-dir              create <path>/.git as a folder (a regular checkout)",
@@ -12,7 +13,8 @@
     "  commondir:<rel>      create the folder <path> and write <path>/commondir containing <rel> (a linked worktree's gitdir)",
     "  file                 create an empty file at <path>",
     "query: the path to resolve. expect.root: the folder the marker makes the project root, or null for none.",
-    "expect.namespace and expect.via (own_checkout | main_checkout | no_git) are present when expect.root is not null."
+    "expect.namespace and expect.via (own_checkout | main_checkout | no_git) are present when expect.root is not null.",
+    "expect.unreadable, when present (with expect.root null): the folder whose marker decides but cannot be read; the Rust walk answers an error naming its config.json, the plugins answer none."
   ],
   "cases": [
     {
@@ -142,6 +144,31 @@
     {
       "name": "folder that is itself a checkout top",
       "layout": ["repo git-dir", "repo marker:example-project"],
+      "query": "repo",
+      "expect": { "root": "repo", "namespace": "example-project", "via": "own_checkout" }
+    },
+    {
+      "name": "version spelled 1.0 is unreadable, and the marker above it is not used",
+      "layout": [
+        "repo git-dir",
+        "repo marker:example-project",
+        "repo/sub marker-text:{\"version\": 1.0, \"namespace\": \"example-sub\"}"
+      ],
+      "query": "repo/sub",
+      "expect": { "root": null, "unreadable": "repo/sub" }
+    },
+    {
+      "name": "unknown version is unreadable",
+      "layout": ["repo git-dir", "repo marker-text:{\"version\": 2, \"namespace\": \"example-project\"}"],
+      "query": "repo",
+      "expect": { "root": null, "unreadable": "repo" }
+    },
+    {
+      "name": "a version field inside another field does not count",
+      "layout": [
+        "repo git-dir",
+        "repo marker-text:{\"version\": 1, \"namespace\": \"example-project\", \"extra\": {\"version\": 1.5}}"
+      ],
       "query": "repo",
       "expect": { "root": "repo", "namespace": "example-project", "via": "own_checkout" }
     }

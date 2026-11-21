@@ -170,7 +170,9 @@ import {
   DAEMON_MEMORY_ADVICE_MARKER,
   resetAdvisoryStateForTesting,
   extractDaemonMemoryAdvisory,
-  daemonTokenPath
+  daemonTokenPath,
+  addSessionWorktree,
+  isSessionScopedTool
 } from './dist/index.js'
 
 // ──────────────────────────────────────────────────────────────────────
@@ -576,13 +578,109 @@ describe('project root marker and namespace order', () => {
   })
 
   it('resolveHookProjectDir: a session in the home folder writes no session file there', () => {
+    // The stand-in home holds `.git` so the walk stops there: without it the
+    // walk would reach the real home folder above the temp folder.
     const home = tempDir()
+    mkdirSync(join(home, '.git'), { recursive: true })
     mkdirSync(join(home, '.NeuroStrata'), { recursive: true })
     const start = { session_id: 's1', cwd: home, hook_event_name: 'SessionStart' }
     assert.equal(resolveHookProjectDir('claude', start, {}, home), home)
     assert.equal(existsSync(join(home, '.NeuroStrata', 'active_session.json')), false)
     const later = { ...start, hook_event_name: 'PreToolUse' }
     assert.equal(resolveHookProjectDir('claude', later, {}, home), home)
+  })
+
+  it('resolveHookProjectDir: a later SessionStart keeps the recorded folder', () => {
+    const base = tempDir()
+    buildLayout(base, ['repo git-dir', 'repo neurostrata-dir', 'repo/packages/api'])
+    const repo = under(base, 'repo')
+    const api = under(base, 'repo/packages/api')
+    const start = { session_id: 's1', cwd: repo, hook_event_name: 'SessionStart' }
+    assert.equal(resolveHookProjectDir('claude', start, {}), repo)
+    // Resume, clear or compact after a `cd`: the session's folder stays.
+    assert.equal(resolveHookProjectDir('claude', { ...start, cwd: api }, {}), repo)
+    assert.equal(
+      resolveHookProjectDir('claude', { ...start, cwd: api, hook_event_name: 'PreToolUse' }, {}),
+      repo
+    )
+    const sessionPath = join(repo, '.NeuroStrata', 'active_session.json')
+    const state = JSON.parse(readFileSync(sessionPath, 'utf8'))
+    assert.deepEqual(state.claude_session_dirs, { s1: repo })
+  })
+
+  it('resolveHookProjectDir: a session file that cannot be parsed is left alone', () => {
+    const base = tempDir()
+    buildLayout(base, ['repo git-dir', 'repo neurostrata-dir'])
+    const repo = under(base, 'repo')
+    const sessionPath = join(repo, '.NeuroStrata', 'active_session.json')
+    writeFileSync(sessionPath, '{ half a fi')
+    const start = { session_id: 's1', cwd: repo, hook_event_name: 'SessionStart' }
+    assert.equal(resolveHookProjectDir('claude', start, {}), repo)
+    assert.equal(readFileSync(sessionPath, 'utf8'), '{ half a fi')
+  })
+
+  it('an unreadable marker is skipped with one warning naming the file', () => {
+    const base = tempDir()
+    buildLayout(base, [
+      'repo git-dir',
+      'repo marker-text:{"version": 1.0, "namespace": "example-project"}'
+    ])
+    const repo = under(base, 'repo')
+    const lines = []
+    const original = console.error
+    console.error = (...args) => lines.push(args.join(' '))
+    try {
+      assert.equal(findRootMarker(repo), null)
+      assert.equal(findRootMarker(repo), null)
+      assert.equal(resolveConfig({ namespace: 'from-config' }, repo).namespace, 'from-config')
+    } finally {
+      console.error = original
+    }
+    const file = join(repo, '.NeuroStrata', 'config.json')
+    assert.equal(lines.length, 1, JSON.stringify(lines))
+    assert.ok(lines[0].includes(file), lines[0])
+  })
+})
+
+describe('claim scope from a linked worktree', () => {
+  it('recognizes task_claim and get_snapshot in each tool spelling', () => {
+    for (const name of [
+      'neurostrata_task_claim',
+      'mcp__neurostrata__neurostrata_task_claim',
+      'neurostrata_neurostrata_get_snapshot',
+      'neurostrata.neurostrata_get_snapshot'
+    ]) {
+      assert.equal(isSessionScopedTool(name), true, name)
+    }
+    for (const name of ['neurostrata_task_update', 'xneurostrata_task_claim', 'Read']) {
+      assert.equal(isSessionScopedTool(name), false, name)
+    }
+  })
+
+  it('passes the session folder as worktree only when the call names no root', () => {
+    const args = { id: 'example-project-1' }
+    assert.equal(addSessionWorktree('neurostrata_task_claim', args, '/wt'), true)
+    assert.equal(args.worktree, '/wt')
+    for (const key of ['worktree', 'project_root', 'cwd']) {
+      const own = { [key]: '/own' }
+      assert.equal(addSessionWorktree('neurostrata_task_claim', own, '/wt'), false)
+      assert.deepEqual(own, { [key]: '/own' })
+    }
+    const other = {}
+    assert.equal(addSessionWorktree('neurostrata_task_update', other, '/wt'), false)
+    assert.deepEqual(other, {})
+  })
+
+  it('the Claude PreToolUse reply carries the worktree in updatedInput', async () => {
+    const out = await handleHookEvent({
+      hook_event_name: 'PreToolUse',
+      tool_name: 'mcp__neurostrata__neurostrata_task_claim',
+      tool_input: { id: 'example-project-1', namespace: 'example-project' }
+    })
+    const input = out.hookSpecificOutput.updatedInput
+    assert.equal(typeof input.worktree, 'string')
+    assert.notEqual(input.worktree, '')
+    assert.equal(input.id, 'example-project-1')
   })
 })
 
