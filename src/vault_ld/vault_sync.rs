@@ -3911,6 +3911,146 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// PR #363: ingestion replays every memory's declarations through
+    /// `relink_edges`. A vault head carrying `exact_edge_targets` must keep its
+    /// bare target when a same-path symbol is published later; replay may not
+    /// infer the symbol and leave the imported edge set changed.
+    #[tokio::test]
+    async fn relink_preserves_exact_vault_targets_across_ingestion() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-replay-targets-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_replay_targets";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        // `a` links the note `z`; the body avoids the symbol name so the
+        // mention detector has nothing to infer. `z` is a real vault note.
+        let mut a = note("a", &["z"]);
+        a.content = "links the target note".to_string();
+        a.canonical_sha256 = a.fingerprint();
+        let mut z = note("z", &[]);
+        z.content = "vault note body".to_string();
+        z.canonical_sha256 = z.fingerprint();
+        std::fs::write(vault.join("a.md"), a.to_markdown()).expect("write a");
+        std::fs::write(vault.join("z.md"), z.to_markdown()).expect("write z");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let linked = |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| -> Vec<String> {
+            edges
+                .iter()
+                .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+                .map(|(_, _, to, _)| to.clone())
+                .collect()
+        };
+        assert_eq!(
+            linked(&store.list_edges(ns).await.expect("initial edges")),
+            vec!["z".to_string()],
+            "the import binds the bare vault note"
+        );
+
+        // Simulate the next ingestion: a code symbol whose logical path is `z`
+        // is staged, published, and the declarations are replayed.
+        let generation = store.begin_generation(ns, "code").await.expect("begin");
+        let symbol_id = crate::parser::ingest::generation_scoped_id(ns, generation, "z");
+        store
+            .upsert(
+                ns,
+                &symbol_id,
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "an ingested symbol".to_string(),
+                    user_id: "auto-ingestor".to_string(),
+                    memory_type: "symbol".to_string(),
+                    agent_name: Some("auto-ingestor".to_string()),
+                    location: "z".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed same-path symbol");
+        store
+            .publish_generation(ns, "code", generation)
+            .await
+            .expect("publish");
+        store
+            .relink_edges(ns, "code")
+            .await
+            .expect("replay declarations");
+
+        let edges = store.list_edges(ns).await.expect("edges after replay");
+        assert_eq!(
+            linked(&edges),
+            vec!["z".to_string()],
+            "replay must not add a second target to the exact declaration: {edges:?}"
+        );
+        assert!(
+            !edges.iter().any(|(_, _, to, _)| to == &symbol_id),
+            "replay must not infer the same-path symbol: {edges:?}"
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("a.md")).expect("read export");
+        assert_eq!(
+            markdown.matches("[[z]]").count(),
+            1,
+            "export must render the one declared link: {markdown}"
+        );
+        assert!(
+            !markdown.contains(&format!("[[{symbol_id}]]")),
+            "export must not render the symbol as a link: {markdown}"
+        );
+
+        let prior_sha = store
+            .get(ns, "a")
+            .await
+            .expect("get head")
+            .expect("head exists")
+            .1
+            .metadata["canonical_sha256"]
+            .clone();
+        let again = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            again.notes_imported, 0,
+            "the exact replay must keep the fingerprint stable"
+        );
+        assert_eq!(
+            store
+                .get(ns, "a")
+                .await
+                .expect("get reimported head")
+                .expect("head exists")
+                .1
+                .metadata["canonical_sha256"],
+            prior_sha,
+            "the head fingerprint must not churn"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Delegating store that fails one head upsert, so the caller can prove a
     /// failed reimport never leaves edges deleted under a surviving old head.
     struct FailingHeadUpsertStore {

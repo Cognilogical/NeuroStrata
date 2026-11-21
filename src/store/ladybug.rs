@@ -11864,6 +11864,14 @@ impl VectorStore for LadybugStore {
         // memoized map instead of rebuilding it per memory.
         let _ = known.mention_candidates();
 
+        let namespace_ids: std::collections::HashSet<&str> =
+            memories.iter().map(|m| m.id.as_str()).collect();
+        let own_namespace_prefix = format!(
+            "{}{}",
+            namespace,
+            crate::parser::ingest::NAMESPACE_SEPARATOR
+        );
+
         // Grouped by relationship because the type is part of the statement and
         // cannot be a value in it: three groups, so three statements, whatever
         // the edge count.
@@ -11896,19 +11904,39 @@ impl VectorStore for LadybugStore {
             for w in &warnings {
                 emit_write_shape_warning(namespace, &memory.id, w);
             }
+            // A vault declaration names an exact id. Replay binds it verbatim
+            // in this namespace, and a target not written yet stays deferred:
+            // path or symbol inference would relink a colliding ingested node.
+            let exact_edge_targets = memory
+                .payload
+                .metadata
+                .get("exact_edge_targets")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             for edge in edge_specs(&memory.payload.metadata) {
-                let target = match known.resolve(&edge.target_id) {
-                    Some(resolved) => {
-                        if resolved != edge.target_id {
-                            by_suffix += 1;
-                        }
-                        resolved
+                let target = if exact_edge_targets {
+                    let exact = edge
+                        .target_id
+                        .strip_prefix(&own_namespace_prefix)
+                        .unwrap_or(&edge.target_id);
+                    if !namespace_ids.contains(exact) {
+                        continue;
                     }
-                    // Kept as declared rather than dropped: it names nothing this
-                    // namespace holds, but the match is not namespaced, so it can
-                    // still land on a node another namespace ingested -- which is
-                    // what the statement-per-edge loop did.
-                    None => edge.target_id.clone(),
+                    exact.to_string()
+                } else {
+                    match known.resolve(&edge.target_id) {
+                        Some(resolved) => {
+                            if resolved != edge.target_id {
+                                by_suffix += 1;
+                            }
+                            resolved
+                        }
+                        // Kept as declared rather than dropped: it names nothing this
+                        // namespace holds, but the match is not namespaced, so it can
+                        // still land on a node another namespace ingested -- which is
+                        // what the statement-per-edge loop did.
+                        None => edge.target_id.clone(),
+                    }
                 };
                 let pair = if edge.points_at_target {
                     (memory.id.clone(), target)

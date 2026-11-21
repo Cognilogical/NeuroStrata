@@ -265,6 +265,54 @@ detection and reconciliation all compare in stored-id form.
     branch; reconciliation then deleted the non-matching edge
     (`the edge must target the exact vault note z: []`).
 
+### 3d. Exact-target replay during ingestion
+
+#### Invariant
+
+`relink_edges` replays every live memory's declarations at the end of an
+ingest (`src/parser/ingest.rs:2532`). For a row carrying
+`exact_edge_targets`, replay binds each target verbatim in the importer's
+namespace, stripping an own-namespace prefix exactly as the write path does.
+A target that is not stored in the namespace stays deferred; replay never
+falls back to `KnownIds` path, suffix, or symbol inference. Ordinary memory
+relink resolution is unchanged. Therefore an imported edge `a → z` survives
+an ingest of a same-path symbol `z`: the stored edge set, export links, and
+reimport fingerprint do not change.
+
+#### Mechanism
+
+- The declaration loop reads `exact_edge_targets` per memory, not globally.
+- Flagged rows resolve against the namespace id set already loaded by the
+  same `list` call that supplies the declarations, skipping an absent target
+  so the declaration remains for a later replay. The existing bare-vs-
+  qualified form (`<ns>::z` names the stored note `z`) is applied first.
+- Unflagged rows keep the existing `KnownIds::active(...).resolve(...)` path
+  and its legacy absolute-path suffix rule.
+
+#### Eval (failed on `80a678fd`)
+
+- `relink_preserves_exact_vault_targets_across_ingestion`
+  - Import vault notes `a` (linking `z`) and `z`; assert one `RELATES_TO`
+    edge `a → z`.
+  - Stage and publish a same-namespace generation containing symbol
+    `<ns>::<gen>::z`, then call `relink_edges(ns, "code")`.
+  - Assert the `RELATES_TO` target set from `a` is still exactly `["z"]`, no
+    edge ends at the symbol id, export renders one `[[z]]` and no symbol
+    link, and an unchanged reimport imports `0` notes with the same
+    fingerprint.
+  - On `80a678fd` replay added `a → <ns>::<gen>::z` (and reported it as a
+    legacy suffix rewrite), so the target set was `[symbol, "z"]`.
+
+#### Residual risk
+
+- Replay still runs mention detection for non-ingestor rows; a vault note
+  whose prose names a symbol can gain a `RELATES_TO` mention edge from that
+  pass. This is separate from declaration replay and out of scope here; the
+  exact-declared edge set is unaffected.
+- The existence check uses the namespace rows loaded at replay start, so a
+  target written concurrently after that read defers to the next ingest.
+  Deferral is safe: the declaration is stored in metadata and retried.
+
 ---
 
 ## 4. #344 — Retired rows must not be exported
@@ -363,8 +411,9 @@ note whose *real* type changed is versioned.
   assertion (that key now exists by design), and the #363 evals.
 - `src/traits.rs` — `VectorStore::reconcile_declared_edges` default no-op.
 - `src/store/ladybug.rs` — `extractor = 'upsert'` RELATES_TO reconciler,
-  `exact_edge_targets` opt-out from `KnownIds` rewriting and from
-  path-inferring edge materialisation.
+  `exact_edge_targets` opt-out from `KnownIds` rewriting, from
+  path-inferring edge materialisation, and from `relink_edges` declaration
+  replay (§3d).
 
 ## 7. Risk
 
