@@ -377,7 +377,8 @@ pub async fn process_mcp_request(
                                 "exclude_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional ids to exclude from the results." },
                                 "limit": { "type": "integer", "description": "Max results. Default 5, max 20." },
                                 "include_ast_edges": { "type": "boolean", "description": "Also bundle 1-hop related memories (DEPENDS_ON/SUPERSEDES/RELATES_TO) and a compact AST neighborhood summary (symbols/callers/callees/imports/importers/blast_radius_count). Default true." },
-                                "staged_file_count": { "type": "integer", "minimum": 0, "default": 0, "description": "Optional count of files in the current edit scope. At 3 or more, adds a T_DIFF recommendation to neurostrata_diff_tour. Absent means no diff-tour trigger." }
+                                "staged_file_count": { "type": "integer", "minimum": 0, "default": 0, "description": "Optional count of files in the current edit scope. At 3 or more, adds a T_DIFF recommendation to neurostrata_diff_tour. Absent means no diff-tour trigger." },
+                                "diff_text": { "type": "string", "description": "Optional staged unified diff text supplied by the caller. When staged_file_count is 3 or more, this is the diff_text bound to the T_DIFF prescription for neurostrata_diff_tour; absent or empty means T_DIFF is withheld with a suppressed_reason rather than dispatching an empty diff." }
                             },
                             "required": ["namespace", "path"]
                         }
@@ -18979,6 +18980,87 @@ mod tests {
                 .any(|v| v.as_str() == Some("staged_file_count")),
             "staged_file_count must stay optional (absent = no diff-tour trigger)"
         );
+    }
+
+    /// PR #356 (Codex P2): MCP callers can only supply declared inputSchema
+    /// properties. `diff_text` must be declared optional so a caller can hand
+    /// the real unified diff to `diff_tour`; otherwise T_DIFF is honestly
+    /// withheld but the advertised action is unreachable for tools/call clients.
+    #[tokio::test]
+    async fn memories_for_file_diff_text_schema_and_action_contract() {
+        // (a) schema declares diff_text as an optional string property.
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array");
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_memories_for_file")
+            .expect("memories_for_file tool must be listed");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["properties"]["diff_text"]["type"], "string");
+        let desc = schema["properties"]["diff_text"]["description"]
+            .as_str()
+            .unwrap_or("");
+        assert!(desc.contains("diff"), "description was {desc:?}");
+        let required = schema["required"].as_array().expect("required array");
+        assert!(
+            !required.iter().any(|v| v.as_str() == Some("diff_text")),
+            "diff_text must stay optional (absent = honest abstention)"
+        );
+
+        // (b) staged_file_count>=3 + non-empty diff_text emits T_DIFF bound to it.
+        let with_diff = crate::graph_read::memories_for_file::recommended_next_actions_with_diff(
+            3,
+            &[],
+            3,
+            false,
+            "NeuroStrata",
+            Some("sym::x"),
+            Some("real diff"),
+        );
+        let diff = with_diff["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["trigger_id"] == "T_DIFF")
+            .expect("T_DIFF emitted when diff_text is supplied");
+        assert_eq!(
+            diff["args"],
+            serde_json::json!({ "namespace": "NeuroStrata", "diff_text": "real diff" }),
+            "T_DIFF args must be schema-valid for neurostrata_diff_tour"
+        );
+
+        // (c) absent diff_text abstains with suppressed_reason, no invalid action.
+        let abstained = crate::graph_read::memories_for_file::recommended_next_actions_with_diff(
+            3,
+            &[],
+            3,
+            false,
+            "NeuroStrata",
+            Some("sym::x"),
+            None,
+        );
+        assert!(
+            abstained["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["trigger_id"] != "T_DIFF"),
+            "no T_DIFF prescription without diff_text"
+        );
+        let reason = abstained["suppressed_reason"].as_str().unwrap_or("");
+        assert!(reason.contains("diff_text"), "reason was {reason:?}");
     }
 
     /// Every tool the surface exposes, in the order tools/list returns them.
