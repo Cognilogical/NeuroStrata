@@ -966,6 +966,75 @@ fn validate_warns_only_on_unresolved_applicable_triggers() {
     );
 }
 
+/// oy5c C10: a hops=3 `related` call proves the canonical two-hop prescription
+/// through a normalized digest; a hops=1 call is not even minted.
+#[test]
+fn dispatch_proof_hops_superset_matches_prescription_digest() {
+    use graph_advisories::{dispatch_proof, HIGH_BLAST_TOOL};
+    let ns = "NeuroStrata";
+    let seed = "mem-seed-42";
+    let prescribed = routing::action_id(
+        "T_HIGH_BLAST",
+        &serde_json::json!({ "namespace": ns, "id": seed, "max_hops": 2 }),
+        &[seed.to_string()],
+    );
+    let plan = dispatch_proof(
+        HIGH_BLAST_TOOL,
+        Some("related"),
+        Some(&serde_json::json!({ "namespace": ns, "id": seed, "max_hops": 3 })),
+        None,
+        ns,
+    )
+    .expect("a genuine related call has a proof plan");
+    assert_eq!(
+        routing::action_id(&plan.trigger, &plan.args, &plan.ids),
+        prescribed,
+        "a hops=3 superset must reproduce the prescribed two-hop digest"
+    );
+}
+
+/// oy5c item 8: an un-dispatchable T_DIFF prescription is withheld with a
+/// suppressed_reason; a real diff_text produces the bound action.
+#[test]
+fn diff_prescription_abstains_on_empty_diff_text() {
+    let abstained = memories_for_file::recommended_next_actions_with_diff(
+        3,
+        &[],
+        3,
+        false,
+        "NeuroStrata",
+        Some("sym::x"),
+        None,
+    );
+    assert!(
+        abstained["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["trigger_id"] != "T_DIFF"),
+        "no T_DIFF prescription without diff_text"
+    );
+    let reason = abstained["suppressed_reason"].as_str().unwrap_or("");
+    assert!(reason.contains("diff_text"), "reason was {reason:?}");
+
+    let with_diff = memories_for_file::recommended_next_actions_with_diff(
+        3,
+        &[],
+        3,
+        false,
+        "NeuroStrata",
+        Some("sym::x"),
+        Some("real diff"),
+    );
+    let diff = with_diff["next_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["trigger_id"] == "T_DIFF")
+        .expect("T_DIFF emitted when diff_text is supplied");
+    assert_eq!(diff["args"]["diff_text"], "real diff");
+}
+
 /// Spec §6 R8: the evaluation contract is a checked-in, strict-JSON declaration.
 fn load_evaluation_contract() -> Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

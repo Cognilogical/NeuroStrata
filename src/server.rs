@@ -2047,33 +2047,35 @@ pub async fn process_mcp_request(
                                     name == "neurostrata_taxonomy",
                                     args_ref,
                                 );
-                            // R7 proof: the ledger is digest-only, so a follow-up
-                            // `neurostrata_related` call must prove at dispatch that
-                            // it matched the prescription (concrete seed, >=2 hops).
-                            // Reuse the existing `followed_action_ids` field; no new
-                            // receipt field, no raw args/hops text stored.
-                            if name == "neurostrata_related" {
-                                let seed = args_ref
-                                    .and_then(|a| a.get("id"))
-                                    .and_then(Value::as_str)
-                                    .map(str::trim)
-                                    .filter(|s| !s.is_empty());
-                                let hops = args_ref
-                                    .and_then(|a| a.get("max_hops"))
-                                    .and_then(Value::as_u64)
-                                    .unwrap_or(0);
-                                if let (Some(seed), true) = (seed, hops >= 2) {
-                                    let proof_args = serde_json::json!({
-                                        "namespace": ns.as_str(),
-                                        "id": seed,
-                                        "max_hops": hops,
-                                    });
-                                    fields.followed_action_ids =
-                                        vec![crate::task::routing::action_id(
-                                            crate::task::graph_advisories::T_HIGH_BLAST,
-                                            &proof_args,
-                                            &[seed.to_string()],
-                                        )];
+                            // R7 proof: mint a digest-only proof id under the
+                            // trigger actually followed. The optional
+                            // `followed_trigger_id` hint is the `next_action`
+                            // trigger the caller is dispatching; the pure
+                            // planner de-aliases `related` (T_HIGH_BLAST vs
+                            // T_SEED_EXPAND), normalizes hops >= 2, and abstains
+                            // on an empty diff. Reuse `followed_action_ids`;
+                            // no new receipt field, no raw text stored.
+                            let followed_hint = args_ref
+                                .and_then(|a| {
+                                    a.get("followed_trigger_id")
+                                        .or_else(|| a.get("trigger_id"))
+                                })
+                                .and_then(Value::as_str);
+                            if let Some(plan) =
+                                crate::task::graph_advisories::dispatch_proof(
+                                    name,
+                                    Some(fields.operation.as_str()),
+                                    args_ref,
+                                    followed_hint,
+                                    &ns,
+                                )
+                            {
+                                fields.followed_action_ids =
+                                    vec![crate::task::routing::action_id(
+                                        &plan.trigger, &plan.args, &plan.ids,
+                                    )];
+                                if fields.trigger_id.trim().is_empty() {
+                                    fields.trigger_id = plan.trigger;
                                 }
                             }
                             crate::task::record_tool_receipt(&store, fields, caller_root).await;
@@ -3705,14 +3707,19 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                 .and_then(serde_json::Value::as_str)
                 .or_else(|| hit_ids.first().map(String::as_str))
                 .unwrap_or(original_path);
-            let escalation = crate::graph_read::memories_for_file::recommended_next_actions(
-                blast_radius_count,
-                &bridge_ids,
-                staged_file_count,
-                hits.is_empty(),
-                &namespace,
-                Some(seed_id),
-            );
+            let diff_text = arguments
+                .get("diff_text")
+                .and_then(serde_json::Value::as_str);
+            let escalation =
+                crate::graph_read::memories_for_file::recommended_next_actions_with_diff(
+                    blast_radius_count,
+                    &bridge_ids,
+                    staged_file_count,
+                    hits.is_empty(),
+                    &namespace,
+                    Some(seed_id),
+                    diff_text,
+                );
             if let Some(status) = escalation.get("status").and_then(serde_json::Value::as_str) {
                 response["status"] = serde_json::Value::String(status.to_string());
             }
