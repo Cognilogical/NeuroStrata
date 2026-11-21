@@ -1844,4 +1844,80 @@ mod tests {
         );
         assert!(matches!(v_py, ValidateVerdict::DeterministicReject { .. }));
     }
+
+    /// Codex review a3c19c0f#r4650129139: complete patch envelopes
+    /// (`*** Begin Patch`, `--- a/...` unified diffs) must be recognised
+    /// before the tighter marker check, or targets silently disappear.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn patch_envelopes_and_unified_diffs_extract_targets() {
+        let (_store, validator) = validator_with(vec![rule(
+            "global-no-python",
+            &no_py_trigger(),
+            "Never use Python code",
+            "active",
+        )])
+        .await;
+
+        let codex_envelope =
+            "*** Begin Patch\n*** Update File: scripts/run.py\n@@\n+print(1)\n*** End Patch\n";
+        let (v_codex, f_codex) = validator
+            .validate("apply_patch", codex_envelope, "/workspace", false)
+            .await;
+        assert_eq!(
+            f_codex,
+            vec!["global-no-python".to_string()],
+            "a Codex Begin Patch envelope must yield its target"
+        );
+        assert!(matches!(
+            v_codex,
+            ValidateVerdict::DeterministicReject { .. }
+        ));
+
+        let unified =
+            "--- a/scripts/run.py\n+++ b/scripts/run.py\n@@ -1 +1,2 @@\n print(0)\n+print(1)\n";
+        let (v_unified, f_unified) = validator
+            .validate("apply_patch", unified, "/workspace", false)
+            .await;
+        assert_eq!(
+            f_unified,
+            vec!["global-no-python".to_string()],
+            "a unified diff starting with --- a/ must yield its target"
+        );
+        assert!(matches!(
+            v_unified,
+            ValidateVerdict::DeterministicReject { .. }
+        ));
+
+        let json_envelope = serde_json::json!({
+            "tool": "apply_patch",
+            "input": codex_envelope
+        })
+        .to_string();
+        let (v_json, f_json) = validator
+            .validate("apply_patch", &json_envelope, "/workspace", false)
+            .await;
+        assert_eq!(
+            f_json,
+            vec!["global-no-python".to_string()],
+            "an enveloped patch under `input` must yield its target"
+        );
+        assert!(matches!(
+            v_json,
+            ValidateVerdict::DeterministicReject { .. }
+        ));
+
+        let doc_envelope = "*** Begin Patch\n*** Update File: docs/guide.md\n@@\n+#!/usr/bin/env python3\n+example\n*** End Patch\n";
+        let (v_doc, f_doc) = validator
+            .validate("apply_patch", doc_envelope, "/workspace", false)
+            .await;
+        assert!(
+            f_doc.is_empty(),
+            "the doc-like exclusion must hold inside an envelope: {:?}",
+            f_doc
+        );
+        assert!(matches!(
+            v_doc,
+            ValidateVerdict::SandboxPassHighFidelity { .. }
+        ));
+    }
 }
