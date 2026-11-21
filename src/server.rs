@@ -6679,7 +6679,10 @@ async fn handle_get_snapshot(
         crate::task::receipt_ledger_root(inferred_root.as_deref(), &store, namespace).await;
     let readiness_input = crate::task::snapshot_readiness::ReadinessInput {
         concepts: readiness_concepts,
-        graph_tool_names: active_task_graph_tool_names(&ledger_root, &active_task_ids),
+        graph_tool_names: ledger_root
+            .as_deref()
+            .map(|root| active_task_graph_tool_names(root, &active_task_ids))
+            .unwrap_or_default(),
         has_thesis,
     };
     let readiness_section =

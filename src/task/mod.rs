@@ -658,7 +658,7 @@ pub fn persist_active_session_file(
         namespace,
         golden_rules,
         active_task,
-        dirs::home_dir().as_deref(),
+        session_home_dir().as_deref(),
     );
 }
 
@@ -669,7 +669,7 @@ fn persist_active_session_file_with_home(
     active_task: Option<(&str, &MemoryPayload)>,
     home: Option<&std::path::Path>,
 ) {
-    if crate::formal_kernel::is_home_without_git_with(project_root, home) {
+    if is_home_without_git_with(project_root, home) {
         return;
     }
     let ns_dir = project_root.join(".NeuroStrata");
@@ -1406,42 +1406,130 @@ pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
     crate::formal_kernel::resolve_session_root(None, dir)
 }
 
-/// Walk a candidate root up to the enclosing `.git`/`.NeuroStrata` marker.
-fn walk_to_worktree_marker(mut root: std::path::PathBuf) -> std::path::PathBuf {
-    while !root.as_os_str().is_empty()
-        && !root.join(".git").exists()
-        && !root.join(".NeuroStrata").exists()
-    {
-        match root.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => root = parent.to_path_buf(),
-            _ => break,
-        }
-    }
-    root
+#[cfg(test)]
+thread_local! {
+    static TEST_HOME_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-fn has_worktree_marker(root: &std::path::Path) -> bool {
-    root.join(".git").exists() || root.join(".NeuroStrata").exists()
+/// Point this test thread's home folder at `home` until the guard drops.
+#[cfg(test)]
+pub(crate) fn override_home_dir_for_test(home: &std::path::Path) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_HOME_DIR.with(|h| *h.borrow_mut() = None);
+        }
+    }
+    TEST_HOME_DIR.with(|h| *h.borrow_mut() = Some(home.to_path_buf()));
+    Reset
+}
+
+/// The user's home folder. Tests can replace it per thread.
+fn session_home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = TEST_HOME_DIR.with(|h| h.borrow().clone()) {
+        return Some(home);
+    }
+    dirs::home_dir()
+}
+
+fn is_home_folder(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    let Some(home) = home.and_then(|h| dunce::canonicalize(h).ok()) else {
+        return false;
+    };
+    dunce::canonicalize(dir).is_ok_and(|d| d == home)
+}
+
+/// True when `dir` is the user's home folder and holds no `.git`. Such a
+/// folder is never a project, so no session file (`active_session.json`,
+/// `session_queries.json`) is written there: `~/.NeuroStrata` belongs to
+/// SynapticMesh, not to a project.
+pub(crate) fn is_home_without_git(dir: &std::path::Path) -> bool {
+    is_home_without_git_with(dir, session_home_dir().as_deref())
+}
+
+fn is_home_without_git_with(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    is_home_folder(dir, home) && !dir.join(".git").exists()
+}
+
+/// Where a walk for a session-file root ended.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionMarkerWalk {
+    /// The nearest `.git` folder, or the start folder when it holds `.NeuroStrata`.
+    Root(std::path::PathBuf),
+    /// The walk reached the home folder without finding `.git`.
+    StoppedAtHome,
+    /// No `.git` above the start folder, and the start folder holds no `.NeuroStrata`.
+    NotFound,
+}
+
+/// Find the session-file root for `start` (a folder, or a file whose folder
+/// is used). `.git` counts at any level; `.NeuroStrata` counts only on the
+/// start folder itself, never on an ancestor (issue #322). The home folder
+/// without `.git` is never a root, and a walk that reaches it stops there.
+fn walk_to_session_marker(start: &std::path::Path) -> SessionMarkerWalk {
+    let home = session_home_dir().and_then(|h| dunce::canonicalize(h).ok());
+    let start = if start.is_dir() {
+        start
+    } else {
+        match start.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => return SessionMarkerWalk::NotFound,
+        }
+    };
+    let is_home = |dir: &std::path::Path| {
+        home.as_deref()
+            .is_some_and(|h| dunce::canonicalize(dir).is_ok_and(|d| d == h))
+    };
+    if start.join(".NeuroStrata").exists() && !start.join(".git").exists() && !is_home(start) {
+        return SessionMarkerWalk::Root(start.to_path_buf());
+    }
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() {
+            return SessionMarkerWalk::Root(dir.to_path_buf());
+        }
+        if is_home(dir) {
+            return SessionMarkerWalk::StoppedAtHome;
+        }
+        cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
+    }
+    SessionMarkerWalk::NotFound
+}
+
+/// Walk a candidate root to its session-file root; `None` when there is none.
+fn walk_to_worktree_marker(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    if root.as_os_str().is_empty() {
+        return None;
+    }
+    match walk_to_session_marker(root) {
+        SessionMarkerWalk::Root(r) => Some(r),
+        SessionMarkerWalk::StoppedAtHome | SessionMarkerWalk::NotFound => None,
+    }
 }
 
 /// The single ledger-root policy shared by the receipt recorder and by
 /// `task_validate`: an explicit caller worktree hint wins; otherwise prefer
 /// the namespace registry's `project_root` then registered directory rows, and
-/// only fall back to the daemon CWD last. Mirrors `record_graph_query_with_root`
-/// so a daemon running outside the checkout writes and reads the same ledger.
+/// only fall back to the daemon CWD last. Each candidate must reach a `.git`
+/// folder, or be itself a folder holding `.NeuroStrata`; the home folder
+/// without `.git` never qualifies. `None` when no candidate qualifies: the
+/// recorder then writes nothing, rather than creating `.NeuroStrata` in the
+/// home folder or at a drive root.
 pub(crate) async fn receipt_ledger_root(
     caller_root: Option<&str>,
     store: &Arc<dyn VectorStore>,
     namespace: &str,
-) -> std::path::PathBuf {
+) -> Option<std::path::PathBuf> {
     if let Some(hint) = caller_root.map(str::trim).filter(|s| !s.is_empty()) {
-        let candidate = walk_to_worktree_marker(resolve_session_root_dir(std::path::Path::new(hint)));
         // A caller hint is only trusted when it actually resolves inside a
-        // worktree (`.git`/`.NeuroStrata`). A scratch dir with no marker must
-        // fall through to the registry/directory rows and daemon CWD, never
-        // become the ledger root.
-        if has_worktree_marker(&candidate) {
-            return candidate;
+        // worktree. A scratch dir with no marker falls through to the
+        // registry/directory rows and daemon CWD, never becomes the root.
+        if let Some(root) =
+            walk_to_worktree_marker(&resolve_session_root_dir(std::path::Path::new(hint)))
+        {
+            return Some(root);
         }
     }
     let ns = crate::server::resolve_namespace(store, namespace).await;
@@ -1453,9 +1541,8 @@ pub(crate) async fn receipt_ledger_root(
                 .and_then(Value::as_str)
                 .filter(|p| !p.trim().is_empty())
             {
-                let candidate = walk_to_worktree_marker(std::path::PathBuf::from(p));
-                if has_worktree_marker(&candidate) {
-                    return candidate;
+                if let Some(root) = walk_to_worktree_marker(std::path::Path::new(p)) {
+                    return Some(root);
                 }
             }
         }
@@ -1468,14 +1555,13 @@ pub(crate) async fn receipt_ledger_root(
                 .get("absolute_path")
                 .and_then(Value::as_str)
             {
-                let candidate = walk_to_worktree_marker(std::path::PathBuf::from(p));
-                if has_worktree_marker(&candidate) {
-                    return candidate;
+                if let Some(root) = walk_to_worktree_marker(std::path::Path::new(p)) {
+                    return Some(root);
                 }
             }
         }
     }
-    walk_to_worktree_marker(crate::daemon::resolve_project_root())
+    walk_to_worktree_marker(&crate::daemon::resolve_project_root())
 }
 
 /// Record a graph or memory lookup against any active `in_progress` task in
@@ -1554,26 +1640,22 @@ async fn record_graph_query_inner(
                 .to_string_lossy()
                 .into_owned()
         });
+    // A hint under the home folder (no `.git` on the way up) names no
+    // project: the task is still stamped, but no ledger gets the entry.
+    let mut hint_under_home = false;
     if project_root.is_none() {
         let hint_path = std::path::Path::new(query_hint);
         if hint_path.is_absolute() {
-            let mut cur = if hint_path.is_dir() {
-                Some(hint_path)
-            } else {
-                hint_path.parent()
-            };
-            while let Some(dir) = cur {
-                // `.git` only: a file under the home folder must not land its
-                // entry in `~/.NeuroStrata`.
-                if dir.join(".git").exists() {
+            match walk_to_session_marker(hint_path) {
+                SessionMarkerWalk::Root(dir) => {
                     project_root = Some(dir.to_string_lossy().to_string());
-                    break;
                 }
-                cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
+                SessionMarkerWalk::StoppedAtHome => hint_under_home = true,
+                SessionMarkerWalk::NotFound => {}
             }
         }
     }
-    if project_root.is_none() {
+    if project_root.is_none() && !hint_under_home {
         if let Ok(Some((_, registry))) =
             store.get(&ns, &crate::registry::registry_row_id(&ns)).await
         {
@@ -1588,7 +1670,7 @@ async fn record_graph_query_inner(
             }
         }
     }
-    if project_root.is_none() {
+    if project_root.is_none() && !hint_under_home {
         if let Ok(dirs) = store.list(&ns, None, Some("directory")).await {
             for d in &dirs {
                 if let Some(p) = d
@@ -1650,24 +1732,13 @@ async fn record_graph_query_inner(
             }
         }
     }
-    if project_root.is_none() {
+    if project_root.is_none() && !hint_under_home {
         // Start from `resolve_project_root()` (which honors `NEUROSTRATA_PROJECT_ROOT`
-        // before falling back to `std::env::current_dir()`) and walk up through
-        // parent directories looking for `.git` or `.NeuroStrata`.
-        let start = crate::daemon::resolve_project_root();
-        if !start.as_os_str().is_empty() {
-            let mut cur = start;
-            loop {
-                if cur.join(".git").exists() || cur.join(".NeuroStrata").exists() {
-                    project_root = Some(cur.to_string_lossy().to_string());
-                    break;
-                }
-                match cur.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => cur = parent.to_path_buf(),
-                    _ => break,
-                }
-            }
-        }
+        // before falling back to `std::env::current_dir()`) and walk up to the
+        // nearest `.git`, or use that folder when it holds `.NeuroStrata`.
+        // No root found (home folder, drive root): nothing is written.
+        project_root = walk_to_worktree_marker(&crate::daemon::resolve_project_root())
+            .map(|root| root.to_string_lossy().into_owned());
     }
     let governed_prefix = if query_hint.ends_with('/')
         || (project_root.is_some()
@@ -1688,9 +1759,7 @@ async fn record_graph_query_inner(
         // Bare module/domain keyword: widen to directory coverage.
         format!("{}/", query_hint)
     };
-    if let Some(root) = project_root
-        .filter(|r| !crate::formal_kernel::is_home_without_git(std::path::Path::new(r)))
-    {
+    if let Some(root) = project_root.filter(|r| !is_home_without_git(std::path::Path::new(r))) {
         let ledger_path = std::path::Path::new(&root).join(".NeuroStrata/session_queries.json");
         // NOTE (spec §6 R6.2): this is the PRE-dispatch legacy path. It writes
         // only the legacy `queries[]` row + the single task stamp above; it must
@@ -1799,10 +1868,9 @@ pub async fn record_tool_receipt(
     // versioned `events[]` receipt and the additive `tool_invocations`
     // counter. Legacy `queries[]` rows belong exclusively to the handler-
     // internal ledger recorders, so none are written here.
-    let root = receipt_ledger_root(caller_root, store, &ns).await;
-    if root.as_os_str().is_empty() {
+    let Some(root) = receipt_ledger_root(caller_root, store, &ns).await else {
         return;
-    }
+    };
     let ledger_path = root.join(".NeuroStrata/session_queries.json");
     let tool = fields.tool.clone();
     tool_receipts::mutate_session_ledger(&ledger_path, &ns, |doc| {
@@ -2057,9 +2125,6 @@ async fn resolve_task_scope(
     if scope.worktree.is_none() {
         if let Some(ref explicit_wt) = explicit_root {
             let root_dir = resolve_session_root_dir(explicit_wt);
-            if crate::formal_kernel::is_home_without_git(&root_dir) {
-                return (chosen_root, scope);
-            }
             let canonical = root_dir
                 .canonicalize()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -3504,12 +3569,13 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
     let caller_hint = arg_str(&args, "worktree")
         .or_else(|| arg_str(&args, "project_root"))
         .or_else(|| arg_str(&args, "cwd"));
-    let root = receipt_ledger_root(caller_hint, &store, &namespace).await;
-    let ledger: Value =
-        std::fs::read_to_string(root.join(".NeuroStrata").join("session_queries.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| json!({ "events": [] }));
+    let ledger: Value = receipt_ledger_root(caller_hint, &store, &namespace)
+        .await
+        .and_then(|root| {
+            std::fs::read_to_string(root.join(".NeuroStrata").join("session_queries.json")).ok()
+        })
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({ "events": [] }));
     let mut applicable: Vec<String> = args
         .get("applicable_triggers")
         .and_then(Value::as_array)
@@ -5952,7 +6018,7 @@ mod tests {
         assert_eq!(doc["events"][0]["event_id"], "evt-registry");
         assert_eq!(
             receipt_ledger_root(None, &store, ns).await,
-            worktree,
+            Some(worktree),
             "validation reads the same root the recorder wrote"
         );
     }
@@ -5969,7 +6035,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&scratch).unwrap();
-        assert!(!has_worktree_marker(&scratch));
+        assert!(!scratch.join(".git").exists() && !scratch.join(".NeuroStrata").exists());
         let worktree = std::env::temp_dir().join(format!(
             "ns-real-worktree-{}",
             uuid::Uuid::new_v4()
@@ -5984,7 +6050,7 @@ mod tests {
         .await;
         assert_eq!(
             receipt_ledger_root(Some(scratch.to_str().unwrap()), &store, ns).await,
-            worktree,
+            Some(worktree),
             "unmarked scratch hint must fall through to the registry root"
         );
     }
@@ -8076,33 +8142,236 @@ mod tests {
     fn home_folder_gets_no_session_file() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".NeuroStrata")).unwrap();
-        persist_active_session_file_with_home(home.path(), "example-project", &[], None, Some(home.path()));
-        assert!(!home.path().join(".NeuroStrata/active_session.json").exists());
+        persist_active_session_file_with_home(
+            home.path(),
+            "example-project",
+            &[],
+            None,
+            Some(home.path()),
+        );
+        assert!(!home
+            .path()
+            .join(".NeuroStrata/active_session.json")
+            .exists());
         let work = home.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        persist_active_session_file_with_home(&work, "example-project", &[], None, Some(home.path()));
+        persist_active_session_file_with_home(
+            &work,
+            "example-project",
+            &[],
+            None,
+            Some(home.path()),
+        );
         assert!(work.join(".NeuroStrata/active_session.json").exists());
+    }
+
+    /// Folders for the home-folder tests: `home` (holding `.NeuroStrata`, as
+    /// SynapticMesh leaves it), `top` (holding a bare `.NeuroStrata`) and
+    /// `nowhere` (no marker, for `NEUROSTRATA_PROJECT_ROOT`), side by side.
+    fn home_test_layout() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let home = base.join("home");
+        let top = base.join("top");
+        let nowhere = base.join("nowhere");
+        std::fs::create_dir_all(home.join(".NeuroStrata")).unwrap();
+        std::fs::create_dir_all(top.join(".NeuroStrata")).unwrap();
+        std::fs::create_dir_all(&nowhere).unwrap();
+        (tmp, home, top, nowhere)
+    }
+
+    fn ledger_at(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(".NeuroStrata").join("session_queries.json")
     }
 
     #[tokio::test]
     async fn ledger_hint_walk_ignores_ancestor_neurostrata() {
-        let tmp = tempfile::tempdir().unwrap();
-        let top = dunce::canonicalize(tmp.path()).unwrap();
-        std::fs::create_dir_all(top.join(".NeuroStrata")).unwrap();
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, top, nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &nowhere);
         let repo = top.join("scratch");
         std::fs::create_dir_all(repo.join("src")).unwrap();
         let file = repo.join("src").join("a.rs");
         std::fs::write(&file, "x").unwrap();
+        let notes = top.join("notes");
+        std::fs::create_dir_all(notes.join(".NeuroStrata")).unwrap();
+        let note = notes.join("a.md");
+        std::fs::write(&note, "x").unwrap();
         let store = store_with_namespace("example-project").await;
         let hint = file.to_string_lossy().to_string();
 
+        // An ancestor's bare `.NeuroStrata` is not a project root.
         record_graph_query_with_root(&store, "example-project", "t", &hint, None).await;
-        assert!(!top.join(".NeuroStrata/session_queries.json").exists());
+        assert!(!ledger_at(&top).exists());
+        assert!(!ledger_at(&nowhere).exists());
 
+        // The hint's own folder still counts when it holds `.NeuroStrata`.
+        let note_hint = note.to_string_lossy().to_string();
+        record_graph_query_with_root(&store, "example-project", "t", &note_hint, None).await;
+        assert!(ledger_at(&notes).exists());
+
+        // `.git` counts at any level.
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         record_graph_query_with_root(&store, "example-project", "t", &hint, None).await;
-        assert!(repo.join(".NeuroStrata/session_queries.json").exists());
-        assert!(!top.join(".NeuroStrata/session_queries.json").exists());
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(ledger_at(&repo).exists());
+        assert!(!ledger_at(&top).exists());
+    }
+
+    #[tokio::test]
+    async fn ledger_hint_under_home_writes_nothing() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, top, _nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        // A registry root and a daemon root that would otherwise catch it.
+        let project = top.join("example-project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &project);
+        let store = store_with_namespace("example-project").await;
+        crate::registry::cache_project_root(
+            &store,
+            Some(&emb()),
+            "example-project",
+            project.to_str().unwrap(),
+        )
+        .await;
+        let docs = home.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        for file in [docs.join("a.md"), home.join("b.md")] {
+            std::fs::write(&file, "x").unwrap();
+            let hint = file.to_string_lossy().to_string();
+            record_graph_query_with_root(&store, "example-project", "t", &hint, None).await;
+        }
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(!ledger_at(&home).exists());
+        assert!(!ledger_at(&docs).exists());
+        assert!(
+            !ledger_at(&project).exists(),
+            "a hint under home stops; no fallback write"
+        );
+
+        // A home folder that is a git checkout is a project.
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let hint = docs.join("a.md").to_string_lossy().to_string();
+        record_graph_query_with_root(&store, "example-project", "t", &hint, None).await;
+        assert!(ledger_at(&home).exists());
+    }
+
+    #[tokio::test]
+    async fn daemon_root_walk_ignores_home_and_ancestor_neurostrata() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, top, _nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        let store = store_with_namespace("example-project").await;
+        let sub = top.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        for daemon_root in [&home, &sub] {
+            std::env::set_var("NEUROSTRATA_PROJECT_ROOT", daemon_root);
+            record_graph_query_with_root(&store, "example-project", "t", "related", None).await;
+        }
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(!ledger_at(&home).exists());
+        assert!(!ledger_at(&top).exists());
+        assert!(!ledger_at(&sub).exists());
+    }
+
+    #[tokio::test]
+    async fn receipt_ledger_root_never_answers_home_or_bare_ancestor() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, top, nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        let store = temp_store().await;
+        let ns = "example-project";
+        store.init(ns).await.expect("init namespace schema");
+        let sub = top.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // (a) home without .git: as hint and as daemon root.
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &home);
+        let got = receipt_ledger_root(Some(home.to_str().unwrap()), &store, ns).await;
+        assert_eq!(got, None);
+        // (b) a bare ancestor `.NeuroStrata` is not a root.
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &sub);
+        let got = receipt_ledger_root(Some(sub.to_str().unwrap()), &store, ns).await;
+        assert_eq!(got, None);
+        // The start folder holding `.NeuroStrata` is.
+        let got = receipt_ledger_root(Some(top.to_str().unwrap()), &store, ns).await;
+        assert_eq!(got, Some(top.clone()));
+        // (c) no marker anywhere: no root, and the recorder writes nothing.
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &nowhere);
+        assert_eq!(receipt_ledger_root(None, &store, ns).await, None);
+        let fields = tool_receipts::ReceiptFields::new(
+            "evt-none".to_string(),
+            0,
+            "sess-none".to_string(),
+            String::new(),
+            ns.to_string(),
+            "neurostrata_related".to_string(),
+            "related".to_string(),
+            String::new(),
+            "graph_read".to_string(),
+            true,
+            tool_receipts::ReceiptStatus::Success,
+            0,
+            1,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "q",
+            "r",
+        );
+        record_tool_receipt(&store, fields, Some(nowhere.to_str().unwrap())).await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(!nowhere.join(".NeuroStrata").exists());
+        assert!(!ledger_at(&home).exists());
+        assert!(!ledger_at(&top).exists());
+
+        // Home that is a git checkout is a project.
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let got = receipt_ledger_root(Some(home.to_str().unwrap()), &store, ns).await;
+        assert_eq!(got, Some(home.clone()));
+    }
+
+    #[tokio::test]
+    async fn claim_from_home_keeps_its_worktree_stamp() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, _top, nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &nowhere);
+        let store = store_with_namespace("example-project").await;
+        let id = create_task(&store, "example-project", "work started from home", 2).await;
+        let reply = handle_task_claim(
+            json!({
+                "namespace": "example-project",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": "ses_home",
+                "worktree": home.to_string_lossy(),
+            }),
+            store.clone(),
+        )
+        .await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+        let (_, payload) = store.get("example-project", &id).await.unwrap().unwrap();
+        let worktree = payload.metadata["task"]["worktree"]
+            .as_str()
+            .map(|w| dunce::canonicalize(w).unwrap());
+        assert_eq!(
+            worktree,
+            Some(home.clone()),
+            "a claim from home must not be stored unattributed"
+        );
+        assert!(!home
+            .join(".NeuroStrata")
+            .join("active_session.json")
+            .exists());
     }
 
     #[tokio::test]
