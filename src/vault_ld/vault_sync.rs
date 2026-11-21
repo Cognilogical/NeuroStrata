@@ -1094,6 +1094,10 @@ pub async fn import_vault_with_limits(
             None => serde_json::json!({}),
         };
         metadata["vault_source"] = serde_json::json!(true);
+        // A WikiLink names an exact vault-note id. Store-side path resolution
+        // must not relink it to an ingested symbol that happens to share its
+        // logical path (PR #363).
+        metadata["exact_edge_targets"] = serde_json::json!(true);
         metadata["stub"] = serde_json::json!(is_stub);
         metadata["canonical_sha256"] = serde_json::json!(note.canonical_sha256);
         metadata["fingerprint_version"] = serde_json::json!(FINGERPRINT_VERSION);
@@ -1168,26 +1172,31 @@ pub async fn import_vault_with_limits(
             .is_some_and(|targets| !targets.is_empty())
             .then(|| (payload.clone(), item.vector.clone()));
 
-        // Retire edges from the previous declaration before materialising this
-        // one: `upsert` only merges declared edges, so a removed WikiLink
-        // would otherwise stay live (#346). Reconcile first because a declared
-        // target may resolve to a different stored id than the literal.
-        if let Err(e) = store
-            .reconcile_declared_edges(&config.namespace, &item.id, "RELATES_TO", &item.related)
-            .await
-        {
-            errors.push(format!(
-                "Failed to retire stale edges for {}: {}",
-                item.id, e
-            ));
-        }
-
+        // Materialise the new head before retiring the old head's edges.
+        // Reconciliation deletes edges the current head still relies on, so
+        // doing it first would leave a surviving old head broken when the
+        // upsert fails (#363). Vault targets are exact note ids, so the
+        // declared set matches the ids the upsert writes.
         match store
             .upsert(&config.namespace, &item.id, item.vector, payload)
             .await
         {
             Ok(report) => {
                 imported += 1;
+                if let Err(e) = store
+                    .reconcile_declared_edges(
+                        &config.namespace,
+                        &item.id,
+                        "RELATES_TO",
+                        &item.related,
+                    )
+                    .await
+                {
+                    errors.push(format!(
+                        "Failed to retire stale edges for {}: {}",
+                        item.id, e
+                    ));
+                }
                 // A declarer may precede its target in id order. The edge is
                 // not lost: retry once after every head exists.
                 if !report.deferred_edges.is_empty() {
@@ -1225,14 +1234,13 @@ pub async fn import_vault_with_limits(
                     .collect()
             })
             .unwrap_or_default();
-        if let Err(e) = store
+        if let Err(e) = store.upsert(&config.namespace, &id, vector, payload).await {
+            errors.push(format!("Failed to relink edges for {}: {}", id, e));
+        } else if let Err(e) = store
             .reconcile_declared_edges(&config.namespace, &id, "RELATES_TO", &keep)
             .await
         {
             errors.push(format!("Failed to retire stale edges for {}: {}", id, e));
-        }
-        if let Err(e) = store.upsert(&config.namespace, &id, vector, payload).await {
-            errors.push(format!("Failed to relink edges for {}: {}", id, e));
         }
     }
 
@@ -3648,6 +3656,345 @@ mod tests {
                     && rel == "GOVERNS"
                     && to == "kept-target"),
             "the unrelated edge must still survive: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: a vault target whose logical path collides with an ingested
+    /// symbol must remain the exact vault-note id. Store-side path resolution
+    /// must not relink the WikiLink to the symbol.
+    #[tokio::test]
+    async fn vault_targets_survive_symbol_path_collisions() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-exact-targets-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_exact_targets";
+        store.init(ns).await.expect("init");
+
+        store
+            .upsert(
+                ns,
+                "CollideNs::shared-target",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "an ingested symbol".to_string(),
+                    user_id: "auto-ingestor".to_string(),
+                    memory_type: "symbol".to_string(),
+                    agent_name: None,
+                    location: "shared-target".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed colliding symbol");
+
+        let config = vault_config(&root, &vault, ns);
+        let mut linker = note("linker", &["shared-target"]);
+        linker.content = "links the vault note".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut target = note("shared-target", &[]);
+        target.content = "vault note body".to_string();
+        target.canonical_sha256 = target.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("shared-target.md"), target.to_markdown()).expect("write target");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let (_, head) = store
+            .get(ns, "linker")
+            .await
+            .expect("get head")
+            .expect("head exists");
+        assert_eq!(
+            head.metadata["related_to"],
+            serde_json::json!(["shared-target"]),
+            "a vault target must stay an exact note id"
+        );
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| from == "linker"
+                && rel == "RELATES_TO"
+                && to == "shared-target"),
+            "the edge must target the exact vault note: {:?}",
+            edges
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, _, to, _)| to == "CollideNs::shared-target"),
+            "the ingested symbol must not be linked: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Delegating store that fails one head upsert, so the caller can prove a
+    /// failed reimport never leaves edges deleted under a surviving old head.
+    struct FailingHeadUpsertStore {
+        inner: std::sync::Arc<dyn VectorStore>,
+        fail_id: &'static str,
+    }
+
+    impl crate::traits::AsAny for FailingHeadUpsertStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VectorStore for FailingHeadUpsertStore {
+        async fn init(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.init(namespace).await
+        }
+
+        async fn upsert(
+            &self,
+            namespace: &str,
+            id: &str,
+            vector: Vec<f32>,
+            payload: crate::traits::MemoryPayload,
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
+            if id == self.fail_id {
+                anyhow::bail!("injected head upsert failure for {id}");
+            }
+            self.inner.upsert(namespace, id, vector, payload).await
+        }
+
+        async fn search(
+            &self,
+            namespace: &str,
+            vector: Vec<f32>,
+            limit: usize,
+            include_tasks: bool,
+            include_archived: bool,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner
+                .search(namespace, vector, limit, include_tasks, include_archived)
+                .await
+        }
+
+        async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(namespace, id).await
+        }
+
+        async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(namespace).await
+        }
+
+        async fn reconcile_declared_edges(
+            &self,
+            namespace: &str,
+            id: &str,
+            rel_type: &str,
+            keep: &[String],
+        ) -> anyhow::Result<usize> {
+            self.inner
+                .reconcile_declared_edges(namespace, id, rel_type, keep)
+                .await
+        }
+
+        async fn relink_edges(&self, namespace: &str, source_key: &str) -> anyhow::Result<usize> {
+            self.inner.relink_edges(namespace, source_key).await
+        }
+
+        async fn begin_generation(&self, namespace: &str, source_key: &str) -> anyhow::Result<u64> {
+            self.inner.begin_generation(namespace, source_key).await
+        }
+
+        async fn publish_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .publish_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn abort_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .abort_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn active_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+        ) -> anyhow::Result<u64> {
+            self.inner.active_generation(namespace, source_key).await
+        }
+
+        async fn generation_nodes(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<String>> {
+            self.inner.generation_nodes(namespace, generation).await
+        }
+
+        async fn list(
+            &self,
+            namespace: &str,
+            user_id: Option<&str>,
+            memory_type: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner.list(namespace, user_id, memory_type).await
+        }
+
+        async fn generation_summary(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<crate::traits::GenerationRow>> {
+            self.inner.generation_summary(namespace, generation).await
+        }
+
+        async fn get(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, crate::traits::MemoryPayload)>> {
+            self.inner.get(namespace, id).await
+        }
+
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+
+        async fn export_graph(
+            &self,
+            include_retired: bool,
+            include_archived: bool,
+            project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+            anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner
+                .export_graph(
+                    include_retired,
+                    include_archived,
+                    project_contexts,
+                    anchor_override,
+                )
+                .await
+        }
+
+        async fn increment_access_count(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(namespace, id).await
+        }
+
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+    }
+
+    /// PR #363: when the head upsert fails, an edit that removes a WikiLink
+    /// must not leave the old head with its previously stored edge deleted.
+    #[tokio::test]
+    async fn failed_reimport_keeps_existing_edges_with_the_old_head() {
+        let root = std::env::temp_dir().join(format!("ns-vault-atomic-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_atomic_edges";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let mut linker = note("linker", &["stale-target", "kept-target"]);
+        linker.content = "links both".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        for plain in [note("stale-target", &[]), note("kept-target", &[])] {
+            let mut plain = plain;
+            plain.content = format!("body of {}", plain.id);
+            plain.canonical_sha256 = plain.fingerprint();
+            std::fs::write(vault.join(format!("{}.md", plain.id)), plain.to_markdown())
+                .expect("write note");
+        }
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        linker.related = vec!["kept-target".to_string()];
+        linker.content = "links one".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("rewrite linker");
+
+        let failing: std::sync::Arc<dyn VectorStore> =
+            std::sync::Arc::new(FailingHeadUpsertStore {
+                inner: store.clone(),
+                fail_id: "linker",
+            });
+        let second = import_vault(config, failing, std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("failing reimport");
+        assert!(!second.errors.is_empty(), "head upsert must fail");
+
+        let (_, head) = store
+            .get(ns, "linker")
+            .await
+            .expect("get head")
+            .expect("old head survives");
+        let mut related: Vec<String> = head.metadata["related_to"]
+            .as_array()
+            .expect("related_to array")
+            .iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect();
+        related.sort();
+        assert_eq!(
+            related,
+            vec!["kept-target".to_string(), "stale-target".to_string()],
+            "the old head must still declare its original links"
+        );
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| from == "linker"
+                && rel == "RELATES_TO"
+                && to == "stale-target"),
+            "a failed head upsert must not retire an edge under the old head: {:?}",
             edges
         );
         let _ = std::fs::remove_dir_all(&root);

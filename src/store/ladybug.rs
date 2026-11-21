@@ -10326,7 +10326,16 @@ impl VectorStore for LadybugStore {
                     })
                 })
         });
-        if has_unqualified_edge_target {
+        // Declared targets can be guaranteed exact by the caller (vault notes
+        // name other notes by id, not by a path that might resolve to a symbol
+        // from a different source). Path rewriting in that case would silently
+        // relink the declaration to a different node (PR #363).
+        let exact_edge_targets = payload
+            .metadata
+            .get("exact_edge_targets")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if has_unqualified_edge_target && !exact_edge_targets {
             let ids = self.mention_symbol_ids(&namespace).await;
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
             for key in [
