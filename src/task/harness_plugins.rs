@@ -64,7 +64,10 @@ async function main() {
   }
   const init = mod.initialize ?? plugin?.initialize ?? plugin?.setup;
   if (typeof init === "function") {
-    await init({ config: { namespace: process.env.NEUROSTRATA_NAMESPACE } });
+    // The namespace comes from the environment (Claude Code hooks) or the
+    // first argument (Codex hooks, which run through PowerShell on Windows).
+    const namespace = process.env.NEUROSTRATA_NAMESPACE || process.argv[2];
+    await init({ config: { namespace } });
   }
   const handler =
     mod.handleHookEvent ??
@@ -228,6 +231,88 @@ fn repair_installer_hook_command(
         return None;
     }
     Some(format!("{prefix}{abs_runner}\"{suffix}"))
+}
+
+/// Codex tools the hook runs for: `apply_patch` edits files and `Bash` is
+/// Codex's shell tool (on every platform, including PowerShell on Windows).
+const CODEX_PRE_TOOL_USE_MATCHER: &str = "apply_patch|Bash";
+
+/// The installer's Codex hook command. Codex runs hook commands through the
+/// platform shell (PowerShell on Windows), so the namespace is an argument,
+/// not a `NAME=value` prefix that only POSIX shells understand.
+fn codex_hook_command(abs_runner: &str, namespace: &str) -> String {
+    format!("node \"{abs_runner}\" \"{namespace}\"")
+}
+
+/// Add the NeuroStrata PreToolUse and Stop hooks to `.codex/hooks.json`,
+/// keeping every other entry. A command the installer wrote for a runner
+/// that has since moved is pointed at the current runner. A hooks.json that
+/// is not a JSON object is left untouched.
+fn wire_codex_hooks(project_root: &Path, namespace: &str, abs_runner: &str) -> Option<String> {
+    let hooks_path = project_root.join(".codex/hooks.json");
+    let mut doc: Value = match std::fs::read_to_string(&hooks_path) {
+        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(d) if d.is_object() => d,
+            _ => return None,
+        },
+        Err(_) => json!({}),
+    };
+    let cmd = codex_hook_command(abs_runner, namespace);
+    let obj = doc.as_object_mut()?;
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    let h_obj = hooks.as_object_mut()?;
+    for (event, matcher) in [
+        ("PreToolUse", Some(CODEX_PRE_TOOL_USE_MATCHER)),
+        ("Stop", None),
+    ] {
+        let entries = h_obj.entry(event).or_insert_with(|| json!([]));
+        let Some(arr) = entries.as_array_mut() else {
+            continue;
+        };
+        let mut present = false;
+        for entry in arr.iter_mut() {
+            let Some(entry_hooks) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            for hook in entry_hooks {
+                let Some(command) = hook.get("command").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if command == cmd {
+                    present = true;
+                } else if let Some(old_path) = command
+                    .strip_prefix("node \"")
+                    .and_then(|rest| rest.strip_suffix(&format!("\" \"{namespace}\"")))
+                {
+                    if path_basename(old_path) == path_basename(abs_runner)
+                        && runner_is_replaceable(old_path, project_root, abs_runner)
+                    {
+                        hook["command"] = Value::String(cmd.clone());
+                        present = true;
+                    }
+                }
+            }
+        }
+        if !present {
+            let mut entry = json!({ "hooks": [{ "type": "command", "command": cmd }] });
+            if let Some(m) = matcher {
+                entry["matcher"] = json!(m);
+            }
+            arr.push(entry);
+        }
+    }
+
+    if let Some(parent) = hooks_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let serialized = serde_json::to_string_pretty(&doc).ok()?;
+    let needs_write = std::fs::read_to_string(&hooks_path)
+        .map(|existing| existing != serialized)
+        .unwrap_or(true);
+    if needs_write {
+        std::fs::write(&hooks_path, serialized).ok()?;
+    }
+    Some(hooks_path.to_string_lossy().to_string())
 }
 
 fn has_any_env(keys: &[&str]) -> bool {
@@ -784,7 +869,11 @@ fn wire_harness_config(
                     "entry": abs_dist,
                     "cliHookRunner": abs_runner
                 });
-                return write_json_if_changed(&cfg_path, &doc);
+                let cfg_written = write_json_if_changed(&cfg_path, &doc);
+                // Codex CLI never reads the file above: it runs hooks from
+                // `.codex/hooks.json` (or `[hooks]` in config.toml). Without
+                // this entry no NeuroStrata hook ran in Codex at all (#333).
+                return wire_codex_hooks(project_root, namespace, abs_runner).or(cfg_written);
             }
             None
         }
@@ -1377,5 +1466,100 @@ mod tests {
             snippet.contains("memories_for_file"),
             "snippet must still direct to memories_for_file"
         );
+    }
+
+    fn read_codex_hooks(root: &Path) -> Value {
+        let raw = std::fs::read_to_string(root.join(".codex/hooks.json")).expect("read hooks.json");
+        serde_json::from_str(&raw).expect("parse hooks.json")
+    }
+
+    fn codex_commands(doc: &Value, event: &str) -> Vec<String> {
+        doc["hooks"][event]
+            .as_array()
+            .expect("event array")
+            .iter()
+            .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|h| h["command"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// #333: Codex CLI runs hooks from `.codex/hooks.json`; the
+    /// `.codex/plugins/neurostrata.json` file alone never ran anything.
+    #[test]
+    fn codex_install_wires_hooks_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).expect("create .codex");
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner")
+            .to_string();
+        let expected = format!("node \"{runner}\" \"TestProj\"");
+
+        let doc = read_codex_hooks(tmp.path());
+        let pre = doc["hooks"]["PreToolUse"].as_array().expect("PreToolUse");
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0]["matcher"], json!("apply_patch|Bash"));
+        assert_eq!(pre[0]["hooks"][0]["type"], json!("command"));
+        assert_eq!(codex_commands(&doc, "PreToolUse"), vec![expected.clone()]);
+        assert_eq!(codex_commands(&doc, "Stop"), vec![expected.clone()]);
+        assert!(
+            !expected.contains("NEUROSTRATA_NAMESPACE="),
+            "PowerShell cannot run a NAME=value prefix: {expected}"
+        );
+        assert!(tmp.path().join(".codex/plugins/neurostrata.json").exists());
+
+        // The runner must accept the namespace as its first argument.
+        let runner_src = std::fs::read_to_string(&runner).expect("read runner");
+        assert!(runner_src.contains("process.argv[2]"));
+
+        // A second run adds nothing.
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
+        assert_eq!(read_codex_hooks(tmp.path()), doc);
+    }
+
+    #[test]
+    fn codex_hooks_json_keeps_user_hooks_and_repoints_a_moved_runner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).expect("create .codex");
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner")
+            .to_string();
+        let expected = format!("node \"{runner}\" \"TestProj\"");
+        let gone = tmp
+            .path()
+            .join("moved-away/.NeuroStrata/plugins/codex/cli-hook.mjs");
+        let stale = format!("node \"{}\" \"TestProj\"", gone.to_string_lossy());
+
+        let user = json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": "echo user-hook" }] },
+                    { "matcher": "apply_patch|Bash", "hooks": [{ "type": "command", "command": stale }] }
+                ],
+                "SessionStart": [{ "hooks": [{ "type": "command", "command": "echo start" }] }]
+            },
+            "other": true
+        });
+        let path = tmp.path().join(".codex/hooks.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&user).unwrap()).expect("write");
+
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
+        let doc = read_codex_hooks(tmp.path());
+        assert_eq!(
+            codex_commands(&doc, "PreToolUse"),
+            vec!["echo user-hook".to_string(), expected.clone()],
+            "user hook kept, moved runner repointed, nothing duplicated"
+        );
+        assert_eq!(codex_commands(&doc, "Stop"), vec![expected]);
+        assert_eq!(codex_commands(&doc, "SessionStart"), vec!["echo start".to_string()]);
+        assert_eq!(doc["other"], json!(true));
+
+        // A hooks.json that is not a JSON object is the user's to fix.
+        std::fs::write(&path, "not json").expect("write");
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "not json");
     }
 }

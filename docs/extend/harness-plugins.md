@@ -11,6 +11,8 @@
 
 The plugin is harness-agnostic: the same `createHarnessPlugin` function works for OpenCode, Claude, Hermes, and Codex because it only depends on the harness hook interface, not on harness internals.
 
+Codex CLI runs hooks only from `.codex/hooks.json` (or `[hooks]` in its `config.toml`), so for Codex the installer adds a `PreToolUse` hook for `apply_patch|Bash` and a `Stop` hook there, next to any existing entries. The hook command is `node "<runner>" "<namespace>"`: Codex runs hook commands through PowerShell on Windows, so the namespace is the runner's first argument rather than a `NEUROSTRATA_NAMESPACE=` prefix. Codex sends `apply_patch` input as `{"command": "<patch>"}`; file-touch recall reads the patch path from `command`. `Stop` and `SubagentStop` are answered with `{"continue": true}`, because Codex rejects a `Stop` reply that carries a permission decision. Codex asks the user to review a new hook once and runs project hooks only in a trusted project.
+
 ## Session- & worktree-aware task state
 
 `resolveActiveTaskFromDaemon` never picks the first `in_progress` task blindly. Among in-progress tasks it prefers, in strict order: an explicit `preferredTaskId`, a task matching both `activeSessionId` and the current `effectiveProjectRoot`, a task matching `activeSessionId`, a task matching the worktree, then any in-progress task. A fallback owned by a different session never overwrites a known `activeSessionId`, which prevents cross-session / cross-worktree Breath bleed between child worktrees.

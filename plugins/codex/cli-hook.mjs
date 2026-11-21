@@ -31,7 +31,9 @@ async function main() {
   } catch {
     process.exit(0);
   }
-  await initialize({ config: { namespace: process.env.NEUROSTRATA_NAMESPACE } });
+  await initialize({
+    config: { namespace: process.env.NEUROSTRATA_NAMESPACE || process.argv[2] }
+  });
   const handler = plugin.handleHookEvent ?? plugin.handleClaudeHookEvent ?? plugin;
   if (typeof handler === "function") {
     const out = await handler(event);

@@ -2114,6 +2114,8 @@ function extractFilePath(args, altArgs, rawPatch) {
         asString(args.path) ??
         extractPatchPath(args.patchText ?? args.patch ?? args.diff ?? args.input) ??
         extractPatchPath(rawPatch) ??
+        // Codex CLI's PreToolUse hook sends apply_patch as {"command": "<patch>"}.
+        extractPatchPath(args.command) ??
         (altArgs
             ? (asString(altArgs.file_path) ??
                 asString(altArgs.filePath) ??
@@ -2808,9 +2810,10 @@ export async function handleHookEvent(event) {
         if (hookEventName === 'Stop' && transcript) {
             await onTurnEnd({ role: 'assistant', content: transcript });
         }
-        return {
-            hookSpecificOutput: { hookEventName, permissionDecision: 'allow' }
-        };
+        // Stop takes no permission decision. Codex CLI rejects a Stop reply that
+        // carries one and reports the hook as failed; `continue: true` is valid
+        // for both Claude Code and Codex (and matches the hermes/openclaw shims).
+        return { continue: true };
     }
     return { hookSpecificOutput: { hookEventName, permissionDecision: 'allow' } };
 }

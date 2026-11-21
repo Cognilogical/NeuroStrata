@@ -693,10 +693,11 @@ describe('handleHookEvent / handleClaudeHookEvent alias', () => {
     }
   })
 
-  it('Stop / SubagentStop events allow', async () => {
+  it('Stop / SubagentStop events continue without a permission decision', async () => {
     for (const ev of ['Stop', 'SubagentStop']) {
       const out = await handleHookEvent({ hook_event_name: ev })
-      assert.equal(out.hookSpecificOutput.permissionDecision, 'allow')
+      // Codex CLI rejects a Stop reply that carries permissionDecision.
+      assert.deepEqual(out, { continue: true })
     }
   })
 })
@@ -2899,6 +2900,43 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
         `the raw patch must reach guard_validate, got ${payload}`
       )
       assert.notEqual(payload, '{}')
+    } finally {
+      server.close()
+      resetModuleState()
+    }
+  })
+
+  it('Codex CLI apply_patch {command} event gets file recall and the guard', async () => {
+    const { server, url, counters } = await createMockDaemonServer()
+    try {
+      await initialize({
+        config: {
+          namespace: 'r8-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: true,
+          requestTimeoutMs: 500
+        },
+        tool: { hook: async () => {} },
+        hooks: {}
+      })
+      // The tool_input a Codex 0.170 PreToolUse hook sent for apply_patch.
+      const patch =
+        '*** Begin Patch\n*** Add File: src/run.rs\n+fn main() {}\n*** End Patch'
+      await handleHookEvent({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'apply_patch',
+        tool_input: { command: patch }
+      })
+      assert.ok(
+        counters.memoriesForFilePaths.includes('src/run.rs'),
+        `the patched path must be recalled, got ${JSON.stringify(counters.memoriesForFilePaths)}`
+      )
+      assert.equal(counters.guardValidate, 1)
+      assert.ok(
+        counters.guardArgs[0].payload.includes('*** Add File: src/run.rs'),
+        `the patch must reach guard_validate, got ${counters.guardArgs[0].payload}`
+      )
     } finally {
       server.close()
       resetModuleState()
