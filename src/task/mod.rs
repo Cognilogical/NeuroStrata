@@ -658,7 +658,7 @@ pub fn persist_active_session_file(
         namespace,
         golden_rules,
         active_task,
-        session_home_dir().as_deref(),
+        &session_home_dirs(),
     );
 }
 
@@ -667,9 +667,9 @@ fn persist_active_session_file_with_home(
     namespace: &str,
     golden_rules: &[SearchResult],
     active_task: Option<(&str, &MemoryPayload)>,
-    home: Option<&std::path::Path>,
+    homes: &[std::path::PathBuf],
 ) {
-    if is_home_without_git_with(project_root, home) {
+    if is_home_without_git_with(project_root, homes) {
         return;
     }
     let ns_dir = project_root.join(".NeuroStrata");
@@ -1409,10 +1409,12 @@ pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
 // Process-wide, not per thread: a test that points NEUROSTRATA_PROJECT_ROOT
 // into its fake home must have every concurrent test see that folder as the
 // home folder too, or another test's lookup could write a ledger there.
+// The fake home is added to the real one, never put in its place: a test
+// running at the same time still stops at the real home folder.
 #[cfg(test)]
 static TEST_HOME_DIR: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
-/// Treat `home` as the home folder until the guard drops. Hold
+/// Also treat `home` as a home folder until the guard drops. Hold
 /// `daemon::project_root_env_test_lock()` while the guard lives.
 #[cfg(test)]
 pub(crate) fn override_home_dir_for_test(home: &std::path::Path) -> impl Drop {
@@ -1426,17 +1428,18 @@ pub(crate) fn override_home_dir_for_test(home: &std::path::Path) -> impl Drop {
     Reset
 }
 
-/// The user's home folder. Tests can replace it.
-fn session_home_dir() -> Option<std::path::PathBuf> {
+/// The user's home folder. Tests can add a fake one next to it.
+fn session_home_dirs() -> Vec<std::path::PathBuf> {
+    let mut homes = Vec::new();
     #[cfg(test)]
-    if let Some(home) = TEST_HOME_DIR
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-    {
-        return Some(home);
-    }
-    dirs::home_dir()
+    homes.extend(
+        TEST_HOME_DIR
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone(),
+    );
+    homes.extend(dirs::home_dir());
+    homes
 }
 
 fn is_home_folder(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
@@ -1446,16 +1449,20 @@ fn is_home_folder(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool
     dunce::canonicalize(dir).is_ok_and(|d| d == home)
 }
 
+fn is_any_home_folder(dir: &std::path::Path, homes: &[std::path::PathBuf]) -> bool {
+    homes.iter().any(|h| is_home_folder(dir, Some(h)))
+}
+
 /// True when `dir` is the user's home folder and holds no `.git`. Such a
 /// folder is never a project, so no session file (`active_session.json`,
 /// `session_queries.json`) is written there: `~/.NeuroStrata` belongs to
 /// SynapticMesh, not to a project.
 pub(crate) fn is_home_without_git(dir: &std::path::Path) -> bool {
-    is_home_without_git_with(dir, session_home_dir().as_deref())
+    is_home_without_git_with(dir, &session_home_dirs())
 }
 
-fn is_home_without_git_with(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
-    is_home_folder(dir, home) && !dir.join(".git").exists()
+fn is_home_without_git_with(dir: &std::path::Path, homes: &[std::path::PathBuf]) -> bool {
+    is_any_home_folder(dir, homes) && !dir.join(".git").exists()
 }
 
 /// Where a walk for a session-file root ended.
@@ -1475,7 +1482,7 @@ enum SessionMarkerWalk {
 /// (SynapticMesh keeps its node id there), and a walk that reaches it stops
 /// there rather than continuing above it.
 fn walk_to_session_marker(start: &std::path::Path) -> SessionMarkerWalk {
-    let home = session_home_dir().and_then(|h| dunce::canonicalize(h).ok());
+    let homes = session_home_dirs();
     let start = if start.is_dir() {
         start
     } else {
@@ -1484,10 +1491,7 @@ fn walk_to_session_marker(start: &std::path::Path) -> SessionMarkerWalk {
             _ => return SessionMarkerWalk::NotFound,
         }
     };
-    let is_home = |dir: &std::path::Path| {
-        home.as_deref()
-            .is_some_and(|h| dunce::canonicalize(dir).is_ok_and(|d| d == h))
-    };
+    let is_home = |dir: &std::path::Path| is_any_home_folder(dir, &homes);
     let mut cur = Some(start);
     while let Some(dir) = cur {
         if dir.join(".git").exists() {
@@ -8153,7 +8157,7 @@ mod tests {
             "example-project",
             &[],
             None,
-            Some(home.path()),
+            &[home.path().to_path_buf()],
         );
         assert!(!home
             .path()
@@ -8166,7 +8170,7 @@ mod tests {
             "example-project",
             &[],
             None,
-            Some(home.path()),
+            &[home.path().to_path_buf()],
         );
         assert!(work.join(".NeuroStrata/active_session.json").exists());
     }
