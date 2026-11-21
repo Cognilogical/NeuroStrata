@@ -56,21 +56,21 @@ superseding of the apply receipt.
 
 ## 4. Behavior Specification
 
-1. **Staged-first resolution.** In the `transition_task` arm, when
+1. **Staged-first comparison head.** In the `transition_task` arm, when
    `staged_rows` already holds `delta.after_id` (staged by a later delta in
-   the reverse walk), that payload is the comparison head. Only when it is
-   absent does the arm read `store.get(&invocation.namespace,
-   &delta.after_id)`.
+   the reverse walk), that payload is the comparison head; otherwise the
+   persisted row from `store.get(&invocation.namespace, &delta.after_id)`
+   is. The persisted row is still read in both cases so a genuinely missing
+   row is reported and the commit CAS keeps a persisted anchor.
 2. **Guard semantics unchanged.** The guard still requires
    `is_active_payload(current, now_ts)`, `actual_status == expected_status`,
    and `actual_upd == expected_upd` on the resolved head. A genuine external
    write between apply and revert still raises `ConflictWithNewerVersion`.
 3. **Expected-head CAS anchored to persisted state.** The commit CAS
-   (`ExpectedHead::ActiveRow`) verifies pre-transaction persisted values.
-   `record_expected_active_row` is therefore invoked with the resolved head
-   where the same-row dedupe (`seen_expected_rows`) keeps the first — hence
-   persisted — expected status for the row. Feeding an uncommitted staged
-   status into the CAS would deadlock the commit.
+   (`ExpectedHead::ActiveRow`) verifies pre-transaction persisted values, so
+   `record_expected_active_row` is invoked with the persisted row, never the
+   staged comparison head. Feeding an uncommitted staged status into the CAS
+   would make the revert commit fail against its own staging.
 4. **Revert receipt deltas stay chained.** `revert_task_deltas` records
    `before_status = actual_status` of the resolved head and
    `after_status = before_status` of the original delta, so the revert
@@ -109,9 +109,8 @@ mechanisms.
 - **CAS regression (highest).** If the CAS expected head were taken from
   staged state, the revert commit would fail with
   `ConflictWithNewerVersion` after passing the guard. Mitigated by keeping
-  the existing `seen_expected_rows` dedupe order (first resolved head per
-  row is the persisted one in the reverse walk) and by the two-transition
-  eval.
+  `record_expected_active_row` on the persisted row and by the
+  two-transition eval.
 - **Masked external writes.** Resolving from staged state must not weaken
   the guard for the first delta of a chain: the staged payload is compared
   strictly (status + `updated_at`) and a mismatch still conflicts. Eval 2's

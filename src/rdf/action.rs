@@ -3468,7 +3468,12 @@ pub async fn revert_action(
                 }
             }
             "transition_task" => {
-                let Some((_v, current_task)) = store
+                // Repeated transitions of one task land here in reverse: the
+                // persisted row already carries the chain's final status, so
+                // the comparison head is the before-image staged by the newer
+                // delta. The persisted row still anchors the commit CAS.
+                let staged_task = staged_rows.get(&delta.after_id).cloned();
+                let Some((_v, persisted_task)) = store
                     .get(&invocation.namespace, &delta.after_id)
                     .await
                     .map_err(|e| ActionError::Storage(e.to_string()))?
@@ -3478,6 +3483,7 @@ pub async fn revert_action(
                         superseded_by: "missing_task".to_string(),
                     });
                 };
+                let current_task = staged_task.unwrap_or_else(|| persisted_task.clone());
 
                 check_target_auth(&current_task, &delta.after_id)?;
                 if let Some(ref before_p) = delta.before_payload {
@@ -3525,7 +3531,7 @@ pub async fn revert_action(
                     &mut expected_heads,
                     &mut seen_expected_rows,
                     &delta.after_id,
-                    &current_task,
+                    &persisted_task,
                 );
 
                 let before_payload = delta.before_payload.as_ref().ok_or_else(|| {
