@@ -6293,6 +6293,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hooks_install_after_hook_hygiene_on_a_fresh_clone_still_asks() {
+        let _env = crate::daemon::project_root_env_test_lock();
+        std::env::remove_var("NEUROSTRATA_NAMESPACE");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = hooks_repo(&tmp, "example-project");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        // The daemon's hook refresh on a clone with only a folder name to go on.
+        crate::task::hook_hygiene(&root);
+        assert_eq!(
+            crate::task::harness_plugins::resolve_namespace(&root).expect("resolves").configs,
+            Vec::<(String, String)>::new(),
+            "no harness config may carry the folder name"
+        );
+        let report = run_hooks_install(&root, false, None, || async { Ok(mock_registry()) }).await;
+        assert_eq!(report.code, 0, "{report:?}");
+        assert!(
+            report.out.iter().any(|l| l.contains("hooks install --namespace <ns>") && l.contains("example-project")),
+            "{report:?}"
+        );
+        assert!(!marker_file(&root).exists(), "{report:?}");
+    }
+
+    #[tokio::test]
     async fn hooks_install_under_other_namespace_marker_installs_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let root = hooks_repo(&tmp, "example-project");
