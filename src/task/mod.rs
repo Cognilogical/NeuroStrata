@@ -4197,6 +4197,75 @@ pub(crate) fn is_current_task_coverage_gate(content: &str) -> bool {
     content.contains(&marker)
 }
 
+/// Live (non-comment, non-empty) entries in a hook's PROJECT_GATES array.
+fn hook_project_gates(content: &str) -> Vec<String> {
+    const OPEN: &str = "PROJECT_GATES=(";
+    let start = match content.find(OPEN) {
+        Some(i) => i + OPEN.len(),
+        None => return Vec::new(),
+    };
+    let block = match content[start..].find(')') {
+        Some(i) => &content[start..start + i],
+        None => return Vec::new(),
+    };
+    block
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Canonical pre-push bytes plus any project-added PROJECT_GATES entries
+/// found in `stale`, merged in (dedup, original order). The canonical hash
+/// marker is retained so hygiene does not rewrite the hook again next run.
+fn refreshed_pre_push_preserving_gates(stale: &str) -> String {
+    let defaults = hook_project_gates(SCAFFOLDED_PRE_PUSH_HOOK);
+    let mut added: Vec<String> = Vec::new();
+    for gate in hook_project_gates(stale) {
+        if !defaults.contains(&gate) && !added.contains(&gate) {
+            added.push(gate);
+        }
+    }
+    if added.is_empty() {
+        return SCAFFOLDED_PRE_PUSH_HOOK.to_string();
+    }
+    const OPEN: &str = "PROJECT_GATES=(";
+    let start = SCAFFOLDED_PRE_PUSH_HOOK
+        .find(OPEN)
+        .expect("PROJECT_GATES in canonical pre-push")
+        + OPEN.len();
+    let end = start
+        + SCAFFOLDED_PRE_PUSH_HOOK[start..]
+            .find(')')
+            .expect("closing paren of PROJECT_GATES");
+    let mut out = String::with_capacity(SCAFFOLDED_PRE_PUSH_HOOK.len() + 128);
+    out.push_str(&SCAFFOLDED_PRE_PUSH_HOOK[..end]);
+    for gate in added {
+        out.push_str("    ");
+        out.push_str(&gate);
+        out.push('\n');
+    }
+    out.push_str(&SCAFFOLDED_PRE_PUSH_HOOK[end..]);
+    out
+}
+
+/// Content version marker for the scaffolded pre-commit hook. The canonical
+/// hook is byte-identity guarded, so it cannot carry a literal hash-marker
+/// line like pre-push/task-coverage-gate. This header block was introduced
+/// when the hook stopped stamping `graph_queried`; its presence proves the
+/// current version already landed. Local checks a project appends leave the
+/// marker intact, so "current + local edits" is distinct from "stale V1".
+pub(crate) const PRE_COMMIT_VERSION_MARKER: &str =
+    "# Warns when a staged file has no recorded NeuroStrata graph/memory lookup and";
+
+/// True when `content` carries the current pre-commit version marker. Such a
+/// hook is preserved even when local edits make it differ from the canonical
+/// bytes; only hooks missing the marker (older versions) are refreshed.
+pub(crate) fn is_current_pre_commit_hook(content: &str) -> bool {
+    content.contains(PRE_COMMIT_VERSION_MARKER)
+}
+
 /// The directory git actually runs hooks from, resolved the way git resolves
 /// it: `core.hooksPath` at the highest-priority config level that sets it,
 /// else `$GIT_DIR/hooks`.
@@ -4257,6 +4326,7 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
     } else if let Ok(pc_content) = std::fs::read_to_string(&pre_commit_target) {
         if pc_content.contains("NeuroStrata pre-commit hook")
             && pc_content != SCAFFOLDED_PRE_COMMIT_HOOK
+            && !is_current_pre_commit_hook(&pc_content)
             && std::fs::copy(&pre_commit_target, hooks_dir.join("pre-commit.bak")).is_ok()
             && std::fs::write(&pre_commit_target, SCAFFOLDED_PRE_COMMIT_HOOK).is_ok()
         {
@@ -4296,7 +4366,10 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
         }
         let stale_ours = match rel {
             "hooks/pre-push" => is_ours_hook(&on_disk) && !is_current_hook(&on_disk),
-            "hooks/pre-commit" => on_disk.contains("NeuroStrata pre-commit hook"),
+            "hooks/pre-commit" => {
+                on_disk.contains("NeuroStrata pre-commit hook")
+                    && !is_current_pre_commit_hook(&on_disk)
+            }
             "install-hooks.sh" => {
                 on_disk.contains("Install scripts/hooks/pre-push as the hook git runs")
             }
@@ -4314,7 +4387,12 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
             tracing::warn!("failed to back up stale tracked {rel}: {e}");
             continue;
         }
-        if std::fs::write(&path, content).is_ok() {
+        let refreshed = if rel == "hooks/pre-push" {
+            refreshed_pre_push_preserving_gates(&on_disk)
+        } else {
+            content.to_string()
+        };
+        if std::fs::write(&path, &refreshed).is_ok() {
             set_executable(&path);
             notes.push(format!("HOOKS: refreshed stale tracked {rel}"));
         }
@@ -4339,7 +4417,7 @@ pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
             } else if let Err(e) = std::fs::copy(&target, hooks_dir.join("pre-push.bak")) {
                 tracing::warn!("failed to back up foreign pre-push hook: {e}");
                 String::new()
-            } else if std::fs::write(&target, SCAFFOLDED_PRE_PUSH_HOOK).is_ok() {
+            } else if std::fs::write(&target, refreshed_pre_push_preserving_gates(&content)).is_ok() {
                 set_executable(&target);
                 format!("HOOKS: updated pre-push (stale -> v{version})")
             } else {
@@ -5700,6 +5778,121 @@ mod tests {
                     .unwrap()
                     .contains("fabricated"),
             "stale tracked hook must be backed up before rewrite"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex 4653560567: refreshing a stale tracked pre-push hook must keep
+    /// project-added PROJECT_GATES entries instead of dropping them with the
+    /// canonical rewrite. The original (with the guard) is still backed up.
+    #[cfg(unix)]
+    #[test]
+    fn hook_hygiene_refresh_preserves_project_added_prepush_gates() {
+        let root =
+            std::env::temp_dir().join(format!("ns-hygiene-custom-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("scripts").join("hooks")).unwrap();
+        let custom_gate = "./scripts/local-audit.sh";
+        let stale = SCAFFOLDED_PRE_PUSH_HOOK
+            .replace(
+                &format!("# neurostrata-hook-sha256: {}", hook_sha256()),
+                "# old pre-push marker (stale)\n",
+            )
+            .replace(
+                "    # ./scripts/rules-gate.sh\n",
+                &format!("    # ./scripts/rules-gate.sh\n    {custom_gate}\n"),
+            );
+        assert!(
+            stale.contains(custom_gate),
+            "fixture must carry custom gate"
+        );
+        let tracked = root.join("scripts/hooks/pre-push");
+        std::fs::write(&tracked, &stale).unwrap();
+        let status = hook_hygiene(&root);
+        let refreshed = std::fs::read_to_string(&tracked).unwrap();
+        assert!(
+            refreshed.contains(&format!("# neurostrata-hook-sha256: {}", hook_sha256())),
+            "stale hook must be refreshed to a current marker: {status}"
+        );
+        assert!(
+            refreshed.contains(custom_gate),
+            "project-added PROJECT_GATES entry must survive refresh: {refreshed}"
+        );
+        let backup = root.join("scripts/hooks/pre-push.bak");
+        assert!(
+            backup.is_file()
+                && std::fs::read_to_string(&backup)
+                    .unwrap()
+                    .contains(custom_gate),
+            ".bak must retain the original hook with its custom guard"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex 4653560575: a current-version pre-commit hook with local edits
+    /// must survive hygiene; the old code overwrote any marked hook that
+    /// differed from the embedded script, destroying local checks.
+    #[cfg(unix)]
+    #[test]
+    fn hook_hygiene_preserves_local_edits_in_current_pre_commit() {
+        let root = std::env::temp_dir().join(format!("ns-hygiene-local-pc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("scripts").join("hooks")).unwrap();
+        let anchor = "\nexit 0\n";
+        let pos = SCAFFOLDED_PRE_COMMIT_HOOK
+            .rfind(anchor)
+            .expect("canonical pre-commit hook ends with exit 0");
+        let mut local = String::new();
+        local.push_str(&SCAFFOLDED_PRE_COMMIT_HOOK[..pos]);
+        local.push_str("\necho 'local project check'\n");
+        local.push_str(&SCAFFOLDED_PRE_COMMIT_HOOK[pos..]);
+        let tracked = root.join("scripts/hooks/pre-commit");
+        std::fs::write(&tracked, &local).unwrap();
+        let status = hook_hygiene(&root);
+        let after = std::fs::read_to_string(&tracked).unwrap();
+        assert!(
+            after.contains("local project check"),
+            "local edits to a current pre-commit hook must be preserved: {status}"
+        );
+        assert!(
+            !root.join("scripts/hooks/pre-commit.bak").exists(),
+            "a preserved current hook needs no backup: {status}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex 4653560575: a stale (old-version) pre-commit hook is still
+    /// refreshed to canonical bytes with a `.bak`, so the version check does
+    /// not make hygiene stop healing genuinely superseded hooks.
+    #[cfg(unix)]
+    #[test]
+    fn hook_hygiene_refreshes_stale_pre_commit_with_old_marker() {
+        let root = std::env::temp_dir().join(format!("ns-hygiene-stale-pc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join("scripts").join("hooks")).unwrap();
+        let stale = "#!/bin/bash\n# NeuroStrata pre-commit hook — scaffolded by neurostrata-bootstrap.\n# STALE V1 fabrication machinery\nexit 0\n";
+        let tracked = root.join("scripts/hooks/pre-commit");
+        std::fs::write(&tracked, stale).unwrap();
+        let status = hook_hygiene(&root);
+        assert!(
+            status.contains("stale tracked"),
+            "hygiene must report the stale pre-commit hook: {status}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked).unwrap(),
+            SCAFFOLDED_PRE_COMMIT_HOOK,
+            "stale pre-commit hook must be refreshed to canonical bytes"
+        );
+        let backup = root.join("scripts/hooks/pre-commit.bak");
+        assert!(
+            backup.is_file()
+                && std::fs::read_to_string(&backup)
+                    .unwrap()
+                    .contains("STALE V1"),
+            "stale pre-commit hook must be backed up before rewrite"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

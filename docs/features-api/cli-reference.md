@@ -180,7 +180,7 @@ neurostrata-mcp task import <namespace> --from-beads <path>
 
 ### `hooks install`
 
-Installs `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (graph-query ledger) plus detected agent harness plugins. Hook hygiene also detects stale NeuroStrata-owned tracked hooks, scaffolded task-coverage gates, and the installer script; it backs the stale copy up to `<path>.bak` and refreshes it from the current embedded source so an old install cannot resurrect superseded hook behavior. Local edits to a current-version hook are preserved; `pre-push`/`pre-commit` bytes are guarded by byte-identity checks.
+Installs `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (graph-query ledger) plus detected agent harness plugins. Hook hygiene also detects stale NeuroStrata-owned tracked hooks, scaffolded task-coverage gates, and the installer script; it backs the stale copy up to `<path>.bak` and refreshes it from the current embedded source so an old install cannot resurrect superseded hook behavior. Local edits to a current-version hook are preserved; `pre-push`/`pre-commit` bytes are guarded by byte-identity checks. On a stale pre-push hook, project-added `PROJECT_GATES` entries are parsed and merged into the refreshed hook (dedup, original order) before the original is backed up to `.bak`, so custom guards survive the upgrade. A current-version pre-commit hook carrying local checks is left untouched; only a hook missing the current version marker is refreshed from the canonical source (with `.bak`).
 
 ```bash
 neurostrata-mcp hooks install [--force]
