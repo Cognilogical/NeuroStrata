@@ -239,17 +239,24 @@ mod tests {
     ///     the same allocation); relax only above `PSI_AVG10_THRESHOLD`.
     ///   - cgroup CPU quota present without PSI -> strict; host load is
     ///     out of scope, never a relaxation trigger.
-    ///   - no cgroup limit -> whole host visible; host load normalized by
-    ///     available parallelism is same-scope and may relax.
+    ///   - no cgroup limit AND visible CPUs == host CPU count -> whole host
+    ///     visible; host load normalized by available parallelism is same-scope
+    ///     and may relax.
+    ///   - no cgroup limit but visible CPUs < host count (cpuset/taskset
+    ///     affinity or cgroup v1) -> `Restricted`: host load is out of scope.
     ///   - any read/parse failure -> strict; never relax on unknown load.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     enum CgroupScope {
         /// PSI `some avg10` for this cgroup (same CPU allocation).
         Psi(f64),
         /// cgroup CPU quota present; host-wide load is out of scope.
         QuotaLimited,
-        /// No cgroup CPU limit; process sees the whole host.
+        /// No cgroup CPU limit and the process sees every host CPU, so host
+        /// load is the same allocation and may relax.
         NoLimit,
+        /// No CPU limit, but affinity/cpuset hides host CPUs from the process;
+        /// host-wide load cannot justify relaxation.
+        Restricted,
         /// Unreadable/unparseable signal: strict path.
         Unknown,
     }
@@ -264,24 +271,101 @@ mod tests {
         value.is_finite().then_some(value)
     }
 
-    /// Read the cgroup CPU scope. Absent `cpu.pressure` and `cpu.max` means no
-    /// cgroup v2 limit (whole host visible); a non-`max` quota means a limited
-    /// allocation where host-wide load cannot justify relaxation.
-    fn cgroup_scope() -> CgroupScope {
-        match std::fs::read_to_string("/sys/fs/cgroup/cpu.pressure") {
-            Ok(raw) => return psi_some_avg10(&raw).map_or(CgroupScope::Unknown, CgroupScope::Psi),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return CgroupScope::Unknown,
+    /// One classifier input: `Absent` is ENOENT (cgroup v1 has no `cpu.max`),
+    /// `Error` is any other I/O failure. Representing both keeps the decision
+    /// pure and directly testable against synthetic filesystem state.
+    #[derive(Debug, Clone, Copy)]
+    enum ReadState<'a> {
+        Present(&'a str),
+        Absent,
+        Error,
+    }
+
+    /// Host CPU count derived independently of `available_parallelism()` by
+    /// counting numbered `cpuN` lines in `/proc/stat`. The aggregate `cpu`
+    /// line has no digit and is excluded; `None` on no numbered lines so the
+    /// caller falls back to strict.
+    fn host_cpu_count(stat_raw: &str) -> Option<usize> {
+        let n = stat_raw
+            .lines()
+            .filter(|line| {
+                line.strip_prefix("cpu")
+                    .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            })
+            .count();
+        (n > 0).then_some(n)
+    }
+
+    /// Pure classifier over observed filesystem state plus the process's
+    /// visible CPU count. Host load relaxes the strict assertion only after
+    /// BOTH a cgroup-scope check AND a scope-equality check pass: absence of
+    /// v2 `cpu.pressure`/`cpu.max` is not proof of whole-host visibility —
+    /// cpuset/taskset affinity and cgroup v1 reach the same branch.
+    fn classify_cgroup_scope(
+        psi: ReadState<'_>,
+        cpu_max: ReadState<'_>,
+        proc_stat: ReadState<'_>,
+        visible_cpus: usize,
+    ) -> CgroupScope {
+        match psi {
+            ReadState::Present(raw) => {
+                return psi_some_avg10(raw).map_or(CgroupScope::Unknown, CgroupScope::Psi);
+            }
+            ReadState::Error => return CgroupScope::Unknown,
+            ReadState::Absent => {}
         }
-        match std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
-            Ok(raw) => match raw.split_whitespace().next().unwrap_or("") {
-                "max" => CgroupScope::NoLimit,
-                quota if quota.parse::<u64>().is_ok() => CgroupScope::QuotaLimited,
-                _ => CgroupScope::Unknown,
+        match cpu_max {
+            ReadState::Present(raw) => match raw.split_whitespace().next().unwrap_or("") {
+                "max" => {}
+                quota if quota.parse::<u64>().is_ok() => return CgroupScope::QuotaLimited,
+                _ => return CgroupScope::Unknown,
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CgroupScope::NoLimit,
-            Err(_) => CgroupScope::Unknown,
+            ReadState::Error => return CgroupScope::Unknown,
+            ReadState::Absent => {}
         }
+        let stat_raw = match proc_stat {
+            ReadState::Present(raw) => raw,
+            ReadState::Absent | ReadState::Error => return CgroupScope::Unknown,
+        };
+        match host_cpu_count(stat_raw) {
+            Some(n) if visible_cpus > 0 && n == visible_cpus => CgroupScope::NoLimit,
+            Some(_) => CgroupScope::Restricted,
+            None => CgroupScope::Unknown,
+        }
+    }
+
+    /// Read the cgroup CPU scope from the host, then delegate the decision to
+    /// [`classify_cgroup_scope`]. File reads happen here; the classifier stays
+    /// pure so filesystem-state cases are directly testable.
+    fn cgroup_scope() -> CgroupScope {
+        let psi_raw = match std::fs::read_to_string("/sys/fs/cgroup/cpu.pressure") {
+            Ok(raw) => Some(raw),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return CgroupScope::Unknown,
+        };
+        let cpu_max_raw = match std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+            Ok(raw) => Some(raw),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return CgroupScope::Unknown,
+        };
+        let proc_stat_raw = match std::fs::read_to_string("/proc/stat") {
+            Ok(raw) => raw,
+            Err(_) => return CgroupScope::Unknown,
+        };
+        let visible_cpus = match std::thread::available_parallelism() {
+            Ok(n) => n.get(),
+            Err(_) => return CgroupScope::Unknown,
+        };
+        classify_cgroup_scope(
+            psi_raw
+                .as_deref()
+                .map_or(ReadState::Absent, ReadState::Present),
+            cpu_max_raw
+                .as_deref()
+                .map_or(ReadState::Absent, ReadState::Present),
+            ReadState::Present(&proc_stat_raw),
+            visible_cpus,
+        )
     }
 
     /// Linux load normalized by available parallelism. Takes the max of the
@@ -311,11 +395,12 @@ mod tests {
 
     /// Pure decision seam: only pressure scoped to this CPU allocation may
     /// relax the strict assertion. Host load is consulted exclusively when no
-    /// cgroup limit exists (the process then sees the whole host).
+    /// cgroup limit exists AND the process sees every host CPU; a narrowed
+    /// cpuset/taskset/cgroup-v1 scope stays strict.
     fn scoped_pressure_relaxes(scope: CgroupScope, host_load_per_cpu: Option<f64>) -> bool {
         match scope {
             CgroupScope::Psi(avg10) => avg10 >= PSI_AVG10_THRESHOLD,
-            CgroupScope::QuotaLimited | CgroupScope::Unknown => false,
+            CgroupScope::QuotaLimited | CgroupScope::Restricted | CgroupScope::Unknown => false,
             CgroupScope::NoLimit => host_load_per_cpu.is_some_and(|load| load >= HIGH_LOAD_PER_CPU),
         }
     }
@@ -670,5 +755,133 @@ mod tests {
             psi_some_avg10("some avg10=nan avg60=0.00 avg300=0.00 total=0\n"),
             None
         );
+    }
+
+    /// Filesystem-state classifier tests (Codex #357 v2). Host load may relax
+    /// the strict AC5 assertion ONLY when the process sees every host CPU:
+    /// absence of v2 cpu.pressure/cpu.max alone does not prove whole-host
+    /// visibility (cpuset/taskset affinity and cgroup v1 reach that branch).
+    fn stat_with_cpus(n: usize) -> String {
+        let mut raw = String::from("cpu  100 0 50 200 0 0 0 0 0 0\n");
+        for i in 0..n {
+            raw.push_str(&format!("cpu{i}  10 0 5 20 0 0 0 0 0 0\n"));
+        }
+        raw
+    }
+
+    #[test]
+    fn classifier_narrowed_affinity_stays_strict_under_high_host_load() {
+        // Process sees 8 of 16 host CPUs; no cgroup v2 files. High host load
+        // is out of scope and must not relax the strict assertion.
+        let stat = stat_with_cpus(16);
+        let scope = classify_cgroup_scope(
+            ReadState::Absent,
+            ReadState::Absent,
+            ReadState::Present(&stat),
+            8,
+        );
+        assert_eq!(scope, CgroupScope::Restricted);
+        assert!(!scoped_pressure_relaxes(
+            scope,
+            Some(HIGH_LOAD_PER_CPU + 3.0)
+        ));
+    }
+
+    #[test]
+    fn classifier_equal_scope_high_host_load_relaxes() {
+        let stat = stat_with_cpus(16);
+        let scope = classify_cgroup_scope(
+            ReadState::Absent,
+            ReadState::Present("max 100000 100000\n"),
+            ReadState::Present(&stat),
+            16,
+        );
+        assert_eq!(scope, CgroupScope::NoLimit);
+        assert!(scoped_pressure_relaxes(
+            scope,
+            Some(HIGH_LOAD_PER_CPU + 0.5)
+        ));
+    }
+
+    #[test]
+    fn classifier_cgroup_v1_narrowed_scope_stays_strict() {
+        // cpu.max absent (cgroup v1) + fewer visible CPUs than host.
+        let stat = stat_with_cpus(32);
+        let scope = classify_cgroup_scope(
+            ReadState::Absent,
+            ReadState::Absent,
+            ReadState::Present(&stat),
+            16,
+        );
+        assert_eq!(scope, CgroupScope::Restricted);
+        assert!(!scoped_pressure_relaxes(scope, Some(5.0)));
+    }
+
+    #[test]
+    fn classifier_unreadable_host_stat_stays_strict() {
+        let scope =
+            classify_cgroup_scope(ReadState::Absent, ReadState::Absent, ReadState::Error, 16);
+        assert_eq!(scope, CgroupScope::Unknown);
+        assert!(!scoped_pressure_relaxes(scope, Some(5.0)));
+    }
+
+    #[test]
+    fn classifier_unparseable_host_cpu_count_stays_strict() {
+        let scope = classify_cgroup_scope(
+            ReadState::Absent,
+            ReadState::Absent,
+            ReadState::Present("cpu  no per-cpu lines here\n"),
+            16,
+        );
+        assert_eq!(scope, CgroupScope::Unknown);
+        assert!(!scoped_pressure_relaxes(scope, Some(5.0)));
+    }
+
+    #[test]
+    fn classifier_psi_and_quota_paths_preserved() {
+        let stat = stat_with_cpus(16);
+        // PSI present wins regardless of scope equality.
+        let psi = classify_cgroup_scope(
+            ReadState::Present(concat!(
+                "some avg10=44.86 avg60=0.00 avg300=0.00 total=0\n",
+                "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+            )),
+            ReadState::Absent,
+            ReadState::Present(&stat),
+            8,
+        );
+        assert!(matches!(psi, CgroupScope::Psi(v) if v >= PSI_AVG10_THRESHOLD));
+        assert!(scoped_pressure_relaxes(psi, Some(0.0)));
+
+        // Quota stays strict even when the process sees every host CPU.
+        let quota = classify_cgroup_scope(
+            ReadState::Absent,
+            ReadState::Present("200000 100000 100000\n"),
+            ReadState::Present(&stat),
+            16,
+        );
+        assert_eq!(quota, CgroupScope::QuotaLimited);
+        assert!(!scoped_pressure_relaxes(quota, Some(5.0)));
+
+        // Unreadable PSI read -> strict.
+        let err = classify_cgroup_scope(
+            ReadState::Error,
+            ReadState::Absent,
+            ReadState::Present(&stat),
+            16,
+        );
+        assert_eq!(err, CgroupScope::Unknown);
+        assert!(!scoped_pressure_relaxes(err, Some(5.0)));
+    }
+
+    #[test]
+    fn host_cpu_count_counts_numbered_cpu_lines_only() {
+        let raw = stat_with_cpus(3);
+        assert_eq!(host_cpu_count(&raw), Some(3));
+        assert_eq!(
+            host_cpu_count("cpu  1 2 3\ncpu0 1 2 3\ncpuX 1 2 3\n"),
+            Some(1)
+        );
+        assert_eq!(host_cpu_count("cpu  1 2 3\n"), None);
     }
 }
