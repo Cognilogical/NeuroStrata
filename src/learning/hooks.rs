@@ -228,14 +228,72 @@ fn learner_writable(payload: &MemoryPayload) -> bool {
         })
 }
 
+/// Genuine tool receipts are real outcomes (`success`/`empty`) from an
+/// allowlisted graph tool, attributed to a task. The digest-only `events[]`
+/// schema never stores rule/procedure ids verbatim, so reference evidence can
+/// only come from the id-bearing fields of such receipts (panel C50). Legacy
+/// `queries[]` rows and failed/unlisted/unattributed events are not evidence.
+fn referenced_ids_from_ledger(
+    session_queries_text: &str,
+    task_id: Option<&str>,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if session_queries_text.is_empty() {
+        return out;
+    }
+    let Ok(ledger) = serde_json::from_str::<Value>(session_queries_text) else {
+        return out;
+    };
+    let Some(events) = ledger.get("events").and_then(Value::as_array) else {
+        return out;
+    };
+    for event in events {
+        let status = event.get("status").and_then(Value::as_str).unwrap_or("");
+        if status != "success" && status != "empty" {
+            continue;
+        }
+        let tool = event.get("tool").and_then(Value::as_str).unwrap_or("");
+        if !crate::task::snapshot_readiness::GRAPH_TOOLS.contains(&tool) {
+            continue;
+        }
+        let attributed = event.get("task_id").and_then(Value::as_str).unwrap_or("");
+        if attributed.is_empty() {
+            continue;
+        }
+        if let Some(tid) = task_id {
+            if attributed != tid {
+                continue;
+            }
+        }
+        for key in [
+            "returned_ids",
+            "prescribed_action_ids",
+            "followed_action_ids",
+        ] {
+            if let Some(ids) = event.get(key).and_then(Value::as_array) {
+                for id in ids
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    out.insert(id.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Rule/procedure ids actually referenced by task evidence, the task's
-/// subagent prompt injection, a session-query ledger, or an action receipt.
-/// Only active, writable rows of the two governed memory types are eligible.
+/// subagent prompt injection, genuine `events[]` receipts for `task_id`, or an
+/// action receipt. Only active, writable rows of the two governed memory types
+/// are eligible.
 pub fn collect_reflection_targets(
     rows: &[SearchResult],
     task_payload: Option<&MemoryPayload>,
     receipt_payloads: &[&MemoryPayload],
     session_queries_text: &str,
+    task_id: Option<&str>,
 ) -> BTreeSet<String> {
     let now = current_action_timestamp();
     let eligible: Vec<&SearchResult> = rows
@@ -264,13 +322,7 @@ pub fn collect_reflection_targets(
             }
         }
     }
-    if !session_queries_text.is_empty() {
-        for r in &eligible {
-            if session_queries_text.contains(&r.id) {
-                mentioned.insert(r.id.clone());
-            }
-        }
-    }
+    mentioned.extend(referenced_ids_from_ledger(session_queries_text, task_id));
     for rp in receipt_payloads {
         // Governing links live inside `metadata.action_receipt` on real rows;
         // also read the top level so plain reference payloads still count.
@@ -330,7 +382,7 @@ fn receipt_reflection_targets(
     if receipt_payloads.is_empty() {
         return BTreeSet::new();
     }
-    collect_reflection_targets(rows, None, &receipt_payloads, "")
+    collect_reflection_targets(rows, None, &receipt_payloads, "", None)
         .into_iter()
         .filter(|id| task_targets.contains(id))
         .collect()
@@ -658,6 +710,7 @@ pub async fn on_task_completed_with_judge(
         task_payload,
         &receipt_payloads,
         &session_queries_text(project_root),
+        Some(task_id),
     );
     // Mandatory task id for idempotency: a duplicate delivery cannot double-count.
     let completion_receipt = format!("task-complete:{task_id}");
@@ -816,6 +869,7 @@ pub async fn on_action_applied(
         None,
         &receipt_payloads,
         &session_queries_text(project_root),
+        None,
     );
     for target in &targets {
         match cas_update_memory(store, namespace, target, |payload| {
@@ -879,7 +933,7 @@ pub async fn on_action_reverted_with_root(
         })
         .map(|r| &r.payload)
         .collect();
-    let targets = collect_reflection_targets(&rows, None, &reverted_payloads, "");
+    let targets = collect_reflection_targets(&rows, None, &reverted_payloads, "", None);
     let queue = crate::judgment::laya_onnx::ContradictionQueue::new(project_root);
     let now = chrono::Utc::now();
     let mut reflected = BTreeSet::new();
@@ -1141,8 +1195,43 @@ mod tests {
             "task",
             j!({ "extracted_from": ["rule-a", "fact-c", "private-rule"] }),
         );
-        let targets = collect_reflection_targets(&rows, Some(&task.payload), &[], "");
+        let targets = collect_reflection_targets(&rows, Some(&task.payload), &[], "", None);
         assert_eq!(targets, vec!["rule-a".to_string()].into_iter().collect());
+    }
+
+    /// Panel C50: a rule id is a legitimate reference only when a genuine
+    /// `events[]` receipt for the dispatching task carries it in an id-bearing
+    /// field. Raw ledger substrings (legacy `queries[]`, failed/unlisted/other
+    /// task receipts) must not count.
+    #[test]
+    fn reflection_targets_parse_events_instead_of_ledger_substrings() {
+        let ids = [
+            "rule-legacy",
+            "rule-failed",
+            "rule-unlisted",
+            "rule-other",
+            "rule-good",
+        ];
+        let rows: Vec<SearchResult> = ids.iter().map(|id| memory(id, "rule", j!({}))).collect();
+        let ledger = j!({
+            "queries": [
+                {"ts": 1, "tool": "neurostrata_locate", "query": "rule-legacy"}
+            ],
+            "events": [
+                {"status": "failed", "tool": "neurostrata_locate", "task_id": "task-1", "returned_ids": ["rule-failed"]},
+                {"status": "success", "tool": "bogus_tool", "task_id": "task-1", "returned_ids": ["rule-unlisted"]},
+                {"status": "success", "tool": "neurostrata_memories_for_file", "task_id": "task-2", "returned_ids": ["rule-other"]},
+                {"status": "success", "tool": "neurostrata_memories_for_file", "task_id": "task-1", "returned_ids": ["rule-good"]}
+            ]
+        })
+        .to_string();
+
+        let targets = collect_reflection_targets(&rows, None, &[], &ledger, Some("task-1"));
+        assert_eq!(
+            targets,
+            vec!["rule-good".to_string()].into_iter().collect(),
+            "only the genuine, attributed, allowlisted success receipt is a reference"
+        );
     }
 
     #[tokio::test]

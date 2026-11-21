@@ -801,7 +801,12 @@ fn seed_expand_next_hops(namespace: &str, seeds: &[String], edges: &[Value]) -> 
         let trigger = crate::task::routing::RouteTrigger {
             id: "T_SEED_EXPAND",
             tool: "neurostrata_related",
-            args: json!({"namespace": namespace, "id": seed, "max_hops": 2}),
+            args: json!({
+                "namespace": namespace,
+                "id": seed,
+                "max_hops": 2,
+                "followed_trigger_id": "T_SEED_EXPAND"
+            }),
             reason: "Seed has a real related edge; expand two hops before editing.".to_string(),
         };
         actions.push(crate::task::routing::next_action(&trigger, &[seed.clone()]));
@@ -1476,6 +1481,31 @@ pub async fn record_graph_query_with_root(
     query_hint: &str,
     caller_root: Option<&str>,
 ) {
+    record_graph_query_inner(store, namespace, tool_name, query_hint, caller_root, true).await;
+}
+
+/// Append one legacy `queries[]` history row for a path returned by a single
+/// dispatched lookup without touching task counters (panel C14). The dispatch
+/// itself is counted once via [`record_graph_query`]; these rows exist only for
+/// readers that still consult the legacy history ledger.
+pub async fn record_legacy_query_path(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    tool_name: &str,
+    query_hint: &str,
+    caller_root: Option<&str>,
+) {
+    record_graph_query_inner(store, namespace, tool_name, query_hint, caller_root, false).await;
+}
+
+async fn record_graph_query_inner(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    tool_name: &str,
+    query_hint: &str,
+    caller_root: Option<&str>,
+    count_task: bool,
+) {
     let ns = crate::server::resolve_namespace(store, namespace).await;
     #[cfg(test)]
     {
@@ -1554,37 +1584,48 @@ pub async fn record_graph_query_with_root(
             }
         }
     }
-    let mut attributed_task_id = String::new();
-    for r in &rows {
-        if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
-            if attributed_task_id.is_empty() {
-                attributed_task_id = r.id.clone();
-            }
+    // Panel C14/C15: one dispatch increments ONE counter — the dispatching
+    // task — never every in-progress task. No explicit task id reaches this
+    // legacy recorder, so it uses the same deterministic first-in-progress-by-id
+    // fallback as the receipt recorder. The whole load -> decide -> upsert runs
+    // under the per-task claim lock from the claim path so concurrent dispatches
+    // cannot lose increments across their `.await` points.
+    if count_task {
+        if let Some(r) = rows
+            .iter()
+            .filter(|r| gate::is_task(r) && gate::task_status(r) == Status::InProgress)
+            .min_by(|a, b| a.id.cmp(&b.id))
+        {
+            let lock = claim_lock(&r.id);
+            let _guard = lock.lock().await;
             if let Ok(Some((vec, mut payload))) = store.get(&ns, &r.id).await {
                 let obj = task_obj_mut(&mut payload);
-                let count = obj
-                    .get("graph_queries_count")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-                    + 1;
-                obj.insert("graph_queries_count".to_string(), json!(count));
-                obj.insert("graph_queried".to_string(), json!(true));
-                let mut recent: Vec<String> = obj
-                    .get("recent_queries")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                recent.push(entry_str.clone());
-                if recent.len() > 10 {
-                    let drop_n = recent.len() - 10;
-                    recent.drain(0..drop_n);
+                // Re-check under the lock: the task may have left in_progress.
+                if obj.get("status").and_then(Value::as_str) == Some(Status::InProgress.as_str()) {
+                    let count = obj
+                        .get("graph_queries_count")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
+                        + 1;
+                    obj.insert("graph_queries_count".to_string(), json!(count));
+                    obj.insert("graph_queried".to_string(), json!(true));
+                    let mut recent: Vec<String> = obj
+                        .get("recent_queries")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    recent.push(entry_str.clone());
+                    if recent.len() > 10 {
+                        let drop_n = recent.len() - 10;
+                        recent.drain(0..drop_n);
+                    }
+                    obj.insert("recent_queries".to_string(), json!(recent));
+                    let _ = store.upsert(&ns, &r.id, vec, payload).await;
                 }
-                obj.insert("recent_queries".to_string(), json!(recent));
-                let _ = store.upsert(&ns, &r.id, vec, payload).await;
             }
         }
     }
@@ -1629,11 +1670,9 @@ pub async fn record_graph_query_with_root(
     if let Some(root) = project_root {
         let ledger_path = std::path::Path::new(&root).join(".NeuroStrata/session_queries.json");
         // NOTE (spec §6 R6.2): this is the PRE-dispatch legacy path. It writes
-        // only the legacy `queries[]` row + task stamp above; it must NOT write
-        // an `events[]` receipt, because no outcome exists yet. Receipts are
-        // written exclusively by `record_tool_receipt` after the handler returns.
-        // `attributed_task_id` is intentionally unused here now.
-        let _ = attributed_task_id;
+        // only the legacy `queries[]` row + the single task stamp above; it must
+        // NOT write an `events[]` receipt, because no outcome exists yet. Receipts
+        // are written exclusively by `record_tool_receipt` after the handler returns.
         tool_receipts::mutate_session_ledger(&ledger_path, &ns, |doc| {
             if let Some(arr) = doc.get_mut("queries").and_then(|v| v.as_array_mut()) {
                 // Legacy rows stay for compatibility; every quality-metric
@@ -1664,8 +1703,9 @@ pub(crate) fn current_session_id() -> String {
 
 /// Record a fully-specified POST-DISPATCH receipt. This is the ONLY function
 /// that writes `events[]` receipts; every outcome field comes from the real
-/// handler response. It fills `task_id` from the active in-progress task for
-/// attribution and bumps the additive-only `tool_invocations` counter. Legacy
+/// handler response. It keeps a caller-supplied `task_id` for attribution and
+/// otherwise falls back to the stable active in-progress task, then bumps the
+/// additive-only `tool_invocations` counter. Legacy
 /// `queries[]` rows and the `graph_queries_count`/`graph_queried` stamps belong
 /// exclusively to the handler-internal recorders. Receipts stay in the local
 /// JSON ledger — never memory rows, so no ReBAC or mesh surface sees them.
@@ -1676,22 +1716,56 @@ pub async fn record_tool_receipt(
 ) {
     let ns = crate::server::resolve_namespace(store, &fields.namespace).await;
 
-    // Review fix round 2: ATTRIBUTION ONLY. Find the active in-progress task so
-    // the receipt can be attributed (snapshot readiness diversity counts it),
-    // but never touch `graph_queries_count`, `graph_queried` or `recent_queries`.
-    // Those counters are stamped exclusively by the handler-internal ledger
-    // recorders; incrementing them here double-counts a single dispatch.
+    // Review fix round 2: ATTRIBUTION ONLY. Never touch `graph_queries_count`,
+    // `graph_queried` or `recent_queries`; those belong exclusively to the
+    // handler-internal recorders, and bumping them here double-counts a dispatch.
+    //
+    // Panel C15: a non-empty `fields.task_id` is the caller's real task context
+    // and always wins. The generic MCP dispatch forwards no task id, but it does
+    // carry a session id and a caller root. When no id is supplied, attribute the
+    // receipt to the task that actually made the call, mirroring the specificity
+    // order of `handle_guard_validate` in src/server.rs:
+    // session+worktree > session > worktree > lowest-id. Within each tier the
+    // lowest id wins, so attribution stays deterministic regardless of the order
+    // `store.list` returned. Receipt attribution is telemetry only (never a
+    // gate/quota), so this sharpens accuracy without opening any work.
     if fields.task_id.is_empty() {
         let now = chrono::Utc::now().timestamp();
         if let Ok(rows) = store.list(&ns, None, Some("task")).await {
-            for r in &rows {
-                if gate::is_task(r)
+            let is_active = |r: &SearchResult| {
+                gate::is_task(r)
                     && !gate::is_retired(&r.payload.metadata, now)
                     && gate::task_status(r) == Status::InProgress
-                {
-                    fields.task_id = r.id.clone();
-                    break;
-                }
+            };
+            fn task_meta<'a>(r: &'a SearchResult, key: &str) -> Option<&'a str> {
+                r.payload
+                    .metadata
+                    .get("task")
+                    .and_then(|t| t.get(key))
+                    .and_then(|v| v.as_str())
+            }
+            let pick = |matches: &dyn Fn(&SearchResult) -> bool| {
+                rows.iter()
+                    .filter(|r| is_active(r) && matches(r))
+                    .min_by(|a, b| a.id.cmp(&b.id))
+                    .map(|r| r.id.clone())
+            };
+            let session = fields.session_id.trim();
+            let session = (!session.is_empty()).then_some(session);
+            let worktree = caller_root.map(str::trim).filter(|w| !w.is_empty());
+            let attributed = match (session, worktree) {
+                (Some(s), Some(w)) => pick(&|r| {
+                    task_meta(r, "session_id") == Some(s) && task_meta(r, "worktree") == Some(w)
+                })
+                .or_else(|| pick(&|r| task_meta(r, "session_id") == Some(s)))
+                .or_else(|| pick(&|r| task_meta(r, "worktree") == Some(w))),
+                (Some(s), None) => pick(&|r| task_meta(r, "session_id") == Some(s)),
+                (None, Some(w)) => pick(&|r| task_meta(r, "worktree") == Some(w)),
+                (None, None) => None,
+            }
+            .or_else(|| pick(&|_| true));
+            if let Some(id) = attributed {
+                fields.task_id = id;
             }
         }
     }
@@ -6137,6 +6211,351 @@ mod tests {
             ledger["queries"].as_array().map(|a| a.len()),
             Some(0),
             "no legacy queries[] row from the receipt recorder"
+        );
+    }
+
+    async fn seeded_task_count(store: &Arc<dyn VectorStore>, ns: &str, id: &str) -> i64 {
+        store.get(ns, id).await.unwrap().unwrap().1.metadata["task"]
+            .get("graph_queries_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    }
+
+    /// Panel C14: one locate dispatch must increment exactly one task counter,
+    /// never every in-progress task and never once per returned path.
+    #[tokio::test]
+    async fn graph_query_counts_one_dispatch_on_one_task_only() {
+        use crate::guard::testkit::MockStore;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C14OneDispatch";
+        let vector = StubEmbedder.embed("seed").await.unwrap();
+        for (id, status) in [
+            ("task-z", "in_progress"),
+            ("task-a", "in_progress"),
+            ("task-open", "open"),
+        ] {
+            store
+                .upsert(
+                    ns,
+                    id,
+                    vector.clone(),
+                    MemoryPayload {
+                        content: "task".to_string(),
+                        user_id: "kenton".to_string(),
+                        memory_type: "task".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: json!({
+                            "task": { "status": status, "title": id }
+                        }),
+                    },
+                )
+                .await
+                .expect("seed task");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+
+        record_graph_query_with_root(&store, ns, "neurostrata_locate", "q", Some(&caller_root))
+            .await;
+
+        let counts = [
+            seeded_task_count(&store, ns, "task-z").await,
+            seeded_task_count(&store, ns, "task-a").await,
+            seeded_task_count(&store, ns, "task-open").await,
+        ];
+        assert_eq!(
+            counts.iter().sum::<i64>(),
+            1,
+            "one increment total, got {:?}",
+            counts
+        );
+        assert_eq!(
+            counts.iter().filter(|&&c| c > 0).count(),
+            1,
+            "only the dispatching task is stamped, got {:?}",
+            counts
+        );
+    }
+
+    /// Panel C15: when no caller task context reaches the generic dispatch,
+    /// the first-match fallback must be stable (lowest task id), not whichever
+    /// row `store.list` happened to return first.
+    #[tokio::test]
+    async fn receipt_fallback_uses_stable_first_in_progress_task() {
+        use crate::guard::testkit::MockStore;
+        use crate::task::tool_receipts::build_dispatch_receipt;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C15Attribution";
+        let vector = StubEmbedder.embed("seed").await.unwrap();
+        // Insert in reverse-id order: a stable fallback picks by id, not insertion order.
+        for id in ["z-task", "a-task"] {
+            store
+                .upsert(
+                    ns,
+                    id,
+                    vector.clone(),
+                    MemoryPayload {
+                        content: "task".to_string(),
+                        user_id: "kenton".to_string(),
+                        memory_type: "task".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: json!({ "task": { "status": "in_progress", "title": id } }),
+                    },
+                )
+                .await
+                .expect("seed task");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        let response = json!({"memories": [{"id": "m1"}]}).to_string();
+        let fields = build_dispatch_receipt(
+            "evt-c15".to_string(),
+            1,
+            "ses".to_string(),
+            ns.to_string(),
+            "neurostrata_locate".to_string(),
+            "q",
+            &response,
+            false,
+            1,
+        );
+        assert!(fields.task_id.is_empty());
+        record_tool_receipt(&store, fields, Some(&caller_root)).await;
+
+        let ledger: Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".NeuroStrata/session_queries.json"))
+                .expect("ledger written"),
+        )
+        .expect("valid ledger");
+        assert_eq!(
+            ledger["events"][0]["task_id"].as_str(),
+            Some("a-task"),
+            "fallback must be deterministic (lowest task id), not first insertion"
+        );
+    }
+
+    /// Seed an in-progress task carrying the optional claim context that a
+    /// real `neurostrata_task_claim` writes under `metadata["task"]`.
+    async fn seed_attributed_task(
+        store: &Arc<dyn VectorStore>,
+        ns: &str,
+        id: &str,
+        session_id: Option<&str>,
+        worktree: Option<&str>,
+    ) {
+        let vector = StubEmbedder.embed("seed").await.unwrap();
+        let mut task = json!({ "status": "in_progress", "title": id });
+        if let Some(s) = session_id {
+            task["session_id"] = json!(s);
+        }
+        if let Some(w) = worktree {
+            task["worktree"] = json!(w);
+        }
+        store
+            .upsert(
+                ns,
+                id,
+                vector,
+                MemoryPayload {
+                    content: "task".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "task": task }),
+                },
+            )
+            .await
+            .expect("seed task");
+    }
+
+    /// Read the task id attributed on the first `events[]` receipt.
+    fn receipt_attributed_task(tmp: &tempfile::TempDir) -> Option<String> {
+        let ledger: Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".NeuroStrata/session_queries.json"))
+                .expect("ledger written"),
+        )
+        .expect("valid ledger");
+        ledger["events"][0]["task_id"].as_str().map(str::to_string)
+    }
+
+    /// C15 follow-up (Codex P2): two in-progress tasks in one namespace with
+    /// different session ids — the receipt must go to the caller's session,
+    /// not the lexicographically smaller task.
+    #[tokio::test]
+    async fn receipt_fallback_attributes_by_session() {
+        use crate::guard::testkit::MockStore;
+        use crate::task::tool_receipts::build_dispatch_receipt;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C15SessionAttribution";
+        seed_attributed_task(&store, ns, "a-task", Some("session-alpha"), None).await;
+        seed_attributed_task(&store, ns, "b-task", Some("session-beta"), None).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        let fields = build_dispatch_receipt(
+            "evt-c15-session".to_string(),
+            1,
+            "session-beta".to_string(),
+            ns.to_string(),
+            "neurostrata_locate".to_string(),
+            "q",
+            &json!({"memories": [{"id": "m1"}]}).to_string(),
+            false,
+            1,
+        );
+        assert!(fields.task_id.is_empty());
+        record_tool_receipt(&store, fields, Some(&caller_root)).await;
+
+        assert_eq!(
+            receipt_attributed_task(&tmp).as_deref(),
+            Some("b-task"),
+            "receipt must follow fields.session_id, not the lowest id"
+        );
+    }
+
+    /// A session match beats a lexicographically smaller id, and the combined
+    /// session+worktree tier outranks either single-context tier.
+    #[tokio::test]
+    async fn receipt_session_match_beats_smaller_id_and_worktree() {
+        use crate::guard::testkit::MockStore;
+        use crate::task::tool_receipts::build_dispatch_receipt;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C15SessionWorktreeAttribution";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        // Smaller id: only the session matches.
+        seed_attributed_task(
+            &store,
+            ns,
+            "a-task",
+            Some("session-beta"),
+            Some("other-root"),
+        )
+        .await;
+        // Larger id: both session and worktree match the caller.
+        seed_attributed_task(
+            &store,
+            ns,
+            "z-task",
+            Some("session-beta"),
+            Some(caller_root.as_str()),
+        )
+        .await;
+        let fields = build_dispatch_receipt(
+            "evt-c15-both".to_string(),
+            1,
+            "session-beta".to_string(),
+            ns.to_string(),
+            "neurostrata_locate".to_string(),
+            "q",
+            &json!({"memories": [{"id": "m1"}]}).to_string(),
+            false,
+            1,
+        );
+        record_tool_receipt(&store, fields, Some(&caller_root)).await;
+
+        assert_eq!(
+            receipt_attributed_task(&tmp).as_deref(),
+            Some("z-task"),
+            "session+worktree match must beat the smaller id and session-only match"
+        );
+    }
+
+    /// With no session match, a worktree-only match still wins over the
+    /// lowest-id fallback.
+    #[tokio::test]
+    async fn receipt_fallback_attributes_by_worktree() {
+        use crate::guard::testkit::MockStore;
+        use crate::task::tool_receipts::build_dispatch_receipt;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C15WorktreeAttribution";
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        seed_attributed_task(
+            &store,
+            ns,
+            "a-task",
+            Some("session-alpha"),
+            Some("other-root"),
+        )
+        .await;
+        seed_attributed_task(
+            &store,
+            ns,
+            "b-task",
+            Some("session-beta"),
+            Some(caller_root.as_str()),
+        )
+        .await;
+        let fields = build_dispatch_receipt(
+            "evt-c15-worktree".to_string(),
+            1,
+            "session-unmatched".to_string(),
+            ns.to_string(),
+            "neurostrata_locate".to_string(),
+            "q",
+            &json!({"memories": [{"id": "m1"}]}).to_string(),
+            false,
+            1,
+        );
+        record_tool_receipt(&store, fields, Some(&caller_root)).await;
+
+        assert_eq!(
+            receipt_attributed_task(&tmp).as_deref(),
+            Some("b-task"),
+            "worktree-only match must beat the lowest-id fallback"
+        );
+    }
+
+    /// Caller truth always wins: an explicit non-empty task id is never
+    /// overwritten by any session/worktree fallback.
+    #[tokio::test]
+    async fn receipt_explicit_task_id_wins_over_fallback() {
+        use crate::guard::testkit::MockStore;
+        use crate::task::tool_receipts::build_dispatch_receipt;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C15ExplicitTaskId";
+        seed_attributed_task(&store, ns, "a-task", Some("session-beta"), None).await;
+        seed_attributed_task(&store, ns, "explicit-task", None, None).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        let mut fields = build_dispatch_receipt(
+            "evt-c15-explicit".to_string(),
+            1,
+            "session-beta".to_string(),
+            ns.to_string(),
+            "neurostrata_locate".to_string(),
+            "q",
+            &json!({"memories": [{"id": "m1"}]}).to_string(),
+            false,
+            1,
+        );
+        fields.task_id = "explicit-task".to_string();
+        record_tool_receipt(&store, fields, Some(&caller_root)).await;
+
+        assert_eq!(
+            receipt_attributed_task(&tmp).as_deref(),
+            Some("explicit-task"),
+            "explicit fields.task_id must outrank any fallback"
         );
     }
 

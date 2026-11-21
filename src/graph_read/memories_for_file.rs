@@ -290,8 +290,57 @@ pub fn recommended_next_actions(
     namespace: &str,
     seed_id: Option<&str>,
 ) -> Value {
+    recommended_next_actions_inner(
+        blast_radius_count,
+        bridge_ids,
+        staged_file_count,
+        empty,
+        namespace,
+        seed_id,
+        Some(""),
+        false,
+    )
+}
+
+/// Production variant: `T_DIFF` is prescribed only when a real `diff_text` was
+/// supplied. An empty prescription cannot be honestly dispatched, so the
+/// trigger is withheld and a `suppressed_reason` states the condition — the
+/// same abstention pattern used for a high-blast lookup with no usable seed.
+pub fn recommended_next_actions_with_diff(
+    blast_radius_count: usize,
+    bridge_ids: &[String],
+    staged_file_count: usize,
+    empty: bool,
+    namespace: &str,
+    seed_id: Option<&str>,
+    diff_text: Option<&str>,
+) -> Value {
+    recommended_next_actions_inner(
+        blast_radius_count,
+        bridge_ids,
+        staged_file_count,
+        empty,
+        namespace,
+        seed_id,
+        diff_text,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recommended_next_actions_inner(
+    blast_radius_count: usize,
+    bridge_ids: &[String],
+    staged_file_count: usize,
+    empty: bool,
+    namespace: &str,
+    seed_id: Option<&str>,
+    diff_text: Option<&str>,
+    abstain_on_empty_diff: bool,
+) -> Value {
     let status = if empty { "empty" } else { "success" };
     let mut actions: Vec<Value> = Vec::new();
+    let mut diff_suppressed = false;
 
     if empty {
         // An empty lookup prescribes T_AMBIGUOUS only when there is a usable
@@ -313,7 +362,12 @@ pub fn recommended_next_actions(
             // `routing::next_action` likewise refuses an empty seed id: a
             // related call with args.id == "" is schema-invalid, so abstain.
             if let Some(id) = seed_id.filter(|id| !id.trim().is_empty()) {
-                let args = json!({ "namespace": namespace, "id": id, "max_hops": 2 });
+                let args = json!({
+                    "namespace": namespace,
+                    "id": id,
+                    "max_hops": 2,
+                    "followed_trigger_id": "T_HIGH_BLAST"
+                });
                 actions.push(next_action(
                     "T_HIGH_BLAST",
                     "neurostrata_related",
@@ -340,28 +394,39 @@ pub fn recommended_next_actions(
     }
 
     if staged_file_count >= DIFF_STAGED_FILE_THRESHOLD {
-        // `diff_tour` declares no `git_ref` arg; the caller fills `diff_text`.
-        let args = json!({ "namespace": namespace, "diff_text": "" });
-        actions.push(next_action(
-            "T_DIFF",
-            "neurostrata_diff_tour",
-            &args,
-            &[],
-            "Scope has >=3 staged files; supply diff_text (e.g. from HEAD) and review by dependency stop.",
-            EXPECTED_DIFF,
-        ));
+        // `diff_tour` declares no `git_ref` arg. Bind the prescription to real
+        // diff_text so a genuine dispatch can reproduce its digest; with no
+        // text the action is un-dispatchable and must be withheld.
+        let text = diff_text.unwrap_or("");
+        if !abstain_on_empty_diff || !text.trim().is_empty() {
+            let args = json!({ "namespace": namespace, "diff_text": text });
+            actions.push(next_action(
+                "T_DIFF",
+                "neurostrata_diff_tour",
+                &args,
+                &[],
+                "Scope has >=3 staged files; review by dependency stop.",
+                EXPECTED_DIFF,
+            ));
+        } else {
+            diff_suppressed = true;
+        }
     }
 
     actions.truncate(MAX_NEXT_ACTIONS);
     let mut response = json!({ "status": status, "next_actions": actions });
-    if response["next_actions"]
+    let no_actions = response["next_actions"]
         .as_array()
-        .is_some_and(Vec::is_empty)
-    {
+        .is_some_and(Vec::is_empty);
+    if no_actions || diff_suppressed {
         // State the *conditions* for escalation, not the observed values: a
         // high-radius lookup with no usable seed, or an empty lookup with no
         // seed to narrow, also lands here.
-        let reason = if empty {
+        let reason = if diff_suppressed && no_actions {
+            "Diff tour needs a non-empty diff_text; no schema-valid T_DIFF action to prescribe."
+        } else if diff_suppressed {
+            "Diff tour needs a non-empty diff_text; T_DIFF withheld until the caller supplies it."
+        } else if empty {
             "Empty lookup with no usable symbol/path seed: no schema-valid graph action to prescribe; narrow the query and re-run the path lookup."
         } else {
             "Single-file lookup already carries 1-hop related memories; no trigger fired (high-blast needs radius >= 15 and a usable seed, no conceptual bridge, staged scope < 3)."

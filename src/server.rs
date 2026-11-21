@@ -446,7 +446,8 @@ async fn _with_watch(
                                 "exclude_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional ids to exclude from the results." },
                                 "limit": { "type": "integer", "description": "Max results. Default 5, max 20." },
                                 "include_ast_edges": { "type": "boolean", "description": "Also bundle 1-hop related memories (DEPENDS_ON/SUPERSEDES/RELATES_TO) and a compact AST neighborhood summary (symbols/callers/callees/imports/importers/blast_radius_count). Default true." },
-                                "staged_file_count": { "type": "integer", "minimum": 0, "default": 0, "description": "Optional count of files in the current edit scope. At 3 or more, adds a T_DIFF recommendation to neurostrata_diff_tour. Absent means no diff-tour trigger." }
+                                "staged_file_count": { "type": "integer", "minimum": 0, "default": 0, "description": "Optional count of files in the current edit scope. At 3 or more, adds a T_DIFF recommendation to neurostrata_diff_tour. Absent means no diff-tour trigger." },
+                                "diff_text": { "type": "string", "description": "Optional staged unified diff text supplied by the caller. When staged_file_count is 3 or more, this is the diff_text bound to the T_DIFF prescription for neurostrata_diff_tour; absent or empty means T_DIFF is withheld with a suppressed_reason rather than dispatching an empty diff." }
                             },
                             "required": ["namespace", "path"]
                         }
@@ -2186,33 +2187,29 @@ async fn _with_watch(
                                     name == "neurostrata_taxonomy",
                                     args_ref,
                                 );
-                            // R7 proof: the ledger is digest-only, so a follow-up
-                            // `neurostrata_related` call must prove at dispatch that
-                            // it matched the prescription (concrete seed, >=2 hops).
-                            // Reuse the existing `followed_action_ids` field; no new
-                            // receipt field, no raw args/hops text stored.
-                            if name == "neurostrata_related" {
-                                let seed = args_ref
-                                    .and_then(|a| a.get("id"))
-                                    .and_then(Value::as_str)
-                                    .map(str::trim)
-                                    .filter(|s| !s.is_empty());
-                                let hops = args_ref
-                                    .and_then(|a| a.get("max_hops"))
-                                    .and_then(Value::as_u64)
-                                    .unwrap_or(0);
-                                if let (Some(seed), true) = (seed, hops >= 2) {
-                                    let proof_args = serde_json::json!({
-                                        "namespace": ns.as_str(),
-                                        "id": seed,
-                                        "max_hops": hops,
-                                    });
-                                    fields.followed_action_ids =
-                                        vec![crate::task::routing::action_id(
-                                            crate::task::graph_advisories::T_HIGH_BLAST,
-                                            &proof_args,
-                                            &[seed.to_string()],
-                                        )];
+                            // R7 proof: mint a digest-only proof under the
+                            // trigger actually followed. `related` serves two
+                            // triggers with identical args, so only an
+                            // explicit `followed_trigger_id` (copied from the
+                            // prescribed `next_action.args`) can bind it; no
+                            // hint => abstain, never default. Reuse the
+                            // existing `followed_action_ids` field; no raw
+                            // args are written into the ledger.
+                            let followed_hint = args_ref
+                                .and_then(|a| a.get("followed_trigger_id"))
+                                .and_then(Value::as_str);
+                            if let Some((proof_id, followed_trigger)) =
+                                mint_followed_action_id(
+                                    name,
+                                    fields.operation.as_str(),
+                                    args_ref,
+                                    followed_hint,
+                                    &ns,
+                                )
+                            {
+                                fields.followed_action_ids = vec![proof_id];
+                                if fields.trigger_id.trim().is_empty() {
+                                    fields.trigger_id = followed_trigger;
                                 }
                             }
                             crate::task::record_tool_receipt(&store, fields, caller_root).await;
@@ -3844,14 +3841,19 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                 .and_then(serde_json::Value::as_str)
                 .or_else(|| hit_ids.first().map(String::as_str))
                 .unwrap_or(original_path);
-            let escalation = crate::graph_read::memories_for_file::recommended_next_actions(
-                blast_radius_count,
-                &bridge_ids,
-                staged_file_count,
-                hits.is_empty(),
-                &namespace,
-                Some(seed_id),
-            );
+            let diff_text = arguments
+                .get("diff_text")
+                .and_then(serde_json::Value::as_str);
+            let escalation =
+                crate::graph_read::memories_for_file::recommended_next_actions_with_diff(
+                    blast_radius_count,
+                    &bridge_ids,
+                    staged_file_count,
+                    hits.is_empty(),
+                    &namespace,
+                    Some(seed_id),
+                    diff_text,
+                );
             if let Some(status) = escalation.get("status").and_then(serde_json::Value::as_str) {
                 response["status"] = serde_json::Value::String(status.to_string());
             }
@@ -12901,6 +12903,28 @@ mod migration_notice_tests {
     }
 }
 
+/// Mint a digest-only follow-through proof for an MCP `tools/call` dispatch.
+/// Returns `(action_id, followed_trigger)`, or `None` when the call cannot
+/// honestly prove a prescription. Single source of truth shared by the live
+/// dispatcher and its C32 regression test.
+fn mint_followed_action_id(
+    tool: &str,
+    operation: &str,
+    args: Option<&Value>,
+    hint: Option<&str>,
+    namespace: &str,
+) -> Option<(String, String)> {
+    let plan = crate::task::graph_advisories::dispatch_proof(
+        tool,
+        Some(operation),
+        args,
+        hint,
+        namespace,
+    )?;
+    let action_id = crate::task::routing::action_id(&plan.trigger, &plan.args, &plan.ids);
+    Some((action_id, plan.trigger))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13196,6 +13220,101 @@ mod tests {
                 text_of(&response)
             );
         }
+    }
+
+    /// oy5c C32 regression: drive the SAME mint step the MCP dispatcher uses.
+    /// A real T_SEED_EXPAND next_action (hint included in its args) mints a
+    /// seed-expansion proof that cannot resolve a T_HIGH_BLAST advisory; a
+    /// hint-less related call mints nothing.
+    #[test]
+    fn c32_related_proof_mint_dealiases_and_abstains_without_hint() {
+        use crate::task::graph_advisories::{compute_advisories, AdvisoryInput, HIGH_BLAST_TOOL};
+        use crate::task::routing::{next_action, RouteTrigger};
+        use serde_json::json;
+        use std::collections::BTreeSet;
+
+        let ns = "NeuroStrata";
+        let seed = "mem-seed-42";
+        let make = |trigger: &'static str| {
+            let t = RouteTrigger {
+                id: trigger,
+                tool: HIGH_BLAST_TOOL,
+                args: json!({
+                    "namespace": ns,
+                    "id": seed,
+                    "max_hops": 2,
+                    "followed_trigger_id": trigger,
+                }),
+                reason: String::new(),
+            };
+            next_action(&t, &[seed.to_string()])
+        };
+        let seed_expand = make("T_SEED_EXPAND");
+        let high_blast = make("T_HIGH_BLAST");
+        let (proof, _) = super::mint_followed_action_id(
+            HIGH_BLAST_TOOL,
+            "related",
+            Some(&seed_expand["args"]),
+            seed_expand["args"]["followed_trigger_id"].as_str(),
+            ns,
+        )
+        .expect("hinted related call has a proof");
+        assert!(proof.starts_with("T_SEED_EXPAND:"), "actual: {proof}");
+        assert_eq!(
+            proof,
+            seed_expand["action_id"].as_str().unwrap(),
+            "proof must bind to the prescribed seed-expansion action"
+        );
+        assert_ne!(
+            proof,
+            high_blast["action_id"].as_str().unwrap(),
+            "seed-expansion proof must differ from the high-blast prescription"
+        );
+
+        let active: BTreeSet<String> = ["t-active".to_string()].into_iter().collect();
+        let ledger = json!({
+            "events": [
+                {
+                    "task_id": "t-active",
+                    "tool": "neurostrata_memories_for_file",
+                    "status": "success",
+                    "ts": 10,
+                    "prescribed_action_ids": [high_blast["action_id"]]
+                },
+                {
+                    "task_id": "t-active",
+                    "tool": HIGH_BLAST_TOOL,
+                    "status": "success",
+                    "ts": 11,
+                    "returned_ids": ["mem-x"],
+                    "followed_action_ids": [proof]
+                }
+            ]
+        });
+        let r = compute_advisories(&AdvisoryInput {
+            ledger: &ledger,
+            active_task_ids: &active,
+            allowed_graph_tools: &["neurostrata_memories_for_file", HIGH_BLAST_TOOL],
+            applicable_trigger_ids: &["T_HIGH_BLAST".to_string()],
+            taxonomy_available: false,
+            concept_grounding_linked: false,
+        });
+        assert!(
+            r.high_blast_radius_unexplored,
+            "a seed-expansion follow must not resolve T_HIGH_BLAST"
+        );
+
+        assert!(
+            super::mint_followed_action_id(
+                HIGH_BLAST_TOOL,
+                "related",
+                Some(&json!({ "namespace": ns, "id": seed, "max_hops": 2 })),
+                None,
+                ns,
+            )
+            .is_none(),
+            "a hint-less related call cannot distinguish the triggers; abstain"
+        );
     }
 
     #[test]
@@ -19303,6 +19422,87 @@ mod tests {
                 .any(|v| v.as_str() == Some("staged_file_count")),
             "staged_file_count must stay optional (absent = no diff-tour trigger)"
         );
+    }
+
+    /// PR #356 (Codex P2): MCP callers can only supply declared inputSchema
+    /// properties. `diff_text` must be declared optional so a caller can hand
+    /// the real unified diff to `diff_tour`; otherwise T_DIFF is honestly
+    /// withheld but the advertised action is unreachable for tools/call clients.
+    #[tokio::test]
+    async fn memories_for_file_diff_text_schema_and_action_contract() {
+        // (a) schema declares diff_text as an optional string property.
+        let (store, _) = store_with_one_rule("probe").await;
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/list".to_string(),
+            params: Some(serde_json::json!({})),
+        };
+        let (bus, _seen) = recording_bus();
+        let response =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let tools = response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array");
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "neurostrata_memories_for_file")
+            .expect("memories_for_file tool must be listed");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["properties"]["diff_text"]["type"], "string");
+        let desc = schema["properties"]["diff_text"]["description"]
+            .as_str()
+            .unwrap_or("");
+        assert!(desc.contains("diff"), "description was {desc:?}");
+        let required = schema["required"].as_array().expect("required array");
+        assert!(
+            !required.iter().any(|v| v.as_str() == Some("diff_text")),
+            "diff_text must stay optional (absent = honest abstention)"
+        );
+
+        // (b) staged_file_count>=3 + non-empty diff_text emits T_DIFF bound to it.
+        let with_diff = crate::graph_read::memories_for_file::recommended_next_actions_with_diff(
+            3,
+            &[],
+            3,
+            false,
+            "NeuroStrata",
+            Some("sym::x"),
+            Some("real diff"),
+        );
+        let diff = with_diff["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["trigger_id"] == "T_DIFF")
+            .expect("T_DIFF emitted when diff_text is supplied");
+        assert_eq!(
+            diff["args"],
+            serde_json::json!({ "namespace": "NeuroStrata", "diff_text": "real diff" }),
+            "T_DIFF args must be schema-valid for neurostrata_diff_tour"
+        );
+
+        // (c) absent diff_text abstains with suppressed_reason, no invalid action.
+        let abstained = crate::graph_read::memories_for_file::recommended_next_actions_with_diff(
+            3,
+            &[],
+            3,
+            false,
+            "NeuroStrata",
+            Some("sym::x"),
+            None,
+        );
+        assert!(
+            abstained["next_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["trigger_id"] != "T_DIFF"),
+            "no T_DIFF prescription without diff_text"
+        );
+        let reason = abstained["suppressed_reason"].as_str().unwrap_or("");
+        assert!(reason.contains("diff_text"), "reason was {reason:?}");
     }
 
     /// Every tool the surface exposes, in the order tools/list returns them.
