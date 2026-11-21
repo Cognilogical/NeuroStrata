@@ -40,8 +40,10 @@ command surface when the raw text would have been inspected.
 
 1. Collect modelled commands as today (`command`/`cmd`/`script`/`code`, then
    a joined `args` array).
-2. If the object yields no command surface, fall back to the whole payload
-   string (the existing non-JSON path) instead of returning empty.
+2. If the object yields no command surface, do not return empty: keep the
+   whole payload string (substring rules) and add decoded string values from
+   a bounded recursive walk (depth ≤3, node budget) so prefix-anchored rules
+   (`rm -rf `, `curl `) can see a command nested under an unlisted key.
 3. Extraction-independent branches (action-type substring, Zero-Action
    preflight) are unchanged.
 

@@ -10,6 +10,67 @@ use crate::traits::{Embedder, VectorStore};
 use std::sync::Arc;
 use tracing::info;
 
+/// Path-bearing JSON keys recognised at any bounded nesting level. Matching
+/// is case-insensitive so spelling drift (`Path`, `file-path`) still yields
+/// its target.
+const MUTATION_PATH_KEYS: &[&str] = &[
+    "path",
+    "file_path",
+    "filePath",
+    "filepath",
+    "target_file",
+    "targetFile",
+    "filename",
+    "notebook_path",
+    "notebookPath",
+];
+
+/// Content-bearing keys whose first line may be a shebang. `new_source` is
+/// Claude NotebookEdit's body field (#333/B3).
+const MUTATION_CONTENT_KEYS: &[&str] = &[
+    "content",
+    "newString",
+    "new_string",
+    "new_str",
+    "replacement",
+    "insert_text",
+    "new_source",
+    "newSource",
+];
+
+/// Keys whose value may be a patch body. `input` covers the Codex exec
+/// bridge (`{"tool":"apply_patch","input":"*** Update File: …"}`).
+const MUTATION_PATCH_KEYS: &[&str] = &["patchText", "patch", "patch_text", "diff", "input"];
+
+/// Patch headers that make a string value worth scanning as a patch.
+const PATCH_MARKERS: &[&str] = &[
+    "*** Update File:",
+    "*** Add File:",
+    "*** Move to:",
+    "+++ b/",
+    "+++ /",
+    "diff --git ",
+];
+
+/// Documentation/data targets never carry an executable shebang; a quoted
+/// `#!` example in one is prose, not an interpreter surface (#333/B4).
+const DOC_LIKE_EXTENSIONS: &[&str] = &[
+    ".md",
+    ".markdown",
+    ".rst",
+    ".txt",
+    ".adoc",
+    ".html",
+    ".htm",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+];
+
+const MUTATION_WALK_MAX_DEPTH: usize = 3;
+const MUTATION_WALK_MAX_NODES: usize = 256;
+
 pub struct GuardValidator {
     semantic: SemanticEvaluator,
     sandbox: SandboxEvaluator,
@@ -318,13 +379,44 @@ impl GuardValidator {
         filename.ends_with(ext_branch) && filename.len() > ext_branch.len()
     }
 
+    fn patch_target_is_doc_like(path: &str) -> bool {
+        let normalized = path
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .replace('\\', "/")
+            .to_lowercase();
+        DOC_LIKE_EXTENSIONS
+            .iter()
+            .any(|ext| normalized.ends_with(ext))
+    }
+
+    fn contains_patch_marker(text: &str) -> bool {
+        let trimmed = text.trim_start();
+        PATCH_MARKERS
+            .iter()
+            .any(|marker| trimmed.starts_with(marker))
+    }
+
+    fn should_scan_patch(key: &str, value: &str) -> bool {
+        MUTATION_PATCH_KEYS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(key))
+            || Self::contains_patch_marker(value)
+    }
+
     fn extract_patch_targets_and_shebangs(
         patch_text: &str,
         paths: &mut Vec<String>,
         shebangs: &mut Vec<String>,
     ) {
+        // #333/B4: only the FIRST added line of a target can be a shebang,
+        // and only for a non-documentation target. Harvesting any added
+        // `#!` line made a quoted example in a docs patch a deny.
+        let mut target_doc_like = false;
+        let mut added_line_seen = false;
         for line in patch_text.lines() {
             let trimmed = line.trim();
+            let mut started_target = false;
             for prefix in [
                 "*** Update File:",
                 "*** Add File:",
@@ -336,14 +428,22 @@ impl GuardValidator {
                     let candidate = rest.trim();
                     if !candidate.is_empty() && candidate != "/dev/null" {
                         paths.push(candidate.to_lowercase());
+                        target_doc_like = Self::patch_target_is_doc_like(candidate);
+                        added_line_seen = false;
+                        started_target = true;
                     }
                 }
             }
+            if started_target || line.starts_with("+++") {
+                continue;
+            }
             if let Some(added) = line.strip_prefix('+') {
-                if !line.starts_with("+++") {
-                    let added_trimmed = added.trim();
-                    if let Some(rest) = added_trimmed.strip_prefix("#!") {
-                        shebangs.push(rest.trim().to_lowercase());
+                if !added_line_seen {
+                    added_line_seen = true;
+                    if !target_doc_like {
+                        if let Some(rest) = added.trim().strip_prefix("#!") {
+                            shebangs.push(rest.trim().to_lowercase());
+                        }
                     }
                 }
             }
@@ -358,6 +458,61 @@ impl GuardValidator {
         }
     }
 
+    fn walk_mutation_json(
+        value: &serde_json::Value,
+        depth: usize,
+        budget: &mut usize,
+        paths: &mut Vec<String>,
+        shebangs: &mut Vec<String>,
+    ) {
+        if depth > MUTATION_WALK_MAX_DEPTH || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, val) in map {
+                    if *budget == 0 {
+                        break;
+                    }
+                    match val {
+                        serde_json::Value::String(s) => {
+                            if MUTATION_PATH_KEYS
+                                .iter()
+                                .any(|k| k.eq_ignore_ascii_case(key))
+                                && !s.trim().is_empty()
+                            {
+                                paths.push(s.trim().to_lowercase());
+                            }
+                            if MUTATION_CONTENT_KEYS
+                                .iter()
+                                .any(|k| k.eq_ignore_ascii_case(key))
+                            {
+                                Self::collect_shebang_from_content(s, shebangs);
+                            }
+                            if Self::should_scan_patch(key, s) {
+                                Self::extract_patch_targets_and_shebangs(s, paths, shebangs);
+                            }
+                        }
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                            Self::walk_mutation_json(val, depth + 1, budget, paths, shebangs);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if *budget == 0 {
+                        break;
+                    }
+                    Self::walk_mutation_json(item, depth + 1, budget, paths, shebangs);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn extract_file_mutation_targets_and_shebangs(payload: &str) -> (Vec<String>, Vec<String>) {
         let mut paths = Vec::new();
         let mut shebangs = Vec::new();
@@ -365,67 +520,24 @@ impl GuardValidator {
         if let Ok(serde_json::Value::Object(map)) =
             serde_json::from_str::<serde_json::Value>(payload)
         {
-            const PATH_KEYS: &[&str] = &[
-                "path",
-                "file_path",
-                "filePath",
-                "filepath",
-                "target_file",
-                "targetFile",
-                "filename",
-                "notebook_path",
-                "notebookPath",
-            ];
-            const CONTENT_KEYS: &[&str] = &[
-                "content",
-                "newString",
-                "new_string",
-                "new_str",
-                "replacement",
-                "insert_text",
-            ];
-            const PATCH_KEYS: &[&str] = &["patchText", "patch", "diff"];
-
-            for key in PATH_KEYS {
-                if let Some(s) = map.get(*key).and_then(|v| v.as_str()) {
-                    paths.push(s.trim().to_lowercase());
-                }
-            }
-            for key in CONTENT_KEYS {
-                if let Some(s) = map.get(*key).and_then(|v| v.as_str()) {
-                    Self::collect_shebang_from_content(s, &mut shebangs);
-                }
-            }
-            for key in PATCH_KEYS {
-                if let Some(s) = map.get(*key).and_then(|v| v.as_str()) {
-                    Self::extract_patch_targets_and_shebangs(s, &mut paths, &mut shebangs);
-                }
-            }
-            for array_key in ["edits", "files", "changes"] {
-                if let Some(serde_json::Value::Array(items)) = map.get(array_key) {
-                    for item in items {
-                        if let serde_json::Value::Object(sub) = item {
-                            for key in PATH_KEYS {
-                                if let Some(s) = sub.get(*key).and_then(|v| v.as_str()) {
-                                    paths.push(s.trim().to_lowercase());
-                                }
-                            }
-                            for key in CONTENT_KEYS {
-                                if let Some(s) = sub.get(*key).and_then(|v| v.as_str()) {
-                                    Self::collect_shebang_from_content(s, &mut shebangs);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // #333/B1: a bounded recursive walk, not a top-level allowlist
+            // plus one fixed nesting level. Shipped wrappers (`tool_input`),
+            // unlisted arrays (`operations`) and key-spelling drift all
+            // surface their targets. Patch-shaped string values are decoded
+            // by `serde_json` before the scan, so `input` bodies have real
+            // newlines (#333/B2 exec bridge).
+            let mut budget = MUTATION_WALK_MAX_NODES;
+            Self::walk_mutation_json(
+                &serde_json::Value::Object(map),
+                0,
+                &mut budget,
+                &mut paths,
+                &mut shebangs,
+            );
             return (paths, shebangs);
         }
 
-        if payload.contains("*** Update File:")
-            || payload.contains("*** Add File:")
-            || payload.contains("+++ ")
-        {
+        if Self::contains_patch_marker(payload) {
             Self::extract_patch_targets_and_shebangs(payload, &mut paths, &mut shebangs);
             return (paths, shebangs);
         }
@@ -466,6 +578,43 @@ impl GuardValidator {
         })
     }
 
+    fn collect_shell_command_strings(
+        value: &serde_json::Value,
+        depth: usize,
+        budget: &mut usize,
+        out: &mut Vec<String>,
+    ) {
+        if depth > MUTATION_WALK_MAX_DEPTH || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        match value {
+            serde_json::Value::String(s) => {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() && !out.iter().any(|c| c == trimmed) {
+                    out.push(trimmed.to_string());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    if *budget == 0 {
+                        break;
+                    }
+                    Self::collect_shell_command_strings(item, depth + 1, budget, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for val in map.values() {
+                    if *budget == 0 {
+                        break;
+                    }
+                    Self::collect_shell_command_strings(val, depth + 1, budget, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn extract_shell_commands(payload: &str) -> Vec<String> {
         if let Ok(serde_json::Value::Object(map)) =
             serde_json::from_str::<serde_json::Value>(payload)
@@ -485,6 +634,21 @@ impl GuardValidator {
                         cmds.push(joined.join(" "));
                     }
                 }
+            }
+            if cmds.is_empty() {
+                // #332: parse success with an unmodelled shape must not be
+                // less scrutinised than the raw text. Keep the raw payload
+                // (substring rules) and add decoded strings from a bounded
+                // walk so prefix-anchored rules (`rm -rf `, `curl `) can see
+                // a command nested under an unlisted key.
+                cmds.push(payload.to_string());
+                let mut budget = MUTATION_WALK_MAX_NODES;
+                Self::collect_shell_command_strings(
+                    &serde_json::Value::Object(map),
+                    0,
+                    &mut budget,
+                    &mut cmds,
+                );
             }
             return cmds;
         }
@@ -1508,12 +1672,7 @@ mod tests {
         ));
 
         let (v_modeled, f_modeled) = validator
-            .validate(
-                "bash",
-                r#"{"command":"echo hello"}"#,
-                "/workspace",
-                false,
-            )
+            .validate("bash", r#"{"command":"echo hello"}"#, "/workspace", false)
             .await;
         assert!(f_modeled.is_empty());
         assert!(matches!(
@@ -1569,10 +1728,7 @@ mod tests {
             vec!["global-no-python".to_string()],
             "paths inside an unlisted array must be extracted"
         );
-        assert!(matches!(
-            v_ops,
-            ValidateVerdict::DeterministicReject { .. }
-        ));
+        assert!(matches!(v_ops, ValidateVerdict::DeterministicReject { .. }));
     }
 
     /// #333 (B3): NotebookEdit carries its body under `new_source`.
@@ -1663,8 +1819,7 @@ mod tests {
             ValidateVerdict::SandboxPassHighFidelity { .. }
         ));
 
-        let script_patch =
-            "*** Add File: scripts/run-tool\n+#!/usr/bin/env python3\n+print(1)\n";
+        let script_patch = "*** Add File: scripts/run-tool\n+#!/usr/bin/env python3\n+print(1)\n";
         let (v_script, f_script) = validator
             .validate("apply_patch", script_patch, "/workspace", false)
             .await;
@@ -1687,9 +1842,6 @@ mod tests {
             vec!["global-no-python".to_string()],
             "the patch path rule must keep firing"
         );
-        assert!(matches!(
-            v_py,
-            ValidateVerdict::DeterministicReject { .. }
-        ));
+        assert!(matches!(v_py, ValidateVerdict::DeterministicReject { .. }));
     }
 }

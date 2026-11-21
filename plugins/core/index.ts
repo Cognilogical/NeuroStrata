@@ -2966,6 +2966,13 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
   // demanding an active task for `git push` would be an unbreakable Catch-22).
   if (isMutatingTool(toolName)) {
     const payload = JSON.stringify(args)
+    // Same forwarding rule as the hook path: a raw patch string under
+    // `input` is the analysable surface (#333/B2 exec bridge).
+    const rawStringInput =
+      typeof input?.input === 'string' && input.input.trim() !== ''
+        ? input.input
+        : null
+    const guardPayload = rawStringInput ?? payload
     const shellExempt = isZeroActionExemptShellPayload(toolName, payload)
     if (config.strictMode) {
       const call: any = {
@@ -2994,7 +3001,7 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
           active_task_id,
           worktree,
           action_type: toolName,
-          payload,
+          payload: guardPayload,
           cwd,
           is_mutating: !shellExempt,
           use_sandbox: false,
@@ -3302,6 +3309,13 @@ export async function handleHookEvent(
       }
       const callArgs = firstRecord(toolInput)
       const payload = JSON.stringify(callArgs)
+      // A raw-string tool input (Codex apply_patch) is discarded by
+      // firstRecord; forward the text itself so the daemon can scan the
+      // patch body instead of receiving "{}" (#333/B2).
+      const guardPayload =
+        typeof toolInputRaw === 'string' && toolInputRaw.trim() !== ''
+          ? toolInputRaw
+          : payload
       const shellExempt = isZeroActionExemptShellPayload(toolNameRaw, payload)
       if (config.strictMode) {
         const projectRoot = effectiveProjectRoot(config)
@@ -3322,7 +3336,7 @@ export async function handleHookEvent(
             active_task_id,
             worktree,
             action_type: toolNameRaw,
-            payload,
+            payload: guardPayload,
             cwd,
             is_mutating: !shellExempt,
             use_sandbox: false,
