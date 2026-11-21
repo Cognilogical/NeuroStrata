@@ -3269,8 +3269,7 @@ async fn lookup_marker(store: &Arc<dyn VectorStore>, namespace: &str, path: &str
 
 /// [`LookupMarker`] for a caller that only needs the lookup forms
 /// (context_plan, related): no note, and no store read. The marker's
-/// namespace is matched ignoring case, as [`crate::paths::with_root_config`]
-/// does.
+/// namespace is matched ignoring case, as `server::resolve_namespace` does.
 fn lookup_marker_forms_only(namespace: &str, path: &str) -> LookupMarker {
     if !crate::paths::is_absolute_any(path) {
         return LookupMarker::default();
@@ -3334,11 +3333,16 @@ fn lookup_path_with_registry_root(
     // `marker.found` already names this namespace; only the root is left to
     // check, once.
     if !crate::paths::marker_root_is_cached_root(found, registry_root) {
-        let note = format!(
-            "The project marker root {} is not the cached root of {namespace} ({}): run `neurostrata-mcp root show` to compare them",
-            found.root.display(),
-            registry_root.unwrap_or("none"),
-        );
+        let note = match registry_root {
+            Some(cached) => format!(
+                "The project marker root {} is not the cached root of {namespace} ({cached}): run `neurostrata-mcp root show` to compare them",
+                found.root.display(),
+            ),
+            None => format!(
+                "The project marker root {} is not the cached root of {namespace} (none): run `neurostrata-mcp hooks install` in the project to set it",
+                found.root.display(),
+            ),
+        };
         return Ok((resolved.lookup, resolved.forms, Some(note)));
     }
     let lookup = crate::paths::with_marker_spelling(resolved.lookup, path, found);
