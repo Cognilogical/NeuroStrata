@@ -1,11 +1,16 @@
 //! Daemon-native incremental AST freshness: watcher core vocabulary, ports,
-//! and pure decisions. Task 1 lands the contract only; the event loop,
-//! persistence store, and service methods follow in later tasks.
+//! and pure decisions. This module owns the normalized event contract and the
+//! pure debounce, flush, and backoff decisions shared by the watcher core.
+//!
+//! The core API is consumed by the daemon and MCP adapters composed onto this
+//! module; until that composition lands, items here are intentionally public
+//! even where the binary target cannot reach them.
+#![allow(dead_code)]
 
+use anyhow::Result;
+use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use async_trait::async_trait;
-use anyhow::Result;
 
 pub const QUIET_PERIOD: Duration = Duration::from_millis(300);
 pub const MAX_WINDOW: Duration = Duration::from_secs(2);
@@ -38,6 +43,7 @@ pub struct WatchEvent {
     pub root: PathBuf,
     pub path: PathBuf,
     pub kind: WatchEventKind,
+    pub new_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -93,16 +99,19 @@ pub fn normalize_event(event: WatchEvent) -> Vec<PathEffect> {
             path: event.path,
             upsert: false,
         }],
-        WatchEventKind::Rename => vec![
-            PathEffect {
-                path: event.path.clone(),
-                upsert: false,
-            },
-            PathEffect {
-                path: event.path,
-                upsert: true,
-            },
-        ],
+        WatchEventKind::Rename => {
+            let new_path = event.new_path.clone().unwrap_or_else(|| event.path.clone());
+            vec![
+                PathEffect {
+                    path: event.path,
+                    upsert: false,
+                },
+                PathEffect {
+                    path: new_path,
+                    upsert: true,
+                },
+            ]
+        }
     }
 }
 
@@ -128,6 +137,7 @@ mod tests {
             root: PathBuf::from("/tmp/fresh-root"),
             path: PathBuf::from("/tmp/fresh-root/src/lib.rs"),
             kind,
+            new_path: None,
         }
     }
 
@@ -136,10 +146,7 @@ mod tests {
         for kind in [WatchEventKind::Create, WatchEventKind::Modify] {
             let effects = normalize_event(watch_event(kind));
             assert_eq!(effects.len(), 1);
-            assert_eq!(
-                effects[0].path,
-                PathBuf::from("/tmp/fresh-root/src/lib.rs")
-            );
+            assert_eq!(effects[0].path, PathBuf::from("/tmp/fresh-root/src/lib.rs"));
             assert!(effects[0].upsert);
         }
     }
@@ -153,22 +160,46 @@ mod tests {
 
     #[test]
     fn normalize_event_rename_yields_remove_then_upsert() {
-        let effects = normalize_event(watch_event(WatchEventKind::Rename));
+        let event = WatchEvent {
+            root: PathBuf::from("/tmp/fresh-root"),
+            path: PathBuf::from("/tmp/fresh-root/src/lib.rs"),
+            kind: WatchEventKind::Rename,
+            new_path: Some(PathBuf::from("/tmp/fresh-root/src/lib_v2.rs")),
+        };
+        let effects = normalize_event(event);
         assert_eq!(effects.len(), 2);
         assert!(!effects[0].upsert);
+        assert_eq!(effects[0].path, PathBuf::from("/tmp/fresh-root/src/lib.rs"));
         assert!(effects[1].upsert);
+        assert_eq!(
+            effects[1].path,
+            PathBuf::from("/tmp/fresh-root/src/lib_v2.rs")
+        );
+        assert_ne!(effects[0].path, effects[1].path);
     }
 
     #[test]
     fn should_flush_stays_quiet_below_thresholds() {
-        assert!(!should_flush(Duration::from_millis(200), Duration::from_secs(1)));
-        assert!(!should_flush(Duration::from_millis(200), Duration::from_millis(1500)));
+        assert!(!should_flush(
+            Duration::from_millis(200),
+            Duration::from_secs(1)
+        ));
+        assert!(!should_flush(
+            Duration::from_millis(200),
+            Duration::from_millis(1500)
+        ));
     }
 
     #[test]
     fn should_flush_fires_on_quiet_period_or_max_window() {
-        assert!(should_flush(Duration::from_millis(300), Duration::from_secs(2)));
-        assert!(should_flush(Duration::from_millis(50), Duration::from_secs(2)));
+        assert!(should_flush(
+            Duration::from_millis(300),
+            Duration::from_secs(2)
+        ));
+        assert!(should_flush(
+            Duration::from_millis(50),
+            Duration::from_secs(2)
+        ));
     }
 
     #[test]
