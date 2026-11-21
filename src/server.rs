@@ -2051,10 +2051,11 @@ async fn _with_watch(
                                 match watch.unregister(namespace, std::path::Path::new(dir_path)) {
                                     Ok(removed) => {
                                         // Parity with the daemon HTTP unwatch shim: emit the
-                                        // same structured shape. Core unregister returns only
-                                        // bool, so derive the canonical path here (the path is
-                                        // already J6-validated by the core before Ok).
-                                        let canonical = std::fs::canonicalize(dir_path)
+                                        // same structured shape. Reuse the core's J6 resolver
+                                        // so the echo matches the path the core operated on,
+                                        // even when the path has a non-existent tail.
+                                        let canonical = watch
+                                            .resolve_path(std::path::Path::new(dir_path))
                                             .map(|p| p.to_string_lossy().to_string())
                                             .unwrap_or_else(|_| dir_path.to_string());
                                         result_text = serde_json::json!({
@@ -12956,6 +12957,40 @@ mod tests {
             assert!(
                 text.contains("Error unwatching") && text.contains("outside the project root"),
                 "J6 path was not refused: {text}"
+            );
+        }
+
+        #[tokio::test]
+        async fn watch_unwatch_echoes_core_resolved_path_for_nonexistent_tail() {
+            // A path with a `.` segment and a non-existent tail is resolvable by
+            // the core J6 policy (nearest existing ancestor + plain remainder)
+            // but not by std::fs::canonicalize. The MCP echo must match the core.
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("root");
+            std::fs::create_dir_all(&root).unwrap();
+            let canonical_root = root.canonicalize().unwrap();
+            let watch = watch_service(&root);
+            let (store, _) = store_with_one_rule("ns").await;
+            let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+            let (bus, _) = recording_bus();
+            let raw = format!("{}/./missing/deep", canonical_root.display());
+
+            let response = call(
+                store,
+                ingests,
+                bus,
+                Some(watch),
+                "neurostrata_unwatch",
+                serde_json::json!({ "namespace": "ns", "dir_path": raw }),
+            )
+            .await;
+            let parsed: serde_json::Value =
+                serde_json::from_str(text_of(&response)).expect("unwatch is JSON");
+            assert_eq!(parsed["removed"], false);
+            assert_eq!(
+                parsed["canonical_path"],
+                canonical_root.join("missing/deep").display().to_string(),
+                "echo must use the core resolver, not raw-path canonicalize"
             );
         }
 

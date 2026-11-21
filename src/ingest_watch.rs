@@ -860,6 +860,15 @@ impl IngestWatchService {
         self.ensure_runtime(namespace, &canonical)
     }
 
+    /// Resolve a caller path with the same J6 policy the core applies to
+    /// registration/unregistration. Adapters that echo a canonical path must
+    /// use this rather than re-canonicalizing: `resolve_caller_path` can return
+    /// a resolved path with a non-existent tail, which a plain `canonicalize`
+    /// would refuse, producing a divergent echo.
+    pub fn resolve_path(&self, raw: &Path) -> anyhow::Result<PathBuf> {
+        self.canonical_or_err(raw)
+    }
+
     pub fn unregister(&self, namespace: &str, raw: &Path) -> anyhow::Result<bool> {
         let canonical = self.canonical_or_err(raw)?;
         let key = (namespace.to_string(), canonical.clone());
