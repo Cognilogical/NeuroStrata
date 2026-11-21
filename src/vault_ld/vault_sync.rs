@@ -698,6 +698,17 @@ async fn exact_stored_target(
     Ok(found)
 }
 
+/// The keep set for one head's declarations, plus whether it depends on a
+/// post-write replay.
+struct KeepTargets {
+    ids: Vec<String>,
+    /// The keep-set chose a vault-known id that was not stored when the head
+    /// was written. The write may have bound a stored alias fallback and
+    /// reported no deferred edge, so reconciliation would retire that edge
+    /// without a post-write replay once the preferred id exists.
+    pending_preferred: bool,
+}
+
 /// The edge ids a head's declarations will actually bind, matching the store's
 /// exact-mode lookup. Both id sources are consulted per spelling so the keep
 /// set cannot pick an alias the upsert would not have bound; an unresolved
@@ -708,15 +719,18 @@ async fn exact_keep_targets(
     namespace: &str,
     declared: &[String],
     known: &std::collections::BTreeSet<String>,
-) -> Vec<String> {
-    let mut keep = Vec::with_capacity(declared.len());
+) -> KeepTargets {
+    let mut ids = Vec::with_capacity(declared.len());
+    let mut pending_preferred = false;
     for target in declared {
         // Find the first spelling present in either source. Vault membership is
         // free; the store is queried only until one spelling resolves.
         let mut store_hit = None;
+        let mut known_hit = None;
         let mut failure = None;
         for candidate in crate::parser::ingest::exact_target_spellings(namespace, target) {
             if known.contains(candidate) {
+                known_hit = Some(candidate.to_string());
                 break;
             }
             match store.get(namespace, candidate).await {
@@ -733,18 +747,35 @@ async fn exact_keep_targets(
         }
         if let Some(e) = failure {
             warn!("Could not resolve exact edge target {}: {}", target, e);
-            keep.push(target.clone());
+            ids.push(target.clone());
             continue;
         }
-        keep.push(
-            crate::parser::ingest::exact_target_match(namespace, target, |candidate| {
-                known.contains(candidate) || store_hit.as_deref() == Some(candidate)
-            })
-            .unwrap_or(target.as_str())
-            .to_string(),
-        );
+        // A vault-known id may be written later in this import. It is still
+        // the preferred binding, so its absence now makes the head depend on
+        // the post-write replay even when an alias kept the first upsert happy.
+        let chosen = match known_hit {
+            Some(candidate) => match store.get(namespace, &candidate).await {
+                Ok(Some(_)) => candidate,
+                Ok(None) => {
+                    pending_preferred = true;
+                    candidate
+                }
+                Err(e) => {
+                    // Resolution failed, not the target: keep the preferred id
+                    // and retry after the writes rather than dropping it.
+                    warn!("Could not resolve exact edge target {}: {}", target, e);
+                    pending_preferred = true;
+                    candidate
+                }
+            },
+            None => store_hit.unwrap_or_else(|| target.clone()),
+        };
+        ids.push(chosen);
     }
-    keep
+    KeepTargets {
+        ids,
+        pending_preferred,
+    }
 }
 
 /// WikiLink targets with no corresponding note in the vault. BTreeSet gives
@@ -1281,7 +1312,7 @@ pub async fn import_vault_with_limits(
             Ok(report) => {
                 imported += 1;
                 if let Err(e) = store
-                    .reconcile_declared_edges(&config.namespace, &item.id, "RELATES_TO", &keep)
+                    .reconcile_declared_edges(&config.namespace, &item.id, "RELATES_TO", &keep.ids)
                     .await
                 {
                     errors.push(format!(
@@ -1289,9 +1320,11 @@ pub async fn import_vault_with_limits(
                         item.id, e
                     ));
                 }
-                // A declarer may precede its target in id order. The edge is
-                // not lost: retry once after every head exists.
-                if !report.deferred_edges.is_empty() {
+                // A declarer may precede its target in id order, and an alias
+                // fallback can hide that from the deferred report: retry after
+                // every head exists whenever the preferred binding was not yet
+                // stored.
+                if !report.deferred_edges.is_empty() || keep.pending_preferred {
                     if let Some((payload, vector)) = retry {
                         deferred_retry.push((item.id.clone(), vector, payload));
                     }
@@ -1330,7 +1363,7 @@ pub async fn import_vault_with_limits(
         if let Err(e) = store.upsert(&config.namespace, &id, vector, payload).await {
             errors.push(format!("Failed to relink edges for {}: {}", id, e));
         } else if let Err(e) = store
-            .reconcile_declared_edges(&config.namespace, &id, "RELATES_TO", &keep)
+            .reconcile_declared_edges(&config.namespace, &id, "RELATES_TO", &keep.ids)
             .await
         {
             errors.push(format!("Failed to retire stale edges for {}: {}", id, e));
@@ -4371,6 +4404,126 @@ mod tests {
         assert_eq!(
             linked(&edges),
             vec![stored_id],
+            "an unchanged reimport must not churn the reconciled edge set: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: a preferred vault target may be absent when its declarer is
+    /// written, while an alias is already stored. The upsert binds the alias
+    /// and reports no deferred edge; reconciliation then retires it. The
+    /// preferred id must be retried after the whole vault exists, even though
+    /// the initial lookup succeeded.
+    #[tokio::test]
+    async fn forward_reference_rebinds_preferred_target_after_alias_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-vault-pending-preferred-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "ns";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        // The alias is live in the store before the preferred id exists.
+        store
+            .upsert(
+                ns,
+                "z",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "memory stored under the bare alias".to_string(),
+                    memory_type: "note".to_string(),
+                    location: "".to_string(),
+                    user_id: "default".to_string(),
+                    agent_name: Some("auto-ingestor".to_string()),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed stored alias");
+
+        let preferred = format!("{ns}::z");
+        // `a` sorts before the target, so it is written while `ns::z` is absent.
+        let mut linker = note("a", &[preferred.as_str()]);
+        linker.content = "links the future verbatim note".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut target = note(&preferred, &[]);
+        target.content = "body of the future verbatim note".to_string();
+        target.canonical_sha256 = target.fingerprint();
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("target.md"), target.to_markdown()).expect("write target");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.success, "{result:?}");
+
+        let linked = |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| {
+            edges
+                .iter()
+                .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+                .map(|(_, _, to, _)| to.clone())
+                .collect::<Vec<_>>()
+        };
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            linked(&edges),
+            vec![preferred.clone()],
+            "the replay must rebind the preferred id once it exists: {:?}",
+            edges
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(from, _, to, _)| from == "a" && to == "z"),
+            "reconciliation must not leave the alias edge: {:?}",
+            edges
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("a.md")).expect("read export");
+        assert_eq!(
+            markdown.matches(&format!("[[{preferred}]]")).count(),
+            1,
+            "{markdown}"
+        );
+        assert!(!markdown.contains("[[z]]"), "{markdown}");
+
+        let again = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            again.notes_imported, 0,
+            "an unchanged reimport must be a no-op: {:?}",
+            again.errors
+        );
+        let edges = store
+            .list_edges(ns)
+            .await
+            .expect("list edges after reimport");
+        assert_eq!(
+            linked(&edges),
+            vec![preferred],
             "an unchanged reimport must not churn the reconciled edge set: {:?}",
             edges
         );

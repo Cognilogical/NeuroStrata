@@ -397,6 +397,45 @@ declarations keep the declared spelling.
   containing `_`), stub validation refuses it and reports the error instead
   of minting an alias; the declaration stays deferred.
 
+### 3f. Pending preferred targets replay after the write phase
+
+#### Invariant
+
+A declaration's preferred binding is the first candidate spelling the vault
+knows. If that id is not stored when the declaring head is written, the head
+depends on the post-write replay even when the write bound a stored alias
+candidate and therefore reported no deferred edge. After every head exists the
+replay rebinds the preferred id, and reconciliation keeps it. A declaration
+whose preferred id is already stored, or that has no vault-known candidate,
+keeps the existing behaviour: it replays only when the write reports a
+deferred edge.
+
+#### Mechanism
+
+- `exact_keep_targets` returns the keep ids together with a
+  `pending_preferred` flag. When a candidate spelling is vault-known the store
+  is queried once for that id; absent (or unreadable) sets the flag while the
+  id stays the keep target.
+- The write loop schedules the existing deferred replay when the upsert report
+  is non-empty **or** `pending_preferred` is set. Replay recomputes the keep
+  set — now preferring the stored verbatim id — re-upserts the same head, and
+  reconciles against it.
+- The flag is per declarer, so notes whose preferred target was already
+  stored do not replay. Ordinary store callers and alias-only declarations
+  are unchanged.
+
+#### Eval (failed on `667c0cd9`)
+
+- `forward_reference_rebinds_preferred_target_after_alias_fallback`
+  - Store the bare note `z`; import a vault containing `a → ns::z` and the
+    note whose literal id is `ns::z` (`a` sorts first).
+  - Assert the only `a` `RELATES_TO` edge ends at `ns::z` (no `a → z`), export
+    renders exactly one `[[ns::z]]` and no `[[z]]`, and an unchanged reimport
+    imports `0` notes while leaving the edge intact.
+  - On `667c0cd9` the first write bound `z` and reported no deferred edge, so
+    no replay ran; reconciliation then deleted it
+    (`the replay must rebind the preferred id once it exists: []`).
+
 ---
 
 ## 4. #344 — Retired rows must not be exported
@@ -488,9 +527,9 @@ note whose *real* type changed is versioned.
 
 - `src/vault_ld/mod.rs` — v2 fingerprint, legacy fingerprint, version const.
 - `src/vault_ld/vault_sync.rs` — `related_to` head key, deferred-edge retry,
-  retirement export filter, history-id import guard, `fingerprint_version`
-  stamp, `exact_edge_targets` stamp, per-head `reconcile_declared_edges` call
-  after a successful upsert, updated
+  pending-preferred-target replay (§3f), retirement export filter, history-id
+  import guard, `fingerprint_version` stamp, `exact_edge_targets` stamp,
+  per-head `reconcile_declared_edges` call after a successful upsert, updated
   `import_reconciles_preserved_edge_fields_with_edited_links`
   assertion (that key now exists by design), and the #363 evals.
 - `src/traits.rs` — `VectorStore::reconcile_declared_edges` default no-op.
@@ -518,6 +557,9 @@ note whose *real* type changed is versioned.
 - Vault-origin upserts skip path-based target resolution and use a verbatim
   namespace lookup instead; ordinary upserts, the parser, and `KnownIds` are
   untouched.
+- A declaration whose preferred vault id is not stored yet costs one extra
+  store read at keep-set time and one re-upsert after the write phase; only
+  that declarer replays, not the whole vault.
 - The reconcile and the head write are two statements, not one transaction;
   the order makes a failed write safe at the cost of a crash window that can
   leave stale edges with the new head (repaired on the next changed import).
