@@ -471,10 +471,8 @@ fn relative_keys(row: &SearchResult) -> Vec<String> {
     keys
 }
 
-/// Ids of active rows with a relative stored key that names an existing file
-/// or folder under `current` but would be spelled differently relative to
-/// `new`, so moving the root from `current` to `new` would stop them matching.
-/// Absolute keys never matched by a relative key, so they are not lost.
+/// [`rows_lost_in`] over the namespace's rows read from a store, for tests.
+#[cfg(test)]
 pub async fn rows_lost_by_root_change(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
@@ -485,8 +483,12 @@ pub async fn rows_lost_by_root_change(
     Ok(rows_lost_in(&rows, current, new))
 }
 
-/// [`rows_lost_by_root_change`] over rows already listed (the CLI reads them
-/// through the daemon's `/cli/read`).
+/// Ids of active rows with a relative stored key that names an existing file
+/// or folder under `current` but would be spelled differently relative to
+/// `new`, so moving the root from `current` to `new` would stop them matching.
+/// Absolute keys never matched by a relative key, so they are not lost. The
+/// rows are already listed (the CLI reads them through the daemon's
+/// `/cli/read`).
 pub fn rows_lost_in(rows: &[SearchResult], current: &Path, new: &Path) -> Vec<String> {
     let now = now_secs();
     let current_str = current

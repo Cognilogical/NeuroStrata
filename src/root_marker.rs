@@ -26,8 +26,6 @@ const CURRENT_VERSION: u32 = 1;
 /// How deep [`refuse_root_target`] looks for a `.git` below a non-git folder.
 /// Checkouts are usually one to three levels under a workspace folder; the
 /// bound keeps the check fast on a large tree.
-// Wired into the writers by a later PR of this stack; only tests call it yet.
-#[cfg_attr(not(test), allow(dead_code))]
 const NESTED_GIT_MAX_DEPTH: usize = 4;
 
 /// Folders the nested-checkout walk never enters: dependency and build
@@ -58,8 +56,6 @@ fn present_string<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Stri
 }
 
 impl RootConfig {
-    // Wired into the writers by a later PR of this stack; only tests call it yet.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(namespace: impl Into<String>) -> Self {
         RootConfig {
             version: CURRENT_VERSION,
@@ -89,8 +85,6 @@ pub enum MarkerRead {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-// Wired into the writers by a later PR of this stack; only tests call it yet.
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum WriteOutcome {
     Written,
     /// Another writer published the file first; this is what it holds now.
@@ -98,8 +92,6 @@ pub enum WriteOutcome {
 }
 
 #[derive(Debug)]
-// Wired into the writers by a later PR of this stack; only tests call it yet.
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum MarkerError {
     Unsafe(&'static str),
     Io(std::io::Error),
@@ -157,8 +149,6 @@ pub fn read_marker(dir: &Path) -> MarkerRead {
 /// name exists: a second writer gets `LostRace` with what the first wrote.
 /// There is no fallback to a replacing rename, so a filesystem without hard
 /// links answers `Io`.
-// Wired into the writers by a later PR of this stack; only tests call it yet.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn write_new_marker(dir: &Path, cfg: &RootConfig) -> Result<WriteOutcome, MarkerError> {
     let (tmp, target) = prepare(dir, cfg)?;
     let linked = std::fs::hard_link(&tmp, &target);
@@ -174,8 +164,6 @@ pub fn write_new_marker(dir: &Path, cfg: &RootConfig) -> Result<WriteOutcome, Ma
 
 /// Writes the marker in `dir`, replacing any existing one with temp + rename
 /// so a concurrent reader sees either the old or the new file.
-// Wired into the writers by a later PR of this stack; only tests call it yet.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn replace_marker(dir: &Path, cfg: &RootConfig) -> Result<(), MarkerError> {
     let (tmp, target) = prepare(dir, cfg)?;
     if let Err(err) = std::fs::rename(&tmp, &target) {
@@ -187,8 +175,6 @@ pub fn replace_marker(dir: &Path, cfg: &RootConfig) -> Result<(), MarkerError> {
 
 /// Validates `cfg`, checks `.NeuroStrata` is safe, and writes the
 /// serialized config to a fresh temporary file beside the target.
-// Wired into the writers by a later PR of this stack; only tests call it yet.
-#[cfg_attr(not(test), allow(dead_code))]
 fn prepare(dir: &Path, cfg: &RootConfig) -> Result<(PathBuf, PathBuf), MarkerError> {
     if let Some(reason) = cfg.invalid_reason() {
         return Err(MarkerError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, reason)));
@@ -213,8 +199,6 @@ fn prepare(dir: &Path, cfg: &RootConfig) -> Result<(PathBuf, PathBuf), MarkerErr
     Ok((tmp, target))
 }
 
-// Wired into the writers by a later PR of this stack; only tests call it yet.
-#[cfg_attr(not(test), allow(dead_code))]
 fn temp_name(target: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -228,8 +212,6 @@ fn temp_name(target: &Path) -> PathBuf {
 /// True when `dir/.NeuroStrata` is a real directory inside `dir` (not a
 /// symlink or junction pointing elsewhere), by the check upstream uses for
 /// its marker. A missing `.NeuroStrata` is created as a real directory first.
-// Wired into the writers by a later PR of this stack; only tests call it yet.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn marker_dir_is_safe(dir: &Path) -> bool {
     let Ok(dir) = dunce::canonicalize(dir) else {
         return false;
@@ -257,14 +239,10 @@ pub fn marker_dir_is_safe(dir: &Path) -> bool {
 ///   `.git` below it (looked for down to [`NESTED_GIT_MAX_DEPTH`] levels,
 ///   skipping `node_modules`, `target` and `.git`), so it is a workspace
 ///   folder above projects, not a project.
-// Wired into the writers by a later PR of this stack; nothing calls it yet.
-#[allow(dead_code)]
 pub fn refuse_root_target(dir: &Path) -> Option<&'static str> {
     refuse_root_target_with(dir, dirs::home_dir().as_deref())
 }
 
-// Wired into the writers by a later PR of this stack; only tests call it yet.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn refuse_root_target_with(dir: &Path, home: Option<&Path>) -> Option<&'static str> {
     let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     if dir.parent().is_none() {
@@ -281,8 +259,6 @@ pub(crate) fn refuse_root_target_with(dir: &Path, home: Option<&Path>) -> Option
 
 /// Whether some directory below `dir` (at `depth` and deeper, down to
 /// [`NESTED_GIT_MAX_DEPTH`]) holds a `.git`. Links are not followed.
-// Wired into the writers by a later PR of this stack; only tests call it yet.
-#[cfg_attr(not(test), allow(dead_code))]
 fn has_git_below(dir: &Path, depth: usize) -> bool {
     if depth > NESTED_GIT_MAX_DEPTH {
         return false;
@@ -1178,8 +1154,9 @@ pub(crate) enum RootSetStep {
     RegistryUpdated,
 }
 
-/// `neurostrata-mcp root set` (spec 6.8) against a store. See
+/// `neurostrata-mcp root set` (spec 6.8) against a store, for tests. See
 /// [`root_set_with`].
+#[cfg(test)]
 pub async fn root_set(
     store: &std::sync::Arc<dyn crate::traits::VectorStore>,
     emb: Option<&std::sync::Arc<dyn crate::traits::Embedder>>,
@@ -1234,6 +1211,12 @@ pub(crate) async fn root_set_with(
     let dir = dunce::canonicalize(&args.dir).unwrap_or_else(|_| args.dir.clone());
     // A root inside a linked worktree is marked in the main checkout.
     let target = in_main_checkout(&dir);
+    if is_temp_root(&target) {
+        return Err(format!(
+            "refused: {} is the system temp folder, which cannot be a project root",
+            target.display()
+        ));
+    }
     if let Some(reason) = refuse_root_target(&target) {
         return Err(format!("refused: {} is a {reason}, which cannot be a project root", target.display()));
     }
@@ -1335,8 +1318,11 @@ pub(crate) async fn root_set_with(
     if registry.set_root(ns, &target).await {
         lines.push(format!("Cached root of {ns} set to {}.", target.display()));
     } else {
-        lines.push(format!(
-            "The cached root of {ns} could not be set; rerun this command to finish."
+        // The marker is written but the cache still points elsewhere: a
+        // failure, so scripts and the exit code see it.
+        return Err(format!(
+            "{}\nThe cached root of {ns} could not be set; rerun this command to finish.",
+            lines.join("\n")
         ));
     }
     if stop_after == Some(RootSetStep::RegistryUpdated) {
@@ -2621,9 +2607,9 @@ mod tests {
         let repo = base.join("repo");
         // No registry row and no embedder to create one: the cache cannot be set.
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
-        let lines = root_set(&store, None, &set_args(&repo)).await.unwrap();
-        assert!(!lines.iter().any(|l| l.starts_with("Cached root of")), "{lines:?}");
-        assert!(lines.iter().any(|l| l.contains("could not be set")), "{lines:?}");
+        let err = root_set(&store, None, &set_args(&repo)).await.unwrap_err();
+        assert!(!err.contains("Cached root of"), "{err}");
+        assert!(err.contains("could not be set"), "{err}");
         assert!(has_marker(&repo));
 
         let (store, emb) = mock();
