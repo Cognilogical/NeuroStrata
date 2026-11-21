@@ -61,7 +61,7 @@ pub const MAX_VAULT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// Metadata keys the import owns on the replacement head. Everything else on
 /// a prior head (notably `task`) is preserved across a reimport: #335 showed
 /// that copying a fixed field list drops the next structured field silently.
-const IMPORT_OWNED_METADATA_KEYS: [&str; 13] = [
+const IMPORT_OWNED_METADATA_KEYS: [&str; 17] = [
     // Import-owned values, overlaid after the prior head is copied.
     "vault_source",
     "stub",
@@ -69,6 +69,13 @@ const IMPORT_OWNED_METADATA_KEYS: [&str; 13] = [
     "related",
     "valid_from",
     "supersedes",
+    // Edge renderings. The vault note's parsed link set is authoritative;
+    // keeping alternate keys would resurrect links deleted from the vault,
+    // because VaultNote::from_payload unions all four fields on export.
+    "related_to",
+    "relates_to",
+    "governs",
+    "depends_on",
     // Store-derived and retirement bookkeeping must not be re-headered.
     "facets",
     "facets_bitemporal",
@@ -3127,11 +3134,8 @@ mod tests {
         let mut edited = note("edge-reconcile", &["kept-edge"]);
         edited.content = "Edited body".to_string();
         edited.canonical_sha256 = edited.fingerprint();
-        std::fs::write(
-            vault.join("edge-reconcile.md"),
-            edited.to_markdown(),
-        )
-        .expect("write edited note");
+        std::fs::write(vault.join("edge-reconcile.md"), edited.to_markdown())
+            .expect("write edited note");
 
         let config = VaultSyncConfig {
             namespace: ns.to_string(),

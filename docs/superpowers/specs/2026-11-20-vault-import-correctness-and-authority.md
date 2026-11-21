@@ -51,6 +51,11 @@ blockers, priority, labels, or history on the live head.
    verbatim.
    - Import-owned (never copied from prior): `vault_source`, `stub`,
      `canonical_sha256`, `related`, `valid_from`, `supersedes`.
+   - Edge renderings are import-owned too: `related_to`, `relates_to`,
+     `governs`, `depends_on` are removed from the copy. The vault note's
+     parsed link set is authoritative; keeping an alternate edge field would
+     resurrect links deleted from the vault because `from_payload` unions all
+     four fields on the next export.
    - Store/bitemporal-derived (never copied): `facets`, `facets_bitemporal`,
      `concept_iri`, `topology_original`, `valid_to`, `superseded_by`,
      `archived_by_vault_import`.
@@ -72,6 +77,13 @@ blockers, priority, labels, or history on the live head.
   - Same seed, changed body in the vault.
   - Assert new head content is the edited body, `metadata.task` preserved,
     `supersedes` points at the retired copy.
+- `import_reconciles_preserved_edge_fields_with_edited_links`
+  - Seed a prior head with `related`, `related_to`, `governs`, `depends_on`
+    and an unrelated `custom_state`.
+  - Reimport an edited note keeping only one link.
+  - Assert the new head's edge fields are exactly the parsed link set (no
+    stale alternates), `custom_state` survives, and `from_payload`'s exported
+    related set does not resurrect deleted links.
 
 ---
 
