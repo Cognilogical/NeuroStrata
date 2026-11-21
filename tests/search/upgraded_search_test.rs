@@ -204,30 +204,126 @@ fn prompt_sites_have_no_stale_graph_contract() {
     }
 }
 
-// Task 13 P1-6: tool names + drift-prone required args in the canonical R4
-// contract must match the static agent prompt site.
+// Task 13 P1-6 / review IMPORTANT-1: derive BOTH tool names and required args
+// from `agent_routing_contract_json()` and check them against the prompt's
+// command-signature lines, not just a hand-written list of three names.
+
+/// `(tool, required_args)` for every canonical R4 trigger, read from the contract.
+fn contract_tool_args(contract: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+    contract["triggers"]
+        .as_array()
+        .expect("triggers array")
+        .iter()
+        .map(|t| {
+            (
+                t["tool"].as_str().expect("tool").to_string(),
+                t["required_args"]
+                    .as_array()
+                    .expect("required_args")
+                    .iter()
+                    .map(|a| a.as_str().expect("arg").to_string())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Word-boundary token check, robust to backticks, commas, and parentheses.
+fn line_has_token(line: &str, token: &str) -> bool {
+    line.match_indices(token).any(|(i, _)| {
+        let before = line[..i].chars().last();
+        let after = line[i + token.len()..].chars().next();
+        let boundary = |c: Option<char>| c.map_or(true, |c| !c.is_alphanumeric() && c != '_');
+        boundary(before) && boundary(after)
+    })
+}
+
+/// Lines where the tool name is immediately followed by an arg list:
+/// `` `neurostrata_related` (`namespace`, ...) ``. Tolerant of spacing.
+fn signature_lines<'a>(text: &'a str, tool: &str) -> Vec<&'a str> {
+    text.lines()
+        .filter(|line| {
+            line.match_indices(tool).any(|(i, _)| {
+                let rest = line[i + tool.len()..].trim_start();
+                let rest = rest.strip_prefix('`').unwrap_or(rest).trim_start();
+                rest.starts_with('(')
+            })
+        })
+        .collect()
+}
+
+fn assert_signature_args(sig: &str, tool: &str, args: &[String], site: &str) {
+    for arg in args {
+        assert!(
+            line_has_token(sig, arg),
+            "{site}: {tool} signature line missing required arg `{arg}`: {sig}"
+        );
+    }
+}
+
 #[test]
 fn routing_contract_tool_names_match_agent_prompt() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let agent_prompt = fs::read_to_string(
-        root.join(".agents/agents/NeuroStrata-Task.md"),
-    )
-    .expect("agent prompt");
+    let agent_prompt =
+        fs::read_to_string(root.join(".agents/agents/NeuroStrata-Task.md")).expect("agent prompt");
     let contract = routing::agent_routing_contract_json();
-    for trigger in contract["triggers"].as_array().expect("triggers array") {
-        let tool = trigger["tool"].as_str().expect("tool");
-        // Only tools the Graph-First reflex documents belong in that prompt;
-        // every documented contract tool must still be named there.
-        if ["neurostrata_memories_for_file", "neurostrata_related", "neurostrata_sparql_query"]
-            .contains(&tool)
-        {
-            assert!(agent_prompt.contains(tool), "agent prompt missing tool {tool}");
+    let tools = contract_tool_args(&contract);
+
+    // Every tool this prompt documents with a signature carries ALL of that
+    // tool's contract-required args on that very line (no cross-line borrowing).
+    for (tool, args) in &tools {
+        for sig in signature_lines(&agent_prompt, tool) {
+            assert_signature_args(sig, tool, args, "agent prompt");
         }
     }
-    // The two known drift points: related uses `max_hops`, not `depth`; search
-    // documents hybrid as default with `include_references`, never the removed
-    // `include_related` flag.
-    assert!(agent_prompt.contains("neurostrata_related"));
+
+    // Across all tracked prompt sites, any tool with at least one signature
+    // must have SOME signature carrying its full required args. `namespace` is
+    // ambient in authored prose (the caller namespace is inferred), so only the
+    // non-ambient args are enforced here; the strict agent-prompt check above
+    // still requires every contract arg including `namespace`. SKILL.md is a
+    // broad generated surface whose legacy `related(depth)` line is tolerated,
+    // but it cannot be the sole coverage for a contract tool.
+    let ambient = ["namespace"];
+    let site_texts: Vec<String> = GRAPH_CONTRACT_TRACKED_SITES
+        .iter()
+        .map(|rel| fs::read_to_string(root.join(rel)).unwrap_or_default())
+        .collect();
+    for (tool, args) in &tools {
+        let mut sigs: Vec<&str> = Vec::new();
+        for text in &site_texts {
+            sigs.extend(signature_lines(text, tool));
+        }
+        if sigs.is_empty() {
+            continue;
+        }
+        let checked: Vec<&String> = args.iter().filter(|a| !ambient.contains(&a.as_str())).collect();
+        assert!(
+            sigs.iter().any(|sig| checked.iter().all(|a| line_has_token(sig, a))),
+            "no tracked-site {tool} signature carries required args {checked:?}"
+        );
+    }
+
+    // RED control: a drifted `related(depth)` signature is rejected by the
+    // very same helper, proving the test is not vacuous.
+    let drifted = agent_prompt.replace("`max_hops`", "`depth`");
+    let drifted_sig = signature_lines(&drifted, "neurostrata_related")
+        .into_iter()
+        .next()
+        .expect("related signature");
+    assert!(
+        !line_has_token(drifted_sig, "max_hops"),
+        "RED control: drifted signature must lose max_hops"
+    );
+
+    // Keep the minimum name-presence and no-drift phrase checks.
+    for tool in [
+        "neurostrata_memories_for_file",
+        "neurostrata_related",
+        "neurostrata_sparql_query",
+    ] {
+        assert!(agent_prompt.contains(tool), "agent prompt missing tool {tool}");
+    }
     assert!(agent_prompt.contains("max_hops"), "related must document max_hops");
     assert!(!agent_prompt.contains("`depth`"), "related must not document depth");
     assert!(agent_prompt.contains("\"hybrid\"") && agent_prompt.contains("(default)"));

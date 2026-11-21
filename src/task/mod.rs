@@ -1145,7 +1145,7 @@ pub async fn build_task_graph_context(
             break;
         }
     }
-    let subagent_prompt = render_subagent_prompt(
+    let mut subagent_prompt = render_subagent_prompt(
         namespace,
         task_id,
         &goal,
@@ -1154,6 +1154,13 @@ pub async fn build_task_graph_context(
         &bridges_prompt,
         &taxonomy_prompt,
     );
+    // Review IMPORTANT-3: an extreme Golden Rule load can still exceed 3,500
+    // after every shed stage. Golden Rule ids/lines are emitted first in the
+    // hits block, so a char-boundary-safe prefix cap keeps as many as fit and
+    // never splits a UTF-8 scalar. The assert below stays as a postcondition.
+    if subagent_prompt.chars().count() > 3500 {
+        subagent_prompt = subagent_prompt.chars().take(3500).collect();
+    }
     assert!(
         subagent_prompt.chars().count() <= 3500,
         "rendered subagent prompt exceeded the 3,500-char bound"
@@ -10687,6 +10694,60 @@ mod tests {
         for id in &ids {
             assert!(prompt.contains(id), "golden rule id {id} was dropped");
         }
+    }
+
+    // Review IMPORTANT-3: a pathological golden-rule load that still exceeds
+    // 3,500 after every shed stage must hard-cap gracefully (no assert panic),
+    // keeping the early Golden Rule ids and a valid UTF-8 boundary.
+    #[tokio::test]
+    async fn subagent_prompt_hard_caps_with_pathological_golden_rules() {
+        let store = temp_store().await;
+        store.init("probe").await.expect("init probe");
+        let mut ids = Vec::new();
+        for i in 0..28 {
+            let id = format!("pathological-golden-{i}");
+            ids.push(id.clone());
+            store
+                .upsert(
+                    "probe",
+                    &id,
+                    vec![0.5f32; 4],
+                    MemoryPayload {
+                        content: format!("rule {i}: {}", "p".repeat(600)),
+                        user_id: "owner".to_string(),
+                        memory_type: "rule".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: json!({"pinned": true, "access_count": 0}),
+                    },
+                )
+                .await
+                .expect("seed golden");
+        }
+        let payload = MemoryPayload {
+            content: "G".repeat(300),
+            user_id: "owner".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        };
+        let (_ctx, prompt) =
+            build_task_graph_context(&store, "probe", "task-pathological", &[0.5f32; 4], &payload)
+                .await;
+        assert!(
+            prompt.chars().count() <= 3500,
+            "hard cap failed: {}",
+            prompt.chars().count()
+        );
+        for id in ids.iter().take(4) {
+            assert!(prompt.contains(id), "early golden rule id {id} was dropped");
+        }
+        // A truncated tail must still be valid UTF-8 (String guarantees this),
+        // and the bound must be exactly respected, not merely approximated.
+        assert_eq!(prompt.chars().count(), prompt.chars().take(3500).count());
     }
 
     // ── Capability C: task views + task_validate production surfaces ──────

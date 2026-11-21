@@ -44,6 +44,13 @@ pub const EXPECTED_DECISION_T_STRATEGIC: &str =
     "Judge ranked advice against implemented interfaces; record accepted or rejected items.";
 pub const EXPECTED_DECISION_T_INVARIANT: &str =
     "Decide from the read-only result; never mutate memory from this query.";
+// Review IMPORTANT-2: the two response-derived seed next-hops are real
+// triggers, not UNKNOWN. Their decisions stay neutral: a real edge or bridge is
+// evidence to decide from, never proof that the seed is already resolved.
+pub const EXPECTED_DECISION_T_SEED_EDGE: &str =
+    "A real conceptual-bridge edge is evidence; decide from it, abstain when it adds nothing.";
+pub const EXPECTED_DECISION_T_SEED_EXPAND: &str =
+    "Expand the edge-bearing seed two hops; decide from real edges, never a fabricated one.";
 pub const EXPECTED_DECISION_UNKNOWN: &str =
     "Use the result to decide the next step; abstain when it adds no evidence.";
 
@@ -344,6 +351,8 @@ pub fn expected_decision(trigger_id: &str) -> &'static str {
         "T_DOMAIN_NEW" => EXPECTED_DECISION_T_DOMAIN_NEW,
         "T_STRATEGIC" => EXPECTED_DECISION_T_STRATEGIC,
         "T_INVARIANT" => EXPECTED_DECISION_T_INVARIANT,
+        "T_SEED_EDGE" => EXPECTED_DECISION_T_SEED_EDGE,
+        "T_SEED_EXPAND" => EXPECTED_DECISION_T_SEED_EXPAND,
         _ => EXPECTED_DECISION_UNKNOWN,
     }
 }
@@ -412,6 +421,29 @@ mod tests {
             prescribed["action_id"],
             action_id("T_HIGH_BLAST", &proof_args, &["other-seed".to_string()]),
             "a different seed must not reproduce the prescribed proof"
+        );
+    }
+
+    // Review IMPORTANT-2: response-derived seed next-hops are real triggers and
+    // must render an honest neutral decision, never EXPECTED_DECISION_UNKNOWN.
+    #[test]
+    fn seed_triggers_have_honest_expected_decisions() {
+        for id in ["T_SEED_EDGE", "T_SEED_EXPAND"] {
+            let decision = expected_decision(id);
+            assert_ne!(
+                decision, EXPECTED_DECISION_UNKNOWN,
+                "{id} must not render EXPECTED_DECISION_UNKNOWN"
+            );
+            assert!(!decision.is_empty(), "{id} decision must be non-empty");
+        }
+        // The seven canonical triggers and the honest fallback are unchanged.
+        assert_eq!(
+            expected_decision("T_HIGH_BLAST"),
+            EXPECTED_DECISION_T_HIGH_BLAST
+        );
+        assert_eq!(
+            expected_decision("T_NOT_A_TRIGGER"),
+            EXPECTED_DECISION_UNKNOWN
         );
     }
 }

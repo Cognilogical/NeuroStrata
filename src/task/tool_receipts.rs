@@ -177,7 +177,10 @@ pub fn ensure_events_section(doc: &mut Value) {
     // the same normalization the ledger writer applies before it mutates.
     if doc.is_array() {
         let rows = std::mem::take(doc);
-        *doc = json!({ "queries": rows });
+        // Match mutate_session_ledger's wrap: it always carries a namespace.
+        // A bare legacy array records none, so the neutral "global" default
+        // applies (same missing-namespace policy as MCP receipts).
+        *doc = json!({ "namespace": "global", "queries": rows });
     }
     if !doc.is_object() {
         *doc = json!({});
@@ -1027,5 +1030,13 @@ mod tests {
         assert_eq!(doc["queries"][0]["tool"], json!("neurostrata_locate"));
         assert_eq!(doc["events_version"], json!(EVENTS_VERSION));
         assert!(doc["events"].as_array().unwrap().is_empty());
+        // Review MINOR: the bare-array wrap must carry a namespace just as the
+        // mutate_session_ledger wrap does. A bare legacy array has no recorded
+        // namespace, so the neutral "global" default applies.
+        assert_eq!(
+            doc["namespace"],
+            json!("global"),
+            "bare-array wrap must include a namespace"
+        );
     }
 }
