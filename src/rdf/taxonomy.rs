@@ -383,8 +383,39 @@ pub struct TaxonomyRequest {
     pub top_k: Option<usize>,
 }
 
+/// Keys accepted by `TaxonomyRequest`, for unknown-field visibility (#334/C3).
+/// Derived from a default serialization so new struct fields are picked up
+/// automatically, plus the serde aliases that are accepted but not emitted.
+pub fn unknown_taxonomy_request_fields(value: &Value) -> Vec<String> {
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    if let Ok(Value::Object(defaults)) = serde_json::to_value(TaxonomyRequest::default()) {
+        known.extend(defaults.keys().cloned());
+    }
+    for alias in ["action", "alt_labels", "related"] {
+        known.insert(alias.to_string());
+    }
+    let Some(obj) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = obj
+        .keys()
+        .filter(|key| !known.contains(*key))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
+}
+
 /// Typed response wrapper for `neurostrata_taxonomy`.
 pub type TaxonomyResponse = Value;
+
+/// Hard caps for `compare`: caller-controlled collections must not drive
+/// pairwise/ancestor work without a bound (#334/C1).
+pub const MAX_COMPARE_SLUGS: usize = 64;
+pub const MAX_COMPARE_AXES: usize = 32;
+/// Tree query controls (#334/C2).
+pub const MAX_TREE_HOPS: usize = 4;
+pub const MAX_TREE_ROOTS: usize = 50;
 
 fn normalize_slug_vec(raw: &[String]) -> Vec<String> {
     let mut set = BTreeSet::new();
@@ -2058,17 +2089,33 @@ fn build_tree_node(
     slug: &str,
     concepts: &BTreeMap<String, HydratedConcept>,
     allowed_set: &BTreeSet<String>,
-    visited: &mut BTreeSet<String>,
+    visited: &mut BTreeMap<String, usize>,
+    remaining_hops: Option<usize>,
 ) -> Option<TaxonomyTreeNode> {
-    if !visited.insert(slug.to_string()) {
-        return None;
+    // Track the greatest remaining budget seen per node, not a boolean:
+    // a DAG node first reached by a longer path must be revisited when a
+    // shorter path leaves more hops for its descendants (#334/C2 follow-up).
+    let budget = remaining_hops.unwrap_or(usize::MAX);
+    if let Some(best) = visited.get(slug) {
+        if *best >= budget {
+            return None;
+        }
     }
+    visited.insert(slug.to_string(), budget);
     let c = concepts.get(slug)?;
     let mut children = Vec::new();
-    for child_slug in &c.narrower {
-        if allowed_set.contains(child_slug) && !visited.contains(child_slug) {
-            if let Some(child_node) = build_tree_node(child_slug, concepts, allowed_set, visited) {
-                children.push(child_node);
+    if remaining_hops != Some(0) {
+        for child_slug in &c.narrower {
+            if allowed_set.contains(child_slug) {
+                if let Some(child_node) = build_tree_node(
+                    child_slug,
+                    concepts,
+                    allowed_set,
+                    visited,
+                    remaining_hops.map(|hops| hops.saturating_sub(1)),
+                ) {
+                    children.push(child_node);
+                }
             }
         }
     }
@@ -2150,12 +2197,22 @@ async fn execute_tree(
             .collect()
     };
 
-    let mut visited = BTreeSet::new();
+    let mut visited = BTreeMap::new();
+    let max_hops = req.max_hops.map(|hops| hops.clamp(1, MAX_TREE_HOPS));
     let mut roots = Vec::new();
     for r_slug in root_slugs {
-        if let Some(node) = build_tree_node(&r_slug, &view.concepts, &allowed_slugs, &mut visited) {
+        if let Some(node) = build_tree_node(
+            &r_slug,
+            &view.concepts,
+            &allowed_slugs,
+            &mut visited,
+            max_hops,
+        ) {
             roots.push(node);
         }
+    }
+    if let Some(limit) = req.limit.map(|limit| limit.clamp(1, MAX_TREE_ROOTS)) {
+        roots.truncate(limit);
     }
 
     Ok(json!({
@@ -2552,6 +2609,12 @@ async fn execute_compare(
     if slugs.len() < 2 {
         return Err("compare requires at least 2 distinct concept slugs".to_string());
     }
+    if slugs.len() > MAX_COMPARE_SLUGS {
+        return Err(format!(
+            "compare supports at most {MAX_COMPARE_SLUGS} concept slugs (got {})",
+            slugs.len()
+        ));
+    }
 
     let now_ts = chrono::Utc::now().timestamp();
     let (active_rows, active_edges) = load_active_rows_and_edges(store, namespace, now_ts).await?;
@@ -2651,6 +2714,12 @@ async fn execute_compare(
         }
         union_axes.into_iter().collect()
     };
+    if axes.len() > MAX_COMPARE_AXES {
+        return Err(format!(
+            "compare supports at most {MAX_COMPARE_AXES} evaluation axes (got {})",
+            axes.len()
+        ));
+    }
 
     let mut axis_matrix: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for axis in &axes {
@@ -5588,5 +5657,275 @@ mod tests {
             snap.contains("DEPRECATED") || snap.contains("not_definition"),
             "snapshot taxonomy must expose the annotation: {snap}"
         );
+    }
+
+    /// #334/C1: compare must reject more than 64 slugs before any pair work.
+    #[tokio::test]
+    async fn compare_rejects_slugs_beyond_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-cap-slugs";
+        store.init(ns).await.expect("init");
+
+        let slugs: Vec<String> = (0..65).map(|i| format!("slug-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(slugs),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("65 slugs must be rejected");
+        assert!(
+            err.contains("at most 64"),
+            "expected the slug cap error, got: {err}"
+        );
+    }
+
+    /// #334/C1: compare must reject more than 32 evaluation axes.
+    #[tokio::test]
+    async fn compare_rejects_axes_beyond_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-cap-axes";
+        store.init(ns).await.expect("init");
+
+        for slug in ["axis-a", "axis-b"] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("cap fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed concept");
+        }
+
+        let axes: Vec<String> = (0..33).map(|i| format!("axis-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(vec!["axis-a".to_string(), "axis-b".to_string()]),
+                axes: Some(axes),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("33 axes must be rejected");
+        assert!(
+            err.contains("at most 32"),
+            "expected the axis cap error, got: {err}"
+        );
+    }
+
+    /// #334/C2: `max_hops` must cap tree depth.
+    #[tokio::test]
+    async fn tree_honours_max_hops() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-hops";
+        store.init(ns).await.expect("init");
+
+        for (slug, broader) in [
+            ("alpha", None),
+            ("beta", Some("alpha")),
+            ("gamma", Some("beta")),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("tree fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    broader: broader.map(|b| vec![b.to_string()]),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed tree");
+        }
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                root_slug: Some("alpha".to_string()),
+                max_hops: Some(1),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops");
+
+        let root = &tree["roots"][0];
+        assert_eq!(root["slug"], "alpha");
+        let children = root["children"].as_array().expect("children");
+        assert_eq!(children.len(), 1, "one hop must expose only beta: {root}");
+        assert_eq!(children[0]["slug"], "beta");
+        assert_eq!(
+            children[0]["children"].as_array().unwrap().len(),
+            0,
+            "gamma is beyond max_hops=1: {root}"
+        );
+    }
+
+    /// #334/C2 review follow-up (4650591458): a shorter path to a shared DAG
+    /// node must be allowed to expand even after a longer path marked it.
+    #[tokio::test]
+    async fn tree_revisits_shared_nodes_with_a_larger_budget() {
+        fn contains_slug(node: &Value, slug: &str) -> bool {
+            if node.get("slug").and_then(Value::as_str) == Some(slug) {
+                return true;
+            }
+            node.get("children")
+                .and_then(Value::as_array)
+                .map(|children| children.iter().any(|child| contains_slug(child, slug)))
+                .unwrap_or(false)
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-shared";
+        store.init(ns).await.expect("init");
+
+        for (slug, broader) in [
+            ("alpha", None),
+            ("beta", Some(vec!["alpha"])),
+            ("charlie", Some(vec!["beta", "alpha"])),
+            ("delta", Some(vec!["charlie"])),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("shared DAG fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    broader: broader
+                        .map(|list| list.into_iter().map(|item| item.to_string()).collect()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed shared DAG");
+        }
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                root_slug: Some("alpha".to_string()),
+                max_hops: Some(2),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree over a shared DAG");
+        assert!(
+            contains_slug(&tree["roots"][0], "delta"),
+            "delta is two hops from alpha via the direct alpha→charlie edge: {tree}"
+        );
+    }
+
+    /// #334/C2: `limit` must cap the number of returned roots.
+    #[tokio::test]
+    async fn tree_honours_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-limit";
+        store.init(ns).await.expect("init");
+
+        for slug in ["alpha", "delta"] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("root fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed root");
+        }
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                limit: Some(1),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with limit");
+        assert_eq!(
+            tree["roots"].as_array().unwrap().len(),
+            1,
+            "limit=1 must return one root: {tree}"
+        );
+    }
+
+    /// #334/C3: unknown request keys are reported; aliases are recognised.
+    #[test]
+    fn unknown_taxonomy_request_fields_reports_only_unrecognised_keys() {
+        let value = json!({
+            "operation": "tree",
+            "namespace": "ns",
+            "limit": 1,
+            "typo_field": true,
+            "action": "tree",
+            "related": []
+        });
+        assert_eq!(
+            unknown_taxonomy_request_fields(&value),
+            vec!["typo_field".to_string()]
+        );
+        assert!(unknown_taxonomy_request_fields(&json!({})).is_empty());
     }
 }
