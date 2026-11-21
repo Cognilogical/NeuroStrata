@@ -85,6 +85,7 @@ pub trait DataConnector: Send + Sync {
 - MCP tool: `neurostrata_data_connector`
 - HTTP endpoint: `POST /data-connector`
 - CLI: `neurostrata-mcp data-connector <list|describe|register-pointer|resolve|apply-effect|mediate>`
+- Caller-originated pointer reads (`list_pointers`, `resolve_pointer`, `mediate`) require a named `principal` on every transport; omitting it is rejected at the external boundary instead of being forwarded as the port's trusted `None`, which stays kernel-internal. `apply_effect` is unchanged and fails closed in its pre-gate.
 
 ## Verification
 
