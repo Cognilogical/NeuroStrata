@@ -92,6 +92,61 @@ between the two persisted memories after import, independent of note id order.
 
 ---
 
+## 3a. #346 — A removed WikiLink must retire its stored edge
+
+### Invariant
+
+After an import, the `RELATES_TO` edges that originate at an imported head
+with `extractor = 'upsert'` equal the vault's parsed link set for that note.
+A link removed from the vault leaves no edge — including the transition to an
+empty link set, which retires every such edge. Kept links survive, and edges
+owned by other provenance (`mention-detector`, hand-authored) or other
+relations (`GOVERNS`, `DEPENDS_ON`, `CONTAINS`, `EXTRACTED_FROM`) are never
+touched.
+
+### Mechanism
+
+`upsert` only MERGEs declared edges; its deletion pass covers only
+mention-detector edges. Reconciliation is therefore a caller-owned step:
+
+- `VectorStore::reconcile_declared_edges(namespace, id, rel_type, keep)` —
+  default no-op for stores without a graph projection.
+- `LadybugStore` deletes edges `a-[r:rel_type]->b` where `a.id = id`,
+  `a.namespace = namespace`, `r.extractor = 'upsert'`, and `b.id` is not in
+  `keep`. An empty `keep` drops the `NOT IN` clause, deleting all of them.
+- `import_vault_with_limits` calls it for every planned head **before** that
+  head's `upsert`, so a declared target that resolves to a different stored id
+  cannot delete the edge the same write just created; the deferred-edge replay
+  reconciles again before its retry upsert.
+
+The pass is explicit rather than implicit in `upsert`: an absent `related_to`
+key means "not declared by this write" for ordinary callers, and only the
+vault knows that its parsed link set is authoritative and total.
+
+### Eval (fails on baseline)
+
+- `reimport_retires_stored_edges_for_removed_wikilinks`
+  - Import `linker` → `stale-target`, `kept-target`; assert both edges exist
+    (control) and seed an unrelated `GOVERNS` upsert edge.
+  - Rewrite `linker` with only `kept-target`, reimport; assert the
+    `stale-target` edge is gone, `kept-target` survives, `GOVERNS` survives,
+    export renders exactly one `[[kept-target]]` and no `[[stale-target]]`.
+  - Clear the last link, reimport; assert no `RELATES_TO` from `linker`
+    remains and the unrelated `GOVERNS` edge still does.
+
+### Migration and residual risk
+
+No schema change. Reconciliation is delete-only and idempotent, so a head that
+reimports after this patch converges in one pass. Residual: reimporting a
+byte-identical note is a deliberate no-op, so an edge orphaned by a *pre-fix*
+import of that same note survives until the note is edited (the no-op path
+never reaches reconciliation). This is bounded by the fact that the orphan was
+created by a pre-fix removal import; an operator can force convergence by
+touching the note. `LadybugStore::upsert` behaviour and the parser are
+untouched, so no other writer changes shape.
+
+---
+
 ## 4. #344 — Retired rows must not be exported
 
 ### Invariant
@@ -182,8 +237,11 @@ note whose *real* type changed is versioned.
 - `src/vault_ld/mod.rs` — v2 fingerprint, legacy fingerprint, version const.
 - `src/vault_ld/vault_sync.rs` — `related_to` head key, deferred-edge retry,
   retirement export filter, history-id import guard, `fingerprint_version`
-  stamp, updated `import_reconciles_preserved_edge_fields_with_edited_links`
+  stamp, per-head `reconcile_declared_edges` call, updated
+  `import_reconciles_preserved_edge_fields_with_edited_links`
   assertion (that key now exists by design).
+- `src/traits.rs` — `VectorStore::reconcile_declared_edges` default no-op.
+- `src/store/ladybug.rs` — `extractor = 'upsert'` RELATES_TO reconciler.
 
 ## 7. Risk
 
@@ -193,4 +251,7 @@ note whose *real* type changed is versioned.
   head; both import-owned.
 - Export file set shrinks for namespaces with history: stale files remain on
   disk (additive export), documented above.
-- Store and parser untouched.
+- One extra delete-only statement per planned note before its upsert; it
+  performs no page writes when the edge set already matches. Caller-scoped, so
+  non-vault upserts keep their current behaviour.
+- Parser and `upsert` edge materialization untouched.

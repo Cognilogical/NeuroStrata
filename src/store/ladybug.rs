@@ -11707,6 +11707,64 @@ impl VectorStore for LadybugStore {
         LadybugStore::list_edges(self, namespace).await
     }
 
+    async fn reconcile_declared_edges(
+        &self,
+        namespace: &str,
+        id: &str,
+        rel_type: &str,
+        keep: &[String],
+    ) -> Result<usize> {
+        // A caller that cannot name a real relation could interpolate arbitrary
+        // Cypher into the label position.
+        if !is_valid_relation_name(rel_type) {
+            anyhow::bail!("invalid relation name for edge reconciliation: {rel_type}");
+        }
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        let rel_type = rel_type.to_string();
+        let keep = keep.to_vec();
+        self.write_with_deadline("reconciling declared edges", move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            let safe_id = escape_ladybug_string(&id);
+            // `upsert` is the only provenance this reconciler owns: mention
+            // links are refreshed by their own pass, and hand-authored edges
+            // have no declaration to reconcile against.
+            let mut stale_query = format!(
+                "MATCH (a:Memory {{id: '{safe_id}'}})-[r:{rel_type}]->(b:Memory) \
+                 WHERE a.namespace = '{safe_ns}' AND r.extractor = 'upsert'"
+            );
+            if !keep.is_empty() {
+                let keep_list = keep
+                    .iter()
+                    .map(|t| format!("'{}'", escape_ladybug_string(t)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                stale_query.push_str(&format!(" AND NOT b.id IN [{keep_list}]"));
+            }
+            stale_query.push_str(" RETURN b.id");
+            let mut stale = Vec::new();
+            for row in conn.query(&stale_query)? {
+                stale.push(format!("{}", row[0]));
+            }
+            if stale.is_empty() {
+                return Ok(0);
+            }
+            let stale_list = stale
+                .iter()
+                .map(|t| format!("'{}'", escape_ladybug_string(t)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let delete_query = format!(
+                "MATCH (a:Memory {{id: '{safe_id}'}})-[r:{rel_type}]->(b:Memory) \
+                 WHERE a.namespace = '{safe_ns}' AND r.extractor = 'upsert' \
+                 AND b.id IN [{stale_list}] DELETE r"
+            );
+            conn.query(&delete_query)?;
+            Ok(stale.len())
+        })
+        .await
+    }
+
     async fn relink_edges(&self, namespace: &str, source_key: &str) -> Result<usize> {
         // Declarations live in each memory's metadata, which survives ingestion;
         // only the edges themselves are lost with the nodes. Replaying them is

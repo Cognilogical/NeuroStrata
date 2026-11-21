@@ -984,6 +984,8 @@ pub async fn import_vault_with_limits(
         metadata: serde_json::Value,
         content: String,
         memory_type: String,
+        /// The vault's parsed link set, kept for edge reconciliation.
+        related: Vec<String>,
         history: Option<(String, Vec<f32>, crate::traits::MemoryPayload)>,
     }
 
@@ -1124,6 +1126,7 @@ pub async fn import_vault_with_limits(
             metadata,
             content: note.content,
             memory_type: declared_type.to_string(),
+            related: note.related,
             history,
         });
     }
@@ -1165,6 +1168,20 @@ pub async fn import_vault_with_limits(
             .is_some_and(|targets| !targets.is_empty())
             .then(|| (payload.clone(), item.vector.clone()));
 
+        // Retire edges from the previous declaration before materialising this
+        // one: `upsert` only merges declared edges, so a removed WikiLink
+        // would otherwise stay live (#346). Reconcile first because a declared
+        // target may resolve to a different stored id than the literal.
+        if let Err(e) = store
+            .reconcile_declared_edges(&config.namespace, &item.id, "RELATES_TO", &item.related)
+            .await
+        {
+            errors.push(format!(
+                "Failed to retire stale edges for {}: {}",
+                item.id, e
+            ));
+        }
+
         match store
             .upsert(&config.namespace, &item.id, item.vector, payload)
             .await
@@ -1197,6 +1214,23 @@ pub async fn import_vault_with_limits(
     // Every row (and stub) now exists, so a forward reference resolves. A
     // target absent from both the vault and the store stays deferred.
     for (id, vector, payload) in deferred_retry {
+        let keep: Vec<String> = payload
+            .metadata
+            .get("related_to")
+            .and_then(Value::as_array)
+            .map(|targets| {
+                targets
+                    .iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Err(e) = store
+            .reconcile_declared_edges(&config.namespace, &id, "RELATES_TO", &keep)
+            .await
+        {
+            errors.push(format!("Failed to retire stale edges for {}: {}", id, e));
+        }
         if let Err(e) = store.upsert(&config.namespace, &id, vector, payload).await {
             errors.push(format!("Failed to relink edges for {}: {}", id, e));
         }
@@ -3468,6 +3502,154 @@ mod tests {
             .await
             .expect("reimport");
         assert_eq!(again.notes_imported, 0, "round-trip must be a no-op");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #346: a WikiLink removed from the vault must retire the stored edge,
+    /// not only its metadata. Reconcile is scoped to upsert-declared
+    /// RELATES_TO edges, so mention-detector links and GOVERNS survive.
+    #[tokio::test]
+    async fn reimport_retires_stored_edges_for_removed_wikilinks() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-retire-edges-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_retire_edges";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let mut linker = note("linker", &["stale-target", "kept-target"]);
+        linker.content = "links both".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        for plain in [note("stale-target", &[]), note("kept-target", &[])] {
+            let mut plain = plain;
+            plain.content = format!("body of {}", plain.id);
+            plain.canonical_sha256 = plain.fingerprint();
+            std::fs::write(vault.join(format!("{}.md", plain.id)), plain.to_markdown())
+                .expect("write note");
+        }
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        let edges = store.list_edges(ns).await.expect("list edges");
+        for target in ["stale-target", "kept-target"] {
+            assert!(
+                edges.iter().any(|(from, rel, to, _)| from == "linker"
+                    && rel == "RELATES_TO"
+                    && to == target),
+                "import must materialize {target}: {:?}",
+                edges
+            );
+        }
+
+        // Control: an unrelated upsert-declared edge is never reconciled.
+        store
+            .upsert(
+                ns,
+                "governing-rule",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "a rule".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({"governs": ["kept-target"]}),
+                },
+            )
+            .await
+            .expect("seed governs edge");
+
+        linker.related = vec!["kept-target".to_string()];
+        linker.content = "links one".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("rewrite linker");
+
+        let second = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("reimport");
+        assert_eq!(second.notes_imported, 1, "{:?}", second.errors);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            !edges.iter().any(|(from, rel, to, _)| from == "linker"
+                && rel == "RELATES_TO"
+                && to == "stale-target"),
+            "a removed WikiLink must retire its RELATES_TO edge: {:?}",
+            edges
+        );
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| from == "linker"
+                && rel == "RELATES_TO"
+                && to == "kept-target"),
+            "a kept WikiLink must keep its edge: {:?}",
+            edges
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(from, rel, to, _)| from == "governing-rule"
+                    && rel == "GOVERNS"
+                    && to == "kept-target"),
+            "an unrelated upsert edge must survive reconciliation: {:?}",
+            edges
+        );
+
+        let exported = export_vault(config.clone(), store.clone())
+            .await
+            .expect("export");
+        assert!(exported.success, "{:?}", exported.errors);
+        let markdown = std::fs::read_to_string(vault.join("linker.md")).expect("read export");
+        assert!(
+            !markdown.contains("[[stale-target]]"),
+            "export must not resurrect the removed link: {markdown}"
+        );
+        assert_eq!(markdown.matches("[[kept-target]]").count(), 1, "{markdown}");
+
+        // Empty transition: removing the last link retires the last edge.
+        linker.related.clear();
+        linker.content = "links none".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown())
+            .expect("rewrite empty linker");
+        let third = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import empty links");
+        assert!(third.errors.is_empty(), "{:?}", third.errors);
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            !edges
+                .iter()
+                .any(|(from, rel, _, _)| from == "linker" && rel == "RELATES_TO"),
+            "an empty link set must retire every declared RELATES_TO edge: {:?}",
+            edges
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(from, rel, to, _)| from == "governing-rule"
+                    && rel == "GOVERNS"
+                    && to == "kept-target"),
+            "the unrelated edge must still survive: {:?}",
+            edges
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
