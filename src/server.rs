@@ -2050,17 +2050,19 @@ async fn _with_watch(
                                     .unwrap_or("");
                                 match watch.unregister(namespace, std::path::Path::new(dir_path)) {
                                     Ok(removed) => {
-                                        if removed {
-                                            result_text = format!(
-                                                "Successfully unwatched {} in namespace '{}'.",
-                                                dir_path, namespace
-                                            );
-                                        } else {
-                                            result_text = format!(
-                                                "Watch root {} was not registered in namespace '{}'.",
-                                                dir_path, namespace
-                                            );
-                                        }
+                                        // Parity with the daemon HTTP unwatch shim: emit the
+                                        // same structured shape. Core unregister returns only
+                                        // bool, so derive the canonical path here (the path is
+                                        // already J6-validated by the core before Ok).
+                                        let canonical = std::fs::canonicalize(dir_path)
+                                            .map(|p| p.to_string_lossy().to_string())
+                                            .unwrap_or_else(|_| dir_path.to_string());
+                                        result_text = serde_json::json!({
+                                            "removed": removed,
+                                            "namespace": namespace,
+                                            "canonical_path": canonical,
+                                        })
+                                        .to_string();
                                     }
                                     Err(e) => {
                                         result_text = format!("Error unwatching: {}", e);
@@ -12924,11 +12926,14 @@ mod tests {
                 }),
             )
             .await;
-            assert!(
-                text_of(&response).contains("Successfully unwatched"),
-                "unwatch did not delegate: {}",
-                text_of(&response)
+            let unwatch: serde_json::Value =
+                serde_json::from_str(text_of(&response)).expect("unwatch is JSON");
+            assert_eq!(
+                unwatch["removed"], true,
+                "unwatch did not delegate: {unwatch}"
             );
+            assert_eq!(unwatch["namespace"], "ns");
+            assert_eq!(unwatch["canonical_path"], canonical.display().to_string());
             assert!(watch.status(Some("ns")).roots.is_empty());
 
             // A path outside the startup root is refused by the core J6 gate;
