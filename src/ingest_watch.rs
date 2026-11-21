@@ -21,6 +21,17 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchUnwatchReq {
+    pub namespace: String,
+    pub dir_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchStatusQuery {
+    pub namespace: Option<String>,
+}
+
 pub const QUIET_PERIOD: Duration = Duration::from_millis(300);
 pub const MAX_WINDOW: Duration = Duration::from_secs(2);
 pub const BACKOFF_STEPS_SECS: &[u64] = &[1, 2, 4, 8, 16, 30];
@@ -28,7 +39,7 @@ pub const MAX_RENAME_COOKIES: usize = 1024;
 
 pub struct TestEventSource {
     pub tx: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
-    pub rx: tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<WatchEvent>>,
     watched: std::sync::Mutex<Vec<PathBuf>>,
     unwatched: std::sync::Mutex<Vec<PathBuf>>,
 }
@@ -38,7 +49,7 @@ impl TestEventSource {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             tx,
-            rx,
+            rx: tokio::sync::Mutex::new(rx),
             watched: std::sync::Mutex::new(Vec::new()),
             unwatched: std::sync::Mutex::new(Vec::new()),
         }
@@ -46,16 +57,16 @@ impl TestEventSource {
 }
 #[async_trait]
 impl WatchEventSource for TestEventSource {
-    async fn recv(&mut self) -> Option<WatchEvent> {
-        self.rx.recv().await
+    async fn recv(&self) -> Option<WatchEvent> {
+        self.rx.lock().await.recv().await
     }
 
-    fn watch_root(&mut self, root: &Path) -> Result<(), String> {
+    fn watch_root(&self, root: &Path) -> Result<(), String> {
         self.watched.lock().unwrap().push(root.to_path_buf());
         Ok(())
     }
 
-    fn unwatch_root(&mut self, root: &Path) -> Result<(), String> {
+    fn unwatch_root(&self, root: &Path) -> Result<(), String> {
         self.unwatched.lock().unwrap().push(root.to_path_buf());
         Ok(())
     }
@@ -98,10 +109,10 @@ pub struct PathEffect {
 }
 
 #[async_trait]
-pub trait WatchEventSource: Send {
-    async fn recv(&mut self) -> Option<WatchEvent>;
-    fn watch_root(&mut self, root: &Path) -> Result<(), String>;
-    fn unwatch_root(&mut self, root: &Path) -> Result<(), String>;
+pub trait WatchEventSource: Send + Sync {
+    async fn recv(&self) -> Option<WatchEvent>;
+    fn watch_root(&self, root: &Path) -> Result<(), String>;
+    fn unwatch_root(&self, root: &Path) -> Result<(), String>;
 }
 
 pub trait WatchRegistrationStore: Send + Sync {
@@ -109,13 +120,13 @@ pub trait WatchRegistrationStore: Send + Sync {
     fn save(&self, regs: &[Registration]) -> anyhow::Result<()>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TriggerOutcome {
     pub state: TriggerState,
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum TriggerState {
     Finished,
     Failed,
@@ -195,9 +206,12 @@ pub fn next_backoff(attempt: usize) -> Duration {
 /// with `new_path` set. `watch_root`/`unwatch_root` record intent and
 /// delegate to the underlying `notify::RecommendedWatcher` where supported.
 pub struct NotifyEventSource {
-    watcher: RecommendedWatcher,
+    // `recv` and (un)watch are independently synchronized inside the source,
+    // so the daemon loop can await events without blocking request-path root
+    // registration.
+    watcher: Mutex<RecommendedWatcher>,
     tx: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<WatchEvent>>,
     watched_roots: Mutex<HashSet<PathBuf>>,
     pending_renames: Arc<Mutex<HashMap<usize, (PathBuf, tokio::time::Instant)>>>,
 }
@@ -281,9 +295,9 @@ impl NotifyEventSource {
             }
         })?;
         Ok(NotifyEventSource {
-            watcher,
+            watcher: Mutex::new(watcher),
             tx,
-            rx,
+            rx: tokio::sync::Mutex::new(rx),
             watched_roots: Mutex::new(HashSet::new()),
             pending_renames,
         })
@@ -292,16 +306,23 @@ impl NotifyEventSource {
 
 #[async_trait]
 impl WatchEventSource for NotifyEventSource {
-    async fn recv(&mut self) -> Option<WatchEvent> {
-        self.rx.recv().await
+    async fn recv(&self) -> Option<WatchEvent> {
+        self.rx.lock().await.recv().await
     }
 
-    fn watch_root(&mut self, root: &Path) -> Result<(), String> {
+    fn watch_root(&self, root: &Path) -> Result<(), String> {
         // Fail closed: a root we cannot actually watch must not be recorded
-        // as active. Recursive mode covers nested source files.
-        self.watcher
-            .watch(root, notify::RecursiveMode::Recursive)
-            .map_err(|err| format!("could not watch {}: {err}", root.display()))?;
+        // as active. Recursive mode covers nested source files. Never nest
+        // the watcher and root-set guards — lock one at a time.
+        {
+            let mut watcher = self
+                .watcher
+                .lock()
+                .map_err(|_| "watch watcher mutex poisoned".to_string())?;
+            watcher
+                .watch(root, notify::RecursiveMode::Recursive)
+                .map_err(|err| format!("could not watch {}: {err}", root.display()))?;
+        }
         let mut roots = self
             .watched_roots
             .lock()
@@ -310,17 +331,30 @@ impl WatchEventSource for NotifyEventSource {
         Ok(())
     }
 
-    fn unwatch_root(&mut self, root: &Path) -> Result<(), String> {
+    fn unwatch_root(&self, root: &Path) -> Result<(), String> {
+        let watched = {
+            let roots = self
+                .watched_roots
+                .lock()
+                .map_err(|_| "watch roots mutex poisoned".to_string())?;
+            roots.contains(root)
+        };
+        if !watched {
+            return Ok(());
+        }
+        {
+            let mut watcher = self
+                .watcher
+                .lock()
+                .map_err(|_| "watch watcher mutex poisoned".to_string())?;
+            watcher
+                .unwatch(root)
+                .map_err(|err| format!("could not unwatch {}: {err}", root.display()))?;
+        }
         let mut roots = self
             .watched_roots
             .lock()
             .map_err(|_| "watch roots mutex poisoned".to_string())?;
-        if !roots.contains(root) {
-            return Ok(());
-        }
-        self.watcher
-            .unwatch(root)
-            .map_err(|err| format!("could not unwatch {}: {err}", root.display()))?;
         roots.remove(root);
         Ok(())
     }
@@ -645,7 +679,7 @@ pub struct RootRuntime {
     pub watch_active: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RootStatus {
     pub namespace: String,
     pub canonical_path: PathBuf,
@@ -660,7 +694,7 @@ pub struct RootStatus {
     pub watch_active: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WatchStatusReport {
     pub roots: Vec<RootStatus>,
 }
@@ -679,7 +713,9 @@ struct BurstState {
 /// status behind the event source / store / trigger ports. Concrete adapters
 /// are wired only at the composition root.
 pub struct IngestWatchService {
-    events: tokio::sync::Mutex<Box<dyn WatchEventSource>>,
+    // The source synchronizes recv and (un)watch internally; no outer mutex,
+    // so the event loop never blocks request-path registration.
+    events: Box<dyn WatchEventSource>,
     store: Arc<dyn WatchRegistrationStore>,
     trigger: Arc<dyn IngestTrigger>,
     startup_root: PathBuf,
@@ -706,7 +742,7 @@ impl IngestWatchService {
         allowed_external_dirs: Vec<PathBuf>,
     ) -> Self {
         Self {
-            events: tokio::sync::Mutex::new(events),
+            events,
             store,
             trigger,
             startup_root,
@@ -730,21 +766,13 @@ impl IngestWatchService {
     }
 
     fn activate(&self, canonical: &Path) -> anyhow::Result<()> {
-        let mut events = self
-            .events
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("watch event source mutex poisoned"))?;
-        events
+        self.events
             .watch_root(canonical)
             .map_err(|err| anyhow::anyhow!("{err}"))
     }
 
     fn deactivate(&self, canonical: &Path) -> anyhow::Result<()> {
-        let mut events = self
-            .events
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("watch event source mutex poisoned"))?;
-        events
+        self.events
             .unwatch_root(canonical)
             .map_err(|err| anyhow::anyhow!("{err}"))
     }
@@ -820,7 +848,7 @@ impl IngestWatchService {
         self.ensure_runtime(namespace, &canonical)
     }
 
-    pub fn unregister(&self, namespace: &str, raw: &Path) -> anyhow::Result<()> {
+    pub fn unregister(&self, namespace: &str, raw: &Path) -> anyhow::Result<bool> {
         let canonical = self.canonical_or_err(raw)?;
         let key = (namespace.to_string(), canonical.clone());
         let mut state = self.lock_state()?;
@@ -831,13 +859,13 @@ impl IngestWatchService {
         });
         drop(state);
         if !removed {
-            return Ok(());
+            return Ok(false);
         }
         self.persist_state()?;
         if !still_referenced {
             self.deactivate(&canonical)?;
         }
-        Ok(())
+        Ok(removed)
     }
 
     pub fn on_ingest_success(&self, namespace: &str, canonical: &Path) -> anyhow::Result<()> {
@@ -1237,17 +1265,15 @@ impl IngestWatchService {
                 self.fire(&key).await?;
             }
             let deadline = self.next_deadline();
-            let mut events = self.events.lock().await;
             tokio::select! {
-                ev = events.recv() => {
-                    drop(events);
+                ev = self.events.recv() => {
                     if let Some(ev) = ev {
                         self.ingest_event(ev, tokio::time::Instant::now())?;
                     } else {
                         return Ok(());
                     }
                 }
-                _ = tokio::time::sleep_until(deadline) => { drop(events); }
+                _ = tokio::time::sleep_until(deadline) => {}
                 _ = &mut shutdown => {
                     tracing::debug!("watch service shutting down");
                     return Ok(());
@@ -1624,16 +1650,12 @@ mod tests {
 
     #[tokio::test]
     async fn notify_event_source_real_watcher_reports_events() {
-        use notify::Watcher as _;
         let dir = tempfile::tempdir().unwrap();
-        let mut source = NotifyEventSource::new().expect("notify watcher available");
-        source
-            .watcher
-            .watch(dir.path(), notify::RecursiveMode::Recursive)
-            .expect("watch temp dir");
+        let source = NotifyEventSource::new().expect("notify watcher available");
+        source.watch_root(dir.path()).expect("watch temp dir");
 
         // Helper to wait for specific event kind
-        async fn recv(source: &mut NotifyEventSource, want: WatchEventKind) -> WatchEvent {
+        async fn recv(source: &NotifyEventSource, want: WatchEventKind) -> WatchEvent {
             loop {
                 let ev = tokio::time::timeout(std::time::Duration::from_secs(2), source.recv())
                     .await
@@ -1651,13 +1673,13 @@ mod tests {
         std::fs::write(&file, b"hello").unwrap();
 
         // Poll for create event
-        let ev = recv(&mut source, WatchEventKind::Create).await;
+        let ev = recv(&source, WatchEventKind::Create).await;
         assert_eq!(ev.kind, WatchEventKind::Create);
         assert_eq!(ev.path, file);
 
         // Modify the file - exact kind may vary by platform/backend; accept any
         std::fs::write(&file, b"world").unwrap();
-        let ev = recv(&mut source, WatchEventKind::Modify).await;
+        let ev = recv(&source, WatchEventKind::Modify).await;
         assert_eq!(ev.path, file);
         // Accept Modify, Create (truncate+write may look like recreate), or Remove+Create
         assert!(matches!(
@@ -1667,7 +1689,7 @@ mod tests {
 
         // Delete the file
         std::fs::remove_file(&file).unwrap();
-        let ev = recv(&mut source, WatchEventKind::Remove).await;
+        let ev = recv(&source, WatchEventKind::Remove).await;
         // Accept any kind that indicates the path is gone; on some platforms a
         // modify+remove pair may arrive shifted, so we just verify the path matches.
         assert_eq!(ev.path, file);
@@ -1677,10 +1699,10 @@ mod tests {
         let new = dir.path().join("new.txt");
         std::fs::write(&old, b"old").unwrap();
         // Wait for create
-        let _ = recv(&mut source, WatchEventKind::Create).await;
+        let _ = recv(&source, WatchEventKind::Create).await;
         // Rename
         std::fs::rename(&old, &new).unwrap();
-        let ev = recv(&mut source, WatchEventKind::Rename).await;
+        let ev = recv(&source, WatchEventKind::Rename).await;
         assert_eq!(ev.kind, WatchEventKind::Rename);
         assert_eq!(ev.path, old);
         assert_eq!(ev.new_path, Some(new.clone()));
@@ -2043,6 +2065,35 @@ mod tests {
         };
         handle.await.unwrap().unwrap();
         assert_eq!(std::fs::read(&registry_path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn loop_register_and_unregister_succeed_while_event_loop_is_active() {
+        // Regression for the live-path concurrency bug: the daemon's run()
+        // loop awaits the event source. Request-path (un)registration must
+        // never block on that loop or try_lock a mutex it holds across recv().
+        let dir = tempfile::tempdir().unwrap();
+        let (service, canonical) = service_with(&dir, Arc::new(NoopTrigger));
+        let service = Arc::new(service);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.run(shutdown_rx).await })
+        };
+        // Let the loop reach its recv() await before touching registration.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        service
+            .register("NeuroStrata", &canonical)
+            .expect("register succeeds while the event loop is active");
+        assert!(service.status(None).roots[0].watch_active);
+        assert!(service
+            .unregister("NeuroStrata", &canonical)
+            .expect("unwatch succeeds while the event loop is active"));
+        assert!(service.status(None).roots.is_empty());
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
