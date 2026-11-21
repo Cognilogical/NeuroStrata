@@ -1877,7 +1877,7 @@ mod tests {
                         "pointer_id": "ptr_default_json",
                         "offset": 0,
                         "limit": 10,
-                        "max_bytes": 4096
+                        "max_bytes": 1024
                     },
                     "now_secs": now
                 }),
@@ -2078,5 +2078,149 @@ mod tests {
             .expect("describe_pool built-in default in untouched namespace");
         assert_eq!(other_ns_default["access_mode"], "read_write");
         assert_eq!(other_ns_default["max_slice_rows"], 1000);
+    }
+
+    /// #331: a successful `memory_pool` write-back must be durable across the
+    /// per-request kernel boundary, not only in the request-local connector.
+    #[tokio::test]
+    async fn memory_pool_write_back_survives_a_fresh_kernel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store_impl =
+            Arc::new(LadybugStore::new(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_pool_durability";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pool",
+                    "schema": {
+                        "connector_id": "memory_pool",
+                        "pool_id": "durable_mem",
+                        "access_mode": "read_write",
+                        "entity_types": ["item"],
+                        "max_slice_rows": 25,
+                        "max_slice_bytes": 2048,
+                        "description": "Write-back durability"
+                    },
+                    "records": {
+                        "mem://items": [{"v": 1}]
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pool");
+
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_durable",
+                        "connector_id": "memory_pool",
+                        "pool_id": "durable_mem",
+                        "pointer_uri": "mem://items",
+                        "entity_type": "item",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_durable",
+            "ptr_durable",
+            "durable_mem",
+            false,
+        )
+        .await;
+
+        let receipt = kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "apply_effect",
+                    "req": {
+                        "pointer_id": "ptr_durable",
+                        "operation": "append",
+                        "payload": {"v": 2},
+                        "action_receipt_id": "rcpt_durable",
+                        "idempotency_key": "idem-durable"
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("apply effect");
+        assert_eq!(receipt["applied"], true);
+        let new_source_sha = receipt["new_source_sha256"]
+            .as_str()
+            .expect("new source sha")
+            .to_string();
+
+        // The request-local kernel sees the write immediately.
+        let same_kernel = kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {
+                        "pointer_id": "ptr_durable",
+                        "offset": 0,
+                        "limit": 10,
+                        "max_bytes": 1024
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("same-kernel resolve");
+        assert_eq!(same_kernel["records"].as_array().unwrap().len(), 2);
+
+        // A fresh kernel is the production serving shape (one kernel per
+        // data-connector request). The receipt promised this state.
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let fresh = kernel2
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "resolve_pointer",
+                    "req": {
+                        "pointer_id": "ptr_durable",
+                        "offset": 0,
+                        "limit": 10,
+                        "max_bytes": 1024
+                    },
+                    "now_secs": now
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("fresh-kernel resolve");
+        let fresh_records = fresh["records"].as_array().expect("records");
+        assert_eq!(
+            fresh_records.len(),
+            2,
+            "the write-back must survive the request boundary: {fresh}"
+        );
+        assert_eq!(
+            fresh["source_sha256"],
+            json!(new_source_sha),
+            "a fresh read must match the receipt's new source SHA"
+        );
     }
 }
