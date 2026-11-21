@@ -1436,6 +1436,70 @@ mod tests {
         assert!(!dir.join(format!("{absent_id}.json")).exists());
     }
 
+    /// Wiring-level egress test (task 1ypd / panel C3 R6.4): drive the REAL
+    /// `drain_once` path — not `is_shareable_memory_type` directly — with a
+    /// receipt-shaped row, a non-shareable row, and a legitimate shareable row.
+    /// Only the last may cross into the mesh checkout.
+    #[test]
+    fn mesh_drain_egress_does_not_export_receipt_or_nonshareable_rows() {
+        let (mesh, outbox) = fixture("egress-wiring", None);
+
+        // (a) receipt-shaped row: `action_receipt` is non-shareable even with
+        // eligibility:shareable — the type gate must stop it at drain time.
+        let receipt_id = Uuid::now_v7();
+        let mut receipt_entry = created(
+            &receipt_id.to_string(),
+            json!({
+                "eligibility": "shareable",
+                "event_id": "evt-must-not-escape",
+                "query_digest": "digest-must-not-escape"
+            }),
+        );
+        receipt_entry.memory_type = "action_receipt".to_string();
+        receipt_entry.content = "evt-must-not-escape secret query".to_string();
+        outbox.append(&receipt_entry).unwrap();
+
+        // (a2) a second, distinctly-typed non-shareable row.
+        let task_id = Uuid::now_v7();
+        let mut task_entry = created(&task_id.to_string(), shareable_metadata());
+        task_entry.memory_type = "task".to_string();
+        outbox.append(&task_entry).unwrap();
+
+        // (b) the legitimate shareable row.
+        let shareable_id = Uuid::now_v7();
+        outbox
+            .append(&created(&shareable_id.to_string(), shareable_metadata()))
+            .unwrap();
+
+        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+        assert_eq!(
+            report.applied, 1,
+            "only the legitimate shareable row crosses"
+        );
+        assert_eq!(
+            report.skipped, 2,
+            "receipt + non-shareable rows are skipped"
+        );
+        assert!(report.committed);
+
+        let dir = mesh.root().join("ns").join("memories");
+        let mut exported: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".json"))
+            .collect();
+        exported.sort();
+        assert_eq!(exported, vec![format!("{shareable_id}.json")]);
+        assert!(!dir.join(format!("{receipt_id}.json")).exists());
+        assert!(!dir.join(format!("{task_id}.json")).exists());
+
+        // The crossing record is the real one and carries no receipt content.
+        let text = std::fs::read_to_string(dir.join(format!("{shareable_id}.json"))).unwrap();
+        assert!(!text.contains("evt-must-not-escape"));
+        assert!(!text.contains("query_digest"));
+    }
+
     #[test]
     fn a_superseded_entry_records_the_lifecycle_and_successor() {
         let (mesh, outbox) = fixture("superseded", None);
