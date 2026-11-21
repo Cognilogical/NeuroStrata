@@ -1476,6 +1476,31 @@ pub async fn record_graph_query_with_root(
     query_hint: &str,
     caller_root: Option<&str>,
 ) {
+    record_graph_query_inner(store, namespace, tool_name, query_hint, caller_root, true).await;
+}
+
+/// Append one legacy `queries[]` history row for a path returned by a single
+/// dispatched lookup without touching task counters (panel C14). The dispatch
+/// itself is counted once via [`record_graph_query`]; these rows exist only for
+/// readers that still consult the legacy history ledger.
+pub async fn record_legacy_query_path(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    tool_name: &str,
+    query_hint: &str,
+    caller_root: Option<&str>,
+) {
+    record_graph_query_inner(store, namespace, tool_name, query_hint, caller_root, false).await;
+}
+
+async fn record_graph_query_inner(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    tool_name: &str,
+    query_hint: &str,
+    caller_root: Option<&str>,
+    count_task: bool,
+) {
     let ns = crate::server::resolve_namespace(store, namespace).await;
     #[cfg(test)]
     {
@@ -1554,37 +1579,48 @@ pub async fn record_graph_query_with_root(
             }
         }
     }
-    let mut attributed_task_id = String::new();
-    for r in &rows {
-        if gate::is_task(r) && gate::task_status(r) == Status::InProgress {
-            if attributed_task_id.is_empty() {
-                attributed_task_id = r.id.clone();
-            }
+    // Panel C14/C15: one dispatch increments ONE counter — the dispatching
+    // task — never every in-progress task. No explicit task id reaches this
+    // legacy recorder, so it uses the same deterministic first-in-progress-by-id
+    // fallback as the receipt recorder. The whole load -> decide -> upsert runs
+    // under the per-task claim lock from the claim path so concurrent dispatches
+    // cannot lose increments across their `.await` points.
+    if count_task {
+        if let Some(r) = rows
+            .iter()
+            .filter(|r| gate::is_task(r) && gate::task_status(r) == Status::InProgress)
+            .min_by(|a, b| a.id.cmp(&b.id))
+        {
+            let lock = claim_lock(&r.id);
+            let _guard = lock.lock().await;
             if let Ok(Some((vec, mut payload))) = store.get(&ns, &r.id).await {
                 let obj = task_obj_mut(&mut payload);
-                let count = obj
-                    .get("graph_queries_count")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-                    + 1;
-                obj.insert("graph_queries_count".to_string(), json!(count));
-                obj.insert("graph_queried".to_string(), json!(true));
-                let mut recent: Vec<String> = obj
-                    .get("recent_queries")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                recent.push(entry_str.clone());
-                if recent.len() > 10 {
-                    let drop_n = recent.len() - 10;
-                    recent.drain(0..drop_n);
+                // Re-check under the lock: the task may have left in_progress.
+                if obj.get("status").and_then(Value::as_str) == Some(Status::InProgress.as_str()) {
+                    let count = obj
+                        .get("graph_queries_count")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
+                        + 1;
+                    obj.insert("graph_queries_count".to_string(), json!(count));
+                    obj.insert("graph_queried".to_string(), json!(true));
+                    let mut recent: Vec<String> = obj
+                        .get("recent_queries")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    recent.push(entry_str.clone());
+                    if recent.len() > 10 {
+                        let drop_n = recent.len() - 10;
+                        recent.drain(0..drop_n);
+                    }
+                    obj.insert("recent_queries".to_string(), json!(recent));
+                    let _ = store.upsert(&ns, &r.id, vec, payload).await;
                 }
-                obj.insert("recent_queries".to_string(), json!(recent));
-                let _ = store.upsert(&ns, &r.id, vec, payload).await;
             }
         }
     }
@@ -1629,11 +1665,9 @@ pub async fn record_graph_query_with_root(
     if let Some(root) = project_root {
         let ledger_path = std::path::Path::new(&root).join(".NeuroStrata/session_queries.json");
         // NOTE (spec §6 R6.2): this is the PRE-dispatch legacy path. It writes
-        // only the legacy `queries[]` row + task stamp above; it must NOT write
-        // an `events[]` receipt, because no outcome exists yet. Receipts are
-        // written exclusively by `record_tool_receipt` after the handler returns.
-        // `attributed_task_id` is intentionally unused here now.
-        let _ = attributed_task_id;
+        // only the legacy `queries[]` row + the single task stamp above; it must
+        // NOT write an `events[]` receipt, because no outcome exists yet. Receipts
+        // are written exclusively by `record_tool_receipt` after the handler returns.
         tool_receipts::mutate_session_ledger(&ledger_path, &ns, |doc| {
             if let Some(arr) = doc.get_mut("queries").and_then(|v| v.as_array_mut()) {
                 // Legacy rows stay for compatibility; every quality-metric
@@ -1664,8 +1698,9 @@ pub(crate) fn current_session_id() -> String {
 
 /// Record a fully-specified POST-DISPATCH receipt. This is the ONLY function
 /// that writes `events[]` receipts; every outcome field comes from the real
-/// handler response. It fills `task_id` from the active in-progress task for
-/// attribution and bumps the additive-only `tool_invocations` counter. Legacy
+/// handler response. It keeps a caller-supplied `task_id` for attribution and
+/// otherwise falls back to the stable active in-progress task, then bumps the
+/// additive-only `tool_invocations` counter. Legacy
 /// `queries[]` rows and the `graph_queries_count`/`graph_queried` stamps belong
 /// exclusively to the handler-internal recorders. Receipts stay in the local
 /// JSON ledger — never memory rows, so no ReBAC or mesh surface sees them.
@@ -1676,22 +1711,31 @@ pub async fn record_tool_receipt(
 ) {
     let ns = crate::server::resolve_namespace(store, &fields.namespace).await;
 
-    // Review fix round 2: ATTRIBUTION ONLY. Find the active in-progress task so
-    // the receipt can be attributed (snapshot readiness diversity counts it),
-    // but never touch `graph_queries_count`, `graph_queried` or `recent_queries`.
-    // Those counters are stamped exclusively by the handler-internal ledger
-    // recorders; incrementing them here double-counts a single dispatch.
+    // Review fix round 2: ATTRIBUTION ONLY. Never touch `graph_queries_count`,
+    // `graph_queried` or `recent_queries`; those belong exclusively to the
+    // handler-internal recorders, and bumping them here double-counts a dispatch.
+    //
+    // Panel C15: a non-empty `fields.task_id` is the caller's real task context
+    // and always wins. The generic MCP dispatch forwards no task id, so when it
+    // is genuinely unavailable the fallback picks the lowest-id active
+    // in-progress task. First-match is the safe default here because receipt
+    // attribution is telemetry only (never a gate/quota): a wrong attribution
+    // cannot force work open, and a stable id ordering avoids a random,
+    // per-process-varying assignment rather than silently preferring whichever
+    // row `store.list` returned first.
     if fields.task_id.is_empty() {
         let now = chrono::Utc::now().timestamp();
         if let Ok(rows) = store.list(&ns, None, Some("task")).await {
-            for r in &rows {
-                if gate::is_task(r)
-                    && !gate::is_retired(&r.payload.metadata, now)
-                    && gate::task_status(r) == Status::InProgress
-                {
-                    fields.task_id = r.id.clone();
-                    break;
-                }
+            if let Some(r) = rows
+                .iter()
+                .filter(|r| {
+                    gate::is_task(r)
+                        && !gate::is_retired(&r.payload.metadata, now)
+                        && gate::task_status(r) == Status::InProgress
+                })
+                .min_by(|a, b| a.id.cmp(&b.id))
+            {
+                fields.task_id = r.id.clone();
             }
         }
     }
@@ -6137,6 +6181,134 @@ mod tests {
             ledger["queries"].as_array().map(|a| a.len()),
             Some(0),
             "no legacy queries[] row from the receipt recorder"
+        );
+    }
+
+    async fn seeded_task_count(store: &Arc<dyn VectorStore>, ns: &str, id: &str) -> i64 {
+        store.get(ns, id).await.unwrap().unwrap().1.metadata["task"]
+            .get("graph_queries_count")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    }
+
+    /// Panel C14: one locate dispatch must increment exactly one task counter,
+    /// never every in-progress task and never once per returned path.
+    #[tokio::test]
+    async fn graph_query_counts_one_dispatch_on_one_task_only() {
+        use crate::guard::testkit::MockStore;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C14OneDispatch";
+        let vector = StubEmbedder.embed("seed").await.unwrap();
+        for (id, status) in [
+            ("task-z", "in_progress"),
+            ("task-a", "in_progress"),
+            ("task-open", "open"),
+        ] {
+            store
+                .upsert(
+                    ns,
+                    id,
+                    vector.clone(),
+                    MemoryPayload {
+                        content: "task".to_string(),
+                        user_id: "kenton".to_string(),
+                        memory_type: "task".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: json!({
+                            "task": { "status": status, "title": id }
+                        }),
+                    },
+                )
+                .await
+                .expect("seed task");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+
+        record_graph_query_with_root(&store, ns, "neurostrata_locate", "q", Some(&caller_root))
+            .await;
+
+        let counts = [
+            seeded_task_count(&store, ns, "task-z").await,
+            seeded_task_count(&store, ns, "task-a").await,
+            seeded_task_count(&store, ns, "task-open").await,
+        ];
+        assert_eq!(
+            counts.iter().sum::<i64>(),
+            1,
+            "one increment total, got {:?}",
+            counts
+        );
+        assert_eq!(
+            counts.iter().filter(|&&c| c > 0).count(),
+            1,
+            "only the dispatching task is stamped, got {:?}",
+            counts
+        );
+    }
+
+    /// Panel C15: when no caller task context reaches the generic dispatch,
+    /// the first-match fallback must be stable (lowest task id), not whichever
+    /// row `store.list` happened to return first.
+    #[tokio::test]
+    async fn receipt_fallback_uses_stable_first_in_progress_task() {
+        use crate::guard::testkit::MockStore;
+        use crate::task::tool_receipts::build_dispatch_receipt;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "C15Attribution";
+        let vector = StubEmbedder.embed("seed").await.unwrap();
+        // Insert in reverse-id order: a stable fallback picks by id, not insertion order.
+        for id in ["z-task", "a-task"] {
+            store
+                .upsert(
+                    ns,
+                    id,
+                    vector.clone(),
+                    MemoryPayload {
+                        content: "task".to_string(),
+                        user_id: "kenton".to_string(),
+                        memory_type: "task".to_string(),
+                        agent_name: None,
+                        location: String::new(),
+                        location_lines: String::new(),
+                        metadata: json!({ "task": { "status": "in_progress", "title": id } }),
+                    },
+                )
+                .await
+                .expect("seed task");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        let response = json!({"memories": [{"id": "m1"}]}).to_string();
+        let fields = build_dispatch_receipt(
+            "evt-c15".to_string(),
+            1,
+            "ses".to_string(),
+            ns.to_string(),
+            "neurostrata_locate".to_string(),
+            "q",
+            &response,
+            false,
+            1,
+        );
+        assert!(fields.task_id.is_empty());
+        record_tool_receipt(&store, fields, Some(&caller_root)).await;
+
+        let ledger: Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".NeuroStrata/session_queries.json"))
+                .expect("ledger written"),
+        )
+        .expect("valid ledger");
+        assert_eq!(
+            ledger["events"][0]["task_id"].as_str(),
+            Some("a-task"),
+            "fallback must be deterministic (lowest task id), not first insertion"
         );
     }
 
