@@ -352,7 +352,13 @@ pub fn recommended_next_actions(
         ));
     }
 
-    actions.truncate(MAX_NEXT_ACTIONS);
+    // §5's cap is structural: one high-blast + one seed-edge + one diff is the
+    // maximum this decision can emit. A runtime truncate can only discard a
+    // legitimate action, so assert the bound instead of silently cutting.
+    debug_assert!(
+        actions.len() <= MAX_NEXT_ACTIONS,
+        "escalation must emit at most {MAX_NEXT_ACTIONS} actions"
+    );
     let mut response = json!({ "status": status, "next_actions": actions });
     if response["next_actions"]
         .as_array()

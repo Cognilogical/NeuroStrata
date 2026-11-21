@@ -3636,6 +3636,56 @@ pub async fn render_snapshot_taxonomy_section(store: &LadybugStore, namespace: &
     }
 }
 
+/// Active, ReBAC-visible taxonomy rows shared by the snapshot readiness view
+/// and `task_validate`'s graph/ontology advisory. Both signals must come from
+/// the SAME pipeline: `load_active_rows_and_edges` excludes archived,
+/// superseded, conflicting and expired rows, then the public-access policy
+/// drops restricted rows. This keeps a stale/private concept from flipping
+/// `taxonomy_available`. Fail-soft: an unreadable store yields empty inputs.
+async fn load_visible_taxonomy_rows(
+    store: &LadybugStore,
+    namespace: &str,
+    now_ts: i64,
+) -> (
+    Vec<(String, MemoryPayload)>,
+    Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>,
+) {
+    let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
+        .into_iter()
+        .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
+        .collect();
+    (unrestricted_rows, active_edges)
+}
+
+/// Advisory taxonomy signal for `task_validate`: `(taxonomy_available,
+/// concept_grounding_linked)` computed from the active, ReBAC-visible rows —
+/// never from a raw `store.list` that can include expired/superseded rows.
+pub async fn taxonomy_advisory_signal(
+    store: &LadybugStore,
+    namespace: &str,
+) -> (bool, bool) {
+    let now_ts = chrono::Utc::now().timestamp();
+    let (rows, _edges) = load_visible_taxonomy_rows(store, namespace, now_ts).await;
+    let concept_rows: Vec<&MemoryPayload> = rows
+        .iter()
+        .filter(|(_id, pl)| matches!(pl.memory_type.as_str(), "concept" | "thesis"))
+        .map(|(_id, pl)| pl)
+        .collect();
+    let taxonomy_available = !concept_rows.is_empty();
+    let concept_grounding_linked = concept_rows.iter().any(|pl| {
+        pl.metadata
+            .get("extracted_from")
+            .and_then(Value::as_array)
+            .map(|ids| !ids.is_empty())
+            .unwrap_or(false)
+    });
+    (taxonomy_available, concept_grounding_linked)
+}
+
 /// R5 readiness view: whether an unrestricted thesis is visible plus one
 /// `(slug, read-time epistemic_status)` pair per visible concept. Reuses the
 /// same filtered view helpers as `render_snapshot_taxonomy_section`, so the
@@ -3646,14 +3696,8 @@ pub async fn snapshot_taxonomy_readiness_view(
     namespace: &str,
 ) -> (bool, Vec<(String, String)>) {
     let now_ts = chrono::Utc::now().timestamp();
-    let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
-    else {
-        return (false, Vec::new());
-    };
-    let unrestricted_rows: Vec<(String, MemoryPayload)> = active_rows
-        .into_iter()
-        .filter(|(_id, pl)| is_public_access_policy(&pl.metadata))
-        .collect();
+    let (unrestricted_rows, active_edges) =
+        load_visible_taxonomy_rows(store, namespace, now_ts).await;
     let view = build_principal_taxonomy_view(&unrestricted_rows, &active_edges, "admin");
     let concepts = view
         .concepts
