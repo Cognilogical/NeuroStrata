@@ -6409,11 +6409,26 @@ async fn run() -> anyhow::Result<()> {
                     _ => dir.clone(),
                 };
                 let found = crate::root_marker::find_root_marker(&folder);
+                // Without a marker the namespace is the one `namespace resolve`
+                // gives; when that fails, say why instead of guessing one.
                 let namespace = match &found {
-                    Ok(Some(found)) => found.config.namespace.clone(),
-                    _ => crate::task::harness_plugins::resolve_project_namespace(&folder),
+                    Ok(Some(found)) => Ok(found.config.namespace.clone()),
+                    _ => crate::task::harness_plugins::resolve_namespace(&folder)
+                        .map(|resolved| resolved.namespace)
+                        .map_err(|e| e.to_string()),
                 };
-                let cached = root_show_cached_root(probe_daemon().await, &namespace).await;
+                let (namespace, cached) = match namespace {
+                    Ok(ns) => {
+                        let cached = root_show_cached_root(probe_daemon().await, &ns).await;
+                        (ns, cached)
+                    }
+                    Err(why) => (
+                        format!("unknown ({why})"),
+                        crate::root_marker::CachedRoot::Unknown(
+                            "no namespace to look it up for".to_string(),
+                        ),
+                    ),
+                };
                 let bindings = root_show_bindings();
                 println!(
                     "{}",
