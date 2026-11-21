@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use notify::event::{ModifyKind, RenameMode};
-use notify::{Error, Event, EventKind, RecommendedWatcher};
+use notify::{Error, Event, EventKind, RecommendedWatcher, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -24,6 +24,42 @@ use uuid::Uuid;
 pub const QUIET_PERIOD: Duration = Duration::from_millis(300);
 pub const MAX_WINDOW: Duration = Duration::from_secs(2);
 pub const BACKOFF_STEPS_SECS: &[u64] = &[1, 2, 4, 8, 16, 30];
+pub const MAX_RENAME_COOKIES: usize = 1024;
+
+pub struct TestEventSource {
+    pub tx: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
+    pub rx: tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
+    watched: std::sync::Mutex<Vec<PathBuf>>,
+    unwatched: std::sync::Mutex<Vec<PathBuf>>,
+}
+
+impl TestEventSource {
+    pub fn channel() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            tx,
+            rx,
+            watched: std::sync::Mutex::new(Vec::new()),
+            unwatched: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+#[async_trait]
+impl WatchEventSource for TestEventSource {
+    async fn recv(&mut self) -> Option<WatchEvent> {
+        self.rx.recv().await
+    }
+
+    fn watch_root(&mut self, root: &Path) -> Result<(), String> {
+        self.watched.lock().unwrap().push(root.to_path_buf());
+        Ok(())
+    }
+
+    fn unwatch_root(&mut self, root: &Path) -> Result<(), String> {
+        self.unwatched.lock().unwrap().push(root.to_path_buf());
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Registration {
@@ -179,6 +215,12 @@ impl NotifyEventSource {
                     EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
                         if let Some(cookie) = ev.tracker() {
                             if let Ok(mut pending) = pending_renames_clone.lock() {
+                                if pending.len() >= MAX_RENAME_COOKIES {
+                                    // Evict oldest entry to keep map bounded.
+                                    if let Some(old_key) = pending.keys().next().cloned() {
+                                        pending.remove(&old_key);
+                                    }
+                                }
                                 pending.insert(cookie, path.clone());
                             }
                         }
@@ -235,18 +277,24 @@ impl WatchEventSource for NotifyEventSource {
     }
 
     fn watch_root(&mut self, root: &Path) -> Result<(), String> {
+        // Delegate to the underlying notify::RecommendedWatcher so OS
+        // events are actually delivered for this root. The daemon layer
+        // re‑initialises the watcher when roots change.
+        let _ = self
+            .watcher
+            .watch(root, notify::RecursiveMode::NonRecursive);
         let mut roots = self
             .watched_roots
             .lock()
             .map_err(|_| "watch roots mutex poisoned".to_string())?;
         roots.insert(root.to_path_buf());
-        // `notify::RecommendedWatcher` cannot add paths after start without a
-        // restart; the daemon layer re‑initialises the watcher when roots
-        // change. Record the intent for status reporting.
         Ok(())
     }
 
     fn unwatch_root(&mut self, root: &Path) -> Result<(), String> {
+        // Delegate to the underlying notify::RecommendedWatcher so OS
+        // events are torn down for this root.
+        let _ = self.watcher.unwatch(root);
         let mut roots = self
             .watched_roots
             .lock()
@@ -846,9 +894,13 @@ impl IngestWatchService {
             }
             let runtime = state
                 .roots
-                .get(&(entry_namespace.clone(), entry_path.clone()))
-                .expect("runtime present");
+                .get(&(entry_namespace.clone(), entry_path.clone()));
+            if runtime.is_none() {
+                continue;
+            }
             let finished = runtime
+                .as_ref()
+                .unwrap()
                 .last_outcome
                 .as_ref()
                 .map(|outcome| outcome.state == TriggerState::Finished)
@@ -856,19 +908,24 @@ impl IngestWatchService {
             roots.push(RootStatus {
                 namespace: entry_namespace.clone(),
                 canonical_path: entry_path.clone(),
-                dirty: runtime.dirty,
-                pending_paths_count: runtime.pending.len(),
-                last_event_unix: runtime.last_event_unix,
-                last_trigger_unix: runtime.last_trigger_unix,
-                last_ingest_state: runtime.last_outcome.as_ref().map(|o| o.state),
+                dirty: runtime.as_ref().unwrap().dirty,
+                pending_paths_count: runtime.as_ref().unwrap().pending.len(),
+                last_event_unix: runtime.as_ref().unwrap().last_event_unix,
+                last_trigger_unix: runtime.as_ref().unwrap().last_trigger_unix,
+                last_ingest_state: runtime
+                    .as_ref()
+                    .unwrap()
+                    .last_outcome
+                    .as_ref()
+                    .map(|o| o.state),
                 last_ingest_finished_unix: if finished {
-                    runtime.last_trigger_unix
+                    runtime.as_ref().unwrap().last_trigger_unix
                 } else {
                     None
                 },
-                backoff_attempt: runtime.backoff_attempt,
-                next_retry_unix: runtime.next_retry_unix,
-                watch_active: runtime.watch_active,
+                backoff_attempt: runtime.as_ref().unwrap().backoff_attempt,
+                next_retry_unix: runtime.as_ref().unwrap().next_retry_unix,
+                watch_active: runtime.as_ref().unwrap().watch_active,
             });
         }
         WatchStatusReport { roots }
@@ -903,7 +960,14 @@ impl IngestWatchService {
                         if !crate::parser::ingest::is_ingest_eligible_path(&ev.path, canonical) {
                             continue;
                         }
-                        runtime.pending.insert(ev.path.clone());
+                        // Coalesce pending paths: for Rename emit both old and new.
+                        let mut paths_to_insert = vec![ev.path.clone()];
+                        if let Some(ref new_path) = ev.new_path {
+                            paths_to_insert.push(new_path.clone());
+                        }
+                        for path in paths_to_insert {
+                            runtime.pending.insert(path);
+                        }
                         runtime.dirty = true;
                         runtime.last_event_unix = Some(now);
                         // Compute debounce timing.
@@ -1096,46 +1160,6 @@ mod tests {
         assert_eq!(next_backoff(4), Duration::from_secs(16));
         assert_eq!(next_backoff(5), Duration::from_secs(30));
         assert_eq!(next_backoff(6), Duration::from_secs(30));
-    }
-
-    pub struct TestEventSource {
-        pub tx: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
-        pub rx: tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
-        watched: std::sync::Mutex<Vec<PathBuf>>,
-        unwatched: std::sync::Mutex<Vec<PathBuf>>,
-    }
-
-    impl TestEventSource {
-        pub fn channel() -> Self {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            Self {
-                tx,
-                rx,
-                watched: std::sync::Mutex::new(Vec::new()),
-                unwatched: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl WatchEventSource for TestEventSource {
-        async fn recv(&mut self) -> Option<WatchEvent> {
-            self.rx.recv().await
-        }
-        fn watch_root(&mut self, root: &Path) -> Result<(), String> {
-            self.watched
-                .lock()
-                .map_err(|_| "watch mutex poisoned".to_string())?
-                .push(root.to_path_buf());
-            Ok(())
-        }
-        fn unwatch_root(&mut self, root: &Path) -> Result<(), String> {
-            self.unwatched
-                .lock()
-                .map_err(|_| "watch mutex poisoned".to_string())?
-                .push(root.to_path_buf());
-            Ok(())
-        }
     }
 
     struct NoopTrigger;
