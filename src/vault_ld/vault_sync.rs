@@ -58,6 +58,27 @@ pub const MAX_VAULT_FILES: usize = 10_000;
 pub const MAX_VAULT_FILE_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_VAULT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Metadata keys the import owns on the replacement head. Everything else on
+/// a prior head (notably `task`) is preserved across a reimport: #335 showed
+/// that copying a fixed field list drops the next structured field silently.
+const IMPORT_OWNED_METADATA_KEYS: [&str; 13] = [
+    // Import-owned values, overlaid after the prior head is copied.
+    "vault_source",
+    "stub",
+    "canonical_sha256",
+    "related",
+    "valid_from",
+    "supersedes",
+    // Store-derived and retirement bookkeeping must not be re-headered.
+    "facets",
+    "facets_bitemporal",
+    "concept_iri",
+    "topology_original",
+    "valid_to",
+    "superseded_by",
+    "archived_by_vault_import",
+];
+
 /// Resource caps for a vault import/export. The default entry points use the
 /// published constants; tests tighten them to exercise fail-closed paths.
 #[derive(Debug, Clone)]
@@ -786,7 +807,17 @@ pub async fn import_vault_with_limits(
     let mut preloaded: Vec<(PathBuf, String)> = Vec::new();
     let mut total_bytes: u64 = 0;
     for path in &paths {
-        let metadata = match std::fs::metadata(path) {
+        // #337: authorize each candidate's RESOLVED path, then read that same
+        // path. Checking only the vault root let a `.md` symlink import a file
+        // from outside the project root / allowed_external_dirs.
+        let resolved = match crate::daemon::check_caller_path(path, &project_root, &allowed) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                errors.push(format!("Refusing vault file {}: {}", path.display(), e));
+                continue;
+            }
+        };
+        let metadata = match std::fs::metadata(&resolved) {
             Ok(metadata) => metadata,
             Err(e) => {
                 errors.push(format!(
@@ -806,7 +837,7 @@ pub async fn import_vault_with_limits(
             ));
             continue;
         }
-        let content = match std::fs::read_to_string(path) {
+        let content = match std::fs::read_to_string(&resolved) {
             Ok(content) => content,
             Err(e) => {
                 errors.push(format!(
@@ -866,8 +897,39 @@ pub async fn import_vault_with_limits(
     }
 
     // Mint queryable stubs for unresolved WikiLinks; each is gated again.
-    let mut stub_ids = std::collections::BTreeSet::new();
+    // #336: a target is unresolved only when the vault AND the store lack it.
+    // In a partial vault a linked memory's file is absent by definition; a
+    // placeholder must not replace the live head that still exists.
+    let mut mintable = Vec::new();
     for target in unresolved_wiki_targets(&notes) {
+        match store.get(&config.namespace, &target).await {
+            Ok(Some((_, payload))) => {
+                // An existing stub is exactly the state this loop would
+                // produce, so re-import is a silent no-op. A non-stub head
+                // is live knowledge whose file is simply absent from a
+                // partial vault — that is the #336 refusal.
+                let prior_is_stub = payload
+                    .metadata
+                    .get("stub")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if !prior_is_stub {
+                    errors.push(format!(
+                        "Skipping WikiLink stub for '{}': the memory exists in the store \
+                         and its file is absent from the vault",
+                        target
+                    ));
+                }
+            }
+            Ok(None) => mintable.push(target),
+            Err(e) => errors.push(format!(
+                "Skipping WikiLink stub for '{}': could not check the store: {}",
+                target, e
+            )),
+        }
+    }
+    let mut stub_ids = std::collections::BTreeSet::new();
+    for target in mintable {
         let stub = stub_note(&target);
         let turtle = match note_to_turtle(&stub) {
             Ok(turtle) => turtle,
@@ -922,15 +984,35 @@ pub async fn import_vault_with_limits(
             }
         };
 
+        // #336 backstop: a stub is additive only. If a prior head exists for
+        // a stub id (a write landed between resolution and planning), refuse
+        // rather than replace live content with placeholder text.
+        if is_stub && prior_payload.is_some() {
+            errors.push(format!(
+                "Refusing to replace existing memory '{}' with a WikiLink stub",
+                note.id
+            ));
+            continue;
+        }
+
         if let Some(ref prior) = prior_payload {
             // Byte-identical re-import is a no-op before any sovereignty
             // question: a protected row we do not touch is not overwritten.
             // The hash always comes from parsed content/edges, never frontmatter.
+            // Task rows have no stored hash, so derive the same identity the
+            // export path would render for the prior payload (#335).
             let prior_hash = prior
                 .metadata
                 .get("canonical_sha256")
                 .and_then(|v| v.as_str());
-            if prior_hash == Some(note.canonical_sha256.as_str()) {
+            let unchanged = match prior_hash {
+                Some(hash) => hash == note.canonical_sha256,
+                None => {
+                    VaultNote::from_payload(&note.id, prior).canonical_sha256
+                        == note.canonical_sha256
+                }
+            };
+            if unchanged {
                 continue;
             }
             if let Err(e) = writable_prior(principal, prior) {
@@ -949,13 +1031,25 @@ pub async fn import_vault_with_limits(
             }
         };
 
-        let mut metadata = serde_json::json!({
-            "vault_source": true,
-            "stub": is_stub,
-            "canonical_sha256": note.canonical_sha256,
-            "related": note.related,
-            "valid_from": now,
-        });
+        // #335: start from the prior head's structured metadata so a reimport
+        // cannot silently drop fields the import does not own (`task`, and any
+        // future structured state). Import-owned and store-derived keys are
+        // removed here and overlaid below.
+        let mut metadata = match prior_payload.as_ref().and_then(|p| p.metadata.as_object()) {
+            Some(prior_obj) => {
+                let mut preserved = prior_obj.clone();
+                for key in IMPORT_OWNED_METADATA_KEYS {
+                    preserved.remove(key);
+                }
+                serde_json::Value::Object(preserved)
+            }
+            None => serde_json::json!({}),
+        };
+        metadata["vault_source"] = serde_json::json!(true);
+        metadata["stub"] = serde_json::json!(is_stub);
+        metadata["canonical_sha256"] = serde_json::json!(note.canonical_sha256);
+        metadata["related"] = serde_json::json!(note.related);
+        metadata["valid_from"] = serde_json::json!(now);
 
         let mut history = None;
         if let (Some(hv), Some(mut prior)) = (prior_vector, prior_payload) {
@@ -966,14 +1060,8 @@ pub async fn import_vault_with_limits(
                 ));
                 continue;
             }
-            if let Some(prior_obj) = prior.metadata.as_object() {
-                if let Some(visible_to) = prior_obj.get("visible_to") {
-                    metadata["visible_to"] = visible_to.clone();
-                }
-                if let Some(eligibility) = prior_obj.get("eligibility") {
-                    metadata["eligibility"] = eligibility.clone();
-                }
-            }
+            // `visible_to` / `eligibility` (and any future structured field)
+            // already came across in the wholesale copy above.
             let history_id = format!("{}.vault-history.{}", note.id, uuid::Uuid::new_v4());
             retire_metadata(&mut prior.metadata, &note.id, now);
             metadata["supersedes"] = serde_json::json!(history_id);
@@ -2829,7 +2917,7 @@ mod tests {
         let vault = root.join("vault");
         std::fs::create_dir_all(&vault).expect("create vault");
         let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
                 .expect("temp store"),
         );
         let ns = "vault_task_noop";
@@ -2903,7 +2991,7 @@ mod tests {
         let vault = root.join("vault");
         std::fs::create_dir_all(&vault).expect("create vault");
         let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
                 .expect("temp store"),
         );
         let ns = "vault_task_edit";
@@ -2975,7 +3063,7 @@ mod tests {
         let vault = root.join("vault");
         std::fs::create_dir_all(&vault).expect("create vault");
         let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
                 .expect("temp store"),
         );
         let ns = "vault_stub_over";
@@ -3036,7 +3124,8 @@ mod tests {
         assert_eq!(head.content, "Real knowledge");
         assert_eq!(head.memory_type, "fact");
         assert!(
-            head.metadata.get("stub").is_none() || head.metadata["stub"] == serde_json::json!(false),
+            head.metadata.get("stub").is_none()
+                || head.metadata["stub"] == serde_json::json!(false),
             "existing head must not be marked as a stub: {:?}",
             head.metadata
         );
@@ -3058,7 +3147,7 @@ mod tests {
         std::fs::create_dir_all(&vault).expect("create vault");
         std::fs::create_dir_all(&outside).expect("create outside");
         let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
                 .expect("temp store"),
         );
         let ns = "vault_symlink";
