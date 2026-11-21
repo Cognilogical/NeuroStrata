@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::connectors::{
-    DataPointerRecord, DataPoolSchema, ExternalEffectReceipt, WriteBackSnapshot,
+    DataPointerRecord, DataPoolAccessMode, DataPoolSchema, ExternalEffectReceipt, WriteBackSnapshot,
 };
 use crate::formal_kernel::KernelActionReceiptState;
 use crate::rebac::can_read_memory;
@@ -500,18 +500,43 @@ impl MemoryPort for LadybugMemoryPort {
             .and_then(|p| p.metadata.get("pool_idempotency"))
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
+        // Review 9227e20f#r4650419233: a schema-only update may have landed
+        // while this effect was in flight. Preserve the persisted schema and
+        // revalidate its access mode before committing the write-back.
+        let stored_schema: Option<DataPoolSchema> = existing
+            .as_ref()
+            .and_then(|p| p.metadata.get("pool_schema"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        if let Some(schema) = &stored_schema {
+            if schema.access_mode == DataPoolAccessMode::ReadOnly {
+                anyhow::bail!(
+                    "pool '{}:{}' became read-only; refusing write-back persistence",
+                    schema.connector_id,
+                    schema.pool_id
+                );
+            }
+        }
+        let effective_schema = stored_schema.as_ref().unwrap_or(schema);
 
         // Compare only the pointer this write-back touched: other pointers
         // are merged, so concurrent kernels writing different pointers both
         // survive. A same-pointer concurrent write is a conflict, not a last-
-        // writer-wins overwrite.
-        if let Some(current) = records.get(pointer_uri) {
-            if current.as_slice() != snapshot.prior_records.as_slice() {
+        // writer-wins overwrite. A pointer missing from an existing row is a
+        // removal by a newer replacement, not an invitation to resurrect it.
+        match records.get(pointer_uri) {
+            Some(current) if current.as_slice() != snapshot.prior_records.as_slice() => {
                 anyhow::bail!(
                     "concurrent pool write conflict for pointer '{}'",
                     pointer_uri
                 );
             }
+            None if existing.is_some() && !snapshot.prior_records.is_empty() => {
+                anyhow::bail!(
+                    "pointer '{}' was removed by a concurrent pool update",
+                    pointer_uri
+                );
+            }
+            _ => {}
         }
         records.insert(pointer_uri.to_string(), snapshot.pointer_records.clone());
         stored_idempotency.extend(
@@ -523,23 +548,28 @@ impl MemoryPort for LadybugMemoryPort {
 
         let metadata = serde_json::json!({
             "eligibility": "private",
-            "pool_schema": serde_json::to_value(schema)?,
+            "pool_schema": serde_json::to_value(effective_schema)?,
             "pool_records": serde_json::to_value(&records)?,
             "pool_idempotency": serde_json::to_value(&stored_idempotency)?,
             "source": {
                 "kind": "data_connector_pool",
-                "ref": format!("{}:{}", schema.connector_id, schema.pool_id)
+                "ref": format!("{}:{}", effective_schema.connector_id, effective_schema.pool_id)
             }
         });
         let payload = MemoryPayload {
             content: format!(
                 "data pool {}:{} ({})",
-                schema.connector_id, schema.pool_id, schema.description
+                effective_schema.connector_id,
+                effective_schema.pool_id,
+                effective_schema.description
             ),
             user_id: principal.unwrap_or("").to_string(),
             memory_type: "data_pointer".to_string(),
             agent_name: None,
-            location: format!("{}:{}", schema.connector_id, schema.pool_id),
+            location: format!(
+                "{}:{}",
+                effective_schema.connector_id, effective_schema.pool_id
+            ),
             location_lines: String::new(),
             metadata,
         };

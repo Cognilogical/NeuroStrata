@@ -59,9 +59,15 @@ post-write records with that same source SHA.
    receipt produced by the written pointer's latest effect; a receipt whose
    persistence was rejected is never included in a later write's snapshot,
    so it cannot replay as applied without durable records.
-7. **No false receipt.** If the snapshot or persistence fails, the effect
+7. **Commits revalidate stored state.** The persisted `pool_schema` is
+   preserved and its access mode revalidated: a pool changed to read-only
+   after hydration rejects the write-back instead of restoring the stale
+   schema. A pointer missing from an existing row is a removal, not an
+   insert: a snapshot with prior records for it is a conflict. Schema
+   updates and write-back commits share the persistence turn.
+8. **No false receipt.** If the snapshot or persistence fails, the effect
    returns an error instead of a success receipt that cannot be observed.
-8. **Same-kernel visibility is unchanged**: the in-memory effect is visible
+9. **Same-kernel visibility is unchanged**: the in-memory effect is visible
    immediately, and the persist step does not mutate the request-local
    connector again.
 
@@ -100,6 +106,13 @@ Additional evals:
   same-pointer conflict, writing another pointer must not durably record the
   failed receipt; a later retry applies instead of replaying a phantom
   success.
+- `write_back_revalidates_the_persisted_schema` — a stale read-write commit
+  after a read-only schema update is rejected and the stored schema remains
+  read-only; `write_back_does_not_restore_a_schema_that_became_read_only`
+  covers the kernel-level path.
+- `stale_kernel_cannot_resurrect_a_removed_pointer` — a pointer omitted by a
+  newer record replacement is a conflict, and the removed pointer stays
+  removed.
 
 Negative control (existing coverage): `json_file` registration/resolution
 across kernels continues to pass; its connector returns no snapshot so the

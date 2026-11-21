@@ -234,6 +234,12 @@ impl AgentKernel {
                 registered.pool_id.clone(),
             ));
         }
+        // Schema updates and write-back persistence share one turn, so a
+        // read-only change cannot interleave with a stale write-back commit.
+        let _persist = POOL_WRITEBACK_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
         self.memory
             .register_data_pool(namespace, &registered, records, principal)
             .await
@@ -2558,7 +2564,15 @@ mod tests {
             )
             .await
             .expect("register pointer");
-        seed_receipt(&store_impl, ns, "rcpt_schema", "ptr_schema", "schema_idem", false).await;
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_schema",
+            "ptr_schema",
+            "schema_idem",
+            false,
+        )
+        .await;
 
         let request = json!({
             "operation": "apply_effect",
