@@ -1874,13 +1874,14 @@ async fn handle_mcp(
         // empty body, as MCP's HTTP transport answers one; the stdio proxy
         // writes nothing for an empty body.
         let is_notification = rpc_req.id.is_none();
-        let response = crate::server::process_mcp_request(
+        let response = crate::server::process_mcp_request_with_watch(
             rpc_req,
             state.embedder.clone(),
             state.vector_store.clone(),
             state.ingests.clone(),
             state.deduplication_checker.clone(),
             state.bus.clone(),
+            Some(state.watch.clone()),
         )
         .await;
         if is_notification {

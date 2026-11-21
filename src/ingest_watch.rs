@@ -5,7 +5,6 @@
 //! The core API is consumed by the daemon and MCP adapters composed onto this
 //! module; until that composition lands, items here are intentionally public
 //! even where the binary target cannot reach them.
-#![allow(dead_code)]
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -37,13 +36,18 @@ pub const MAX_WINDOW: Duration = Duration::from_secs(2);
 pub const BACKOFF_STEPS_SECS: &[u64] = &[1, 2, 4, 8, 16, 30];
 pub const MAX_RENAME_COOKIES: usize = 1024;
 
+// Test-only fake source; shared by this module's tests and the MCP shim tests.
+#[cfg(test)]
 pub struct TestEventSource {
+    // Held so the channel stays open while run() awaits recv() in loop tests.
+    #[allow(dead_code)]
     pub tx: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
     rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<WatchEvent>>,
     watched: std::sync::Mutex<Vec<PathBuf>>,
     unwatched: std::sync::Mutex<Vec<PathBuf>>,
 }
 
+#[cfg(test)]
 impl TestEventSource {
     pub fn channel() -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -55,6 +59,7 @@ impl TestEventSource {
         }
     }
 }
+#[cfg(test)]
 #[async_trait]
 impl WatchEventSource for TestEventSource {
     async fn recv(&self) -> Option<WatchEvent> {
@@ -210,9 +215,13 @@ pub struct NotifyEventSource {
     // so the daemon loop can await events without blocking request-path root
     // registration.
     watcher: Mutex<RecommendedWatcher>,
+    // Retained so the callback's sender stays alive for the source's lifetime.
+    #[allow(dead_code)]
     tx: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
     rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<WatchEvent>>,
     watched_roots: Mutex<HashSet<PathBuf>>,
+    // Shared with the notify callback; the field itself is never re-read here.
+    #[allow(dead_code)]
     pending_renames: Arc<Mutex<HashMap<usize, (PathBuf, tokio::time::Instant)>>>,
 }
 
@@ -843,6 +852,9 @@ impl IngestWatchService {
         Ok(registration)
     }
 
+    // Core registration port; the daemon auto-registers via on_ingest_success
+    // and callers/tests use this directly. Kept as public surface.
+    #[allow(dead_code)]
     pub fn register(&self, namespace: &str, raw: &Path) -> anyhow::Result<Registration> {
         let canonical = self.canonical_or_err(raw)?;
         self.ensure_runtime(namespace, &canonical)
