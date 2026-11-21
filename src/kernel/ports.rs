@@ -486,10 +486,19 @@ impl MemoryPort for LadybugMemoryPort {
             namespace, schema.connector_id, schema.pool_id
         );
         let now = chrono::Utc::now().timestamp();
-        let existing = self
-            .trusted_get_memory(namespace, &row_id)
-            .await?
-            .filter(|p| !is_retired_data_metadata(&p.metadata, now));
+        let stored = self.trusted_get_memory(namespace, &row_id).await?;
+        // Review 0fce913e#r4650457715: an archive that landed after the
+        // effect hydrated the pool must reject the commit, not revive the row.
+        if let Some(row) = &stored {
+            if is_retired_data_metadata(&row.metadata, now) {
+                anyhow::bail!(
+                    "pool '{}:{}' is retired; refusing write-back persistence",
+                    schema.connector_id,
+                    schema.pool_id
+                );
+            }
+        }
+        let existing = stored.filter(|p| !is_retired_data_metadata(&p.metadata, now));
         let mut records: HashMap<String, Vec<Value>> = existing
             .as_ref()
             .and_then(|p| p.metadata.get("pool_records"))

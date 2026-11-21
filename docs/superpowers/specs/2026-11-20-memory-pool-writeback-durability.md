@@ -63,13 +63,17 @@ post-write records with that same source SHA.
    preserved and its access mode revalidated: a pool changed to read-only
    after hydration rejects the write-back instead of restoring the stale
    schema. A pointer missing from an existing row is a removal, not an
-   insert: a snapshot with prior records for it is a conflict. Schema
+   insert: a snapshot with prior records for it is a conflict. A pool row
+   archived after hydration rejects the commit and is never revived. Schema
    updates and write-back commits share the persistence turn.
-8. **No false receipt.** If the snapshot or persistence fails, the effect
+8. **Receipt-load failures fail the request.** Hydration does not swallow a
+   `pool_idempotency` error: silently proceeding without receipts would let a
+   retried effect duplicate.
+9. **No false receipt.** If the snapshot or persistence fails, the effect
    returns an error instead of a success receipt that cannot be observed.
-9. **Same-kernel visibility is unchanged**: the in-memory effect is visible
-   immediately, and the persist step does not mutate the request-local
-   connector again.
+10. **Same-kernel visibility is unchanged**: the in-memory effect is visible
+    immediately, and the persist step does not mutate the request-local
+    connector again.
 
 ---
 
@@ -113,6 +117,11 @@ Additional evals:
 - `stale_kernel_cannot_resurrect_a_removed_pointer` — a pointer omitted by a
   newer record replacement is a conflict, and the removed pointer stays
   removed.
+- `write_back_rejects_a_retired_pool_at_commit` — a commit against a pool row
+  archived after hydration is rejected (kernel-level
+  `write_back_rejects_a_pool_that_became_retired` covers the early path).
+- Receipt-load failure propagation is enforced by `?` in hydration; the
+  kernel path fails the request instead of hydrating without receipts.
 
 Negative control (existing coverage): `json_file` registration/resolution
 across kernels continues to pass; its connector returns no snapshot so the

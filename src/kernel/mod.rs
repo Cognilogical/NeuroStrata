@@ -279,11 +279,10 @@ impl AgentKernel {
                 }
                 // Review 14c61663#r4650345073: retries through a fresh kernel
                 // must see the persisted receipts, not re-apply the effect.
-                let receipts = self
-                    .memory
-                    .pool_idempotency(namespace, &schema)
-                    .await
-                    .unwrap_or_default();
+                // Review 0fce913e#r4650457720: a receipt-load failure must
+                // fail the request, not silently hydrate without receipts
+                // and let a retry duplicate the effect.
+                let receipts = self.memory.pool_idempotency(namespace, &schema).await?;
                 if !receipts.is_empty() {
                     let _ = connector.hydrate_idempotency(&scoped_id, &receipts).await;
                 }
@@ -3219,7 +3218,15 @@ mod tests {
             )
             .await
             .expect("register pointer");
-        seed_receipt(&store_impl, ns, "rcpt_retired", "ptr_retired", "retired_pool", false).await;
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_retired",
+            "ptr_retired",
+            "retired_pool",
+            false,
+        )
+        .await;
 
         kernel1
             .execute_connector_command(
