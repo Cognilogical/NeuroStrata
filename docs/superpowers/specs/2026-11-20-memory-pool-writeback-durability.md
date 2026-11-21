@@ -52,10 +52,16 @@ post-write records with that same source SHA.
    conflict error instead of overwriting a concurrent write.
 5. **Idempotency is durable.** `pool_idempotency` is persisted with the
    records and restored during hydration, so a retry through a fresh kernel
-   returns the original receipt and never appends twice.
-6. **No false receipt.** If the snapshot or persistence fails, the effect
+   returns the original receipt and never appends twice. A schema-only
+   `upsert_pool` (records omitted) carries the receipt map alongside the
+   retained records.
+6. **Only committed receipts are durable.** A snapshot carries only the
+   receipt produced by the written pointer's latest effect; a receipt whose
+   persistence was rejected is never included in a later write's snapshot,
+   so it cannot replay as applied without durable records.
+7. **No false receipt.** If the snapshot or persistence fails, the effect
    returns an error instead of a success receipt that cannot be observed.
-7. **Same-kernel visibility is unchanged**: the in-memory effect is visible
+8. **Same-kernel visibility is unchanged**: the in-memory effect is visible
    immediately, and the persist step does not mutate the request-local
    connector again.
 
@@ -87,6 +93,13 @@ Additional evals:
   replaying the same idempotency key through a fresh kernel returns the
   original receipt and leaves exactly two records. Baseline: hydration omits
   the receipt and the payload is appended twice.
+- `schema_only_upsert_preserves_idempotency_receipts` — a schema-only
+  `upsert_pool` after a successful append keeps the receipt attached to the
+  retained records; a fresh-kernel replay is still a no-op.
+- `failed_pointer_receipt_is_not_persisted_by_another_pointer` — after a
+  same-pointer conflict, writing another pointer must not durably record the
+  failed receipt; a later retry applies instead of replaying a phantom
+  success.
 
 Negative control (existing coverage): `json_file` registration/resolution
 across kernels continues to pass; its connector returns no snapshot so the

@@ -71,6 +71,8 @@ pub trait DataConnector: Send + Sync {
 - `InMemoryPoolConnector` returns the written pointer's post-effect records, its prior records, and the pool's idempotency receipts. After a successful effect and post-gate, the kernel merges that delta into the pool registry row under a process-wide turn before returning the receipt.
 - Merging is per-pointer: concurrent kernels writing different pointers both survive; a same-pointer write whose stored records no longer match `prior_records` is a conflict, not a last-writer-wins overwrite.
 - `pool_idempotency` is persisted with the records and restored during hydration, so a retry through a fresh kernel returns the original receipt and cannot append twice.
+- A schema-only `upsert_pool` (no `records`) preserves `pool_idempotency` alongside the retained `pool_records`; it must not orphan receipts from their records.
+- A snapshot carries only the receipt produced by the written pointer's latest effect. A receipt whose persistence was rejected is never promoted by a later write to another pointer, so it cannot replay as `applied: true` without durable records.
 - `JsonFilePoolConnector` returns `None` (file-backed) and is not rewritten. A snapshot or persistence failure rejects the effect rather than returning an unobservable success receipt.
 
 ## Transport Parity

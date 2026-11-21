@@ -415,12 +415,24 @@ impl MemoryPort for LadybugMemoryPort {
             "__data_pool__:{}:{}:{}",
             namespace, schema.connector_id, schema.pool_id
         );
+        let now = chrono::Utc::now().timestamp();
+        let existing = self
+            .trusted_get_memory(namespace, &row_id)
+            .await?
+            .filter(|p| !is_retired_data_metadata(&p.metadata, now));
         let existing_records = if records.is_none() {
-            let now = chrono::Utc::now().timestamp();
-            self.trusted_get_memory(namespace, &row_id)
-                .await?
-                .filter(|p| !is_retired_data_metadata(&p.metadata, now))
+            existing
+                .as_ref()
                 .and_then(|p| p.metadata.get("pool_records").cloned())
+        } else {
+            None
+        };
+        // Review 490f0340#r4650391606: a schema-only update retains the
+        // records, so it must retain the receipts bound to them as well.
+        let existing_idempotency = if records.is_none() {
+            existing
+                .as_ref()
+                .and_then(|p| p.metadata.get("pool_idempotency").cloned())
         } else {
             None
         };
@@ -436,6 +448,9 @@ impl MemoryPort for LadybugMemoryPort {
             metadata["pool_records"] = serde_json::to_value(recs)?;
         } else if let Some(prev_recs) = existing_records {
             metadata["pool_records"] = prev_recs;
+        }
+        if let Some(prev_idempotency) = existing_idempotency {
+            metadata["pool_idempotency"] = prev_idempotency;
         }
         let user_id = principal.unwrap_or("");
         let payload = MemoryPayload {

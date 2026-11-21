@@ -89,7 +89,8 @@ pub struct ExternalEffectReceipt {
 pub struct WriteBackSnapshot {
     pub prior_records: Vec<Value>,
     pub pointer_records: Vec<Value>,
-    /// Receipts to retain, keyed by the connector's idempotency key.
+    /// The receipt produced by the written pointer's latest effect, keyed by
+    /// the connector's idempotency key.
     pub idempotency: HashMap<String, ExternalEffectReceipt>,
 }
 
@@ -267,6 +268,10 @@ struct InMemoryPoolEntry {
     /// Pointer records before the most recent effect, used by the kernel to
     /// detect a concurrent same-pointer write at persistence time.
     prior_records: HashMap<String, Vec<Value>>,
+    /// Idempotency key produced by the pointer's most recent effect. Only
+    /// that receipt is snapshotted for persistence, so a receipt from a
+    /// rejected write is never made durable by a later write elsewhere.
+    last_receipt_keys: HashMap<String, String>,
 }
 
 pub struct InMemoryPoolConnector {
@@ -295,6 +300,7 @@ impl InMemoryPoolConnector {
                     records: HashMap::new(),
                     idempotency: HashMap::new(),
                     prior_records: HashMap::new(),
+                    last_receipt_keys: HashMap::new(),
                 },
             );
         }
@@ -440,6 +446,8 @@ impl DataConnector for InMemoryPoolConnector {
             // so persistence does not report a self-conflict.
             let current = pool.records.get(pointer_uri).cloned().unwrap_or_default();
             pool.prior_records.insert(pointer_uri.to_string(), current);
+            pool.last_receipt_keys
+                .insert(pointer_uri.to_string(), idempotency_key.clone());
             return Ok(receipt);
         }
         let all_records = pool.records.get_mut(pointer_uri).ok_or_else(|| {
@@ -483,6 +491,8 @@ impl DataConnector for InMemoryPoolConnector {
         let new_source_sha = InMemoryPoolConnector::compute_source_sha256(all_records);
         pool.prior_records
             .insert(pointer_uri.to_string(), prior_records);
+        pool.last_receipt_keys
+            .insert(pointer_uri.to_string(), idempotency_key.clone());
         let receipt = ExternalEffectReceipt {
             pointer_id: pointer_uri.to_string(),
             connector_id: self.connector_id().to_string(),
@@ -516,10 +526,20 @@ impl DataConnector for InMemoryPoolConnector {
             .get(pointer_uri)
             .cloned()
             .unwrap_or_else(|| pointer_records.clone());
+        // Review 490f0340#r4650391609: snapshot only the receipt produced by
+        // this pointer's latest effect. A receipt whose persistence was
+        // rejected stays out of later snapshots (and therefore out of the
+        // durable row).
+        let mut idempotency = HashMap::new();
+        if let Some(key) = entry.last_receipt_keys.get(pointer_uri) {
+            if let Some(receipt) = entry.idempotency.get(key) {
+                idempotency.insert(key.clone(), receipt.clone());
+            }
+        }
         Ok(Some(WriteBackSnapshot {
             prior_records,
             pointer_records,
-            idempotency: entry.idempotency.clone(),
+            idempotency,
         }))
     }
 
