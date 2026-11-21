@@ -19,6 +19,10 @@ Only `validate` never writes; `apply` commits all effects (`SupersedeMemory`, `U
 
 `neurostrata_action` (MCP), `POST /action` (Daemon), and `neurostrata-mcp action <define|validate|apply|revert|log>` (CLI) share a single deterministic application service.
 
+## Connector Target Binding
+
+`ActionReceiptPayload` stamps `target_pointer_id` / `target_pool_id` inside the nested `metadata.action_receipt` when the action declares both the reserved `pointer_id` and `pool_id` parameters. Connector write-back binds only through that immutable payload (receipt-id equal, both identifiers equal); receipts written before the stamp remain bound through the same nested parameter pair. Editable top-level row metadata and unbound active receipts never authorize a write-back.
+
 ## Capability E Production Learning & Reflection Hooks
 
 v1.19.0 wires deterministic trajectory mining and outcome-verified reflection into committed lifecycle points (`src/learning/hooks.rs`). Hooks never complete a task and never apply or revert an action, so they cannot recurse into the lifecycle that invoked them.

@@ -249,6 +249,13 @@ impl AgentKernel {
         format!("__ns_pool__:{}:{}:{}", namespace.len(), namespace, pool_id)
     }
 
+    /// Durable retry key: exact values, digest-free, so a source-digest
+    /// collision (#351) cannot collapse two effects onto one entry. The
+    /// pointer URI comes from the trusted pointer record, never the caller.
+    fn effect_dedup_key(req: &ExternalEffectRequest, pointer_uri: &str) -> String {
+        serde_json::json!([req.action_receipt_id, pointer_uri, req.idempotency_key]).to_string()
+    }
+
     async fn describe_pool_with_hydration(
         &self,
         namespace: &str,
@@ -499,6 +506,25 @@ impl AgentKernel {
         if pre_verdict != KernelConnectorPreVerdict::AllowPreWriteBack {
             anyhow::bail!("Pre-gate denied write-back: {:?}", pre_verdict);
         }
+        // #350: one (receipt, pointer, idempotency key) triple names one
+        // logical effect. The durable receipt row and the apply/persist
+        // sequence share this turn, so a retry through a fresh kernel observes
+        // the applied result instead of repeating it.
+        let _persist = POOL_WRITEBACK_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let dedup_key = Self::effect_dedup_key(req, &pointer.pointer_uri);
+        if let Some(stored) = self
+            .memory
+            .pool_effect_receipt(namespace, &schema, &dedup_key)
+            .await?
+        {
+            let mut replay = stored;
+            replay.pointer_id = pointer.pointer_id.clone();
+            replay.pool_id = pointer.pool_id.clone();
+            return Ok(replay);
+        }
         let mut guarded_req = req.clone();
         if let Some(pointer_expected) = &pointer.expected_source_sha256 {
             if guarded_req
@@ -510,7 +536,7 @@ impl AgentKernel {
             }
             guarded_req.expected_source_sha256 = Some(pointer_expected.clone());
         }
-        let receipt = connector
+        let mut receipt = connector
             .apply_external_effect(&connector_pool_id, &pointer.pointer_uri, &guarded_req)
             .await?;
         let pointer_source_digest_matches = match &pointer.expected_source_sha256 {
@@ -536,21 +562,17 @@ impl AgentKernel {
         // that delta into the registry row the next request hydrates from.
         // Connectors that already persist (json_file) return None and are
         // left alone.
-        if let Some(snapshot) = connector
+        let snapshot = connector
             .snapshot_write_back(&connector_pool_id, &pointer.pointer_uri)
-            .await?
-        {
-            let _persist = POOL_WRITEBACK_LOCK
-                .get_or_init(|| tokio::sync::Mutex::new(()))
-                .lock()
-                .await;
+            .await?;
+        if let Some(snapshot) = &snapshot {
             if let Err(e) = self
                 .memory
                 .register_pool_writeback(
                     namespace,
                     &schema,
                     &pointer.pointer_uri,
-                    &snapshot,
+                    snapshot,
                     principal,
                 )
                 .await
@@ -570,7 +592,13 @@ impl AgentKernel {
                 return Err(e);
             }
         }
-        let mut receipt = receipt;
+        // #350: the retry key is durable even for connectors that persist
+        // their own records, so the next kernel can answer the same triple
+        // without connector I/O. A failure here fails the request: a success
+        // receipt for a retry that could duplicate would be a lie.
+        self.memory
+            .register_pool_effect_receipt(namespace, &schema, &dedup_key, &receipt, principal)
+            .await?;
         receipt.pointer_id = pointer.pointer_id.clone();
         receipt.pool_id = pointer.pool_id.clone();
         Ok(receipt)
@@ -997,9 +1025,69 @@ mod tests {
         pool_id: &str,
         reverted: bool,
     ) {
-        let mut metadata = json!({"pointer_id": pointer_id, "pool_id": pool_id});
+        seed_receipt_with_binding(
+            store, namespace, receipt_id, pointer_id, pool_id, reverted, true,
+        )
+        .await;
+    }
+
+    /// Mirrors a receipt written before the target was stamped: the same
+    /// reserved parameter pair is nested in the receipt, no explicit fields.
+    async fn seed_in_flight_receipt(
+        store: &LadybugStore,
+        namespace: &str,
+        receipt_id: &str,
+        pointer_id: &str,
+        pool_id: &str,
+    ) {
+        seed_receipt_with_binding(
+            store, namespace, receipt_id, pointer_id, pool_id, false, false,
+        )
+        .await;
+    }
+
+    /// Reproduces the production writer's metadata shape
+    /// (`src/rdf/action.rs`): the receipt is nested under
+    /// `metadata.action_receipt`, never at the top level.
+    async fn seed_receipt_with_binding(
+        store: &LadybugStore,
+        namespace: &str,
+        receipt_id: &str,
+        pointer_id: &str,
+        pool_id: &str,
+        reverted: bool,
+        stamped: bool,
+    ) {
+        let mut receipt = json!({
+            "receipt_id": receipt_id,
+            "action_slug": "connector-write-back",
+            "principal": "alice",
+            "executed_at": 1000,
+            "params": {"pointer_id": pointer_id, "pool_id": pool_id},
+            "superseded_pairs": [],
+            "created_ids": [],
+            "twin_deltas": [],
+            "edge_deltas": [],
+            "row_deltas": [],
+            "task_deltas": [],
+            "reverted_at": null,
+            "reverted_by_receipt_id": null,
+            "reverts_receipt_id": null,
+            "forced_by": null,
+            "forced_at": null
+        });
+        if stamped {
+            receipt["target_pointer_id"] = json!(pointer_id);
+            receipt["target_pool_id"] = json!(pool_id);
+        }
+        let mut metadata = json!({
+            "eligibility": "private",
+            "valid_from": 1000,
+            "action_receipt": receipt
+        });
         if reverted {
-            metadata["reverted_at"] = json!("2026-01-01T00:00:00Z");
+            // The production revert writer retires the row with `valid_to`.
+            metadata["valid_to"] = json!(1001);
         }
         let payload = MemoryPayload {
             content: "receipt".to_string(),
@@ -1014,6 +1102,100 @@ mod tests {
             .put_scoped_memory(namespace, receipt_id, &payload)
             .await
             .expect("seed receipt");
+    }
+
+    /// #352: the receipt shape the production writer emits must authorize its
+    /// own target, and the same shape bound elsewhere must still deny before
+    /// connector I/O.
+    #[tokio::test]
+    async fn production_receipt_binds_its_write_back_target() {
+        let ns = "ns352";
+        let spy = Arc::new(SpyConnector::new(
+            "spy",
+            DataPoolAccessMode::ReadWrite,
+            10,
+            1024,
+        ));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        kernel
+            .register_pointer(ns, &pointer_record("ptr_bound", "spy", 1000, 100), Some(ns))
+            .await
+            .expect("register");
+        seed_receipt(&store, ns, "rcpt_bound", "ptr_bound", "pool1", false).await;
+
+        let receipt = kernel
+            .apply_external_effect(
+                ns,
+                &writeback_request("ptr_bound", "rcpt_bound"),
+                1000,
+                Some(ns),
+            )
+            .await
+            .expect("a production-shaped receipt must authorize its target");
+        assert!(receipt.applied);
+        assert_eq!(spy.apply_calls.load(Ordering::SeqCst), 1);
+
+        seed_receipt(
+            &store,
+            ns,
+            "rcpt_elsewhere",
+            "some_other_pointer",
+            "other_pool",
+            false,
+        )
+        .await;
+        let err = kernel
+            .apply_external_effect(
+                ns,
+                &writeback_request("ptr_bound", "rcpt_elsewhere"),
+                1000,
+                Some(ns),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Pre-gate"), "unexpected: {err}");
+        assert_eq!(
+            spy.apply_calls.load(Ordering::SeqCst),
+            1,
+            "a wrong-target receipt must deny before connector I/O"
+        );
+    }
+
+    /// #352: receipts already written before the stamp existed remain usable
+    /// through the reserved parameter pair nested in the same payload.
+    #[tokio::test]
+    async fn in_flight_receipt_binds_via_nested_params() {
+        let ns = "ns352_inflight";
+        let spy = Arc::new(SpyConnector::new(
+            "spy",
+            DataPoolAccessMode::ReadWrite,
+            10,
+            1024,
+        ));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        kernel
+            .register_pointer(
+                ns,
+                &pointer_record("ptr_inflight", "spy", 1000, 100),
+                Some(ns),
+            )
+            .await
+            .expect("register");
+        seed_in_flight_receipt(&store, ns, "rcpt_inflight", "ptr_inflight", "pool1").await;
+
+        let receipt = kernel
+            .apply_external_effect(
+                ns,
+                &writeback_request("ptr_inflight", "rcpt_inflight"),
+                1000,
+                Some(ns),
+            )
+            .await
+            .expect("an in-flight receipt must bind through nested params");
+        assert!(receipt.applied);
+        assert_eq!(spy.apply_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2523,6 +2705,191 @@ mod tests {
             2,
             "a replay must not duplicate the append: {resolved}"
         );
+    }
+
+    /// #350: a genuine (production-shaped receipt) unpinned `json_file`
+    /// append retried through a fresh kernel must apply exactly once.
+    #[tokio::test]
+    async fn json_file_unpinned_append_retry_through_fresh_kernel_applies_once() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let records_path = dir.path().join("records.json");
+        std::fs::write(
+            &records_path,
+            serde_json::to_string_pretty(&vec![json!({"v": 1})]).unwrap(),
+        )
+        .expect("seed records");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_json_idempotent";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_json",
+                        "connector_id": "json_file",
+                        "pool_id": "default",
+                        "pointer_uri": "records.json",
+                        "entity_type": "json_record",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(&store_impl, ns, "rcpt_json", "ptr_json", "default", false).await;
+
+        let request = json!({
+            "operation": "apply_effect",
+            "req": {
+                "pointer_id": "ptr_json",
+                "operation": "append",
+                "payload": {"v": 2},
+                "action_receipt_id": "rcpt_json",
+                "idempotency_key": "retry-json"
+            },
+            "now_secs": now
+        });
+        let first = kernel1
+            .execute_connector_command(ns, &request, Some(ns))
+            .await
+            .expect("first apply");
+        assert_eq!(first["applied"], true);
+        let record_count = || {
+            serde_json::from_str::<Vec<Value>>(
+                &std::fs::read_to_string(&records_path).expect("read records"),
+            )
+            .expect("parse records")
+            .len()
+        };
+        assert_eq!(record_count(), 2);
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let replay = kernel2
+            .execute_connector_command(ns, &request, Some(ns))
+            .await
+            .expect("retry through a fresh kernel");
+        assert_eq!(replay["applied"], true);
+        assert_eq!(
+            replay["new_source_sha256"], first["new_source_sha256"],
+            "a retry must return the original receipt"
+        );
+        assert_eq!(
+            record_count(),
+            2,
+            "a fresh-kernel retry must not append twice"
+        );
+    }
+
+    /// #350 control: same-instance replay stays a no-op, and a stale pinned
+    /// CAS request that is not an exact replay still conflicts.
+    #[tokio::test]
+    async fn json_file_same_instance_replay_and_stale_cas_keep_their_semantics() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let records_path = dir.path().join("records.json");
+        std::fs::write(
+            &records_path,
+            serde_json::to_string_pretty(&vec![json!({"v": 1})]).unwrap(),
+        )
+        .expect("seed records");
+        let store_impl =
+            Arc::new(LadybugStore::for_testing(dir.path().join("db"), 4).expect("store init"));
+        let store: Arc<dyn VectorStore> = store_impl.clone();
+        let ns = "ns_json_controls";
+        store.init(ns).await.expect("init ns");
+        let bus = Arc::new(ThalamicBus::new(64));
+        let now = now_epoch();
+
+        let kernel1 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        kernel1
+            .execute_connector_command(
+                ns,
+                &json!({
+                    "operation": "register_pointer",
+                    "record": {
+                        "pointer_id": "ptr_json_ctl",
+                        "connector_id": "json_file",
+                        "pool_id": "default",
+                        "pointer_uri": "records.json",
+                        "entity_type": "json_record",
+                        "expected_source_sha256": null,
+                        "captured_at_secs": now,
+                        "max_staleness_secs": 3600
+                    }
+                }),
+                Some(ns),
+            )
+            .await
+            .expect("register pointer");
+        seed_receipt(
+            &store_impl,
+            ns,
+            "rcpt_json_ctl",
+            "ptr_json_ctl",
+            "default",
+            false,
+        )
+        .await;
+        let pre_apply_sha = {
+            let records: Vec<Value> = serde_json::from_str(
+                &std::fs::read_to_string(&records_path).expect("read records"),
+            )
+            .expect("parse records");
+            let mut hasher = sha2::Sha256::new();
+            use sha2::Digest;
+            for record in &records {
+                hasher.update(serde_json::to_vec(record).expect("serialize"));
+            }
+            hex::encode(hasher.finalize())
+        };
+
+        let request = json!({
+            "operation": "apply_effect",
+            "req": {
+                "pointer_id": "ptr_json_ctl",
+                "operation": "append",
+                "payload": {"v": 2},
+                "action_receipt_id": "rcpt_json_ctl",
+                "idempotency_key": "retry-json-ctl"
+            },
+            "now_secs": now
+        });
+        kernel1
+            .execute_connector_command(ns, &request, Some(ns))
+            .await
+            .expect("first apply");
+        let same_instance = kernel1
+            .execute_connector_command(ns, &request, Some(ns))
+            .await
+            .expect("same-instance replay");
+        assert_eq!(same_instance["applied"], true);
+
+        let kernel2 = AgentKernel::new(store.clone(), bus.clone(), dir.path().to_path_buf());
+        let mut stale = request.clone();
+        stale["req"]["idempotency_key"] = json!("retry-json-new");
+        stale["req"]["expected_source_sha256"] = json!(pre_apply_sha);
+        let err = kernel2
+            .execute_connector_command(ns, &stale, Some(ns))
+            .await
+            .expect_err("a stale pinned CAS request must conflict");
+        assert!(
+            err.to_string().contains("CAS conflict") || err.to_string().contains("DenyCasConflict"),
+            "expected a CAS conflict, got: {err}"
+        );
+        let records: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(&records_path).expect("read records"))
+                .expect("parse records");
+        assert_eq!(records.len(), 2, "no duplicate from either control path");
     }
 
     /// Review 490f0340#r4650391606: a schema-only `upsert_pool` must keep the

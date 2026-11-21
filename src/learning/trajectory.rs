@@ -384,6 +384,8 @@ mod tests {
             principal: "agent".to_string(),
             executed_at: 1_700_000_000,
             params: Default::default(),
+            target_pointer_id: None,
+            target_pool_id: None,
             superseded_pairs: vec![],
             created_ids: vec![],
             twin_deltas: vec![],

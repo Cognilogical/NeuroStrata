@@ -64,6 +64,8 @@ pub trait DataConnector: Send + Sync {
 ## Write-Back Receipts
 
 - `ExternalEffectRequest` / `ExternalEffectReceipt`; idempotency key; active target-bound `action_receipt` (`ActiveBound`). Write-back requires CAS + idempotency key.
+- Target binding comes from the production receipt payload (`metadata.action_receipt`), not from editable row metadata: the nested `receipt_id` must equal the requested receipt and the stamped `target_pointer_id`/`target_pool_id` (or the pre-stamp nested `pointer_id`/`pool_id` parameter pair) must equal the write-back pointer and pool. A receipt whose action never declared that pair is unbound and denied.
+- The kinetic action writer stamps `target_pointer_id`/`target_pool_id` in the nested receipt when the action declares both reserved parameters; receipt rows keep no top-level `pointer_id`/`pool_id`.
 
 ## Write-Back Durability
 
@@ -79,6 +81,9 @@ pub trait DataConnector: Send + Sync {
 - A schema-only `upsert_pool` (no `records`) preserves `pool_idempotency` alongside the retained `pool_records`; it must not orphan receipts from their records.
 - A snapshot carries only the receipt produced by the written pointer's latest effect. A receipt whose persistence was rejected is never promoted by a later write to another pointer, so it cannot replay as `applied: true` without durable records.
 - `JsonFilePoolConnector` returns `None` (file-backed) and is not rewritten. A snapshot or persistence failure rejects the effect rather than returning an unobservable success receipt.
+- Durable retry key (`pool_idempotency`, shared by every connector): `[action_receipt_id, pointer_uri, idempotency_key]` as an exact-value JSON array (digest-free, so #351's source-digest collision cannot merge two effects). The applied `ExternalEffectReceipt` is persisted under it in the same registry row the next kernel hydrates from. A fresh-kernel retry with the same triple returns the original receipt and performs no connector I/O; a different key or payload is new work and still passes CAS. The row contains no `pool_records` for `json_file`, so the connector remains file-backed while the retry key is durable.
+- Retry-key lookup, connector apply, write-back persistence, and the retry-key write run under one process-wide `POOL_WRITEBACK_LOCK` turn, so two requests in the serving process cannot both miss the key. Cross-process concurrent writers are outside the single-writer daemon contract.
+- A retry-key write failure fails the request after the connector applied; no success receipt is returned. A self-persisting connector has no prior-byte rollback, so the caller must resolve the pointer before retrying as new work.
 
 ## Transport Parity
 
