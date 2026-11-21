@@ -1260,6 +1260,9 @@ pub(crate) mod tests {
         git(&["commit", "--allow-empty", "-m", "init"]);
         git(&["worktree", "add", "-b", "feature/linked", linked.to_str().unwrap()]);
         std::fs::create_dir_all(linked.join("pkg")).unwrap();
+        // A main checkout holding only `.git` is not taken as one (it may be
+        // a separate git dir); a real checkout holds files.
+        std::fs::create_dir_all(main.join("pkg")).unwrap();
 
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
         let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);

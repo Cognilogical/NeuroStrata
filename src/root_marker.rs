@@ -868,7 +868,7 @@ pub fn root_hint(namespace: &str, path: &Path) -> Option<String> {
     }
     let folder = start_folder(path)?;
     if folder.parent().is_none()
-        || crate::formal_kernel::is_home_dir(&folder, dirs::home_dir().as_deref())
+        || crate::task::is_home_folder(&folder, dirs::home_dir().as_deref())
     {
         return None;
     }
@@ -2584,7 +2584,7 @@ mod tests {
                 &find_root_marker(&repo),
                 NS,
                 &CachedRoot::Known(cached(&store).await),
-                &std::collections::HashMap::new(),
+                &Ok(std::collections::HashMap::new()),
             );
             assert!(shown.contains(&format!("  {} (namespace {NS})", old.display())), "{shown}");
             assert!(shown.contains(&format!("  {} (namespace {NS})", new.display())), "{shown}");
