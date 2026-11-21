@@ -3311,4 +3311,383 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
     }
+
+    /// v1 identity, reproduced here so the legacy seeds do not depend on the
+    /// code under test gaining a legacy method before it exists.
+    fn legacy_fingerprint(note: &VaultNote) -> String {
+        let mut related = note.related.clone();
+        related.sort();
+        related.dedup();
+        hex::encode(Sha256::digest(
+            format!(
+                "{}\u{1f}{}\u{1f}{}",
+                note.content.trim(),
+                note.epistemic_tier,
+                related.join("\u{1e}")
+            )
+            .as_bytes(),
+        ))
+    }
+
+    fn vault_config(root: &Path, vault: &Path, ns: &str) -> VaultSyncConfig {
+        VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.to_path_buf(),
+            output_dir: vault.to_path_buf(),
+            principal: None,
+            project_root: Some(root.to_path_buf()),
+            allowed_external_dirs: None,
+        }
+    }
+
+    /// #343: a WikiLink must reach the graph, not just metadata.
+    #[tokio::test]
+    async fn import_materializes_wikilink_edges_and_exports_without_duplicates() {
+        let root = std::env::temp_dir().join(format!("ns-vault-edges-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_edges";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let mut a = note("note-a", &["note-b"]);
+        a.content = "A links to B".to_string();
+        a.canonical_sha256 = a.fingerprint();
+        let mut b = note("note-b", &[]);
+        b.content = "B is a target".to_string();
+        b.canonical_sha256 = b.fingerprint();
+        std::fs::write(vault.join("note-a.md"), a.to_markdown()).expect("write a");
+        std::fs::write(vault.join("note-b.md"), b.to_markdown()).expect("write b");
+
+        let imported = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(imported.errors.is_empty(), "{:?}", imported.errors);
+        assert_eq!(imported.notes_imported, 2, "{:?}", imported.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| from == "note-a"
+                && rel == "RELATES_TO"
+                && to == "note-b"),
+            "WikiLink must be a stored RELATES_TO edge, got {:?}",
+            edges
+        );
+
+        let exported = export_vault(config.clone(), store.clone())
+            .await
+            .expect("export");
+        assert!(exported.success, "{:?}", exported.errors);
+        let markdown = std::fs::read_to_string(vault.join("note-a.md")).expect("read export");
+        assert_eq!(
+            markdown.matches("[[note-b]]").count(),
+            1,
+            "export must render the link once, not once per metadata key"
+        );
+
+        let again = import_vault(config, store, std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert_eq!(again.notes_imported, 0, "round-trip must be a no-op");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #344: retired rows must not be presented as current knowledge.
+    #[tokio::test]
+    async fn export_excludes_retired_rows_and_keeps_canvas_coherent() {
+        let root = std::env::temp_dir().join(format!("ns-vault-retired-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_retired";
+        store.init(ns).await.expect("init");
+        let namespace = ns.to_string();
+        let seed = |id: &'static str, metadata: serde_json::Value, content: &'static str| {
+            let store = store.clone();
+            let namespace = namespace.clone();
+            async move {
+                store
+                    .upsert(
+                        &namespace,
+                        id,
+                        vec![0.0; 4],
+                        crate::traits::MemoryPayload {
+                            content: content.to_string(),
+                            user_id: "default".to_string(),
+                            memory_type: "rule".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata,
+                        },
+                    )
+                    .await
+                    .expect("seed row");
+            }
+        };
+        let past = chrono::Utc::now().timestamp() - 60;
+        let future = chrono::Utc::now().timestamp() + 3600;
+        seed("live-rule", serde_json::json!({}), "live body").await;
+        seed(
+            "expired-rule",
+            serde_json::json!({"valid_to": past, "superseded_by": "live-rule"}),
+            "expired body",
+        )
+        .await;
+        seed(
+            "superseded-rule",
+            serde_json::json!({"superseded_by": "live-rule"}),
+            "superseded body",
+        )
+        .await;
+        seed(
+            "future-rule",
+            serde_json::json!({"valid_to": future}),
+            "future body",
+        )
+        .await;
+        seed(
+            "live-rule.vault-history.0000",
+            serde_json::json!({"valid_to": past, "superseded_by": "live-rule"}),
+            "history body",
+        )
+        .await;
+
+        let config = vault_config(&root, &vault, ns);
+        let exported = export_vault(config, store).await.expect("export");
+        assert!(exported.success, "{:?}", exported.errors);
+        assert_eq!(exported.notes_exported, 2, "{:?}", exported.errors);
+        assert!(vault.join("live-rule.md").exists());
+        assert!(vault.join("future-rule.md").exists());
+        for id in ["expired-rule", "superseded-rule", "live-rule.vault-history.0000"] {
+            assert!(
+                !vault.join(format!("{id}.md")).exists(),
+                "retired row {id} must not be exported"
+            );
+        }
+        let canvas: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(vault.join("topology.canvas")).unwrap())
+                .expect("canvas json");
+        assert_eq!(
+            canvas["nodes"].as_array().map(Vec::len),
+            Some(2),
+            "canvas must describe the exported set: {canvas}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #344: a stale export's history file must not become live knowledge.
+    #[tokio::test]
+    async fn import_ignores_stale_vault_history_files() {
+        let root = std::env::temp_dir().join(format!("ns-vault-stale-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_stale_history";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let history_id = "stale-note.vault-history.6f0f0f0f-0000-4000-8000-000000000000";
+        let mut stale = note(history_id, &[]);
+        stale.content = "obsolete body".to_string();
+        stale.canonical_sha256 = stale.fingerprint();
+        std::fs::write(vault.join(format!("{history_id}.md")), stale.to_markdown())
+            .expect("write stale history");
+        let mut live = note("stale-note", &[]);
+        live.content = "current body".to_string();
+        live.canonical_sha256 = live.fingerprint();
+        std::fs::write(vault.join("stale-note.md"), live.to_markdown()).expect("write live");
+
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+        assert!(
+            store.get(ns, history_id).await.unwrap().is_none(),
+            "history ids are importer projections, never vault-authored memories"
+        );
+        assert!(store.get(ns, "stale-note").await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #345: seed the exact shape a pre-v2 import leaves behind.
+    async fn seed_legacy_head(
+        store: &std::sync::Arc<dyn VectorStore>,
+        ns: &str,
+        id: &str,
+        body: &str,
+        memory_type: &str,
+        legacy_hash: &str,
+    ) {
+        store
+            .upsert(
+                ns,
+                id,
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: body.to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: memory_type.to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "vault_source": true,
+                        "stub": false,
+                        "canonical_sha256": legacy_hash,
+                        "related": [],
+                        "valid_from": chrono::Utc::now().timestamp() - 60
+                    }),
+                },
+            )
+            .await
+            .expect("seed legacy head");
+    }
+
+    /// #345: a type-only edit must not be swallowed as "unchanged".
+    #[tokio::test]
+    async fn type_only_edit_creates_new_head_version() {
+        let root = std::env::temp_dir().join(format!("ns-vault-type-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_type_edit";
+        store.init(ns).await.expect("init");
+
+        let mut before = note("type-note", &[]);
+        before.content = "same body".to_string();
+        before.canonical_sha256 = legacy_fingerprint(&before);
+        seed_legacy_head(&store, ns, "type-note", "same body", "fact", &before.canonical_sha256)
+            .await;
+
+        let mut after = before.clone();
+        after.rdf_type = "yaml:rule".to_string();
+        after.canonical_sha256 = after.fingerprint();
+        std::fs::write(vault.join("type-note.md"), after.to_markdown()).expect("write note");
+
+        let result = import_vault(
+            vault_config(&root, &vault, ns),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.notes_imported, 1,
+            "a type-only edit must be imported: {:?}",
+            result.errors
+        );
+        let (_, head) = store.get(ns, "type-note").await.unwrap().unwrap();
+        assert_eq!(head.memory_type, "rule");
+        assert_eq!(head.metadata["fingerprint_version"], serde_json::json!(2));
+        assert!(
+            head.metadata.get("supersedes").is_some(),
+            "the edit must create a history version"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #345: upgrading identity must not re-version unchanged legacy heads.
+    #[tokio::test]
+    async fn legacy_v1_head_reimport_is_not_mass_versioned() {
+        let root = std::env::temp_dir().join(format!("ns-vault-legacy-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_legacy_noop";
+        store.init(ns).await.expect("init");
+
+        let mut unchanged = note("legacy-note", &[]);
+        unchanged.content = "legacy body".to_string();
+        unchanged.canonical_sha256 = legacy_fingerprint(&unchanged);
+        seed_legacy_head(
+            &store,
+            ns,
+            "legacy-note",
+            "legacy body",
+            "fact",
+            &unchanged.canonical_sha256,
+        )
+        .await;
+        std::fs::write(vault.join("legacy-note.md"), unchanged.to_markdown())
+            .expect("write note");
+
+        let result = import_vault(
+            vault_config(&root, &vault, ns),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.notes_imported, 0,
+            "v1 -> v2 must not mass-version: {:?}",
+            result.errors
+        );
+        let (_, head) = store.get(ns, "legacy-note").await.unwrap().unwrap();
+        assert!(head.metadata.get("supersedes").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #345: once stamped v2, a byte-identical reimport remains a no-op.
+    #[tokio::test]
+    async fn unchanged_v2_reimport_is_a_noop() {
+        let root = std::env::temp_dir().join(format!("ns-vault-v2-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_v2_noop";
+        store.init(ns).await.expect("init");
+        let mut body = note("v2-note", &[]);
+        body.content = "v2 body".to_string();
+        body.canonical_sha256 = body.fingerprint();
+        std::fs::write(vault.join("v2-note.md"), body.to_markdown()).expect("write note");
+
+        let first = import_vault(
+            vault_config(&root, &vault, ns),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("first import");
+        assert_eq!(first.notes_imported, 1, "{:?}", first.errors);
+        let second = import_vault(
+            vault_config(&root, &vault, ns),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("second import");
+        assert_eq!(second.notes_imported, 0, "{:?}", second.errors);
+        let (_, head) = store.get(ns, "v2-note").await.unwrap().unwrap();
+        assert_eq!(head.metadata["fingerprint_version"], serde_json::json!(2));
+        assert!(head.metadata.get("supersedes").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
