@@ -6384,7 +6384,6 @@ async fn run() -> anyhow::Result<()> {
     // Check if the daemon is already running on port 34343
     let probe = probe_daemon().await;
 
-
     // Only a daemon that answered gets to hold the database lock as far as the
     // CLI is concerned. Treating silence as "running" would refuse every local
     // command on a machine where an empty port times out rather than refuses.
