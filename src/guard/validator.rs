@@ -69,6 +69,19 @@ const DOC_LIKE_EXTENSIONS: &[&str] = &[
     ".toml",
 ];
 
+/// Search-only edit fields. Their text is what the caller is replacing or
+/// looking for, not a target to inspect: removing a patch example from a
+/// documentation edit must not turn the quoted path into a mutation target
+/// (6ad42c1d#r4650196713).
+const MUTATION_SEARCH_KEYS: &[&str] = &[
+    "old_string",
+    "oldString",
+    "old_str",
+    "oldStr",
+    "old_text",
+    "oldText",
+];
+
 const MUTATION_WALK_MAX_DEPTH: usize = 3;
 /// Node budget for the bounded extraction walks. Large legitimate MultiEdit
 /// payloads fit; anything beyond it is reported as incomplete and fails
@@ -415,6 +428,13 @@ impl GuardValidator {
     }
 
     fn should_scan_patch(key: &str, value: &str) -> bool {
+        // Search text is never a target (6ad42c1d#r4650196713).
+        if MUTATION_SEARCH_KEYS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(key))
+        {
+            return false;
+        }
         MUTATION_PATCH_KEYS
             .iter()
             .any(|k| k.eq_ignore_ascii_case(key))

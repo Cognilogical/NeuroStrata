@@ -99,6 +99,9 @@ any added `#!` line, so documentation examples cause false denials.
      `*** Update File:`/`*** Add File:`/`*** Move to:`, `diff --git `,
      `+++ b/`, or a unified `--- a/...` followed by `+++ `. Decoding matters:
      a patch inside a JSON string has real newlines only after parse.
+     Search text (`old_string`/`old_str`/`old_text` and camelCase forms) is
+     never scanned as a patch: removing an example from a doc must not turn
+     its quoted path into a mutation target.
 2. **Raw patch fallback in addition.** Non-JSON payloads keep the existing
    marker scan. JSON payloads do not need a whole-text scan (escaped
    newlines make it inert), but a decoded patch value is scanned.
@@ -142,6 +145,9 @@ Rust (`src/guard/validator.rs` tests):
     `.py` target;
   - a payload beyond the node budget with no visible target fires the rule
     (fail closed) instead of silently passing.
+- `edit_search_text_is_not_scanned_as_a_patch`
+  - a `README.md` edit whose `old_string` is a patch example does not fire a
+    `.py` rule.
 
 JS (`plugins/core/test.mjs`, mock daemon records `guardArgs`):
 - `apply_patch raw hook input reaches guard_validate as the patch, not "{}"`
