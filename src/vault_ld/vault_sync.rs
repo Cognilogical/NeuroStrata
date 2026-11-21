@@ -656,15 +656,26 @@ pub async fn export_vault_with_limits(
     })
 }
 
+/// A WikiLink may spell this vault's own namespace (`<ns>::z`); the linked
+/// note is stored under its bare id. Edge binding and reconciliation compare
+/// in that stored form while the declared spelling stays for export.
+fn stored_edge_target<'a>(namespace: &str, target: &'a str) -> &'a str {
+    target
+        .strip_prefix(namespace)
+        .and_then(|rest| rest.strip_prefix(crate::parser::ingest::NAMESPACE_SEPARATOR))
+        .unwrap_or(target)
+}
+
 /// WikiLink targets with no corresponding note in the vault. BTreeSet gives
 /// deterministic order for queryable stub minting.
-pub fn unresolved_wiki_targets(notes: &[VaultNote]) -> Vec<String> {
+pub fn unresolved_wiki_targets(notes: &[VaultNote], namespace: &str) -> Vec<String> {
     let known: std::collections::BTreeSet<&str> = notes.iter().map(|n| n.id.as_str()).collect();
     let mut missing = std::collections::BTreeSet::new();
     for note in notes {
         for target in &note.related {
-            if !known.contains(target.as_str()) {
-                missing.insert(target.clone());
+            let target = stored_edge_target(namespace, target);
+            if !known.contains(target) {
+                missing.insert(target.to_string());
             }
         }
     }
@@ -926,7 +937,7 @@ pub async fn import_vault_with_limits(
     // In a partial vault a linked memory's file is absent by definition; a
     // placeholder must not replace the live head that still exists.
     let mut mintable = Vec::new();
-    for target in unresolved_wiki_targets(&notes) {
+    for target in unresolved_wiki_targets(&notes, &config.namespace) {
         match store.get(&config.namespace, &target).await {
             Ok(Some((_, payload))) => {
                 // An existing stub is exactly the state this loop would
@@ -1171,6 +1182,11 @@ pub async fn import_vault_with_limits(
             .and_then(Value::as_array)
             .is_some_and(|targets| !targets.is_empty())
             .then(|| (payload.clone(), item.vector.clone()));
+        let keep: Vec<String> = item
+            .related
+            .iter()
+            .map(|target| stored_edge_target(&config.namespace, target).to_string())
+            .collect();
 
         // Materialise the new head before retiring the old head's edges.
         // Reconciliation deletes edges the current head still relies on, so
@@ -1184,12 +1200,7 @@ pub async fn import_vault_with_limits(
             Ok(report) => {
                 imported += 1;
                 if let Err(e) = store
-                    .reconcile_declared_edges(
-                        &config.namespace,
-                        &item.id,
-                        "RELATES_TO",
-                        &item.related,
-                    )
+                    .reconcile_declared_edges(&config.namespace, &item.id, "RELATES_TO", &keep)
                     .await
                 {
                     errors.push(format!(
@@ -1230,7 +1241,10 @@ pub async fn import_vault_with_limits(
             .map(|targets| {
                 targets
                     .iter()
-                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .filter_map(|t| {
+                        t.as_str()
+                            .map(|t| stored_edge_target(&config.namespace, t).to_string())
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -1371,7 +1385,7 @@ mod tests {
             note("b", &["missing-1", "a"]),
         ];
         assert_eq!(
-            unresolved_wiki_targets(&notes),
+            unresolved_wiki_targets(&notes, "ns"),
             vec!["missing-1", "missing-2"]
         );
     }
@@ -3767,6 +3781,132 @@ mod tests {
             again.notes_imported, 0,
             "the exact-id round-trip must keep the fingerprint stable: {:?}",
             again.errors
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: a same-namespace qualified WikiLink (`<ns>::z`) names the
+    /// vault note `z`, which is stored bare. A same-path ingested symbol must
+    /// not capture it just because the note has not been written yet.
+    #[tokio::test]
+    async fn qualified_wikilink_binds_exact_note_before_symbol_resolution() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-vault-qualified-targets-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_qualified_targets";
+        store.init(ns).await.expect("init");
+
+        let generation = store.begin_generation(ns, "code").await.expect("begin");
+        let symbol_id = crate::parser::ingest::generation_scoped_id(ns, generation, "z");
+        store
+            .upsert(
+                ns,
+                &symbol_id,
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "an ingested symbol".to_string(),
+                    user_id: "auto-ingestor".to_string(),
+                    memory_type: "symbol".to_string(),
+                    agent_name: Some("auto-ingestor".to_string()),
+                    location: "z".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed colliding symbol");
+        store
+            .publish_generation(ns, "code", generation)
+            .await
+            .expect("publish");
+
+        let qualified_target = format!("{ns}::z");
+        let config = vault_config(&root, &vault, ns);
+        let mut linker = note("linker", &[qualified_target.as_str()]);
+        linker.content = "links the qualified vault note".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        // The link spells the note with its namespace; the note id stays bare.
+        let mut target = note("z", &[]);
+        target.content = "qualified vault note body".to_string();
+        target.canonical_sha256 = target.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("qualified.md"), target.to_markdown()).expect("write target");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let (_, head) = store
+            .get(ns, "linker")
+            .await
+            .expect("get head")
+            .expect("head exists");
+        assert_eq!(
+            head.metadata["related_to"],
+            serde_json::json!([qualified_target.clone()]),
+            "the declared spelling must survive for export"
+        );
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges
+                .iter()
+                .any(|(from, rel, to, _)| from == "linker" && rel == "RELATES_TO" && to == "z"),
+            "the edge must target the exact vault note `z`: {:?}",
+            edges
+        );
+        assert!(
+            !edges.iter().any(|(_, _, to, _)| to == &symbol_id),
+            "the same-path ingested symbol must not be linked: {:?}",
+            edges
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("linker.md")).expect("read export");
+        assert_eq!(
+            markdown.matches(&format!("[[{qualified_target}]]")).count(),
+            1,
+            "{markdown}"
+        );
+        assert!(
+            !markdown.contains(&format!("[[{symbol_id}]]")),
+            "export must not render the symbol as a second link: {markdown}"
+        );
+
+        let prior_sha = head.metadata["canonical_sha256"].clone();
+        let again = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            again.notes_imported, 0,
+            "the exact-id round-trip must keep the fingerprint stable"
+        );
+        let (_, reimported) = store
+            .get(ns, "linker")
+            .await
+            .expect("get reimported head")
+            .expect("head exists");
+        assert_eq!(
+            reimported.metadata["canonical_sha256"], prior_sha,
+            "the linker fingerprint must not churn"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

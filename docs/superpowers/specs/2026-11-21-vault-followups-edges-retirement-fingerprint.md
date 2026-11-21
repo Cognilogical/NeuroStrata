@@ -183,12 +183,12 @@ untouched, so no other writer changes shape.
   head. Ordinary memories never carry the flag, so their write-path resolution
   is unchanged.
 - `LadybugStore::upsert` skips the `KnownIds::resolve` rewrite when the flag is
-  present. Edge materialisation also branches on it: the target is looked up
-  verbatim inside the importer's namespace
-  (`exact_target_in_namespace_exists`) instead of through
-  `resolve_target_on_write`'s generation and suffix inference. A target not yet
-  written defers to the existing replay pass, which retries the same exact
-  lookup.
+  present. Edge materialisation checks it before the qualified-ID branch and
+  looks the target up verbatim inside the importer's namespace
+  (`exact_target_in_namespace_exists`), removing an own-namespace prefix first
+  (§3c), instead of through `resolve_target_on_write`'s generation and suffix
+  inference. A target not yet written defers to the existing replay pass, which
+  retries the same exact lookup.
 - `reconcile_declared_edges` runs after the head `upsert` returns `Ok`, and
   after the deferred replay `upsert` returns `Ok`; a failed upsert performs no
   reconciliation. The history row cleanup on failure is unchanged.
@@ -229,6 +229,41 @@ declared id.
   between them leaves either old edges plus new head (retried on the next
   changed import) or the intended set; it cannot leave deleted edges with the
   old head.
+
+### 3c. Exact-target ordering for qualified spellings
+
+#### Invariant
+
+For a head carrying `exact_edge_targets`, target resolution happens before the
+generic qualified-ID branch. No exact-mode target may reach
+`resolve_target_on_write`'s generation or suffix inference, including a target
+that contains `::`. A same-namespace spelling (`<ns>::z`) names the vault note
+stored as the bare id `z`; a target absent at write time defers to the replay
+pass instead of resolving through a symbol that shares the logical path. The
+declared spelling stays in metadata for export, while edge binding, stub
+detection and reconciliation all compare in stored-id form.
+
+#### Mechanism
+
+- `LadybugStore::upsert` checks `exact_edge_targets` first. The declared target
+  is stripped of the importer's own namespace prefix when present, then looked
+  up verbatim with `exact_target_in_namespace_exists`; missing defers, and the
+  earlier qualified branch keeps its inference for ordinary memories only.
+- `unresolved_wiki_targets` and the reconciliation keep-set in the importer
+  apply the same stored-id form (`stored_edge_target`), so a qualified spelling
+  neither mints a bogus qualified stub nor deletes the edge it just bound.
+
+#### Eval (failed on `c14f5de0`)
+
+- `qualified_wikilink_binds_exact_note_before_symbol_resolution`
+  - Seed a published same-namespace symbol `<ns>::<gen>::z`, then import vault
+    notes `z` and `linker` linking `<ns>::z`; `linker` sorts before `z`.
+  - Assert `related_to == ["<ns>::z"]`, the `RELATES_TO` edge ends at `z` and
+    not the symbol, export carries exactly one `[[<ns>::z]]` and no symbol
+    link, and the reimport imports `0` notes with an unchanged fingerprint.
+  - On `c14f5de0` the qualified branch inferred the symbol before the exact
+    branch; reconciliation then deleted the non-matching edge
+    (`the edge must target the exact vault note z: []`).
 
 ---
 

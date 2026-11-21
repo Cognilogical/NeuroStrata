@@ -10711,7 +10711,52 @@ impl VectorStore for LadybugStore {
                     });
                     continue;
                 }
-                let target = if edge.target_id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+                let target = if exact_edge_targets {
+                    // The caller guaranteed exact ids, so do not infer a path
+                    // or a generation: materialising must bind what it named
+                    // even when another node shares the logical path (#363).
+                    // A same-namespace qualified spelling (`<ns>::z`) names
+                    // the note `z`, which is stored bare.
+                    let exact = edge
+                        .target_id
+                        .strip_prefix(&format!(
+                            "{}{}",
+                            namespace,
+                            crate::parser::ingest::NAMESPACE_SEPARATOR
+                        ))
+                        .unwrap_or(&edge.target_id);
+                    match exact_target_in_namespace_exists(conn, &namespace, exact) {
+                        Ok(true) => exact.to_string(),
+                        Ok(false) => {
+                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                rel_type: edge.rel_type.to_string(),
+                                declared_target: edge.target_id.clone(),
+                                declaration_index: edge.declaration_index,
+                                resolution: crate::traits::TargetResolution::Missing,
+                            });
+                            emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                                field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                                why: "exact target does not exist yet".to_string(),
+                                skipped: "this edge materialization".to_string(),
+                            });
+                            continue;
+                        }
+                        Err(e) => {
+                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
+                                rel_type: edge.rel_type.to_string(),
+                                declared_target: edge.target_id.clone(),
+                                declaration_index: edge.declaration_index,
+                                resolution: crate::traits::TargetResolution::Failed(e.to_string()),
+                            });
+                            emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
+                                field: format!("metadata.{}", edge.rel_type.to_lowercase()),
+                                why: "exact target lookup failed".to_string(),
+                                skipped: "this edge materialization".to_string(),
+                            });
+                            continue;
+                        }
+                    }
+                } else if edge.target_id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR) {
                     // (E) Qualified: exact ID lookup in any namespace.
                     match exact_target_exists(conn, &edge.target_id) {
                         Ok(true) => edge.target_id.clone(),
@@ -10759,41 +10804,6 @@ impl VectorStore for LadybugStore {
                             emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
                                 field: format!("metadata.{}", edge.rel_type.to_lowercase()),
                                 why: "target lookup failed".to_string(),
-                                skipped: "this edge materialization".to_string(),
-                            });
-                            continue;
-                        }
-                    }
-                } else if exact_edge_targets {
-                    // The caller guaranteed exact ids, so do not infer a path
-                    // or a generation: materialising must bind what it named
-                    // even when another node shares the logical path (#363).
-                    match exact_target_in_namespace_exists(conn, &namespace, &edge.target_id) {
-                        Ok(true) => edge.target_id.clone(),
-                        Ok(false) => {
-                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
-                                rel_type: edge.rel_type.to_string(),
-                                declared_target: edge.target_id.clone(),
-                                declaration_index: edge.declaration_index,
-                                resolution: crate::traits::TargetResolution::Missing,
-                            });
-                            emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
-                                field: format!("metadata.{}", edge.rel_type.to_lowercase()),
-                                why: "exact target does not exist yet".to_string(),
-                                skipped: "this edge materialization".to_string(),
-                            });
-                            continue;
-                        }
-                        Err(e) => {
-                            deferred_edges.push(crate::traits::EdgeResolutionStatus {
-                                rel_type: edge.rel_type.to_string(),
-                                declared_target: edge.target_id.clone(),
-                                declaration_index: edge.declaration_index,
-                                resolution: crate::traits::TargetResolution::Failed(e.to_string()),
-                            });
-                            emit_write_shape_warning(&namespace, &id, &WriteShapeWarning {
-                                field: format!("metadata.{}", edge.rel_type.to_lowercase()),
-                                why: "exact target lookup failed".to_string(),
                                 skipped: "this edge materialization".to_string(),
                             });
                             continue;
