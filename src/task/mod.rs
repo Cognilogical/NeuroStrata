@@ -3717,7 +3717,11 @@ pub async fn handle_bootstrap(
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let root = std::path::Path::new(project_root);
     let harness_plugins =
-        harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
+        harness_plugins::auto_install_detected_plugins(
+            root,
+            harness_plugins::ConfigNamespace::Set(&namespace),
+            arg_str(&args, "harness"),
+        );
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
     let hook_installed = verified["hook_installed"].as_bool().unwrap_or(false);
 
@@ -3934,10 +3938,15 @@ LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 # The namespace configured for this project (harness settings; folder name
 # last), resolved in one place: `neurostrata-mcp namespace resolve`. The
 # ledger's own field and the folder name are fallbacks when the binary is
-# not on PATH.
+# not on PATH or the lookup fails.
 NAMESPACE=""
+RESOLVED=""
 if command -v neurostrata-mcp >/dev/null 2>&1; then
-    NAMESPACE=$(neurostrata-mcp namespace resolve 2>/dev/null)
+    if NAMESPACE=$(neurostrata-mcp namespace resolve 2>/dev/null) && [ -n "$NAMESPACE" ]; then
+        RESOLVED=1
+    else
+        NAMESPACE=""
+    fi
 fi
 if [ -z "$NAMESPACE" ] && [ -f "$LEDGER" ]; then
     NAMESPACE=$(grep -o '"namespace"[[:space:]]*:[[:space:]]*"[^"]*"' "$LEDGER" | head -n1 | sed 's/.*"namespace"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
@@ -4167,6 +4176,46 @@ done
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
+elif [ -n "$RESOLVED" ]; then
+    # The ledger's namespace follows the resolved one, so lookups recorded from
+    # now on are filed under the namespace the hooks and the gate use. The
+    # rewrite goes through a temporary file and a rename; an unparseable
+    # ledger or a missing node/python3 leaves the file as it is.
+    export LEDGER NAMESPACE
+    if command -v node >/dev/null 2>&1; then
+        node -e '
+          const fs = require("fs");
+          const ledger = process.env.LEDGER;
+          const ns = process.env.NAMESPACE;
+          let parsed;
+          try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) process.exit(0);
+          if (parsed.namespace === ns) process.exit(0);
+          parsed.namespace = ns;
+          const tmp = ledger + ".tmp-" + process.pid;
+          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + "\n");
+          fs.renameSync(tmp, ledger);
+        ' 2>/dev/null || true
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c '
+import json, os, sys
+ledger = os.environ["LEDGER"]
+ns = os.environ["NAMESPACE"]
+try:
+    with open(ledger, encoding="utf-8") as f:
+        parsed = json.load(f)
+except Exception:
+    sys.exit(0)
+if not isinstance(parsed, dict) or parsed.get("namespace") == ns:
+    sys.exit(0)
+parsed["namespace"] = ns
+tmp = ledger + ".tmp-" + str(os.getpid())
+with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+    json.dump(parsed, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, ledger)
+' 2>/dev/null || true
+    fi
 fi
 
 
@@ -4252,20 +4301,49 @@ pub(crate) fn git_hooks_dir(root: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// Best-effort hook hygiene for a project root. Returns a single status line
-/// describing what was done (or a warning), or an empty string when nothing
-/// needed doing (or the root isn't a git repo). Never errors.
+/// Best-effort hook hygiene for a project root, run by the daemon. Returns
+/// status lines describing what was done (or a warning), or an empty string
+/// when nothing needed doing (or the root isn't a git repo). Never errors.
+/// The daemon's own `NEUROSTRATA_NAMESPACE` is not read: one daemon serves
+/// every project.
 pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
+    hook_hygiene_reading_env(root, false)
+}
+
+/// [`hook_hygiene`] for a CLI run in the project, where
+/// `NEUROSTRATA_NAMESPACE` is the user's, as the git hooks see it.
+pub(crate) fn hook_hygiene_from_cli(root: &std::path::Path) -> String {
+    hook_hygiene_reading_env(root, true)
+}
+
+fn hook_hygiene_reading_env(root: &std::path::Path, read_env: bool) -> String {
     if !root.join(".git").exists() {
         return String::new();
     }
-    // The configured namespace (harness settings, then the main checkout's,
-    // ledger, folder name last) -- the answer the hooks get from
-    // `neurostrata-mcp namespace resolve`, so a refresh never rewrites a
-    // harness config with the folder name. The daemon's own environment is
-    // not read: one daemon serves every project.
-    let repo_ns = harness_plugins::resolve_project_namespace_ignoring_env(root);
-    let _ = harness_plugins::auto_install_detected_plugins(root, &repo_ns, None);
+    // Harness configs get a namespace only from an explicit source (a harness
+    // config, or the environment on the CLI): a ledger or folder-name answer
+    // written there would outrank every explicit source from then on. Each
+    // config keeps its own; with no explicit answer only plugin files are
+    // refreshed.
+    let (explicit, warning) = match harness_plugins::namespace_for_refresh(root, read_env) {
+        Ok(ns) => (ns, None),
+        Err(e) => (None, Some(format!("HOOKS: harness configs left as they are: {e}"))),
+    };
+    let _ = harness_plugins::auto_install_detected_plugins(
+        root,
+        harness_plugins::ConfigNamespace::Keep(explicit.as_deref()),
+        None,
+    );
+    let status = hook_hygiene_files(root);
+    match warning {
+        Some(w) if status.is_empty() => w,
+        Some(w) => format!("{w}\n{status}"),
+        None => status,
+    }
+}
+
+/// The git hook and tracked hook-script part of [`hook_hygiene`].
+fn hook_hygiene_files(root: &std::path::Path) -> String {
     let hooks_dir = git_hooks_dir(root);
     if !hooks_dir.is_dir() {
         if let Err(e) = std::fs::create_dir_all(&hooks_dir) {
@@ -4972,7 +5050,11 @@ pub async fn handle_task_setup(
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
     let harness_plugins =
-        harness_plugins::auto_install_detected_plugins(root, &namespace, arg_str(&args, "harness"));
+        harness_plugins::auto_install_detected_plugins(
+            root,
+            harness_plugins::ConfigNamespace::Set(&namespace),
+            arg_str(&args, "harness"),
+        );
 
     let scan = detect_project(root);
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
@@ -6049,6 +6131,73 @@ mod tests {
             checked_in.contains("scripts/check-staged-quality.sh"),
             "the pre-commit hook must delegate to the project's staged-quality runner"
         );
+    }
+
+    /// The pre-commit hook files the ledger under the namespace `namespace
+    /// resolve` answered: an older ledger naming another one is updated, its
+    /// recorded lookups kept; a failed lookup leaves the ledger as it is.
+    #[test]
+    fn pre_commit_hook_updates_the_ledger_namespace_to_the_resolved_one() {
+        let Some(bash) = hook_bash() else {
+            eprintln!("skipped: no bash to run the hook with");
+            return;
+        };
+        let has = |prog: &str| {
+            std::process::Command::new(prog)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !has("node") && !has("python3") {
+            eprintln!("skipped: neither node nor python3 to rewrite the ledger with");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        std::fs::create_dir_all(repo.join(".NeuroStrata")).unwrap();
+        git_stdout_in(&repo, &["init", "-q"]);
+        let ledger = repo.join(".NeuroStrata").join("session_queries.json");
+        let seeded = serde_json::to_string_pretty(&json!({
+            "namespace": "beta",
+            "queries": [{"tool": "t", "query": "src/a.rs"}]
+        }))
+        .unwrap();
+        std::fs::write(&ledger, &seeded).unwrap();
+        let hook = tmp.path().join("pre-commit");
+        std::fs::write(&hook, SCAFFOLDED_PRE_COMMIT_HOOK).unwrap();
+        let stub_dir = tmp.path().join("stub-bin");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        write_exec_hook(
+            &stub_dir.join("neurostrata-mcp"),
+            "#!/bin/sh\nif [ \"$1\" = namespace ]; then\n    [ -n \"$STUB_RESOLVE_EXIT\" ] && exit \"$STUB_RESOLVE_EXIT\"\n    echo alpha\n    exit 0\nfi\nexit 0\n",
+        );
+        let run = |resolve_exit: Option<&str>| {
+            let mut dirs = vec![stub_dir.clone()];
+            if let Some(bin) = bash.parent() {
+                dirs.push(bin.to_path_buf());
+            }
+            dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+            let mut cmd = std::process::Command::new(&bash);
+            cmd.arg(&hook)
+                .current_dir(&repo)
+                .env("PATH", std::env::join_paths(dirs).expect("join PATH"))
+                .env_remove("STUB_RESOLVE_EXIT");
+            if let Some(code) = resolve_exit {
+                cmd.env("STUB_RESOLVE_EXIT", code);
+            }
+            let out = cmd.output().expect("the hook runs");
+            assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        let read = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap()
+        };
+        run(Some("1"));
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap(), seeded, "a failed lookup changes nothing");
+        run(None);
+        let doc = read();
+        assert_eq!(doc["namespace"], json!("alpha"));
+        assert_eq!(doc["queries"], json!([{"tool": "t", "query": "src/a.rs"}]));
     }
 
     /// The pre-push hook stays fail-closed around `namespace resolve`: with
