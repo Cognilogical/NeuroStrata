@@ -199,7 +199,7 @@ pub struct NotifyEventSource {
     tx: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
     rx: tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
     watched_roots: Mutex<HashSet<PathBuf>>,
-    pending_renames: Arc<Mutex<HashMap<usize, PathBuf>>>,
+    pending_renames: Arc<Mutex<HashMap<usize, (PathBuf, tokio::time::Instant)>>>,
 }
 
 impl NotifyEventSource {
@@ -207,7 +207,7 @@ impl NotifyEventSource {
     /// watcher with a background task that forwards events into the channel.
     pub fn new() -> anyhow::Result<Self> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let pending_renames: Arc<Mutex<HashMap<usize, PathBuf>>> =
+        let pending_renames: Arc<Mutex<HashMap<usize, (PathBuf, tokio::time::Instant)>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let pending_renames_clone = Arc::clone(&pending_renames);
         let tx_clone = tx.clone();
@@ -231,12 +231,17 @@ impl NotifyEventSource {
                         if let Some(cookie) = ev.tracker() {
                             if let Ok(mut pending) = pending_renames_clone.lock() {
                                 if pending.len() >= MAX_RENAME_COOKIES {
-                                    // Evict oldest entry to keep map bounded.
-                                    if let Some(old_key) = pending.keys().next().cloned() {
+                                    // Evict the least recently inserted cookie,
+                                    // not an arbitrary HashMap slot.
+                                    if let Some(old_key) = pending
+                                        .iter()
+                                        .min_by_key(|(_, (_, at))| *at)
+                                        .map(|(key, _)| *key)
+                                    {
                                         pending.remove(&old_key);
                                     }
                                 }
-                                pending.insert(cookie, path.clone());
+                                pending.insert(cookie, (path.clone(), tokio::time::Instant::now()));
                             }
                         }
                         (WatchEventKind::Remove, None, false)
@@ -245,7 +250,7 @@ impl NotifyEventSource {
                         let resolved_new = path.clone();
                         if let Some(cookie) = ev.tracker() {
                             if let Ok(mut pending) = pending_renames_clone.lock() {
-                                if let Some(old) = pending.remove(&cookie) {
+                                if let Some((old, _)) = pending.remove(&cookie) {
                                     let watch_event = WatchEvent {
                                         root: PathBuf::from("/"),
                                         path: old,
@@ -1263,11 +1268,13 @@ impl IngestWatchService {
         };
         for (namespace, canonical) in keys {
             let path_str = canonical.to_string_lossy().to_string();
-            match self.trigger.trigger(&namespace, &path_str).await {
+            let key = (namespace.clone(), canonical.clone());
+            let retry_delay = match self.trigger.trigger(&namespace, &path_str).await {
                 Ok(outcome) => {
                     let now = unix_now_secs();
                     let mut state = self.lock_state()?;
-                    if let Some(rt) = state.roots.get_mut(&(namespace.clone(), canonical.clone())) {
+                    let mut delay = None;
+                    if let Some(rt) = state.roots.get_mut(&key) {
                         rt.last_trigger_unix = Some(now);
                         rt.last_outcome = Some(outcome.clone());
                         if outcome.state == TriggerState::Finished {
@@ -1276,22 +1283,52 @@ impl IngestWatchService {
                             rt.pending.clear();
                         } else {
                             rt.dirty = true;
-                            let delay = next_backoff(rt.backoff_attempt);
+                            let next = next_backoff(rt.backoff_attempt);
                             rt.backoff_attempt += 1;
-                            rt.next_retry_unix = Some(now + delay.as_secs());
+                            rt.next_retry_unix = Some(now + next.as_secs());
+                            delay = Some(next);
                         }
                     }
+                    delay
                 }
                 Err(err) => {
                     tracing::error!("reconcile trigger failed for {}: {}", path_str, err);
                     let now = unix_now_secs();
                     let mut state = self.lock_state()?;
-                    if let Some(rt) = state.roots.get_mut(&(namespace.clone(), canonical.clone())) {
+                    let mut delay = None;
+                    if let Some(rt) = state.roots.get_mut(&key) {
                         rt.dirty = true;
-                        let delay = next_backoff(rt.backoff_attempt);
+                        let next = next_backoff(rt.backoff_attempt);
                         rt.backoff_attempt += 1;
-                        rt.next_retry_unix = Some(now + delay.as_secs());
+                        rt.next_retry_unix = Some(now + next.as_secs());
+                        delay = Some(next);
                     }
+                    delay
+                }
+            };
+            // Arm the run loop's backoff path so a failed reconcile is retried
+            // with the same delay it records for status.
+            if let Some(delay) = retry_delay {
+                let finished = tokio::time::Instant::now();
+                {
+                    let mut retries = self
+                        .retry_at
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("retry mutex poisoned"))?;
+                    retries.insert(key.clone(), finished + delay);
+                }
+                {
+                    let mut bursts = self
+                        .bursts
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("burst mutex poisoned"))?;
+                    bursts.insert(
+                        key,
+                        BurstState {
+                            first: finished,
+                            last: finished,
+                        },
+                    );
                 }
             }
         }
