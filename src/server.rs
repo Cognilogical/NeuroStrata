@@ -20066,7 +20066,7 @@ mod tests {
             for secret in ["ptr_secret", "uri1", "s3cr3t"] {
                 assert!(
                     !response_text.contains(secret),
-                    "omitted principal must not disclose {secret}: {response_text}"
+                    "omitted principal must not disclose restricted data"
                 );
             }
         }
