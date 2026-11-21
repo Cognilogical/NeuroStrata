@@ -695,7 +695,7 @@ pub async fn process_mcp_request(
                             "type": "object",
                             "properties": {
                                 "namespace": { "type": "string", "description": "The exact project name (e.g., 'NeuroStrata'; runtime defaults to 'global' if omitted on direct handler calls)." },
-                                "principal": { "type": "string", "description": "Optional requested principal." },
+                                "principal": { "type": "string", "description": "Requested principal. Required for pointer reads (list_pointers, resolve_pointer, mediate); optional for other operations." },
                                 "args": {
                                     "type": "object",
                                     "description": "Connector operation arguments discriminated by 'operation'; each variant declares its own required fields. Omitting 'now_secs' defaults it to the current epoch. Runtime also accepts extra fields not listed here.",
@@ -2178,6 +2178,26 @@ pub async fn process_mcp_request(
     }
 }
 
+/// Pointer-read operations whose caller-facing output exposes data-pointer
+/// records or contents. The port's trusted `None` principal exists for
+/// kernel-internal reads and must not be reachable by omitting a field.
+pub(crate) fn connector_operation_reads_pointers(operation: &str) -> bool {
+    matches!(operation, "list_pointers" | "resolve_pointer" | "mediate")
+}
+
+/// Reject an omitted principal on a caller-originated pointer read (#348).
+pub(crate) fn enforce_external_connector_principal(
+    operation: &str,
+    principal: Option<&str>,
+) -> Result<(), String> {
+    if connector_operation_reads_pointers(operation) && principal.is_none() {
+        return Err(format!(
+            "principal is required for data-connector pointer reads ('{operation}')"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn handle_data_connector(
     arguments: &Value,
     store: Arc<dyn VectorStore>,
@@ -2208,6 +2228,14 @@ pub(crate) async fn handle_data_connector(
         return serde_json::json!({"ok": false, "error": "args object required"}).to_string();
     };
     let principal = arguments.get("principal").and_then(|v| v.as_str());
+    if let Err(error) = enforce_external_connector_principal(
+        args.get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        principal,
+    ) {
+        return serde_json::json!({"ok": false, "error": error}).to_string();
+    }
     let workspace_root = crate::daemon::resolve_project_root();
     let kernel = crate::kernel::AgentKernel::new(store.clone(), bus.clone(), workspace_root);
     match kernel
@@ -19931,15 +19959,17 @@ mod tests {
         }
     }
 
-    /// Compatibility: omitted namespace and principal must use existing defaults
-    /// (namespace -> "global", principal -> None) and return successful response.
+    /// Compatibility: an omitted namespace still defaults to "global" for a
+    /// caller that names its principal. (An omitted principal is a pointer
+    /// read without authority and is rejected; see
+    /// `data_connector_pointer_reads_require_principal`.)
     #[tokio::test]
-    async fn data_connector_omitted_fields_use_defaults() {
+    async fn data_connector_omitted_namespace_uses_default() {
         let (store, _ladybug_store, bus, _ptr) = seed_data_pointer_in_namespace("global").await;
 
-        // No namespace, no principal — should use defaults and succeed
         let arguments = json!({
-            "args": {"operation": "list_pointers"}
+            "args": {"operation": "list_pointers"},
+            "principal": "alice"
         });
         let response_text = handle_data_connector(&arguments, store.clone(), bus.clone()).await;
         let response: Value = serde_json::from_str(&response_text).expect("valid JSON");
@@ -19948,6 +19978,37 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["pointer_id"], "ptr_secret");
         assert_eq!(list[0]["pointer_uri"], "uri1");
+    }
+
+    /// The external boundary rejects omission only on pointer reads; the
+    /// write path and non-pointer operations keep their existing handling.
+    #[test]
+    fn external_connector_principal_required_only_for_pointer_reads() {
+        for operation in ["list_pointers", "resolve_pointer", "mediate"] {
+            assert!(
+                enforce_external_connector_principal(operation, None).is_err(),
+                "{operation} must reject an omitted principal"
+            );
+            assert!(
+                enforce_external_connector_principal(operation, Some("alice")).is_ok(),
+                "{operation} must accept a named principal"
+            );
+        }
+        for operation in [
+            "list_connectors",
+            "describe_pool",
+            "register_pool",
+            "upsert_pool",
+            "list_pools",
+            "register_pointer",
+            "apply_effect",
+            "unknown",
+        ] {
+            assert!(
+                enforce_external_connector_principal(operation, None).is_ok(),
+                "{operation} must keep its existing boundary handling"
+            );
+        }
     }
 
     /// #348: omitting `principal` must not escalate a caller to the trusted
@@ -20011,7 +20072,8 @@ mod tests {
         }
 
         // Named owner keeps read access on both surfaces.
-        let list_text = handle_data_connector(&list_args(Some("alice")), store.clone(), bus.clone()).await;
+        let list_text =
+            handle_data_connector(&list_args(Some("alice")), store.clone(), bus.clone()).await;
         let list: Value = serde_json::from_str(&list_text).expect("valid JSON");
         let listed = list.as_array().expect("owner list returns array");
         assert_eq!(listed.len(), 1);
@@ -20025,10 +20087,14 @@ mod tests {
         );
 
         // Named stranger stays denied: empty listing, pre-gate resolution.
-        let stranger_list_text = handle_data_connector(&list_args(Some("mallory")), store.clone(), bus.clone()).await;
+        let stranger_list_text =
+            handle_data_connector(&list_args(Some("mallory")), store.clone(), bus.clone()).await;
         let stranger_list: Value = serde_json::from_str(&stranger_list_text).expect("valid JSON");
         assert_eq!(
-            stranger_list.as_array().expect("stranger list returns array").len(),
+            stranger_list
+                .as_array()
+                .expect("stranger list returns array")
+                .len(),
             0,
             "stranger listing must omit the restricted pointer: {stranger_list_text}"
         );

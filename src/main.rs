@@ -8112,6 +8112,16 @@ async fn run() -> anyhow::Result<()> {
                             principal.clone(),
                         ),
                     };
+                    if let Err(error) = crate::server::enforce_external_connector_principal(
+                        args_json
+                            .get("operation")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default(),
+                        principal.as_deref(),
+                    ) {
+                        eprintln!("data-connector error: {}", error);
+                        std::process::exit(1);
+                    }
                     let bus = Arc::new(crate::events::ThalamicBus::new(daemon::BUS_CAPACITY));
                     let kernel = crate::kernel::AgentKernel::new(
                         concrete_store.clone(),
