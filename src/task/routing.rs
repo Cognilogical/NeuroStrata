@@ -140,7 +140,8 @@ pub fn agent_routing_contract_json() -> Value {
                 "args": {
                     "namespace": "<namespace>",
                     "id": "<symbol-or-file-id>",
-                    "max_hops": 2
+                    "max_hops": 2,
+                    "followed_trigger_id": "T_HIGH_BLAST"
                 },
                 "follow_up_operations": [],
                 "expected_decision": EXPECTED_DECISION_T_HIGH_BLAST
@@ -249,7 +250,8 @@ pub fn evaluate_triggers(ctx: TaskContext) -> Vec<RouteTrigger> {
                 args: json!({
                     "namespace": namespace,
                     "id": id,
-                    "max_hops": 2
+                    "max_hops": 2,
+                    "followed_trigger_id": "T_HIGH_BLAST"
                 }),
                 reason: format!(
                     "Blast radius {} >= {HIGH_BLAST_THRESHOLD}: expand two hops from '{id}'.",

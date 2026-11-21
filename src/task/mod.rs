@@ -801,7 +801,12 @@ fn seed_expand_next_hops(namespace: &str, seeds: &[String], edges: &[Value]) -> 
         let trigger = crate::task::routing::RouteTrigger {
             id: "T_SEED_EXPAND",
             tool: "neurostrata_related",
-            args: json!({"namespace": namespace, "id": seed, "max_hops": 2}),
+            args: json!({
+                "namespace": namespace,
+                "id": seed,
+                "max_hops": 2,
+                "followed_trigger_id": "T_SEED_EXPAND"
+            }),
             reason: "Seed has a real related edge; expand two hops before editing.".to_string(),
         };
         actions.push(crate::task::routing::next_action(&trigger, &[seed.clone()]));
