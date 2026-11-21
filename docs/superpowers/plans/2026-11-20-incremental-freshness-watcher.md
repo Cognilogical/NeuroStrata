@@ -53,7 +53,7 @@
   - `pub const BACKOFF_STEPS_SECS: &[u64] = &[1, 2, 4, 8, 16, 30];`
   - `pub struct Registration { pub namespace: String, pub canonical_path: PathBuf, pub created_at_unix: u64, pub updated_at_unix: u64 }` + `Registration::key(&self) -> (String, PathBuf)`
   - `pub enum WatchEventKind { Create, Modify, Remove, Rename }`
-  - `pub struct WatchEvent { pub root: PathBuf, pub path: PathBuf, pub kind: WatchEventKind }`
+  - `pub struct WatchEvent { pub root: PathBuf, pub path: PathBuf, pub kind: WatchEventKind, pub new_path: Option<PathBuf> }` (`new_path` is `Some` only for `Rename`: old path in `path`, destination in `new_path`; `None` for all other kinds)
   - `pub struct PathEffect { pub path: PathBuf, pub upsert: bool }`
   - `#[async_trait] pub trait WatchEventSource: Send { async fn recv(&mut self) -> Option<WatchEvent>; fn watch_root(&mut self, root: &Path) -> Result<(), String>; fn unwatch_root(&mut self, root: &Path) -> Result<(), String>; }`
   - `pub trait WatchRegistrationStore: Send + Sync { fn load(&self) -> anyhow::Result<Vec<Registration>>; fn save(&self, regs: &[Registration]) -> anyhow::Result<()>; }`
@@ -64,7 +64,7 @@
 
 - [ ] **Step 1: Write failing tests for pure decisions and eligibility**
 
-In `src/ingest_watch.rs` tests assert: `normalize_event` on `Rename` yields exactly two effects (`upsert=false` old, `upsert=true` new); on `Create`/`Modify`/`Remove` yields one effect with the matching `upsert` flag. `should_flush` false below 300 ms quiet and below 2 s window; true at 300 ms quiet; true at 2 s window even under continuous events. `next_backoff(0..5)` equals 1,2,4,8,16,30 seconds and `next_backoff(6)` stays 30 s.
+In `src/ingest_watch.rs` tests assert: `normalize_event` on `Rename` yields exactly two effects (`upsert=false` for `event.path`, `upsert=true` for `event.new_path`, which must differ); on `Create`/`Modify`/`Remove` yields one effect with the matching `upsert` flag. `should_flush` false below 300 ms quiet and below 2 s window; true at 300 ms quiet; true at 2 s window even under continuous events. `next_backoff(0..5)` equals 1,2,4,8,16,30 seconds and `next_backoff(6)` stays 30 s.
 
 In `src/parser/ingest.rs` tests assert: all 19 existing skip names (verbatim: `node_modules, target, vendor, .venv, venv, env, .env, dist, build, out, .dolt, .git, .next, .nuxt, __pycache__, .fastembed_cache, .idea, .vscode, coverage`) rejected anywhere in a path under root; `*.db`, `*.wal`, and lock/checkpoint sidecars rejected; a plain `src/lib.rs` under root accepted; paths outside root rejected.
 
@@ -171,7 +171,7 @@ Expected: compile failure — missing adapters/loop.
 
 - [ ] **Step 3: Implement adapters and event loop**
 
-Implement `NotifyEventSource`: translate `notify` create/modify/remove/rename kinds into `WatchEvent`; watcher callback sends into the unbounded channel; `watch_root`/`unwatch_root` delegate to `notify::Watcher`. Implement `IngestJobsTrigger` mapping `IngestProgress.state` to `TriggerState` and error text to `TriggerOutcome.error`. Implement `run`: filter through `is_ingest_eligible_path`, normalize to `PathEffect`s, insert into per-root `pending`, compute flush deadline from first event (max window) and last event (quiet period), call `should_flush`/`next_backoff`, trigger via port, update runtime/status, retry on failure without crashing. On shutdown, stop accepting events; rely on `IngestJobs::wait_idle` at the daemon layer for in-flight walks.
+Implement `NotifyEventSource`: translate `notify` create/modify/remove/rename kinds into `WatchEvent`; for rename populate `path` with the old path and `new_path` with the destination from notify's rename payload; watcher callback sends into the unbounded channel; `watch_root`/`unwatch_root` delegate to `notify::Watcher`. Implement `IngestJobsTrigger` mapping `IngestProgress.state` to `TriggerState` and error text to `TriggerOutcome.error`. Implement `run`: filter through `is_ingest_eligible_path`, normalize to `PathEffect`s, insert into per-root `pending`, compute flush deadline from first event (max window) and last event (quiet period), call `should_flush`/`next_backoff`, trigger via port, update runtime/status, retry on failure without crashing. On shutdown, stop accepting events; rely on `IngestJobs::wait_idle` at the daemon layer for in-flight walks.
 
 - [ ] **Step 4: Add and run the single real-watcher integration test**
 
