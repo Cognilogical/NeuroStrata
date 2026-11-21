@@ -5589,4 +5589,190 @@ mod tests {
             "snapshot taxonomy must expose the annotation: {snap}"
         );
     }
+
+    /// #334/C1: compare must reject more than 64 slugs before any pair work.
+    #[tokio::test]
+    async fn compare_rejects_slugs_beyond_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-cap-slugs";
+        store.init(ns).await.expect("init");
+
+        let slugs: Vec<String> = (0..65).map(|i| format!("slug-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(slugs),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("65 slugs must be rejected");
+        assert!(
+            err.contains("at most 64"),
+            "expected the slug cap error, got: {err}"
+        );
+    }
+
+    /// #334/C1: compare must reject more than 32 evaluation axes.
+    #[tokio::test]
+    async fn compare_rejects_axes_beyond_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-cap-axes";
+        store.init(ns).await.expect("init");
+
+        for slug in ["axis-a", "axis-b"] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("cap fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed concept");
+        }
+
+        let axes: Vec<String> = (0..33).map(|i| format!("axis-{i}")).collect();
+        let err = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "compare".to_string(),
+                namespace: ns.to_string(),
+                slugs: Some(vec!["axis-a".to_string(), "axis-b".to_string()]),
+                axes: Some(axes),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect_err("33 axes must be rejected");
+        assert!(
+            err.contains("at most 32"),
+            "expected the axis cap error, got: {err}"
+        );
+    }
+
+    /// #334/C2: `max_hops` must cap tree depth.
+    #[tokio::test]
+    async fn tree_honours_max_hops() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-hops";
+        store.init(ns).await.expect("init");
+
+        for (slug, broader) in [
+            ("alpha", None),
+            ("beta", Some("alpha")),
+            ("gamma", Some("beta")),
+        ] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("tree fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    broader: broader.map(|b| vec![b.to_string()]),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed tree");
+        }
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                root_slug: Some("alpha".to_string()),
+                max_hops: Some(1),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with max_hops");
+
+        let root = &tree["roots"][0];
+        assert_eq!(root["slug"], "alpha");
+        let children = root["children"].as_array().expect("children");
+        assert_eq!(children.len(), 1, "one hop must expose only beta: {root}");
+        assert_eq!(children[0]["slug"], "beta");
+        assert_eq!(
+            children[0]["children"].as_array().unwrap().len(),
+            0,
+            "gamma is beyond max_hops=1: {root}"
+        );
+    }
+
+    /// #334/C2: `limit` must cap the number of returned roots.
+    #[tokio::test]
+    async fn tree_honours_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::for_testing(tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "tax-tree-limit";
+        store.init(ns).await.expect("init");
+
+        for slug in ["alpha", "delta"] {
+            execute_taxonomy(
+                &store,
+                &embedder,
+                TaxonomyRequest {
+                    operation: "upsert_concept".to_string(),
+                    namespace: ns.to_string(),
+                    slug: Some(slug.to_string()),
+                    pref_label: Some(slug.to_string()),
+                    definition: Some("root fixture".to_string()),
+                    domain: Some("testing".to_string()),
+                    ..Default::default()
+                },
+                &sec("alice"),
+            )
+            .await
+            .expect("seed root");
+        }
+
+        let tree = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "tree".to_string(),
+                namespace: ns.to_string(),
+                limit: Some(1),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("tree with limit");
+        assert_eq!(
+            tree["roots"].as_array().unwrap().len(),
+            1,
+            "limit=1 must return one root: {tree}"
+        );
+    }
 }
