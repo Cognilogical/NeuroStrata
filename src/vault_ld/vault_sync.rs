@@ -2819,4 +2819,288 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
     }
+
+    /// #335: task rows carry no `canonical_sha256`, so the unchanged check
+    /// must derive identity from the prior payload. An unchanged round-trip
+    /// must neither replace the head nor drop `metadata.task`.
+    #[tokio::test]
+    async fn import_unchanged_task_roundtrip_is_a_noop_and_keeps_task_state() {
+        let root = std::env::temp_dir().join(format!("ns-task-noop-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_task_noop";
+        store.init(ns).await.expect("init");
+        let task_meta = serde_json::json!({
+            "status": "done",
+            "session_id": "sess-1",
+            "assignee": "agent-a",
+            "blocked_by": ["other-task"],
+            "history": [{"at": 1, "note": "claimed"}],
+            "created_at": 1,
+            "updated_at": 2
+        });
+        store
+            .upsert(
+                ns,
+                "task-1",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "Ship the vault fix".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: Some("agent-a".to_string()),
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "task": task_meta.clone() }),
+                },
+            )
+            .await
+            .expect("seed task head");
+
+        let mut exported = note("task-1", &[]);
+        exported.rdf_type = "yaml:task".to_string();
+        exported.epistemic_tier = "task".to_string();
+        exported.content = "Ship the vault fix".to_string();
+        exported.canonical_sha256 = exported.fingerprint();
+        std::fs::write(vault.join("task-1.md"), exported.to_markdown()).expect("write task note");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert_eq!(
+            result.notes_imported, 0,
+            "unchanged task round-trip must be a no-op: {:?}",
+            result.errors
+        );
+        let (_, head) = store.get(ns, "task-1").await.unwrap().unwrap();
+        assert_eq!(head.content, "Ship the vault fix");
+        assert_eq!(head.memory_type, "task");
+        assert_eq!(head.metadata["task"], task_meta);
+        assert!(
+            head.metadata.get("supersedes").is_none(),
+            "unchanged import must not retire the head"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #335: an edited task reimport must keep the prior head's structured
+    /// task state (status, claim, blockers, history) on the new live head.
+    #[tokio::test]
+    async fn import_task_edit_preserves_task_state() {
+        let root = std::env::temp_dir().join(format!("ns-task-edit-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_task_edit";
+        store.init(ns).await.expect("init");
+        let task_meta = serde_json::json!({
+            "status": "in_progress",
+            "session_id": "sess-1",
+            "assignee": "agent-a",
+            "blocked_by": ["other-task"],
+            "history": [{"at": 1, "note": "claimed"}]
+        });
+        store
+            .upsert(
+                ns,
+                "task-2",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "Original task body".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: Some("agent-a".to_string()),
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "task": task_meta.clone() }),
+                },
+            )
+            .await
+            .expect("seed task head");
+
+        let mut edited = note("task-2", &[]);
+        edited.rdf_type = "yaml:task".to_string();
+        edited.epistemic_tier = "task".to_string();
+        edited.content = "Edited task body".to_string();
+        edited.canonical_sha256 = edited.fingerprint();
+        std::fs::write(vault.join("task-2.md"), edited.to_markdown()).expect("write task note");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let (_, head) = store.get(ns, "task-2").await.unwrap().unwrap();
+        assert_eq!(head.content, "Edited task body");
+        assert_eq!(head.memory_type, "task");
+        assert_eq!(
+            head.metadata["task"], task_meta,
+            "task state must survive an edited reimport"
+        );
+        let history_id = head.metadata["supersedes"].as_str().expect("supersedes");
+        let (_, history) = store.get(ns, history_id).await.unwrap().unwrap();
+        assert_eq!(history.content, "Original task body");
+        assert_eq!(history.metadata["task"], task_meta);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #336: a WikiLink target that exists in the store but whose file is
+    /// absent from the vault must not be replaced by a stub.
+    #[tokio::test]
+    async fn import_does_not_stub_over_existing_head_absent_from_vault() {
+        let root = std::env::temp_dir().join(format!("ns-stub-over-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_stub_over";
+        store.init(ns).await.expect("init");
+        store
+            .upsert(
+                ns,
+                "existing-target",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "Real knowledge".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "canonical_sha256": "seed-hash",
+                        "visible_to": ["default"]
+                    }),
+                },
+            )
+            .await
+            .expect("seed existing target");
+
+        // Only the linker is in the vault; the target's own file is absent.
+        std::fs::write(
+            vault.join("linker.md"),
+            note("linker", &["existing-target"]).to_markdown(),
+        )
+        .expect("write linker note");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("existing-target") && e.to_lowercase().contains("stub")),
+            "the unresolved-but-present target must be reported: {:?}",
+            result.errors
+        );
+        let (_, head) = store
+            .get(ns, "existing-target")
+            .await
+            .unwrap()
+            .expect("existing target must remain");
+        assert_eq!(head.content, "Real knowledge");
+        assert_eq!(head.memory_type, "fact");
+        assert!(
+            head.metadata.get("stub").is_none() || head.metadata["stub"] == serde_json::json!(false),
+            "existing head must not be marked as a stub: {:?}",
+            head.metadata
+        );
+        assert!(
+            head.metadata.get("supersedes").is_none(),
+            "existing head must not be retired by a stub"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #337: a `.md` symlink inside an authorized vault that resolves outside
+    /// the project root (and allowlist) must be refused, not imported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn import_refuses_md_symlink_outside_authorized_roots() {
+        let root = std::env::temp_dir().join(format!("ns-symlink-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("ns-symlink-out-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_symlink";
+        store.init(ns).await.expect("init");
+
+        std::fs::write(vault.join("good.md"), note("good", &[]).to_markdown())
+            .expect("write good note");
+        let escaped = outside.join("escape-note.md");
+        std::fs::write(&escaped, note("escape-note", &[]).to_markdown())
+            .expect("write outside note");
+        std::os::unix::fs::symlink(&escaped, vault.join("escape.md")).expect("symlink escape");
+
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.clone()),
+            allowed_external_dirs: None,
+        };
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert_eq!(
+            result.notes_imported, 1,
+            "only the in-bound note may import: {:?}",
+            result.errors
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("escape.md") && e.to_lowercase().contains("refus")),
+            "the escaping symlink must be refused by name: {:?}",
+            result.errors
+        );
+        assert!(
+            store.get(ns, "escape-note").await.unwrap().is_none(),
+            "content outside the authority boundary must not enter the store"
+        );
+        assert!(store.get(ns, "good").await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
 }
