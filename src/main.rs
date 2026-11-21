@@ -942,6 +942,10 @@ pub(crate) enum RootCommands {
         /// Namespace to audit (default: the marker's namespace)
         #[arg(long)]
         namespace: Option<String>,
+        /// A planned new root: print the corrections relative to it, so that
+        /// applying them and then running `root set <path>` loses nothing
+        #[arg(long = "for-root")]
+        for_root: Option<std::path::PathBuf>,
         /// Print the report as JSON
         #[arg(long)]
         json: bool,
@@ -2512,8 +2516,8 @@ impl crate::root_marker::RootRegistry for DaemonRootRegistry {
         serde_json::from_value(v["rows"].clone()).map_err(|e| e.to_string())
     }
 
-    async fn set_root(&self, namespace: &str, root: &std::path::Path) -> bool {
-        let sent = daemon_http_client()
+    async fn set_root(&self, namespace: &str, root: &std::path::Path) -> Result<(), String> {
+        let res = daemon_http_client()
             .post("http://127.0.0.1:34343/cli/root")
             .json(&serde_json::json!({
                 "op": "cache_root",
@@ -2522,13 +2526,17 @@ impl crate::root_marker::RootRegistry for DaemonRootRegistry {
             }))
             .timeout(std::time::Duration::from_secs(30))
             .send()
-            .await;
-        match sent {
-            Ok(res) if res.status().is_success() => res
-                .json::<serde_json::Value>()
-                .await
-                .is_ok_and(|v| v["ok"].as_bool() == Some(true)),
-            _ => false,
+            .await
+            .map_err(|e| format!("daemon: {e}"))?;
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            return Err(format!("the daemon answered {status} on /cli/root: {}", body.trim()));
+        }
+        match res.json::<serde_json::Value>().await {
+            Ok(v) if v["ok"].as_bool() == Some(true) => Ok(()),
+            Ok(_) => Err("the daemon could not write the registry row".to_string()),
+            Err(e) => Err(format!("daemon: {e}")),
         }
     }
 }
@@ -2579,13 +2587,16 @@ struct HooksInstallReport {
     err: Vec<String>,
 }
 
-/// `hooks install` in the git checkout `root`: the marker step (the
-/// namespace resolved from this process's environment; the registry opened
-/// by `open_registry` only when a namespace is known), then the hooks and
-/// plugins. Another namespace's marker installs nothing (exit 1); every other
-/// marker outcome still installs the hooks.
+/// `hooks install` in the git checkout `root`, run from `caller_dir`: the
+/// marker step (the namespace resolved from this process's environment; the
+/// registry opened by `open_registry` only when a namespace is known), then
+/// the hooks and plugins. Another namespace's marker, or a split subfolder
+/// of another namespace around `caller_dir`, installs nothing (exit 1); every
+/// other marker outcome still installs the hooks. A cached root that could
+/// not be set exits 1 after installing.
 async fn run_hooks_install<F>(
     root: &std::path::Path,
+    caller_dir: &std::path::Path,
     force: bool,
     namespace: Option<&str>,
     open_registry: impl FnOnce() -> F,
@@ -2594,15 +2605,45 @@ where
     F: std::future::Future<Output = Result<Box<dyn crate::root_marker::RootRegistry>, String>>,
 {
     use crate::root_marker::SetupMarker;
+    use crate::task::harness_plugins::ConfigNamespace;
     let mut report = HooksInstallReport::default();
+    let named = namespace.is_some();
     let namespace = match namespace {
         Some(ns) => Ok(ns.to_string()),
         None => crate::task::harness_plugins::explicit_namespace(root),
     };
-    let (message, marker_root) = match namespace {
-        Err(candidates) => (SetupMarker::AskNamespace(candidates).message("", root), None),
+    // A split subfolder around the caller (a deeper marker than the checkout
+    // top's) whose namespace is not the one being installed, or whose
+    // checkout top belongs to another namespace: the hooks are the checkout
+    // top's, so the caller is sent there (replacing a marker would not help).
+    if let (Ok(ns), Ok(Some(split))) = (&namespace, crate::root_marker::find_root_marker(caller_dir)) {
+        // `relative_to_on_disk` answers only for a folder strictly below.
+        let deeper =
+            crate::paths::relative_to_on_disk(&split.root.to_string_lossy(), &root.to_string_lossy()).is_some();
+        let top_is_other = matches!(
+            crate::root_marker::find_root_marker(root),
+            Ok(Some(top)) if !top.config.namespace.eq_ignore_ascii_case(ns)
+        );
+        if deeper && (!split.config.namespace.eq_ignore_ascii_case(ns) || top_is_other) {
+            report.err.push(format!(
+                "{} is inside {}, a split subfolder of namespace {} ({}). `hooks install` works on the \
+                 checkout top {}, so nothing was installed for {ns}. Run `neurostrata-mcp hooks install` from {}.",
+                caller_dir.display(),
+                split.root.display(),
+                split.config.namespace,
+                split.root.join(crate::root_marker::ROOT_CONFIG_REL).display(),
+                root.display(),
+                root.display()
+            ));
+            report.code = 1;
+            return report;
+        }
+    }
+    let chosen: Option<String> = namespace.as_ref().ok().cloned();
+    let (message, marker_root, failed) = match namespace {
+        Err(candidates) => (SetupMarker::AskNamespace(candidates).message("", root), None, false),
         Ok(ns) => match open_registry().await {
-            Err(why) => (Some(format!("No .NeuroStrata/config.json written: {why}.")), None),
+            Err(why) => (Some(format!("No .NeuroStrata/config.json written: {why}.")), None, false),
             Ok(registry) => {
                 let outcome =
                     crate::root_marker::ensure_marker_with(registry.as_ref(), root, Some(&ns)).await;
@@ -2612,33 +2653,49 @@ where
                     report.code = 1;
                     return report;
                 }
-                (outcome.message(&ns, root), outcome.root().map(std::path::Path::to_path_buf))
+                (
+                    outcome.message(&ns, root),
+                    outcome.root().map(std::path::Path::to_path_buf),
+                    outcome.failed(),
+                )
             }
         },
     };
     match install_pre_push_hook(root, force) {
         Ok(target) => {
             let _ = install_pre_commit_hook(root);
-            // Harness configs get a namespace only from an explicit source
-            // (the marker, a harness config or NEUROSTRATA_NAMESPACE), never
-            // the ledger or the folder name; each config keeps its own.
-            let explicit = match crate::task::harness_plugins::namespace_for_refresh(root, true) {
-                Ok(ns) => ns,
-                Err(e) => {
-                    report.err.push(format!("warning: harness configs left as they are: {e}"));
-                    None
+            // The harness configs get the namespace the marker step used:
+            // `--namespace` goes into every config; a namespace a marker now
+            // covers the checkout for goes into configs that name none.
+            // Otherwise (the step asked, or wrote no marker) a config gets a
+            // namespace only from an explicit source (a harness config or
+            // NEUROSTRATA_NAMESPACE), never the ledger or the folder name.
+            let refreshed: Option<String>;
+            let config_namespace = match (&chosen, named, marker_root.is_some()) {
+                (Some(ns), true, _) => ConfigNamespace::Set(ns),
+                (Some(ns), false, true) => ConfigNamespace::Keep(Some(ns)),
+                _ => {
+                    refreshed = match crate::task::harness_plugins::namespace_for_refresh(root, true) {
+                        Ok(ns) => ns,
+                        Err(e) => {
+                            report.err.push(format!("warning: harness configs left as they are: {e}"));
+                            None
+                        }
+                    };
+                    ConfigNamespace::Keep(refreshed.as_deref())
                 }
             };
-            let _ = crate::task::harness_plugins::auto_install_detected_plugins(
-                root,
-                crate::task::harness_plugins::ConfigNamespace::Keep(explicit.as_deref()),
-                None,
-            );
+            let _ = crate::task::harness_plugins::auto_install_detected_plugins(root, config_namespace, None);
             report.out.push(format!(
                 "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
                 target.display()
             ));
-            report.out.extend(message);
+            if failed {
+                report.err.extend(message);
+                report.code = 1;
+            } else {
+                report.out.extend(message);
+            }
             report
                 .out
                 .extend(marker_root.as_deref().and_then(crate::root_marker::commit_advice));
@@ -2659,9 +2716,20 @@ where
 async fn run_root_audit(
     dir: Option<&std::path::PathBuf>,
     namespace: Option<&str>,
+    for_root: Option<&std::path::PathBuf>,
     json: bool,
 ) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
+    let planned = match for_root {
+        Some(p) => {
+            let p = cwd.join(p);
+            if !p.is_dir() {
+                anyhow::bail!("--for-root {} is not an existing folder", p.display());
+            }
+            Some(dunce::canonicalize(&p).unwrap_or(p))
+        }
+        None => None,
+    };
     let dir = dir.map(|d| cwd.join(d)).unwrap_or(cwd);
     if !dir.exists() {
         anyhow::bail!("{} does not exist", dir.display());
@@ -2718,7 +2786,11 @@ async fn run_root_audit(
             ),
         },
     };
-    let bindings = Config::load().map(|c| c.project_contexts).unwrap_or_default();
+    // A config that cannot be read is an error: dropping its bindings would
+    // turn refs bound to another root into fixable rows. A missing one has
+    // no bindings.
+    let bindings =
+        root_show_bindings().map_err(|e| anyhow::anyhow!("root audit cannot read the config: {e}"))?;
     let report = match source {
         CliReadStore::Daemon => {
             let v = cli_read_op(
@@ -2728,16 +2800,21 @@ async fn run_root_audit(
             .await
             .map_err(|e| anyhow::anyhow!("root audit cannot read the store: daemon: {e}"))?;
             let rows: Vec<crate::traits::SearchResult> = serde_json::from_value(v["rows"].clone())?;
-            crate::root_audit::audit_rows(&rows, &namespace, &root, &bindings)
+            crate::root_audit::audit_rows_for(&rows, &namespace, &root, planned.as_deref(), &bindings)
         }
         CliReadStore::Direct(store, _lock) => {
-            crate::root_audit::audit_namespace(&store, &namespace, &root, &bindings).await?
+            crate::root_audit::audit_namespace(&store, &namespace, &root, planned.as_deref(), &bindings)
+                .await?
         }
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("root: {}\nnamespace: {namespace}\n", root.display());
+        println!("root: {}", root.display());
+        if let Some(planned) = &planned {
+            println!("planned root: {}", planned.display());
+        }
+        println!("namespace: {namespace}\n");
         println!("{}", report.to_text());
     }
     Ok(report.exit_code())
@@ -4450,7 +4527,7 @@ mod tests {
         match cli.command {
             Some(Commands::Root { action }) => assert_eq!(
                 action,
-                RootCommands::Audit { dir: None, namespace: None, json: false }
+                RootCommands::Audit { dir: None, namespace: None, for_root: None, json: false }
             ),
             other => panic!("expected Root/Audit, got {:?}", other),
         }
@@ -4464,8 +4541,18 @@ mod tests {
                 RootCommands::Audit {
                     dir: Some("some/dir".into()),
                     namespace: Some("example-project".to_string()),
+                    for_root: None,
                     json: true,
                 }
+            ),
+            other => panic!("expected Root/Audit, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "root", "audit", "--for-root", "/repo"])
+            .expect("parses --for-root");
+        match cli.command {
+            Some(Commands::Root { action }) => assert_eq!(
+                action,
+                RootCommands::Audit { dir: None, namespace: None, for_root: Some("/repo".into()), json: false }
             ),
             other => panic!("expected Root/Audit, got {:?}", other),
         }
@@ -6277,7 +6364,7 @@ mod tests {
         let root = hooks_repo(&tmp, "example-project");
         let opened = std::sync::atomic::AtomicBool::new(false);
         let opened_ref = &opened;
-        let report = run_hooks_install(&root, false, None, move || async move {
+        let report = run_hooks_install(&root, &root, false, None, move || async move {
             opened_ref.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(mock_registry())
         })
@@ -6306,7 +6393,7 @@ mod tests {
             Vec::<(String, String)>::new(),
             "no harness config may carry the folder name"
         );
-        let report = run_hooks_install(&root, false, None, || async { Ok(mock_registry()) }).await;
+        let report = run_hooks_install(&root, &root, false, None, || async { Ok(mock_registry()) }).await;
         assert_eq!(report.code, 0, "{report:?}");
         assert!(
             report.out.iter().any(|l| l.contains("hooks install --namespace <ns>") && l.contains("example-project")),
@@ -6322,7 +6409,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".NeuroStrata")).unwrap();
         std::fs::write(marker_file(&root), br#"{"version":1,"namespace":"other-project"}"#).unwrap();
         let report =
-            run_hooks_install(&root, false, Some("example-project"), || async { Ok(mock_registry()) }).await;
+            run_hooks_install(&root, &root, false, Some("example-project"), || async { Ok(mock_registry()) }).await;
         assert_eq!(report.code, 1, "{report:?}");
         assert!(report.err.iter().any(|l| l.contains("other-project")), "{report:?}");
         assert!(report.out.is_empty(), "{report:?}");
@@ -6339,7 +6426,7 @@ mod tests {
     async fn hooks_install_with_daemon_unreachable_installs_hooks_without_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let root = hooks_repo(&tmp, "example-project");
-        let report = run_hooks_install(&root, false, Some("example-project"), || async {
+        let report = run_hooks_install(&root, &root, false, Some("example-project"), || async {
             Err("no daemon answered and the store is locked".to_string())
         })
         .await;
@@ -6353,12 +6440,110 @@ mod tests {
         assert!(!marker_file(&root).exists());
     }
 
+    fn harness_config_namespaces(root: &std::path::Path) -> Vec<(String, String)> {
+        crate::task::harness_plugins::resolve_namespace(root)
+            .map(|r| r.configs)
+            .unwrap_or_default()
+    }
+
+    /// A bare `hooks install` that has to ask writes no namespace into a
+    /// harness config, so a second run still asks instead of writing a
+    /// marker for the folder name.
+    #[tokio::test]
+    async fn hooks_install_twice_without_a_namespace_still_asks() {
+        let _env = crate::daemon::project_root_env_test_lock();
+        std::env::remove_var("NEUROSTRATA_NAMESPACE");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = hooks_repo(&tmp, "example-project");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        for run in 1..=2 {
+            let report = run_hooks_install(&root, &root, false, None, || async { Ok(mock_registry()) }).await;
+            assert_eq!(report.code, 0, "run {run}: {report:?}");
+            assert!(
+                report.out.iter().any(|l| l.contains("hooks install --namespace <ns>")),
+                "run {run}: {report:?}"
+            );
+            assert!(!marker_file(&root).exists(), "run {run}: {report:?}");
+            assert_eq!(harness_config_namespaces(&root), Vec::<(String, String)>::new(), "run {run}");
+        }
+        assert!(root.join(".NeuroStrata").join("plugins").join("claude").exists());
+    }
+
+    /// `--namespace` is the plugins' namespace too, even when the marker
+    /// step could not run.
+    #[tokio::test]
+    async fn hooks_install_namespace_flag_reaches_the_harness_configs() {
+        let _env = crate::daemon::project_root_env_test_lock();
+        std::env::remove_var("NEUROSTRATA_NAMESPACE");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = hooks_repo(&tmp, "example-project");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let report = run_hooks_install(&root, &root, false, Some("team-project"), || async {
+            Err("no daemon answered and the store is locked".to_string())
+        })
+        .await;
+        assert_eq!(report.code, 0, "{report:?}");
+        assert!(!marker_file(&root).exists());
+        let configs = harness_config_namespaces(&root);
+        assert!(!configs.is_empty(), "{report:?}");
+        assert!(configs.iter().all(|(_, ns)| ns == "team-project"), "{configs:?}");
+    }
+
+    /// The marker is written but the cached root cannot be set: the hooks
+    /// are installed and the command fails, saying why.
+    #[tokio::test]
+    async fn hooks_install_fails_when_the_cached_root_is_not_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = hooks_repo(&tmp, "example-project");
+        let report = run_hooks_install(&root, &root, false, Some("example-project"), || async {
+            Ok(Box::new(crate::root_marker::StoreRegistry {
+                store: Arc::new(crate::guard::testkit::MockStore::new()),
+                emb: None,
+                checkpoint: false,
+            }) as Box<dyn crate::root_marker::RootRegistry>)
+        })
+        .await;
+        assert_eq!(report.code, 1, "{report:?}");
+        assert!(root.join(".git").join("hooks").join("pre-push").is_file());
+        assert!(marker_file(&root).is_file());
+        assert!(report.err.iter().any(|l| l.contains("could not be set")), "{report:?}");
+    }
+
+    /// Run inside a split subfolder of another namespace, `hooks install`
+    /// installs nothing and sends the caller to the checkout top; it never
+    /// suggests replacing a marker.
+    #[tokio::test]
+    async fn hooks_install_inside_another_namespace_split_refuses() {
+        let _env = crate::daemon::project_root_env_test_lock();
+        std::env::remove_var("NEUROSTRATA_NAMESPACE");
+        let tmp = tempfile::tempdir().unwrap();
+        let root = hooks_repo(&tmp, "example-project");
+        let api = root.join("api");
+        for (dir, ns) in [(&root, "outer-project"), (&api, "inner-project")] {
+            std::fs::create_dir_all(dir.join(".NeuroStrata")).unwrap();
+            std::fs::write(marker_file(dir), format!(r#"{{"version":1,"namespace":"{ns}"}}"#)).unwrap();
+        }
+        for namespace in [Some("outer-project"), None, Some("inner-project")] {
+            let report =
+                run_hooks_install(&root, &api, false, namespace, || async { Ok(mock_registry()) }).await;
+            assert_eq!(report.code, 1, "{namespace:?}: {report:?}");
+            let text = report.err.join("\n");
+            assert!(text.contains("inner-project") && text.contains("split"), "{text}");
+            assert!(!text.contains("--replace"), "{text}");
+            assert!(!root.join(".git").join("hooks").join("pre-push").exists());
+        }
+        // From the checkout top it installs.
+        let report =
+            run_hooks_install(&root, &root, false, None, || async { Ok(mock_registry()) }).await;
+        assert_eq!(report.code, 0, "{report:?}");
+    }
+
     #[tokio::test]
     async fn hooks_install_with_namespace_writes_marker_and_hooks() {
         let tmp = tempfile::tempdir().unwrap();
         let root = hooks_repo(&tmp, "example-project");
         let report =
-            run_hooks_install(&root, false, Some("example-project"), || async { Ok(mock_registry()) }).await;
+            run_hooks_install(&root, &root, false, Some("example-project"), || async { Ok(mock_registry()) }).await;
         assert_eq!(report.code, 0, "{report:?}");
         assert!(root.join(".git").join("hooks").join("pre-push").is_file());
         assert!(marker_file(&root).is_file());
@@ -6961,8 +7146,9 @@ async fn run() -> anyhow::Result<()> {
                     crate::root_marker::format_root_show(&folder, &found, &namespace, &cached, &bindings)
                 );
             }
-            RootCommands::Audit { dir, namespace, json } => {
-                let code = run_root_audit(dir.as_ref(), namespace.as_deref(), *json).await?;
+            RootCommands::Audit { dir, namespace, for_root, json } => {
+                let code =
+                    run_root_audit(dir.as_ref(), namespace.as_deref(), for_root.as_ref(), *json).await?;
                 if code != 0 {
                     std::process::exit(code);
                 }
@@ -8177,7 +8363,9 @@ async fn run() -> anyhow::Result<()> {
                         );
                         std::process::exit(1);
                     }
-                    let report = run_hooks_install(&root, force, namespace.as_deref(), || async {
+                    let caller_dir = std::env::current_dir().unwrap_or_else(|_| root.clone());
+                    let caller_dir = dunce::canonicalize(&caller_dir).unwrap_or(caller_dir);
+                    let report = run_hooks_install(&root, &caller_dir, force, namespace.as_deref(), || async {
                         open_cli_root_registry(probe_daemon().await).await
                     })
                     .await;

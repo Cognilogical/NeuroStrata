@@ -47,10 +47,14 @@ pub enum UndecidedWhy {
     /// A path whose `source_context.source_id` is bound to a project context
     /// whose root is not this one.
     OtherSourceRoot,
-    /// An absolute `location` inside the root that is not the first ref's
-    /// path: supersede sets `location` from the first of `locations`, so the
-    /// call would replace it.
+    /// A `location` that is not the first ref's path once both are spelled
+    /// relative to the root: supersede sets `location` from the first of
+    /// `locations`, so the call would replace it.
     LocationDiffersFromFirstRef,
+    /// `--for-root`: a relative path that names a file under the current root
+    /// that lies outside the planned root, so no key under the planned root
+    /// names it.
+    OutsidePlannedRoot,
 }
 
 impl UndecidedWhy {
@@ -62,6 +66,9 @@ impl UndecidedWhy {
             UndecidedWhy::OtherSourceRoot => "its source_id is bound to a different root",
             UndecidedWhy::LocationDiffersFromFirstRef => {
                 "location differs from the first ref; supersede would replace it with the first ref's path"
+            }
+            UndecidedWhy::OutsidePlannedRoot => {
+                "names a file under the current root that is outside the planned root"
             }
         }
     }
@@ -166,41 +173,70 @@ fn location_is_path(location: &str) -> bool {
 }
 
 /// A `governs` entry that names a path rather than a memory id, a symbol id or
-/// a domain (the rule `related` applies to its seeds).
-fn governs_is_path(entry: &str) -> bool {
+/// a domain (the rule `related` applies to its seeds). A bare name without a
+/// separator (`Cargo.toml`) is a path when a file of that name exists under
+/// one of `roots`.
+fn governs_is_path(entry: &str, roots: &[&Path]) -> bool {
     if crate::paths::is_absolute_any(entry) {
         return true;
     }
     if entry.contains("::") || entry.starts_with("file:") {
         return false;
     }
-    entry.contains('/') || entry.contains('\\')
+    if entry.contains('/') || entry.contains('\\') {
+        return true;
+    }
+    let name = entry.trim();
+    !name.is_empty() && roots.iter().any(|root| root.join(name).is_file())
 }
 
 fn ends_with_separator(raw: &str) -> bool {
     raw.ends_with('/') || raw.ends_with('\\')
 }
 
-fn same_folder(a: &Path, b: &Path) -> bool {
-    match (dunce::canonicalize(a), dunce::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
+/// The roots an audit judges paths against: the current root, whose files
+/// the stored relative keys name today, and the root the corrections are
+/// spelled relative to (the same one unless `--for-root` names a planned
+/// root).
+struct Roots<'a> {
+    current: &'a Path,
+    target: &'a Path,
+    target_str: String,
+    planned: bool,
+}
+
+impl<'a> Roots<'a> {
+    fn new(current: &'a Path, planned: Option<&'a Path>) -> Self {
+        let target = planned.unwrap_or(current);
+        Roots {
+            current,
+            target,
+            target_str: target.to_string_lossy().to_string(),
+            planned: planned.is_some_and(|p| !crate::root_marker::same_folder(p, current)),
+        }
+    }
+
+    fn both(&self) -> [&Path; 2] {
+        [self.current, self.target]
     }
 }
 
 /// What one stored path needs.
 enum Verdict {
-    /// Absolute and inside the root: this project-relative spelling.
+    /// This spelling, relative to the target root.
     Rewrite(String),
     /// Relative and names nothing under the root.
     Missing,
+    /// Relative, names a file under the current root, but that file is
+    /// outside the planned root.
+    OutsideTarget,
     /// Already fine, or not this audit's business (absolute outside the root).
     Keep,
 }
 
-fn judge(raw: &str, root: &Path, root_str: &str) -> Verdict {
+fn judge(raw: &str, roots: &Roots) -> Verdict {
     if crate::paths::is_absolute_any(raw) {
-        let lookup = to_project_relative(raw, Some(root_str), None);
+        let lookup = to_project_relative(raw, Some(&roots.target_str), None);
         if lookup.source != RootSource::ProjectRoot || lookup.path.is_empty() {
             return Verdict::Keep;
         }
@@ -212,10 +248,42 @@ fn judge(raw: &str, root: &Path, root_str: &str) -> Verdict {
     }
     let bare = raw.split('#').next().unwrap_or(raw);
     let key = crate::parser::ingest::normalize_node_path(bare);
-    if key.is_empty() || root.join(&key).exists() {
+    if key.is_empty() {
+        return Verdict::Keep;
+    }
+    let under_current = roots.current.join(&key);
+    if !roots.planned {
+        return if under_current.exists() { Verdict::Keep } else { Verdict::Missing };
+    }
+    // A planned root: a key that names a file under the current root is
+    // spelled relative to the planned root; one that does not, but names a
+    // file under the planned root, already fits it.
+    if under_current.exists() {
+        return match relative_to_on_disk(&under_current.to_string_lossy(), &roots.target_str) {
+            Some(rel) if rel == key => Verdict::Keep,
+            Some(mut rel) => {
+                if ends_with_separator(bare) && !rel.ends_with('/') {
+                    rel.push('/');
+                }
+                rel.push_str(&raw[bare.len()..]);
+                Verdict::Rewrite(rel)
+            }
+            None => Verdict::OutsideTarget,
+        };
+    }
+    if roots.target.join(&key).exists() {
         Verdict::Keep
     } else {
         Verdict::Missing
+    }
+}
+
+/// `raw` as the call would store it: the rewritten spelling, else the stored
+/// one, normalized for comparison.
+fn spelled_key(raw: &str, roots: &Roots) -> String {
+    match judge(raw, roots) {
+        Verdict::Rewrite(rel) => crate::parser::ingest::normalize_node_path(&rel),
+        _ => crate::parser::ingest::normalize_node_path(raw),
     }
 }
 
@@ -236,7 +304,7 @@ fn bound_elsewhere(reference: &Value, root: &Path, bindings: &HashMap<String, Pa
     };
     // A binding names the `.NeuroStrata` folder; its parent is the root.
     let bound_root = context_dir.parent().unwrap_or(context_dir);
-    !same_folder(bound_root, root)
+    !crate::root_marker::same_folder(bound_root, root)
 }
 
 /// Audit rows already read from a namespace. Rows are taken as given apart
@@ -248,7 +316,21 @@ pub fn audit_rows(
     root: &Path,
     bindings: &HashMap<String, PathBuf>,
 ) -> AuditReport {
-    let root_str = root.to_string_lossy().to_string();
+    audit_rows_for(rows, namespace, root, None, bindings)
+}
+
+/// [`audit_rows`] with corrections spelled relative to `planned` (`root
+/// audit --for-root`) when given: keys that name files under `root` today
+/// are rewritten to the keys the planned root produces for them, so applying
+/// the calls and then moving the root there loses nothing.
+pub fn audit_rows_for(
+    rows: &[SearchResult],
+    namespace: &str,
+    root: &Path,
+    planned: Option<&Path>,
+    bindings: &HashMap<String, PathBuf>,
+) -> AuditReport {
+    let roots = Roots::new(root, planned);
     let now = now_secs();
     let mut fixable = Vec::new();
     let mut needs_decision: Vec<UndecidedRow> = Vec::new();
@@ -302,13 +384,16 @@ pub fn audit_rows(
                         other_root_paths.push(crate::parser::ingest::normalize_node_path(&raw));
                         note(&raw, UndecidedWhy::OtherSourceRoot, &mut undecided);
                     } else {
-                        match judge(&raw, root, &root_str) {
+                        match judge(&raw, &roots) {
                             Verdict::Rewrite(rel) => {
                                 rewrote = true;
                                 spelled = rel;
                             }
                             Verdict::Missing => {
                                 note(&raw, UndecidedWhy::NoSuchFile, &mut undecided)
+                            }
+                            Verdict::OutsideTarget => {
+                                note(&raw, UndecidedWhy::OutsidePlannedRoot, &mut undecided)
                             }
                             Verdict::Keep => {}
                         }
@@ -318,35 +403,29 @@ pub fn audit_rows(
                 out.push(Value::Object(obj));
             }
             locations = Some(out);
-            // Supersede sets `location` from the first of `locations`. An
-            // absolute in-root location that is not the first ref's path would
-            // be replaced, so that memory is left for the user to decide.
+            // Supersede sets `location` from the first of `locations`. A
+            // location that is a path and differs from the first ref's path
+            // (both spelled relative to the root) would be replaced, so a
+            // memory that would get a call is left for the user to decide.
             let location = payload.location.as_str();
-            if location_is_path(location)
-                && matches!(judge(location, root, &root_str), Verdict::Rewrite(_))
-            {
-                let same = first_raw.flatten().is_some_and(|first| {
-                    crate::parser::ingest::normalize_node_path(&first)
-                        == crate::parser::ingest::normalize_node_path(location)
-                });
-                if !same {
-                    location_conflict = true;
-                    note(
-                        location,
-                        UndecidedWhy::LocationDiffersFromFirstRef,
-                        &mut undecided,
-                    );
-                }
+            if location_is_path(location) {
+                let same = first_raw
+                    .flatten()
+                    .is_some_and(|first| spelled_key(&first, &roots) == spelled_key(location, &roots));
+                location_conflict = !same;
             }
         } else if location_is_path(&payload.location) {
             let raw = payload.location.clone();
             let mut spelled = raw.clone();
-            match judge(&raw, root, &root_str) {
+            match judge(&raw, &roots) {
                 Verdict::Rewrite(rel) => {
                     rewrote = true;
                     spelled = rel;
                 }
                 Verdict::Missing => note(&raw, UndecidedWhy::NoSuchFile, &mut undecided),
+                Verdict::OutsideTarget => {
+                    note(&raw, UndecidedWhy::OutsidePlannedRoot, &mut undecided)
+                }
                 Verdict::Keep => {}
             }
             let mut obj = Map::new();
@@ -369,19 +448,23 @@ pub fn audit_rows(
                     out.push(entry.clone());
                     continue;
                 };
-                if !governs_is_path(raw)
+                if !governs_is_path(raw, &roots.both())
                     || other_root_paths.contains(&crate::parser::ingest::normalize_node_path(raw))
                 {
                     out.push(entry.clone());
                     continue;
                 }
-                match judge(raw, root, &root_str) {
+                match judge(raw, &roots) {
                     Verdict::Rewrite(rel) => {
                         rewrote = true;
                         out.push(Value::String(rel));
                     }
                     Verdict::Missing => {
                         note(raw, UndecidedWhy::NoSuchFile, &mut undecided);
+                        out.push(entry.clone());
+                    }
+                    Verdict::OutsideTarget => {
+                        note(raw, UndecidedWhy::OutsidePlannedRoot, &mut undecided);
                         out.push(entry.clone());
                     }
                     Verdict::Keep => out.push(entry.clone()),
@@ -399,6 +482,15 @@ pub fn audit_rows(
             });
         }
 
+        // The conflict matters only for a memory that would get a call.
+        let location_conflict = location_conflict && rewrote && !other_root;
+        if location_conflict {
+            note(
+                &payload.location,
+                UndecidedWhy::LocationDiffersFromFirstRef,
+                &mut undecided,
+            );
+        }
         needs_decision.extend(undecided);
         // One memory is one supersede call: a memory with a path bound to
         // another root is left whole for the user to decide.
@@ -426,22 +518,25 @@ pub fn audit_rows(
     }
 }
 
-/// Audit a namespace's active memories against `root` (the marker root).
-/// `bindings` are the configured project contexts (source_id to its
-/// `.NeuroStrata` folder). Only lists rows; never writes.
+/// Audit a namespace's active memories against `root` (the marker root),
+/// spelling corrections relative to `planned` when given. `bindings` are the
+/// configured project contexts (source_id to its `.NeuroStrata` folder). Only
+/// lists rows; never writes.
 pub async fn audit_namespace(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     root: &Path,
+    planned: Option<&Path>,
     bindings: &HashMap<String, PathBuf>,
 ) -> anyhow::Result<AuditReport> {
     let rows = store.list(namespace, None, None).await?;
-    Ok(audit_rows(&rows, namespace, root, bindings))
+    Ok(audit_rows_for(&rows, namespace, root, planned, bindings))
 }
 
 /// Every relative path key a row stores: `location`, `refs` files and the
-/// `governs` entries that name paths (never memory ids or domains).
-fn relative_keys(row: &SearchResult) -> Vec<String> {
+/// `governs` entries that name paths (never memory ids or domains; a bare
+/// name only when a file of that name exists under `root`).
+fn relative_keys(row: &SearchResult, root: &Path) -> Vec<String> {
     let payload = &row.payload;
     let mut keys = Vec::new();
     if location_is_path(&payload.location) {
@@ -463,7 +558,7 @@ fn relative_keys(row: &SearchResult) -> Vec<String> {
             governs
                 .iter()
                 .filter_map(Value::as_str)
-                .filter(|g| governs_is_path(g))
+                .filter(|g| governs_is_path(g, &[root]))
                 .map(str::to_string),
         );
     }
@@ -490,15 +585,34 @@ pub async fn rows_lost_by_root_change(
 /// rows are already listed (the CLI reads them through the daemon's
 /// `/cli/read`).
 pub fn rows_lost_in(rows: &[SearchResult], current: &Path, new: &Path) -> Vec<String> {
+    let new_str = new.to_string_lossy().to_string();
+    rows_losing(rows, current, |full, key| {
+        relative_to_on_disk(full, &new_str).as_deref() != Some(key)
+    })
+}
+
+/// For a root change between unrelated folders (a sibling, another clone):
+/// ids of active rows with a relative stored key that names an existing file
+/// or folder under `current` but nothing under `new`.
+pub fn rows_missing_under(rows: &[SearchResult], current: &Path, new: &Path) -> Vec<String> {
+    rows_losing(rows, current, |_, key| !new.join(key).exists())
+}
+
+/// Ids of active rows with a relative key that names something under
+/// `current` (`full`) and that `lost(full, key)` says would stop matching.
+fn rows_losing(
+    rows: &[SearchResult],
+    current: &Path,
+    lost_key: impl Fn(&str, &str) -> bool,
+) -> Vec<String> {
     let now = now_secs();
     let current_str = current
         .to_string_lossy()
         .trim_end_matches(['/', '\\'])
         .to_string();
-    let new_str = new.to_string_lossy().to_string();
     let mut lost: Vec<String> = Vec::new();
     for row in rows.iter().filter(|r| is_auditable(r, now)) {
-        let moves = relative_keys(row).iter().any(|raw| {
+        let moves = relative_keys(row, current).iter().any(|raw| {
             let bare = raw.split('#').next().unwrap_or(raw);
             let key = crate::parser::ingest::normalize_node_path(bare);
             if key.is_empty() {
@@ -508,7 +622,7 @@ pub fn rows_lost_in(rows: &[SearchResult], current: &Path, new: &Path) -> Vec<St
             if !Path::new(&full).exists() {
                 return false;
             }
-            relative_to_on_disk(&full, &new_str).as_deref() != Some(key.as_str())
+            lost_key(&full, &key)
         });
         if moves && !lost.contains(&row.id) {
             lost.push(row.id.clone());
@@ -696,7 +810,7 @@ mod tests {
             ),
         )])
         .await;
-        let report = audit_namespace(&store, "example-project", &root, &HashMap::new())
+        let report = audit_namespace(&store, "example-project", &root, None, &HashMap::new())
             .await
             .unwrap();
         assert!(
@@ -732,7 +846,7 @@ mod tests {
             payload("Rule.", "", json!({ "governs": [dir, "auth"] })),
         )])
         .await;
-        let report = audit_namespace(&store, "example-project", &root, &HashMap::new())
+        let report = audit_namespace(&store, "example-project", &root, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(report.fixable.len(), 1);
@@ -752,7 +866,7 @@ mod tests {
             payload("Rule.", "", json!({ "governs": [a] })),
         )])
         .await;
-        let report = audit_namespace(&store, "example-project", &root, &HashMap::new())
+        let report = audit_namespace(&store, "example-project", &root, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(report.fixable.len(), 1);
@@ -773,7 +887,7 @@ mod tests {
             ),
         )])
         .await;
-        let report = audit_namespace(&store, "example-project", &root, &HashMap::new())
+        let report = audit_namespace(&store, "example-project", &root, None, &HashMap::new())
             .await
             .unwrap();
         assert!(report.fixable.is_empty());
@@ -810,7 +924,7 @@ mod tests {
             ),
         )])
         .await;
-        let report = audit_namespace(&store, "example-project", &root, &bindings)
+        let report = audit_namespace(&store, "example-project", &root, None, &bindings)
             .await
             .unwrap();
         assert!(report.fixable.is_empty(), "{:?}", report.fixable);
@@ -830,7 +944,7 @@ mod tests {
         touch(&root, "src/a.rs");
         let only_undecided =
             store_with(vec![("m1", payload("Rule.", "src/gone.rs", json!({})))]).await;
-        let report = audit_namespace(&only_undecided, "example-project", &root, &HashMap::new())
+        let report = audit_namespace(&only_undecided, "example-project", &root, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(report.needs_decision.len(), 1);
@@ -840,7 +954,7 @@ mod tests {
             payload("Rule.", &abs(&root, "src/a.rs"), json!({})),
         )])
         .await;
-        let report = audit_namespace(&with_fixable, "example-project", &root, &HashMap::new())
+        let report = audit_namespace(&with_fixable, "example-project", &root, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(report.fixable.len(), 1);
@@ -872,7 +986,7 @@ mod tests {
             ),
         ])
         .await;
-        let report = audit_namespace(&store, "example-project", &root, &HashMap::new())
+        let report = audit_namespace(&store, "example-project", &root, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(report.fixable.len(), 3, "{:?}", report.needs_decision);
@@ -913,7 +1027,7 @@ mod tests {
             ),
         ])
         .await;
-        let report = audit_namespace(&store, "example-project", &root, &HashMap::new())
+        let report = audit_namespace(&store, "example-project", &root, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(
@@ -948,7 +1062,7 @@ mod tests {
             ("t1", task),
         ])
         .await;
-        let report = audit_namespace(&store, "example-project", &root, &HashMap::new())
+        let report = audit_namespace(&store, "example-project", &root, None, &HashMap::new())
             .await
             .unwrap();
         assert!(report.fixable.is_empty(), "{:?}", report.fixable);
@@ -974,7 +1088,7 @@ mod tests {
             .await
             .unwrap();
         let store: Arc<dyn VectorStore> = counting.clone();
-        let report = audit_namespace(&store, "example-project", &root, &HashMap::new())
+        let report = audit_namespace(&store, "example-project", &root, None, &HashMap::new())
             .await
             .unwrap();
         assert_eq!(report.fixable.len(), 1);
@@ -989,7 +1103,7 @@ mod tests {
         let (_tmp, top) = tmp_root();
         let sub = top.join("sub");
         touch(&sub, "a.rs");
-        touch(&sub, "auth");
+        std::fs::create_dir_all(sub.join("auth")).unwrap();
         let store = store_with(vec![
             (
                 "m1",
@@ -1011,5 +1125,170 @@ mod tests {
             .await
             .unwrap();
         assert!(same.is_empty(), "{same:?}");
+    }
+
+    /// `--for-root`: keys that name files under the current root are spelled
+    /// relative to the planned root, so applying the calls and then moving
+    /// the root up loses nothing.
+    #[tokio::test]
+    async fn for_root_spells_corrections_relative_to_the_planned_root() {
+        let (_tmp, top) = tmp_root();
+        let sub = top.join("sub");
+        touch(&sub, "a.rs");
+        touch(&sub, "b.rs");
+        touch(&top, "top.rs");
+        let b = abs(&sub, "b.rs");
+        let rows = vec![
+            ("m1", payload("Rule a.", "a.rs", json!({ "refs": [{ "file": "a.rs", "lines": "2" }] }))),
+            ("m2", payload("Rule b.", &b, json!({ "governs": [b] }))),
+            // Already a key of the planned root.
+            ("m3", payload("Rule top.", "top.rs", json!({}))),
+            ("m4", payload("Rule gone.", "gone.rs", json!({}))),
+        ];
+        let store = store_with(rows).await;
+        let report = audit_namespace(&store, "example-project", &sub, Some(&top), &HashMap::new())
+            .await
+            .unwrap();
+        let fixed: HashMap<&str, &Value> =
+            report.fixable.iter().map(|r| (r.id.as_str(), &r.supersede_args)).collect();
+        assert_eq!(fixed.len(), 2, "{:?}", report);
+        assert_eq!(fixed["m1"]["locations"], json!([{ "path": "sub/a.rs", "lines": "2" }]));
+        assert_eq!(fixed["m2"]["locations"], json!([{ "path": "sub/b.rs" }]));
+        assert_eq!(fixed["m2"]["governs"], json!(["sub/b.rs"]));
+        assert_eq!(
+            report.needs_decision,
+            vec![UndecidedRow {
+                id: "m4".to_string(),
+                path: "gone.rs".to_string(),
+                why: UndecidedWhy::NoSuchFile,
+            }]
+        );
+
+        // The corrected rows lose nothing when the root moves up.
+        let corrected = vec![
+            ("m1", payload("Rule a.", "sub/a.rs", json!({ "refs": [{ "file": "sub/a.rs" }] }))),
+            ("m3", payload("Rule top.", "top.rs", json!({}))),
+        ];
+        let rows: Vec<SearchResult> = store_with(corrected)
+            .await
+            .list("example-project", None, None)
+            .await
+            .unwrap();
+        assert!(rows_lost_in(&rows, &sub, &top).is_empty());
+        // Without the correction the move loses m1.
+        let rows: Vec<SearchResult> = store.list("example-project", None, None).await.unwrap();
+        assert_eq!(rows_lost_in(&rows, &sub, &top), vec!["m1".to_string()]);
+
+        // A planned root that does not contain the file: the key cannot be
+        // spelled there, so it is left for a decision.
+        let (_other_tmp, other) = tmp_root();
+        let report = audit_namespace(&store, "example-project", &sub, Some(&other), &HashMap::new())
+            .await
+            .unwrap();
+        assert!(report.needs_decision.contains(&UndecidedRow {
+            id: "m1".to_string(),
+            path: "a.rs".to_string(),
+            why: UndecidedWhy::OutsidePlannedRoot,
+        }));
+    }
+
+    /// A location that names another file than the first ref, both relative
+    /// to the root, would be replaced by supersede: the memory is left for a
+    /// decision even when the location is relative.
+    #[tokio::test]
+    async fn relative_location_differing_from_rewritten_first_ref_needs_decision() {
+        let (_tmp, root) = tmp_root();
+        touch(&root, "src/a.rs");
+        touch(&root, "README.md");
+        let a = abs(&root, "src/a.rs");
+        let store = store_with(vec![
+            ("m1", payload("Rule.", "README.md", json!({ "refs": [{ "file": a }] }))),
+            ("m2", payload("Rule.", "src/a.rs", json!({ "refs": [{ "file": a }] }))),
+            // Nothing to rewrite: no call, so no decision either.
+            ("m3", payload("Rule.", "README.md", json!({ "refs": [{ "file": "src/a.rs" }] }))),
+        ])
+        .await;
+        let report = audit_namespace(&store, "example-project", &root, None, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            report.needs_decision,
+            vec![UndecidedRow {
+                id: "m1".to_string(),
+                path: "README.md".to_string(),
+                why: UndecidedWhy::LocationDiffersFromFirstRef,
+            }]
+        );
+        assert_eq!(report.fixable.len(), 1);
+        assert_eq!(report.fixable[0].id, "m2");
+    }
+
+    /// A bare file name in `governs` is a key when that file exists under the
+    /// root: the root-change check counts it, and an absolute spelling of it
+    /// is still rewritten.
+    #[tokio::test]
+    async fn bare_file_name_governs_counts_as_a_path() {
+        let (_tmp, top) = tmp_root();
+        let sub = top.join("sub");
+        touch(&sub, "Cargo.toml");
+        let store = store_with(vec![
+            ("m1", payload("Rule.", "", json!({ "governs": ["Cargo.toml"] }))),
+            // No such file: a domain or an id, not a key.
+            ("m2", payload("Rule.", "", json!({ "governs": ["auth"] }))),
+        ])
+        .await;
+        let lost = rows_lost_by_root_change(&store, "example-project", &sub, &top)
+            .await
+            .unwrap();
+        assert_eq!(lost, vec!["m1".to_string()]);
+        let report = audit_namespace(&store, "example-project", &sub, Some(&top), &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(report.fixable.len(), 1, "{report:?}");
+        assert_eq!(report.fixable[0].supersede_args["governs"], json!(["sub/Cargo.toml"]));
+    }
+
+    /// Between unrelated roots a key is lost only when its file is missing
+    /// under the new root.
+    #[tokio::test]
+    async fn rows_missing_under_an_unrelated_root() {
+        let (_tmp, base) = tmp_root();
+        let (old, new) = (base.join("old"), base.join("new"));
+        touch(&old, "a.rs");
+        touch(&old, "both.rs");
+        touch(&new, "both.rs");
+        let rows: Vec<SearchResult> = store_with(vec![
+            ("m1", payload("Rule.", "a.rs", json!({}))),
+            ("m2", payload("Rule.", "both.rs", json!({}))),
+        ])
+        .await
+        .list("example-project", None, None)
+        .await
+        .unwrap();
+        assert_eq!(rows_missing_under(&rows, &old, &new), vec!["m1".to_string()]);
+    }
+
+    /// A binding spelled differently for the same folder is this root, not
+    /// another one.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn binding_in_another_spelling_of_the_root_is_this_root() {
+        let (_tmp, root) = tmp_root();
+        touch(&root, "src/a.rs");
+        let a = abs(&root, "src/a.rs");
+        let raw = root.to_string_lossy().into_owned();
+        let respelled = format!("{}{}", raw[..1].to_ascii_lowercase(), raw[1..].replace('\\', "/"));
+        let mut bindings = HashMap::new();
+        bindings.insert("this-src".to_string(), PathBuf::from(respelled).join(".NeuroStrata"));
+        let store = store_with(vec![(
+            "m1",
+            payload("Rule.", &a, json!({ "refs": [{ "file": a, "source_context": { "source_id": "this-src" } }] })),
+        )])
+        .await;
+        let report = audit_namespace(&store, "example-project", &root, None, &bindings)
+            .await
+            .unwrap();
+        assert!(report.needs_decision.is_empty(), "{:?}", report.needs_decision);
+        assert_eq!(report.fixable.len(), 1);
     }
 }

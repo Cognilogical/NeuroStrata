@@ -712,7 +712,7 @@ fn miscased_marker_folders(dir: &Path) -> Vec<PathBuf> {
 /// links and the nearest existing ancestor), by the rule the path lookups
 /// use. `relative_to_on_disk` answers only for a path strictly below the
 /// root, so a child name that does not exist is compared.
-fn same_folder(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_folder(a: &Path, b: &Path) -> bool {
     const PROBE: &str = ".neurostrata-same-folder-probe";
     let probe = a.join(PROBE);
     crate::paths::relative_to_on_disk(&probe.to_string_lossy(), &b.to_string_lossy()).as_deref()
@@ -749,6 +749,10 @@ pub enum SetupMarker {
     RootChangeBlocked(Vec<String>),
     /// The folder may not hold a marker, or the write failed, for this reason.
     Refused(&'static str),
+    /// A marker for the namespace covers `root` (written now when `written`),
+    /// but the cached root could not be set to it, for `reason`: the marker
+    /// spelling stays off until it is. A failure: `hooks install` exits 1.
+    CacheNotSet { root: PathBuf, written: bool, reason: String },
 }
 
 impl SetupMarker {
@@ -763,14 +767,20 @@ impl SetupMarker {
             SetupMarker::OtherNamespace(_) => "other_namespace",
             SetupMarker::RootChangeBlocked(_) => "root_change_blocked",
             SetupMarker::Refused(_) => "refused",
+            SetupMarker::CacheNotSet { .. } => "cache_not_set",
         }
+    }
+
+    /// Whether the step failed in a way the caller must report as an error.
+    pub fn failed(&self) -> bool {
+        matches!(self, SetupMarker::CacheNotSet { .. })
     }
 
     /// The marker root, when a marker for the namespace now covers the project.
     pub fn root(&self) -> Option<&Path> {
         match self {
             SetupMarker::Reused(root) | SetupMarker::Written(root) => Some(root),
-            SetupMarker::KeptCache { root, .. } => Some(root),
+            SetupMarker::KeptCache { root, .. } | SetupMarker::CacheNotSet { root, .. } => Some(root),
             _ => None,
         }
     }
@@ -803,9 +813,10 @@ impl SetupMarker {
                 "No .NeuroStrata/config.json written: the cached root of {namespace} is the subfolder {}. \
                  Run `neurostrata-mcp root set {} --namespace {namespace}` to keep today's stored keys, \
                  or `neurostrata-mcp root set {} --namespace {namespace}` after applying the corrections \
-                 `neurostrata-mcp root audit` lists ({ROOT_GUIDE}).",
+                 `neurostrata-mcp root audit --for-root {}` lists ({ROOT_GUIDE}).",
                 sub.display(),
                 sub.display(),
+                top.display(),
                 top.display()
             ),
             SetupMarker::AskNamespace(candidates) => format!(
@@ -819,7 +830,7 @@ impl SetupMarker {
             ),
             SetupMarker::RootChangeBlocked(ids) => format!(
                 "No .NeuroStrata/config.json written: it would move the root of {namespace}, and {} \
-                 memories would stop matching ({}). Run `neurostrata-mcp root audit` and correct them \
+                 memories would stop matching ({}). Run `neurostrata-mcp root audit --for-root {dir}` and correct them \
                  ({ROOT_GUIDE}), or run `neurostrata-mcp root set {dir} --namespace {namespace} --force`.",
                 ids.len(),
                 ids.join(", ")
@@ -827,6 +838,14 @@ impl SetupMarker {
             SetupMarker::Refused(reason) => {
                 format!("No .NeuroStrata/config.json written: {reason}.")
             }
+            SetupMarker::CacheNotSet { root, written, reason } => format!(
+                "{} {} for {namespace}, but the cached root of {namespace} could not be set to {} ({reason}), \
+                 so lookups do not use the marker yet. Run `neurostrata-mcp root set {} --namespace {namespace}` to set it.",
+                if *written { "Wrote" } else { "Using" },
+                root.join(ROOT_CONFIG_REL).display(),
+                root.display(),
+                root.display()
+            ),
         })
     }
 
@@ -849,6 +868,10 @@ impl SetupMarker {
             SetupMarker::OtherNamespace(other) => out["namespace"] = serde_json::json!(other),
             SetupMarker::RootChangeBlocked(ids) => out["memory_ids"] = serde_json::json!(ids),
             SetupMarker::Refused(reason) => out["reason"] = serde_json::json!(reason),
+            SetupMarker::CacheNotSet { root, reason, .. } => {
+                out["root"] = serde_json::json!(root.to_string_lossy());
+                out["reason"] = serde_json::json!(reason);
+            }
         }
         out["message"] = serde_json::json!(self.message(namespace, project_dir));
         out
@@ -895,14 +918,15 @@ fn is_temp_root(dir: &Path) -> bool {
 pub trait RootRegistry: Send + Sync {
     async fn cached_root(&self, namespace: &str) -> Result<Option<String>, String>;
     async fn rows(&self, namespace: &str) -> Result<Vec<crate::traits::SearchResult>, String>;
-    /// `true` when the cached root now is `root`.
-    async fn set_root(&self, namespace: &str, root: &Path) -> bool;
+    /// Set the cached root to `root`; `Err` says why it was not set.
+    async fn set_root(&self, namespace: &str, root: &Path) -> Result<(), String>;
     /// Called once the writer is done (a store opened by the CLI checkpoints).
     async fn finish(&self) {}
 }
 
 /// [`RootRegistry`] over a store, for MCP setup/bootstrap and the CLI when no
-/// daemon answers.
+/// daemon answers. Every call uses the namespace as the store spells it
+/// (matched case-insensitively), as the daemon's routes do.
 pub struct StoreRegistry {
     pub store: std::sync::Arc<dyn crate::traits::VectorStore>,
     pub emb: Option<std::sync::Arc<dyn crate::traits::Embedder>>,
@@ -913,20 +937,27 @@ pub struct StoreRegistry {
 #[async_trait::async_trait]
 impl RootRegistry for StoreRegistry {
     async fn cached_root(&self, namespace: &str) -> Result<Option<String>, String> {
-        crate::registry::cached_project_root(&self.store, namespace)
+        let namespace = crate::server::resolve_namespace(&self.store, namespace).await;
+        crate::registry::cached_project_root(&self.store, &namespace)
             .await
             .map_err(|e| e.to_string())
     }
 
     async fn rows(&self, namespace: &str) -> Result<Vec<crate::traits::SearchResult>, String> {
+        let namespace = crate::server::resolve_namespace(&self.store, namespace).await;
         self.store
-            .list(namespace, None, None)
+            .list(&namespace, None, None)
             .await
             .map_err(|e| e.to_string())
     }
 
-    async fn set_root(&self, namespace: &str, root: &Path) -> bool {
-        crate::registry::set_project_root(&self.store, self.emb.as_ref(), namespace, root).await
+    async fn set_root(&self, namespace: &str, root: &Path) -> Result<(), String> {
+        let namespace = crate::server::resolve_namespace(&self.store, namespace).await;
+        if crate::registry::set_project_root(&self.store, self.emb.as_ref(), &namespace, root).await {
+            Ok(())
+        } else {
+            Err("the registry row could not be written".to_string())
+        }
     }
 
     async fn finish(&self) {
@@ -967,8 +998,10 @@ fn same_tree(a: &Path, b: &Path) -> bool {
 }
 
 /// The memories that would stop matching if the cached root moved from
-/// `current` to `new`. Empty when the roots are the same, or when they are
-/// unrelated folders (no key of one tree can be judged against the other).
+/// `current` to `new`. Empty when the roots are the same. Inside one tree a
+/// key is lost when the new root spells its file differently; between
+/// unrelated folders (a sibling, another clone) it is lost when its file
+/// exists under `current` but not under `new`.
 async fn lost_by_change(
     registry: &dyn RootRegistry,
     namespace: &str,
@@ -976,12 +1009,30 @@ async fn lost_by_change(
     new: &Path,
 ) -> Result<Vec<String>, String> {
     match current {
-        Some(current) if !same_root(current, new) && same_tree(current, new) => {
+        Some(current) if !same_root(current, new) => {
             let rows = registry.rows(namespace).await?;
-            Ok(crate::root_audit::rows_lost_in(&rows, current, new))
+            Ok(if same_tree(current, new) {
+                crate::root_audit::rows_lost_in(&rows, current, new)
+            } else {
+                crate::root_audit::rows_missing_under(&rows, current, new)
+            })
         }
         _ => Ok(Vec::new()),
     }
+}
+
+/// Setup's root-change check: none when setup keeps an unrelated cached root
+/// (it does not move it), else [`lost_by_change`].
+async fn setup_loss_check(
+    registry: &dyn RootRegistry,
+    namespace: &str,
+    cached: Option<&Path>,
+    root: &Path,
+) -> Result<Vec<String>, String> {
+    if unrelated_cache(cached, root).is_some() {
+        return Ok(Vec::new());
+    }
+    lost_by_change(registry, namespace, cached, root).await
 }
 
 /// A usable cached root outside `root`'s tree (another clone, or an older
@@ -994,23 +1045,22 @@ fn unrelated_cache(cached: Option<&Path>, root: &Path) -> Option<PathBuf> {
 
 /// Setup's cache update: nothing when the cache already is `root`, nothing
 /// when it is an unrelated usable folder (returned), else set it (missing,
-/// unusable, or in the same tree after the root-change check).
+/// unusable, or in the same tree after the root-change check). `Err` says why
+/// the cache could not be set.
 async fn settle_cache(
     registry: &dyn RootRegistry,
     namespace: &str,
     cached: Option<&Path>,
     root: &Path,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>, String> {
     if cached.is_some_and(|c| same_root(c, root)) {
-        return None;
+        return Ok(None);
     }
     if let Some(kept) = unrelated_cache(cached, root) {
-        return Some(kept);
+        return Ok(Some(kept));
     }
-    if !registry.set_root(namespace, root).await {
-        tracing::warn!("the cached root of '{namespace}' could not be set to {}", root.display());
-    }
-    None
+    registry.set_root(namespace, root).await?;
+    Ok(None)
 }
 
 /// The marker step of `neurostrata_task_setup`, `neurostrata_bootstrap` and
@@ -1061,10 +1111,14 @@ pub async fn ensure_marker_with(
             return SetupMarker::Refused("the cached root could not be read");
         }
     };
-    let finished = |root: PathBuf, written: bool, kept: Option<PathBuf>| match kept {
-        Some(cached) => SetupMarker::KeptCache { root, cached, written },
-        None if written => SetupMarker::Written(root),
-        None => SetupMarker::Reused(root),
+    let finished = |root: PathBuf, written: bool, settled: Result<Option<PathBuf>, String>| match settled {
+        Err(reason) => {
+            tracing::warn!("the cached root of '{namespace}' could not be set to {}: {reason}", root.display());
+            SetupMarker::CacheNotSet { root, written, reason }
+        }
+        Ok(Some(cached)) => SetupMarker::KeptCache { root, cached, written },
+        Ok(None) if written => SetupMarker::Written(root),
+        Ok(None) => SetupMarker::Reused(root),
     };
     match find_root_marker(&dir) {
         Err(_) => {
@@ -1076,7 +1130,7 @@ pub async fn ensure_marker_with(
             return SetupMarker::OtherNamespace(found.config.namespace)
         }
         Ok(Some(found)) => {
-            return match lost_by_change(registry, &namespace, cached.as_deref(), &found.root).await {
+            return match setup_loss_check(registry, &namespace, cached.as_deref(), &found.root).await {
                 Ok(ids) if !ids.is_empty() => SetupMarker::RootChangeBlocked(ids),
                 Ok(_) => {
                     let kept = settle_cache(registry, &namespace, cached.as_deref(), &found.root).await;
@@ -1105,7 +1159,7 @@ pub async fn ensure_marker_with(
     if let Some(reason) = refuse_root_target(&target) {
         return SetupMarker::Refused(reason);
     }
-    match lost_by_change(registry, &namespace, cached.as_deref(), &target).await {
+    match setup_loss_check(registry, &namespace, cached.as_deref(), &target).await {
         Ok(ids) if !ids.is_empty() => return SetupMarker::RootChangeBlocked(ids),
         Ok(_) => {}
         Err(e) => {
@@ -1256,10 +1310,11 @@ pub(crate) async fn root_set_with(
         if !args.force {
             return Err(format!(
                 "changing the root of {ns} from {from} to {} would stop {} memories matching: {}. \
-                 Run `neurostrata-mcp root audit` and correct them first ({ROOT_GUIDE}), or pass --force.",
+                 Run `neurostrata-mcp root audit --for-root {}` and correct them first ({ROOT_GUIDE}), or pass --force.",
                 target.display(),
                 lost.len(),
-                lost.join(", ")
+                lost.join(", "),
+                target.display()
             ));
         }
         lines.push(format!(
@@ -1315,23 +1370,33 @@ pub(crate) async fn root_set_with(
     }
 
     // 2. Point the registry at it.
-    if registry.set_root(ns, &target).await {
-        lines.push(format!("Cached root of {ns} set to {}.", target.display()));
-    } else {
+    if let Err(reason) = registry.set_root(ns, &target).await {
         // The marker is written but the cache still points elsewhere: a
         // failure, so scripts and the exit code see it.
         return Err(format!(
-            "{}\nThe cached root of {ns} could not be set; rerun this command to finish.",
+            "{}\nThe cached root of {ns} could not be set ({reason}); rerun this command to finish.",
             lines.join("\n")
         ));
     }
+    lines.push(format!("Cached root of {ns} set to {}.", target.display()));
     if stop_after == Some(RootSetStep::RegistryUpdated) {
         return Ok(lines);
     }
 
-    // 3. Remove the old markers.
+    // 3. Remove the old markers. A concurrent `root set` may have made one
+    // of them the cached root since: that marker stays, so the cache never
+    // points at a folder without one.
     for old_dir in &old {
         let old_file = old_dir.join(ROOT_CONFIG_REL);
+        if let Ok(Some(now)) = usable_cached_root(registry, ns).await {
+            if same_root(&now, old_dir) {
+                lines.push(format!(
+                    "Kept the old marker {}: the cached root of {ns} is that folder again (another `root set` changed it).",
+                    old_file.display()
+                ));
+                continue;
+            }
+        }
         match std::fs::remove_file(&old_file) {
             Ok(()) => lines.push(format!("Removed the old marker {}.", old_file.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -2446,10 +2511,12 @@ mod tests {
                 .into_iter()
                 .map(|ns| {
                     let (store, barrier, repo) = (store.clone(), barrier.clone(), repo.clone());
+                    // An embedder, so the winner can also create the registry row.
+                    let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                         barrier.wait();
-                        rt.block_on(ensure_marker_for_setup(&store, None, &repo, Some(ns)))
+                        rt.block_on(ensure_marker_for_setup(&store, Some(&emb), &repo, Some(ns)))
                     })
                 })
                 .collect();
@@ -2615,6 +2682,143 @@ mod tests {
         let (store, emb) = mock();
         let lines = root_set(&store, Some(&emb), &set_args(&repo)).await.unwrap();
         assert!(lines.iter().any(|l| l.starts_with("Cached root of")), "{lines:?}");
+    }
+
+    /// Setup whose cache write fails reports it: the marker is written, the
+    /// outcome is a failure the reply and `hooks install` show.
+    #[tokio::test]
+    async fn setup_reports_a_cache_it_could_not_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir"]"#);
+        let repo = base.join("repo");
+        // No registry row and no embedder to create one.
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let got = ensure_marker_for_setup(&store, None, &repo, Some(NS)).await;
+        let SetupMarker::CacheNotSet { root, written, reason } = &got else { panic!("{got:?}") };
+        assert_eq!((root, *written), (&repo, true));
+        assert_eq!(reason, "the registry row could not be written");
+        assert!(got.failed() && got.installs_plugins());
+        assert_eq!(got.kind(), "cache_not_set");
+        assert_eq!(got.root(), Some(repo.as_path()));
+        assert!(has_marker(&repo));
+        let message = got.message(NS, &repo).unwrap();
+        assert!(message.contains("could not be set") && message.contains("root set"), "{message}");
+        assert_eq!(got.to_json(NS, &repo)["reason"], serde_json::json!(reason));
+        // A rerun that still cannot set it says so again (not "reused").
+        let again = ensure_marker_for_setup(&store, None, &repo, Some(NS)).await;
+        assert_eq!(again.kind(), "cache_not_set", "{again:?}");
+        assert!(!SetupMarker::Written(repo.clone()).failed());
+    }
+
+    /// A root moved to an unrelated folder (a sibling, another clone) lists
+    /// the rows whose key names a file under the old root but nothing under
+    /// the new one.
+    #[tokio::test]
+    async fn root_set_to_a_sibling_checks_rows_by_file_existence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["api git-dir", "api/a.rs file", "api/both.rs file", "web git-dir", "web/both.rs file"]"#);
+        let (api, web) = (base.join("api"), base.join("web"));
+        let (store, emb) = mock();
+        cache_root(&store, &emb, &api).await;
+        rule_at(&store, "rule-a", "a.rs", serde_json::json!({})).await;
+        rule_at(&store, "rule-both", "both.rs", serde_json::json!({})).await;
+
+        let err = root_set(&store, Some(&emb), &set_args(&web)).await.unwrap_err();
+        assert!(err.contains("rule-a") && !err.contains("rule-both"), "{err}");
+        assert!(err.contains(&format!("root audit --for-root {}", web.display())), "{err}");
+        assert!(!has_marker(&web));
+        assert_eq!(cached(&store).await, Some(api.to_string_lossy().into_owned()));
+
+        // Once the file exists under the new root too, nothing is lost.
+        std::fs::write(web.join("a.rs"), b"").unwrap();
+        root_set(&store, Some(&emb), &set_args(&web)).await.unwrap();
+        assert_eq!(cached(&store).await, Some(web.to_string_lossy().into_owned()));
+    }
+
+    /// A registry that, like a second `root set` racing this one, moves the
+    /// cached root back to `back_to` right after every write.
+    struct RacedRegistry {
+        inner: StoreRegistry,
+        back_to: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl RootRegistry for RacedRegistry {
+        async fn cached_root(&self, namespace: &str) -> Result<Option<String>, String> {
+            self.inner.cached_root(namespace).await
+        }
+        async fn rows(&self, namespace: &str) -> Result<Vec<crate::traits::SearchResult>, String> {
+            self.inner.rows(namespace).await
+        }
+        async fn set_root(&self, namespace: &str, root: &Path) -> Result<(), String> {
+            self.inner.set_root(namespace, root).await?;
+            self.inner.set_root(namespace, &self.back_to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_keeps_an_old_marker_that_became_the_cached_root_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir", "repo/old marker:example-project", "repo/new"]"#);
+        let repo = base.join("repo");
+        let (old, new) = (repo.join("old"), repo.join("new"));
+        let (store, emb) = mock();
+        cache_root(&store, &emb, &old).await;
+        let registry = RacedRegistry {
+            inner: StoreRegistry { store: store.clone(), emb: Some(emb.clone()), checkpoint: false },
+            back_to: old.clone(),
+        };
+        let mut args = set_args(&new);
+        args.replace = true;
+        let lines = root_set_with(&registry, &args, None).await.unwrap();
+        assert!(has_marker(&old), "the cached root keeps its marker: {lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("Kept the old marker")), "{lines:?}");
+        assert_eq!(cached(&store).await, Some(old.to_string_lossy().into_owned()));
+    }
+
+    /// Without a daemon the CLI reads the store directly: the namespace is
+    /// matched to its stored spelling, as the daemon does, so the existing
+    /// cache and rows are checked instead of a second registry row.
+    #[tokio::test]
+    async fn store_registry_uses_the_stored_namespace_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir", "repo/sub/a.rs file"]"#);
+        let repo = base.join("repo");
+        let (store, emb) = mock();
+        let stored = "Example-Project";
+        crate::registry::cache_project_root(&store, Some(&emb), stored, &repo.join("sub").to_string_lossy())
+            .await;
+        store
+            .upsert(
+                stored,
+                "rule-a",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "rule a".to_string(),
+                    user_id: "agent".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: "a.rs".to_string(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        let err = root_set(&store, Some(&emb), &set_args(&repo)).await.unwrap_err();
+        assert!(err.contains("rule-a"), "{err}");
+        let mut forced = set_args(&repo);
+        forced.force = true;
+        root_set(&store, Some(&emb), &forced).await.unwrap();
+        assert_eq!(
+            crate::registry::cached_project_root(&store, stored).await.unwrap(),
+            Some(repo.to_string_lossy().into_owned())
+        );
+        assert_eq!(cached(&store).await, None, "no second registry row under the typed spelling");
     }
 
     #[tokio::test]
