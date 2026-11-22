@@ -892,7 +892,9 @@ export const MUTATING_FILE_TOOLS = new Set([
   'patch_file',
   'apply_patch',
   'replace_string_in_file',
-  'insert_edit_into_file'
+  'insert_edit_into_file',
+  // Claude Code edits notebook cells with NotebookEdit (#333/B3).
+  'NotebookEdit'
 ])
 
 export const SHELL_TOOLS = new Set([
@@ -2580,12 +2582,14 @@ function extractFilePath(
     asString(args.file_path) ??
     asString(args.filePath) ??
     asString(args.path) ??
+    asString(args.notebook_path) ??
     extractPatchPath(args.patchText ?? args.patch ?? args.diff ?? args.input) ??
     extractPatchPath(rawPatch) ??
     (altArgs
       ? (asString(altArgs.file_path) ??
         asString(altArgs.filePath) ??
         asString(altArgs.path) ??
+        asString(altArgs.notebook_path) ??
         extractPatchPath(
           altArgs.patchText ?? altArgs.patch ?? altArgs.diff ?? altArgs.input
         ))

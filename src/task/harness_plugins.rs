@@ -41,9 +41,11 @@ async function main() {
   console.info = console.error;
   console.warn = console.error;
 
-  // A large hook response (e.g. a big `updatedInput`) can still be buffered in
-  // stdout when `process.exit(0)` runs, so the host reads a truncated JSON
-  // body. Awaiting the write callback guarantees the payload is flushed first.
+  // Await the write callback so a large hook response (e.g. a big
+  // `updatedInput`) is fully flushed before the runner ends. The runner then
+  // returns instead of calling process.exit: on Windows, process.exit while a
+  // daemon HTTP socket is still open crashes node, and the host reports the
+  // hook as failed (Codex then runs the tool anyway).
   const writeStdout = (text) =>
     new Promise((resolve) => {
       process.stdout.write(text, () => resolve());
@@ -53,14 +55,14 @@ async function main() {
   try {
     raw = readFileSync(0, "utf8");
   } catch {
-    process.exit(0);
+    return;
   }
-  if (!raw.trim()) process.exit(0);
+  if (!raw.trim()) return;
   let event;
   try {
     event = JSON.parse(raw);
   } catch {
-    process.exit(0);
+    return;
   }
   const init = mod.initialize ?? plugin?.initialize ?? plugin?.setup;
   if (typeof init === "function") {
@@ -74,7 +76,7 @@ async function main() {
   if (typeof handler === "function") {
     const out = await handler(event);
     await writeStdout(JSON.stringify(out));
-    process.exit(0);
+    return;
   }
   if (event.hook_event_name === "Stop" && typeof event.transcript === "string") {
     const turnEnd = mod.onTurnEnd ?? plugin?.onTurnEnd;
@@ -96,6 +98,12 @@ const EMBEDDED_NEUROSTRATA_TASK_AGENT_MD: &str =
     include_str!("../../.agents/agents/NeuroStrata-Task.md");
 const SUBAGENT_RULE_MARKER: &str = "subagent_prompt_injection";
 const SUBAGENT_GRAPH_FIRST_RULE_SNIPPET: &str = "\n- **NEUROSTRATA GRAPH-FIRST & SUBAGENT CONTEXT RULE:** Honor the `### NeuroStrata Task & Graph Context` (`subagent_prompt_injection`) block in your prompt — every `[rule]` entry is a binding architectural constraint. Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `mode`: `hybrid` (default) + `include_references`: true / `neurostrata_sparql_query`). Never leave `TODO`, `FIXME`, `stub`, or `phase-2` deferrals.\n";
+
+/// Claude Code tools the installed PreToolUse hook runs for. NotebookEdit
+/// writes files too, so it goes through the guard like Write and Edit.
+const CLAUDE_PRE_TOOL_USE_MATCHER: &str = "Read|Write|Edit|MultiEdit|NotebookEdit|Bash|Task";
+/// The matcher older installers wrote, before NotebookEdit was guarded.
+const LEGACY_CLAUDE_PRE_TOOL_USE_MATCHER: &str = "Read|Write|Edit|MultiEdit|Bash|Task";
 
 const KNOWN_HARNESSES: &[&str] = &[
     "opencode",
@@ -715,7 +723,7 @@ fn wire_harness_config(
                         if let Some(h_obj) = hooks.as_object_mut() {
                             h_obj.entry("PreToolUse").or_insert_with(|| {
                                 json!([{
-                                    "matcher": "Read|Write|Edit|MultiEdit|Bash|Task",
+                                    "matcher": CLAUDE_PRE_TOOL_USE_MATCHER,
                                     "hooks": [{ "type": "command", "command": cmd.clone() }]
                                 }])
                             });
@@ -752,6 +760,28 @@ fn wire_harness_config(
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                            }
+                            // An older installer wrote a matcher without
+                            // NotebookEdit, so notebook edits skipped the
+                            // guard. Widen only our own entry, and only when
+                            // it still has that exact matcher.
+                            if let Some(entries) =
+                                h_obj.get_mut("PreToolUse").and_then(|v| v.as_array_mut())
+                            {
+                                for entry in entries {
+                                    let ours = entry["hooks"]
+                                        .as_array()
+                                        .map(|hooks| {
+                                            hooks.iter().any(|h| h["command"].as_str() == Some(cmd.as_str()))
+                                        })
+                                        .unwrap_or(false);
+                                    if ours
+                                        && entry["matcher"].as_str()
+                                            == Some(LEGACY_CLAUDE_PRE_TOOL_USE_MATCHER)
+                                    {
+                                        entry["matcher"] = json!(CLAUDE_PRE_TOOL_USE_MATCHER);
                                     }
                                 }
                             }
@@ -864,6 +894,77 @@ mod tests {
         let patched =
             std::fs::read_to_string(&custom_agent_md).expect("read patched custom-worker.md");
         assert!(patched.contains("subagent_prompt_injection"));
+    }
+
+    fn claude_pre_tool_use_matchers(root: &Path) -> Vec<(String, String)> {
+        let raw = std::fs::read_to_string(root.join(".claude/settings.local.json"))
+            .expect("read settings");
+        let doc: Value = serde_json::from_str(&raw).expect("parse settings");
+        doc["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse array")
+            .iter()
+            .map(|e| {
+                (
+                    e["matcher"].as_str().unwrap_or_default().to_string(),
+                    e["hooks"][0]["command"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// #333: NotebookEdit writes files, so the installed hook must run for
+    /// it, and an install made by an older version must be widened on the
+    /// next run without touching user hooks.
+    #[test]
+    fn claude_hook_matcher_covers_notebook_edit_and_widens_older_installs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let fresh = claude_pre_tool_use_matchers(tmp.path());
+        assert_eq!(fresh.len(), 1);
+        assert!(
+            fresh[0].0.split('|').any(|t| t == "NotebookEdit"),
+            "fresh install must guard NotebookEdit: {:?}",
+            fresh
+        );
+        let ours = fresh[0].1.clone();
+
+        let cfg = tmp.path().join(".claude/settings.local.json");
+        let older = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": LEGACY_CLAUDE_PRE_TOOL_USE_MATCHER,
+                        "hooks": [{ "type": "command", "command": ours }]
+                    },
+                    {
+                        "matcher": LEGACY_CLAUDE_PRE_TOOL_USE_MATCHER,
+                        "hooks": [{ "type": "command", "command": "echo user-hook" }]
+                    }
+                ],
+                "Stop": [{ "hooks": [{ "type": "command", "command": ours }] }]
+            }
+        });
+        std::fs::write(&cfg, serde_json::to_string_pretty(&older).unwrap())
+            .expect("write older settings");
+
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let after = claude_pre_tool_use_matchers(tmp.path());
+        assert_eq!(
+            after,
+            vec![
+                (CLAUDE_PRE_TOOL_USE_MATCHER.to_string(), ours.clone()),
+                (
+                    LEGACY_CLAUDE_PRE_TOOL_USE_MATCHER.to_string(),
+                    "echo user-hook".to_string()
+                ),
+            ],
+            "only the installer's own entry is widened"
+        );
     }
 
     #[test]

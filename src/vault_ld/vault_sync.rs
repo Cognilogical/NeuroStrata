@@ -14,7 +14,9 @@ use tracing::warn;
 use crate::rebac;
 use crate::secrets::SecretScanner;
 use crate::traits::{Embedder, SearchResult, VectorStore};
-use crate::vault_ld::{CanvasDocument, CanvasNode, VaultNote, VAULT_LD_SHAPES_V1, YAML_LD_CONTEXT};
+use crate::vault_ld::{
+    CanvasDocument, CanvasNode, VaultNote, FINGERPRINT_VERSION, VAULT_LD_SHAPES_V1, YAML_LD_CONTEXT,
+};
 
 /// Configuration for a vault sync operation
 #[derive(Debug, Clone)]
@@ -61,11 +63,12 @@ pub const MAX_VAULT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// Metadata keys the import owns on the replacement head. Everything else on
 /// a prior head (notably `task`) is preserved across a reimport: #335 showed
 /// that copying a fixed field list drops the next structured field silently.
-const IMPORT_OWNED_METADATA_KEYS: [&str; 17] = [
+const IMPORT_OWNED_METADATA_KEYS: [&str; 18] = [
     // Import-owned values, overlaid after the prior head is copied.
     "vault_source",
     "stub",
     "canonical_sha256",
+    "fingerprint_version",
     "related",
     "valid_from",
     "supersedes",
@@ -84,6 +87,19 @@ const IMPORT_OWNED_METADATA_KEYS: [&str; 17] = [
     "valid_to",
     "superseded_by",
     "archived_by_vault_import",
+];
+
+/// Edge declarations a retired history copy must not carry into `upsert`.
+/// Reconciliation only owns the live head's edges, so a copied declaration
+/// would materialise a fresh, active edge from knowledge that is retired.
+const HISTORY_EDGE_DECLARATION_KEYS: [&str; 7] = [
+    "related_to",
+    "related",
+    "governs",
+    "depends_on",
+    "contained_by",
+    "extracted_from",
+    "edge_sources",
 ];
 
 /// Resource caps for a vault import/export. The default entry points use the
@@ -506,11 +522,20 @@ pub async fn export_vault_with_limits(
         .await
         .map_err(|e| format!("Failed to list memories: {}", e))?;
 
-    // Filter by ReBAC can_read_memory
+    // Filter by ReBAC can_read_memory, then drop retired rows: an export is
+    // the current-knowledge surface, and `list` is generation-scoped only.
     let principal = config.principal.as_deref().unwrap_or("default");
+    let now = chrono::Utc::now().timestamp();
     let filtered: Vec<SearchResult> = memories
         .into_iter()
         .filter(|m| rebac::can_read_memory(principal, &m.payload.user_id, &m.payload.metadata))
+        .filter(|m| {
+            let metadata = &m.payload.metadata;
+            !crate::store::ladybug::is_retired_at(metadata, now)
+                && metadata
+                    .get("superseded_by")
+                    .map_or(true, serde_json::Value::is_null)
+        })
         .collect();
 
     // Convert to VaultNotes
@@ -644,14 +669,171 @@ pub async fn export_vault_with_limits(
     })
 }
 
+/// Exact-mode target resolution against the ids in `known`. The declared
+/// spelling wins so an exported id that already starts with the namespace
+/// (`<ns>::7::path`) keeps its own row; only then may the namespace prefix act
+/// as an alias for a bare id (`<ns>::z` → `z`).
+fn exact_note_target(
+    namespace: &str,
+    declared: &str,
+    known: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    crate::parser::ingest::exact_target_match(namespace, declared, |candidate| {
+        known.contains(candidate)
+    })
+    .map(str::to_string)
+}
+
+/// Store-backed half of the same rule: try each spelling in order and return
+/// the first row that exists. `None` means every spelling is absent and the
+/// caller must defer or stub the declared spelling.
+async fn exact_stored_target(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    declared: &str,
+    cache: &mut std::collections::HashMap<String, Option<(String, crate::traits::MemoryPayload)>>,
+) -> Result<Option<(String, crate::traits::MemoryPayload)>, String> {
+    if let Some(cached) = cache.get(declared) {
+        return Ok(cached.clone());
+    }
+    let mut found = None;
+    for candidate in crate::parser::ingest::exact_target_spellings(namespace, declared) {
+        match store.get(namespace, candidate).await {
+            Ok(Some((_, payload))) => {
+                found = Some((candidate.to_string(), payload));
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    cache.insert(declared.to_string(), found.clone());
+    Ok(found)
+}
+
+/// The keep set for one head's declarations, plus whether it depends on a
+/// post-write replay.
+struct KeepTargets {
+    ids: Vec<String>,
+    /// The keep-set chose a vault-known id that was not stored when the head
+    /// was written. The write may have bound a stored alias fallback and
+    /// reported no deferred edge, so reconciliation would retire that edge
+    /// without a post-write replay once the preferred id exists.
+    pending_preferred: bool,
+}
+
+/// The edge ids a head's declarations will actually bind, matching the store's
+/// exact-mode lookup. Both id sources are consulted per spelling so the keep
+/// set cannot pick an alias the upsert would not have bound; an unresolved
+/// declaration keeps its declared spelling so a later replay binds the same
+/// target the vault named.
+async fn exact_keep_targets(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    declared: &[String],
+    known: &std::collections::BTreeSet<String>,
+) -> KeepTargets {
+    let mut ids = Vec::with_capacity(declared.len());
+    let mut pending_preferred = false;
+    for target in declared {
+        // Find the first spelling present in either source. Vault membership is
+        // free; the store is queried only until one spelling resolves.
+        let mut store_hit = None;
+        let mut known_hit = None;
+        let mut failure = None;
+        for candidate in crate::parser::ingest::exact_target_spellings(namespace, target) {
+            if known.contains(candidate) {
+                known_hit = Some(candidate.to_string());
+                break;
+            }
+            match store.get(namespace, candidate).await {
+                Ok(Some(_)) => {
+                    store_hit = Some(candidate.to_string());
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        if let Some(e) = failure {
+            warn!("Could not resolve exact edge target {}: {}", target, e);
+            ids.push(target.clone());
+            continue;
+        }
+        // A vault-known id may be written later in this import. It is still
+        // the preferred binding, so its absence now makes the head depend on
+        // the post-write replay even when an alias kept the first upsert happy.
+        let chosen = match known_hit {
+            Some(candidate) => match store.get(namespace, &candidate).await {
+                Ok(Some(_)) => candidate,
+                Ok(None) => {
+                    pending_preferred = true;
+                    candidate
+                }
+                Err(e) => {
+                    // Resolution failed, not the target: keep the preferred id
+                    // and retry after the writes rather than dropping it.
+                    warn!("Could not resolve exact edge target {}: {}", target, e);
+                    pending_preferred = true;
+                    candidate
+                }
+            },
+            None => store_hit.unwrap_or_else(|| target.clone()),
+        };
+        ids.push(chosen);
+    }
+    KeepTargets {
+        ids,
+        pending_preferred,
+    }
+}
+
+/// The `RELATES_TO` declarations an unchanged head may rebind. Only a
+/// vault-import-owned head stores the vault render (`related`/`related_to`);
+/// store-owned rows keep relationship-typed keys (`governs`, `depends_on`),
+/// which must never be replayed as `RELATES_TO`. `None` means the head is not
+/// a vault declaration.
+fn vault_declared_targets(prior: &crate::traits::MemoryPayload) -> Option<Vec<String>> {
+    let metadata = &prior.metadata;
+    let vault_owned = metadata
+        .get("vault_source")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || metadata
+            .get("exact_edge_targets")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if !vault_owned {
+        return None;
+    }
+    let mut declared = Vec::new();
+    for key in ["related", "related_to"] {
+        if let Some(targets) = metadata.get(key).and_then(Value::as_array) {
+            declared.extend(
+                targets
+                    .iter()
+                    .filter_map(|target| target.as_str().map(str::to_string)),
+            );
+        }
+    }
+    declared.sort();
+    declared.dedup();
+    Some(declared)
+}
+
 /// WikiLink targets with no corresponding note in the vault. BTreeSet gives
-/// deterministic order for queryable stub minting.
-pub fn unresolved_wiki_targets(notes: &[VaultNote]) -> Vec<String> {
-    let known: std::collections::BTreeSet<&str> = notes.iter().map(|n| n.id.as_str()).collect();
+/// deterministic order for queryable stub minting. An own-namespace prefix is
+/// an alias only when the bare note exists, so unresolved ids keep the spelling
+/// the vault declared.
+pub fn unresolved_wiki_targets(notes: &[VaultNote], namespace: &str) -> Vec<String> {
+    let known: std::collections::BTreeSet<String> = notes.iter().map(|n| n.id.clone()).collect();
     let mut missing = std::collections::BTreeSet::new();
     for note in notes {
         for target in &note.related {
-            if !known.contains(target.as_str()) {
+            if exact_note_target(namespace, target, &known).is_none() {
                 missing.insert(target.clone());
             }
         }
@@ -686,6 +868,16 @@ fn retire_metadata(metadata: &mut serde_json::Value, new_id: &str, now: i64) {
             "archived_by_vault_import".to_string(),
             serde_json::json!(true),
         );
+    }
+}
+
+/// Drop the declarations whose only consumer is edge materialisation. Content,
+/// type, task state and the retirement stamps stay on the copy.
+fn strip_history_edge_declarations(metadata: &mut serde_json::Value) {
+    if let Some(obj) = metadata.as_object_mut() {
+        for key in HISTORY_EDGE_DECLARATION_KEYS {
+            obj.remove(key);
+        }
     }
 }
 
@@ -872,6 +1064,12 @@ pub async fn import_vault_with_limits(
         }
 
         let note = match VaultNote::from_markdown(&content) {
+            Ok(note) if note.id.contains(".vault-history.") => {
+                // History copies are importer projections, never vault-authored
+                // knowledge. Old exports may still carry them; ignoring the id
+                // keeps a stale vault from resurrecting one.
+                continue;
+            }
             Ok(mut note) => {
                 // Frontmatter hash is informational and may be stale. Derive
                 // bitemporal identity from content, tier and edges (finding 3).
@@ -908,8 +1106,9 @@ pub async fn import_vault_with_limits(
     // In a partial vault a linked memory's file is absent by definition; a
     // placeholder must not replace the live head that still exists.
     let mut mintable = Vec::new();
-    for target in unresolved_wiki_targets(&notes) {
-        match store.get(&config.namespace, &target).await {
+    let mut exact_cache = std::collections::HashMap::new();
+    for target in unresolved_wiki_targets(&notes, &config.namespace) {
+        match exact_stored_target(&store, &config.namespace, &target, &mut exact_cache).await {
             Ok(Some((_, payload))) => {
                 // An existing stub is exactly the state this loop would
                 // produce, so re-import is a silent no-op. A non-stub head
@@ -956,6 +1155,8 @@ pub async fn import_vault_with_limits(
         notes.push(stub);
     }
     notes.sort_by(|a, b| a.id.cmp(&b.id));
+    let known_notes: std::collections::BTreeSet<String> =
+        notes.iter().map(|n| n.id.clone()).collect();
 
     let principal = config.principal.as_deref().unwrap_or("default");
     let now = chrono::Utc::now().timestamp();
@@ -966,10 +1167,16 @@ pub async fn import_vault_with_limits(
         metadata: serde_json::Value,
         content: String,
         memory_type: String,
+        /// The vault's parsed link set, kept for edge reconciliation.
+        related: Vec<String>,
         history: Option<(String, Vec<f32>, crate::traits::MemoryPayload)>,
     }
 
     let mut planned: Vec<Planned> = Vec::new();
+    // An unchanged declarer skips planning, so its edge can never observe a
+    // preferred target that only arrives in this turn. Record the declaration
+    // and rebind edges after every head is written, without touching the head.
+    let mut unchanged_declarers: Vec<(String, Vec<String>)> = Vec::new();
     for note in notes {
         let is_stub = stub_ids.contains(&note.id);
         let gate_metadata = serde_json::json!({
@@ -1002,24 +1209,53 @@ pub async fn import_vault_with_limits(
             continue;
         }
 
+        let declared_type = note.rdf_type.strip_prefix("yaml:").unwrap_or("symbol");
         if let Some(ref prior) = prior_payload {
             // Byte-identical re-import is a no-op before any sovereignty
             // question: a protected row we do not touch is not overwritten.
-            // The hash always comes from parsed content/edges, never frontmatter.
-            // Task rows have no stored hash, so derive the same identity the
-            // export path would render for the prior payload (#335).
+            // The hash always comes from parsed content/edges/type, never
+            // frontmatter. Task rows have no stored hash, so derive the same
+            // identity the export path would render for the prior payload
+            // (#335).
             let prior_hash = prior
                 .metadata
                 .get("canonical_sha256")
                 .and_then(|v| v.as_str());
-            let unchanged = match prior_hash {
-                Some(hash) => hash == note.canonical_sha256,
-                None => {
-                    VaultNote::from_payload(&note.id, prior).canonical_sha256
-                        == note.canonical_sha256
+            let prior_version = prior
+                .metadata
+                .get("fingerprint_version")
+                .and_then(Value::as_u64);
+            let unchanged = if prior_version.is_some_and(|v| v >= FINGERPRINT_VERSION) {
+                match prior_hash {
+                    Some(hash) => hash == note.canonical_sha256,
+                    None => {
+                        VaultNote::from_payload(&note.id, prior).canonical_sha256
+                            == note.canonical_sha256
+                    }
                 }
+            } else {
+                // v1 head: keep its no-op round-trip, but require the declared
+                // type to match so a type-only edit still versions.
+                prior.memory_type == declared_type
+                    && match prior_hash {
+                        Some(hash) => {
+                            hash == note.fingerprint_legacy() || hash == note.canonical_sha256
+                        }
+                        None => {
+                            VaultNote::from_payload(&note.id, prior).fingerprint_legacy()
+                                == note.fingerprint_legacy()
+                        }
+                    }
             };
             if unchanged {
+                // Rebinding mutates edges, so an untouched head still needs
+                // the same sovereignty gate as a changed one. A protected head
+                // stays a silent no-op, exactly as the unchanged path was before.
+                if writable_prior(principal, prior).is_ok() {
+                    if let Some(declared) = vault_declared_targets(prior) {
+                        unchanged_declarers.push((note.id.clone(), declared));
+                    }
+                }
                 continue;
             }
             if let Err(e) = writable_prior(principal, prior) {
@@ -1053,9 +1289,17 @@ pub async fn import_vault_with_limits(
             None => serde_json::json!({}),
         };
         metadata["vault_source"] = serde_json::json!(true);
+        // A WikiLink names an exact vault-note id. Store-side path resolution
+        // must not relink it to an ingested symbol that happens to share its
+        // logical path (PR #363).
+        metadata["exact_edge_targets"] = serde_json::json!(true);
         metadata["stub"] = serde_json::json!(is_stub);
         metadata["canonical_sha256"] = serde_json::json!(note.canonical_sha256);
+        metadata["fingerprint_version"] = serde_json::json!(FINGERPRINT_VERSION);
+        // `related` is the vault render; `related_to` is the parser-recognised
+        // relation key that materialises the RELATES_TO edge (#343).
         metadata["related"] = serde_json::json!(note.related);
+        metadata["related_to"] = serde_json::json!(note.related);
         metadata["valid_from"] = serde_json::json!(now);
 
         let mut history = None;
@@ -1071,6 +1315,7 @@ pub async fn import_vault_with_limits(
             // already came across in the wholesale copy above.
             let history_id = format!("{}.vault-history.{}", note.id, uuid::Uuid::new_v4());
             retire_metadata(&mut prior.metadata, &note.id, now);
+            strip_history_edge_declarations(&mut prior.metadata);
             metadata["supersedes"] = serde_json::json!(history_id);
             history = Some((history_id, hv, prior));
         }
@@ -1080,17 +1325,16 @@ pub async fn import_vault_with_limits(
             vector,
             metadata,
             content: note.content,
-            memory_type: note
-                .rdf_type
-                .strip_prefix("yaml:")
-                .unwrap_or("symbol")
-                .to_string(),
+            memory_type: declared_type.to_string(),
+            related: note.related,
             history,
         });
     }
 
     // ---- Phase 2: writes ----
     let mut imported = 0;
+    let mut imported_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut deferred_retry: Vec<(String, Vec<f32>, crate::traits::MemoryPayload)> = Vec::new();
     for item in planned {
         let cleanup_id = item.history.as_ref().map(|(id, _, _)| id.clone());
         if let Some((history_id, history_vector, history_payload)) = item.history {
@@ -1118,11 +1362,45 @@ pub async fn import_vault_with_limits(
             metadata: item.metadata,
         };
 
+        let retry = payload
+            .metadata
+            .get("related_to")
+            .and_then(Value::as_array)
+            .is_some_and(|targets| !targets.is_empty())
+            .then(|| (payload.clone(), item.vector.clone()));
+        let keep = exact_keep_targets(&store, &config.namespace, &item.related, &known_notes).await;
+
+        // Materialise the new head before retiring the old head's edges.
+        // Reconciliation deletes edges the current head still relies on, so
+        // doing it first would leave a surviving old head broken when the
+        // upsert fails (#363). Vault targets are exact note ids, so the
+        // declared set matches the ids the upsert writes.
         match store
             .upsert(&config.namespace, &item.id, item.vector, payload)
             .await
         {
-            Ok(_) => imported += 1,
+            Ok(report) => {
+                imported += 1;
+                imported_ids.insert(item.id.clone());
+                if let Err(e) = store
+                    .reconcile_declared_edges(&config.namespace, &item.id, "RELATES_TO", &keep.ids)
+                    .await
+                {
+                    errors.push(format!(
+                        "Failed to retire stale edges for {}: {}",
+                        item.id, e
+                    ));
+                }
+                // A declarer may precede its target in id order, and an alias
+                // fallback can hide that from the deferred report: retry after
+                // every head exists whenever the preferred binding was not yet
+                // stored.
+                if !report.deferred_edges.is_empty() || keep.pending_preferred {
+                    if let Some((payload, vector)) = retry {
+                        deferred_retry.push((item.id.clone(), vector, payload));
+                    }
+                }
+            }
             Err(e) => {
                 // Never leave a head-without-history outcome: roll back the
                 // history row staged for this note.
@@ -1135,6 +1413,48 @@ pub async fn import_vault_with_limits(
                 }
                 errors.push(format!("Failed to upsert {}: {}", item.id, e));
             }
+        }
+    }
+
+    // Every row (and stub) now exists, so a forward reference resolves. A
+    // target absent from both the vault and the store stays deferred.
+    for (id, vector, payload) in deferred_retry {
+        let declared: Vec<String> = payload
+            .metadata
+            .get("related_to")
+            .and_then(Value::as_array)
+            .map(|targets| {
+                targets
+                    .iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let keep = exact_keep_targets(&store, &config.namespace, &declared, &known_notes).await;
+        if let Err(e) = store.upsert(&config.namespace, &id, vector, payload).await {
+            errors.push(format!("Failed to relink edges for {}: {}", id, e));
+        } else if let Err(e) = store
+            .reconcile_declared_edges(&config.namespace, &id, "RELATES_TO", &keep.ids)
+            .await
+        {
+            errors.push(format!("Failed to retire stale edges for {}: {}", id, e));
+        }
+    }
+
+    // A declaration that did not change can still point at the wrong row: the
+    // preferred exact target it names may only have been imported now. Rebind
+    // those edges after every head exists; the head row itself is never
+    // rewritten, so no content version or history row appears.
+    for (id, declared) in unchanged_declarers {
+        let keep = exact_keep_targets(&store, &config.namespace, &declared, &known_notes).await;
+        if !keep.ids.iter().any(|target| imported_ids.contains(target)) {
+            continue;
+        }
+        if let Err(e) = store
+            .rebind_declared_edges(&config.namespace, &id, "RELATES_TO", &declared, &keep.ids)
+            .await
+        {
+            errors.push(format!("Failed to rebind edges for {}: {}", id, e));
         }
     }
 
@@ -1265,9 +1585,19 @@ mod tests {
             note("b", &["missing-1", "a"]),
         ];
         assert_eq!(
-            unresolved_wiki_targets(&notes),
+            unresolved_wiki_targets(&notes, "ns"),
             vec!["missing-1", "missing-2"]
         );
+
+        // A qualified spelling is an alias only when the bare note exists.
+        let alias = vec![note("a", &["ns::z"]), note("z", &[])];
+        assert!(unresolved_wiki_targets(&alias, "ns").is_empty());
+        // With no bare note the declaration stays unresolved in its own spelling.
+        let missing = vec![note("a", &["ns::missing"])];
+        assert_eq!(unresolved_wiki_targets(&missing, "ns"), vec!["ns::missing"]);
+        // A verbatim scoped note id resolves before the prefix is read as an alias.
+        let verbatim = vec![note("a", &["ns::7::path"]), note("ns::7::path", &[])];
+        assert!(unresolved_wiki_targets(&verbatim, "ns").is_empty());
     }
 
     #[test]
@@ -1441,7 +1771,13 @@ mod tests {
         assert_eq!(head.metadata["related"], serde_json::json!(["second"]));
         let history_id = head.metadata["supersedes"].as_str().expect("supersedes");
         let (_, history) = store.get(ns, history_id).await.unwrap().unwrap();
-        assert_eq!(history.metadata["related"], serde_json::json!(["first"]));
+        assert_eq!(history.content, "Same body");
+        assert!(
+            history.metadata.get("related").is_none()
+                && history.metadata.get("related_to").is_none(),
+            "a retired copy must not keep edge declarations: {:?}",
+            history.metadata
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3153,7 +3489,14 @@ mod tests {
 
         let (_, head) = store.get(ns, "edge-reconcile").await.unwrap().unwrap();
         assert_eq!(head.metadata["related"], serde_json::json!(["kept-edge"]));
-        for key in ["related_to", "governs", "depends_on"] {
+        // #343: `related_to` is now the parser-recognised head key and must
+        // carry exactly the parsed set, not the stale preserved one.
+        assert_eq!(
+            head.metadata["related_to"],
+            serde_json::json!(["kept-edge"]),
+            "the head must declare the parsed link set for edge materialisation"
+        );
+        for key in ["governs", "depends_on"] {
             assert!(
                 head.metadata.get(key).is_none(),
                 "stale edge field {key} must be reconciled away: {:?}",
@@ -3170,6 +3513,139 @@ mod tests {
             exported.related,
             vec!["kept-edge".to_string()],
             "the next export must not resurrect deleted links"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex review 4656373077: a retired history copy must not materialise
+    /// the edge declarations its live head no longer carries.
+    #[tokio::test]
+    async fn history_copy_does_not_materialize_retired_edges() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-history-edges-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_history_edges";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let mut alpha = note("alpha-note", &["beta-note"]);
+        alpha.content = "Alpha body".to_string();
+        alpha.canonical_sha256 = alpha.fingerprint();
+        std::fs::write(vault.join("alpha-note.md"), alpha.to_markdown()).expect("write alpha");
+        let mut beta = note("beta-note", &[]);
+        beta.content = "Beta body".to_string();
+        beta.canonical_sha256 = beta.fingerprint();
+        std::fs::write(vault.join("beta-note.md"), beta.to_markdown()).expect("write beta");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(first.notes_imported, 2, "{:?}", first.errors);
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            relates_to_targets(&edges, "alpha-note"),
+            vec!["beta-note".to_string()],
+            "control: the first import materialises the link: {:?}",
+            edges
+        );
+
+        // Structured state the import does not own must ride along into the
+        // retired copy.
+        let (_, mut head) = store
+            .get(ns, "alpha-note")
+            .await
+            .expect("get alpha")
+            .expect("alpha exists");
+        head.metadata["task"] = serde_json::json!({
+            "id": "task-1",
+            "status": "in_progress"
+        });
+        let vector = TestEmbedder
+            .embed(&head.content)
+            .await
+            .expect("embed alpha");
+        store
+            .upsert(ns, "alpha-note", vector, head)
+            .await
+            .expect("stamp task state");
+
+        let mut edited = note("alpha-note", &[]);
+        edited.content = "Alpha body".to_string();
+        edited.canonical_sha256 = edited.fingerprint();
+        std::fs::write(vault.join("alpha-note.md"), edited.to_markdown()).expect("rewrite alpha");
+        let second = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("second import");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(second.notes_imported, 1, "{:?}", second.errors);
+
+        let rows = store.list(ns, None, None).await.expect("list rows");
+        let history: Vec<_> = rows
+            .iter()
+            .filter(|row| row.id.starts_with("alpha-note.vault-history."))
+            .collect();
+        assert_eq!(history.len(), 1, "the changed head leaves one history copy");
+        let history = history[0];
+        let history_id = history.id.clone();
+        assert_eq!(history.payload.content, "Alpha body");
+        assert_eq!(history.payload.memory_type, "fact");
+        assert_eq!(
+            history.payload.metadata["task"],
+            serde_json::json!({"id": "task-1", "status": "in_progress"}),
+            "retirement must preserve structured state: {:?}",
+            history.payload.metadata
+        );
+        assert!(
+            history
+                .payload
+                .metadata
+                .get("valid_to")
+                .and_then(serde_json::Value::as_i64)
+                .is_some(),
+            "the copy must stay retired: {:?}",
+            history.payload.metadata
+        );
+
+        let edges = store
+            .list_edges(ns)
+            .await
+            .expect("list edges after reimport");
+        assert!(
+            edges.iter().all(|(from, _, _, _)| from != &history.id),
+            "a retired copy must not originate live edges: {:?}",
+            edges
+        );
+        assert!(
+            relates_to_targets(&edges, "alpha-note").is_empty(),
+            "the current head no longer links beta: {:?}",
+            edges
+        );
+
+        // RDF projects the stored edge set, so the retired relationship must
+        // be absent from it as well.
+        let projected: Vec<(String, crate::traits::MemoryPayload)> =
+            rows.into_iter().map(|row| (row.id, row.payload)).collect();
+        let quads = crate::rdf::rows_to_quads(&projected, ns, crate::rdf::Tier::Domain, 0, &edges);
+        let relates_to = crate::rdf::namespace::relation_predicate("RELATES_TO");
+        let retired_subject = format!("urn:neurostrata:memory:{history_id}");
+        let retired_relation = quads.iter().any(|quad| {
+            quad.subject == retired_subject
+                && quad.predicate == relates_to
+                && matches!(&quad.object, crate::rdf::QuadObject::Iri(iri) if iri.ends_with(":beta-note"))
+        });
+        assert!(
+            !retired_relation,
+            "RDF must not project the retired relationship: {quads:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3310,5 +3786,2416 @@ mod tests {
         assert!(store.get(ns, "good").await.unwrap().is_some());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// v1 identity, reproduced here so the legacy seeds do not depend on the
+    /// code under test gaining a legacy method before it exists.
+    fn legacy_fingerprint(note: &VaultNote) -> String {
+        let mut related = note.related.clone();
+        related.sort();
+        related.dedup();
+        hex::encode(Sha256::digest(
+            format!(
+                "{}\u{1f}{}\u{1f}{}",
+                note.content.trim(),
+                note.epistemic_tier,
+                related.join("\u{1e}")
+            )
+            .as_bytes(),
+        ))
+    }
+
+    fn vault_config(root: &Path, vault: &Path, ns: &str) -> VaultSyncConfig {
+        VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.to_path_buf(),
+            output_dir: vault.to_path_buf(),
+            principal: None,
+            project_root: Some(root.to_path_buf()),
+            allowed_external_dirs: None,
+        }
+    }
+
+    /// #343: a WikiLink must reach the graph, not just metadata.
+    #[tokio::test]
+    async fn import_materializes_wikilink_edges_and_exports_without_duplicates() {
+        let root = std::env::temp_dir().join(format!("ns-vault-edges-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_edges";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let mut a = note("note-a", &["note-b"]);
+        a.content = "A links to B".to_string();
+        a.canonical_sha256 = a.fingerprint();
+        let mut b = note("note-b", &[]);
+        b.content = "B is a target".to_string();
+        b.canonical_sha256 = b.fingerprint();
+        std::fs::write(vault.join("note-a.md"), a.to_markdown()).expect("write a");
+        std::fs::write(vault.join("note-b.md"), b.to_markdown()).expect("write b");
+
+        let imported = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(imported.errors.is_empty(), "{:?}", imported.errors);
+        assert_eq!(imported.notes_imported, 2, "{:?}", imported.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| from == "note-a"
+                && rel == "RELATES_TO"
+                && to == "note-b"),
+            "WikiLink must be a stored RELATES_TO edge, got {:?}",
+            edges
+        );
+
+        let exported = export_vault(config.clone(), store.clone())
+            .await
+            .expect("export");
+        assert!(exported.success, "{:?}", exported.errors);
+        let markdown = std::fs::read_to_string(vault.join("note-a.md")).expect("read export");
+        assert_eq!(
+            markdown.matches("[[note-b]]").count(),
+            1,
+            "export must render the link once, not once per metadata key"
+        );
+
+        let again = import_vault(config, store, std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert_eq!(again.notes_imported, 0, "round-trip must be a no-op");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #346: a WikiLink removed from the vault must retire the stored edge,
+    /// not only its metadata. Reconcile is scoped to upsert-declared
+    /// RELATES_TO edges, so mention-detector links and GOVERNS survive.
+    #[tokio::test]
+    async fn reimport_retires_stored_edges_for_removed_wikilinks() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-retire-edges-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_retire_edges";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let mut linker = note("linker", &["stale-target", "kept-target"]);
+        linker.content = "links both".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        for plain in [note("stale-target", &[]), note("kept-target", &[])] {
+            let mut plain = plain;
+            plain.content = format!("body of {}", plain.id);
+            plain.canonical_sha256 = plain.fingerprint();
+            std::fs::write(vault.join(format!("{}.md", plain.id)), plain.to_markdown())
+                .expect("write note");
+        }
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        let edges = store.list_edges(ns).await.expect("list edges");
+        for target in ["stale-target", "kept-target"] {
+            assert!(
+                edges.iter().any(|(from, rel, to, _)| from == "linker"
+                    && rel == "RELATES_TO"
+                    && to == target),
+                "import must materialize {target}: {:?}",
+                edges
+            );
+        }
+
+        // Control: an unrelated upsert-declared edge is never reconciled.
+        store
+            .upsert(
+                ns,
+                "governing-rule",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "a rule".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({"governs": ["kept-target"]}),
+                },
+            )
+            .await
+            .expect("seed governs edge");
+
+        linker.related = vec!["kept-target".to_string()];
+        linker.content = "links one".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("rewrite linker");
+
+        let second = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("reimport");
+        assert_eq!(second.notes_imported, 1, "{:?}", second.errors);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            !edges.iter().any(|(from, rel, to, _)| from == "linker"
+                && rel == "RELATES_TO"
+                && to == "stale-target"),
+            "a removed WikiLink must retire its RELATES_TO edge: {:?}",
+            edges
+        );
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| from == "linker"
+                && rel == "RELATES_TO"
+                && to == "kept-target"),
+            "a kept WikiLink must keep its edge: {:?}",
+            edges
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(from, rel, to, _)| from == "governing-rule"
+                    && rel == "GOVERNS"
+                    && to == "kept-target"),
+            "an unrelated upsert edge must survive reconciliation: {:?}",
+            edges
+        );
+
+        let exported = export_vault(config.clone(), store.clone())
+            .await
+            .expect("export");
+        assert!(exported.success, "{:?}", exported.errors);
+        let markdown = std::fs::read_to_string(vault.join("linker.md")).expect("read export");
+        assert!(
+            !markdown.contains("[[stale-target]]"),
+            "export must not resurrect the removed link: {markdown}"
+        );
+        assert_eq!(markdown.matches("[[kept-target]]").count(), 1, "{markdown}");
+
+        // Empty transition: removing the last link retires the last edge.
+        linker.related.clear();
+        linker.content = "links none".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown())
+            .expect("rewrite empty linker");
+        let third = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import empty links");
+        assert!(third.errors.is_empty(), "{:?}", third.errors);
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            !edges
+                .iter()
+                .any(|(from, rel, _, _)| from == "linker" && rel == "RELATES_TO"),
+            "an empty link set must retire every declared RELATES_TO edge: {:?}",
+            edges
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(from, rel, to, _)| from == "governing-rule"
+                    && rel == "GOVERNS"
+                    && to == "kept-target"),
+            "the unrelated edge must still survive: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: a vault target whose logical path collides with an ingested
+    /// symbol must remain the exact vault-note id — in the declared metadata
+    /// and in the materialised edge — so export renders one link and the
+    /// reimport fingerprint is stable.
+    #[tokio::test]
+    async fn vault_targets_survive_symbol_path_collisions() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-exact-targets-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_exact_targets";
+        store.init(ns).await.expect("init");
+
+        let generation = store.begin_generation(ns, "code").await.expect("begin");
+        let symbol_id =
+            crate::parser::ingest::generation_scoped_id(ns, generation, "shared-target");
+        store
+            .upsert(
+                ns,
+                &symbol_id,
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "an ingested symbol".to_string(),
+                    user_id: "auto-ingestor".to_string(),
+                    memory_type: "symbol".to_string(),
+                    agent_name: Some("auto-ingestor".to_string()),
+                    location: "shared-target".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed colliding symbol");
+        store
+            .publish_generation(ns, "code", generation)
+            .await
+            .expect("publish");
+
+        let config = vault_config(&root, &vault, ns);
+        let mut linker = note("linker", &["shared-target"]);
+        linker.content = "links the vault note".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut target = note("shared-target", &[]);
+        target.content = "vault note body".to_string();
+        target.canonical_sha256 = target.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("shared-target.md"), target.to_markdown()).expect("write target");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let (_, head) = store
+            .get(ns, "linker")
+            .await
+            .expect("get head")
+            .expect("head exists");
+        assert_eq!(
+            head.metadata["related_to"],
+            serde_json::json!(["shared-target"]),
+            "a vault target must stay an exact note id"
+        );
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| from == "linker"
+                && rel == "RELATES_TO"
+                && to == "shared-target"),
+            "the edge must target the exact vault note: {:?}",
+            edges
+        );
+        assert!(
+            !edges.iter().any(|(_, _, to, _)| to == &symbol_id),
+            "the ingested symbol must not be linked: {:?}",
+            edges
+        );
+
+        export_vault(config.clone(), store.clone())
+            .await
+            .expect("export");
+        let markdown = std::fs::read_to_string(vault.join("linker.md")).expect("read export");
+        assert_eq!(
+            markdown.matches("[[shared-target]]").count(),
+            1,
+            "{markdown}"
+        );
+        assert!(
+            !markdown.contains(&format!("[[{symbol_id}]]")),
+            "export must not render the symbol as a second link: {markdown}"
+        );
+
+        let again = import_vault(config, store, std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert_eq!(
+            again.notes_imported, 0,
+            "the exact-id round-trip must keep the fingerprint stable: {:?}",
+            again.errors
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: a same-namespace qualified WikiLink (`<ns>::z`) names the
+    /// vault note `z`, which is stored bare. A same-path ingested symbol must
+    /// not capture it just because the note has not been written yet.
+    #[tokio::test]
+    async fn qualified_wikilink_binds_exact_note_before_symbol_resolution() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-vault-qualified-targets-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_qualified_targets";
+        store.init(ns).await.expect("init");
+
+        let generation = store.begin_generation(ns, "code").await.expect("begin");
+        let symbol_id = crate::parser::ingest::generation_scoped_id(ns, generation, "z");
+        store
+            .upsert(
+                ns,
+                &symbol_id,
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "an ingested symbol".to_string(),
+                    user_id: "auto-ingestor".to_string(),
+                    memory_type: "symbol".to_string(),
+                    agent_name: Some("auto-ingestor".to_string()),
+                    location: "z".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed colliding symbol");
+        store
+            .publish_generation(ns, "code", generation)
+            .await
+            .expect("publish");
+
+        let qualified_target = format!("{ns}::z");
+        let config = vault_config(&root, &vault, ns);
+        let mut linker = note("linker", &[qualified_target.as_str()]);
+        linker.content = "links the qualified vault note".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        // The link spells the note with its namespace; the note id stays bare.
+        let mut target = note("z", &[]);
+        target.content = "qualified vault note body".to_string();
+        target.canonical_sha256 = target.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("qualified.md"), target.to_markdown()).expect("write target");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let (_, head) = store
+            .get(ns, "linker")
+            .await
+            .expect("get head")
+            .expect("head exists");
+        assert_eq!(
+            head.metadata["related_to"],
+            serde_json::json!([qualified_target.clone()]),
+            "the declared spelling must survive for export"
+        );
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges
+                .iter()
+                .any(|(from, rel, to, _)| from == "linker" && rel == "RELATES_TO" && to == "z"),
+            "the edge must target the exact vault note `z`: {:?}",
+            edges
+        );
+        assert!(
+            !edges.iter().any(|(_, _, to, _)| to == &symbol_id),
+            "the same-path ingested symbol must not be linked: {:?}",
+            edges
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("linker.md")).expect("read export");
+        assert_eq!(
+            markdown.matches(&format!("[[{qualified_target}]]")).count(),
+            1,
+            "{markdown}"
+        );
+        assert!(
+            !markdown.contains(&format!("[[{symbol_id}]]")),
+            "export must not render the symbol as a second link: {markdown}"
+        );
+
+        let prior_sha = head.metadata["canonical_sha256"].clone();
+        let again = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            again.notes_imported, 0,
+            "the exact-id round-trip must keep the fingerprint stable"
+        );
+        let (_, reimported) = store
+            .get(ns, "linker")
+            .await
+            .expect("get reimported head")
+            .expect("head exists");
+        assert_eq!(
+            reimported.metadata["canonical_sha256"], prior_sha,
+            "the linker fingerprint must not churn"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: ingestion replays every memory's declarations through
+    /// `relink_edges`. A vault head carrying `exact_edge_targets` must keep its
+    /// bare target when a same-path symbol is published later; replay may not
+    /// infer the symbol and leave the imported edge set changed.
+    #[tokio::test]
+    async fn relink_preserves_exact_vault_targets_across_ingestion() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-replay-targets-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_replay_targets";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        // `a` links the note `z`; the body avoids the symbol name so the
+        // mention detector has nothing to infer. `z` is a real vault note.
+        let mut a = note("a", &["z"]);
+        a.content = "links the target note".to_string();
+        a.canonical_sha256 = a.fingerprint();
+        let mut z = note("z", &[]);
+        z.content = "vault note body".to_string();
+        z.canonical_sha256 = z.fingerprint();
+        std::fs::write(vault.join("a.md"), a.to_markdown()).expect("write a");
+        std::fs::write(vault.join("z.md"), z.to_markdown()).expect("write z");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let linked = |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| -> Vec<String> {
+            edges
+                .iter()
+                .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+                .map(|(_, _, to, _)| to.clone())
+                .collect()
+        };
+        assert_eq!(
+            linked(&store.list_edges(ns).await.expect("initial edges")),
+            vec!["z".to_string()],
+            "the import binds the bare vault note"
+        );
+
+        // Simulate the next ingestion: a code symbol whose logical path is `z`
+        // is staged, published, and the declarations are replayed.
+        let generation = store.begin_generation(ns, "code").await.expect("begin");
+        let symbol_id = crate::parser::ingest::generation_scoped_id(ns, generation, "z");
+        store
+            .upsert(
+                ns,
+                &symbol_id,
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "an ingested symbol".to_string(),
+                    user_id: "auto-ingestor".to_string(),
+                    memory_type: "symbol".to_string(),
+                    agent_name: Some("auto-ingestor".to_string()),
+                    location: "z".to_string(),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed same-path symbol");
+        store
+            .publish_generation(ns, "code", generation)
+            .await
+            .expect("publish");
+        store
+            .relink_edges(ns, "code")
+            .await
+            .expect("replay declarations");
+
+        let edges = store.list_edges(ns).await.expect("edges after replay");
+        assert_eq!(
+            linked(&edges),
+            vec!["z".to_string()],
+            "replay must not add a second target to the exact declaration: {edges:?}"
+        );
+        assert!(
+            !edges.iter().any(|(_, _, to, _)| to == &symbol_id),
+            "replay must not infer the same-path symbol: {edges:?}"
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("a.md")).expect("read export");
+        assert_eq!(
+            markdown.matches("[[z]]").count(),
+            1,
+            "export must render the one declared link: {markdown}"
+        );
+        assert!(
+            !markdown.contains(&format!("[[{symbol_id}]]")),
+            "export must not render the symbol as a link: {markdown}"
+        );
+
+        let prior_sha = store
+            .get(ns, "a")
+            .await
+            .expect("get head")
+            .expect("head exists")
+            .1
+            .metadata["canonical_sha256"]
+            .clone();
+        let again = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            again.notes_imported, 0,
+            "the exact replay must keep the fingerprint stable"
+        );
+        assert_eq!(
+            store
+                .get(ns, "a")
+                .await
+                .expect("get reimported head")
+                .expect("head exists")
+                .1
+                .metadata["canonical_sha256"],
+            prior_sha,
+            "the head fingerprint must not churn"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: a vault declaration replayed by ingestion belongs to
+    /// reconciliation. Once the literal preferred note exists, replay
+    /// materialises `a -> ns::z`; removing the WikiLink must retire that edge
+    /// and its citation on the next import. Ordinary relink edges are not
+    /// reconciliation-owned, so they survive.
+    #[tokio::test]
+    async fn reimport_retires_replayed_vault_declaration_edges() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-vault-replay-ownership-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "ns";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+        let preferred = format!("{ns}::z");
+
+        // The bare alias exists first; the literal preferred note does not.
+        let mut a = note("a", &[preferred.as_str()]);
+        a.content = "links the alias until the verbatim note exists".to_string();
+        a.canonical_sha256 = a.fingerprint();
+        let mut alias = note("z", &[]);
+        alias.content = "body of the bare alias".to_string();
+        alias.canonical_sha256 = alias.fingerprint();
+        std::fs::write(vault.join("a.md"), a.to_markdown()).expect("write a");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write z");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        let memory_api_upsert = |id: &str, content: &str, metadata: Value| {
+            let store = store.clone();
+            let id = id.to_string();
+            let content = content.to_string();
+            async move {
+                store
+                    .upsert(
+                        ns,
+                        &id,
+                        vec![0.0; 4],
+                        crate::traits::MemoryPayload {
+                            content,
+                            user_id: "default".to_string(),
+                            memory_type: "fact".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata,
+                        },
+                    )
+                    .await
+                    .expect("memory api upsert");
+            }
+        };
+        // Control: an ordinary declaration whose target only appears after it
+        // was written, so the ordinary replay path creates the edge.
+        memory_api_upsert(
+            "control",
+            "ordinary declarer",
+            serde_json::json!({"related_to": ["control-target"]}),
+        )
+        .await;
+        memory_api_upsert(
+            &preferred,
+            "body of the verbatim note",
+            serde_json::json!({}),
+        )
+        .await;
+        memory_api_upsert("control-target", "ordinary target", serde_json::json!({})).await;
+
+        store
+            .relink_edges(ns, "code")
+            .await
+            .expect("replay declarations");
+        let edges = store.list_edges(ns).await.expect("edges after replay");
+        assert!(
+            edges.iter().any(|(from, rel, to, prov)| from == "a"
+                && rel == "RELATES_TO"
+                && to == &preferred
+                && prov.as_ref().and_then(|p| p.extractor.as_deref()) == Some("upsert")),
+            "replay must materialise the now-exact preferred target under reconciliation ownership: {edges:?}"
+        );
+        assert!(
+            edges.iter().any(|(from, rel, to, prov)| from == "control"
+                && rel == "RELATES_TO"
+                && to == "control-target"
+                && prov.as_ref().and_then(|p| p.extractor.as_deref()) == Some("relink")),
+            "control must have an ordinary relink edge: {edges:?}"
+        );
+        let (_, replayed_head) = store
+            .get(ns, "a")
+            .await
+            .expect("get replayed declarer")
+            .expect("declarer exists");
+        let replayed_sources = replayed_head
+            .metadata
+            .get("edge_sources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            replayed_sources
+                .iter()
+                .any(|s| s["rel_type"] == "RELATES_TO"
+                    && s["resolved_target"] == preferred.as_str()
+                    && s["extractor"] == "upsert"),
+            "the replayed edge must cite its declaration: {replayed_sources:?}"
+        );
+
+        a.related.clear();
+        a.content = "links none".to_string();
+        a.canonical_sha256 = a.fingerprint();
+        std::fs::write(vault.join("a.md"), a.to_markdown()).expect("rewrite a");
+        let second = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("edges after reimport");
+        assert!(
+            !edges
+                .iter()
+                .any(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO"),
+            "a removed WikiLink must retire its replayed declaration edge: {edges:?}"
+        );
+        let (_, head) = store
+            .get(ns, "a")
+            .await
+            .expect("get declarer")
+            .expect("declarer exists");
+        let sources = head
+            .metadata
+            .get("edge_sources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !sources.iter().any(|s| s["rel_type"] == "RELATES_TO"),
+            "the retired replay edge must not leave provenance: {sources:?}"
+        );
+        assert!(
+            edges.iter().any(|(from, rel, to, prov)| from == "control"
+                && rel == "RELATES_TO"
+                && to == "control-target"
+                && prov.as_ref().and_then(|p| p.extractor.as_deref()) == Some("relink")),
+            "an ordinary memory relink edge must not be reconciled: {edges:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: replay owns the whole binding set of an exact-mode
+    /// declaration, not just the edges it creates. When the preferred verbatim
+    /// target appears, the alias edge the first import bound and its citation
+    /// must be retired with it; ordinary relink edges stay untouched.
+    #[tokio::test]
+    async fn replay_reconciles_obsolete_exact_bindings() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-vault-replay-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "ns";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+        let preferred = format!("{ns}::z");
+
+        let mut a = note("a", &[preferred.as_str()]);
+        a.content = "links the alias until the verbatim note exists".to_string();
+        a.canonical_sha256 = a.fingerprint();
+        let mut alias = note("z", &[]);
+        alias.content = "body of the bare alias".to_string();
+        alias.canonical_sha256 = alias.fingerprint();
+        std::fs::write(vault.join("a.md"), a.to_markdown()).expect("write a");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write z");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        let relates_from =
+            |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)],
+             from: &str|
+             -> Vec<String> {
+                edges
+                    .iter()
+                    .filter(|(source, rel, _, _)| source == from && rel == "RELATES_TO")
+                    .map(|(_, _, target, _)| target.clone())
+                    .collect()
+            };
+        assert_eq!(
+            relates_from(&store.list_edges(ns).await.expect("initial edges"), "a"),
+            vec!["z".to_string()],
+            "the first import binds the only stored candidate"
+        );
+
+        let upsert = |id: &str, content: &str, metadata: Value| {
+            let store = store.clone();
+            let id = id.to_string();
+            let content = content.to_string();
+            async move {
+                store
+                    .upsert(
+                        ns,
+                        &id,
+                        vec![0.0; 4],
+                        crate::traits::MemoryPayload {
+                            content,
+                            user_id: "default".to_string(),
+                            memory_type: "fact".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata,
+                        },
+                    )
+                    .await
+                    .expect("memory api upsert");
+            }
+        };
+        upsert(
+            &preferred,
+            "body of the verbatim note",
+            serde_json::json!({}),
+        )
+        .await;
+        // Control: this pair only becomes resolvable during replay, so its
+        // edge is created by the ordinary relink path in the same pass.
+        upsert(
+            "control",
+            "ordinary declarer",
+            serde_json::json!({"related_to": ["control-target"]}),
+        )
+        .await;
+        upsert("control-target", "ordinary target", serde_json::json!({})).await;
+
+        store
+            .relink_edges(ns, "code")
+            .await
+            .expect("replay declarations");
+
+        let edges = store.list_edges(ns).await.expect("edges after replay");
+        assert_eq!(
+            relates_from(&edges, "a"),
+            vec![preferred.clone()],
+            "replay must retire the obsolete alias binding: {edges:?}"
+        );
+        assert!(
+            edges.iter().any(|(from, rel, to, prov)| from == "control"
+                && rel == "RELATES_TO"
+                && to == "control-target"
+                && prov.as_ref().and_then(|p| p.extractor.as_deref()) == Some("relink")),
+            "the ordinary relink edge must survive: {edges:?}"
+        );
+
+        let (_, head) = store
+            .get(ns, "a")
+            .await
+            .expect("get declarer")
+            .expect("declarer exists");
+        let sources = head
+            .metadata
+            .get("edge_sources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            sources.iter().any(
+                |s| s["rel_type"] == "RELATES_TO" && s["resolved_target"] == preferred.as_str()
+            ),
+            "the preferred binding keeps its citation: {sources:?}"
+        );
+        assert!(
+            !sources
+                .iter()
+                .any(|s| s["rel_type"] == "RELATES_TO" && s["resolved_target"] == "z"),
+            "the retired alias edge must not leave provenance: {sources:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: an exported note's own id can carry the namespace and a
+    /// numeric middle segment (`<ns>::7::path`). A WikiLink naming it must
+    /// bind that verbatim row, not treat the prefix as an alias and mint a
+    /// `7::path` stub.
+    #[tokio::test]
+    async fn qualified_note_id_binds_verbatim_before_alias_stripping() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-verbatim-id-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        // `ns` is a valid IRI scheme, so the scoped id itself stays a legal
+        // Turtle subject; a longer namespace with `_` would not.
+        let ns = "ns";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let scoped_id = format!("{ns}::7::path");
+        let alias_id = "7::path";
+        let mut linker = note("linker", &[scoped_id.as_str()]);
+        linker.content = "links the scoped note".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut target = note(&scoped_id, &[]);
+        target.content = "body of the scoped note".to_string();
+        target.canonical_sha256 = target.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("scoped.md"), target.to_markdown()).expect("write target");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(
+            store
+                .get(ns, &scoped_id)
+                .await
+                .expect("get scoped")
+                .is_some(),
+            "the verbatim note must be imported"
+        );
+        assert!(
+            store.get(ns, alias_id).await.expect("get alias").is_none(),
+            "the namespace prefix must not be read as an alias: no `{alias_id}` stub"
+        );
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| from == "linker"
+                && rel == "RELATES_TO"
+                && to == &scoped_id),
+            "the edge must bind the verbatim note id: {:?}",
+            edges
+        );
+        assert!(
+            !edges.iter().any(|(_, _, to, _)| to == alias_id),
+            "no edge may bind the stripped alias: {:?}",
+            edges
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("linker.md")).expect("read export");
+        assert_eq!(
+            markdown.matches(&format!("[[{scoped_id}]]")).count(),
+            1,
+            "{markdown}"
+        );
+        assert!(
+            !markdown.contains(&format!("[[{alias_id}]]")),
+            "export must keep the verbatim spelling: {markdown}"
+        );
+
+        let prior_sha = store
+            .get(ns, "linker")
+            .await
+            .expect("get head")
+            .expect("head exists")
+            .1
+            .metadata["canonical_sha256"]
+            .clone();
+        let again = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            again.notes_imported, 0,
+            "the verbatim round-trip must keep the fingerprint stable"
+        );
+        assert_eq!(
+            store
+                .get(ns, "linker")
+                .await
+                .expect("get reimported head")
+                .expect("head exists")
+                .1
+                .metadata["canonical_sha256"],
+            prior_sha,
+            "the linker fingerprint must not churn"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: keep resolution must consult stored ids and vault ids per
+    /// spelling. A stored verbatim `<ns>::z` outranks the vault-known alias
+    /// `z`; otherwise reconciliation deletes the edge the upsert just wrote
+    /// and an unchanged reimport can never repair it.
+    #[tokio::test]
+    async fn stored_verbatim_target_outranks_vault_alias_during_reconciliation() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-dual-set-keep-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "ns";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let stored_id = format!("{ns}::z");
+        store
+            .upsert(
+                ns,
+                &stored_id,
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "memory stored under its verbatim id".to_string(),
+                    memory_type: "note".to_string(),
+                    location: "".to_string(),
+                    user_id: "default".to_string(),
+                    agent_name: Some("auto-ingestor".to_string()),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed stored verbatim target");
+
+        // Partial vault: only the bare `z` file and a linker naming `ns::z`.
+        let mut linker = note("linker", &[stored_id.as_str()]);
+        linker.content = "links the stored verbatim memory".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut target = note("z", &[]);
+        target.content = "partial vault body for z".to_string();
+        target.canonical_sha256 = target.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("z.md"), target.to_markdown()).expect("write z");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.success, "{result:?}");
+
+        let linked = |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| {
+            edges
+                .iter()
+                .filter(|(from, rel, _, _)| from == "linker" && rel == "RELATES_TO")
+                .map(|(_, _, to, _)| to.clone())
+                .collect::<Vec<_>>()
+        };
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            linked(&edges),
+            vec![stored_id.clone()],
+            "reconciliation must keep the id materialization bound: {:?}",
+            edges
+        );
+        assert!(
+            !edges.iter().any(|(_, _, to, _)| to == "z"),
+            "no edge may bind the alias: {:?}",
+            edges
+        );
+        let (_, bare) = store
+            .get(ns, "z")
+            .await
+            .expect("get bare note")
+            .expect("the partial vault note exists");
+        assert_eq!(
+            bare.metadata.get("stub").and_then(Value::as_bool),
+            Some(false),
+            "the vault note itself must not become an alias stub"
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("linker.md")).expect("read export");
+        assert_eq!(
+            markdown.matches(&format!("[[{stored_id}]]")).count(),
+            1,
+            "{markdown}"
+        );
+        assert!(!markdown.contains("[[z]]"), "{markdown}");
+
+        let again = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            again.notes_imported, 0,
+            "an unchanged reimport must be a no-op: {:?}",
+            again.errors
+        );
+        let edges = store
+            .list_edges(ns)
+            .await
+            .expect("list edges after reimport");
+        assert_eq!(
+            linked(&edges),
+            vec![stored_id],
+            "an unchanged reimport must not churn the reconciled edge set: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: a preferred vault target may be absent when its declarer is
+    /// written, while an alias is already stored. The upsert binds the alias
+    /// and reports no deferred edge; reconciliation then retires it. The
+    /// preferred id must be retried after the whole vault exists, even though
+    /// the initial lookup succeeded.
+    #[tokio::test]
+    async fn forward_reference_rebinds_preferred_target_after_alias_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-vault-pending-preferred-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "ns";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        // The alias is live in the store before the preferred id exists.
+        store
+            .upsert(
+                ns,
+                "z",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "memory stored under the bare alias".to_string(),
+                    memory_type: "note".to_string(),
+                    location: "".to_string(),
+                    user_id: "default".to_string(),
+                    agent_name: Some("auto-ingestor".to_string()),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed stored alias");
+
+        let preferred = format!("{ns}::z");
+        // `a` sorts before the target, so it is written while `ns::z` is absent.
+        let mut linker = note("a", &[preferred.as_str()]);
+        linker.content = "links the future verbatim note".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut target = note(&preferred, &[]);
+        target.content = "body of the future verbatim note".to_string();
+        target.canonical_sha256 = target.fingerprint();
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("target.md"), target.to_markdown()).expect("write target");
+
+        let result = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.success, "{result:?}");
+
+        let linked = |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| {
+            edges
+                .iter()
+                .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+                .map(|(_, _, to, _)| to.clone())
+                .collect::<Vec<_>>()
+        };
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            linked(&edges),
+            vec![preferred.clone()],
+            "the replay must rebind the preferred id once it exists: {:?}",
+            edges
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|(from, _, to, _)| from == "a" && to == "z"),
+            "reconciliation must not leave the alias edge: {:?}",
+            edges
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("a.md")).expect("read export");
+        assert_eq!(
+            markdown.matches(&format!("[[{preferred}]]")).count(),
+            1,
+            "{markdown}"
+        );
+        assert!(!markdown.contains("[[z]]"), "{markdown}");
+
+        let again = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert_eq!(
+            again.notes_imported, 0,
+            "an unchanged reimport must be a no-op: {:?}",
+            again.errors
+        );
+        let edges = store
+            .list_edges(ns)
+            .await
+            .expect("list edges after reimport");
+        assert_eq!(
+            linked(&edges),
+            vec![preferred],
+            "an unchanged reimport must not churn the reconciled edge set: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A declarer whose fingerprint is unchanged skips planning entirely. A
+    /// preferred target that only arrives in a later turn therefore never
+    /// reaches it, and its edge stays on the alias fallback forever. Rebinding
+    /// must not mint a second content version of the declarer.
+    #[tokio::test]
+    async fn unchanged_declarer_rebinds_when_preferred_target_arrives() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-vault-unchanged-rebind-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "ns";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        // The bare alias exists before the declarer's preferred id does.
+        store
+            .upsert(
+                ns,
+                "z",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "memory stored under the bare alias".to_string(),
+                    memory_type: "note".to_string(),
+                    location: "".to_string(),
+                    user_id: "default".to_string(),
+                    agent_name: Some("auto-ingestor".to_string()),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed stored alias");
+
+        let preferred = format!("{ns}::z");
+        let mut linker = note("a", &[preferred.as_str()]);
+        linker.content = "links the alias until the verbatim note exists".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut alias = note("z", &[]);
+        alias.content = "body of the bare alias".to_string();
+        alias.canonical_sha256 = alias.fingerprint();
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write alias");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert!(first.success, "{first:?}");
+
+        let linked = |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| {
+            edges
+                .iter()
+                .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+                .map(|(_, _, to, _)| to.clone())
+                .collect::<Vec<_>>()
+        };
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            linked(&edges),
+            vec!["z".to_string()],
+            "the first import binds the stored alias: {:?}",
+            edges
+        );
+
+        let (_, before) = store
+            .get(ns, "a")
+            .await
+            .expect("get declarer")
+            .expect("declarer exists");
+
+        // Second turn: the literal preferred note arrives; `a` is untouched.
+        let mut literal = note(&preferred, &[]);
+        literal.content = "body of the verbatim note".to_string();
+        literal.canonical_sha256 = literal.fingerprint();
+        std::fs::write(vault.join("preferred.md"), literal.to_markdown()).expect("write preferred");
+
+        let second = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(second.success, "{second:?}");
+        assert_eq!(
+            second.notes_imported, 1,
+            "only the preferred note is new: {:?}",
+            second.errors
+        );
+
+        let (_, after) = store
+            .get(ns, "a")
+            .await
+            .expect("get declarer after rebind")
+            .expect("declarer survives");
+        assert_eq!(
+            after.content, before.content,
+            "head content must not change"
+        );
+        assert_eq!(
+            after.memory_type, before.memory_type,
+            "head type must not change"
+        );
+        assert_eq!(
+            after.metadata.get("canonical_sha256"),
+            before.metadata.get("canonical_sha256"),
+            "head identity must not change"
+        );
+        assert_eq!(
+            after.metadata.get("supersedes"),
+            None,
+            "an edge rebind must not supersede the head: {:?}",
+            after.metadata
+        );
+        let history_rows = store
+            .list(ns, None, None)
+            .await
+            .expect("list rows")
+            .into_iter()
+            .filter(|row| row.id.starts_with("a.vault-history."))
+            .count();
+        assert_eq!(history_rows, 0, "no history version may be created");
+
+        let edges = store.list_edges(ns).await.expect("list edges after rebind");
+        assert_eq!(
+            linked(&edges),
+            vec![preferred.clone()],
+            "the unchanged declarer must rebind its preferred target: {:?}",
+            edges
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("a.md")).expect("read export");
+        assert_eq!(
+            markdown.matches(&format!("[[{preferred}]]")).count(),
+            1,
+            "{markdown}"
+        );
+        assert!(!markdown.contains("[[z]]"), "{markdown}");
+
+        let third = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("third import");
+        assert!(third.errors.is_empty(), "{:?}", third.errors);
+        assert_eq!(
+            third.notes_imported, 0,
+            "a stable rebind must not churn the head: {:?}",
+            third.errors
+        );
+        let edges = store
+            .list_edges(ns)
+            .await
+            .expect("list edges after third import");
+        assert_eq!(
+            linked(&edges),
+            vec![preferred],
+            "a third unchanged import must be a stable no-op: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn relates_to_targets(
+        edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)],
+        from: &str,
+    ) -> Vec<String> {
+        edges
+            .iter()
+            .filter(|(source, rel, _, _)| source == from && rel == "RELATES_TO")
+            .map(|(_, _, target, _)| target.clone())
+            .collect()
+    }
+
+    /// Seed an unchanged declarer whose head is already bound to the bare `z`
+    /// alias while its note declares the preferred `ns::z`. The red turn adds
+    /// the literal preferred note to a vault that also holds `a` byte-identical.
+    async fn seed_unchanged_alias_declarer(
+        label: &str,
+        ns: &str,
+        owner: &str,
+        mesh: Option<serde_json::Value>,
+    ) -> (
+        std::sync::Arc<dyn VectorStore>,
+        VaultSyncConfig,
+        String,
+        crate::traits::MemoryPayload,
+    ) {
+        let root = std::env::temp_dir().join(format!("ns-vault-{label}-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        store.init(ns).await.expect("init");
+        let mut config = vault_config(&root, &vault, ns);
+        config.principal = Some("me".to_string());
+
+        let preferred = format!("{ns}::z");
+        let mut linker = note("a", &[preferred.as_str()]);
+        linker.content = "links the alias until the verbatim note exists".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut alias = note("z", &[]);
+        alias.content = "body of the bare alias".to_string();
+        alias.canonical_sha256 = alias.fingerprint();
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write alias");
+
+        store
+            .upsert(
+                ns,
+                "z",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: alias.content.clone(),
+                    memory_type: "fact".to_string(),
+                    location: String::new(),
+                    user_id: "me".to_string(),
+                    agent_name: None,
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "canonical_sha256": alias.canonical_sha256,
+                        "fingerprint_version": FINGERPRINT_VERSION,
+                        "exact_edge_targets": true,
+                    }),
+                },
+            )
+            .await
+            .expect("seed alias");
+
+        let mut metadata = serde_json::json!({
+            "canonical_sha256": linker.canonical_sha256,
+            "fingerprint_version": FINGERPRINT_VERSION,
+            "related_to": ["z"],
+            "exact_edge_targets": true,
+        });
+        if let Some(mesh) = mesh {
+            metadata["mesh"] = mesh;
+        }
+        store
+            .upsert(
+                ns,
+                "a",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: linker.content.clone(),
+                    memory_type: "fact".to_string(),
+                    location: String::new(),
+                    user_id: owner.to_string(),
+                    agent_name: None,
+                    location_lines: String::new(),
+                    metadata: metadata.clone(),
+                },
+            )
+            .await
+            .expect("seed declarer");
+        // A real import writes the vault's preferred id into the head while the
+        // initial upsert can bind the stored alias. Restamp the declaration so
+        // the fixture never asserts a link the vault did not declare.
+        let mut declared = metadata;
+        declared["related_to"] = serde_json::json!([preferred.clone()]);
+        store
+            .upsert(
+                ns,
+                "a",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: linker.content.clone(),
+                    memory_type: "fact".to_string(),
+                    location: String::new(),
+                    user_id: owner.to_string(),
+                    agent_name: None,
+                    location_lines: String::new(),
+                    metadata: declared,
+                },
+            )
+            .await
+            .expect("restamp declarer");
+        let before = store
+            .get(ns, "a")
+            .await
+            .expect("get declarer")
+            .expect("declarer exists")
+            .1;
+
+        let mut literal = note(&preferred, &[]);
+        literal.content = "body of the verbatim note".to_string();
+        literal.canonical_sha256 = literal.fingerprint();
+        std::fs::write(vault.join("preferred.md"), literal.to_markdown()).expect("write preferred");
+
+        (store, config, preferred, before)
+    }
+
+    async fn assert_declarer_head_unchanged(
+        store: &std::sync::Arc<dyn VectorStore>,
+        ns: &str,
+        before: &crate::traits::MemoryPayload,
+    ) {
+        let after = store
+            .get(ns, "a")
+            .await
+            .expect("get declarer after import")
+            .expect("declarer survives")
+            .1;
+        assert_eq!(
+            after.content, before.content,
+            "head content must not change"
+        );
+        assert_eq!(
+            after.memory_type, before.memory_type,
+            "head type must not change"
+        );
+        assert_eq!(after.user_id, before.user_id, "head owner must not change");
+        // Edge provenance follows the edge it cites, so a rebind may retire an
+        // entry without rewriting identity-bearing head metadata.
+        let without_provenance = |metadata: &serde_json::Value| {
+            let mut trimmed = metadata.clone();
+            if let Some(obj) = trimmed.as_object_mut() {
+                obj.remove("edge_sources");
+            }
+            trimmed
+        };
+        assert_eq!(
+            without_provenance(&after.metadata),
+            without_provenance(&before.metadata),
+            "an unchanged declarer's head must not be rewritten"
+        );
+        assert_eq!(
+            after.metadata.get("supersedes"),
+            None,
+            "an edge rebind must not supersede the head: {:?}",
+            after.metadata
+        );
+        let history_rows = store
+            .list(ns, None, None)
+            .await
+            .expect("list rows")
+            .into_iter()
+            .filter(|row| row.id.starts_with("a.vault-history."))
+            .count();
+        assert_eq!(history_rows, 0, "no history version may be created");
+    }
+
+    /// A foreign unchanged declarer is protected ground: the import may not
+    /// rebind its edges merely because its preferred target arrived.
+    #[tokio::test]
+    async fn unchanged_foreign_declarer_does_not_rebind_protected_edges() {
+        let ns = "vaultforeign";
+        let (store, config, preferred, before) =
+            seed_unchanged_alias_declarer("foreign-unchanged", ns, "peer-a", None).await;
+        let root = config.project_root.clone().expect("root");
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+
+        assert_declarer_head_unchanged(&store, ns, &before).await;
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            relates_to_targets(&edges, "a"),
+            vec!["z".to_string()],
+            "a protected declarer must keep its alias edge: {:?}",
+            edges
+        );
+        assert!(
+            !relates_to_targets(&edges, "a").contains(&preferred),
+            "no preferred edge may be created for a protected declarer: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Mesh-provenance sovereignty applies even when the head's owner matches
+    /// the importing principal: the mesh author, not the local owner, decides.
+    #[tokio::test]
+    async fn unchanged_mesh_owned_declarer_does_not_rebind_protected_edges() {
+        let ns = "vaultmesh";
+        let (store, config, preferred, before) = seed_unchanged_alias_declarer(
+            "mesh-unchanged",
+            ns,
+            "me",
+            Some(serde_json::json!({
+                "origin": "mesh-import",
+                "claimed_created_by": "peer-a",
+                "created_by_verified": false
+            })),
+        )
+        .await;
+        let root = config.project_root.clone().expect("root");
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+
+        assert_declarer_head_unchanged(&store, ns, &before).await;
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            relates_to_targets(&edges, "a"),
+            vec!["z".to_string()],
+            "a mesh-owned declarer must keep its alias edge: {:?}",
+            edges
+        );
+        assert!(
+            !relates_to_targets(&edges, "a").contains(&preferred),
+            "no preferred edge may be created for a mesh-owned declarer: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Control: the ownership gate must not stop an owned unchanged declarer
+    /// from following its newly imported preferred target.
+    #[tokio::test]
+    async fn owned_unchanged_declarer_still_rebinds_preferred_target() {
+        let ns = "vaultowned";
+        let (store, config, preferred, before) =
+            seed_unchanged_alias_declarer("owned-unchanged", ns, "me", None).await;
+        let root = config.project_root.clone().expect("root");
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+
+        assert_declarer_head_unchanged(&store, ns, &before).await;
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            relates_to_targets(&edges, "a"),
+            vec![preferred],
+            "an owned unchanged declarer must rebind its preferred target: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: a store-owned rule's `governs` declaration survives the vault
+    /// round-trip only as GOVERNS. The unchanged-declarer queue must not replay
+    /// the exported link union as a second RELATES_TO declaration.
+    #[tokio::test]
+    async fn unchanged_owned_rule_keeps_governs_without_relates_to_rebind() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-vault-governs-unchanged-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vaultgoverns";
+        store.init(ns).await.expect("init");
+        let mut config = vault_config(&root, &vault, ns);
+        config.principal = Some("me".to_string());
+
+        let payload = |content: &str, memory_type: &str, metadata: serde_json::Value| {
+            crate::traits::MemoryPayload {
+                content: content.to_string(),
+                memory_type: memory_type.to_string(),
+                location: String::new(),
+                user_id: "me".to_string(),
+                agent_name: None,
+                location_lines: String::new(),
+                metadata,
+            }
+        };
+        store
+            .upsert(
+                ns,
+                "target-b",
+                vec![0.0; 4],
+                payload("governed body", "fact", serde_json::json!({})),
+            )
+            .await
+            .expect("seed governed target");
+        store
+            .upsert(
+                ns,
+                "rule-r",
+                vec![0.0; 4],
+                payload(
+                    "rule body",
+                    "rule",
+                    serde_json::json!({"governs": ["target-b"]}),
+                ),
+            )
+            .await
+            .expect("seed rule");
+
+        let mut export_config = config.clone();
+        export_config.vault_path = vault.clone();
+        export_config.output_dir = vault.clone();
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(
+            first.notes_imported, 0,
+            "an unchanged round-trip must not rewrite: {:?}",
+            first.errors
+        );
+
+        let (_, before) = store
+            .get(ns, "rule-r")
+            .await
+            .expect("get rule")
+            .expect("rule exists");
+
+        let mut edited = note("target-b", &[]);
+        edited.content = "edited governed body".to_string();
+        edited.canonical_sha256 = edited.fingerprint();
+        std::fs::write(vault.join("target-b.md"), edited.to_markdown()).expect("edit target");
+
+        let second = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(
+            second.notes_imported, 1,
+            "only the edited target is new: {:?}",
+            second.errors
+        );
+
+        let (_, after) = store
+            .get(ns, "rule-r")
+            .await
+            .expect("get rule after")
+            .expect("rule survives");
+        assert_eq!(
+            after.content, before.content,
+            "rule content must not change"
+        );
+        assert_eq!(
+            after.metadata.get("canonical_sha256"),
+            before.metadata.get("canonical_sha256"),
+            "rule identity must not change"
+        );
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges
+                .iter()
+                .any(|(from, rel, to, _)| from == "rule-r" && rel == "GOVERNS" && to == "target-b"),
+            "the GOVERNS edge must survive: {edges:?}"
+        );
+        assert!(
+            relates_to_targets(&edges, "rule-r").is_empty(),
+            "an exported governs link must not rebind as RELATES_TO: {edges:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Delegating store that fails one head upsert, so the caller can prove a
+    /// failed reimport never leaves edges deleted under a surviving old head.
+    struct FailingHeadUpsertStore {
+        inner: std::sync::Arc<dyn VectorStore>,
+        fail_id: &'static str,
+    }
+
+    impl crate::traits::AsAny for FailingHeadUpsertStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VectorStore for FailingHeadUpsertStore {
+        async fn init(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.init(namespace).await
+        }
+
+        async fn upsert(
+            &self,
+            namespace: &str,
+            id: &str,
+            vector: Vec<f32>,
+            payload: crate::traits::MemoryPayload,
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
+            if id == self.fail_id {
+                anyhow::bail!("injected head upsert failure for {id}");
+            }
+            self.inner.upsert(namespace, id, vector, payload).await
+        }
+
+        async fn search(
+            &self,
+            namespace: &str,
+            vector: Vec<f32>,
+            limit: usize,
+            include_tasks: bool,
+            include_archived: bool,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner
+                .search(namespace, vector, limit, include_tasks, include_archived)
+                .await
+        }
+
+        async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(namespace, id).await
+        }
+
+        async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(namespace).await
+        }
+
+        async fn reconcile_declared_edges(
+            &self,
+            namespace: &str,
+            id: &str,
+            rel_type: &str,
+            keep: &[String],
+        ) -> anyhow::Result<usize> {
+            self.inner
+                .reconcile_declared_edges(namespace, id, rel_type, keep)
+                .await
+        }
+
+        async fn relink_edges(&self, namespace: &str, source_key: &str) -> anyhow::Result<usize> {
+            self.inner.relink_edges(namespace, source_key).await
+        }
+
+        async fn begin_generation(&self, namespace: &str, source_key: &str) -> anyhow::Result<u64> {
+            self.inner.begin_generation(namespace, source_key).await
+        }
+
+        async fn publish_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .publish_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn abort_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .abort_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn active_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+        ) -> anyhow::Result<u64> {
+            self.inner.active_generation(namespace, source_key).await
+        }
+
+        async fn generation_nodes(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<String>> {
+            self.inner.generation_nodes(namespace, generation).await
+        }
+
+        async fn list(
+            &self,
+            namespace: &str,
+            user_id: Option<&str>,
+            memory_type: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner.list(namespace, user_id, memory_type).await
+        }
+
+        async fn generation_summary(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<crate::traits::GenerationRow>> {
+            self.inner.generation_summary(namespace, generation).await
+        }
+
+        async fn get(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, crate::traits::MemoryPayload)>> {
+            self.inner.get(namespace, id).await
+        }
+
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+
+        async fn export_graph(
+            &self,
+            include_retired: bool,
+            include_archived: bool,
+            project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+            anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner
+                .export_graph(
+                    include_retired,
+                    include_archived,
+                    project_contexts,
+                    anchor_override,
+                )
+                .await
+        }
+
+        async fn increment_access_count(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(namespace, id).await
+        }
+
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+    }
+
+    /// PR #363: when the head upsert fails, an edit that removes a WikiLink
+    /// must not leave the old head with its previously stored edge deleted.
+    #[tokio::test]
+    async fn failed_reimport_keeps_existing_edges_with_the_old_head() {
+        let root = std::env::temp_dir().join(format!("ns-vault-atomic-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_atomic_edges";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let mut linker = note("linker", &["stale-target", "kept-target"]);
+        linker.content = "links both".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        for plain in [note("stale-target", &[]), note("kept-target", &[])] {
+            let mut plain = plain;
+            plain.content = format!("body of {}", plain.id);
+            plain.canonical_sha256 = plain.fingerprint();
+            std::fs::write(vault.join(format!("{}.md", plain.id)), plain.to_markdown())
+                .expect("write note");
+        }
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("write linker");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        linker.related = vec!["kept-target".to_string()];
+        linker.content = "links one".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        std::fs::write(vault.join("linker.md"), linker.to_markdown()).expect("rewrite linker");
+
+        let failing: std::sync::Arc<dyn VectorStore> =
+            std::sync::Arc::new(FailingHeadUpsertStore {
+                inner: store.clone(),
+                fail_id: "linker",
+            });
+        let second = import_vault(config, failing, std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("failing reimport");
+        assert!(!second.errors.is_empty(), "head upsert must fail");
+
+        let (_, head) = store
+            .get(ns, "linker")
+            .await
+            .expect("get head")
+            .expect("old head survives");
+        let mut related: Vec<String> = head.metadata["related_to"]
+            .as_array()
+            .expect("related_to array")
+            .iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect();
+        related.sort();
+        assert_eq!(
+            related,
+            vec!["kept-target".to_string(), "stale-target".to_string()],
+            "the old head must still declare its original links"
+        );
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| from == "linker"
+                && rel == "RELATES_TO"
+                && to == "stale-target"),
+            "a failed head upsert must not retire an edge under the old head: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #344: retired rows must not be presented as current knowledge.
+    #[tokio::test]
+    async fn export_excludes_retired_rows_and_keeps_canvas_coherent() {
+        let root = std::env::temp_dir().join(format!("ns-vault-retired-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_retired";
+        store.init(ns).await.expect("init");
+        let namespace = ns.to_string();
+        let seed = |id: &'static str, metadata: serde_json::Value, content: &'static str| {
+            let store = store.clone();
+            let namespace = namespace.clone();
+            async move {
+                store
+                    .upsert(
+                        &namespace,
+                        id,
+                        vec![0.0; 4],
+                        crate::traits::MemoryPayload {
+                            content: content.to_string(),
+                            user_id: "default".to_string(),
+                            memory_type: "rule".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata,
+                        },
+                    )
+                    .await
+                    .expect("seed row");
+            }
+        };
+        let past = chrono::Utc::now().timestamp() - 60;
+        let future = chrono::Utc::now().timestamp() + 3600;
+        seed("live-rule", serde_json::json!({}), "live body").await;
+        seed(
+            "expired-rule",
+            serde_json::json!({"valid_to": past, "superseded_by": "live-rule"}),
+            "expired body",
+        )
+        .await;
+        seed(
+            "superseded-rule",
+            serde_json::json!({"superseded_by": "live-rule"}),
+            "superseded body",
+        )
+        .await;
+        seed(
+            "future-rule",
+            serde_json::json!({"valid_to": future}),
+            "future body",
+        )
+        .await;
+        seed(
+            "live-rule.vault-history.0000",
+            serde_json::json!({"valid_to": past, "superseded_by": "live-rule"}),
+            "history body",
+        )
+        .await;
+
+        let config = vault_config(&root, &vault, ns);
+        let exported = export_vault(config, store).await.expect("export");
+        assert!(exported.success, "{:?}", exported.errors);
+        assert_eq!(exported.notes_exported, 2, "{:?}", exported.errors);
+        assert!(vault.join("live-rule.md").exists());
+        assert!(vault.join("future-rule.md").exists());
+        for id in [
+            "expired-rule",
+            "superseded-rule",
+            "live-rule.vault-history.0000",
+        ] {
+            assert!(
+                !vault.join(format!("{id}.md")).exists(),
+                "retired row {id} must not be exported"
+            );
+        }
+        let canvas: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(vault.join("topology.canvas")).unwrap())
+                .expect("canvas json");
+        assert_eq!(
+            canvas["nodes"].as_array().map(Vec::len),
+            Some(2),
+            "canvas must describe the exported set: {canvas}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #344: a stale export's history file must not become live knowledge.
+    #[tokio::test]
+    async fn import_ignores_stale_vault_history_files() {
+        let root = std::env::temp_dir().join(format!("ns-vault-stale-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_stale_history";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let history_id = "stale-note.vault-history.6f0f0f0f-0000-4000-8000-000000000000";
+        let mut stale = note(history_id, &[]);
+        stale.content = "obsolete body".to_string();
+        stale.canonical_sha256 = stale.fingerprint();
+        std::fs::write(vault.join(format!("{history_id}.md")), stale.to_markdown())
+            .expect("write stale history");
+        let mut live = note("stale-note", &[]);
+        live.content = "current body".to_string();
+        live.canonical_sha256 = live.fingerprint();
+        std::fs::write(vault.join("stale-note.md"), live.to_markdown()).expect("write live");
+
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+        assert!(
+            store.get(ns, history_id).await.unwrap().is_none(),
+            "history ids are importer projections, never vault-authored memories"
+        );
+        assert!(store.get(ns, "stale-note").await.unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #345: seed the exact shape a pre-v2 import leaves behind.
+    async fn seed_legacy_head(
+        store: &std::sync::Arc<dyn VectorStore>,
+        ns: &str,
+        id: &str,
+        body: &str,
+        memory_type: &str,
+        legacy_hash: &str,
+    ) {
+        store
+            .upsert(
+                ns,
+                id,
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: body.to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: memory_type.to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "vault_source": true,
+                        "stub": false,
+                        "canonical_sha256": legacy_hash,
+                        "related": [],
+                        "valid_from": chrono::Utc::now().timestamp() - 60
+                    }),
+                },
+            )
+            .await
+            .expect("seed legacy head");
+    }
+
+    /// #345: a type-only edit must not be swallowed as "unchanged".
+    #[tokio::test]
+    async fn type_only_edit_creates_new_head_version() {
+        let root = std::env::temp_dir().join(format!("ns-vault-type-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_type_edit";
+        store.init(ns).await.expect("init");
+
+        let mut before = note("type-note", &[]);
+        before.content = "same body".to_string();
+        before.canonical_sha256 = legacy_fingerprint(&before);
+        seed_legacy_head(
+            &store,
+            ns,
+            "type-note",
+            "same body",
+            "fact",
+            &before.canonical_sha256,
+        )
+        .await;
+
+        let mut after = before.clone();
+        after.rdf_type = "yaml:rule".to_string();
+        after.canonical_sha256 = after.fingerprint();
+        std::fs::write(vault.join("type-note.md"), after.to_markdown()).expect("write note");
+
+        let result = import_vault(
+            vault_config(&root, &vault, ns),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.notes_imported, 1,
+            "a type-only edit must be imported: {:?}",
+            result.errors
+        );
+        let (_, head) = store.get(ns, "type-note").await.unwrap().unwrap();
+        assert_eq!(head.memory_type, "rule");
+        assert_eq!(head.metadata["fingerprint_version"], serde_json::json!(2));
+        assert!(
+            head.metadata.get("supersedes").is_some(),
+            "the edit must create a history version"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #345: upgrading identity must not re-version unchanged legacy heads.
+    #[tokio::test]
+    async fn legacy_v1_head_reimport_is_not_mass_versioned() {
+        let root = std::env::temp_dir().join(format!("ns-vault-legacy-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_legacy_noop";
+        store.init(ns).await.expect("init");
+
+        let mut unchanged = note("legacy-note", &[]);
+        unchanged.content = "legacy body".to_string();
+        unchanged.canonical_sha256 = legacy_fingerprint(&unchanged);
+        seed_legacy_head(
+            &store,
+            ns,
+            "legacy-note",
+            "legacy body",
+            "fact",
+            &unchanged.canonical_sha256,
+        )
+        .await;
+        std::fs::write(vault.join("legacy-note.md"), unchanged.to_markdown()).expect("write note");
+
+        let result = import_vault(
+            vault_config(&root, &vault, ns),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.notes_imported, 0,
+            "v1 -> v2 must not mass-version: {:?}",
+            result.errors
+        );
+        let (_, head) = store.get(ns, "legacy-note").await.unwrap().unwrap();
+        assert!(head.metadata.get("supersedes").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #345: once stamped v2, a byte-identical reimport remains a no-op.
+    #[tokio::test]
+    async fn unchanged_v2_reimport_is_a_noop() {
+        let root = std::env::temp_dir().join(format!("ns-vault-v2-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_v2_noop";
+        store.init(ns).await.expect("init");
+        let mut body = note("v2-note", &[]);
+        body.content = "v2 body".to_string();
+        body.canonical_sha256 = body.fingerprint();
+        std::fs::write(vault.join("v2-note.md"), body.to_markdown()).expect("write note");
+
+        let first = import_vault(
+            vault_config(&root, &vault, ns),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("first import");
+        assert_eq!(first.notes_imported, 1, "{:?}", first.errors);
+        let second = import_vault(
+            vault_config(&root, &vault, ns),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("second import");
+        assert_eq!(second.notes_imported, 0, "{:?}", second.errors);
+        let (_, head) = store.get(ns, "v2-note").await.unwrap().unwrap();
+        assert_eq!(head.metadata["fingerprint_version"], serde_json::json!(2));
+        assert!(head.metadata.get("supersedes").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

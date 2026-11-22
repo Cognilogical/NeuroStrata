@@ -2002,6 +2002,67 @@ mod tests {
         ));
     }
 
+    /// #333: Codex CLI's PreToolUse hook sends `apply_patch` input as an
+    /// object, `{"command": "<patch>"}`, not a raw string, and the plugin
+    /// forwards that object. `command` is not a patch key, so the patch must
+    /// be found by its `*** Begin Patch` marker. Payloads are the ones a real
+    /// Codex 0.170 session sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_apply_patch_command_object_extracts_targets() {
+        let (_store, validator) = validator_with(vec![rule(
+            "global-no-python",
+            &no_py_trigger(),
+            "Never use Python code",
+            "active",
+        )])
+        .await;
+
+        let add_script = serde_json::json!({
+            "command": "*** Begin Patch\n*** Add File: run.py\n+#!/usr/bin/env python3\n+print(1)\n*** Update File: notes.md\n@@\n+world\n*** End Patch"
+        })
+        .to_string();
+        let (v_add, f_add) = validator
+            .validate("apply_patch", &add_script, "/workspace", false)
+            .await;
+        assert_eq!(
+            f_add,
+            vec!["global-no-python".to_string()],
+            "a patch under `command` must yield its targets"
+        );
+        assert!(matches!(v_add, ValidateVerdict::DeterministicReject { .. }));
+
+        let extensionless = serde_json::json!({
+            "command": "*** Begin Patch\n*** Add File: bin/tool\n+#!/usr/bin/env python3\n+print(1)\n*** End Patch"
+        })
+        .to_string();
+        let (v_ext, f_ext) = validator
+            .validate("apply_patch", &extensionless, "/workspace", false)
+            .await;
+        assert_eq!(
+            f_ext,
+            vec!["global-no-python".to_string()],
+            "the shebang of a patch under `command` must reach the rule"
+        );
+        assert!(matches!(v_ext, ValidateVerdict::DeterministicReject { .. }));
+
+        let doc_example = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: README.md\n@@\n+#!/usr/bin/env python3\n+example\n*** End Patch"
+        })
+        .to_string();
+        let (v_doc, f_doc) = validator
+            .validate("apply_patch", &doc_example, "/workspace", false)
+            .await;
+        assert!(
+            f_doc.is_empty(),
+            "a documentation example under `command` must not fire: {:?}",
+            f_doc
+        );
+        assert!(matches!(
+            v_doc,
+            ValidateVerdict::SandboxPassHighFidelity { .. }
+        ));
+    }
+
     /// Codex review d7b8d2ee#r4650162580: a payload that exhausts the walk
     /// budget must not hide a target behind truncation, and recognized
     /// top-level targets must survive a large nested array.
