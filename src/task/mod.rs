@@ -3954,7 +3954,11 @@ fi
 NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo "error: neurostrata-mcp namespace resolve failed — gate NOT run for this push (an older neurostrata-mcp without the namespace resolve command is a likely cause: upgrade it)" >&2; exit 1; }
 FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 GATE_NAMESPACES=("$NAMESPACE")
-[ "$FOLDER_NAMESPACE" = "$NAMESPACE" ] || GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
+# Only a namespace-shaped basename is safe to pass to `task gate`: an
+# option-like or invalid name would change how the CLI parses the call.
+if [[ "$FOLDER_NAMESPACE" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]*$ ]] && [ "$FOLDER_NAMESPACE" != "$NAMESPACE" ]; then
+    GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
+fi
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
 # --strict maps an unavailable database to a blocking exit too, so a 1
@@ -7348,6 +7352,66 @@ mod tests {
                 line
             );
         }
+    }
+
+    /// An option-like or otherwise invalid checkout basename must never be
+    /// handed to `task gate` as a namespace.
+    #[cfg(unix)]
+    #[test]
+    fn pre_push_hook_skips_an_invalid_folder_namespace() {
+        use std::os::unix::fs::PermissionsExt;
+        if which_bash().is_none() || which_git().is_none() {
+            return;
+        }
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(base.path()).unwrap().join("--help");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let hook = root.join("pre-push");
+        std::fs::write(&hook, SCAFFOLDED_PRE_PUSH_HOOK).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bin = base.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("neurostrata-mcp");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = namespace ]; then echo valid-ns; exit 0; fi\nif [ \"$1\" = task ]; then echo \"$3\" >> \"$GATE_LOG\"; exit 0; fi\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = base.path().join("gated");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("bash")
+            .arg(&hook)
+            .current_dir(&root)
+            .env("PATH", &path)
+            .env("GATE_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let gated = std::fs::read_to_string(&log).unwrap_or_default();
+        let lines: Vec<&str> = gated.lines().collect();
+        assert!(lines.contains(&"valid-ns"), "{gated}");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| !l.is_empty() && !l.starts_with(|c: char| c.is_ascii_alphanumeric())),
+            "{gated}"
+        );
     }
 
     /// Non-git: no hook to report, no hook to scaffold, and the gates that
