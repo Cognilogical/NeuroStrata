@@ -1060,10 +1060,11 @@ describe('handleHookEvent / handleClaudeHookEvent alias', () => {
     }
   })
 
-  it('Stop / SubagentStop events allow', async () => {
+  it('Stop / SubagentStop events continue without a permission decision', async () => {
     for (const ev of ['Stop', 'SubagentStop']) {
       const out = await handleHookEvent({ hook_event_name: ev })
-      assert.equal(out.hookSpecificOutput.permissionDecision, 'allow')
+      // Codex CLI rejects a Stop reply that carries permissionDecision.
+      assert.deepEqual(out, { continue: true })
     }
   })
 })
@@ -3309,6 +3310,97 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
     } finally {
       server.close()
       resetModuleState()
+    }
+  })
+
+  it('Codex CLI apply_patch {command} event gets file recall and the guard', async () => {
+    const { server, url, counters } = await createMockDaemonServer()
+    try {
+      await initialize({
+        config: {
+          namespace: 'r8-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: true,
+          requestTimeoutMs: 500
+        },
+        tool: { hook: async () => {} },
+        hooks: {}
+      })
+      // The tool_input a Codex 0.170 PreToolUse hook sent for apply_patch.
+      const patch =
+        '*** Begin Patch\n*** Add File: src/run.rs\n+fn main() {}\n*** End Patch'
+      await handleHookEvent({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'apply_patch',
+        tool_input: { command: patch }
+      })
+      assert.ok(
+        counters.memoriesForFilePaths.includes('src/run.rs'),
+        `the patched path must be recalled, got ${JSON.stringify(counters.memoriesForFilePaths)}`
+      )
+      assert.equal(counters.guardValidate, 1)
+      assert.ok(
+        counters.guardArgs[0].payload.includes('*** Add File: src/run.rs'),
+        `the patch must reach guard_validate, got ${counters.guardArgs[0].payload}`
+      )
+    } finally {
+      server.close()
+      resetModuleState()
+    }
+  })
+
+  it('hook runners keep the disk namespace when NEUROSTRATA_NAMESPACE is unset', async () => {
+    const { server, url, counters } = await createMockDaemonServer()
+    const projectDir = mkdtempSync(join(tmpdir(), 'ns-runner-diskns-'))
+    try {
+      mkdirSync(join(projectDir, '.NeuroStrata'), { recursive: true })
+      writeFileSync(
+        join(projectDir, '.NeuroStrata', 'neurostrata-plugin.json'),
+        JSON.stringify({
+          namespace: 'DiskNs',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: true
+        })
+      )
+      const env = { ...process.env }
+      delete env.NEUROSTRATA_NAMESPACE
+      const event = JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Write',
+        tool_input: { file_path: 'src/a.rs', content: 'x' },
+        cwd: projectDir
+      })
+      for (const harness of ['claude', 'codex', 'github-cli', 'opencode']) {
+        const runner = fileURLToPath(
+          new URL(`../${harness}/cli-hook.mjs`, import.meta.url)
+        )
+        const before = counters.guardArgs.length
+        await new Promise((resolveRun, rejectRun) => {
+          const child = spawn(process.execPath, [runner], {
+            cwd: projectDir,
+            env,
+            stdio: ['pipe', 'ignore', 'ignore']
+          })
+          child.on('error', rejectRun)
+          child.on('close', () => resolveRun())
+          child.stdin.end(event)
+        })
+        assert.ok(
+          counters.guardArgs.length > before,
+          `${harness}: guard_validate must be called`
+        )
+        assert.equal(
+          counters.guardArgs[counters.guardArgs.length - 1].namespace,
+          'DiskNs',
+          `${harness}: the namespace from neurostrata-plugin.json must survive`
+        )
+      }
+    } finally {
+      server.close()
+      resetModuleState()
+      rmSync(projectDir, { recursive: true, force: true })
     }
   })
 

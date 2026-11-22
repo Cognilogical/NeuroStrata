@@ -1795,7 +1795,11 @@ mod tests {
                 );
             } else {
                 match kind {
-                    "git-dir" => std::fs::create_dir_all(path.join(".git")).unwrap(),
+                    "git-dir" => {
+                        std::fs::create_dir_all(path.join(".git")).unwrap();
+                        std::fs::write(path.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+                            .unwrap();
+                    }
                     "neurostrata-dir" => std::fs::create_dir_all(path.join(".NeuroStrata")).unwrap(),
                     "file" => {
                         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
