@@ -219,6 +219,13 @@ function isDirectory(p) {
         return false;
     }
 }
+/** `child` is `parent` or a folder below it, given canonical spellings. */
+function isWithinPath(child, parent) {
+    if (child === parent)
+        return true;
+    const separator = /[\\/]$/.test(parent) ? '' : /\\/.test(parent) ? '\\' : '/';
+    return child.startsWith(parent + separator);
+}
 function isFile(p) {
     try {
         return statSync(p).isFile();
@@ -410,11 +417,28 @@ export function findRootMarker(startDir) {
     let main = null;
     const mainTop = linkedMainCheckout(top);
     if (mainTop !== null) {
+        const mainCanon = canonicalPath(mainTop);
         const allowed = [mainTop];
         let dir = mainTop;
         for (const part of pathParts(relative(top, start))) {
             dir = join(dir, part);
-            if (!isDirectory(dir) || existsSync(join(dir, '.git')))
+            // Mirror main_checkout_walk(): isDirectory() follows a link, so a
+            // `main/pkg` symlink into another repository would contribute that
+            // project's marker. Reject links and folders whose canonical form
+            // leaves the main checkout before walking any further.
+            let st;
+            try {
+                st = lstatSync(dir);
+            }
+            catch {
+                st = null;
+            }
+            if (st === null || !st.isDirectory() || st.isSymbolicLink())
+                break;
+            const real = canonicalPath(dir);
+            if (real === null || mainCanon === null || !isWithinPath(real, mainCanon))
+                break;
+            if (existsSync(join(dir, '.git')))
                 break;
             allowed.push(dir);
         }

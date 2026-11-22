@@ -243,6 +243,13 @@ function isDirectory(p: string): boolean {
   }
 }
 
+/** `child` is `parent` or a folder below it, given canonical spellings. */
+function isWithinPath(child: string, parent: string): boolean {
+  if (child === parent) return true
+  const separator = /[\\/]$/.test(parent) ? '' : /\\/.test(parent) ? '\\' : '/'
+  return child.startsWith(parent + separator)
+}
+
 function isFile(p: string): boolean {
   try {
     return statSync(p).isFile()
@@ -433,11 +440,23 @@ export function findRootMarker(startDir: string): FoundRootMarker | null {
   let main: { depth: number; root: string; read: MarkerRead } | null = null
   const mainTop = linkedMainCheckout(top)
   if (mainTop !== null) {
+    const mainCanon = canonicalPath(mainTop)
     const allowed = [mainTop]
     let dir = mainTop
     for (const part of pathParts(relative(top, start))) {
       dir = join(dir, part)
-      if (!isDirectory(dir) || existsSync(join(dir, '.git'))) break
+      // Reject directory links and paths leaving the main checkout, as
+      // main_checkout_walk() does, so a foreign marker cannot win here.
+      let st
+      try {
+        st = lstatSync(dir)
+      } catch {
+        st = null
+      }
+      if (st === null || !st.isDirectory() || st.isSymbolicLink()) break
+      const real = canonicalPath(dir)
+      if (real === null || mainCanon === null || !isWithinPath(real, mainCanon)) break
+      if (existsSync(join(dir, '.git'))) break
       allowed.push(dir)
     }
     for (let i = allowed.length - 1; i >= 0; i--) {

@@ -8,7 +8,8 @@ import {
   rmSync,
   mkdtempSync,
   existsSync,
-  copyFileSync
+  copyFileSync,
+  symlinkSync
 } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join, isAbsolute, resolve, dirname } from 'node:path'
@@ -473,6 +474,21 @@ describe('project root marker and namespace order', () => {
   it('findRootMarker finds none for a relative path', () => {
     assert.equal(findRootMarker('src'), null)
     assert.equal(findRootMarker('.'), null)
+  })
+
+  it('main-checkout walk ignores a directory symlink leaving the checkout', () => {
+    const base = tempDir()
+    buildLayout(base, [
+      'repo git-dir',
+      'repo/.git/worktrees/wt commondir:../..',
+      'wt git-file:../repo/.git/worktrees/wt',
+      'wt/pkg',
+      'foreign marker:foreign-project'
+    ])
+    // isDirectory() follows links; a main/pkg link into another repository
+    // used to contribute that repository's marker to this worktree.
+    symlinkSync(under(base, 'foreign'), under(base, 'repo/pkg'), 'dir')
+    assert.equal(findRootMarker(under(base, 'wt/pkg')), null)
   })
 
   it('resolveConfig puts marker first', () => {
