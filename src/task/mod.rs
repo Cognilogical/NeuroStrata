@@ -4343,9 +4343,13 @@ if [ ! -f "$LEDGER" ]; then
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
-    # rewrite goes through a temporary file and a rename; an unparseable
-    # ledger or a missing node/python3 leaves the file as it is.
+    # rewrite holds the same cross-process lock as the daemon's ledger writer,
+    # uses a unique EXCLUSIVE temp file (a planted symlink cannot be followed),
+    # keeps the original mode, and wraps legacy bare-array ledgers. An
+    # unparseable ledger or a missing node/python3 leaves the file as it is.
     export LEDGER NAMESPACE
+    exec 9>"$LEDGER.lock" 2>/dev/null || true
+    command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
@@ -4353,16 +4357,20 @@ elif [ -n "$RESOLVED" ]; then
           const ns = process.env.NAMESPACE;
           let parsed;
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) process.exit(0);
-          if (parsed.namespace === ns) process.exit(0);
-          parsed.namespace = ns;
-          const tmp = ledger + ".tmp-" + process.pid;
-          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + "\n");
+          const doc = Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed;
+          if (!doc || typeof doc !== "object") process.exit(0);
+          if (doc.namespace === ns) process.exit(0);
+          doc.namespace = ns;
+          const tmp = ledger + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+          let mode;
+          try { mode = fs.statSync(ledger).mode; } catch {}
+          fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+          if (mode !== undefined) { try { fs.chmodSync(tmp, mode); } catch {} }
           fs.renameSync(tmp, ledger);
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
-import json, os, sys
+import json, os, sys, stat
 ledger = os.environ["LEDGER"]
 ns = os.environ["NAMESPACE"]
 try:
@@ -4370,16 +4378,30 @@ try:
         parsed = json.load(f)
 except Exception:
     sys.exit(0)
-if not isinstance(parsed, dict) or parsed.get("namespace") == ns:
+doc = {"namespace": ns, "queries": parsed} if isinstance(parsed, list) else parsed
+if not isinstance(doc, dict) or doc.get("namespace") == ns:
     sys.exit(0)
-parsed["namespace"] = ns
-tmp = ledger + ".tmp-" + str(os.getpid())
-with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-    json.dump(parsed, f, indent=2, ensure_ascii=False)
-    f.write("\n")
-os.replace(tmp, ledger)
+doc["namespace"] = ns
+tmp = f"{ledger}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    try:
+        os.chmod(tmp, stat.S_IMODE(os.stat(ledger).st_mode))
+    except OSError:
+        pass
+    os.replace(tmp, ledger)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
 ' 2>/dev/null || true
     fi
+    command -v flock >/dev/null 2>&1 && flock -u 9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
 fi
 
 
@@ -6250,6 +6272,66 @@ mod tests {
             checked_in.contains("scripts/check-staged-quality.sh"),
             "the pre-commit hook must delegate to the project's staged-quality runner"
         );
+    }
+
+    /// #374, lost in the #380 merge: the hook's ledger rewrite holds the
+    /// daemon's `<ledger>.lock`, writes an exclusive unique temp file (a
+    /// planted symlink is not followed), keeps the file mode, and wraps a
+    /// bare-array ledger instead of skipping it. The python branch imports
+    /// `stat`, which it uses for the mode copy.
+    #[test]
+    fn pre_commit_ledger_rewrite_locks_and_writes_an_exclusive_temp() {
+        let hook = SCAFFOLDED_PRE_COMMIT_HOOK;
+        for needle in [
+            "exec 9>\"$LEDGER.lock\"",
+            "flock 9",
+            "flock -u 9",
+            "flag: \"wx\", mode: 0o600",
+            "Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed",
+            "import json, os, sys, stat",
+            "os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600",
+            "stat.S_IMODE(os.stat(ledger).st_mode)",
+        ] {
+            assert!(hook.contains(needle), "pre-commit hook lost {needle:?}");
+        }
+        assert!(
+            !hook.contains("ledger + \".tmp-\" + process.pid;"),
+            "a pid-only temp name lets a planted symlink be followed"
+        );
+    }
+
+    /// #380 dropped the exec bit on `scripts/hooks/pre-commit`; the
+    /// installer copies these files, and a checkout without the bit cannot
+    /// run them from `core.hooksPath`.
+    #[test]
+    fn checked_in_hooks_keep_the_exec_bit() {
+        let out = match std::process::Command::new("git")
+            .args([
+                "ls-files",
+                "-s",
+                "scripts/hooks/pre-commit",
+                "scripts/hooks/pre-push",
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+        {
+            Ok(out) if out.status.success() => out,
+            _ => {
+                eprintln!("skipped: git is unavailable or this is not a checkout");
+                return;
+            }
+        };
+        let listing = String::from_utf8_lossy(&out.stdout);
+        if listing.trim().is_empty() {
+            eprintln!("skipped: the hook files are not tracked here");
+            return;
+        }
+        for line in listing.lines() {
+            assert!(
+                line.starts_with("100755 "),
+                "hook lost its exec bit: {line}"
+            );
+        }
     }
 
     /// The pre-commit hook files the ledger under the namespace `namespace
