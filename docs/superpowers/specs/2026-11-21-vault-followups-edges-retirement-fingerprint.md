@@ -436,6 +436,58 @@ deferred edge.
     no replay ran; reconciliation then deleted it
     (`the replay must rebind the preferred id once it exists: []`).
 
+### 3g. Unchanged declarers rebind when a preferred target arrives
+
+#### Invariant
+
+A declarer whose fingerprint matches its stored head skips planning. If its
+declared preferred exact target is imported for the first time in the same
+turn, the skip would otherwise leave the edge on the alias fallback forever.
+After every head is written, each unchanged declarer whose current preferred
+keep set contains a newly imported id has its `RELATES_TO` edges rebound:
+missing edges are materialised and stale ones reconciled away. The head row is
+not rewritten, so content, type, identity, `valid_to`/`supersedes`, and
+history rows are unchanged. A turn that imports no relevant id performs no
+edge work, so repeated unchanged imports stay a stable no-op.
+
+#### Mechanism
+
+- The planning loop records `(id, related)` for every unchanged declaration
+  instead of dropping it at `continue`.
+- The write loop collects the ids whose head upsert succeeded
+  (`imported_ids`).
+- After the deferred replay, an unchanged declarer recomputes
+  `exact_keep_targets` against the now-complete store and vault sets. If any
+  keep id is newly imported, `VectorStore::rebind_declared_edges` creates the
+  missing outgoing edges, then runs the same `reconcile_declared_edges`
+  retirement pass. The store method defaults to a no-op; only the graph-backed
+  store overrides it, and no ordinary caller changes.
+
+#### Eval (failed on `b0019a31`)
+
+- `unchanged_declarer_rebinds_when_preferred_target_arrives`
+  - Store the bare `z`; first import binds `a → ns::z` to that alias (partial
+    vault: `a.md` plus `z.md`).
+  - Second import adds the literal `ns::z` note while `a.md` is byte-identical.
+  - Assert `a` keeps content, type, `canonical_sha256`, no `supersedes`, and
+    zero `a.vault-history.` rows, while its only `RELATES_TO` edge ends at
+    `ns::z`; export renders exactly one `[[ns::z]]` and no `[[z]]`; a third
+    unchanged import imports `0` notes and leaves the edge unchanged.
+  - On `b0019a31` the unchanged `a` never replanned, so the alias edge
+    survived (`the unchanged declarer must rebind its preferred target:
+    ["z"] vs ["ns::z"]`).
+
+#### Residual risk
+
+- The rebind is edge-only and idempotent, but a crash between edge creation
+  and reconciliation can leave both bindings until the next import that
+  imports a relevant id. A later unchanged import with no new ids will not
+  repair it; a changed import of the declarer will.
+- The trigger is membership of a keep id in this turn's imported ids. A
+  preferred id that was already stored but whose edge was mis-bound by an
+  older build is not re-detected without comparing materialised edges, which
+  this fix intentionally does not do.
+
 ---
 
 ## 4. #344 — Retired rows must not be exported
@@ -527,13 +579,16 @@ note whose *real* type changed is versioned.
 
 - `src/vault_ld/mod.rs` — v2 fingerprint, legacy fingerprint, version const.
 - `src/vault_ld/vault_sync.rs` — `related_to` head key, deferred-edge retry,
-  pending-preferred-target replay (§3f), retirement export filter, history-id
+  pending-preferred-target replay (§3f), unchanged-declarer edge rebind (§3g),
+  retirement export filter, history-id
   import guard, `fingerprint_version` stamp, `exact_edge_targets` stamp,
   per-head `reconcile_declared_edges` call after a successful upsert, updated
   `import_reconciles_preserved_edge_fields_with_edited_links`
   assertion (that key now exists by design), and the #363 evals.
-- `src/traits.rs` — `VectorStore::reconcile_declared_edges` default no-op.
+- `src/traits.rs` — `VectorStore::reconcile_declared_edges` default no-op,
+  `VectorStore::rebind_declared_edges` default no-op (§3g).
 - `src/store/ladybug.rs` — `extractor = 'upsert'` RELATES_TO reconciler,
+  `rebind_declared_edges` edge-only materialiser (§3g),
   `exact_edge_targets` opt-out from `KnownIds` rewriting, from
   path-inferring edge materialisation, and from `relink_edges` declaration
   replay (§3d), both using the shared verbatim-first match (§3e).
@@ -560,6 +615,9 @@ note whose *real* type changed is versioned.
 - A declaration whose preferred vault id is not stored yet costs one extra
   store read at keep-set time and one re-upsert after the write phase; only
   that declarer replays, not the whole vault.
+- An unchanged declarer costs one keep-set read after the write phase and, when
+  a preferred target arrived, one edge-create plus one reconcile statement. The
+  head row is never rewritten, so no version or history row appears.
 - The reconcile and the head write are two statements, not one transaction;
   the order makes a failed write safe at the cost of a crash window that can
   leave stale edges with the new head (repaired on the next changed import).

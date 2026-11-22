@@ -11832,6 +11832,77 @@ impl VectorStore for LadybugStore {
         .await
     }
 
+    async fn rebind_declared_edges(
+        &self,
+        namespace: &str,
+        id: &str,
+        rel_type: &str,
+        keep: &[String],
+    ) -> Result<usize> {
+        if !is_valid_relation_name(rel_type) {
+            anyhow::bail!("invalid relation name for edge rebind: {rel_type}");
+        }
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        let rel_type = rel_type.to_string();
+        let namespace_key = namespace.clone();
+        let id_key = id.clone();
+        let rel_type_key = rel_type.clone();
+        let keep_for_reconcile = keep.to_vec();
+        let keep_owned = keep.to_vec();
+        let created = self
+            .write_with_deadline("rebinding declared edges", move |conn| {
+                if keep_owned.is_empty() {
+                    return Ok(0);
+                }
+                let safe_ns = escape_ladybug_string(&namespace);
+                let safe_id = escape_ladybug_string(&id);
+                let targets = keep_owned
+                    .iter()
+                    .map(|target| format!("'{}'", escape_ladybug_string(target)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // Existing targets are not churn: only a genuinely new binding
+                // is reported as materialised.
+                let existing_query = format!(
+                    "MATCH (a:Memory {{id: '{safe_id}'}})-[r:{rel_type}]->(b:Memory) \
+                     WHERE a.namespace = '{safe_ns}' AND b.id IN [{targets}] RETURN b.id"
+                );
+                let mut existing = std::collections::HashSet::new();
+                for row in conn.query(&existing_query)? {
+                    existing.insert(format!("{}", row[0]));
+                }
+                let now = chrono::Utc::now().timestamp();
+                let mut created = 0usize;
+                for target in keep_owned.iter() {
+                    if existing.contains(target) {
+                        continue;
+                    }
+                    let safe_target = escape_ladybug_string(target);
+                    // Both endpoints must belong to the namespace; a global
+                    // MATCH on a repeated id would otherwise bridge namespaces.
+                    let query = format!(
+                        "MATCH (a:Memory {{id: '{safe_id}'}}), (b:Memory {{id: '{safe_target}'}}) \
+                         WHERE a.namespace = '{safe_ns}' AND b.namespace = '{safe_ns}' \
+                         MERGE (a)-[r:{rel_type}]->(b) ON CREATE SET r.source = '{safe_ns}', \
+                         r.valid_from = {now}, r.valid_to = 0, r.generation = 0, \
+                         r.extractor = 'upsert', r.confidence = 1.0, \
+                         r.evidence_id = '{safe_id}', r.origin = 'local' RETURN r"
+                    );
+                    // A target that vanished between planning and this write
+                    // binds nothing, exactly like upsert, and reports no edge.
+                    for _row in conn.query(&query)? {
+                        created += 1;
+                    }
+                }
+                Ok(created)
+            })
+            .await?;
+        self.reconcile_declared_edges(&namespace_key, &id_key, &rel_type_key, &keep_for_reconcile)
+            .await?;
+        Ok(created)
+    }
+
     async fn relink_edges(&self, namespace: &str, source_key: &str) -> Result<usize> {
         // Declarations live in each memory's metadata, which survives ingestion;
         // only the edges themselves are lost with the nodes. Replaying them is

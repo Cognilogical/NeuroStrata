@@ -1117,6 +1117,10 @@ pub async fn import_vault_with_limits(
     }
 
     let mut planned: Vec<Planned> = Vec::new();
+    // An unchanged declarer skips planning, so its edge can never observe a
+    // preferred target that only arrives in this turn. Record the declaration
+    // and rebind edges after every head is written, without touching the head.
+    let mut unchanged_declarers: Vec<(String, Vec<String>)> = Vec::new();
     for note in notes {
         let is_stub = stub_ids.contains(&note.id);
         let gate_metadata = serde_json::json!({
@@ -1188,6 +1192,7 @@ pub async fn import_vault_with_limits(
                     }
             };
             if unchanged {
+                unchanged_declarers.push((note.id.clone(), note.related.clone()));
                 continue;
             }
             if let Err(e) = writable_prior(principal, prior) {
@@ -1264,6 +1269,7 @@ pub async fn import_vault_with_limits(
 
     // ---- Phase 2: writes ----
     let mut imported = 0;
+    let mut imported_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut deferred_retry: Vec<(String, Vec<f32>, crate::traits::MemoryPayload)> = Vec::new();
     for item in planned {
         let cleanup_id = item.history.as_ref().map(|(id, _, _)| id.clone());
@@ -1311,6 +1317,7 @@ pub async fn import_vault_with_limits(
         {
             Ok(report) => {
                 imported += 1;
+                imported_ids.insert(item.id.clone());
                 if let Err(e) = store
                     .reconcile_declared_edges(&config.namespace, &item.id, "RELATES_TO", &keep.ids)
                     .await
@@ -1367,6 +1374,23 @@ pub async fn import_vault_with_limits(
             .await
         {
             errors.push(format!("Failed to retire stale edges for {}: {}", id, e));
+        }
+    }
+
+    // A declaration that did not change can still point at the wrong row: the
+    // preferred exact target it names may only have been imported now. Rebind
+    // those edges after every head exists; the head row itself is never
+    // rewritten, so no content version or history row appears.
+    for (id, declared) in unchanged_declarers {
+        let keep = exact_keep_targets(&store, &config.namespace, &declared, &known_notes).await;
+        if !keep.ids.iter().any(|target| imported_ids.contains(target)) {
+            continue;
+        }
+        if let Err(e) = store
+            .rebind_declared_edges(&config.namespace, &id, "RELATES_TO", &keep.ids)
+            .await
+        {
+            errors.push(format!("Failed to rebind edges for {}: {}", id, e));
         }
     }
 
@@ -4525,6 +4549,185 @@ mod tests {
             linked(&edges),
             vec![preferred],
             "an unchanged reimport must not churn the reconciled edge set: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A declarer whose fingerprint is unchanged skips planning entirely. A
+    /// preferred target that only arrives in a later turn therefore never
+    /// reaches it, and its edge stays on the alias fallback forever. Rebinding
+    /// must not mint a second content version of the declarer.
+    #[tokio::test]
+    async fn unchanged_declarer_rebinds_when_preferred_target_arrives() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-vault-unchanged-rebind-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "ns";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        // The bare alias exists before the declarer's preferred id does.
+        store
+            .upsert(
+                ns,
+                "z",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "memory stored under the bare alias".to_string(),
+                    memory_type: "note".to_string(),
+                    location: "".to_string(),
+                    user_id: "default".to_string(),
+                    agent_name: Some("auto-ingestor".to_string()),
+                    location_lines: "".to_string(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed stored alias");
+
+        let preferred = format!("{ns}::z");
+        let mut linker = note("a", &[preferred.as_str()]);
+        linker.content = "links the alias until the verbatim note exists".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut alias = note("z", &[]);
+        alias.content = "body of the bare alias".to_string();
+        alias.canonical_sha256 = alias.fingerprint();
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write alias");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert!(first.success, "{first:?}");
+
+        let linked = |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| {
+            edges
+                .iter()
+                .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+                .map(|(_, _, to, _)| to.clone())
+                .collect::<Vec<_>>()
+        };
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            linked(&edges),
+            vec!["z".to_string()],
+            "the first import binds the stored alias: {:?}",
+            edges
+        );
+
+        let (_, before) = store
+            .get(ns, "a")
+            .await
+            .expect("get declarer")
+            .expect("declarer exists");
+
+        // Second turn: the literal preferred note arrives; `a` is untouched.
+        let mut literal = note(&preferred, &[]);
+        literal.content = "body of the verbatim note".to_string();
+        literal.canonical_sha256 = literal.fingerprint();
+        std::fs::write(vault.join("preferred.md"), literal.to_markdown()).expect("write preferred");
+
+        let second = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(second.success, "{second:?}");
+        assert_eq!(
+            second.notes_imported, 1,
+            "only the preferred note is new: {:?}",
+            second.errors
+        );
+
+        let (_, after) = store
+            .get(ns, "a")
+            .await
+            .expect("get declarer after rebind")
+            .expect("declarer survives");
+        assert_eq!(
+            after.content, before.content,
+            "head content must not change"
+        );
+        assert_eq!(
+            after.memory_type, before.memory_type,
+            "head type must not change"
+        );
+        assert_eq!(
+            after.metadata.get("canonical_sha256"),
+            before.metadata.get("canonical_sha256"),
+            "head identity must not change"
+        );
+        assert_eq!(
+            after.metadata.get("supersedes"),
+            None,
+            "an edge rebind must not supersede the head: {:?}",
+            after.metadata
+        );
+        let history_rows = store
+            .list(ns, None, None)
+            .await
+            .expect("list rows")
+            .into_iter()
+            .filter(|row| row.id.starts_with("a.vault-history."))
+            .count();
+        assert_eq!(history_rows, 0, "no history version may be created");
+
+        let edges = store.list_edges(ns).await.expect("list edges after rebind");
+        assert_eq!(
+            linked(&edges),
+            vec![preferred.clone()],
+            "the unchanged declarer must rebind its preferred target: {:?}",
+            edges
+        );
+
+        let mut export_config = config.clone();
+        export_config.vault_path = root.join("exported");
+        export_config.output_dir = root.join("exported");
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+        let markdown =
+            std::fs::read_to_string(root.join("exported").join("a.md")).expect("read export");
+        assert_eq!(
+            markdown.matches(&format!("[[{preferred}]]")).count(),
+            1,
+            "{markdown}"
+        );
+        assert!(!markdown.contains("[[z]]"), "{markdown}");
+
+        let third = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("third import");
+        assert!(third.errors.is_empty(), "{:?}", third.errors);
+        assert_eq!(
+            third.notes_imported, 0,
+            "a stable rebind must not churn the head: {:?}",
+            third.errors
+        );
+        let edges = store
+            .list_edges(ns)
+            .await
+            .expect("list edges after third import");
+        assert_eq!(
+            linked(&edges),
+            vec![preferred],
+            "a third unchanged import must be a stable no-op: {:?}",
             edges
         );
         let _ = std::fs::remove_dir_all(&root);

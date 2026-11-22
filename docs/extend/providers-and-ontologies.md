@@ -29,6 +29,12 @@ Stores that project edges into a graph additionally implement the optional seam
 
 The default implementation is a no-op, so a vector-only backend is unaffected. `LadybugStore` implements it as a delete over edges stamped `extractor = 'upsert'`; mention-detector and hand-authored edges are never candidates, and an empty `keep` retires every declared edge. The vault importer calls it before each head's upsert so a removed WikiLink cannot survive as a stale `RELATES_TO` relationship; ordinary upserts that do not declare a link set are never reconciled implicitly.
 
+A second optional seam rebinds edges without rewriting the head:
+
+- `async fn rebind_declared_edges(&self, namespace: &str, id: &str, rel_type: &str, keep: &[String]) -> Result<usize>` — materialise any missing outgoing `rel_type` edges to `keep`, then reconcile the rest
+
+The default is again a no-op. `LadybugStore` creates edges under the same `extractor = 'upsert'` provenance as an upsert would and then runs `reconcile_declared_edges`, leaving content, metadata and history untouched. The vault importer uses it only for an unchanged declarer whose preferred exact target arrived in that import, so a byte-identical note can follow a newly named target without minting a content version.
+
 Both traits are generic over storage backend. The default implementation uses a local in-memory store; custom implementations can target GPU-accelerated indexes or distributed stores.
 
 ## Custom `JudgmentProvider` Adapters
