@@ -348,11 +348,10 @@ pub fn main_checkout_root(dir: &str) -> Option<PathBuf> {
 /// The main checkout that owns the common git directory `common` (canonical):
 /// `core.worktree` when set, else the parent of a common directory named
 /// `.git`. `None` for a bare repository (`core.bare`, whatever the folder is
-/// called), and when the parent holds nothing but that `.git`: that is how
-/// `git init --separate-git-dir <dir>/.git <checkout>` leaves it, and git
-/// records the real checkout nowhere in the common directory (git itself
-/// then lists `<dir>` as the main worktree). A parent with only `.git` has
-/// nothing for a worktree to borrow either way.
+/// called). The parent is a checkout only when the git directory carries Git's
+/// own `HEAD` metadata: `git init --separate-git-dir <dir>/.git <checkout>`
+/// leaves a parent holding just `.git` that git still treats as a checkout,
+/// while unrelated files beside a shared git directory establish nothing.
 fn main_checkout_of_common(common: &Path) -> Option<PathBuf> {
     let core = core_config(common);
     if core.bare {
@@ -367,15 +366,11 @@ fn main_checkout_of_common(common: &Path) -> Option<PathBuf> {
         return None;
     }
     let parent = common.parent()?;
-    let holds_more_than_git = std::fs::read_dir(parent)
-        .ok()?
-        .filter_map(Result::ok)
-        .any(|entry| entry.file_name() != ".git");
-    // `git init --separate-git-dir <parent>/.git <checkout>` leaves a main
-    // checkout with nothing but `.git`: git still owns it, and records that in
-    // the git directory's own HEAD rather than in the parent's entries.
-    let holds_git_metadata = common.join("HEAD").is_file();
-    (holds_more_than_git || holds_git_metadata).then(|| parent.to_path_buf())
+    // Ownership is Git metadata, never the parent's unrelated entries. A
+    // real checkout's git directory carries HEAD even when its working
+    // directory holds nothing else (`git init --separate-git-dir`); a shared
+    // git directory beside arbitrary data does not establish a checkout.
+    common.join("HEAD").is_file().then(|| parent.to_path_buf())
 }
 
 /// The `[core]` settings [`main_checkout_of_common`] reads.
@@ -1192,6 +1187,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = canonical(tmp.path()).unwrap().join("example-project");
         std::fs::create_dir_all(root.join(".git")).unwrap();
+        touch(&root.join(".git").join("HEAD"));
         touch(&root.join("src").join("lib.rs"));
         let worktree = root.join(".claude").join("worktrees").join("agent-1");
         touch(&worktree.join("src").join("lib.rs"));
@@ -2047,10 +2043,28 @@ mod tests {
         std::fs::write(common.join("config"), "[core]\n\tBare = TRUE\n").unwrap();
         assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
         assert_eq!(main_checkout_root(&s(&wt.join("src"))), Some(wt.clone()));
-        // The same layout with `bare = false` and the parent holding that
-        // `.git` is an ordinary main checkout.
+        // The same layout with `bare = false` and a gitdir carrying HEAD is an
+        // ordinary main checkout.
+        touch(&common.join("HEAD"));
         std::fs::write(common.join("config"), "[core]\n\tbare = false\n").unwrap();
         assert_eq!(main_checkout_root(&s(&wt)), Some(project.clone()));
+    }
+
+    /// Unrelated files beside a separate git directory do not make its parent
+    /// a checkout: only Git's own metadata establishes ownership.
+    #[test]
+    fn unrelated_entries_do_not_make_a_parent_the_main_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let data = base.join("data");
+        let common = data.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        touch(&data.join("unrelated.txt"));
+        std::fs::write(common.join("config"), "[core]\n\tbare = false\n").unwrap();
+        let wt = base.join("agent-1");
+        link_worktree(&wt, &common.join("worktrees").join("agent-1"));
+
+        assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
     }
 
     /// A main checkout whose working directory holds nothing but `.git` is
