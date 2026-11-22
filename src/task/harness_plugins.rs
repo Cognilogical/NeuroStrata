@@ -3,7 +3,19 @@
 //! and `neurostrata_get_snapshot`).
 
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+/// Namespace resolution reads untracked config files from the checkout, which
+/// a contributor can replace with a symlink to a special file or a huge file.
+/// Anything past this bound is unreadable, never slurped into memory.
+const MAX_CONFIG_BYTES: u64 = 1_048_576;
+
+/// Serialize same-process config rewrites. Two refreshes that race on one
+/// config must not derive the same temporary path and clobber each other.
+static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 const OPENCODE_INDEX_JS: &str = include_str!("../../plugins/opencode/dist/index.js");
 const OPENCODE_PKG_JSON: &str = include_str!("../../plugins/opencode/package.json");
@@ -230,7 +242,9 @@ fn runner_is_replaceable(old_path: &str, project_root: &Path, abs_runner: &str) 
         return true;
     }
     // Only a definite "not found" counts as missing; an unreadable path is
-    // left alone.
+    // left alone. Repair may repoint any missing `cli-hook.mjs` to the
+    // installer's runner; namespace resolution uses the stricter
+    // `runner_is_installers_hook` below.
     matches!(candidate.try_exists(), Ok(false))
 }
 
@@ -774,6 +788,22 @@ fn read_config(path: &Path) -> Result<Option<Value>, UnreadableConfig> {
         path: path.to_path_buf(),
         reason,
     };
+    // `metadata` follows a symlink, so a link to a FIFO/device or to an
+    // enormous file is rejected before `read` can block or exhaust memory.
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                return Err(unreadable("it is not a regular file".to_string()));
+            }
+            if meta.len() > MAX_CONFIG_BYTES {
+                return Err(unreadable(format!(
+                    "it is larger than the {MAX_CONFIG_BYTES}-byte config limit"
+                )));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e.to_string())),
+    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1649,15 +1679,43 @@ fn sync_skills_and_agent_rules(
 /// a rename, so a reader (a git hook running `namespace resolve`) sees the old
 /// file or the new one, never a half-written one.
 fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    // One lock for every config in this process: a refresh touches a handful,
+    // and serializing them is simpler and safer than a per-path lock table.
+    let _guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+    // PID alone lets two in-process refreshes derive the same temp path.
+    // A process-wide sequence plus create_new makes a planted symlink and a
+    // racing refresh both fail loudly instead of following/clobbering it.
+    let tmp = path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        ATOMIC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = options.open(&tmp)?;
+        std::io::Write::write_all(&mut file, contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        // A refresh must never widen an existing config's access: it carries
+        // tokens and namespace metadata other local users must not read.
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
-    })
+    }
+    written
 }
 
 fn wire_harness_config(

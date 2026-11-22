@@ -777,7 +777,10 @@ fn golden_prompt_lines(golden_rules: &[SearchResult], snippet_len: usize) -> Vec
 /// Map task metadata into the canonical R4 `TaskContext` so
 /// `routing::evaluate_triggers` has a production caller at task-context build
 /// time. Absent/neutral metadata fires nothing (honest abstention).
-fn task_routing_triggers(namespace: &str, metadata: &Value) -> Vec<crate::task::routing::RouteTrigger> {
+fn task_routing_triggers(
+    namespace: &str,
+    metadata: &Value,
+) -> Vec<crate::task::routing::RouteTrigger> {
     let flag = |key: &str| metadata.get(key).and_then(Value::as_bool).unwrap_or(false);
     crate::task::routing::evaluate_triggers(crate::task::routing::TaskContext {
         namespace: namespace.to_string(),
@@ -1104,9 +1107,7 @@ pub async fn build_task_graph_context(
         next_hop_calls.push(crate::task::routing::next_action(&trigger, &lookup_ids));
     }
 
-    let expansion_error_value = expansion_error
-        .map(Value::String)
-        .unwrap_or(Value::Null);
+    let expansion_error_value = expansion_error.map(Value::String).unwrap_or(Value::Null);
 
     let auto_retrieved_context = json!({
         "query": payload.content,
@@ -4355,9 +4356,13 @@ if [ ! -f "$LEDGER" ]; then
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
-    # rewrite goes through a temporary file and a rename; an unparseable
-    # ledger or a missing node/python3 leaves the file as it is.
+    # rewrite holds the same cross-process lock as the daemon's ledger writer,
+    # uses a unique EXCLUSIVE temp file (a planted symlink cannot be followed),
+    # keeps the original mode, and wraps legacy bare-array ledgers. An
+    # unparseable ledger or a missing node/python3 leaves the file as it is.
     export LEDGER NAMESPACE
+    exec 9>"$LEDGER.lock" 2>/dev/null || true
+    command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
@@ -4365,16 +4370,20 @@ elif [ -n "$RESOLVED" ]; then
           const ns = process.env.NAMESPACE;
           let parsed;
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) process.exit(0);
-          if (parsed.namespace === ns) process.exit(0);
-          parsed.namespace = ns;
-          const tmp = ledger + ".tmp-" + process.pid;
-          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + "\n");
+          const doc = Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed;
+          if (!doc || typeof doc !== "object") process.exit(0);
+          if (doc.namespace === ns) process.exit(0);
+          doc.namespace = ns;
+          const tmp = ledger + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+          let mode;
+          try { mode = fs.statSync(ledger).mode; } catch {}
+          fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+          if (mode !== undefined) { try { fs.chmodSync(tmp, mode); } catch {} }
           fs.renameSync(tmp, ledger);
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
-import json, os, sys
+import json, os, sys, stat
 ledger = os.environ["LEDGER"]
 ns = os.environ["NAMESPACE"]
 try:
@@ -4382,16 +4391,30 @@ try:
         parsed = json.load(f)
 except Exception:
     sys.exit(0)
-if not isinstance(parsed, dict) or parsed.get("namespace") == ns:
+doc = {"namespace": ns, "queries": parsed} if isinstance(parsed, list) else parsed
+if not isinstance(doc, dict) or doc.get("namespace") == ns:
     sys.exit(0)
-parsed["namespace"] = ns
-tmp = ledger + ".tmp-" + str(os.getpid())
-with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-    json.dump(parsed, f, indent=2, ensure_ascii=False)
-    f.write("\n")
-os.replace(tmp, ledger)
+doc["namespace"] = ns
+tmp = f"{ledger}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    try:
+        os.chmod(tmp, stat.S_IMODE(os.stat(ledger).st_mode))
+    except OSError:
+        pass
+    os.replace(tmp, ledger)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
 ' 2>/dev/null || true
     fi
+    command -v flock >/dev/null 2>&1 && flock -u 9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
 fi
 
 
@@ -5770,8 +5793,7 @@ mod tests {
     /// never silently skips a guard the hook claims to run.
     #[test]
     fn bootstrap_scaffolds_every_prepush_project_gate() {
-        let root =
-            std::env::temp_dir().join(format!("ns-scaffold-gates-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("ns-scaffold-gates-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
@@ -5835,8 +5857,7 @@ mod tests {
     #[test]
     fn hook_hygiene_seeds_all_tracked_hook_artifacts_on_fresh_project() {
         use std::os::unix::fs::PermissionsExt;
-        let root =
-            std::env::temp_dir().join(format!("ns-hygiene-seed-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("ns-hygiene-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
 
@@ -5891,8 +5912,7 @@ mod tests {
             SCAFFOLDED_TASK_COVERAGE_GATE.contains("untracked work items"),
             "the guard must carry the task-ID gate marker"
         );
-        let path =
-            std::env::temp_dir().join(format!("ns-gate-scaffold-{}.sh", std::process::id()));
+        let path = std::env::temp_dir().join(format!("ns-gate-scaffold-{}.sh", std::process::id()));
         std::fs::write(&path, SCAFFOLDED_TASK_COVERAGE_GATE).unwrap();
         let syntax = std::process::Command::new("bash")
             .arg("-n")
@@ -6020,18 +6040,11 @@ mod tests {
         let store = temp_store().await;
         let ns = "RegRootNs";
         store.init(ns).await.expect("init namespace schema");
-        let worktree = std::env::temp_dir().join(format!(
-            "ns-ledger-registry-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let worktree =
+            std::env::temp_dir().join(format!("ns-ledger-registry-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(worktree.join(".git")).unwrap();
-        crate::registry::cache_project_root(
-            &store,
-            Some(&emb()),
-            ns,
-            worktree.to_str().unwrap(),
-        )
-        .await;
+        crate::registry::cache_project_root(&store, Some(&emb()), ns, worktree.to_str().unwrap())
+            .await;
         assert_eq!(
             crate::registry::cached_project_root(&store, ns)
                 .await
@@ -6068,8 +6081,7 @@ mod tests {
             ledger.exists(),
             "receipt must be written under the registry project_root, not daemon CWD"
         );
-        let doc: Value =
-            serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
         assert_eq!(doc["events"][0]["event_id"], "evt-registry");
         assert_eq!(
             receipt_ledger_root(None, &store, ns).await,
@@ -6085,10 +6097,8 @@ mod tests {
         let store = temp_store().await;
         let ns = "HintRootNs";
         store.init(ns).await.expect("init namespace schema");
-        let scratch = std::env::temp_dir().join(format!(
-            "ns-scratch-hint-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("ns-scratch-hint-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&scratch).unwrap();
         assert!(!scratch.join(".git").exists() && !scratch.join(".NeuroStrata").exists());
         let worktree = std::env::temp_dir().join(format!(
@@ -6096,13 +6106,8 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(worktree.join(".git")).unwrap();
-        crate::registry::cache_project_root(
-            &store,
-            Some(&emb()),
-            ns,
-            worktree.to_str().unwrap(),
-        )
-        .await;
+        crate::registry::cache_project_root(&store, Some(&emb()), ns, worktree.to_str().unwrap())
+            .await;
         assert_eq!(
             receipt_ledger_root(Some(scratch.to_str().unwrap()), &store, ns).await,
             Some(worktree),
@@ -6282,8 +6287,7 @@ mod tests {
 
     /// The pre-commit hook files the ledger under the namespace `namespace
     /// resolve` answered: an older ledger naming another one is updated, its
-    /// recorded lookups kept; a failed lookup leaves the ledger as it is and
-    /// its reason reaches the hook's stderr.
+    /// recorded lookups kept; a failed lookup leaves the ledger as it is.
     #[test]
     fn pre_commit_hook_updates_the_ledger_namespace_to_the_resolved_one() {
         let Some(bash) = hook_bash() else {
@@ -6750,14 +6754,16 @@ exit 0
             .expect("task exists")
             .1
             .metadata;
-        assert_eq!(after, before, "record_tool_receipt must not mutate task counters");
+        assert_eq!(
+            after, before,
+            "record_tool_receipt must not mutate task counters"
+        );
 
         // Attribution still lands on the receipt, and no legacy row is written.
         let ledger_path = tmp.path().join(".NeuroStrata/session_queries.json");
-        let ledger: Value = serde_json::from_str(
-            &std::fs::read_to_string(&ledger_path).expect("ledger written"),
-        )
-        .expect("valid ledger");
+        let ledger: Value =
+            serde_json::from_str(&std::fs::read_to_string(&ledger_path).expect("ledger written"))
+                .expect("valid ledger");
         assert_eq!(ledger["events"][0]["task_id"].as_str(), Some(task_id));
         assert_eq!(
             ledger["queries"].as_array().map(|a| a.len()),
@@ -10870,10 +10876,7 @@ exit 0
             .any(|a| a == "T_HIGH_BLAST:abc123"));
 
         // Isolated worktree ledger seeded with that attributed receipt.
-        let tmp = std::env::temp_dir().join(format!(
-            "ns-advisory-e2e-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp = std::env::temp_dir().join(format!("ns-advisory-e2e-{}", uuid::Uuid::new_v4()));
         let ns_dir = tmp.join(".NeuroStrata");
         std::fs::create_dir_all(&ns_dir).unwrap();
         let mut event = fields.to_value();
@@ -10944,8 +10947,7 @@ exit 0
 
         // Exact followed-proof of the prescribed action id resolves it.
         let mut proven_related = related;
-        proven_related["followed_action_ids"] =
-            serde_json::json!(["T_HIGH_BLAST:abc123"]);
+        proven_related["followed_action_ids"] = serde_json::json!(["T_HIGH_BLAST:abc123"]);
         let resolved = serde_json::json!({
             "events_version": 1,
             "events": [event, proven_related]
@@ -11918,9 +11920,16 @@ exit 0
         };
         let (ctx, _prompt) =
             build_task_graph_context(&store, "probe", "task-1", &[0.0f32; 4], &payload).await;
-        let edges = ctx["related_edges"].as_array().expect("related_edges array");
-        assert!(!edges.is_empty(), "related_edges must be non-empty: {edges:?}");
-        let calls = ctx["next_hop_calls"].as_array().expect("next_hop_calls array");
+        let edges = ctx["related_edges"]
+            .as_array()
+            .expect("related_edges array");
+        assert!(
+            !edges.is_empty(),
+            "related_edges must be non-empty: {edges:?}"
+        );
+        let calls = ctx["next_hop_calls"]
+            .as_array()
+            .expect("next_hop_calls array");
         assert!(!calls.is_empty(), "next_hop_calls must be non-empty");
         assert_eq!(calls[0]["tool"], "neurostrata_related");
         assert_eq!(calls[0]["trigger_id"], "T_SEED_EXPAND");
@@ -11947,10 +11956,8 @@ exit 0
     #[test]
     fn task_routing_triggers_use_canonical_contract() {
         assert!(task_routing_triggers("ns", &json!({})).is_empty());
-        let routes = task_routing_triggers(
-            "ns",
-            &json!({"task_type": "feature", "strategic": true}),
-        );
+        let routes =
+            task_routing_triggers("ns", &json!({"task_type": "feature", "strategic": true}));
         let ids: Vec<&str> = routes.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec!["T_DOMAIN_NEW", "T_STRATEGIC"]);
         assert_eq!(routes[1].tool, "neurostrata_taxonomy");
@@ -12010,8 +12017,15 @@ exit 0
         };
         let (ctx, prompt) =
             build_task_graph_context(&store, "probe", "task-1", &[0.5f32; 4], &payload).await;
-        assert!(prompt.chars().count() <= 3500, "prompt too long: {}", prompt.chars().count());
-        assert!(prompt.contains("golden-1"), "golden rule must survive truncation: {prompt}");
+        assert!(
+            prompt.chars().count() <= 3500,
+            "prompt too long: {}",
+            prompt.chars().count()
+        );
+        assert!(
+            prompt.contains("golden-1"),
+            "golden rule must survive truncation: {prompt}"
+        );
         let golden = ctx["golden_rules"].as_array().expect("golden_rules");
         assert!(!golden.is_empty(), "golden_rules must remain present");
     }
