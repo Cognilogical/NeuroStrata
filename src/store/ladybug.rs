@@ -7332,6 +7332,114 @@ pub fn edge_specs(metadata: &serde_json::Value) -> Vec<EdgeSpec> {
     parse_edge_specs(&payload).0
 }
 
+/// Source coordinates shared by every declaration on one row.
+///
+/// `upsert` reads them from the payload being written; a rebind reads the same
+/// fields back from the stored row, so both paths compute the same evidence id
+/// for the same declaration.
+struct EdgeProvenanceSource {
+    file: Option<String>,
+    content_hash: Option<String>,
+    line_start: Option<i64>,
+    line_end: Option<i64>,
+    /// The location's original line text, kept for the evidence id so it
+    /// round-trips a non-range spelling unchanged.
+    line_label: String,
+}
+
+impl EdgeProvenanceSource {
+    fn from_row(metadata: &Value, location: &str, location_lines: &str, content: &str) -> Self {
+        let file = metadata
+            .get("absolute_path")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                if location.trim().is_empty() {
+                    None
+                } else {
+                    Some(location.to_string())
+                }
+            });
+        let content_hash = metadata
+            .get("file_sha256")
+            .or_else(|| metadata.get("span_sha256"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(content.as_bytes());
+                Some(hex::encode(hasher.finalize()))
+            });
+        let lines = (if location_lines.trim().is_empty() {
+            None
+        } else {
+            Some(location_lines)
+        })
+        .or_else(|| metadata.get("location_lines").and_then(Value::as_str));
+        let (line_start, line_end) = match lines {
+            Some(s) if !s.trim().is_empty() => {
+                let parts: Vec<&str> = s.split('-').collect();
+                let start = parts.first().and_then(|p| p.trim().parse::<i64>().ok());
+                let end = parts
+                    .get(1)
+                    .and_then(|p| p.trim().parse::<i64>().ok())
+                    .or(start);
+                (start, end)
+            }
+            _ => (None, None),
+        };
+        Self {
+            file,
+            content_hash,
+            line_start,
+            line_end,
+            line_label: location_lines.trim().to_string(),
+        }
+    }
+}
+
+/// Build one `metadata.edge_sources` entry and the evidence id that names it.
+///
+/// Every writer of a declaration edge must call this: the relationship and its
+/// citation are one fact, so their evidence ids cannot drift.
+fn edge_provenance_entry(
+    declaring_id: &str,
+    rel_type: &str,
+    declaration_index: usize,
+    declared_target: &str,
+    resolved_target: &str,
+    orientation: &str,
+    source: &EdgeProvenanceSource,
+) -> (String, Value) {
+    let evidence_id = match (&source.file, &source.content_hash) {
+        (Some(f), Some(h)) => format!(
+            "{}:{}:{}",
+            f,
+            source.line_label,
+            &h[..h.floor_char_boundary(12)]
+        ),
+        (Some(f), None) => format!("{}:{}", f, source.line_label),
+        _ => declaring_id.to_string(),
+    };
+    let entry = serde_json::json!({
+        "declaring_id": declaring_id,
+        "rel_type": rel_type,
+        "declaration_index": declaration_index,
+        "declared_target": declared_target,
+        "resolved_target": resolved_target,
+        "logical_target": crate::parser::generation::logical_path_of(resolved_target),
+        "orientation": orientation,
+        "file": source.file,
+        "content_hash": source.content_hash,
+        "line_start": source.line_start,
+        "line_end": source.line_end,
+        "evidence_id": evidence_id,
+        "extractor": "upsert",
+    });
+    (evidence_id, entry)
+}
+
 /// Memory types written with a zero vector. They describe where something
 /// lives, or record that a machine operation happened, not what it says, so
 /// they carry no meaning for a similarity search: directory ingestion's nodes,
@@ -10887,77 +10995,26 @@ impl VectorStore for LadybugStore {
                 // F18: GOVERNS source must be rule even when target missing/stubbed.
                 // (handled above for resolved targets; missing targets skip role check)
                 // F6: stamp edge provenance for this resolved declaration.
-                let evidence_id = {
-                    let declared = edge.target_id.clone();
-                    let resolved = target.clone();
-                    let logical = crate::parser::generation::logical_path_of(&resolved).to_string();
-                    let orientation = if edge.points_at_target {
+                let source = EdgeProvenanceSource::from_row(
+                    &payload.metadata,
+                    &payload.location,
+                    &payload.location_lines,
+                    &payload.content,
+                );
+                let (evidence_id, entry) = edge_provenance_entry(
+                    &id,
+                    edge.rel_type,
+                    edge.declaration_index,
+                    &edge.target_id,
+                    &target,
+                    if edge.points_at_target {
                         "self_to_target"
                     } else {
                         "target_to_self"
-                    }
-                    .to_string();
-                    let file = payload
-                        .metadata
-                        .get("absolute_path")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            if payload.location.trim().is_empty() {
-                                None
-                            } else {
-                                Some(payload.location.clone())
-                            }
-                        });
-                    let content_hash = payload
-                        .metadata
-                        .get("file_sha256")
-                        .or_else(|| payload.metadata.get("span_sha256"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            use sha2::{Digest, Sha256};
-                            let mut hasher = Sha256::new();
-                            hasher.update(payload.content.as_bytes());
-                            Some(hex::encode(hasher.finalize()))
-                        });
-                    let (line_start, line_end) = match (if payload.location_lines.trim().is_empty() { None } else { Some(payload.location_lines.as_str()) })
-                        .or_else(|| payload.metadata.get("location_lines").and_then(|v| v.as_str()))
-                    {
-                        Some(s) if !s.trim().is_empty() => {
-                            let parts: Vec<&str> = s.split('-').collect();
-                            let start = parts.first().and_then(|p| p.trim().parse::<i64>().ok());
-                            let end = parts
-                                .get(1)
-                                .and_then(|p| p.trim().parse::<i64>().ok())
-                                .or(start);
-                            (start, end)
-                        }
-                        _ => (None, None),
-                    };
-                    let evidence_id = match (&file, &content_hash) {
-                        (Some(f), Some(h)) => format!("{}:{}:{}", f, payload.location_lines.trim(), &h[..h.floor_char_boundary(12)]),
-                        (Some(f), None) => format!("{}:{}", f, payload.location_lines.trim()),
-                        _ => id.clone(),
-                    };
-                    let entry = serde_json::json!({
-                        "declaring_id": id,
-                        "rel_type": edge.rel_type,
-                        "declaration_index": edge.declaration_index,
-                        "declared_target": declared,
-                        "resolved_target": resolved,
-                        "logical_target": logical,
-                        "orientation": orientation,
-                        "file": file,
-                        "content_hash": content_hash,
-                        "line_start": line_start,
-                        "line_end": line_end,
-                        "evidence_id": evidence_id,
-                        "extractor": "upsert",
-                    });
-                    resolved_edge_entries.push(entry);
-                    evidence_id
-                };
+                    },
+                    &source,
+                );
+                resolved_edge_entries.push(entry);
                 if !is_valid_relation_name(edge.rel_type) {
                     deferred_edges.push(crate::traits::EdgeResolutionStatus {
                         rel_type: edge.rel_type.to_string(),
@@ -11885,6 +11942,7 @@ impl VectorStore for LadybugStore {
         namespace: &str,
         id: &str,
         rel_type: &str,
+        declared: &[String],
         keep: &[String],
     ) -> Result<usize> {
         if !is_valid_relation_name(rel_type) {
@@ -11898,6 +11956,7 @@ impl VectorStore for LadybugStore {
         let rel_type_key = rel_type.clone();
         let keep_for_reconcile = keep.to_vec();
         let keep_owned = keep.to_vec();
+        let declared_owned = declared.to_vec();
         let created = self
             .write_with_deadline("rebinding declared edges", move |conn| {
                 if keep_owned.is_empty() {
@@ -11920,13 +11979,58 @@ impl VectorStore for LadybugStore {
                 for row in conn.query(&existing_query)? {
                     existing.insert(format!("{}", row[0]));
                 }
+                // The unchanged head is the provenance source: its stored
+                // coordinates are what `upsert` would have stamped had the
+                // declaration reached it on this pass.
+                let source = {
+                    let query = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' \
+                         RETURN m.metadata, m.location, m.location_lines, m.content"
+                    );
+                    let mut rows = conn.query(&query)?;
+                    rows.next().map(|row| {
+                        let metadata = match &row[0] {
+                            lbug::Value::String(raw) => {
+                                serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({}))
+                            }
+                            _ => serde_json::json!({}),
+                        };
+                        EdgeProvenanceSource::from_row(
+                            &metadata,
+                            &format!("{}", row[1]),
+                            &format!("{}", row[2]),
+                            &format!("{}", row[3]),
+                        )
+                    })
+                };
                 let now = chrono::Utc::now().timestamp();
                 let mut created = 0usize;
-                for target in keep_owned.iter() {
+                let mut fresh_entries: Vec<Value> = Vec::new();
+                for (index, target) in keep_owned.iter().enumerate() {
                     if existing.contains(target) {
                         continue;
                     }
+                    let declared_target = declared_owned
+                        .get(index)
+                        .map(String::as_str)
+                        .unwrap_or(target.as_str());
+                    let (evidence_id, entry) = match &source {
+                        Some(source) => {
+                            let (evidence_id, entry) = edge_provenance_entry(
+                                &id,
+                                &rel_type,
+                                index,
+                                declared_target,
+                                target,
+                                "self_to_target",
+                                source,
+                            );
+                            (evidence_id, Some(entry))
+                        }
+                        None => (id.clone(), None),
+                    };
                     let safe_target = escape_ladybug_string(target);
+                    let safe_evidence = escape_ladybug_string(&evidence_id);
                     // Both endpoints must belong to the namespace; a global
                     // MATCH on a repeated id would otherwise bridge namespaces.
                     let query = format!(
@@ -11935,12 +12039,57 @@ impl VectorStore for LadybugStore {
                          MERGE (a)-[r:{rel_type}]->(b) ON CREATE SET r.source = '{safe_ns}', \
                          r.valid_from = {now}, r.valid_to = 0, r.generation = 0, \
                          r.extractor = 'upsert', r.confidence = 1.0, \
-                         r.evidence_id = '{safe_id}', r.origin = 'local' RETURN r"
+                         r.evidence_id = '{safe_evidence}', r.origin = 'local' RETURN r"
                     );
                     // A target that vanished between planning and this write
                     // binds nothing, exactly like upsert, and reports no edge.
                     for _row in conn.query(&query)? {
                         created += 1;
+                        if let Some(entry) = entry.clone() {
+                            fresh_entries.push(entry);
+                        }
+                    }
+                }
+                if !fresh_entries.is_empty() {
+                    let read_q = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' \
+                         RETURN m.metadata"
+                    );
+                    let mut rows = conn.query(&read_q)?;
+                    if let Some(row) = rows.next() {
+                        if let lbug::Value::String(meta_str) = &row[0] {
+                            if let Ok(mut meta) = serde_json::from_str::<Value>(meta_str) {
+                                if let Some(obj) = meta.as_object_mut() {
+                                    let sources = obj
+                                        .entry("edge_sources".to_string())
+                                        .or_insert_with(|| serde_json::json!([]));
+                                    if !sources.is_array() {
+                                        *sources = serde_json::json!([]);
+                                    }
+                                    let sources = sources.as_array_mut().expect("array");
+                                    for entry in fresh_entries {
+                                        // One citation per live binding: a
+                                        // retry replaces rather than stacks.
+                                        sources.retain(|existing| {
+                                            existing.get("rel_type") == entry.get("rel_type")
+                                                && existing.get("extractor")
+                                                    == entry.get("extractor")
+                                                && existing.get("resolved_target")
+                                                    == entry.get("resolved_target")
+                                        });
+                                        sources.push(entry);
+                                    }
+                                    if let Ok(new_meta) = serde_json::to_string(&meta) {
+                                        let update_q = format!(
+                                            "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' \
+                                             AND m.id = '{safe_id}' SET m.metadata = '{}'",
+                                            escape_ladybug_string(&new_meta)
+                                        );
+                                        conn.query(&update_q)?;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(created)

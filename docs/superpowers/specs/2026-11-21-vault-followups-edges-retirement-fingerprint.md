@@ -562,10 +562,6 @@ row.
 
 #### Residual risk
 
-- An unchanged-declarer rebind creates the preferred edge but does not mint a
-  new provenance entry; reconciliation removes the stale alias entry, so the
-  rebound edge is uncited until the head is written again. This is a citation
-  gap, not a wrong citation, and is preferred to citing a deleted target.
 - A database that already performed a buggy removal before this patch keeps
   its stale entry until that note changes: a byte-identical reimport is a
   no-op and never reaches reconciliation (same class as the edge orphan in
@@ -574,6 +570,60 @@ row.
   them leaves the edge gone with stale provenance and reports an error; the
   next changed import reconciles again. The reverse (provenance removed, edge
   kept) cannot happen because the provenance pass runs after the delete.
+
+### 3i. Rebound declarations mint matching provenance
+
+#### Invariant
+
+Every live declared edge has exactly one `metadata.edge_sources` entry that
+cites the declaration that produced it, including an edge created by an
+unchanged-declarer rebind. When `a → z` is rebound to `a → ns::z`, the
+replacement entry names `declared_target = ns::z`, `resolved_target = ns::z`,
+and the same relation, declaration index and evidence id that `upsert` would
+stamp. Reconciliation then retires the alias entry with the alias edge, so the
+row never cites a target it is not bound to and never loses the citation for
+the edge it is bound to. The provenance update is metadata-only: no content
+version, `supersedes` stamp, or history row is created.
+
+#### Mechanism
+
+- `edge_provenance_entry` and `EdgeProvenanceSource` are the single builder for
+  both writers. `upsert` reads the coordinates from the payload being written;
+  `rebind_declared_edges` reads the same fields (`metadata`, `location`,
+  `location_lines`, `content`) from the unchanged stored head, so an entry's
+  shape and evidence id cannot drift between the two paths.
+- `VectorStore::rebind_declared_edges` takes the importing note's `declared`
+  list, positionally aligned with `keep`. For each created edge it builds the
+  entry, dedupes by `(rel_type, extractor, resolved_target)`, and writes the
+  row's metadata once. The edge carries the same computed `evidence_id` as its
+  entry.
+- The subsequent reconciliation keep-set contains the preferred id, so it
+  removes the alias edge and the alias entry and retains the replacement pair.
+
+#### Eval (failed on `414f7981`)
+
+- `rebound_declaration_keeps_edge_source_provenance`
+  - Import `a → ns::z` and the alias note `z`; the first import binds `a → z`.
+  - Add the literal `ns::z` note while `a.md` is byte-identical; reimport.
+  - Assert the only `a` `RELATES_TO` edge ends at `ns::z`, the head keeps its
+    content and `canonical_sha256`, has no `supersedes`, and has zero history
+    rows; `edge_sources` contains a `RELATES_TO` entry whose `declared_target`
+    and `resolved_target` are both `ns::z` and no `RELATES_TO` entry for `z`.
+  - A `neurostrata_search_memory` lexical call with `include_references: true`
+    cites `ns::z` and not `z`.
+  - On `414f7981` the edge rebound correctly but `edge_sources` was `[]`:
+    reconciliation had retired the alias entry and the rebind minted none.
+
+#### Residual risk
+
+- `declared` and `keep` are positional. The only caller is the vault importer,
+  which derives both from the same note, so a future caller must preserve that
+  alignment; a mismatch only mislabels `declared_target` and the declaration
+  index, never the binding or the citation's resolved target.
+- A crash after the edge MERGE and before the metadata write leaves the edge
+  uncited, not wrongly cited; the next changed import of the head re-stamps
+  provenance through `upsert`. A byte-identical import does not retry, same
+  class as §3a.
 
 ---
 
@@ -673,16 +723,20 @@ note whose *real* type changed is versioned.
   `import_reconciles_preserved_edge_fields_with_edited_links`
   assertion (that key now exists by design), and the #363 evals.
 - `src/traits.rs` — `VectorStore::reconcile_declared_edges` default no-op,
-  `VectorStore::rebind_declared_edges` default no-op (§3g).
+  `VectorStore::rebind_declared_edges` default no-op, and the rebind's
+  `declared`/`keep` binding contract (§3g, §3i).
 - `src/store/ladybug.rs` — `extractor = 'upsert'` RELATES_TO reconciler,
-  `rebind_declared_edges` edge-only materialiser (§3g),
+  `rebind_declared_edges` materialiser that stamps replacement-edge provenance
+  through the shared `edge_provenance_entry` builder (§3g, §3i),
   `exact_edge_targets` opt-out from `KnownIds` rewriting, from
   path-inferring edge materialisation, and from `relink_edges` declaration
   replay (§3d), both using the shared verbatim-first match (§3e), and
   provenance reconciliation inside the edge reconciler (§3h).
-- `src/server.rs` — the `include_references` eval (§3h); no behaviour change.
+- `src/server.rs` — the `include_references` evals for retired and rebound
+  citations (§3h, §3i); no behaviour change.
 - `docs/features-api/mcp-and-http-api.md` — `include_references` citation
-  contract now states that provenance retires with its edge.
+  contract now states that provenance retires with its edge and that a rebind
+  cites its replacement edge.
 - `src/parser/generation.rs` — `exact_target_spellings`, `exact_target_match`,
   and `exact_target_match_fallible`: the single verbatim-first alias rule and
   precedence selector shared by the vault importer and the store (§3e),
@@ -707,9 +761,10 @@ note whose *real* type changed is versioned.
   store read at keep-set time and one re-upsert after the write phase; only
   that declarer replays, not the whole vault.
 - An unchanged declarer costs one keep-set read after the write phase and, when
-  a preferred target arrived, one edge-create plus one reconcile statement. The
-  head row is never rewritten, so no version or history row appears; its
-  `edge_sources` may change when a stale citation is retired (§3h).
+  a preferred target arrived, one metadata read, one edge-create plus its
+  provenance entry, and one reconcile statement. The head row is never
+  rewritten, so no version or history row appears; its `edge_sources` changes
+  only by swapping the retired citation for the replacement (§3h, §3i).
 - Reconciliation performs one metadata read per pass and writes metadata only
   when a provenance entry was removed. Ordinary rows and other relations are
   untouched.

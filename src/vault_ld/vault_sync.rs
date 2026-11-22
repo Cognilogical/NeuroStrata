@@ -1392,7 +1392,7 @@ pub async fn import_vault_with_limits(
             continue;
         }
         if let Err(e) = store
-            .rebind_declared_edges(&config.namespace, &id, "RELATES_TO", &keep.ids)
+            .rebind_declared_edges(&config.namespace, &id, "RELATES_TO", &declared, &keep.ids)
             .await
         {
             errors.push(format!("Failed to rebind edges for {}: {}", id, e));

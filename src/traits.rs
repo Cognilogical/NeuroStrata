@@ -560,13 +560,16 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// Import skips declarations whose fingerprint is unchanged, so a preferred
     /// target that appears in a later turn cannot reach them through `upsert`.
     /// This materialises the missing edges and retires the stale ones, leaving
-    /// content, metadata and history untouched. Stores without a graph
-    /// projection keep the no-op default.
+    /// content, history and version metadata untouched. `declared` is the
+    /// importing note's declaration list, positionally aligned with `keep`, so
+    /// a replacement edge can carry the same provenance shape `upsert` writes.
+    /// Stores without a graph projection keep the no-op default.
     async fn rebind_declared_edges(
         &self,
         _namespace: &str,
         _id: &str,
         _rel_type: &str,
+        _declared: &[String],
         _keep: &[String],
     ) -> Result<usize> {
         Ok(0)
