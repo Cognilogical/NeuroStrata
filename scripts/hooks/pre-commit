@@ -257,6 +257,12 @@ elif [ -n "$RESOLVED" ]; then
     # rewrite goes through a temporary file and a rename; an unparseable
     # ledger or a missing node/python3 leaves the file as it is.
     export LEDGER NAMESPACE
+    # Coordinate with the daemon's ledger writer (which takes this same lock):
+    # without it, a receipt committed after our snapshot is lost to the rename.
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"${LEDGER}.lock"
+        flock -x 9
+    fi
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
@@ -290,6 +296,9 @@ with open(tmp, "w", encoding="utf-8", newline="\n") as f:
     f.write("\n")
 os.replace(tmp, ledger)
 ' 2>/dev/null || true
+    fi
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>&-
     fi
 fi
 
