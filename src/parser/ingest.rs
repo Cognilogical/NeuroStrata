@@ -1378,6 +1378,24 @@ fn replay_processed_entry(
     Ok(())
 }
 
+/// Folder the stored node keys are relative to. A marker pinning an ancestor
+/// of the walk root keeps the cached project root there, so keys must use the
+/// marker's root: a key relative to a subdirectory is unreachable from the
+/// cached root's absolute-path lookups.
+fn key_root_for_ingest(dir_path: &Path, namespace: &str) -> std::path::PathBuf {
+    match crate::root_marker::find_root_marker(dir_path) {
+        Ok(Some(found)) if found.config.namespace.eq_ignore_ascii_case(namespace) => {
+            let root = found.marker_dir();
+            if dir_path.starts_with(&root) {
+                root
+            } else {
+                dir_path.to_path_buf()
+            }
+        }
+        _ => dir_path.to_path_buf(),
+    }
+}
+
 /// Blocking producer: walks the directory tree, reads files, parses ASTs,
 /// and streams owned results through `tx`. Runs on the blocking thread pool
 /// so filesystem I/O never stalls the async runtime.
@@ -1408,6 +1426,7 @@ fn run_producer(
         std::collections::HashMap::new();
     let mut raw_imports: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    let key_root = key_root_for_ingest(&dir_path, &namespace);
 
     let walker = WalkBuilder::new(&dir_path).build();
 
@@ -1450,13 +1469,13 @@ fn run_producer(
                 .to_string()
         };
 
-        let node_path = node_id_for(&dir_path, path);
+        let node_path = node_id_for(&key_root, path);
 
         let parent_id = if path == dir_path {
             None
         } else if let Some(p) = path.parent() {
-            if p == dir_path || p.strip_prefix(&dir_path).is_ok() {
-                let p_str = node_id_for(&dir_path, p);
+            if p == key_root || p.strip_prefix(&key_root).is_ok() {
+                let p_str = node_id_for(&key_root, p);
                 if p_str != "." && p_str != "" && p_str != node_path {
                     Some(p_str)
                 } else {
@@ -3091,6 +3110,67 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&db);
+    }
+
+    /// A marker pins the repo root; ingesting only its `src/` subfolder must
+    /// still key nodes from the pinned root, or absolute lookups that start
+    /// from the cached root can never reach them.
+    #[tokio::test]
+    async fn subdirectory_ingest_keys_nodes_from_the_marked_root() {
+        let tmp = std::env::temp_dir().join(format!("ns-subdir-key-{}", uuid::Uuid::new_v4()));
+        let repo = tmp.join("repo");
+        let src = repo.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            repo.join(".NeuroStrata").join("config.json"),
+            r#"{"version":1,"namespace":"test-ns"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn x() {}\n").unwrap();
+
+        let db = tmp.join("db");
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.unwrap();
+        let pinned = dunce::canonicalize(&repo).unwrap();
+        crate::registry::cache_project_root(
+            &store,
+            Some(&(Arc::new(ZeroEmbedder) as Arc<dyn Embedder>)),
+            "test-ns",
+            &pinned.to_string_lossy(),
+        )
+        .await;
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(
+            &dunce::canonicalize(&src).unwrap(),
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("ingest succeeds");
+
+        let locations: Vec<String> = store
+            .list("test-ns", None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.payload.location)
+            .collect();
+        assert!(
+            locations.iter().any(|p| p == "src/lib.rs"),
+            "expected a root-relative key, got {locations:?}"
+        );
+        assert!(
+            !locations.iter().any(|p| p == "lib.rs"),
+            "an ingest-folder-relative key is unreachable from the pinned root: {locations:?}"
+        );
     }
 
     #[tokio::test]
