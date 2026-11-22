@@ -272,7 +272,7 @@ elif [ -n "$RESOLVED" ]; then
           if (!doc || typeof doc !== "object") process.exit(0);
           if (doc.namespace === ns) process.exit(0);
           doc.namespace = ns;
-          const tmp = `${ledger}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+          const tmp = ledger + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
           let mode;
           try { mode = fs.statSync(ledger).mode; } catch {}
           fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { flag: "wx", mode: 0o600 });
