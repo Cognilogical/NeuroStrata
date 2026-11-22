@@ -1854,10 +1854,11 @@ fn wire_harness_config(
                     write_doc = true;
                 }
                 if write_doc {
+                    let mut may_add = false;
                     if let Some(obj) = doc.as_object_mut() {
                         let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
                         if let Some(h_obj) = hooks.as_object_mut() {
-                            let may_add = repair_claude_hooks(
+                            may_add = repair_claude_hooks(
                                 h_obj,
                                 namespace,
                                 abs_runner,
@@ -1924,6 +1925,24 @@ fn wire_harness_config(
                                         entry["matcher"] = json!(CLAUDE_PRE_TOOL_USE_MATCHER);
                                     }
                                 }
+                            }
+                        }
+                    }
+                    // A caller that already resolved the namespace (get_snapshot,
+                    // hook_hygiene_with_namespace) leaves an explicit answer in the
+                    // settings' env block; hook commands stay plain. Reading back the
+                    // plugin config keeps this consistent with an older install's
+                    // baked namespace and adds nothing when that write failed.
+                    if may_add {
+                        if let (Some(persisted), Some(obj)) =
+                            (claude_config_namespace(project_root), doc.as_object_mut())
+                        {
+                            let env = obj.entry("env".to_string()).or_insert_with(|| json!({}));
+                            if let Some(env_obj) = env.as_object_mut() {
+                                env_obj.insert(
+                                    "NEUROSTRATA_NAMESPACE".to_string(),
+                                    Value::String(persisted),
+                                );
                             }
                         }
                     }
