@@ -1048,7 +1048,7 @@ mod tests {
         );
     }
 
-    /// #376 review: a hook rewriting the ledger holds `<ledger>.lock`; the daemon's single
+    /// A hook rewriting the ledger holds `<ledger>.lock`; the daemon's single
     /// mutation path must wait for it rather than rename a stale snapshot over
     /// a receipt the hook has not seen.
     #[test]

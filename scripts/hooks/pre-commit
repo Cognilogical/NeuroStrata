@@ -249,20 +249,21 @@ for raw_file in "${StagedFiles[@]}"; do
 done
 
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
+# The daemon mutates this ledger under the same lock; without it a hook could
+# rename a stale snapshot over a receipt written in between. Only where `flock`
+# exists (Linux; not Git Bash or stock macOS). `9>>` opens the lock file
+# without truncating it.
+rewrite_session_ledger_namespace() {
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
-    # rewrite holds the same cross-process lock as the daemon's ledger writer
-    # where `flock` exists (Linux; not Git Bash or stock macOS), uses a unique
-    # EXCLUSIVE temp file (a planted symlink cannot be followed),
-    # keeps the original mode, and wraps legacy bare-array ledgers. An
-    # unparseable ledger or a missing node/python3 leaves the file as it is.
+    # rewrite uses a unique EXCLUSIVE temp file (a planted symlink cannot be
+    # followed), keeps the original mode, and wraps legacy bare-array ledgers.
+    # An unparseable ledger or a missing node/python3 leaves the file as it is.
     export LEDGER NAMESPACE
-    exec 9>>"$LEDGER.lock" 2>/dev/null || true
-    command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
@@ -313,8 +314,14 @@ except Exception:
         pass
 ' 2>/dev/null || true
     fi
-    command -v flock >/dev/null 2>&1 && flock -u 9 2>/dev/null || true
-    exec 9>&- 2>/dev/null || true
+fi
+}
+
+mkdir -p "$(dirname "$LEDGER")"
+if command -v flock >/dev/null 2>&1; then
+    ( flock -x 9; rewrite_session_ledger_namespace ) 9>>"$LEDGER.lock"
+else
+    rewrite_session_ledger_namespace
 fi
 
 
