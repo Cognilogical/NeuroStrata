@@ -185,6 +185,15 @@ Installs `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (g
 ```bash
 neurostrata-mcp hooks install [--force]
 ```
+The pre-push hook gates the project's configured namespace (see `namespace resolve`) and the checkout's folder name; the pre-commit hook records against the configured namespace. The pre-push hook blocks the push when `neurostrata-mcp` is missing, when `namespace resolve` fails, or when the gate exits with anything other than 0 or 1.
+
+### `namespace resolve`
+Prints the namespace configured for a project. Order: `NEUROSTRATA_NAMESPACE` in `.claude/settings.local.json` (its `env` block, else a hook command in the installer's exact form `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"` that runs the installer's `.NeuroStrata/plugins/claude/cli-hook.mjs`), then `namespace` in the opencode, codex, hermes, openclaw or GitHub CLI plugin config, read from the checkout, else from the main checkout of a linked worktree; then `NEUROSTRATA_NAMESPACE` in the environment (surrounding quotes dropped); then the `namespace` field of `.NeuroStrata/session_queries.json`; the main checkout's folder name last (outside git, the same files in `dir` itself, then its folder name). A namespace is letters, digits, `-`, `_`, `.` and `:`, starting with a letter or digit; any other value is skipped, and a config value in quotes is not one. When harness configs name different namespaces, it prints a warning on stderr and uses the first in the order above (Claude, opencode, codex, hermes, openclaw, GitHub CLI). It exits non-zero with an error on stderr, so the `pre-push` hook blocks the push, when `dir` does not exist, when a harness config exists but cannot be read or parsed (a UTF-8 byte order mark included; the error names the file), or when nothing names a namespace and the folder name is not one (a space in it, say). A relative `dir` is taken against the current directory. It opens no database and starts no daemon. The `pre-push` and `pre-commit` hooks use it; the `pre-commit` hook also sets the ledger's `namespace` field to its answer.
+
+`hooks install`, `get_snapshot`'s hook refresh and the daemon's startup install refresh the harness plugin files. They write a namespace into a harness config only when it came from a harness config or, for `hooks install` and the CLI, `NEUROSTRATA_NAMESPACE` (the daemon does not read its own environment: one daemon serves every project); a ledger or folder-name answer is never written there. Each config keeps a usable namespace it already names, a config that cannot be read is left as it is, and a config with no namespace to write is not written. Config files are written through a temporary file and a rename.
+```bash
+neurostrata-mcp namespace resolve [dir]
+```
 
 ---
 

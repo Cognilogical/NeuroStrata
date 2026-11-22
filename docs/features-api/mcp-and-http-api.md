@@ -99,6 +99,8 @@ Active-task resolution is session/worktree scoped: when the daemon returns sever
 
 All endpoints are served by the **neurostrata-mcp daemon** on `127.0.0.1:34343`. Tauri acts as a lightweight HTTP client; Cursor MCP integration proxies stdio JSON-RPC requests.
 
+At startup the daemon refreshes the harness plugin files in its startup root and in every configured project. Each harness config keeps the namespace it already names; a config that names none, or cannot be read, is not written, so the daemon never writes an empty or made-up namespace into a harness config (see `namespace resolve` in the CLI reference).
+
 `POST /mcp` follows JSON-RPC 2.0: a method the server does not implement gets error `-32601` (method not found) with the request's `id`, `ping` gets an empty result, and a notification (no `id`) gets `202 Accepted` with an empty body. For an unknown method, an explicit `"id": null` is a request id, not a notification: it receives the `-32601` response above with `"id": null`; only an omitted `id` suppresses the reply.
 
 ## Storage Status Surfaces
