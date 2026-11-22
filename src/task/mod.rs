@@ -4389,8 +4389,7 @@ done
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
 # The daemon mutates this ledger under the same lock; without it a hook could
 # rename a stale snapshot over a receipt written in between. Only where `flock`
-# exists (Linux; not Git Bash or stock macOS). `9>>` opens the lock file
-# without truncating it.
+# exists (Linux; not Git Bash or stock macOS).
 rewrite_session_ledger_namespace() {
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
@@ -4457,7 +4456,7 @@ fi
 
 mkdir -p "$(dirname "$LEDGER")"
 if command -v flock >/dev/null 2>&1; then
-    ( flock -x 9; rewrite_session_ledger_namespace ) 9>>"$LEDGER.lock"
+    ( flock -x 9; rewrite_session_ledger_namespace ) 9>"$LEDGER.lock"
 else
     rewrite_session_ledger_namespace
 fi
@@ -6504,7 +6503,7 @@ mod tests {
                 "the hook must take an exclusive ledger lock"
             );
             assert!(
-                source.contains("9>>\"$LEDGER.lock\""),
+                source.contains("9>\"$LEDGER.lock\""),
                 "the hook and the daemon must lock the same file"
             );
             let definition = source.find("rewrite_session_ledger_namespace() {");
