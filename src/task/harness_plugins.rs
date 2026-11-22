@@ -1377,12 +1377,20 @@ fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
         std::process::id(),
         ATOMIC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
+    write_staged_atomically(&tmp, path, contents)
+}
+
+/// The security-relevant core of [`write_atomically`], with the staged path
+/// supplied by the caller so a symlink planted at that exact path can be
+/// exercised deterministically. Production callers get a unique staged name
+/// from [`write_atomically`]; both routes share this single implementation.
+fn write_staged_atomically(staged: &Path, path: &Path, contents: &str) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
     let written = (|| -> std::io::Result<()> {
-        let mut file = options.open(&tmp)?;
+        let mut file = options.open(staged)?;
         std::io::Write::write_all(&mut file, contents.as_bytes())?;
         file.sync_all()?;
         drop(file);
@@ -1391,12 +1399,12 @@ fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
         #[cfg(unix)]
         if let Ok(meta) = std::fs::metadata(path) {
             let mode = meta.permissions().mode();
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+            std::fs::set_permissions(staged, std::fs::Permissions::from_mode(mode))?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(staged, path)
     })();
     if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(staged);
     }
     written
 }
