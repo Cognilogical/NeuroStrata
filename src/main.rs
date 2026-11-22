@@ -1959,9 +1959,16 @@ fn gate_verify_daemon(info: Option<&serde_json::Value>, own: (u64, u64)) -> Resu
     }
 }
 
+/// The identity probe is bounded independently of the 500 ms health probe:
+/// a daemon that answers /health but stalls on /info must not hold `root show`
+/// forever. On expiry this returns None, which the gate reads as stale and
+/// `root show` reports as an unknown cached root.
+const DAEMON_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 async fn fetch_daemon_info() -> Option<serde_json::Value> {
     let res = daemon_http_client()
         .get("http://127.0.0.1:34343/info")
+        .timeout(DAEMON_INFO_TIMEOUT)
         .send()
         .await
         .ok()?;
@@ -4541,6 +4548,18 @@ mod tests {
             BUS_METRICS_TIMEOUT,
             std::time::Duration::from_secs(10),
             "the other POSTs in this file use ten seconds; bus-metrics hangs the same way"
+        );
+    }
+
+    /// A daemon that answers /health but stalls on /info must not hold
+    /// `root show` forever: the GET is bounded, so identity verification
+    /// falls back to Unknown and the read path can proceed.
+    #[test]
+    fn the_daemon_info_get_is_bounded() {
+        assert!(
+            DAEMON_INFO_TIMEOUT > std::time::Duration::ZERO
+                && DAEMON_INFO_TIMEOUT <= std::time::Duration::from_secs(10),
+            "a finite /info timeout is required; got {DAEMON_INFO_TIMEOUT:?}"
         );
     }
 

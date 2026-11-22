@@ -838,6 +838,12 @@ impl ConfigNamespace<'_> {
     /// The namespace to write into `harness`'s config under `root`, or `None`
     /// to leave that config unwritten. Never an unusable value.
     fn for_harness(self, root: &Path, harness: &str) -> Option<String> {
+        // A setup that was interrupted mid-way left the intended namespace on
+        // disk. Any later refresh finishes that transition instead of freezing
+        // each config on whichever value it happened to receive.
+        if let Some(pending) = pending_namespace(root) {
+            return Some(pending);
+        }
         match self {
             ConfigNamespace::Set(ns) => usable_namespace(ns),
             ConfigNamespace::Keep(fallback) => match harness_config_namespace(root, harness) {
@@ -1007,6 +1013,37 @@ pub fn boot_namespaces_for(dir: &Path) -> Vec<(String, String)> {
     found
 }
 
+/// A setup writes this before fanning a namespace out to several harness
+/// configs. If it stops after only some writes, the marker survives and the
+/// next refresh finishes the transition instead of preserving a split.
+fn namespace_transition_path(root: &Path) -> std::path::PathBuf {
+    root.join(".NeuroStrata").join("namespace_transition.json")
+}
+
+/// Record the namespace an interrupted setup must finish applying. Written
+/// before the multi-config fan-out so a crash cannot lose the intent.
+pub fn begin_namespace_transition(root: &Path, namespace: &str) {
+    let path = namespace_transition_path(root);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = write_atomically(&path, &json!({ "namespace": namespace }).to_string());
+}
+
+fn pending_namespace(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(namespace_transition_path(root)).ok()?;
+    let doc: Value = serde_json::from_str(&text).ok()?;
+    let ns = doc.get("namespace")?.as_str()?;
+    usable_namespace(ns)
+}
+
+/// A successful install means every detected config now carries the pending
+/// namespace; the marker has done its job and must not override later,
+/// deliberate per-config namespaces.
+fn clear_namespace_transition(root: &Path) {
+    let _ = std::fs::remove_file(namespace_transition_path(root));
+}
+
 /// A project-scoped namespace derived from the checkout folder name, used on
 /// the initialization path (daemon boot, snapshot refresh) to wire a detected
 /// harness whose config names no namespace. Never the daemon's environment:
@@ -1143,6 +1180,14 @@ pub fn auto_install_detected_plugins(
 
     let (skills_installed, patched_agents) =
         sync_skills_and_agent_rules(project_root, active, &detected, &mut errors);
+
+    // A pending transition is finished once the installer ran without
+    // errors. Clear it then so it cannot override deliberate per-config
+    // namespaces chosen later. A failed run keeps the marker for the next
+    // refresh to retry.
+    if errors.is_empty() {
+        clear_namespace_transition(project_root);
+    }
 
     json!({
         "active_harness": active,
@@ -1793,6 +1838,31 @@ mod tests {
         assert!(dir
             .join(".NeuroStrata/plugins/openclaw/dist/index.js")
             .exists());
+    }
+
+    /// An interrupted setup that wired only some harness configs is repaired
+    /// by the next refresh: the persisted transition overrides each config's
+    /// stale namespace until every config has been brought forward.
+    #[test]
+    fn pending_namespace_transition_is_finished_by_a_later_refresh() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let claude = dir.join(".claude/plugins/neurostrata.json");
+        let hermes = dir.join(".hermes/plugins/neurostrata.json");
+        write_file(&claude, r#"{"namespace": "new"}"#);
+        write_file(&hermes, r#"{"namespace": "old"}"#);
+        // Setup stopped after writing only the first of the two configs.
+        begin_namespace_transition(&dir, "new");
+        boot_install_plugins(&dir);
+        assert_eq!(namespace_in(&claude), "new");
+        assert_eq!(namespace_in(&hermes), "new");
+        assert!(
+            !namespace_transition_path(&dir).exists(),
+            "a fully applied transition must be cleared"
+        );
     }
 
     /// A folder below the checkout top with its own harness config keeps

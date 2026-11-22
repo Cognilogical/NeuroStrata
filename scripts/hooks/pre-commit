@@ -266,9 +266,15 @@ elif [ -n "$RESOLVED" ]; then
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
           if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) process.exit(0);
           if (parsed.namespace === ns) process.exit(0);
-          parsed.namespace = ns;
+          // Re-read just before writing: a daemon receipt may have been
+          // appended since the first read. Change only the namespace field so
+          // no newer query or event row is replaced by a stale snapshot.
+          let latest;
+          try { latest = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
+          if (!latest || typeof latest !== "object" || Array.isArray(latest)) process.exit(0);
+          latest.namespace = ns;
           const tmp = ledger + ".tmp-" + process.pid;
-          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + "\n");
+          fs.writeFileSync(tmp, JSON.stringify(latest, null, 2) + "\n");
           fs.renameSync(tmp, ledger);
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
@@ -283,10 +289,19 @@ except Exception:
     sys.exit(0)
 if not isinstance(parsed, dict) or parsed.get("namespace") == ns:
     sys.exit(0)
-parsed["namespace"] = ns
+# Re-read just before writing: a daemon receipt may have been appended since
+# the first read. Change only the namespace field so no newer row is lost.
+try:
+    with open(ledger, encoding="utf-8") as f:
+        latest = json.load(f)
+except Exception:
+    sys.exit(0)
+if not isinstance(latest, dict):
+    sys.exit(0)
+latest["namespace"] = ns
 tmp = ledger + ".tmp-" + str(os.getpid())
 with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-    json.dump(parsed, f, indent=2, ensure_ascii=False)
+    json.dump(latest, f, indent=2, ensure_ascii=False)
     f.write("\n")
 os.replace(tmp, ledger)
 ' 2>/dev/null || true

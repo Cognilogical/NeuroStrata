@@ -3819,6 +3819,9 @@ pub async fn handle_bootstrap(
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let root = std::path::Path::new(project_root);
+    // The fan-out touches several harness configs one at a time. Persist the
+    // intent first so an interrupted setup is repaired by a later refresh.
+    harness_plugins::begin_namespace_transition(root, &namespace);
     let harness_plugins = harness_plugins::auto_install_detected_plugins(
         root,
         harness_plugins::ConfigNamespace::Set(&namespace),
@@ -4293,9 +4296,15 @@ elif [ -n "$RESOLVED" ]; then
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
           if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) process.exit(0);
           if (parsed.namespace === ns) process.exit(0);
-          parsed.namespace = ns;
+          // Re-read just before writing: a daemon receipt may have been
+          // appended since the first read. Change only the namespace field so
+          // no newer query or event row is replaced by a stale snapshot.
+          let latest;
+          try { latest = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
+          if (!latest || typeof latest !== "object" || Array.isArray(latest)) process.exit(0);
+          latest.namespace = ns;
           const tmp = ledger + ".tmp-" + process.pid;
-          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + "\n");
+          fs.writeFileSync(tmp, JSON.stringify(latest, null, 2) + "\n");
           fs.renameSync(tmp, ledger);
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
@@ -4310,10 +4319,19 @@ except Exception:
     sys.exit(0)
 if not isinstance(parsed, dict) or parsed.get("namespace") == ns:
     sys.exit(0)
-parsed["namespace"] = ns
+# Re-read just before writing: a daemon receipt may have been appended since
+# the first read. Change only the namespace field so no newer row is lost.
+try:
+    with open(ledger, encoding="utf-8") as f:
+        latest = json.load(f)
+except Exception:
+    sys.exit(0)
+if not isinstance(latest, dict):
+    sys.exit(0)
+latest["namespace"] = ns
 tmp = ledger + ".tmp-" + str(os.getpid())
 with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-    json.dump(parsed, f, indent=2, ensure_ascii=False)
+    json.dump(latest, f, indent=2, ensure_ascii=False)
     f.write("\n")
 os.replace(tmp, ledger)
 ' 2>/dev/null || true
@@ -5172,6 +5190,9 @@ pub async fn handle_task_setup(
     if !root.is_dir() {
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
+    // Persist the intent before fanning out; a later refresh repairs an
+    // interrupted setup instead of freezing a mixed-namespace split.
+    harness_plugins::begin_namespace_transition(root, &namespace);
     let harness_plugins = harness_plugins::auto_install_detected_plugins(
         root,
         harness_plugins::ConfigNamespace::Set(&namespace),
@@ -6253,6 +6274,25 @@ mod tests {
         assert!(
             checked_in.contains("scripts/check-staged-quality.sh"),
             "the pre-commit hook must delegate to the project's staged-quality runner"
+        );
+    }
+
+    /// A daemon row appended after the hook's first read must survive the
+    /// namespace update: both rewrite branches re-read the ledger just before
+    /// writing so they edit the latest content, not a stale snapshot.
+    #[test]
+    fn pre_commit_namespace_rewrite_rereads_the_latest_ledger() {
+        let tail = SCAFFOLDED_PRE_COMMIT_HOOK
+            .split("Write the query ledger")
+            .nth(1)
+            .expect("ledger rewrite block");
+        assert!(
+            tail.matches("readFileSync(ledger").count() >= 2,
+            "the node rewrite must re-read the ledger immediately before writing"
+        );
+        assert!(
+            tail.matches("open(ledger").count() >= 2,
+            "the python rewrite must re-read the ledger immediately before writing"
         );
     }
 
