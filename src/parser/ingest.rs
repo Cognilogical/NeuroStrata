@@ -32,8 +32,9 @@ use tree_sitter::{Parser, Query, StreamingIterator};
 // target. These re-exports keep `ingest.rs` and the store naming the same
 // functions through the path they already use.
 pub use crate::parser::generation::{
-    generation_key, generation_scoped_id, ingest_version, logical_path_of, sha256_hex,
-    split_scoped_id, symbol_id, NAMESPACE_SEPARATOR,
+    exact_target_match, exact_target_match_fallible, exact_target_spellings, generation_key,
+    generation_scoped_id, ingest_version, logical_path_of, sha256_hex, split_scoped_id, symbol_id,
+    NAMESPACE_SEPARATOR,
 };
 
 /// Directory names the ingest walk never descends into. Shared with the
