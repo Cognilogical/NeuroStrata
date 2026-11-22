@@ -450,10 +450,17 @@ not rewritten, so content, type, identity, `valid_to`/`supersedes`, and
 history rows are unchanged. A turn that imports no relevant id performs no
 edge work, so repeated unchanged imports stay a stable no-op.
 
+Rebinding still mutates a protected head's declared graph, so an unchanged
+declarer is queued only when `writable_prior(principal, prior)` accepts its
+stored payload. A foreign- or mesh-owned head is never rebound: its edges stay
+exactly as stored and the turn remains a silent no-op for that head, matching
+the unchanged path's prior behavior.
+
 #### Mechanism
 
-- The planning loop records `(id, related)` for every unchanged declaration
-  instead of dropping it at `continue`.
+- The planning loop runs the same `writable_prior` sovereignty gate used for a
+  changed head before recording `(id, related)` for an unchanged declaration.
+  A protected head is dropped at `continue` without an error or edge mutation.
 - The write loop collects the ids whose head upsert succeeded
   (`imported_ids`).
 - After the deferred replay, an unchanged declarer recomputes
@@ -476,9 +483,27 @@ edge work, so repeated unchanged imports stay a stable no-op.
   - On `b0019a31` the unchanged `a` never replanned, so the alias edge
     survived (`the unchanged declarer must rebind its preferred target:
     ["z"] vs ["ns::z"]`).
+- `unchanged_foreign_declarer_does_not_rebind_protected_edges` and
+  `unchanged_mesh_owned_declarer_does_not_rebind_protected_edges`
+  (failed on `32d4ce41`)
+  - Seed the bare `z`, an unchanged declarer `a` already bound to `z`, and a
+    vault that adds the literal `ns::z`. One case makes `a` foreign; the
+    other makes it mesh-authored by another peer while the local owner
+    matches the importing principal.
+  - Assert `a` keeps its head payload byte-for-byte, zero history rows, and
+    its only `RELATES_TO` edge still ends at `z`; no `ns::z` edge appears.
+  - On `32d4ce41` the unchanged queue bypassed `writable_prior`, so the
+    import rebound the protected head (`["ns::z"] vs ["z"]`).
+- `owned_unchanged_declarer_still_rebinds_preferred_target` is the control:
+  a writable unchanged declarer still follows the newly imported preferred id.
 
 #### Residual risk
 
+- The gate reuses `writable_prior` and therefore inherits its policy: a row
+  with no owner and default private eligibility is writable by any principal,
+  matching the changed-head path. Protected unchanged heads are skipped
+  silently rather than reported in `errors`, preserving the historical no-op
+  contract; an operator who needs a signal must compare store state.
 - The rebind is edge-only and idempotent, but a crash between edge creation
   and reconciliation can leave both bindings until the next import that
   imports a relevant id. A later unchanged import with no new ids will not

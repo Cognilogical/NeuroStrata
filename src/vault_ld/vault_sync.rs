@@ -1192,7 +1192,12 @@ pub async fn import_vault_with_limits(
                     }
             };
             if unchanged {
-                unchanged_declarers.push((note.id.clone(), note.related.clone()));
+                // Rebinding mutates edges, so an untouched head still needs
+                // the same sovereignty gate as a changed one. A protected head
+                // stays a silent no-op, exactly as the unchanged path was before.
+                if writable_prior(principal, prior).is_ok() {
+                    unchanged_declarers.push((note.id.clone(), note.related.clone()));
+                }
                 continue;
             }
             if let Err(e) = writable_prior(principal, prior) {
@@ -4728,6 +4733,249 @@ mod tests {
             linked(&edges),
             vec![preferred],
             "a third unchanged import must be a stable no-op: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn relates_to_targets(
+        edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)],
+        from: &str,
+    ) -> Vec<String> {
+        edges
+            .iter()
+            .filter(|(source, rel, _, _)| source == from && rel == "RELATES_TO")
+            .map(|(_, _, target, _)| target.clone())
+            .collect()
+    }
+
+    /// Seed an unchanged declarer whose head is already bound to the bare `z`
+    /// alias while its note declares the preferred `ns::z`. The red turn adds
+    /// the literal preferred note to a vault that also holds `a` byte-identical.
+    async fn seed_unchanged_alias_declarer(
+        label: &str,
+        ns: &str,
+        owner: &str,
+        mesh: Option<serde_json::Value>,
+    ) -> (
+        std::sync::Arc<dyn VectorStore>,
+        VaultSyncConfig,
+        String,
+        crate::traits::MemoryPayload,
+    ) {
+        let root = std::env::temp_dir().join(format!("ns-vault-{label}-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        store.init(ns).await.expect("init");
+        let mut config = vault_config(&root, &vault, ns);
+        config.principal = Some("me".to_string());
+
+        let preferred = format!("{ns}::z");
+        let mut linker = note("a", &[preferred.as_str()]);
+        linker.content = "links the alias until the verbatim note exists".to_string();
+        linker.canonical_sha256 = linker.fingerprint();
+        let mut alias = note("z", &[]);
+        alias.content = "body of the bare alias".to_string();
+        alias.canonical_sha256 = alias.fingerprint();
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write linker");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write alias");
+
+        store
+            .upsert(
+                ns,
+                "z",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: alias.content.clone(),
+                    memory_type: "fact".to_string(),
+                    location: String::new(),
+                    user_id: "me".to_string(),
+                    agent_name: None,
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({
+                        "canonical_sha256": alias.canonical_sha256,
+                        "fingerprint_version": FINGERPRINT_VERSION,
+                        "exact_edge_targets": true,
+                    }),
+                },
+            )
+            .await
+            .expect("seed alias");
+
+        let mut metadata = serde_json::json!({
+            "canonical_sha256": linker.canonical_sha256,
+            "fingerprint_version": FINGERPRINT_VERSION,
+            "related_to": ["z"],
+            "exact_edge_targets": true,
+        });
+        if let Some(mesh) = mesh {
+            metadata["mesh"] = mesh;
+        }
+        store
+            .upsert(
+                ns,
+                "a",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: linker.content.clone(),
+                    memory_type: "fact".to_string(),
+                    location: String::new(),
+                    user_id: owner.to_string(),
+                    agent_name: None,
+                    location_lines: String::new(),
+                    metadata,
+                },
+            )
+            .await
+            .expect("seed declarer");
+        let before = store
+            .get(ns, "a")
+            .await
+            .expect("get declarer")
+            .expect("declarer exists")
+            .1;
+
+        let mut literal = note(&preferred, &[]);
+        literal.content = "body of the verbatim note".to_string();
+        literal.canonical_sha256 = literal.fingerprint();
+        std::fs::write(vault.join("preferred.md"), literal.to_markdown()).expect("write preferred");
+
+        (store, config, preferred, before)
+    }
+
+    async fn assert_declarer_head_unchanged(
+        store: &std::sync::Arc<dyn VectorStore>,
+        ns: &str,
+        before: &crate::traits::MemoryPayload,
+    ) {
+        let after = store
+            .get(ns, "a")
+            .await
+            .expect("get declarer after import")
+            .expect("declarer survives")
+            .1;
+        assert_eq!(
+            after.content, before.content,
+            "head content must not change"
+        );
+        assert_eq!(
+            after.memory_type, before.memory_type,
+            "head type must not change"
+        );
+        assert_eq!(after.user_id, before.user_id, "head owner must not change");
+        assert_eq!(
+            after.metadata, before.metadata,
+            "an unchanged declarer's head must not be rewritten"
+        );
+        assert_eq!(
+            after.metadata.get("supersedes"),
+            None,
+            "an edge rebind must not supersede the head: {:?}",
+            after.metadata
+        );
+        let history_rows = store
+            .list(ns, None, None)
+            .await
+            .expect("list rows")
+            .into_iter()
+            .filter(|row| row.id.starts_with("a.vault-history."))
+            .count();
+        assert_eq!(history_rows, 0, "no history version may be created");
+    }
+
+    /// A foreign unchanged declarer is protected ground: the import may not
+    /// rebind its edges merely because its preferred target arrived.
+    #[tokio::test]
+    async fn unchanged_foreign_declarer_does_not_rebind_protected_edges() {
+        let ns = "vaultforeign";
+        let (store, config, preferred, before) =
+            seed_unchanged_alias_declarer("foreign-unchanged", ns, "peer-a", None).await;
+        let root = config.project_root.clone().expect("root");
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+
+        assert_declarer_head_unchanged(&store, ns, &before).await;
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            relates_to_targets(&edges, "a"),
+            vec!["z".to_string()],
+            "a protected declarer must keep its alias edge: {:?}",
+            edges
+        );
+        assert!(
+            !relates_to_targets(&edges, "a").contains(&preferred),
+            "no preferred edge may be created for a protected declarer: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Mesh-provenance sovereignty applies even when the head's owner matches
+    /// the importing principal: the mesh author, not the local owner, decides.
+    #[tokio::test]
+    async fn unchanged_mesh_owned_declarer_does_not_rebind_protected_edges() {
+        let ns = "vaultmesh";
+        let (store, config, preferred, before) = seed_unchanged_alias_declarer(
+            "mesh-unchanged",
+            ns,
+            "me",
+            Some(serde_json::json!({
+                "origin": "mesh-import",
+                "claimed_created_by": "peer-a",
+                "created_by_verified": false
+            })),
+        )
+        .await;
+        let root = config.project_root.clone().expect("root");
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+
+        assert_declarer_head_unchanged(&store, ns, &before).await;
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            relates_to_targets(&edges, "a"),
+            vec!["z".to_string()],
+            "a mesh-owned declarer must keep its alias edge: {:?}",
+            edges
+        );
+        assert!(
+            !relates_to_targets(&edges, "a").contains(&preferred),
+            "no preferred edge may be created for a mesh-owned declarer: {:?}",
+            edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Control: the ownership gate must not stop an owned unchanged declarer
+    /// from following its newly imported preferred target.
+    #[tokio::test]
+    async fn owned_unchanged_declarer_still_rebinds_preferred_target() {
+        let ns = "vaultowned";
+        let (store, config, preferred, before) =
+            seed_unchanged_alias_declarer("owned-unchanged", ns, "me", None).await;
+        let root = config.project_root.clone().expect("root");
+        let result = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("import");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes_imported, 1, "{:?}", result.errors);
+
+        assert_declarer_head_unchanged(&store, ns, &before).await;
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            relates_to_targets(&edges, "a"),
+            vec![preferred],
+            "an owned unchanged declarer must rebind its preferred target: {:?}",
             edges
         );
         let _ = std::fs::remove_dir_all(&root);
