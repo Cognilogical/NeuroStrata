@@ -1046,7 +1046,13 @@ mod tests {
                 );
             } else {
                 match kind {
-                    "git-dir" => std::fs::create_dir_all(path.join(".git")).unwrap(),
+                    "git-dir" => {
+                        let git_dir = path.join(".git");
+                        std::fs::create_dir_all(&git_dir).unwrap();
+                        // main_checkout_of_common only accepts a .git that holds HEAD.
+                        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+                        std::fs::write(git_dir.join("config"), "[core]\n\tbare = false\n").unwrap();
+                    }
                     "neurostrata-dir" => std::fs::create_dir_all(path.join(".NeuroStrata")).unwrap(),
                     "file" => {
                         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
