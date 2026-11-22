@@ -981,16 +981,12 @@ ex:C a rdfs:Class .
             "no plain CREATE node/relationship pattern (non-idempotent): {:?}",
             stmts
         );
-        assert!(
-            stmts
-                .iter()
-                .any(|s| s.starts_with("MERGE (n:OntologyClass"))
-        );
-        assert!(
-            stmts
-                .iter()
-                .any(|s| s.starts_with("MERGE (n:OntologyProperty"))
-        );
+        assert!(stmts
+            .iter()
+            .any(|s| s.starts_with("MERGE (n:OntologyClass")));
+        assert!(stmts
+            .iter()
+            .any(|s| s.starts_with("MERGE (n:OntologyProperty")));
         let edges: Vec<_> = stmts
             .iter()
             .filter(|s| s.contains("SUBCLASS_OF") || s.contains("DOMAIN") || s.contains("RANGE"))

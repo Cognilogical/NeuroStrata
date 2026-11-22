@@ -51,18 +51,11 @@ pub use error::{Error, Result};
 pub use ladybug::{LadybugSchemaStore, NamespaceInfo, Projected, TripleRow};
 pub use registry::{SchemaGraph, SchemaRole};
 
-
 pub use oxigraph;
 
 pub use validate::{
-    extract_shacl_shapes,
-    shacl_turtle,
-    ExtractedShaclProperty,
-    ExtractedShaclShape,
-    Finding,
-    Mode,
-    Report,
-    ShexResult,
+    extract_shacl_shapes, shacl_turtle, ExtractedShaclProperty, ExtractedShaclShape, Finding, Mode,
+    Report, ShexResult,
 };
 
 #[cfg(test)]

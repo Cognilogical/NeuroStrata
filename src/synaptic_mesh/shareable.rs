@@ -9,8 +9,14 @@
 /// The memory types that may be shared over the mesh. Everything else —
 /// receipts, `action_receipt`, tasks, structural/ingestion rows, embeddings and
 /// bus sentinel rows — is strictly local.
-pub const SHAREABLE_MEMORY_TYPES: &[&str] =
-    &["rule", "fact", "procedure", "action_type", "thesis", "concept"];
+pub const SHAREABLE_MEMORY_TYPES: &[&str] = &[
+    "rule",
+    "fact",
+    "procedure",
+    "action_type",
+    "thesis",
+    "concept",
+];
 
 /// Whether `memory_type` is a type the mesh may carry. Single source of truth
 /// for both the subscriber (capture) and the worker (export).

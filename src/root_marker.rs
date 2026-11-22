@@ -353,10 +353,12 @@ pub(crate) fn in_main_checkout(dir: &Path) -> PathBuf {
 
 /// The marker that decides `path`'s project root (spec 6.1), or `None`.
 ///
-/// For a file the walk starts at its folder. The path is canonicalized
+/// For a file the walk starts at its folder. That folder is canonicalized
 /// through its nearest existing ancestor, so any spelling of it (drive letter
 /// case, `/`, a junction or symlink) finds the same marker and the root comes
-/// back in canonical spelling. A path that is not absolute on this host (a
+/// back in canonical spelling. A file symlink itself is not followed: the
+/// link's own folder decides, so a link into another checkout does not
+/// carry that checkout's marker. A path that is not absolute on this host (a
 /// POSIX path on Windows, say) cannot be read here and finds none.
 /// 1. Own checkout: from the start folder up to the nearest folder holding
 ///    `.git` (inclusive), never above it; the deepest marker wins.
@@ -419,17 +421,17 @@ fn decide(
 }
 
 /// The folder a walk starts from, or `None` for a path that is not
-/// absolute on this host.
+/// absolute on this host. For a file it is the file's folder, canonicalized
+/// itself: a file symlink is not followed, so a link to a file in another
+/// checkout does not take that checkout's marker.
 fn start_folder(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
     }
-    let path = canonical_through_existing(path);
     if path.is_file() {
-        path.parent().map(Path::to_path_buf)
-    } else {
-        Some(path)
+        return path.parent().map(canonical_through_existing);
     }
+    Some(canonical_through_existing(path))
 }
 
 /// `path` canonicalized through its nearest existing ancestor, with the
@@ -948,6 +950,15 @@ pub fn root_hint(namespace: &str, path: &Path) -> Option<String> {
     if !matches!(find_root_marker(path), Ok(None)) {
         return None;
     }
+    no_marker_hint(namespace, path)
+}
+
+/// [`root_hint`] for a caller that already knows `find_root_marker(path)` is
+/// `Ok(None)`, so the marker walk is not repeated.
+pub fn no_marker_hint(namespace: &str, path: &Path) -> Option<String> {
+    if namespace.trim().is_empty() || !path.is_absolute() || !path.exists() {
+        return None;
+    }
     let folder = start_folder(path)?;
     if folder.parent().is_none()
         || crate::task::is_home_folder(&folder, dirs::home_dir().as_deref())
@@ -1072,9 +1083,9 @@ async fn lost_by_change(
         Some(current) if !same_root(current, new) => {
             let rows = registry.rows(namespace).await?;
             Ok(if same_tree(current, new) {
-                crate::root_audit::rows_lost_in(&rows, current, new, namespace)
+                crate::root_audit::rows_lost_in(&rows, current, new)
             } else {
-                crate::root_audit::rows_missing_under(&rows, current, new, namespace)
+                crate::root_audit::rows_missing_under(&rows, current, new)
             })
         }
         _ => Ok(Vec::new()),
@@ -1432,42 +1443,20 @@ pub(crate) async fn root_set_with(
         None => {
             let mut fresh = RootConfig::new(ns);
             fresh.source_id = args.source_id.clone();
-            // The early read said absent, but a competing writer may have
-            // published between it and the awaits above. Re-read and refuse
-            // a foreign marker here: only `write_new_marker` may claim an
-            // absent target, and only `--replace` may take one from another
-            // namespace.
-            match read_marker(&target) {
-                MarkerRead::Absent => {
-                    match write_new_marker(&target, &fresh).map_err(|e| e.to_string())? {
-                        WriteOutcome::Written => {}
-                        WriteOutcome::LostRace(MarkerRead::Valid(won))
-                            if won.namespace.eq_ignore_ascii_case(ns) => {}
-                        WriteOutcome::LostRace(_) => {
-                            return Err(format!(
+            if matches!(read_marker(&target), MarkerRead::Absent) {
+                match write_new_marker(&target, &fresh).map_err(|e| e.to_string())? {
+                    WriteOutcome::Written => {}
+                    WriteOutcome::LostRace(MarkerRead::Valid(won))
+                        if won.namespace.eq_ignore_ascii_case(ns) => {}
+                    WriteOutcome::LostRace(_) => {
+                        return Err(format!(
                             "another writer published {} first; run `neurostrata-mcp root show`",
                             target.join(ROOT_CONFIG_REL).display()
                         ))
-                        }
                     }
                 }
-                MarkerRead::Valid(won) if won.namespace.eq_ignore_ascii_case(ns) => {}
-                other => {
-                    if !args.replace {
-                        let held = match &other {
-                            MarkerRead::Valid(cfg) => format!("namespace {}", cfg.namespace),
-                            MarkerRead::Unreadable { reason, .. } => {
-                                format!("an unreadable marker ({reason})")
-                            }
-                            MarkerRead::Absent => unreachable!(),
-                        };
-                        return Err(format!(
-                            "another writer published {} ({held}) first; pass --replace to change it",
-                            target.join(ROOT_CONFIG_REL).display()
-                        ));
-                    }
-                    replace_marker(&target, &fresh).map_err(|e| e.to_string())?;
-                }
+            } else {
+                replace_marker(&target, &fresh).map_err(|e| e.to_string())?;
             }
             true
         }
@@ -1770,6 +1759,48 @@ mod tests {
         }
     }
 
+    /// Links `link` to the file `target`; false when this session may not
+    /// create file symlinks (Windows without the privilege).
+    fn link_file(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
+
+    #[test]
+    fn file_symlink_into_another_checkout_does_not_take_its_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let outer = base.join("outer");
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        std::fs::create_dir_all(outer.join("src")).unwrap();
+        std::fs::write(outer.join("src").join("a.rs"), "").unwrap();
+        write_raw(&outer, br#"{"version":1,"namespace":"outer"}"#);
+        let inner = base.join("inner");
+        std::fs::create_dir_all(inner.join(".git")).unwrap();
+        let link = inner.join("link.rs");
+        if !link_file(&outer.join("src").join("a.rs"), &link) {
+            eprintln!("skipped: file symlinks are not available here");
+            return;
+        }
+        assert_eq!(find_root_marker(&link), Ok(None));
+        // The target itself still finds its own marker.
+        let found = find_root_marker(&outer.join("src").join("a.rs"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.root, outer);
+        // A marker in the link's own checkout decides for the link.
+        write_raw(&inner, br#"{"version":1,"namespace":"inner"}"#);
+        let found = find_root_marker(&link).unwrap().unwrap();
+        assert_eq!(found.root, inner);
+        assert_eq!(found.config.namespace, "inner");
+    }
+
     #[test]
     fn symlinked_neurostrata_is_refused() {
         // A missing folder is created as a real directory.
@@ -1919,13 +1950,9 @@ mod tests {
             } else {
                 match kind {
                     "git-dir" => {
-                        let git_dir = path.join(".git");
-                        std::fs::create_dir_all(&git_dir).unwrap();
-                        // A checkout's common dir carries HEAD and a config;
-                        // main_checkout_of_common uses them to tell a checkout
-                        // apart from a dropped git dir.
-                        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-                        std::fs::write(git_dir.join("config"), "[core]\n\tbare = false\n").unwrap();
+                        std::fs::create_dir_all(path.join(".git")).unwrap();
+                        std::fs::write(path.join(".git").join("HEAD"), "ref: refs/heads/main\n")
+                            .unwrap();
                     }
                     "neurostrata-dir" => {
                         std::fs::create_dir_all(path.join(".NeuroStrata")).unwrap()
@@ -3256,56 +3283,6 @@ mod tests {
             cached(&store).await,
             Some(web.to_string_lossy().into_owned())
         );
-    }
-
-    /// A registry that, like a competing `root set`, publishes a foreign
-    /// marker in the target while this command awaits the first registry read.
-    struct CompetingWriterRegistry {
-        inner: StoreRegistry,
-        competitor: (PathBuf, String),
-    }
-
-    #[async_trait::async_trait]
-    impl RootRegistry for CompetingWriterRegistry {
-        async fn cached_root(&self, namespace: &str) -> Result<Option<String>, String> {
-            replace_marker(&self.competitor.0, &RootConfig::new(&self.competitor.1))
-                .map_err(|e| e.to_string())?;
-            self.inner.cached_root(namespace).await
-        }
-        async fn rows(&self, namespace: &str) -> Result<Vec<crate::traits::SearchResult>, String> {
-            self.inner.rows(namespace).await
-        }
-        async fn set_root(&self, namespace: &str, root: &Path) -> Result<(), String> {
-            self.inner.set_root(namespace, root).await
-        }
-        async fn finish(&self) {
-            self.inner.finish().await
-        }
-    }
-
-    #[tokio::test]
-    async fn a_competing_writer_marker_is_not_overwritten_without_replace() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = dunce::canonicalize(tmp.path()).unwrap();
-        layout(&base, r#"["repo git-dir", "repo/target"]"#);
-        let target = base.join("repo/target");
-        let (store, emb) = mock();
-        let registry = CompetingWriterRegistry {
-            inner: StoreRegistry {
-                store: store.clone(),
-                emb: Some(emb.clone()),
-                checkpoint: false,
-            },
-            competitor: (target.clone(), "other-project".to_string()),
-        };
-        let err = root_set_with(&registry, &set_args(&target), None)
-            .await
-            .unwrap_err();
-        assert!(err.contains("another writer"), "{err}");
-        match read_marker(&target) {
-            MarkerRead::Valid(cfg) => assert_eq!(cfg.namespace, "other-project"),
-            other => panic!("the competing marker was overwritten: {other:?}"),
-        }
     }
 
     /// A registry that, like a second `root set` racing this one, moves the

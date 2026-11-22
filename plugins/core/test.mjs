@@ -8,8 +8,7 @@ import {
   rmSync,
   mkdtempSync,
   existsSync,
-  copyFileSync,
-  symlinkSync
+  copyFileSync
 } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join, isAbsolute, resolve, dirname } from 'node:path'
@@ -385,11 +384,17 @@ afterEach(() => {
 
 describe('resolveConfig namespace priority (never hardcodes NeuroStrata)', () => {
   it('preserves a namespace containing spaces for MCP routing', () => {
-    assert.equal(resolveConfig({ namespace: 'My Project' }, '/tmp/opencode').namespace, 'My Project')
+    assert.equal(
+      resolveConfig({ namespace: 'My Project' }, '/tmp/opencode').namespace,
+      'My Project'
+    )
   })
 
   it('pluginConfig.namespace wins', () => {
-    const cfg = resolveConfig({ namespace: 'cfg-ns', strictMode: false }, '/tmp/opencode')
+    const cfg = resolveConfig(
+      { namespace: 'cfg-ns', strictMode: false },
+      '/tmp/opencode'
+    )
     assert.equal(cfg.namespace, 'cfg-ns')
   })
 
@@ -476,19 +481,36 @@ describe('project root marker and namespace order', () => {
     assert.equal(findRootMarker('.'), null)
   })
 
-  it('main-checkout walk ignores a directory symlink leaving the checkout', () => {
+  it('the main-checkout walk stops at a directory symlink', async (t) => {
     const base = tempDir()
     buildLayout(base, [
       'repo git-dir',
+      'repo marker:example-project',
       'repo/.git/worktrees/wt commondir:../..',
       'wt git-file:../repo/.git/worktrees/wt',
-      'wt/pkg',
-      'foreign marker:foreign-project'
+      'wt/pkg/x',
+      'other git-dir',
+      'other/pkg marker:unrelated',
+      'other/pkg/x'
     ])
-    // isDirectory() follows links; a main/pkg link into another repository
-    // used to contribute that repository's marker to this worktree.
-    symlinkSync(under(base, 'foreign'), under(base, 'repo/pkg'), 'dir')
-    assert.equal(findRootMarker(under(base, 'wt/pkg')), null)
+    const { symlinkSync } = await import('node:fs')
+    const link = join(under(base, 'repo'), 'pkg')
+    try {
+      symlinkSync(
+        under(base, 'other/pkg'),
+        link,
+        process.platform === 'win32' ? 'junction' : 'dir'
+      )
+    } catch (err) {
+      t.skip(`symlink creation not permitted: ${err.message}`)
+      return
+    }
+    const from = join(under(base, 'wt/pkg'), 'x')
+    assert.equal(findRootMarker(from)?.namespace, 'example-project')
+    assert.equal(
+      resolveConfig({ namespace: 'cfg-ns' }, from).namespace,
+      'example-project'
+    )
   })
 
   it('resolveConfig puts marker first', () => {
@@ -498,9 +520,15 @@ describe('project root marker and namespace order', () => {
     process.env.NEUROSTRATA_NAMESPACE = 'env-ns'
     try {
       writeMarker(under(base, 'repo'), 'from-marker')
-      assert.equal(resolveConfig({ namespace: 'cfg-ns' }, sub).namespace, 'from-marker')
+      assert.equal(
+        resolveConfig({ namespace: 'cfg-ns' }, sub).namespace,
+        'from-marker'
+      )
       rmSync(join(under(base, 'repo'), '.NeuroStrata', 'config.json'))
-      assert.equal(resolveConfig({ namespace: 'cfg-ns' }, sub).namespace, 'cfg-ns')
+      assert.equal(
+        resolveConfig({ namespace: 'cfg-ns' }, sub).namespace,
+        'cfg-ns'
+      )
       assert.equal(resolveConfig({}, sub).namespace, 'env-ns')
     } finally {
       delete process.env.NEUROSTRATA_NAMESPACE
@@ -510,19 +538,24 @@ describe('project root marker and namespace order', () => {
 
   it('findProjectRoot pass 2 never accepts the home folder', (t) => {
     const base = tempDir()
-    if (insideGit(base)) return t.skip('the temp folder is inside a git checkout')
+    if (insideGit(base))
+      return t.skip('the temp folder is inside a git checkout')
     buildLayout(base, ['home neurostrata-dir', 'home/proj/sub'])
     const home = under(base, 'home')
     const found = findProjectRoot(under(base, 'home/proj/sub'), home)
     assert.notEqual(found, home)
     // A marker in a folder below home is still a root.
     writeMarker(under(base, 'home/proj'), 'example-project')
-    assert.equal(findProjectRoot(under(base, 'home/proj/sub'), home), under(base, 'home/proj'))
+    assert.equal(
+      findProjectRoot(under(base, 'home/proj/sub'), home),
+      under(base, 'home/proj')
+    )
   })
 
   it('findProjectRoot pass 2 keeps nearest .NeuroStrata without a marker', (t) => {
     const base = tempDir()
-    if (insideGit(base)) return t.skip('the temp folder is inside a git checkout')
+    if (insideGit(base))
+      return t.skip('the temp folder is inside a git checkout')
     buildLayout(base, ['a neurostrata-dir', 'a/b neurostrata-dir', 'a/b/c'])
     assert.equal(findProjectRoot(under(base, 'a/b/c')), under(base, 'a/b'))
     // A valid marker further up is preferred over a nearer bare .NeuroStrata.
@@ -538,7 +571,9 @@ describe('project root marker and namespace order', () => {
       'wt git-file:../repo/.git/worktrees/wt'
     ])
     const repo = under(base, 'repo')
-    mkdirSync(join(repo, '.NeuroStrata', 'plugins', 'claude'), { recursive: true })
+    mkdirSync(join(repo, '.NeuroStrata', 'plugins', 'claude'), {
+      recursive: true
+    })
     writeFileSync(
       join(repo, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'),
       JSON.stringify({ id: 'neurostrata-claude', namespace: 'example-project' })
@@ -548,25 +583,39 @@ describe('project root marker and namespace order', () => {
       join(repo, '.opencode', 'neurostrata-plugin.json'),
       JSON.stringify({ neurostrata: { namespace: 'from-opencode' } })
     )
-    assert.deepEqual(readHarnessConfig('claude', repo), { namespace: 'example-project' })
-    assert.deepEqual(readHarnessConfig('opencode', join(repo, 'src')), { namespace: 'from-opencode' })
+    assert.deepEqual(readHarnessConfig('claude', repo), {
+      namespace: 'example-project'
+    })
+    assert.deepEqual(readHarnessConfig('opencode', join(repo, 'src')), {
+      namespace: 'from-opencode'
+    })
     // A linked worktree without configs of its own uses the main checkout's.
-    assert.deepEqual(readHarnessConfig('claude', under(base, 'wt')), { namespace: 'example-project' })
+    assert.deepEqual(readHarnessConfig('claude', under(base, 'wt')), {
+      namespace: 'example-project'
+    })
     assert.deepEqual(readHarnessConfig('codex', repo), {})
     assert.deepEqual(readHarnessConfig('unknown', repo), {})
     // The runner's own install is read first: <root>/.NeuroStrata/plugins/<harness>.
     buildLayout(base, ['other git-dir'])
     const other = under(base, 'other')
-    mkdirSync(join(other, '.NeuroStrata', 'plugins', 'claude'), { recursive: true })
+    mkdirSync(join(other, '.NeuroStrata', 'plugins', 'claude'), {
+      recursive: true
+    })
     writeFileSync(
       join(other, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'),
       JSON.stringify({ namespace: 'from-other' })
     )
     const runnerDir = join(repo, '.NeuroStrata', 'plugins', 'claude')
-    assert.deepEqual(readHarnessConfig('claude', other, runnerDir), { namespace: 'example-project' })
-    assert.deepEqual(readHarnessConfig('claude', other), { namespace: 'from-other' })
+    assert.deepEqual(readHarnessConfig('claude', other, runnerDir), {
+      namespace: 'example-project'
+    })
+    assert.deepEqual(readHarnessConfig('claude', other), {
+      namespace: 'from-other'
+    })
     // A runner folder that is not an install, or another harness's, is skipped.
-    assert.deepEqual(readHarnessConfig('claude', other, join(repo, 'src')), { namespace: 'from-other' })
+    assert.deepEqual(readHarnessConfig('claude', other, join(repo, 'src')), {
+      namespace: 'from-other'
+    })
     assert.deepEqual(readHarnessConfig('codex', other, runnerDir), {})
     writeFileSync(
       join(repo, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'),
@@ -577,20 +626,37 @@ describe('project root marker and namespace order', () => {
 
   it('resolveHookProjectDir: CLAUDE_PROJECT_DIR, then the SessionStart folder, then cwd', () => {
     const base = tempDir()
-    buildLayout(base, ['repo git-dir', 'repo neurostrata-dir', 'repo/packages/api'])
+    buildLayout(base, [
+      'repo git-dir',
+      'repo neurostrata-dir',
+      'repo/packages/api'
+    ])
     const repo = under(base, 'repo')
     const api = under(base, 'repo/packages/api')
     const event = { session_id: 's1', cwd: api, hook_event_name: 'PreToolUse' }
-    assert.equal(resolveHookProjectDir('claude', event, { CLAUDE_PROJECT_DIR: repo }), repo)
+    assert.equal(
+      resolveHookProjectDir('claude', event, { CLAUDE_PROJECT_DIR: repo }),
+      repo
+    )
     assert.equal(resolveHookProjectDir('claude', event, {}), api)
     assert.equal(
-      resolveHookProjectDir('claude', { ...event, cwd: repo, hook_event_name: 'SessionStart' }, {}),
+      resolveHookProjectDir(
+        'claude',
+        { ...event, cwd: repo, hook_event_name: 'SessionStart' },
+        {}
+      ),
       repo
     )
     assert.equal(resolveHookProjectDir('claude', event, {}), repo)
-    assert.equal(resolveHookProjectDir('claude', { ...event, session_id: 's2' }, {}), api)
+    assert.equal(
+      resolveHookProjectDir('claude', { ...event, session_id: 's2' }, {}),
+      api
+    )
     // Other harnesses follow the event's folder.
-    assert.equal(resolveHookProjectDir('codex', event, { CLAUDE_PROJECT_DIR: repo }), api)
+    assert.equal(
+      resolveHookProjectDir('codex', event, { CLAUDE_PROJECT_DIR: repo }),
+      api
+    )
   })
 
   it('resolveHookProjectDir: a session in the home folder writes no session file there', () => {
@@ -599,24 +665,46 @@ describe('project root marker and namespace order', () => {
     const home = tempDir()
     mkdirSync(join(home, '.git'), { recursive: true })
     mkdirSync(join(home, '.NeuroStrata'), { recursive: true })
-    const start = { session_id: 's1', cwd: home, hook_event_name: 'SessionStart' }
+    const start = {
+      session_id: 's1',
+      cwd: home,
+      hook_event_name: 'SessionStart'
+    }
     assert.equal(resolveHookProjectDir('claude', start, {}, home), home)
-    assert.equal(existsSync(join(home, '.NeuroStrata', 'active_session.json')), false)
+    assert.equal(
+      existsSync(join(home, '.NeuroStrata', 'active_session.json')),
+      false
+    )
     const later = { ...start, hook_event_name: 'PreToolUse' }
     assert.equal(resolveHookProjectDir('claude', later, {}, home), home)
   })
 
   it('resolveHookProjectDir: a later SessionStart keeps the recorded folder', () => {
     const base = tempDir()
-    buildLayout(base, ['repo git-dir', 'repo neurostrata-dir', 'repo/packages/api'])
+    buildLayout(base, [
+      'repo git-dir',
+      'repo neurostrata-dir',
+      'repo/packages/api'
+    ])
     const repo = under(base, 'repo')
     const api = under(base, 'repo/packages/api')
-    const start = { session_id: 's1', cwd: repo, hook_event_name: 'SessionStart' }
+    const start = {
+      session_id: 's1',
+      cwd: repo,
+      hook_event_name: 'SessionStart'
+    }
     assert.equal(resolveHookProjectDir('claude', start, {}), repo)
     // Resume, clear or compact after a `cd`: the session's folder stays.
-    assert.equal(resolveHookProjectDir('claude', { ...start, cwd: api }, {}), repo)
     assert.equal(
-      resolveHookProjectDir('claude', { ...start, cwd: api, hook_event_name: 'PreToolUse' }, {}),
+      resolveHookProjectDir('claude', { ...start, cwd: api }, {}),
+      repo
+    )
+    assert.equal(
+      resolveHookProjectDir(
+        'claude',
+        { ...start, cwd: api, hook_event_name: 'PreToolUse' },
+        {}
+      ),
       repo
     )
     const sessionPath = join(repo, '.NeuroStrata', 'active_session.json')
@@ -630,7 +718,11 @@ describe('project root marker and namespace order', () => {
     const repo = under(base, 'repo')
     const sessionPath = join(repo, '.NeuroStrata', 'active_session.json')
     writeFileSync(sessionPath, '{ half a fi')
-    const start = { session_id: 's1', cwd: repo, hook_event_name: 'SessionStart' }
+    const start = {
+      session_id: 's1',
+      cwd: repo,
+      hook_event_name: 'SessionStart'
+    }
     assert.equal(resolveHookProjectDir('claude', start, {}), repo)
     assert.equal(readFileSync(sessionPath, 'utf8'), '{ half a fi')
   })
@@ -648,7 +740,10 @@ describe('project root marker and namespace order', () => {
     try {
       assert.equal(findRootMarker(repo), null)
       assert.equal(findRootMarker(repo), null)
-      assert.equal(resolveConfig({ namespace: 'from-config' }, repo).namespace, 'from-config')
+      assert.equal(
+        resolveConfig({ namespace: 'from-config' }, repo).namespace,
+        'from-config'
+      )
     } finally {
       console.error = original
     }
@@ -668,22 +763,35 @@ describe('claim scope from a linked worktree', () => {
     ]) {
       assert.equal(isSessionScopedTool(name), true, name)
     }
-    for (const name of ['neurostrata_task_update', 'xneurostrata_task_claim', 'Read']) {
+    for (const name of [
+      'neurostrata_task_update',
+      'xneurostrata_task_claim',
+      'Read'
+    ]) {
       assert.equal(isSessionScopedTool(name), false, name)
     }
   })
 
   it('passes the session folder as worktree only when the call names no root', () => {
     const args = { id: 'example-project-1' }
-    assert.equal(addSessionWorktree('neurostrata_task_claim', args, '/wt'), true)
+    assert.equal(
+      addSessionWorktree('neurostrata_task_claim', args, '/wt'),
+      true
+    )
     assert.equal(args.worktree, '/wt')
     for (const key of ['worktree', 'project_root', 'cwd']) {
       const own = { [key]: '/own' }
-      assert.equal(addSessionWorktree('neurostrata_task_claim', own, '/wt'), false)
+      assert.equal(
+        addSessionWorktree('neurostrata_task_claim', own, '/wt'),
+        false
+      )
       assert.deepEqual(own, { [key]: '/own' })
     }
     const other = {}
-    assert.equal(addSessionWorktree('neurostrata_task_update', other, '/wt'), false)
+    assert.equal(
+      addSessionWorktree('neurostrata_task_update', other, '/wt'),
+      false
+    )
     assert.deepEqual(other, {})
   })
 

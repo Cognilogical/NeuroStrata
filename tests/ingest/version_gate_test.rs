@@ -72,7 +72,9 @@ fn fingerprint_is_stable_for_empty_and_one_language_schemas() {
     // same value re-read out of the same variable.
     assert_eq!(
         empty.fingerprint(),
-        ParserSchema::load(r#"{"languages":{}}"#).unwrap().fingerprint()
+        ParserSchema::load(r#"{"languages":{}}"#)
+            .unwrap()
+            .fingerprint()
     );
     let one = ParserSchema::load(r#"{"languages":{"rust":{"extensions":["rs"],"queries":{"functions":"(function_item) @fn"}}}}"#).expect("parses");
     assert_eq!(one.fingerprint(), one.fingerprint());

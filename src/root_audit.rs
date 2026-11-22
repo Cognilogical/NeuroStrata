@@ -172,53 +172,21 @@ fn location_is_path(location: &str) -> bool {
     !trimmed.is_empty() && trimmed != "global" && trimmed != "unknown"
 }
 
-/// The logical file path a qualified target in `namespace` names, or `None`
-/// when `entry` is unqualified or belongs to another namespace. Ingestion
-/// canonicalizes edge targets to `ns::path` (legacy) or `ns::generation::path`,
-/// both of which `logical_path_of` reduces to the path a rule originally
-/// named. A foreign namespace stays a memory id, never a local file key.
-fn same_namespace_file_target<'a>(entry: &'a str, namespace: &str) -> Option<&'a str> {
-    let separator = crate::parser::generation::NAMESPACE_SEPARATOR;
-    let prefix = format!("{namespace}{separator}");
-    if !entry
-        .to_ascii_lowercase()
-        .starts_with(&prefix.to_ascii_lowercase())
-    {
-        return None;
-    }
-    let logical = crate::parser::generation::logical_path_of(entry);
-    if logical.is_empty() || logical.len() == entry.len() {
-        return None;
-    }
-    Some(logical)
-}
-
 /// A `governs` entry that names a path rather than a memory id, a symbol id or
 /// a domain (the rule `related` applies to its seeds). A bare name without a
 /// separator (`Cargo.toml`) is a path when a file of that name exists under
-/// one of `roots`. A qualified entry counts when it names a file in this
-/// namespace, including the generation-scoped form ingestion writes.
-fn governs_is_path(entry: &str, roots: &[&Path], namespace: &str) -> bool {
+/// one of `roots`.
+fn governs_is_path(entry: &str, roots: &[&Path]) -> bool {
     if crate::paths::is_absolute_any(entry) {
         return true;
     }
-    if entry.starts_with("file:") {
+    if entry.contains("::") || entry.starts_with("file:") {
         return false;
     }
-    let Some(candidate) = same_namespace_file_target(entry, namespace) else {
-        return !entry.contains("::")
-            && (entry.contains('/')
-                || entry.contains('\\')
-                || (!entry.trim().is_empty()
-                    && roots.iter().any(|root| root.join(entry.trim()).is_file())));
-    };
-    if candidate.contains("::") {
-        return false;
-    }
-    if candidate.contains('/') || candidate.contains('\\') {
+    if entry.contains('/') || entry.contains('\\') {
         return true;
     }
-    let name = candidate.trim();
+    let name = entry.trim();
     !name.is_empty() && roots.iter().any(|root| root.join(name).is_file())
 }
 
@@ -484,25 +452,16 @@ pub fn audit_rows_for(
                     out.push(entry.clone());
                     continue;
                 };
-                let qualified = same_namespace_file_target(raw, namespace);
-                let path_key = qualified.unwrap_or(raw);
-                if !governs_is_path(raw, &roots.both(), namespace)
-                    || other_root_paths
-                        .contains(&crate::parser::ingest::normalize_node_path(path_key))
+                if !governs_is_path(raw, &roots.both())
+                    || other_root_paths.contains(&crate::parser::ingest::normalize_node_path(raw))
                 {
                     out.push(entry.clone());
                     continue;
                 }
-                match judge(path_key, &roots) {
+                match judge(raw, &roots) {
                     Verdict::Rewrite(rel) => {
                         rewrote = true;
-                        // Keep the qualification (and generation) the store
-                        // wrote; only the file key inside it is respelled.
-                        let spelled = match qualified {
-                            Some(logical) => format!("{}{rel}", &raw[..raw.len() - logical.len()]),
-                            None => rel,
-                        };
-                        out.push(Value::String(spelled));
+                        out.push(Value::String(rel));
                     }
                     Verdict::Missing => {
                         note(raw, UndecidedWhy::NoSuchFile, &mut undecided);
@@ -578,10 +537,10 @@ pub async fn audit_namespace(
     Ok(audit_rows_for(&rows, namespace, root, planned, bindings))
 }
 
-/// Every relative path key a row stores: `location`, `refs` files and the
-/// `governs` entries that name paths (never memory ids or domains; a bare
-/// name only when a file of that name exists under `root`).
-fn relative_keys(row: &SearchResult, root: &Path, namespace: &str) -> Vec<String> {
+/// Every path key a row stores, relative or absolute: `location`, `refs`
+/// files and the `governs` entries that name paths (never memory ids or
+/// domains; a bare name only when a file of that name exists under `root`).
+fn path_keys(row: &SearchResult, root: &Path) -> Vec<String> {
     let payload = &row.payload;
     let mut keys = Vec::new();
     if location_is_path(&payload.location) {
@@ -603,18 +562,19 @@ fn relative_keys(row: &SearchResult, root: &Path, namespace: &str) -> Vec<String
             governs
                 .iter()
                 .filter_map(Value::as_str)
-                .filter(|g| governs_is_path(g, &[root], namespace))
-                // A qualified target is stored with its namespace and
-                // generation; the key a root change tests is the logical path.
-                .map(|g| {
-                    same_namespace_file_target(g, namespace)
-                        .unwrap_or(g)
-                        .to_string()
-                }),
+                .filter(|g| governs_is_path(g, &[root]))
+                .map(str::to_string),
         );
     }
-    keys.retain(|k| !crate::paths::is_absolute_any(k));
     keys
+}
+
+/// Every relative path key a row stores.
+fn relative_keys(row: &SearchResult, root: &Path) -> Vec<String> {
+    path_keys(row, root)
+        .into_iter()
+        .filter(|k| !crate::paths::is_absolute_any(k))
+        .collect()
 }
 
 /// [`rows_lost_in`] over the namespace's rows read from a store, for tests.
@@ -626,7 +586,7 @@ pub async fn rows_lost_by_root_change(
     new: &Path,
 ) -> anyhow::Result<Vec<String>> {
     let rows = store.list(namespace, None, None).await?;
-    Ok(rows_lost_in(&rows, current, new, namespace))
+    Ok(rows_lost_in(&rows, current, new))
 }
 
 /// Ids of active rows with a relative stored key that names an existing file
@@ -635,14 +595,9 @@ pub async fn rows_lost_by_root_change(
 /// Absolute keys never matched by a relative key, so they are not lost. The
 /// rows are already listed (the CLI reads them through the daemon's
 /// `/cli/read`).
-pub fn rows_lost_in(
-    rows: &[SearchResult],
-    current: &Path,
-    new: &Path,
-    namespace: &str,
-) -> Vec<String> {
+pub fn rows_lost_in(rows: &[SearchResult], current: &Path, new: &Path) -> Vec<String> {
     let new_str = new.to_string_lossy().to_string();
-    rows_losing(rows, current, namespace, |full, key| {
+    rows_losing(rows, current, |full, key| {
         relative_to_on_disk(full, &new_str).as_deref() != Some(key)
     })
 }
@@ -650,13 +605,32 @@ pub fn rows_lost_in(
 /// For a root change between unrelated folders (a sibling, another clone):
 /// ids of active rows with a relative stored key that names an existing file
 /// or folder under `current` but nothing under `new`.
-pub fn rows_missing_under(
-    rows: &[SearchResult],
-    current: &Path,
-    new: &Path,
-    namespace: &str,
-) -> Vec<String> {
-    rows_losing(rows, current, namespace, |_, key| !new.join(key).exists())
+pub fn rows_missing_under(rows: &[SearchResult], current: &Path, new: &Path) -> Vec<String> {
+    let mut lost = rows_losing(rows, current, |_, key| !new.join(key).exists());
+    // An absolute anchor under `current` is also lost: lookups join relative
+    // requests to the cached root, so the old spelling stops matching once
+    // the root moves to `new`.
+    let current_canon = dunce::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
+    let now = now_secs();
+    for row in rows.iter().filter(|r| is_auditable(r, now)) {
+        if lost.contains(&row.id) {
+            continue;
+        }
+        let anchored_under_current = path_keys(row, current).into_iter().any(|key| {
+            if !crate::paths::is_absolute_any(&key) {
+                return false;
+            }
+            let path = PathBuf::from(&key);
+            path.exists()
+                && dunce::canonicalize(&path)
+                    .is_ok_and(|p| p.starts_with(&current_canon) && p != current_canon)
+        });
+        if anchored_under_current {
+            lost.push(row.id.clone());
+        }
+    }
+    lost.sort();
+    lost
 }
 
 /// Ids of active rows with a relative key that names something under
@@ -664,7 +638,6 @@ pub fn rows_missing_under(
 fn rows_losing(
     rows: &[SearchResult],
     current: &Path,
-    namespace: &str,
     lost_key: impl Fn(&str, &str) -> bool,
 ) -> Vec<String> {
     let now = now_secs();
@@ -674,9 +647,8 @@ fn rows_losing(
         .to_string();
     let mut lost: Vec<String> = Vec::new();
     for row in rows.iter().filter(|r| is_auditable(r, now)) {
-        let moves = relative_keys(row, current, namespace).iter().any(|raw| {
-            let logical = same_namespace_file_target(raw, namespace).unwrap_or(raw);
-            let bare = logical.split('#').next().unwrap_or(logical);
+        let moves = relative_keys(row, current).iter().any(|raw| {
+            let bare = raw.split('#').next().unwrap_or(raw);
             let key = crate::parser::ingest::normalize_node_path(bare);
             if key.is_empty() {
                 return false;
@@ -1269,13 +1241,10 @@ mod tests {
             .list("example-project", None, None)
             .await
             .unwrap();
-        assert!(rows_lost_in(&rows, &sub, &top, "example-project").is_empty());
+        assert!(rows_lost_in(&rows, &sub, &top).is_empty());
         // Without the correction the move loses m1.
         let rows: Vec<SearchResult> = store.list("example-project", None, None).await.unwrap();
-        assert_eq!(
-            rows_lost_in(&rows, &sub, &top, "example-project"),
-            vec!["m1".to_string()]
-        );
+        assert_eq!(rows_lost_in(&rows, &sub, &top), vec!["m1".to_string()]);
 
         // A planned root that does not contain the file: the key cannot be
         // spelled there, so it is left for a decision.
@@ -1373,62 +1342,6 @@ mod tests {
 
     /// Between unrelated roots a key is lost only when its file is missing
     /// under the new root.
-    /// Ingestion canonicalizes `governs` targets to qualified ids. A change
-    /// of root must still see the file those ids name (and must not mistake
-    /// another namespace's id for a local file).
-    #[tokio::test]
-    async fn qualified_governs_targets_count_as_root_keys() {
-        let (_tmp, top) = tmp_root();
-        touch(&top, "sub/a.rs");
-        let sub = top.join("sub");
-        let store = store_with(vec![
-            (
-                "m-qualified",
-                payload("Rule.", "", json!({ "governs": ["example-project::a.rs"] })),
-            ),
-            (
-                "m-scoped",
-                payload(
-                    "Rule.",
-                    "",
-                    json!({ "governs": ["example-project::7::a.rs"] }),
-                ),
-            ),
-            (
-                "m-foreign",
-                payload("Rule.", "", json!({ "governs": ["other::a.rs"] })),
-            ),
-        ])
-        .await;
-        let lost = rows_lost_by_root_change(&store, "example-project", &sub, &top)
-            .await
-            .unwrap();
-        assert!(lost.contains(&"m-qualified".to_string()), "{lost:?}");
-        assert!(lost.contains(&"m-scoped".to_string()), "{lost:?}");
-        assert!(!lost.contains(&"m-foreign".to_string()), "{lost:?}");
-    }
-
-    #[tokio::test]
-    async fn qualified_governs_target_is_respelled_for_a_planned_root() {
-        let (_tmp, top) = tmp_root();
-        touch(&top, "sub/a.rs");
-        let sub = top.join("sub");
-        let store = store_with(vec![(
-            "m1",
-            payload("Rule.", "", json!({ "governs": ["example-project::a.rs"] })),
-        )])
-        .await;
-        let report = audit_namespace(&store, "example-project", &sub, Some(&top), &HashMap::new())
-            .await
-            .unwrap();
-        assert_eq!(report.fixable.len(), 1, "{report:?}");
-        assert_eq!(
-            report.fixable[0].supersede_args["governs"],
-            json!(["example-project::sub/a.rs"]),
-            "{report:?}"
-        );
-    }
-
     #[tokio::test]
     async fn rows_missing_under_an_unrelated_root() {
         let (_tmp, base) = tmp_root();
@@ -1445,8 +1358,37 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            rows_missing_under(&rows, &old, &new, "example-project"),
+            rows_missing_under(&rows, &old, &new),
             vec!["m1".to_string()]
+        );
+    }
+
+    /// An absolute anchor under the old checkout is a loss too: after the
+    /// root moves, lookups join relative requests to the new root, so the
+    /// old absolute spelling no longer matches.
+    #[tokio::test]
+    async fn rows_missing_under_flags_absolute_anchors_under_the_old_root() {
+        let (_tmp, base) = tmp_root();
+        let (old, new) = (base.join("old"), base.join("new"));
+        touch(&old, "a.rs");
+        touch(&new, "a.rs");
+        let old_abs = abs(&old, "a.rs");
+        let new_abs = abs(&new, "a.rs");
+        let rows: Vec<SearchResult> = store_with(vec![
+            ("m1", payload("Rule.", &old_abs, json!({}))),
+            ("m2", payload("Rule.", &new_abs, json!({}))),
+            (
+                "m3",
+                payload("Rule.", "", json!({ "refs": [{ "file": old_abs }] })),
+            ),
+        ])
+        .await
+        .list("example-project", None, None)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows_missing_under(&rows, &old, &new),
+            vec!["m1".to_string(), "m3".to_string()]
         );
     }
 

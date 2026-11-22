@@ -1534,8 +1534,6 @@ pub(crate) async fn receipt_ledger_root(
     namespace: &str,
 ) -> Option<std::path::PathBuf> {
     if let Some(hint) = caller_root.map(str::trim).filter(|s| !s.is_empty()) {
-        let candidate =
-            walk_to_worktree_marker(&resolve_session_root_dir(std::path::Path::new(hint)));
         // A caller hint is only trusted when it actually resolves inside a
         // worktree. A scratch dir with no marker falls through to the
         // registry/directory rows and daemon CWD, never becomes the root.
@@ -4103,7 +4101,8 @@ LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 # The namespace configured for this project (harness settings; folder name
 # last), resolved in one place: `neurostrata-mcp namespace resolve`. The
 # ledger's own field and the folder name are fallbacks when the binary is
-# not on PATH or the lookup fails.
+# not on PATH or the lookup fails; a failed lookup's reason (an unreadable
+# project marker or harness config) stays on stderr.
 NAMESPACE=""
 RESOLVED=""
 if command -v neurostrata-mcp >/dev/null 2>&1; then
@@ -4344,13 +4343,9 @@ if [ ! -f "$LEDGER" ]; then
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
-    # rewrite holds the same cross-process lock as the daemon's ledger writer,
-    # uses a unique EXCLUSIVE temp file (a planted symlink cannot be followed),
-    # keeps the original mode, and wraps legacy bare-array ledgers. An
-    # unparseable ledger or a missing node/python3 leaves the file as it is.
+    # rewrite goes through a temporary file and a rename; an unparseable
+    # ledger or a missing node/python3 leaves the file as it is.
     export LEDGER NAMESPACE
-    exec 9>"$LEDGER.lock" 2>/dev/null || true
-    command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
@@ -4358,20 +4353,16 @@ elif [ -n "$RESOLVED" ]; then
           const ns = process.env.NAMESPACE;
           let parsed;
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
-          const doc = Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed;
-          if (!doc || typeof doc !== "object") process.exit(0);
-          if (doc.namespace === ns) process.exit(0);
-          doc.namespace = ns;
-          const tmp = ledger + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
-          let mode;
-          try { mode = fs.statSync(ledger).mode; } catch {}
-          fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-          if (mode !== undefined) { try { fs.chmodSync(tmp, mode); } catch {} }
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) process.exit(0);
+          if (parsed.namespace === ns) process.exit(0);
+          parsed.namespace = ns;
+          const tmp = ledger + ".tmp-" + process.pid;
+          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + "\n");
           fs.renameSync(tmp, ledger);
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
-import json, os, sys, stat
+import json, os, sys
 ledger = os.environ["LEDGER"]
 ns = os.environ["NAMESPACE"]
 try:
@@ -4379,30 +4370,16 @@ try:
         parsed = json.load(f)
 except Exception:
     sys.exit(0)
-doc = {"namespace": ns, "queries": parsed} if isinstance(parsed, list) else parsed
-if not isinstance(doc, dict) or doc.get("namespace") == ns:
+if not isinstance(parsed, dict) or parsed.get("namespace") == ns:
     sys.exit(0)
-doc["namespace"] = ns
-tmp = f"{ledger}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
-fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-try:
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(doc, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    try:
-        os.chmod(tmp, stat.S_IMODE(os.stat(ledger).st_mode))
-    except OSError:
-        pass
-    os.replace(tmp, ledger)
-except Exception:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
+parsed["namespace"] = ns
+tmp = ledger + ".tmp-" + str(os.getpid())
+with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+    json.dump(parsed, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, ledger)
 ' 2>/dev/null || true
     fi
-    command -v flock >/dev/null 2>&1 && flock -u 9 2>/dev/null || true
-    exec 9>&- 2>/dev/null || true
 fi
 
 
@@ -6277,7 +6254,8 @@ mod tests {
 
     /// The pre-commit hook files the ledger under the namespace `namespace
     /// resolve` answered: an older ledger naming another one is updated, its
-    /// recorded lookups kept; a failed lookup leaves the ledger as it is.
+    /// recorded lookups kept; a failed lookup leaves the ledger as it is and
+    /// its reason reaches the hook's stderr.
     #[test]
     fn pre_commit_hook_updates_the_ledger_namespace_to_the_resolved_one() {
         let Some(bash) = hook_bash() else {

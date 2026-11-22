@@ -85,9 +85,7 @@ fn procedure_perform_defines_the_fire_locks_and_the_audit_field() {
     let reread_at = body
         .find("Authoritative re-read UNDER the fire lock")
         .expect("the second read is marked on purpose");
-    let upsert_at = body
-        .find("store.upsert")
-        .expect("the row is upserted");
+    let upsert_at = body.find("store.upsert").expect("the row is upserted");
     assert!(
         lock_at < reread_at && reread_at < upsert_at,
         "read locator → lock → authoritative re-read → upsert, in that order"
@@ -130,10 +128,8 @@ fn the_buffer_line_formats_are_pinned() {
 /// reimplementation of the buffer's judgment code.
 #[test]
 fn the_episodic_buffer_writes_persist_entry_ids_and_round_trip_content() {
-    let root = std::env::temp_dir().join(format!(
-        "neurostrata-ack-contract-{}",
-        std::process::id()
-    ));
+    let root =
+        std::env::temp_dir().join(format!("neurostrata-ack-contract-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let sessions = root.join(".NeuroStrata").join("sessions");
     fs::create_dir_all(&sessions).unwrap();
@@ -163,7 +159,13 @@ fn the_episodic_buffer_writes_persist_entry_ids_and_round_trip_content() {
             .as_secs()
             + suffix as u64;
         let (rem, min, hour) = (secs % 60, secs % 3600, secs % 86_400);
-        format!("1970-01-{:02} {:02}:{:02}:{:02}", secs / 86_400 % 28 + 1, hour / 3600, min / 60, rem)
+        format!(
+            "1970-01-{:02} {:02}:{:02}:{:02}",
+            secs / 86_400 % 28 + 1,
+            hour / 3600,
+            min / 60,
+            rem
+        )
     };
     append(format!("- *[{}]*: first entry lands\n", stamp(0)));
     let perform_line = format!(
@@ -178,7 +180,10 @@ fn the_episodic_buffer_writes_persist_entry_ids_and_round_trip_content() {
         2,
         "one whole line per entry: {after_session_one}"
     );
-    assert!(after_session_one.ends_with('\n'), "entries commit as whole lines");
+    assert!(
+        after_session_one.ends_with('\n'),
+        "entries commit as whole lines"
+    );
     assert!(
         after_session_one.contains(&format!("procedure_perform {entry_id} [proc-1]")),
         "the entry is findable by its id: {after_session_one}"
@@ -196,7 +201,10 @@ fn the_episodic_buffer_writes_persist_entry_ids_and_round_trip_content() {
     let roll_name = format!("session-{}-{entry_id}.md", chrono_hide());
     fs::rename(&current, sessions.join(&roll_name)).unwrap();
     assert!(!current.exists(), "current.md was retired by the rollover");
-    assert!(sessions.join(&roll_name).exists(), "the rolled file survived");
+    assert!(
+        sessions.join(&roll_name).exists(),
+        "the rolled file survived"
+    );
     assert!(
         fs::read_to_string(sessions.join(&roll_name))
             .unwrap()
@@ -251,21 +259,14 @@ fn receipt_store_replays_receipt_lines_idempotently_and_judges_currency() {
     // Write the receipt keys one-per-line, then replay that file into a
     // fresh store: the same idempotency holds on replay, and no phantom
     // receipt is born from lines that were never in the ledger.
-    let dir = std::env::temp_dir().join(format!(
-        "neurostrata-receipt-lines-{}",
-        std::process::id()
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("neurostrata-receipt-lines-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let log_path = dir.join("receipts.keys");
     fs::write(
         &log_path,
-        lines
-            .iter()
-            .map(|r| r.key())
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n",
+        lines.iter().map(|r| r.key()).collect::<Vec<_>>().join("\n") + "\n",
     )
     .unwrap();
 
@@ -308,7 +309,14 @@ fn uuid_like() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("{:08x}-{:04x}-4{:03x}-9{:03x}-{:012x}", n as u32, n >> 32, n >> 48, n >> 60, n % (1 << 48))
+    format!(
+        "{:08x}-{:04x}-4{:03x}-9{:03x}-{:012x}",
+        n as u32,
+        n >> 32,
+        n >> 48,
+        n >> 60,
+        n % (1 << 48)
+    )
 }
 
 /// A stamp-shaped suffix so `session-`-prefixed names stay unique across

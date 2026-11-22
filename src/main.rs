@@ -2551,30 +2551,10 @@ impl crate::root_marker::RootRegistry for DaemonRootRegistry {
     }
 }
 
-/// Opens a store the CLI itself writes when no daemon answers. `new()` alone
-/// does not create the `Memory` table, so `init()` must run before the store
-/// is exposed through [`crate::root_marker::StoreRegistry`]: its first
-/// `cached_root()` calls `get()`, which executes `MATCH (m:Memory)`.
-async fn prepare_direct_write_store(
-    db_path: &std::path::Path,
-    namespace: &str,
-) -> Result<LadybugStore, String> {
-    let dimensions = embed::configured_dimensions()
-        .map_err(|e| format!("the store could not be opened: {e}"))?;
-    let store = LadybugStore::new(db_path.to_string_lossy().to_string(), dimensions)
-        .map_err(|e| format!("the store could not be opened: {e}"))?;
-    store
-        .init(namespace)
-        .await
-        .map_err(|e| format!("the store could not be initialized: {e}"))?;
-    Ok(store)
-}
-
 /// The registry the marker writers (`root set`, `hooks install`) use: the
 /// answering daemon, else the store opened here. Never starts a daemon.
 async fn open_cli_root_registry(
     probe: DaemonProbe,
-    namespace: &str,
 ) -> Result<Box<dyn crate::root_marker::RootRegistry>, String> {
     if probe == DaemonProbe::Responsive {
         gate_verify_daemon(
@@ -2593,17 +2573,33 @@ async fn open_cli_root_registry(
                 .to_string(),
         );
     }
-    let store = prepare_direct_write_store(&config.db_path, namespace).await?;
+    let dimensions = embed::configured_dimensions()
+        .map_err(|e| format!("the store could not be opened: {e}"))?;
+    let store = LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
+        .map_err(|e| format!("the store could not be opened: {e}"))?;
+    let embedder = embed::build_embedder().ok();
+    let store: Arc<dyn VectorStore> = Arc::new(store);
+    // A pristine database has no schema: `new` opens it but leaves `init` to
+    // create the tables. Registry calls query Memory immediately, so prepare
+    // the direct writer the same way the fallback write arms do before
+    // handing it to a registry.
+    if let Some(emb) = &embedder {
+        bind_fallback_serving_descriptor(&store, emb);
+    }
+    store
+        .init("global")
+        .await
+        .map_err(|e| format!("the store could not be initialized: {e}"))?;
     Ok(Box::new(crate::root_marker::StoreRegistry {
-        store: Arc::new(store),
-        emb: embed::build_embedder().ok(),
+        store,
+        emb: embedder,
         checkpoint: true,
     }))
 }
 
 /// `root set`: the file work here, the cache through the daemon or the store.
 async fn run_root_set(args: &crate::root_marker::RootSetArgs) -> Result<Vec<String>, String> {
-    let registry = open_cli_root_registry(probe_daemon().await, &args.namespace).await?;
+    let registry = open_cli_root_registry(probe_daemon().await).await?;
     let result = crate::root_marker::root_set_with(registry.as_ref(), args, None).await;
     registry.finish().await;
     result
@@ -3502,30 +3498,63 @@ async fn run_list(read: &ReadSource, namespace: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// A valid config with no database yet: the CLI's direct root registry
+    /// must initialize the store before reading the registry row, or every
+    /// `root set`/`hooks install` against a pristine store fails on a
+    /// missing Memory table.
     #[tokio::test]
-    async fn direct_write_store_is_initialized_before_registry_access() {
-        let tmp = std::env::temp_dir().join(format!("ns-direct-write-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let db = tmp.join("fresh.db");
-        {
-            let store = LadybugStore::new(db.to_string_lossy().to_string(), 4).unwrap();
-            let arc: Arc<dyn VectorStore> = Arc::new(store);
-            assert!(
-                crate::registry::cached_project_root(&arc, "probe")
-                    .await
-                    .is_err(),
-                "a fresh store has no Memory table until init runs"
-            );
-        }
-        let store = prepare_direct_write_store(&db, "probe").await.unwrap();
-        let arc: Arc<dyn VectorStore> = Arc::new(store);
-        assert!(
-            crate::registry::cached_project_root(&arc, "probe")
+    async fn cli_root_registry_inits_a_pristine_store_before_reading_the_cache() {
+        let _env = crate::daemon::project_root_env_test_lock();
+        let old_home = std::env::var_os("HOME");
+        let old_model = std::env::var_os("NEUROSTRATA_MODEL");
+        let old_key = std::env::var_os("NS_TEST_MISSING_KEY");
+        std::env::remove_var("NEUROSTRATA_MODEL");
+        std::env::remove_var("NS_TEST_MISSING_KEY");
+        let root =
+            std::env::temp_dir().join(format!("ns-cli-root-registry-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let config_dir = home.join(".config").join("neurostrata");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        // A remote model with no API key makes build_embedder fail fast; the
+        // registry still needs only the configured dimensions.
+        std::fs::write(
+            config_dir.join("embedders.json"),
+            r#"[{"model_name":"TestRemote","dimensions":4,"base_url":"http://127.0.0.1:1/mcp","api_key_env":"NS_TEST_MISSING_KEY"}]"#,
+        )
+        .unwrap();
+        let db = root.join("db").join("ladybug.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(
+            config_dir.join("config.json"),
+            serde_json::json!({ "db_path": db.to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
+        let outcome = async {
+            let registry = open_cli_root_registry(DaemonProbe::Absent)
                 .await
-                .is_ok(),
-            "init creates the Memory table the registry reads"
-        );
+                .expect("a pristine store still yields a registry");
+            let cached = registry
+                .cached_root("example-project")
+                .await
+                .expect("the cached root is readable on a fresh store");
+            assert!(cached.is_none(), "{cached:?}");
+            registry.finish().await;
+        }
+        .await;
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_model {
+            Some(v) => std::env::set_var("NEUROSTRATA_MODEL", v),
+            None => std::env::remove_var("NEUROSTRATA_MODEL"),
+        }
+        match old_key {
+            Some(v) => std::env::set_var("NS_TEST_MISSING_KEY", v),
+            None => std::env::remove_var("NS_TEST_MISSING_KEY"),
+        }
+        outcome
     }
 
     #[test]
@@ -8592,13 +8621,7 @@ async fn run() -> anyhow::Result<()> {
                         &caller_dir,
                         force,
                         namespace.as_deref(),
-                        || async {
-                            open_cli_root_registry(
-                                probe_daemon().await,
-                                namespace.as_deref().unwrap_or(""),
-                            )
-                            .await
-                        },
+                        || async { open_cli_root_registry(probe_daemon().await).await },
                     )
                     .await;
                     for line in &report.out {
