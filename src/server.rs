@@ -16176,6 +16176,7 @@ mod tests {
             store.clone(),
             ingests,
             None,
+            None,
         )
         .await;
         assert!(text.starts_with("Successfully ingested"), "{text}");
