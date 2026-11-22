@@ -1404,7 +1404,20 @@ pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
     if let Some(wt) = gate::GateScope::capture(dir).worktree {
         return std::path::PathBuf::from(wt);
     }
-    crate::formal_kernel::resolve_session_root(None, dir)
+    let resolved = crate::formal_kernel::resolve_session_root(None, dir);
+    if is_home_without_git(&resolved) {
+        // A markerless descendant of a non-git home is scratch, not a
+        // project. Hand back the home folder, which every writer rejects.
+        let check = dunce::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+        for home in session_home_dirs() {
+            if let Ok(canonical) = dunce::canonicalize(&home) {
+                if check.starts_with(&canonical) {
+                    return canonical;
+                }
+            }
+        }
+    }
+    resolved
 }
 
 // Process-wide, not per thread: a test that points NEUROSTRATA_PROJECT_ROOT
@@ -1463,7 +1476,13 @@ pub(crate) fn is_home_without_git(dir: &std::path::Path) -> bool {
 }
 
 fn is_home_without_git_with(dir: &std::path::Path, homes: &[std::path::PathBuf]) -> bool {
-    is_any_home_folder(dir, homes) && !dir.join(".git").exists()
+    // A markerless descendant of a non-git home is just as much scratch as
+    // the home folder itself. `.NeuroStrata` or `.git` on the way up marks a
+    // real project and stops the walk before home.
+    matches!(
+        walk_to_session_marker_with(dir, homes),
+        SessionMarkerWalk::StoppedAtHome
+    )
 }
 
 /// Where a walk for a session-file root ended.
@@ -1483,7 +1502,13 @@ enum SessionMarkerWalk {
 /// (SynapticMesh keeps its node id there), and a walk that reaches it stops
 /// there rather than continuing above it.
 fn walk_to_session_marker(start: &std::path::Path) -> SessionMarkerWalk {
-    let homes = session_home_dirs();
+    walk_to_session_marker_with(start, &session_home_dirs())
+}
+
+fn walk_to_session_marker_with(
+    start: &std::path::Path,
+    homes: &[std::path::PathBuf],
+) -> SessionMarkerWalk {
     let start = if start.is_dir() {
         start
     } else {
@@ -1534,12 +1559,17 @@ pub(crate) async fn receipt_ledger_root(
     namespace: &str,
 ) -> Option<std::path::PathBuf> {
     if let Some(hint) = caller_root.map(str::trim).filter(|s| !s.is_empty()) {
+        let hint = std::path::Path::new(hint);
+        // A hint at or under a non-git home names no project at all. Stop
+        // here: falling through to the registry/directory rows or daemon CWD
+        // would write this home session's receipt into another project.
+        if is_home_without_git(hint) {
+            return None;
+        }
         // A caller hint is only trusted when it actually resolves inside a
         // worktree. A scratch dir with no marker falls through to the
         // registry/directory rows and daemon CWD, never becomes the root.
-        if let Some(root) =
-            walk_to_worktree_marker(&resolve_session_root_dir(std::path::Path::new(hint)))
-        {
+        if let Some(root) = walk_to_worktree_marker(&resolve_session_root_dir(hint)) {
             return Some(root);
         }
     }
@@ -4015,7 +4045,11 @@ fi
 NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo "error: neurostrata-mcp namespace resolve failed — gate NOT run for this push (an older neurostrata-mcp without the namespace resolve command is a likely cause: upgrade it)" >&2; exit 1; }
 FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 GATE_NAMESPACES=("$NAMESPACE")
-[ "$FOLDER_NAMESPACE" = "$NAMESPACE" ] || GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
+# Only a namespace-shaped basename is safe to pass to `task gate`: an
+# option-like or invalid name would change how the CLI parses the call.
+if [[ "$FOLDER_NAMESPACE" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]*$ ]] && [ "$FOLDER_NAMESPACE" != "$NAMESPACE" ]; then
+    GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
+fi
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
 # --strict maps an unavailable database to a blocking exit too, so a 1
@@ -4052,7 +4086,7 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 5a3b7ea2ec3f8b14761ee1a4efe8dc985a16706e8a18c820064fb5c52ac49e9c
+# neurostrata-hook-sha256: 64205469189211752148cb6897d3deac0d42e1bc2c9188da06bcc8ef2d2202c4
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -4337,6 +4371,9 @@ for raw_file in "${StagedFiles[@]}"; do
 done
 
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
+# The daemon mutates this ledger under the same lock; without it a hook could
+# rename a stale snapshot over a receipt written in between.
+rewrite_session_ledger_namespace() {
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
@@ -4380,6 +4417,14 @@ with open(tmp, "w", encoding="utf-8", newline="\n") as f:
 os.replace(tmp, ledger)
 ' 2>/dev/null || true
     fi
+fi
+}
+
+mkdir -p "$(dirname "$LEDGER")"
+if command -v flock >/dev/null 2>&1; then
+    ( flock -x 9; rewrite_session_ledger_namespace ) 9>"$LEDGER.lock"
+else
+    rewrite_session_ledger_namespace
 fi
 
 
@@ -4471,30 +4516,50 @@ pub(crate) fn git_hooks_dir(root: &std::path::Path) -> std::path::PathBuf {
 /// The daemon's own `NEUROSTRATA_NAMESPACE` is not read: one daemon serves
 /// every project.
 pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
-    hook_hygiene_reading_env(root, false)
+    hook_hygiene_reading_env(root, false, None)
+}
+
+/// Hook hygiene for a caller that already resolved the project namespace
+/// (for example `get_snapshot`). The supplied namespace is an explicit answer
+/// for configs that name none; it never overrides a config's own namespace.
+pub(crate) fn hook_hygiene_with_namespace(
+    root: &std::path::Path,
+    supplied_namespace: Option<&str>,
+) -> String {
+    hook_hygiene_reading_env(root, false, supplied_namespace)
 }
 
 /// [`hook_hygiene`] for a CLI run in the project, where
 /// `NEUROSTRATA_NAMESPACE` is the user's, as the git hooks see it.
 pub(crate) fn hook_hygiene_from_cli(root: &std::path::Path) -> String {
-    hook_hygiene_reading_env(root, true)
+    hook_hygiene_reading_env(root, true, None)
 }
 
-fn hook_hygiene_reading_env(root: &std::path::Path, read_env: bool) -> String {
+fn hook_hygiene_reading_env(
+    root: &std::path::Path,
+    read_env: bool,
+    supplied_namespace: Option<&str>,
+) -> String {
     if !root.join(".git").exists() {
         return String::new();
     }
     // Harness configs get a namespace only from an explicit source (a harness
-    // config, or the environment on the CLI): a ledger or folder-name answer
-    // written there would outrank every explicit source from then on. Each
-    // config keeps its own; with no explicit answer only plugin files are
-    // refreshed.
-    let (explicit, warning) = match harness_plugins::namespace_for_refresh(root, read_env) {
-        Ok(ns) => (ns, None),
-        Err(e) => (
-            None,
-            Some(format!("HOOKS: harness configs left as they are: {e}")),
-        ),
+    // config, a caller that already resolved it, or the environment on the
+    // CLI): a ledger or folder-name answer written there would outrank every
+    // explicit source from then on. Each config keeps its own; with no
+    // explicit answer only plugin files are refreshed.
+    let (explicit, warning) = match supplied_namespace
+        .and_then(harness_plugins::usable_namespace)
+        .map(|ns| (Some(ns), None))
+    {
+        Some(answer) => answer,
+        None => match harness_plugins::namespace_for_refresh(root, read_env) {
+            Ok(ns) => (ns, None),
+            Err(e) => (
+                None,
+                Some(format!("HOOKS: harness configs left as they are: {e}")),
+            ),
+        },
     };
     let _ = harness_plugins::auto_install_detected_plugins(
         root,
@@ -5866,6 +5931,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A caller that knows the namespace (get_snapshot) can wire a detected
+    /// harness that has no config of its own, without reading daemon env.
+    #[test]
+    fn supplied_namespace_wires_a_detected_harness() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+
+        let _ = hook_hygiene_with_namespace(&root, Some("from-caller"));
+
+        let cfg = std::fs::read_to_string(root.join(".claude/settings.local.json"))
+            .expect("Claude hooks must be wired with the supplied namespace");
+        assert!(cfg.contains("from-caller"), "{cfg}");
+    }
+
     /// The scaffolded guard must be the canonical script, not an empty stub.
     #[test]
     fn scaffolded_task_coverage_gate_is_valid_bash() {
@@ -6250,6 +6333,32 @@ mod tests {
             checked_in.contains("scripts/check-staged-quality.sh"),
             "the pre-commit hook must delegate to the project's staged-quality runner"
         );
+    }
+
+    /// Both pre-commit hook copies take the same ledger lock the daemon uses
+    /// around the namespace rewrite, so a stale hook snapshot cannot be
+    /// renamed over a receipt written in between.
+    #[test]
+    fn pre_commit_hook_serializes_its_ledger_rewrite() {
+        for source in [
+            SCAFFOLDED_PRE_COMMIT_HOOK,
+            include_str!("../../scripts/hooks/pre-commit"),
+        ] {
+            assert!(
+                source.contains("flock -x 9"),
+                "the hook must take an exclusive ledger lock"
+            );
+            assert!(
+                source.contains("9>\"$LEDGER.lock\""),
+                "the hook and the daemon must lock the same file"
+            );
+            let definition = source.find("rewrite_session_ledger_namespace() {");
+            let call = source.rfind("rewrite_session_ledger_namespace");
+            assert!(
+                definition.is_some_and(|d| call.is_some_and(|c| d < c)),
+                "the locked rewrite must call the shared function"
+            );
+        }
     }
 
     /// The pre-commit hook files the ledger under the namespace `namespace
@@ -7353,6 +7462,66 @@ mod tests {
         }
     }
 
+    /// An option-like or otherwise invalid checkout basename must never be
+    /// handed to `task gate` as a namespace.
+    #[cfg(unix)]
+    #[test]
+    fn pre_push_hook_skips_an_invalid_folder_namespace() {
+        use std::os::unix::fs::PermissionsExt;
+        if which_bash().is_none() || which_git().is_none() {
+            return;
+        }
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(base.path()).unwrap().join("--help");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let hook = root.join("pre-push");
+        std::fs::write(&hook, SCAFFOLDED_PRE_PUSH_HOOK).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bin = base.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("neurostrata-mcp");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = namespace ]; then echo valid-ns; exit 0; fi\nif [ \"$1\" = task ]; then echo \"$3\" >> \"$GATE_LOG\"; exit 0; fi\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = base.path().join("gated");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("bash")
+            .arg(&hook)
+            .current_dir(&root)
+            .env("PATH", &path)
+            .env("GATE_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let gated = std::fs::read_to_string(&log).unwrap_or_default();
+        let lines: Vec<&str> = gated.lines().collect();
+        assert!(lines.contains(&"valid-ns"), "{gated}");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| !l.is_empty() && !l.starts_with(|c: char| c.is_ascii_alphanumeric())),
+            "{gated}"
+        );
+    }
+
     /// Non-git: no hook to report, no hook to scaffold, and the gates that
     /// still need a chokepoint stay uncovered.
     #[test]
@@ -8404,7 +8573,45 @@ mod tests {
             None,
             &[home.path().to_path_buf()],
         );
+        assert!(
+            !work.join(".NeuroStrata/active_session.json").exists(),
+            "a markerless folder under home is scratch, not a project"
+        );
+        // A marked descendant is a real non-git project and still gets state.
+        std::fs::create_dir_all(work.join(".NeuroStrata")).unwrap();
+        persist_active_session_file_with_home(
+            &work,
+            "example-project",
+            &[],
+            None,
+            &[home.path().to_path_buf()],
+        );
         assert!(work.join(".NeuroStrata/active_session.json").exists());
+    }
+
+    /// A markerless scratch folder below a non-git home is not a project:
+    /// neither root resolution nor a session writer may adopt it.
+    #[test]
+    fn markerless_scratch_under_home_gets_no_session_state() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, _top, _nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        let scratch = home.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let resolved = resolve_session_root_dir(&scratch);
+        assert_ne!(
+            resolved, scratch,
+            "resolution must not adopt a markerless home descendant"
+        );
+        persist_active_session_file_with_home(
+            &scratch,
+            "example-project",
+            &[],
+            None,
+            &[home.clone()],
+        );
+        assert!(!scratch.join(".NeuroStrata/active_session.json").exists());
     }
 
     /// Folders for the home-folder tests: `home` (the injected home folder,
@@ -8581,6 +8788,34 @@ mod tests {
         std::fs::create_dir_all(home.join(".git")).unwrap();
         let got = receipt_ledger_root(Some(home.to_str().unwrap()), &store, ns).await;
         assert_eq!(got, Some(home.clone()));
+    }
+
+    /// A caller hint under a non-git home names no project: receipt-root
+    /// resolution must stop there instead of landing in another project's
+    /// ledger through the registry or daemon-root fallbacks.
+    #[tokio::test]
+    async fn receipt_root_stops_at_a_non_git_home_hint() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, top, nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        let project = top.join("example-project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &nowhere);
+        let store = store_with_namespace("example-project").await;
+        crate::registry::cache_project_root(
+            &store,
+            Some(&emb()),
+            "example-project",
+            project.to_str().unwrap(),
+        )
+        .await;
+        let docs = home.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+
+        let got =
+            receipt_ledger_root(Some(docs.to_str().unwrap()), &store, "example-project").await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert_eq!(got, None, "a home hint must not resolve to another project");
     }
 
     #[tokio::test]
