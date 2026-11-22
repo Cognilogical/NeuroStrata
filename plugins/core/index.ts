@@ -178,14 +178,90 @@ export function findProjectRoot(startDir = process.cwd()): string {
 }
 
 /**
- * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
- *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
- * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
+ * Harness-specific config files that record the namespace the installer wrote
+ * for that harness. The shared session ledger can be rebound by another
+ * harness's pre-commit hook; a harness's own config is authoritative for that
+ * harness and must win before the shared ledger is consulted (#375).
+ */
+const HARNESS_NAMESPACE_CONFIGS: Record<
+  string,
+  { file: string[]; pointer: string[] }
+> = {
+  claude: {
+    file: ['.claude', 'settings.local.json'],
+    pointer: ['env', 'NEUROSTRATA_NAMESPACE']
+  },
+  opencode: {
+    file: ['.opencode', 'neurostrata-plugin.json'],
+    pointer: ['neurostrata', 'namespace']
+  },
+  codex: {
+    file: ['.codex', 'plugins', 'neurostrata.json'],
+    pointer: ['namespace']
+  },
+  hermes: {
+    file: ['.hermes', 'plugins', 'neurostrata.json'],
+    pointer: ['namespace']
+  },
+  openclaw: {
+    file: ['.openclaw', 'plugins', 'neurostrata.json'],
+    pointer: ['namespace']
+  },
+  'github-cli': {
+    file: ['.NeuroStrata', 'plugins', 'github-cli', 'copilot-extension.json'],
+    pointer: ['namespace']
+  }
+}
+
+/** Which harness config this adapter should trust before the shared ledger. */
+function ownHarnessKey(): string | undefined {
+  const name = (activeHarnessName ?? '').toLowerCase()
+  if (name.includes('opencode')) return 'opencode'
+  if (name.includes('claude')) return 'claude'
+  if (name.includes('hermes')) return 'hermes'
+  if (name.includes('codex')) return 'codex'
+  if (name.includes('openclaw')) return 'openclaw'
+  if (name.includes('github') || name.includes('copilot')) return 'github-cli'
+  return undefined
+}
+
+function usableHarnessNamespace(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const ns = value.trim()
+  return /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/.test(ns) ? ns : undefined
+}
+
+/** Namespace this harness's own config records at `dir`, if any. */
+function harnessConfigNamespace(dir: string): string | undefined {
+  const key = ownHarnessKey()
+  if (!key) return undefined
+  const spec = HARNESS_NAMESPACE_CONFIGS[key]
+  let value: unknown
+  try {
+    value = JSON.parse(readFileSync(join(dir, ...spec.file), 'utf8'))
+  } catch {
+    return undefined
+  }
+  for (const step of spec.pointer) {
+    if (value === null || typeof value !== 'object') return undefined
+    value = (value as Record<string, unknown>)[step]
+  }
+  return usableHarnessNamespace(value)
+}
+
+/**
+ * 1. This harness's own config namespace at each directory (authoritative).
+ * 2. <dir>/.NeuroStrata/session_queries.json's non-empty string .namespace.
+ * 3. Otherwise basename(findProjectRoot(startDir)) || "default".
  */
 export function discoverProjectNamespace(startDir = process.cwd()): string {
   const root = findProjectRoot(startDir)
   let current = resolve(startDir)
   while (true) {
+    // This harness's config outranks the shared ledger, which another
+    // harness's hook may have rebound (#375).
+    const own = harnessConfigNamespace(current)
+    if (own) return own
     const sessionQueriesPath = join(
       current,
       '.NeuroStrata',

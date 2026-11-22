@@ -212,6 +212,19 @@ where
             return;
         }
     }
+    // Hold the same lock the pre-commit hook takes before it rewrites the
+    // namespace, so neither side can replace rows the other just committed.
+    // The File lives to the end of this function, releasing the lock on drop.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path.with_extension("json.lock"))
+        .ok();
+    if let Some(ref file) = lock {
+        use fs2::FileExt;
+        let _ = file.lock_exclusive();
+    }
     let mut doc: Value = match std::fs::read_to_string(path) {
         Ok(text) if !text.trim().is_empty() => match serde_json::from_str::<Value>(&text) {
             Ok(value) => value,
@@ -298,10 +311,7 @@ pub fn bump_tool_invocation(doc: &mut Value, tool: &str) {
     if !counters.is_object() {
         *counters = Value::Object(Map::new());
     }
-    let count = counters
-        .get(tool)
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let count = counters.get(tool).and_then(Value::as_u64).unwrap_or(0);
     counters
         .as_object_mut()
         .expect("tool_invocations is an object")
@@ -712,10 +722,7 @@ pub fn trigger_context_from_result(result_text: &str) -> (String, Vec<String>) {
             }
         }
     }
-    (
-        triggers.into_iter().next().unwrap_or_default(),
-        action_ids,
-    )
+    (triggers.into_iter().next().unwrap_or_default(), action_ids)
 }
 
 /// Fill `prescribed_action_ids` from the REAL response actions, leaving the
@@ -807,7 +814,10 @@ mod tests {
         let text = "Missing 'query' parameter.\n\n[search_contract] query=* top_k=5";
         assert_eq!(derive_status(text, false), ReceiptStatus::Failed);
         // Genuine empty search outcomes still classify as Empty, not Failed.
-        assert_eq!(derive_status(r#"{"memories":[]}"#, false), ReceiptStatus::Empty);
+        assert_eq!(
+            derive_status(r#"{"memories":[]}"#, false),
+            ReceiptStatus::Empty
+        );
         assert_eq!(
             derive_status("no relevant memories found.", false),
             ReceiptStatus::Empty
@@ -831,7 +841,11 @@ mod tests {
             )
         };
         assert_eq!(
-            mk("neurostrata_taxonomy", r#"{"operation":"advise","recommendations":[]}"#).operation,
+            mk(
+                "neurostrata_taxonomy",
+                r#"{"operation":"advise","recommendations":[]}"#
+            )
+            .operation,
             "advise"
         );
         assert_eq!(
@@ -866,7 +880,10 @@ mod tests {
             taxonomy_operation_fallback("advise", true, Some(&args)),
             "advise"
         );
-        assert_eq!(taxonomy_operation_fallback("taxonomy", true, None), "taxonomy");
+        assert_eq!(
+            taxonomy_operation_fallback("taxonomy", true, None),
+            "taxonomy"
+        );
     }
 
     // ---- Task 11 Fix 3: honest count/ids for remaining graph tools ----
@@ -890,10 +907,7 @@ mod tests {
     fn receipt_count_and_ids_locate() {
         let text = r#"{"locations":[{"path":"src/a.rs","scip_symbol":"foo"},{"id":"mem-2","symbol":"bar"}],"governing_rules":[{"id":"rule-1"}]}"#;
         assert_eq!(result_count(text), 2);
-        assert_eq!(
-            extract_returned_ids(text),
-            vec!["foo", "mem-2", "rule-1"]
-        );
+        assert_eq!(extract_returned_ids(text), vec!["foo", "mem-2", "rule-1"]);
         let empty = r#"{"locations":[],"governing_rules":[]}"#;
         assert_eq!(result_count(empty), 0);
         assert_eq!(derive_status(empty, false), ReceiptStatus::Empty);
@@ -911,10 +925,7 @@ mod tests {
     fn receipt_count_and_ids_diff_tour() {
         let text = r#"{"total_symbols_touched":2,"stops":[{"items":[{"symbol":"s1","path":"src/a.rs"},{"path":"src/b.rs"}]}],"governing_rules":[{"id":"rule-2"}]}"#;
         assert_eq!(result_count(text), 2);
-        assert_eq!(
-            extract_returned_ids(text),
-            vec!["s1", "src/b.rs", "rule-2"]
-        );
+        assert_eq!(extract_returned_ids(text), vec!["s1", "src/b.rs", "rule-2"]);
         // Fallback when stops is absent.
         assert_eq!(result_count(r#"{"total_symbols_touched":5}"#), 5);
         let empty = r#"{"stops":[]}"#;
@@ -924,7 +935,8 @@ mod tests {
 
     #[test]
     fn receipt_count_and_ids_taxonomy() {
-        let text = r#"{"operation":"advise","recommendations":[{"id":"rec-1"}],"gaps":[{"id":"gap-1"}]}"#;
+        let text =
+            r#"{"operation":"advise","recommendations":[{"id":"rec-1"}],"gaps":[{"id":"gap-1"}]}"#;
         assert_eq!(result_count(text), 2);
         assert_eq!(extract_returned_ids(text), vec!["rec-1", "gap-1"]);
         let single = r#"{"operation":"briefing","concept_id":"concept-1"}"#;

@@ -367,11 +367,29 @@ fn main_checkout_of_common(common: &Path) -> Option<PathBuf> {
         return None;
     }
     let parent = common.parent()?;
-    let holds_more_than_git = std::fs::read_dir(parent)
-        .ok()?
+    // A separate git dir can live in any folder, so unrelated entries beside
+    // it say nothing about checkout ownership. Trust git's own record instead:
+    // each linked worktree's gitdir holds a `gitdir` file naming that
+    // worktree's `.git`. A worktree colocated with `parent` -- nested under it
+    // (agent worktrees) or a sibling of it (`git worktree add ../name`) -- is
+    // evidence `parent` is the real checkout. A storage dir holding a separate
+    // git dir keeps its worktrees elsewhere, so nothing here names it (#375).
+    let grandparent = parent.parent();
+    let owns_a_worktree = std::fs::read_dir(common.join("worktrees"))
+        .ok()
+        .into_iter()
+        .flatten()
         .filter_map(Result::ok)
-        .any(|entry| entry.file_name() != ".git");
-    holds_more_than_git.then(|| parent.to_path_buf())
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("gitdir")).ok())
+        .filter_map(|text| {
+            let git_file = text.trim().replace('\\', "/");
+            PathBuf::from(git_file).parent().map(Path::to_path_buf)
+        })
+        .any(|worktree_dir| {
+            worktree_dir.starts_with(parent)
+                || grandparent.is_some_and(|gp| worktree_dir.parent() == Some(gp))
+        });
+    owns_a_worktree.then(|| parent.to_path_buf())
 }
 
 /// The `[core]` settings [`main_checkout_of_common`] reads.
@@ -1209,6 +1227,11 @@ mod tests {
         )
         .unwrap();
         std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            gitdir.join("gitdir"),
+            format!("{}\n", s(&worktree.join(".git")).replace('\\', "/")),
+        )
+        .unwrap();
     }
 
     /// A submodule at `dir`: a `.git` file into `.git/modules/<name>`, which
@@ -2062,6 +2085,9 @@ mod tests {
         let sep = base.join("sep");
         std::fs::create_dir_all(&common).unwrap();
         std::fs::create_dir_all(&sep).unwrap();
+        // Unrelated entries beside the separate git dir are not proof that
+        // `data/proj` is a checkout (PR #375 review).
+        touch(&common.parent().unwrap().join("storage-data.bin"));
         std::fs::write(
             sep.join(".git"),
             format!("gitdir: {}\n", s(&common).replace('\\', "/")),

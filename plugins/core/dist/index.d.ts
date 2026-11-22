@@ -51,9 +51,9 @@ export declare function resolveConfig(pluginConfig?: unknown, cwd?: string): Plu
  */
 export declare function findProjectRoot(startDir?: string): string;
 /**
- * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
- *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
- * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
+ * 1. This harness's own config namespace at each directory (authoritative).
+ * 2. <dir>/.NeuroStrata/session_queries.json's non-empty string .namespace.
+ * 3. Otherwise basename(findProjectRoot(startDir)) || "default".
  */
 export declare function discoverProjectNamespace(startDir?: string): string;
 /**

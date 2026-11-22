@@ -440,6 +440,22 @@ describe('findProjectRoot / discoverProjectNamespace', () => {
     mkdirSync(join(dir, '.git'), { recursive: true })
     assert.equal(discoverProjectNamespace(dir), 'no-ns-dir')
   })
+
+  it('prefers this harness config over a rebound shared ledger (#375)', () => {
+    const dir = join(tmpRoot, 'opencode-rebind')
+    mkdirSync(join(dir, '.NeuroStrata'), { recursive: true })
+    mkdirSync(join(dir, '.opencode'), { recursive: true })
+    writeFileSync(
+      join(dir, '.NeuroStrata', 'session_queries.json'),
+      JSON.stringify({ namespace: 'alpha' })
+    )
+    writeFileSync(
+      join(dir, '.opencode', 'neurostrata-plugin.json'),
+      JSON.stringify({ plugin: [], neurostrata: { namespace: 'beta' } })
+    )
+    createHarnessPlugin('opencode', 'OpenCode')
+    assert.equal(discoverProjectNamespace(dir), 'beta')
+  })
 })
 
 // ──────────────────────────────────────────────────────────────────────
