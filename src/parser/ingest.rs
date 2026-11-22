@@ -1385,7 +1385,10 @@ fn replay_processed_entry(
 fn key_root_for_ingest(dir_path: &Path, namespace: &str) -> std::path::PathBuf {
     match crate::root_marker::find_root_marker(dir_path) {
         Ok(Some(found)) if found.config.namespace.eq_ignore_ascii_case(namespace) => {
-            let root = found.marker_dir();
+            // `marker_dir()` maps a linked worktree back to the main checkout,
+            // but the walker yields paths in the worktree's own spelling. Strip
+            // against `root` or a nested ingest produces an absolute key.
+            let root = found.root;
             if dir_path.starts_with(&root) {
                 root
             } else {
@@ -3110,6 +3113,37 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&db);
+    }
+
+    /// In a linked worktree the marker folder is spelled in the worktree,
+    /// while `marker_dir()` maps it back to the main checkout. Keys must be
+    /// stripped against the walk's own spelling or they become absolute.
+    #[test]
+    fn key_root_for_linked_worktree_uses_the_worktree_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        let src_main = repo.join("src");
+        std::fs::create_dir_all(repo.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(repo.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
+        std::fs::create_dir_all(src_main.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            src_main.join(".NeuroStrata/config.json"),
+            r#"{"version":1,"namespace":"test-ns"}"#,
+        )
+        .unwrap();
+        let wt = base.join("wt");
+        let src_wt = wt.join("src");
+        let nested_wt = src_wt.join("lib");
+        std::fs::create_dir_all(&nested_wt).unwrap();
+        std::fs::create_dir_all(src_main.join("lib")).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ../repo/.git/worktrees/wt\n").unwrap();
+
+        assert_eq!(
+            key_root_for_ingest(&nested_wt, "test-ns"),
+            src_wt,
+            "a nested ingest must key from the marker folder in the worktree's own spelling"
+        );
     }
 
     /// A marker pins the repo root; ingesting only its `src/` subfolder must
