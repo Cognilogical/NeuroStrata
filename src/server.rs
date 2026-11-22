@@ -5904,7 +5904,7 @@ async fn handle_get_snapshot(
     });
     let hooks_line = inferred_root
         .as_ref()
-        .map(|r| crate::task::hook_hygiene(std::path::Path::new(r)))
+        .map(|r| crate::task::hook_hygiene_with_namespace(std::path::Path::new(r), Some(namespace)))
         .unwrap_or_default();
 
     // Default recall hides tombstoned rows. The snapshot is the operator's
@@ -25013,6 +25013,37 @@ mod context_plan_tests {
             "active_session.json golden_rules must include global NO PYTHON rule: {golden_arr:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// A snapshot refreshes a detected harness using the namespace the caller
+    /// already resolved, not the daemon's environment.
+    #[tokio::test]
+    async fn snapshot_wires_a_detected_harness_with_its_namespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let store: Arc<dyn crate::traits::VectorStore> = Arc::new(
+            crate::store::LadybugStore::for_testing(tmp.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        store.init("probe-wire").await.expect("init namespace");
+
+        let _ = handle_get_snapshot(
+            serde_json::json!({
+                "namespace": "probe-wire",
+                "project_root": root.to_string_lossy(),
+            }),
+            store,
+        )
+        .await
+        .expect("snapshot");
+
+        let cfg = std::fs::read_to_string(root.join(".claude/settings.local.json"))
+            .expect("snapshot must wire the detected Claude harness");
+        assert!(cfg.contains("probe-wire"), "{cfg}");
     }
 
     #[tokio::test]
