@@ -537,6 +537,44 @@ pub trait VectorStore: Send + Sync + AsAny {
         Ok(Vec::new())
     }
 
+    /// Reconcile the edges materialised from a previous declaration of
+    /// `rel_type` against the caller's current declared target set.
+    ///
+    /// Only edges this store stamped `extractor = 'upsert'` are candidates;
+    /// mention-detector and hand-authored provenance are never touched. An
+    /// empty `keep` retires every such edge. Stores without a graph
+    /// projection keep the no-op default.
+    async fn reconcile_declared_edges(
+        &self,
+        _namespace: &str,
+        _id: &str,
+        _rel_type: &str,
+        _keep: &[String],
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// Rebind one head's outgoing `rel_type` edges to `keep` without rewriting
+    /// the head row.
+    ///
+    /// Import skips declarations whose fingerprint is unchanged, so a preferred
+    /// target that appears in a later turn cannot reach them through `upsert`.
+    /// This materialises the missing edges and retires the stale ones, leaving
+    /// content, history and version metadata untouched. `declared` is the
+    /// importing note's declaration list, positionally aligned with `keep`, so
+    /// a replacement edge can carry the same provenance shape `upsert` writes.
+    /// Stores without a graph projection keep the no-op default.
+    async fn rebind_declared_edges(
+        &self,
+        _namespace: &str,
+        _id: &str,
+        _rel_type: &str,
+        _declared: &[String],
+        _keep: &[String],
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Begin a staged ingestion: allocate a fresh generation for this namespace
     /// and source and return it. Nodes written against it are invisible to edge
     /// resolution until `publish_generation` flips the active pointer onto it.

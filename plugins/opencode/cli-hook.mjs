@@ -20,9 +20,11 @@ async function main() {
   console.info = console.error;
   console.warn = console.error;
 
-  // A large hook response (e.g. a big `updatedInput`) can still be buffered in
-  // stdout when `process.exit(0)` runs, so the host reads a truncated JSON
-  // body. Awaiting the write callback guarantees the payload is flushed first.
+  // Await the write callback so a large hook response (e.g. a big
+  // `updatedInput`) is fully flushed before the runner ends. The runner then
+  // returns instead of calling process.exit: on Windows, process.exit while a
+  // daemon HTTP socket is still open crashes node, and the host reports the
+  // hook as failed (Codex then runs the tool anyway).
   const writeStdout = (text) =>
     new Promise((resolve) => {
       process.stdout.write(text, () => resolve());
@@ -32,14 +34,14 @@ async function main() {
   try {
     raw = readFileSync(0, "utf8");
   } catch {
-    process.exit(0);
+    return;
   }
-  if (!raw.trim()) process.exit(0);
+  if (!raw.trim()) return;
   let event;
   try {
     event = JSON.parse(raw);
   } catch {
-    process.exit(0);
+    return;
   }
   // The namespace comes from the harness config the installer wrote; the
   // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
@@ -52,7 +54,7 @@ async function main() {
   if (typeof handler === "function") {
     const out = await handler(event);
     await writeStdout(JSON.stringify(out));
-    process.exit(0);
+    return;
   }
   if (event.hook_event_name === "Stop" && typeof event.transcript === "string") {
     await onTurnEnd({ role: "assistant", content: event.transcript });
