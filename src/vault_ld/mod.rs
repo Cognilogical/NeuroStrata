@@ -22,6 +22,10 @@ pub const CANVAS_SCHEMA: &str = "https://jsoncanvas.org";
 /// block. Only lines after this marker are stripped on re-import.
 pub const STRUCTURAL_EDGE_MARKER: &str = "<!-- vault-ld:structural-edges -->";
 
+/// Identity schema stamped on every imported head. v2 adds `rdf_type` to the
+/// fingerprint inputs; v1 heads are still comparable via `fingerprint_legacy`.
+pub const FINGERPRINT_VERSION: u64 = 2;
+
 /// Represents a single vault note with YAML-LD 1.0 frontmatter
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultNote {
@@ -47,18 +51,36 @@ pub struct VaultNote {
 
 impl VaultNote {
     /// Identity of a note for bitemporal change detection. Content alone is
-    /// insufficient: an edge-only edit is a new version too.
+    /// insufficient: an edge-only edit is a new version too, and so is a
+    /// type-only edit because `@type` drives `memory_type`.
     pub fn fingerprint(&self) -> String {
-        let mut related = self.related.clone();
-        related.sort();
-        related.dedup();
+        let canonical = format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            self.content.trim(),
+            self.epistemic_tier,
+            self.rdf_type,
+            Self::canonical_related(&self.related)
+        );
+        hex::encode(Sha256::digest(canonical.as_bytes()))
+    }
+
+    /// v1 identity (content, tier, related). Comparison only: an existing head
+    /// is matched on this so the v1 -> v2 upgrade does not re-version it.
+    pub fn fingerprint_legacy(&self) -> String {
         let canonical = format!(
             "{}\u{1f}{}\u{1f}{}",
             self.content.trim(),
             self.epistemic_tier,
-            related.join("\u{1e}")
+            Self::canonical_related(&self.related)
         );
         hex::encode(Sha256::digest(canonical.as_bytes()))
+    }
+
+    fn canonical_related(related: &[String]) -> String {
+        let mut sorted = related.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        sorted.join("\u{1e}")
     }
 
     /// Create a VaultNote from a stored payload. Used by export and by the
