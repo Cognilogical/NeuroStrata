@@ -8,6 +8,7 @@
     "  marker-text:<text>   write <text> (the rest of the entry, as is) to <path>/.NeuroStrata/config.json",
     "  neurostrata-dir      create <path>/.NeuroStrata as an empty folder (no config.json: not a marker)",
     "  neurostrata-link:<t> make <path>/.NeuroStrata a link to the folder <t> (a symlink, or a junction on Windows): not a marker",
+    "  dir-link:<t>         make <path> itself a link to the folder <t>: a main-checkout walk stops there",
     "  git-dir              create <path>/.git as a folder (a regular checkout)",
     "  git-file:<gitdir>    write the file <path>/.git containing 'gitdir: <gitdir>' (<gitdir> relative to <path>)",
     "  commondir:<rel>      create the folder <path> and write <path>/commondir containing <rel> (a linked worktree's gitdir)",
@@ -99,6 +100,22 @@
         "wt git-file:../repo/.git/worktrees/wt"
       ],
       "query": "wt/vendor/lib/src",
+      "expect": { "root": "wt", "namespace": "example-project", "via": "main_checkout" }
+    },
+    {
+      "name": "symlinked folder in main checkout is not entered",
+      "layout": [
+        "repo git-dir",
+        "repo marker:example-project",
+        "repo/.git/worktrees/wt commondir:../..",
+        "wt/pkg/src",
+        "wt git-file:../repo/.git/worktrees/wt",
+        "other git-dir",
+        "other marker:example-other",
+        "other/pkg marker:example-foreign",
+        "repo/pkg dir-link:other/pkg"
+      ],
+      "query": "wt/pkg/src",
       "expect": { "root": "wt", "namespace": "example-project", "via": "main_checkout" }
     },
     {

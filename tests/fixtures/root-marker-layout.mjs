@@ -82,6 +82,13 @@ export function buildLayout(base, entries) {
         join(path, '.NeuroStrata'),
         process.platform === 'win32' ? 'junction' : 'dir'
       )
+    } else if (kind.startsWith('dir-link:')) {
+      mkdirSync(dirname(path), { recursive: true })
+      symlinkSync(
+        under(base, kind.slice('dir-link:'.length)),
+        path,
+        process.platform === 'win32' ? 'junction' : 'dir'
+      )
     } else if (kind === 'git-dir') {
       mkdirSync(join(path, '.git'), { recursive: true })
     } else if (kind === 'neurostrata-dir') {

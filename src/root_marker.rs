@@ -1038,6 +1038,12 @@ mod tests {
                     link_dir(&under(base, target), &path.join(".NeuroStrata")),
                     "could not create a link for {entry}"
                 );
+            } else if let Some(target) = kind.strip_prefix("dir-link:") {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                assert!(
+                    link_dir(&under(base, target), &path),
+                    "could not create a link for {entry}"
+                );
             } else {
                 match kind {
                     "git-dir" => std::fs::create_dir_all(path.join(".git")).unwrap(),

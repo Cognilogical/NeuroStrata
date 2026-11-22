@@ -433,11 +433,32 @@ export function findRootMarker(startDir: string): FoundRootMarker | null {
   let main: { depth: number; root: string; read: MarkerRead } | null = null
   const mainTop = linkedMainCheckout(top)
   if (mainTop !== null) {
+    const mainCanonical = canonicalPath(mainTop) ?? mainTop
+    const insideMain = (p: string): boolean => {
+      const rel = relative(mainCanonical, p)
+      const parts = pathParts(rel)
+      return parts.length === 0 || (parts[0] !== '..' && !isAbsoluteAny(rel))
+    }
     const allowed = [mainTop]
     let dir = mainTop
     for (const part of pathParts(relative(top, start))) {
       dir = join(dir, part)
-      if (!isDirectory(dir) || existsSync(join(dir, '.git'))) break
+      let real = false
+      try {
+        const st = lstatSync(dir)
+        real = st.isDirectory() && !st.isSymbolicLink()
+      } catch {}
+      const canonical = canonicalPath(dir)
+      // A link in the main checkout may point into another repository; its
+      // markers are not this worktree's. Stop at links and at any folder
+      // whose canonical form leaves the main checkout.
+      if (
+        !real ||
+        existsSync(join(dir, '.git')) ||
+        canonical === null ||
+        !insideMain(canonical)
+      )
+        break
       allowed.push(dir)
     }
     for (let i = allowed.length - 1; i >= 0; i--) {
