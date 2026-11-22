@@ -102,6 +102,49 @@ pub fn logical_path_of(id: &str) -> &str {
     id
 }
 
+/// Spellings an exact-mode target may bind, in order: the declared id first,
+/// then its own-namespace-stripped alias. Verbatim must win because an exported
+/// note's own id can itself begin with the namespace (`ns::7::path`); stripping
+/// before checking would resolve that note to a different or nonexistent row.
+pub fn exact_target_spellings<'a>(
+    namespace: &str,
+    declared: &'a str,
+) -> impl Iterator<Item = &'a str> {
+    let stripped = declared
+        .strip_prefix(namespace)
+        .and_then(|rest| rest.strip_prefix(NAMESPACE_SEPARATOR))
+        .filter(|rest| !rest.is_empty());
+    std::iter::once(declared).chain(stripped)
+}
+
+/// The first [`exact_target_spellings`] candidate that `exists` accepts.
+///
+/// Every caller resolving an exact target must use this one ordering. A caller
+/// holding more than one id source (vault-known ids and stored ids) must fold
+/// both into the predicate, so neither source can outrank the other by kind:
+/// a stored verbatim id always beats a vault-known alias, and vice versa.
+pub fn exact_target_match<'a>(
+    namespace: &str,
+    declared: &'a str,
+    mut exists: impl FnMut(&str) -> bool,
+) -> Option<&'a str> {
+    exact_target_spellings(namespace, declared).find(|candidate| exists(candidate))
+}
+
+/// Fallible [`exact_target_match`] for callers whose existence check can fail.
+pub fn exact_target_match_fallible<'a, E>(
+    namespace: &str,
+    declared: &'a str,
+    mut exists: impl FnMut(&str) -> Result<bool, E>,
+) -> Result<Option<&'a str>, E> {
+    for candidate in exact_target_spellings(namespace, declared) {
+        if exists(candidate)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
 /// The lowercase hex SHA-256 of `bytes`, used for `file_sha256` and
 /// `span_sha256` capture.
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -158,6 +201,46 @@ mod tests {
         assert_eq!(ns, "ns");
         assert_eq!(gen, 3);
         assert_eq!(path, "a.rs#functions:main@deadbeef");
+    }
+
+    #[test]
+    fn exact_target_spellings_put_the_verbatim_id_first() {
+        assert_eq!(
+            exact_target_spellings("ns", "ns::7::path").collect::<Vec<_>>(),
+            vec!["ns::7::path", "7::path"]
+        );
+        assert_eq!(
+            exact_target_spellings("ns", "ns::z").collect::<Vec<_>>(),
+            vec!["ns::z", "z"]
+        );
+        assert_eq!(
+            exact_target_spellings("ns", "z").collect::<Vec<_>>(),
+            vec!["z"]
+        );
+        assert_eq!(
+            exact_target_spellings("ns", "other::z").collect::<Vec<_>>(),
+            vec!["other::z"]
+        );
+    }
+
+    #[test]
+    fn exact_target_match_prefers_a_stored_verbatim_id_over_a_vault_alias() {
+        // The two sources are folded into one predicate so neither can win by
+        // kind: `<ns>::z` is stored and `z` is only vault-known.
+        let stored = ["ns::z"];
+        let vault = ["z"];
+        assert_eq!(
+            exact_target_match("ns", "ns::z", |candidate| {
+                stored.contains(&candidate) || vault.contains(&candidate)
+            }),
+            Some("ns::z")
+        );
+        // The alias still resolves when the verbatim spelling is absent.
+        assert_eq!(
+            exact_target_match("ns", "ns::z", |candidate| vault.contains(&candidate)),
+            Some("z")
+        );
+        assert_eq!(exact_target_match("ns", "ns::missing", |_| false), None);
     }
 
     #[test]
