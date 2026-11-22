@@ -859,6 +859,57 @@ head or any history row, in `list_edges` or RDF projection.
   note whose declaration was removed; it is the pre-existing §3d class and is
   outside this reconciliation-owned edge set.
 
+### 3m. Replay cites every relationship between the same endpoints
+
+#### Invariant
+
+A declaration's citation identity is `(rel_type, extractor, resolved_target)`,
+never the endpoint pair alone. When one exact-mode head declares both
+`related_to: [B]` and `depends_on: [B]`, replay materialises both edges and
+`metadata.edge_sources` holds one citation per relationship, each naming its
+own `rel_type` and the shared `resolved_target`. `include_references` therefore
+returns both relationships for the head; neither overwrites the other in the
+replay citation map. Edge `evidence_id`s and their citations still agree,
+because the cited chunk stamps the evidence id of its own `(rel_type, pair)`
+entry.
+
+#### Mechanism
+
+- `EdgeCitations` is keyed by relationship type first, then the resolved
+  endpoint pair. `relink_edges` inserts each flagged declaration under
+  `edge.rel_type`; `create_missing_edges` selects the map for the `rel_type`
+  it is replaying and builds and stamps citations from that map only.
+- No content version, `supersedes` stamp, or history row is written: the fix
+  is the lookup key of the in-memory citation map during replay.
+- Ordinary (`relink`) and mention (`mention-detector`) replay carry no
+  citations and are unaffected.
+
+#### Eval (failed on `ebd86185`)
+
+- `replay_cites_both_relations_when_they_share_a_target`
+  - Upsert an exact-mode head (`exact_edge_targets: true`) declaring both
+    `related_to: ["shared-target"]` and `depends_on: ["shared-target"]` while
+    the target is absent, then write the target and run
+    `relink_edges(ns, "code")`.
+  - Assert both `RELATES_TO` and `DEPENDS_ON` edges exist from the head to the
+    target under `extractor = 'upsert'`, `edge_sources` holds exactly one
+    `upsert` citation for each relationship at `resolved_target`, and a
+    `include_references` lexical search cites both relationships.
+  - On `ebd86185` the endpoint-keyed citation map kept only the `DEPENDS_ON`
+    entry, so `RELATES_TO` had no citation and search reported `DEPENDS_ON`
+    for both edges.
+
+#### Residual risk
+
+- The citation map still assumes a single declaration per
+  `(rel_type, resolved_target)` on one head, which matches `edge_sources`'
+  existing `(rel_type, extractor, resolved_target)` replace key (§3i): duplicate
+  declarations of the same target under one relationship collapse to one
+  citation by design.
+- The map lives only for the replay turn. An edge created by a pre-fix replay
+  keeps its already-stamped citation until a later changed import or replay
+  re-creates the binding; the fix does not rewrite stored metadata.
+
 ---
 
 ## 4. #344 — Retired rows must not be exported
@@ -972,14 +1023,17 @@ note whose *real* type changed is versioned.
   while ordinary replay keeps `relink` and mentions keep `mention-detector`
   (§3j), replay-time reconciliation of each flagged declarer's obsolete
   bindings and citations against its current exact keep set (§3k), and
-  provenance reconciliation inside the edge reconciler (§3h).
+  provenance reconciliation inside the edge reconciler (§3h). Replay
+  citations are keyed by relationship type and endpoint pair, so two
+  relationships between the same memories each keep their citation (§3m).
 - `src/server.rs` — the `include_references` evals for retired and rebound
   citations, including retained-declaration and multiple-rebind coverage
   (§3h, §3i); no behaviour change.
 - `docs/features-api/mcp-and-http-api.md` — `include_references` citation
   contract now states that provenance retires with its edge, that a rebind
-  cites its replacement edge, and that a rebind preserves citations for every
-  other live target.
+  cites its replacement edge, that a rebind preserves citations for every
+  other live target, and that replay cites each relationship between the same
+  endpoints separately (§3m).
 - `src/parser/generation.rs` — `exact_target_spellings`, `exact_target_match`,
   and `exact_target_match_fallible`: the single verbatim-first alias rule and
   precedence selector shared by the vault importer and the store (§3e),
@@ -1027,3 +1081,7 @@ note whose *real* type changed is versioned.
 - The history strip removes up to seven metadata keys from the retired copy;
   it adds no write and no store branch. A copy written by a pre-fix build
   keeps whatever edge it already materialised until an operator retires it.
+- A replay citation is selected by `(rel_type, resolved_target)`, so multiple
+  relationships between one head and one target each carry their own
+  `edge_sources` entry; the map allocates one inner map per relationship type
+  per replay pass (§3m).

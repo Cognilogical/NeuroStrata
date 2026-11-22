@@ -15592,6 +15592,132 @@ mod tests {
         }
     }
 
+    /// #363: two declarations on one exact-mode head can name the same target
+    /// under different relationships. Replay must cite each edge by
+    /// `(relationship, resolved target)`, not by endpoints alone; otherwise the
+    /// second citation replaces the first and `include_references` reports one
+    /// relationship for both edges.
+    #[tokio::test]
+    async fn replay_cites_both_relations_when_they_share_a_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(dir.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vault_multi_relation";
+        store.init(ns).await.expect("init");
+
+        let upsert = |id: &str, content: &str, metadata: serde_json::Value| {
+            let store = store.clone();
+            let id = id.to_string();
+            let content = content.to_string();
+            async move {
+                store
+                    .upsert(
+                        ns,
+                        &id,
+                        vec![0.0; 4],
+                        crate::traits::MemoryPayload {
+                            content,
+                            user_id: "default".to_string(),
+                            memory_type: "fact".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata,
+                        },
+                    )
+                    .await
+                    .expect("seed memory");
+            }
+        };
+
+        // The target is absent when the head is written, so both declarations
+        // defer to replay.
+        upsert(
+            "multi-relation",
+            "multirelationprobe head body",
+            serde_json::json!({
+                "exact_edge_targets": true,
+                "related_to": ["shared-target"],
+                "depends_on": ["shared-target"]
+            }),
+        )
+        .await;
+        upsert("shared-target", "shared target body", serde_json::json!({})).await;
+
+        store
+            .relink_edges(ns, "code")
+            .await
+            .expect("replay declarations");
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        let rels = ["RELATES_TO", "DEPENDS_ON"];
+        for rel in rels {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(from, edge_rel, to, prov)| from == "multi-relation"
+                        && edge_rel == rel
+                        && to == "shared-target"
+                        && prov.as_ref().and_then(|p| p.extractor.as_deref()) == Some("upsert")),
+                "replay must materialise the {rel} edge: {edges:?}"
+            );
+        }
+
+        let (_, head) = store
+            .get(ns, "multi-relation")
+            .await
+            .expect("read declarer")
+            .expect("declarer exists");
+        let sources = head
+            .metadata
+            .get("edge_sources")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for rel in rels {
+            assert_eq!(
+                sources
+                    .iter()
+                    .filter(|s| s["rel_type"] == rel && s["resolved_target"] == "shared-target")
+                    .count(),
+                1,
+                "each relation must keep its own citation ({rel}): {sources:?}"
+            );
+        }
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "multirelationprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let refs = search_out
+            .lines()
+            .find_map(|line| line.strip_prefix("edge_references: "))
+            .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+            .unwrap_or_default();
+        for rel in rels {
+            assert!(
+                refs.iter().any(|r| {
+                    r["id"] == "multi-relation"
+                        && r["edge_sources"].as_array().is_some_and(|sources| {
+                            sources.iter().any(|s| {
+                                s["rel_type"] == rel && s["resolved_target"] == "shared-target"
+                            })
+                        })
+                }),
+                "search must cite the {rel} edge ({rel}): {search_out}"
+            );
+        }
+    }
+
     /// The lexical empty-results path must still emit the additive response
     /// contract, otherwise `include_related` is a silent no-op and
     /// `graph_expanded_ids` disappears on exactly the path callers hit most.

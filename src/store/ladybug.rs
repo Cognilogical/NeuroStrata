@@ -7540,7 +7540,12 @@ fn is_valid_relation_name(name: &str) -> bool {
 /// the query text, so this is what bounds how large that text can get.
 const RELINK_BATCH: usize = 500;
 
-type EdgeCitations = std::collections::HashMap<(String, String), (String, Value)>;
+/// Citations are keyed by relationship type first: one head may declare two
+/// relationships to the same target, and each binding has its own citation.
+type EdgeCitations = std::collections::HashMap<
+    &'static str,
+    std::collections::HashMap<(String, String), (String, Value)>,
+>;
 
 struct EdgeReplay<'a> {
     namespace: &'a str,
@@ -7599,20 +7604,19 @@ fn create_missing_edges(
         }
     }
 
+    let citations = replay.citations.and_then(|by_rel| by_rel.get(rel_type));
     let mut created = 0usize;
     for chunk in missing.chunks(RELINK_BATCH) {
         // A cited chunk is the vault replay path: every endpoint was already
         // checked against the namespace id set, so the edge carries the same
         // evidence id as the citation written below.
-        let cited = replay
-            .citations
-            .is_some_and(|by_pair| chunk.iter().all(|pair| by_pair.contains_key(*pair)));
+        let cited =
+            citations.is_some_and(|by_pair| chunk.iter().all(|pair| by_pair.contains_key(*pair)));
         let list = chunk
             .iter()
             .map(|pair| {
                 if cited {
-                    let entry = &replay
-                        .citations
+                    let entry = &citations
                         .and_then(|by_pair| by_pair.get(*pair))
                         .expect("cited chunk")
                         .1;
@@ -7651,7 +7655,7 @@ fn create_missing_edges(
         }
     }
 
-    if let Some(by_pair) = replay.citations {
+    if let Some(by_pair) = citations {
         // The edge and its citation are one fact: only a replay that actually
         // created the binding stamps its provenance.
         let mut by_declarer: std::collections::HashMap<String, Vec<Value>> =
@@ -12365,7 +12369,10 @@ impl VectorStore for LadybugStore {
                         orientation,
                         source,
                     );
-                    vault_citations.insert(pair.clone(), (memory.id.clone(), entry));
+                    vault_citations
+                        .entry(edge.rel_type)
+                        .or_default()
+                        .insert(pair.clone(), (memory.id.clone(), entry));
                     vault_wanted.entry(edge.rel_type).or_default().push(pair);
                 } else {
                     wanted.entry(edge.rel_type).or_default().push(pair);
