@@ -367,6 +367,18 @@ fn main_checkout_of_common(common: &Path) -> Option<PathBuf> {
         return None;
     }
     let parent = common.parent()?;
+    // A shared git directory frequently sits in a workspace folder beside
+    // unrelated entries. Those entries are not proof that this folder is the
+    // main checkout. Ask git which worktree owns the repository and accept
+    // `parent` only when git agrees. A hand-built gitdir that git cannot open
+    // falls back to the older structural check.
+    if let Some(main) = git_main_checkout(common) {
+        return same_location(&main.to_string_lossy(), &parent.to_string_lossy())
+            .then(|| parent.to_path_buf());
+    }
+    if !parent.join(".git").is_dir() {
+        return None;
+    }
     let holds_more_than_git = std::fs::read_dir(parent)
         .ok()?
         .filter_map(Result::ok)
@@ -374,11 +386,90 @@ fn main_checkout_of_common(common: &Path) -> Option<PathBuf> {
     holds_more_than_git.then(|| parent.to_path_buf())
 }
 
+/// The first `worktree` line of `git worktree list --porcelain` is the main
+/// checkout. Pure so the parser can be tested without spawning git.
+fn parse_first_worktree(porcelain: &str) -> Option<PathBuf> {
+    porcelain.lines().find_map(|line| {
+        line.strip_prefix("worktree ")
+            .map(|p| PathBuf::from(p.trim()))
+    })
+}
+
+fn git_main_checkout(common: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(common)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_first_worktree(&String::from_utf8(out.stdout).ok()?)
+}
+
 /// The `[core]` settings [`main_checkout_of_common`] reads.
 #[derive(Default)]
 struct CoreConfig {
     bare: bool,
     worktree: Option<String>,
+}
+
+/// Decode a Git config value: surrounding quotes and the escapes Git accepts
+/// inside them (`\\`, `\"`, `\n`, `\t`, `\b`, octal). Stripping quotes alone
+/// leaves an escaped `core.worktree` path literally escaped, so resolving it
+/// against the git directory lands on the wrong folder.
+fn decode_git_config_value(raw: &str) -> String {
+    let raw = raw.trim();
+    let value = if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        if i >= chars.len() {
+            out.push('\\');
+            break;
+        }
+        let esc = chars[i];
+        i += 1;
+        match esc {
+            'n' => out.push('\n'),
+            't' => out.push('\t'),
+            'b' => out.push('\x08'),
+            '\\' => out.push('\\'),
+            '"' => out.push('"'),
+            d @ '0'..='7' => {
+                let mut code = d.to_digit(8).unwrap_or(0);
+                for _ in 0..2 {
+                    match chars.get(i).and_then(|c| c.to_digit(8)) {
+                        Some(v) => {
+                            code = code * 8 + v;
+                            i += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if let Some(ch) = char::from_u32(code) {
+                    out.push(ch);
+                }
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
 }
 
 /// `core.bare` and `core.worktree` from `<common>/config` (an unreadable
@@ -401,7 +492,7 @@ fn core_config(common: &Path) -> CoreConfig {
             continue;
         }
         let (key, value) = match line.split_once('=') {
-            Some((k, v)) => (k.trim(), Some(v.trim().trim_matches('"'))),
+            Some((k, v)) => (k.trim(), Some(decode_git_config_value(v))),
             None => (line, None),
         };
         if key.eq_ignore_ascii_case("bare") {
@@ -411,7 +502,7 @@ fn core_config(common: &Path) -> CoreConfig {
                     .any(|t| v.eq_ignore_ascii_case(t))
             });
         } else if key.eq_ignore_ascii_case("worktree") {
-            out.worktree = value.filter(|v| !v.is_empty()).map(str::to_string);
+            out.worktree = value.filter(|v| !v.is_empty());
         }
     }
     out
@@ -2145,5 +2236,30 @@ mod tests {
             main_checkout_root(&s(&link.join("src"))),
             Some(root.clone())
         );
+    }
+
+    #[test]
+    fn git_config_escapes_in_core_worktree_are_decoded() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config"),
+            "[core]\n\tworktree = \"C:\\\\work\\\\proj\"\n\tbare = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            core_config(tmp.path()).worktree.as_deref(),
+            Some("C:\\work\\proj")
+        );
+    }
+
+    #[test]
+    fn first_worktree_line_is_parsed_from_porcelain() {
+        let porcelain =
+            "worktree /repo/main\nHEAD abc\nbranch refs/heads/main\n\nworktree /repo/wt\n";
+        assert_eq!(
+            parse_first_worktree(porcelain).as_deref(),
+            Some(Path::new("/repo/main"))
+        );
+        assert_eq!(parse_first_worktree("HEAD abc\n"), None);
     }
 }
