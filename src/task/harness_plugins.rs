@@ -2888,7 +2888,7 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("claude"),
         );
-        let after = file_hooks(tmp.path());
+        let after = claude_pre_tool_use_matchers(tmp.path());
         assert_eq!(
             after,
             vec![
