@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
-#[path = "../../src/context/model.rs"]
-mod model;
 #[path = "../../src/context/freshness.rs"]
 mod freshness;
+#[path = "../../src/context/model.rs"]
+mod model;
 
 use freshness::FreshnessInputs;
 use model::{Coverage, DecisionLifecycle, SemanticValidation, SourceCurrency};
@@ -34,8 +34,14 @@ fn decision_lifecycle_independent() {
 
 #[test]
 fn not_applicable_distinct() {
-    let na = freshness::compute(&FreshnessInputs { has_governed_path: false, ..Default::default() });
-    let un = freshness::compute(&FreshnessInputs { has_governed_path: true, ..Default::default() });
+    let na = freshness::compute(&FreshnessInputs {
+        has_governed_path: false,
+        ..Default::default()
+    });
+    let un = freshness::compute(&FreshnessInputs {
+        has_governed_path: true,
+        ..Default::default()
+    });
     assert_ne!(na.source_currency, un.source_currency);
     assert_eq!(na.source_currency, SourceCurrency::NotApplicable);
     assert_eq!(un.source_currency, SourceCurrency::Unknown);

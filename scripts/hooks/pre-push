@@ -18,22 +18,9 @@ fi
 # (`neurostrata-mcp namespace resolve`); a failed lookup blocks the push.
 # The folder name, the namespace this gate checked before, is gated too.
 NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo "error: neurostrata-mcp namespace resolve failed — gate NOT run for this push (an older neurostrata-mcp without the namespace resolve command is a likely cause: upgrade it)" >&2; exit 1; }
-CHECKOUT_ROOT=$(git rev-parse --show-toplevel)
 FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 GATE_NAMESPACES=("$NAMESPACE")
 [ "$FOLDER_NAMESPACE" = "$NAMESPACE" ] || GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
-
-# A split marker (packages/api/.NeuroStrata/config.json -> Api) names a
-# namespace plugins claim tasks in. Enumerate nested-marker namespaces from
-# the CLI so their tasks reach the gate too; a failed lookup blocks the push.
-NESTED_NAMESPACES=$(neurostrata-mcp namespace gate-namespaces "$CHECKOUT_ROOT") || { echo "error: neurostrata-mcp namespace gate-namespaces failed — gate NOT run for this push" >&2; exit 1; }
-for NESTED_NAMESPACE in $NESTED_NAMESPACES; do
-    ALREADY=0
-    for GATE_NAMESPACE in "${GATE_NAMESPACES[@]}"; do
-        [ "$GATE_NAMESPACE" = "$NESTED_NAMESPACE" ] && ALREADY=1
-    done
-    [ "$ALREADY" -eq 1 ] || GATE_NAMESPACES+=("$NESTED_NAMESPACE")
-done
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
 # --strict maps an unavailable database to a blocking exit too, so a 1
@@ -70,4 +57,4 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 24c563b61cd80b638dd53f421d301cd739b16391d775fda31296dbd812827642
+# neurostrata-hook-sha256: 5a3b7ea2ec3f8b14761ee1a4efe8dc985a16706e8a18c820064fb5c52ac49e9c

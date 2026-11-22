@@ -2390,96 +2390,87 @@ pub(crate) async fn handle_data_connector(
 
 #[cfg(test)]
 pub(crate) mod context_plan_benchmark_instrumentation {
+    //! Counts for one measured `context_plan` request. The counters live in a
+    //! tokio task-local, so only reads made inside [`measure`]'s future are
+    //! counted: other tests running at the same time (many read the registry
+    //! root) can no longer add to them.
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    static ENABLED: AtomicBool = AtomicBool::new(false);
-    static REGISTRY_ROOT_READS: AtomicU64 = AtomicU64::new(0);
-    static STORE_MEMORY_MULTIFORM_OPS: AtomicU64 = AtomicU64::new(0);
-    static AST_FORM_QUERIES: AtomicU64 = AtomicU64::new(0);
-    static BRIDGE_ENRICHMENT_PASSES: AtomicU64 = AtomicU64::new(0);
-    static LOGICAL_FILES_ENRICHED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-
-    pub(crate) struct DisableOnDrop;
-
-    impl Drop for DisableOnDrop {
-        fn drop(&mut self) {
-            ENABLED.store(false, Ordering::Relaxed);
-            reset_counts();
-        }
+    #[derive(Default)]
+    struct Counts {
+        registry_root_reads: AtomicU64,
+        store_memory_multiform_ops: AtomicU64,
+        ast_form_queries: AtomicU64,
+        bridge_enrichment_passes: AtomicU64,
+        logical_files_enriched: Mutex<BTreeSet<String>>,
     }
 
-    fn reset_counts() {
-        REGISTRY_ROOT_READS.store(0, Ordering::Relaxed);
-        STORE_MEMORY_MULTIFORM_OPS.store(0, Ordering::Relaxed);
-        AST_FORM_QUERIES.store(0, Ordering::Relaxed);
-        BRIDGE_ENRICHMENT_PASSES.store(0, Ordering::Relaxed);
-        LOGICAL_FILES_ENRICHED
+    tokio::task_local! {
+        static COUNTS: Arc<Counts>;
+    }
+
+    /// What one measured request counted.
+    pub(crate) struct Measured {
+        pub(crate) snapshot: serde_json::Value,
+        pub(crate) logical_files_enriched: BTreeSet<String>,
+    }
+
+    /// Run `fut` with fresh counters and return its output with what it
+    /// counted.
+    pub(crate) async fn measure<F: std::future::Future>(fut: F) -> (F::Output, Measured) {
+        let counts = Arc::new(Counts::default());
+        let output = COUNTS.scope(counts.clone(), fut).await;
+        let files = counts
+            .logical_files_enriched
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .clone();
+        let snapshot = serde_json::json!({
+            "registry_root_reads_per_request": counts.registry_root_reads.load(Ordering::Relaxed),
+            "store_memory_multiform_ops_per_request": counts.store_memory_multiform_ops.load(Ordering::Relaxed),
+            "ast_form_queries_per_request": counts.ast_form_queries.load(Ordering::Relaxed),
+            "bridge_enrichment_passes_per_request": counts.bridge_enrichment_passes.load(Ordering::Relaxed),
+            "logical_files_enriched_per_request": files.len(),
+        });
+        (
+            output,
+            Measured {
+                snapshot,
+                logical_files_enriched: files,
+            },
+        )
     }
 
-    pub(crate) fn enable() -> DisableOnDrop {
-        reset_counts();
-        ENABLED.store(true, Ordering::Relaxed);
-        DisableOnDrop
-    }
-
-    pub(crate) fn begin_request() {
-        reset_counts();
+    fn bump(pick: impl FnOnce(&Counts) -> &AtomicU64) {
+        let _ = COUNTS.try_with(|counts| pick(counts).fetch_add(1, Ordering::Relaxed));
     }
 
     pub(crate) fn record_registry_root_read() {
-        if ENABLED.load(Ordering::Relaxed) {
-            REGISTRY_ROOT_READS.fetch_add(1, Ordering::Relaxed);
-        }
+        bump(|c| &c.registry_root_reads);
     }
 
     pub(crate) fn record_store_memory_multiform_op() {
-        if ENABLED.load(Ordering::Relaxed) {
-            STORE_MEMORY_MULTIFORM_OPS.fetch_add(1, Ordering::Relaxed);
-        }
+        bump(|c| &c.store_memory_multiform_ops);
     }
 
     pub(crate) fn record_ast_form_query() {
-        if ENABLED.load(Ordering::Relaxed) {
-            AST_FORM_QUERIES.fetch_add(1, Ordering::Relaxed);
-        }
+        bump(|c| &c.ast_form_queries);
     }
 
     pub(crate) fn record_bridge_enrichment_pass() {
-        if ENABLED.load(Ordering::Relaxed) {
-            BRIDGE_ENRICHMENT_PASSES.fetch_add(1, Ordering::Relaxed);
-        }
+        bump(|c| &c.bridge_enrichment_passes);
     }
 
     pub(crate) fn record_logical_file_enriched(path: &str) {
-        if ENABLED.load(Ordering::Relaxed) {
-            LOGICAL_FILES_ENRICHED
+        let _ = COUNTS.try_with(|counts| {
+            counts
+                .logical_files_enriched
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(crate::parser::ingest::normalize_node_path(path));
-        }
-    }
-
-    pub(crate) fn logical_files_enriched() -> BTreeSet<String> {
-        LOGICAL_FILES_ENRICHED
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    pub(crate) fn snapshot() -> serde_json::Value {
-        let logical_files_enriched = logical_files_enriched().len();
-        serde_json::json!({
-            "registry_root_reads_per_request": REGISTRY_ROOT_READS.load(Ordering::Relaxed),
-            "store_memory_multiform_ops_per_request": STORE_MEMORY_MULTIFORM_OPS.load(Ordering::Relaxed),
-            "ast_form_queries_per_request": AST_FORM_QUERIES.load(Ordering::Relaxed),
-            "bridge_enrichment_passes_per_request": BRIDGE_ENRICHMENT_PASSES.load(Ordering::Relaxed),
-            "logical_files_enriched_per_request": logical_files_enriched,
-        })
+        });
     }
 }
 
@@ -2716,15 +2707,28 @@ async fn handle_context_plan(
                             continue;
                         }
                     };
-                    let (lookup, forms) =
-                        match lookup_path_with_registry_root(fp, None, registry_root.as_deref()) {
-                            Ok(found) => found,
-                            Err(e) => {
-                                had_backend_error = true;
-                                tracing::warn!("context_plan path lookup error: {e:#}");
-                                continue;
-                            }
-                        };
+                    let marker = lookup_marker(&store, effective_ns, fp).await;
+                    let used = marker_use(
+                        &marker,
+                        registry_root.as_deref(),
+                        registry_root_read.is_ok(),
+                        effective_ns,
+                    );
+                    log_marker_note("context_plan", used.note.as_deref());
+                    let (lookup, forms) = match lookup_path_with_registry_root(
+                        fp,
+                        None,
+                        registry_root.as_deref(),
+                        used.spelling,
+                        MarkerOrder::First,
+                    ) {
+                        Ok(found) => found,
+                        Err(e) => {
+                            had_backend_error = true;
+                            tracing::warn!("context_plan path lookup error: {e:#}");
+                            continue;
+                        }
+                    };
                     let logical_key = {
                         let norm = crate::parser::ingest::normalize_node_path(&lookup.path);
                         if norm.is_empty() {
@@ -3194,29 +3198,217 @@ pub async fn start_mcp_proxy(origin: DaemonOrigin) -> io::Result<()> {
 /// paths. Stored memories are read as they are, never rewritten. Fails only
 /// when the registered root cannot be read and nothing else constrains an
 /// absolute path (see [`registry_root_for_lookup`]).
+///
+/// `marker` is the path's project marker ([`lookup_marker`]); its spelling
+/// goes first. The second element is one line for the reply about the
+/// marker, when there is something to say, given whether the lookup
+/// succeeded or not (see [`marker_use`]).
 async fn lookup_path_for(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     path: &str,
     project_root: Option<&str>,
-) -> anyhow::Result<(crate::paths::LookupPath, Vec<String>)> {
-    let registry_root = registry_root_for_lookup(
-        crate::registry::cached_project_root(store, namespace).await,
-        namespace,
-        path,
-        project_root,
-    )?;
-    Ok(lookup_path_with_registry_root(
+    marker: &LookupMarker,
+) -> (
+    anyhow::Result<(crate::paths::LookupPath, Vec<String>)>,
+    Option<String>,
+) {
+    let read = crate::registry::cached_project_root(store, namespace).await;
+    let read_ok = read.is_ok();
+    let registry_root = match registry_root_for_lookup(read, namespace, path, project_root) {
+        Ok(root) => root,
+        Err(e) => return (Err(e), marker.note.clone()),
+    };
+    let used = marker_use(marker, registry_root.as_deref(), read_ok, namespace);
+    let found = lookup_path_with_registry_root(
         path,
         project_root,
         registry_root.as_deref(),
-    )?)
+        used.spelling,
+        MarkerOrder::First,
+    )
+    .map_err(anyhow::Error::from);
+    (found, used.note)
+}
+
+/// What the project marker of a looked-up path means for the lookup (spec
+/// 6.2): the marker when it names the call's namespace, else at most one
+/// line for the reply (an unreadable marker, a marker of another namespace,
+/// or a marker whose namespace could not be checked). Nothing for a
+/// relative path or a path without a marker.
+#[derive(Default)]
+struct LookupMarker {
+    found: Option<crate::root_marker::FoundMarker>,
+    note: Option<String>,
+    /// A marker file was found for the path, valid or not, so the
+    /// "no marker" hint does not apply.
+    exists: bool,
+}
+
+/// [`LookupMarker`] for `path`: the marker's namespace is matched with
+/// [`resolve_namespace`]'s case rules ([`marker_owner`]).
+async fn lookup_marker(store: &Arc<dyn VectorStore>, namespace: &str, path: &str) -> LookupMarker {
+    if !crate::paths::is_absolute_any(path) {
+        return LookupMarker::default();
+    }
+    match crate::root_marker::find_root_marker(std::path::Path::new(path)) {
+        Ok(None) => LookupMarker::default(),
+        Err((file, reason)) => LookupMarker {
+            found: None,
+            note: Some(format!(
+                "Warning: {} could not be read ({reason}); the lookup ignored it",
+                file.display()
+            )),
+            exists: true,
+        },
+        Ok(Some(found)) => {
+            let file = found.marker_dir().join(".NeuroStrata").join("config.json");
+            match marker_owner(store, namespace, &found.config.namespace).await {
+                MarkerOwner::Same => LookupMarker {
+                    found: Some(found),
+                    note: None,
+                    exists: true,
+                },
+                MarkerOwner::Other(owner) => LookupMarker {
+                    found: None,
+                    note: Some(format!(
+                        "{path} belongs to namespace {owner} ({}); these results are from {namespace}",
+                        file.display()
+                    )),
+                    exists: true,
+                },
+                MarkerOwner::Unknown(e) => LookupMarker {
+                    found: None,
+                    note: Some(format!(
+                        "Warning: could not check whether namespace {} in {} is {namespace} ({e}); the lookup ignored the marker",
+                        found.config.namespace,
+                        file.display()
+                    )),
+                    exists: true,
+                },
+            }
+        }
+    }
+}
+
+/// Whose a marker is, for [`marker_owner`].
+enum MarkerOwner {
+    /// The marker names the call's namespace.
+    Same,
+    /// The namespace that owns the marker.
+    Other(String),
+    /// The namespaces could not be listed, so a marker that differs only in
+    /// case could be either.
+    Unknown(String),
+}
+
+/// Whether a marker naming `marker_ns` names `namespace` under
+/// [`resolve_namespace`]'s case rules: case does not matter, but a stored
+/// namespace spelled exactly as the marker is that namespace. A failed
+/// namespace listing is never taken as "the same namespace".
+async fn marker_owner(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    marker_ns: &str,
+) -> MarkerOwner {
+    if marker_ns == namespace {
+        return MarkerOwner::Same;
+    }
+    if marker_ns.eq_ignore_ascii_case(namespace) {
+        return match store.list_namespaces().await {
+            Ok(known) if known.iter().any(|k| k == marker_ns) => {
+                MarkerOwner::Other(marker_ns.to_string())
+            }
+            Ok(_) => MarkerOwner::Same,
+            Err(e) => MarkerOwner::Unknown(format!("{e:#}")),
+        };
+    }
+    MarkerOwner::Other(resolve_namespace(store, marker_ns).await)
+}
+
+/// Where the marker's spelling goes among a lookup's forms (spec 6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarkerOrder {
+    /// First, as the lookup's primary path: memories_for_file and
+    /// context_plan, which merge the hits of every form.
+    First,
+    /// After today's forms: `related` traverses from the first form that
+    /// matches a node, so the marker spelling only adds a fallback there.
+    Last,
+}
+
+/// The marker's effect on one lookup once the cached root is read.
+struct MarkerUse<'a> {
+    /// The marker whose spelling joins the lookup.
+    spelling: Option<&'a crate::root_marker::FoundMarker>,
+    /// One line for the reply.
+    note: Option<String>,
+}
+
+/// [`MarkerUse`] for `marker`: its spelling applies only when its root is
+/// the namespace's cached root (`registry_root`). Otherwise the note says
+/// to compare them; when the cached root could not be read (`read_ok`
+/// false) there is nothing to compare, so no note.
+fn marker_use<'a>(
+    marker: &'a LookupMarker,
+    registry_root: Option<&str>,
+    read_ok: bool,
+    namespace: &str,
+) -> MarkerUse<'a> {
+    let Some(found) = marker.found.as_ref() else {
+        return MarkerUse {
+            spelling: None,
+            note: marker.note.clone(),
+        };
+    };
+    if crate::paths::marker_root_is_cached_root(found, registry_root) {
+        return MarkerUse {
+            spelling: Some(found),
+            note: None,
+        };
+    }
+    if !read_ok {
+        tracing::warn!(
+            "the cached root of {namespace} could not be read; the project marker at {} was not used",
+            found.root.display()
+        );
+        return MarkerUse {
+            spelling: None,
+            note: None,
+        };
+    }
+    // The root as it was compared: a worktree's in its main checkout.
+    let compared = crate::root_marker::in_main_checkout(&found.root);
+    let note = match registry_root {
+        Some(cached) => format!(
+            "The project marker root {} is not the cached root of {namespace} ({cached}): run `neurostrata-mcp root show` to compare them",
+            compared.display(),
+        ),
+        None => format!(
+            "The project marker root {} is not the cached root of {namespace} (none): run `neurostrata-mcp hooks install` in the project to set it",
+            compared.display(),
+        ),
+    };
+    MarkerUse {
+        spelling: None,
+        note: Some(note),
+    }
+}
+
+/// Log a marker note for a tool whose reply has no place for it
+/// (context_plan, related).
+fn log_marker_note(tool: &str, note: Option<&str>) {
+    if let Some(note) = note {
+        tracing::warn!("{tool}: {note}");
+    }
 }
 
 fn lookup_path_with_registry_root(
     path: &str,
     project_root: Option<&str>,
     registry_root: Option<&str>,
+    marker: Option<&crate::root_marker::FoundMarker>,
+    order: MarkerOrder,
 ) -> Result<(crate::paths::LookupPath, Vec<String>), crate::paths::UnresolvablePathError> {
     let resolved = crate::paths::resolve_in_scope_forms(
         path,
@@ -3224,7 +3416,29 @@ fn lookup_path_with_registry_root(
         registry_root,
         crate::paths::PathResolutionScope::File,
     )?;
-    Ok((resolved.lookup, resolved.forms))
+    let Some(found) = marker else {
+        return Ok((resolved.lookup, resolved.forms));
+    };
+    let (lookup, forms) = match order {
+        MarkerOrder::First => {
+            let lookup = crate::paths::with_marker_spelling(resolved.lookup, path, found);
+            let mut forms = vec![lookup.path.clone()];
+            forms.extend(resolved.forms);
+            (lookup, forms)
+        }
+        MarkerOrder::Last => {
+            let marked = crate::paths::with_marker_spelling(resolved.lookup.clone(), path, found);
+            let mut forms = resolved.forms;
+            forms.push(marked.path);
+            (resolved.lookup, forms)
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    let forms = forms
+        .into_iter()
+        .filter(|f| seen.insert(crate::parser::ingest::normalize_node_path(f)))
+        .collect();
+    Ok((lookup, forms))
 }
 
 /// The `source` a rule without one gets from its `location`: the path
@@ -3696,7 +3910,10 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     // being touched. The root found here only relativizes the path -- it is
     // never used as `source`, so a worktree that was never ingested cannot pin
     // an empty generation.
-    let (lookup, forms) = match lookup_path_for(&store, &namespace, path, project_root).await {
+    let marker = lookup_marker(&store, &namespace, path).await;
+    let (found, marker_note) =
+        lookup_path_for(&store, &namespace, path, project_root, &marker).await;
+    let (lookup, forms) = match found {
         Ok(found) => found,
         Err(e) => {
             let graph_read = crate::traits::VectorStore::as_any(store.as_ref())
@@ -3717,6 +3934,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
                 response["resolved_path"] = serde_json::Value::String(path.to_string());
                 response["resolved_from"] =
                     serde_json::json!(crate::paths::RootSource::Outside.as_str());
+            }
+            if let Some(note) = marker_note {
+                response["root_hint"] = serde_json::Value::String(note);
             }
             return response.to_string();
         }
@@ -3780,6 +4000,19 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
             if lookup.source != crate::paths::RootSource::Relative {
                 response["resolved_path"] = serde_json::Value::String(lookup.path.clone());
                 response["resolved_from"] = serde_json::json!(lookup.source.as_str());
+            }
+            let no_marker_hint = || {
+                (!marker.exists)
+                    .then(|| {
+                        crate::root_marker::no_marker_hint(
+                            &namespace,
+                            std::path::Path::new(original_path),
+                        )
+                    })
+                    .flatten()
+            };
+            if let Some(hint) = marker_note.or_else(no_marker_hint) {
+                response["root_hint"] = serde_json::Value::String(hint);
             }
             let include_ast_edges = arguments
                 .get("include_ast_edges")
@@ -4063,10 +4296,15 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
                     .to_string();
                 }
             };
+        let marker = lookup_marker(&store_for_meta, &namespace, original_seed).await;
+        let used = marker_use(&marker, registry_root.as_deref(), true, &namespace);
+        log_marker_note("related", used.note.as_deref());
         let forms = match lookup_path_with_registry_root(
             original_seed,
             project_root,
             registry_root.as_deref(),
+            used.spelling,
+            MarkerOrder::Last,
         ) {
             Ok((_, forms)) => forms,
             Err(e) => {
@@ -5195,6 +5433,7 @@ async fn handle_add_memory(
             }
         }
 
+        let hint_location = location.clone();
         let payload = MemoryPayload {
             content: content.to_string(),
             user_id: user_id.to_string(),
@@ -5341,6 +5580,12 @@ async fn handle_add_memory(
                         shape_fields.join(", ")
                     ));
                 }
+                if let Some(hint) = add_memory_hint_path(&arguments, &hint_location)
+                    .as_deref()
+                    .and_then(|p| crate::root_marker::root_hint(namespace, p))
+                {
+                    msg.push_str(&format!("\n{hint}"));
+                }
                 // TASK NUDGE: advisory when a non-task/procedure memory's content
                 // carries task-shaped markers.
                 if memory_type != "task" && memory_type != "procedure" {
@@ -5359,6 +5604,20 @@ async fn handle_add_memory(
     } else {
         "Failed to verify existing namespaces.".to_string()
     }
+}
+
+/// The folder `add_memory`'s root hint is about: `project_root`, else an
+/// absolute `location`.
+fn add_memory_hint_path(arguments: &Value, location: &str) -> Option<std::path::PathBuf> {
+    arguments
+        .get("project_root")
+        .and_then(|r| r.as_str())
+        .filter(|r| !r.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let location = std::path::Path::new(location);
+            location.is_absolute().then(|| location.to_path_buf())
+        })
 }
 
 /// What to tell an agent when this namespace still holds ids written before
@@ -5875,7 +6134,7 @@ async fn handle_get_snapshot(
 
     // Cache an explicitly-provided project_root into the registry row (best-effort).
     if let Some(pr) = &project_root_arg {
-        crate::registry::cache_project_root(&store, None, namespace, pr).await;
+        crate::registry::cache_project_root_unless_marked(&store, None, namespace, pr).await;
     }
 
     // Fetch all memories first so hook hygiene can infer a git root when none
@@ -6437,17 +6696,8 @@ async fn handle_get_snapshot(
         doctor_state["configured_fires_on"] =
             serde_json::json!(crate::task::wiring::VALID_FIRES_ON);
     }
-    if let (Some(vec), Some(mut payload)) = (reg_vec_opt, reg_payload_opt) {
-        if let Some(obj) = payload.metadata.as_object_mut() {
-            obj.insert("doctor_state".to_string(), doctor_state);
-        }
-        if let Err(e) = store.upsert(namespace, &rid, vec, payload).await {
-            tracing::warn!(
-                "failed to persist doctor_state into {}::{}: {e}",
-                namespace,
-                rid
-            );
-        }
+    if reg_vec_opt.is_some() && reg_payload_opt.is_some() {
+        crate::registry::write_doctor_state(&store, namespace, doctor_state).await;
     }
 
     // Communities (N) section (§5.6): partition community_summary out of all_memories,
@@ -6723,11 +6973,20 @@ async fn handle_get_snapshot(
     parts.push(domain_strap.to_string());
     parts.push(body.to_string());
     let snapshot = parts.join("\n");
-
-    Ok(match migration {
+    let snapshot = match migration {
         Some(notice) => format!("{}\n\n{}", snapshot, notice),
         None => snapshot,
-    })
+    };
+
+    Ok(
+        match project_root
+            .as_deref()
+            .and_then(|root| crate::root_marker::root_hint(namespace, std::path::Path::new(root)))
+        {
+            Some(hint) => format!("{snapshot}\n{hint}"),
+            None => snapshot,
+        },
+    )
 }
 
 async fn handle_ingest_directory(
@@ -6831,8 +7090,11 @@ async fn handle_ingest_directory(
             } else {
                 String::new()
             };
+            let hint = crate::root_marker::root_hint(namespace, std::path::Path::new(dir_path))
+                .map(|hint| format!("\n{hint}"))
+                .unwrap_or_default();
             format!(
-                "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols{}; {} declared edges relinked.",
+                "Successfully ingested AST from {} into namespace '{}': {} files, {} symbols{}; {} declared edges relinked.{}",
                 dir_path,
                 namespace,
                 progress.files_ingested,
@@ -6841,7 +7103,8 @@ async fn handle_ingest_directory(
                 progress
                     .relinked_edges
                     .map(|n| n.to_string())
-                    .unwrap_or_else(|| "no".to_string())
+                    .unwrap_or_else(|| "no".to_string()),
+                hint
             )
         }
         Err(e) => format!("Failed to ingest directory {}: {}", dir_path, e),
@@ -10045,6 +10308,9 @@ async fn handle_domain_registry(
             }).to_string()
         }
         "set" => {
+            // One lock from the first read to the upsert: a concurrent writer of
+            // the same row cannot be overwritten by this stale copy.
+            let _row_guard = crate::registry::REGISTRY_ROW_LOCK.lock().await;
             let slug_raw = match arguments.get("slug").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"slug missing"},"warnings":[]}).to_string(),
@@ -10148,6 +10414,9 @@ async fn handle_domain_registry(
             serde_json::json!({"ok":true,"registry":{"version":version,"domains":domains},"warnings":[]}).to_string()
         }
         "remove" => {
+            // One lock from the first read to the upsert: a concurrent writer of
+            // the same row cannot be overwritten by this stale copy.
+            let _row_guard = crate::registry::REGISTRY_ROW_LOCK.lock().await;
             let slug = match arguments.get("slug").and_then(|v| v.as_str()) {
                 Some(s) => s.to_string(),
                 None => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"slug missing"}}).to_string(),
@@ -16765,6 +17034,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn marked_namespace_cache_is_not_overwritten_by_append_log_ingest_or_snapshot() {
+        let (store, _) = store_with_one_rule("ns").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = dunce::canonicalize(tmp.path()).expect("canonical");
+        let repo = base.join("repo");
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(repo.join(".git")).expect("repo .git");
+        std::fs::create_dir_all(repo.join(".NeuroStrata")).expect("marker dir");
+        std::fs::create_dir_all(&sub).expect("sub");
+        std::fs::write(sub.join("lib.rs"), "fn main() {}").expect("source");
+        std::fs::write(
+            repo.join(".NeuroStrata").join("config.json"),
+            br#"{"version":1,"namespace":"ns"}"#,
+        )
+        .expect("marker");
+        let root = repo.to_string_lossy().into_owned();
+        crate::registry::cache_project_root(&store, Some(&emb), "ns", &root).await;
+        let cached = || async {
+            crate::registry::cached_project_root(&store, "ns")
+                .await
+                .expect("read cache")
+        };
+
+        let reply = crate::buffer::handle_append_log(
+            serde_json::json!({
+                "namespace": "ns",
+                "content": "a note",
+                "project_root": sub.to_string_lossy(),
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.starts_with("ERROR"), "{reply}");
+        assert_eq!(cached().await, Some(root.clone()), "after append_log");
+
+        let schema = crate::parser::schema::ParserSchema::load(include_str!("schema.json"))
+            .expect("shipped schema parses");
+        crate::parser::ingest::ingest_directory(
+            &sub,
+            &schema,
+            emb.clone(),
+            store.clone(),
+            "ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("ingest");
+        assert_eq!(cached().await, Some(root.clone()), "after ingest");
+
+        handle_get_snapshot(
+            serde_json::json!({ "namespace": "ns", "project_root": sub.to_string_lossy() }),
+            store.clone(),
+        )
+        .await
+        .expect("snapshot");
+        assert_eq!(cached().await, Some(root), "after snapshot");
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_append_log_ingest_claim_never_write_marker() {
+        let (store, _) = store_with_one_rule("ns").await;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = dunce::canonicalize(tmp.path()).expect("canonical");
+        let repo = base.join("repo");
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(repo.join(".git")).expect("repo .git");
+        std::fs::create_dir_all(&sub).expect("sub");
+        std::fs::write(sub.join("lib.rs"), "fn main() {}").expect("source");
+        let marker = repo.join(".NeuroStrata").join("config.json");
+        let hint = "No .NeuroStrata/config.json for ns: run `neurostrata-mcp hooks install` or neurostrata_task_setup";
+
+        let reply = crate::buffer::handle_append_log(
+            serde_json::json!({
+                "namespace": "ns",
+                "content": "a note",
+                "project_root": repo.to_string_lossy(),
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("append_log json");
+        assert_eq!(parsed["root_hint"], serde_json::json!(hint), "{reply}");
+        assert!(!marker.exists(), "append_log wrote a marker");
+
+        let text = handle_get_snapshot(
+            serde_json::json!({ "namespace": "ns", "project_root": repo.to_string_lossy() }),
+            store.clone(),
+        )
+        .await
+        .expect("snapshot");
+        assert!(text.ends_with(hint), "{text}");
+        assert!(!marker.exists(), "get_snapshot wrote a marker");
+
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let text = handle_ingest_directory(
+            serde_json::json!({ "namespace": "ns", "dir_path": sub.to_string_lossy() }),
+            emb.clone(),
+            store.clone(),
+            ingests,
+            None,
+            None,
+        )
+        .await;
+        assert!(text.starts_with("Successfully ingested"), "{text}");
+        assert!(text.ends_with(hint), "{text}");
+        assert!(!marker.exists(), "ingest wrote a marker");
+
+        let created: Value = serde_json::from_str(
+            &crate::task::handle_task_create(
+                serde_json::json!({ "namespace": "ns", "title": "a task" }),
+                emb.clone(),
+                store.clone(),
+            )
+            .await,
+        )
+        .expect("task_create json");
+        let id = created["id"].as_str().expect("task id").to_string();
+        let reply = crate::task::handle_task_claim(
+            serde_json::json!({
+                "id": id,
+                "namespace": "ns",
+                "session_id": "s1",
+                "assignee": "tester",
+                "project_root": repo.to_string_lossy(),
+            }),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("claim json");
+        assert_eq!(parsed["root_hint"], serde_json::json!(hint), "{reply}");
+        assert!(!marker.exists(), "claim wrote a marker");
+
+        // With a marker for the namespace, no hint and no change to it.
+        std::fs::write(&marker, br#"{"version":1,"namespace":"ns"}"#).expect("marker");
+        let reply = crate::buffer::handle_append_log(
+            serde_json::json!({
+                "namespace": "ns",
+                "content": "another note",
+                "project_root": repo.to_string_lossy(),
+            }),
+            emb.clone(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("append_log json");
+        assert!(parsed.get("root_hint").is_none(), "{reply}");
+        assert_eq!(
+            std::fs::read(&marker).expect("marker"),
+            br#"{"version":1,"namespace":"ns"}"#.to_vec()
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_surfaces_advisory_stale_memories_for_all_active_rows() {
         let (store, _) = store_with_one_rule("probe").await;
         // Add a stale non-task fact via the store trait.
@@ -17161,6 +17588,538 @@ mod tests {
         let got =
             merge_spelling_results(vec![Err::<Vec<MemoryHit>, _>(anyhow::anyhow!("first"))], 10);
         assert!(got.is_err(), "when every spelling fails, surface the error");
+    }
+
+    /// A checkout `<tmp>/repo` with `sub/a.rs`, the namespace's cached root
+    /// set to `cached` (relative to the repo) before `marker` (raw file text)
+    /// is written at the repo top. Returns (temp dir, repo, file, store).
+    async fn marked_repo(
+        namespace: &str,
+        cached: Option<&str>,
+        marker: Option<&[u8]>,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        String,
+        Arc<dyn VectorStore>,
+    ) {
+        let (store, _) = store_with_one_rule(namespace).await;
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let repo = dunce::canonicalize(tmp.path())
+            .expect("canonical")
+            .join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("repo .git");
+        std::fs::create_dir_all(repo.join("sub")).expect("sub");
+        std::fs::write(repo.join("sub").join("a.rs"), "fn a() {}").expect("source");
+        if let Some(rel) = cached {
+            let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+            let root = if rel.is_empty() {
+                repo.clone()
+            } else {
+                repo.join(rel)
+            };
+            crate::registry::cache_project_root(
+                &store,
+                Some(&emb),
+                namespace,
+                &root.to_string_lossy(),
+            )
+            .await;
+        }
+        if let Some(text) = marker {
+            std::fs::create_dir_all(repo.join(".NeuroStrata")).expect("marker dir");
+            std::fs::write(repo.join(".NeuroStrata").join("config.json"), text).expect("marker");
+        }
+        let file = repo.join("sub").join("a.rs").to_string_lossy().to_string();
+        (tmp, repo, file, store)
+    }
+
+    async fn memories_for_file_reply(
+        store: &Arc<dyn VectorStore>,
+        namespace: &str,
+        path: &str,
+        project_root: Option<&std::path::Path>,
+    ) -> Value {
+        let mut args = serde_json::json!({ "namespace": namespace, "path": path });
+        if let Some(root) = project_root {
+            args["project_root"] = serde_json::json!(root.to_string_lossy());
+        }
+        let text = handle_memories_for_file(args, store.clone()).await;
+        serde_json::from_str(&text).expect("valid JSON")
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_marker_spelling_does_not_depend_on_the_caller() {
+        let (_tmp, repo, file, store) = marked_repo(
+            "probe",
+            Some(""),
+            Some(br#"{"version":1,"namespace":"probe"}"#),
+        )
+        .await;
+        for caller in [None, Some(repo.join("sub")), Some(repo.clone())] {
+            let parsed = memories_for_file_reply(&store, "probe", &file, caller.as_deref()).await;
+            assert_eq!(
+                parsed["resolved_path"],
+                serde_json::json!("sub/a.rs"),
+                "{parsed}"
+            );
+            assert_eq!(
+                parsed["resolved_from"],
+                serde_json::json!("root_config"),
+                "{parsed}"
+            );
+            assert!(parsed.get("root_hint").is_none(), "{parsed}");
+        }
+    }
+
+    #[tokio::test]
+    async fn memories_for_file_reply_names_owning_namespace_for_other_marker() {
+        let (_tmp, repo, file, store) = marked_repo(
+            "probe",
+            Some(""),
+            Some(br#"{"version":1,"namespace":"other"}"#),
+        )
+        .await;
+        let parsed = memories_for_file_reply(&store, "probe", &file, Some(&repo.join("sub"))).await;
+        // Forms as today: relative to the caller's root.
+        assert_eq!(
+            parsed["resolved_path"],
+            serde_json::json!("a.rs"),
+            "{parsed}"
+        );
+        assert_eq!(
+            parsed["resolved_from"],
+            serde_json::json!("project_root"),
+            "{parsed}"
+        );
+        let hint = parsed["root_hint"].as_str().expect("root_hint");
+        assert!(hint.contains("belongs to namespace other"), "{hint}");
+        assert!(hint.contains("config.json"), "{hint}");
+        assert_eq!(hint.lines().count(), 1, "{hint}");
+    }
+
+    #[tokio::test]
+    async fn outside_file_under_other_namespace_marker_reply_names_owner() {
+        // The namespace has a cached root; the file is in another repository
+        // whose marker names another namespace, so it resolves Outside.
+        let (tmp, _repo, _file, store) = marked_repo("probe", Some(""), None).await;
+        let other = dunce::canonicalize(tmp.path())
+            .expect("canonical")
+            .join("other-repo");
+        std::fs::create_dir_all(other.join(".git")).expect("other .git");
+        std::fs::create_dir_all(other.join(".NeuroStrata")).expect("marker dir");
+        let marker = other.join(".NeuroStrata").join("config.json");
+        std::fs::write(&marker, br#"{"version":1,"namespace":"other"}"#).expect("marker");
+        std::fs::write(other.join("b.rs"), "fn b() {}").expect("source");
+        let file = other.join("b.rs").to_string_lossy().to_string();
+
+        let parsed = memories_for_file_reply(&store, "probe", &file, None).await;
+        assert_eq!(
+            parsed["resolved_from"],
+            serde_json::json!("outside"),
+            "{parsed}"
+        );
+        assert!(parsed.get("error").is_some(), "{parsed}");
+        let hint = parsed["root_hint"].as_str().expect("root_hint");
+        assert!(hint.contains("belongs to namespace other"), "{hint}");
+        assert_eq!(hint.lines().count(), 1, "{hint}");
+
+        // An unreadable marker there is reported on the same reply.
+        std::fs::write(&marker, b"{ not json").expect("bad marker");
+        let parsed = memories_for_file_reply(&store, "probe", &file, None).await;
+        assert_eq!(
+            parsed["resolved_from"],
+            serde_json::json!("outside"),
+            "{parsed}"
+        );
+        let warning = parsed["root_hint"].as_str().expect("root_hint");
+        assert!(warning.starts_with("Warning:"), "{warning}");
+        assert!(warning.contains("config.json"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn root_show_hint_when_marker_and_cache_differ() {
+        let (_tmp, repo, file, store) = marked_repo(
+            "probe",
+            Some("sub"),
+            Some(br#"{"version":1,"namespace":"probe"}"#),
+        )
+        .await;
+        let parsed = memories_for_file_reply(&store, "probe", &file, None).await;
+        assert_eq!(
+            parsed["resolved_path"],
+            serde_json::json!("a.rs"),
+            "{parsed}"
+        );
+        assert_eq!(
+            parsed["resolved_from"],
+            serde_json::json!("registry_root"),
+            "{parsed}"
+        );
+        let hint = parsed["root_hint"].as_str().expect("root_hint");
+        assert!(hint.contains("neurostrata-mcp root show"), "{hint}");
+        assert!(hint.contains(&repo.to_string_lossy().to_string()), "{hint}");
+        assert_eq!(hint.lines().count(), 1, "{hint}");
+    }
+
+    #[tokio::test]
+    async fn unreadable_marker_warns_and_lookup_unchanged() {
+        let (_tmp, repo, file, store) = marked_repo("probe", Some(""), None).await;
+        let caller = repo.join("sub");
+        let caller_s = caller.to_string_lossy().to_string();
+        let before = memories_for_file_reply(&store, "probe", &file, Some(&caller)).await;
+        let no_marker = lookup_marker(&store, "probe", &file).await;
+        let (forms_before, _) =
+            lookup_path_for(&store, "probe", &file, Some(&caller_s), &no_marker).await;
+        let (_, forms_before) = forms_before.expect("lookup");
+        std::fs::create_dir_all(repo.join(".NeuroStrata")).expect("marker dir");
+        let marker = repo.join(".NeuroStrata").join("config.json");
+        std::fs::write(&marker, b"{ not json").expect("bad marker");
+        let after = memories_for_file_reply(&store, "probe", &file, Some(&caller)).await;
+        assert_eq!(after["resolved_path"], before["resolved_path"], "{after}");
+        assert_eq!(after["resolved_from"], before["resolved_from"], "{after}");
+        assert_eq!(after["resolved_path"], serde_json::json!("a.rs"), "{after}");
+        let warning = after["root_hint"].as_str().expect("root_hint");
+        assert!(warning.starts_with("Warning:"), "{warning}");
+        // The file is named (its separators may mix on Windows).
+        assert!(
+            warning
+                .replace('\\', "/")
+                .contains(&marker.to_string_lossy().replace('\\', "/")),
+            "{warning}"
+        );
+        assert_eq!(warning.lines().count(), 1, "{warning}");
+        // The forms are today's too: read with the marker on disk, which a
+        // valid marker of this namespace would change (it puts `sub/a.rs`
+        // first).
+        let bad = lookup_marker(&store, "probe", &file).await;
+        assert!(bad.found.is_none() && bad.exists);
+        let (forms_after, note) =
+            lookup_path_for(&store, "probe", &file, Some(&caller_s), &bad).await;
+        let (_, forms_after) = forms_after.expect("lookup");
+        assert_eq!(forms_after, forms_before);
+        assert!(note.as_deref().is_some_and(|n| n.starts_with("Warning:")));
+        std::fs::write(&marker, br#"{"version":1,"namespace":"probe"}"#).expect("good marker");
+        let good = lookup_marker(&store, "probe", &file).await;
+        let (forms_good, _) = lookup_path_for(&store, "probe", &file, Some(&caller_s), &good).await;
+        let (_, forms_good) = forms_good.expect("lookup");
+        assert_eq!(forms_good[0], "sub/a.rs", "{forms_good:?}");
+        assert_ne!(forms_good, forms_before);
+    }
+
+    /// A file node `rel` in namespace `probe`, governed by the memory `rule_id`.
+    async fn govern_file(store: &Arc<dyn VectorStore>, rule_id: &str, rel: &str) {
+        let lb = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::ladybug::LadybugStore>()
+            .expect("ladybug store");
+        let (rule_id, rel) = (rule_id.to_string(), rel.to_string());
+        lb.with_conn(move |conn| {
+            conn.query(&format!(
+                "CREATE (m:Memory {{id: '{rel}', namespace: 'probe', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'a', location: '{rel}', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0]}})"
+            ))?;
+            conn.query(&format!(
+                "MERGE (a:Memory {{id: '{rule_id}'}}), (b:Memory {{id: '{rel}'}}) MERGE (a)-[r:GOVERNS {{source: 'test', valid_from: 0, valid_to: 0, generation: 0, extractor: 'test', evidence_id: 'e', origin: 'local'}}]->(b)"
+            ))?;
+            Ok(())
+        })
+        .await
+        .expect("seed file and edge");
+    }
+
+    /// The one rule `marked_repo` seeded.
+    async fn the_rule(store: &Arc<dyn VectorStore>) -> String {
+        store
+            .list("probe", None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .next()
+            .expect("the rule")
+            .id
+    }
+
+    fn memory_ids(parsed: &Value) -> Vec<String> {
+        parsed["memories"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn marker_spelling_is_primary_and_a_row_stored_below_the_caller_root_is_still_found() {
+        // Ingested earlier from `<repo>/sub`, so the file node is `a.rs`.
+        let (_tmp, repo, file, store) = marked_repo(
+            "probe",
+            Some(""),
+            Some(br#"{"version":1,"namespace":"probe"}"#),
+        )
+        .await;
+        let rule = the_rule(&store).await;
+        govern_file(&store, &rule, "a.rs").await;
+        let parsed = memories_for_file_reply(&store, "probe", &file, Some(&repo.join("sub"))).await;
+        assert_eq!(
+            parsed["resolved_path"],
+            serde_json::json!("sub/a.rs"),
+            "{parsed}"
+        );
+        assert_eq!(
+            parsed["resolved_from"],
+            serde_json::json!("root_config"),
+            "{parsed}"
+        );
+        assert!(memory_ids(&parsed).contains(&rule), "{parsed}");
+    }
+
+    #[tokio::test]
+    async fn outside_reply_keeps_the_marker_and_cache_mismatch_hint() {
+        // The cached root is `<tmp>/repo`; the file is in another checkout
+        // whose marker names this namespace.
+        let (tmp, repo, _file, store) = marked_repo("probe", Some(""), None).await;
+        let other = dunce::canonicalize(tmp.path())
+            .expect("canonical")
+            .join("new-repo");
+        std::fs::create_dir_all(other.join(".git")).expect("other .git");
+        std::fs::create_dir_all(other.join(".NeuroStrata")).expect("marker dir");
+        std::fs::write(
+            other.join(".NeuroStrata").join("config.json"),
+            br#"{"version":1,"namespace":"probe"}"#,
+        )
+        .expect("marker");
+        std::fs::write(other.join("b.rs"), "fn b() {}").expect("source");
+        let file = other.join("b.rs").to_string_lossy().to_string();
+
+        let parsed = memories_for_file_reply(&store, "probe", &file, None).await;
+        assert_eq!(
+            parsed["resolved_from"],
+            serde_json::json!("outside"),
+            "{parsed}"
+        );
+        assert!(parsed.get("error").is_some(), "{parsed}");
+        let hint = parsed["root_hint"].as_str().expect("root_hint");
+        assert!(hint.contains("neurostrata-mcp root show"), "{hint}");
+        assert!(hint.contains(&repo.to_string_lossy().to_string()), "{hint}");
+    }
+
+    fn found_at(root: &std::path::Path, via: crate::root_marker::FoundVia) -> LookupMarker {
+        LookupMarker {
+            found: Some(crate::root_marker::FoundMarker {
+                root: root.to_path_buf(),
+                config: crate::root_marker::RootConfig::new("probe"),
+                via,
+            }),
+            note: None,
+            exists: true,
+        }
+    }
+
+    #[test]
+    fn marker_use_notes() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let repo = dunce::canonicalize(tmp.path()).expect("canonical");
+        let elsewhere = repo.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        let marker = found_at(&repo, crate::root_marker::FoundVia::OwnCheckout);
+        let repo_s = repo.to_string_lossy().to_string();
+        let used = marker_use(&marker, Some(&repo_s), true, "probe");
+        assert!(used.spelling.is_some() && used.note.is_none());
+        // No cached root: the note asks for hooks install.
+        let used = marker_use(&marker, None, true, "probe");
+        assert!(used.spelling.is_none());
+        assert!(used.note.expect("note").contains("hooks install"));
+        // A cached root that could not be read is not "no cached root".
+        let used = marker_use(&marker, None, false, "probe");
+        assert!(used.spelling.is_none() && used.note.is_none());
+        let used = marker_use(&marker, Some(&elsewhere.to_string_lossy()), true, "probe");
+        assert!(used.note.expect("note").contains("root show"));
+    }
+
+    #[test]
+    fn worktree_mismatch_hint_names_the_main_checkout_spelling() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let base = dunce::canonicalize(tmp.path()).expect("canonical");
+        let repo = base.join("repo");
+        let admin = repo.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&admin).expect("admin");
+        std::fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+        std::fs::write(admin.join("commondir"), "../..\n").expect("commondir");
+        // A main checkout holds more than its `.git`.
+        std::fs::create_dir_all(repo.join("src")).expect("main src");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).expect("wt");
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", admin.to_string_lossy()),
+        )
+        .expect("gitfile");
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).expect("other");
+        let marker = found_at(&wt, crate::root_marker::FoundVia::MainCheckout);
+        // Cached at the worktree itself: the spelling applies.
+        let used = marker_use(&marker, Some(&wt.to_string_lossy()), true, "probe");
+        assert!(used.spelling.is_some(), "worktree cached root");
+        let note = marker_use(&marker, Some(&other.to_string_lossy()), true, "probe")
+            .note
+            .expect("note");
+        assert!(note.contains(&repo.to_string_lossy().to_string()), "{note}");
+        assert!(!note.contains(&wt.to_string_lossy().to_string()), "{note}");
+    }
+
+    #[tokio::test]
+    async fn marker_owner_exact_spelling_wins() {
+        let (_tmp, _repo, file, store) = marked_repo(
+            "probe",
+            Some(""),
+            Some(br#"{"version":1,"namespace":"Probe"}"#),
+        )
+        .await;
+        assert!(matches!(
+            marker_owner(&store, "probe", "PROBE").await,
+            MarkerOwner::Same
+        ));
+        // Without a stored `Probe`, the marker is this namespace's.
+        assert!(lookup_marker(&store, "probe", &file).await.found.is_some());
+
+        store.init("Probe").await.expect("second namespace");
+        let id = uuid::Uuid::new_v4().to_string();
+        let vector = StubEmbedder.embed("x").await.unwrap();
+        store
+            .upsert("Probe", &id, vector, payload("x"))
+            .await
+            .expect("seed Probe");
+        match marker_owner(&store, "probe", "Probe").await {
+            MarkerOwner::Other(owner) => assert_eq!(owner, "Probe"),
+            _ => panic!("a stored namespace spelled as the marker owns it"),
+        }
+        // context_plan and related read the marker the same way.
+        let marker = lookup_marker(&store, "probe", &file).await;
+        assert!(marker.found.is_none());
+        assert!(marker
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("belongs to namespace Probe")));
+    }
+
+    #[tokio::test]
+    async fn related_keeps_todays_seed_first_and_falls_back_to_the_marker_spelling() {
+        let _related_guard = crate::server::related_traversal_test_lock();
+        let (_tmp, repo, file, store) = marked_repo(
+            "probe",
+            Some(""),
+            Some(br#"{"version":1,"namespace":"probe"}"#),
+        )
+        .await;
+        let seed_file = |rel: &str| {
+            let mut p = payload("pub fn a() {}");
+            p.user_id = "u".to_string();
+            p.memory_type = "structural".to_string();
+            p.agent_name = Some("a".to_string());
+            p.metadata = serde_json::json!({"locations":[{"path": rel}]});
+            p
+        };
+        let args = serde_json::json!({
+            "namespace": "probe",
+            "id": file,
+            "project_root": repo.join("sub").to_string_lossy(),
+            "max_hops": 1,
+        });
+        // Only the marker spelling is stored: the seed falls back to it.
+        store
+            .upsert(
+                "probe",
+                "file:sub/a.rs",
+                vec![0.0; 4],
+                seed_file("sub/a.rs"),
+            )
+            .await
+            .expect("seed");
+        let v: Value =
+            serde_json::from_str(&handle_related(args.clone(), store.clone()).await).unwrap();
+        assert_eq!(
+            v["resolved_seed"],
+            serde_json::json!("file:sub/a.rs"),
+            "{v}"
+        );
+        // Both stored: today's spelling (below the caller's root) still wins.
+        store
+            .upsert("probe", "file:a.rs", vec![0.0; 4], seed_file("a.rs"))
+            .await
+            .expect("seed");
+        let v: Value = serde_json::from_str(&handle_related(args, store.clone()).await).unwrap();
+        assert_eq!(v["resolved_seed"], serde_json::json!("file:a.rs"), "{v}");
+    }
+
+    #[test]
+    fn related_order_puts_the_marker_spelling_last() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let repo = dunce::canonicalize(tmp.path())
+            .expect("canonical")
+            .join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect(".git");
+        std::fs::create_dir_all(repo.join("sub")).expect("sub");
+        std::fs::write(repo.join("sub").join("a.rs"), "").expect("file");
+        let file = repo.join("sub").join("a.rs").to_string_lossy().to_string();
+        let marker = found_at(&repo, crate::root_marker::FoundVia::OwnCheckout);
+        let found = marker.found.as_ref();
+        let sub_s = repo.join("sub").to_string_lossy().to_string();
+        let repo_s = repo.to_string_lossy().to_string();
+        let lookup = |marker, order| {
+            lookup_path_with_registry_root(&file, Some(&sub_s), Some(&repo_s), marker, order)
+                .expect("lookup")
+        };
+        let (_, today) = lookup(None, MarkerOrder::First);
+        let (resolved, last) = lookup(found, MarkerOrder::Last);
+        assert_eq!(resolved.path, "a.rs");
+        assert_eq!(last[..today.len()], today[..]);
+        assert_eq!(
+            last.last().map(String::as_str),
+            Some("sub/a.rs"),
+            "{last:?}"
+        );
+        let (resolved, first) = lookup(found, MarkerOrder::First);
+        assert_eq!(resolved.path, "sub/a.rs");
+        assert_eq!(first[0], "sub/a.rs");
+    }
+
+    #[tokio::test]
+    async fn context_plan_finds_the_governing_rule_with_any_marker() {
+        let (_tmp, repo, file, store) = marked_repo("probe", Some(""), None).await;
+        let rule = the_rule(&store).await;
+        govern_file(&store, &rule, "sub/a.rs").await;
+        let marker = repo.join(".NeuroStrata").join("config.json");
+        std::fs::create_dir_all(repo.join(".NeuroStrata")).expect("marker dir");
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        for text in [
+            &br#"{"version":1,"namespace":"probe"}"#[..],
+            &br#"{"version":1,"namespace":"other"}"#[..],
+            &b"{ not json"[..],
+        ] {
+            std::fs::write(&marker, text).expect("marker");
+            let out = handle_context_plan(
+                &serde_json::json!({
+                    "namespace": "probe",
+                    "files": [file.clone()],
+                    "max_items": 20,
+                }),
+                emb.clone(),
+                store.clone(),
+            )
+            .await;
+            let v: Value = serde_json::from_str(&out).expect("context_plan json");
+            let ids: Vec<&str> = v["items"]
+                .as_array()
+                .expect("items")
+                .iter()
+                .filter_map(|it| it["id"].as_str())
+                .collect();
+            assert!(
+                ids.contains(&rule.as_str()),
+                "marker {}: {v}",
+                String::from_utf8_lossy(text)
+            );
+        }
     }
 
     /// Hooks send the absolute path of the file being touched (Claude Code's
@@ -24405,20 +25364,19 @@ mod context_plan_tests {
                 .expect("upsert governing rule");
         }
 
-        let _instrumentation = super::context_plan_benchmark_instrumentation::enable();
-        super::context_plan_benchmark_instrumentation::begin_request();
-        let result = handle_context_plan(
-            &serde_json::json!({
-                "namespace": "ns",
-                "query": "rule",
-                "files": ["src/one.rs", abs1, "src/two.rs", abs2],
-                "max_items": 20,
-            }),
-            embedder.clone(),
-            store.clone(),
-        )
-        .await;
-        let snap = super::context_plan_benchmark_instrumentation::snapshot();
+        let (result, measured) =
+            super::context_plan_benchmark_instrumentation::measure(handle_context_plan(
+                &serde_json::json!({
+                    "namespace": "ns",
+                    "query": "rule",
+                    "files": ["src/one.rs", abs1, "src/two.rs", abs2],
+                    "max_items": 20,
+                }),
+                embedder.clone(),
+                store.clone(),
+            ))
+            .await;
+        let snap = measured.snapshot;
         let plan: serde_json::Value = serde_json::from_str(&result).expect("plan json");
 
         // Registry root is read once per request, not once per requested file.
@@ -24678,19 +25636,19 @@ mod context_plan_tests {
             })
         );
 
-        let _instrumentation = super::context_plan_benchmark_instrumentation::enable();
         let mut measured_ms = Vec::with_capacity(MEASURED_ITERATIONS);
         let mut expected_counts: Option<serde_json::Value> = None;
         for iteration in 0..(WARMUP_ITERATIONS + MEASURED_ITERATIONS) {
-            super::context_plan_benchmark_instrumentation::begin_request();
             let started = Instant::now();
-            let result =
-                handle_context_plan(&arguments, embedder.clone(), vector_store.clone()).await;
+            let (result, measured) = super::context_plan_benchmark_instrumentation::measure(
+                handle_context_plan(&arguments, embedder.clone(), vector_store.clone()),
+            )
+            .await;
             let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-            let counts = super::context_plan_benchmark_instrumentation::snapshot();
+            let counts = measured.snapshot;
             let plan: serde_json::Value = serde_json::from_str(&result).expect("plan JSON");
             assert!(plan["items"].is_array(), "context plan must contain items");
-            let enriched = super::context_plan_benchmark_instrumentation::logical_files_enriched();
+            let enriched = measured.logical_files_enriched;
             let missing: Vec<&String> = logical_files
                 .iter()
                 .filter(|path| !enriched.contains(*path))
@@ -24698,9 +25656,12 @@ mod context_plan_tests {
             if !missing.is_empty() {
                 use crate::traits::GraphRead;
                 for path in &missing {
-                    let (_lookup, forms) = lookup_path_for(&vector_store, NAMESPACE, path, None)
-                        .await
-                        .expect("benchmark diagnostic lookup_path_for");
+                    let marker = lookup_marker(&vector_store, NAMESPACE, path).await;
+                    let (_lookup, forms) =
+                        lookup_path_for(&vector_store, NAMESPACE, path, None, &marker)
+                            .await
+                            .0
+                            .expect("benchmark diagnostic lookup_path_for");
                     for form in forms {
                         let hits = store
                             .memories_for_file(

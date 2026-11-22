@@ -2383,6 +2383,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             None
         }
     };
+    let hint_root = explicit_root.clone().or_else(|| session_root.clone());
     if let Some(root) = session_root {
         let golden = collect_golden_rules(&store, &namespace, None).await;
         persist_active_session_file(&root, &namespace, &golden, Some((&id, &task.payload)));
@@ -2404,7 +2405,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
-    encode(&json!({
+    let mut reply = json!({
         "id": id,
         "namespace": namespace,
         "status": task.status().as_str(),
@@ -2413,7 +2414,14 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         "task": task_summary(&id, &task.payload),
         "auto_retrieved_context": hits_json,
         "subagent_prompt_injection": subagent_prompt,
-    }))
+    });
+    if let Some(hint) = hint_root
+        .as_deref()
+        .and_then(|root| crate::root_marker::root_hint(&namespace, root))
+    {
+        reply["root_hint"] = json!(hint);
+    }
+    encode(&reply)
 }
 
 // ── tool: neurostrata_task_update ──────────────────────────────────────────
@@ -3819,11 +3827,10 @@ pub async fn handle_bootstrap(
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let root = std::path::Path::new(project_root);
-    let harness_plugins = harness_plugins::auto_install_detected_plugins(
-        root,
-        harness_plugins::ConfigNamespace::Set(&namespace),
-        arg_str(&args, "harness"),
-    );
+    let root_marker =
+        crate::root_marker::ensure_marker_for_setup(&store, Some(&emb), root, Some(&namespace))
+            .await;
+    let harness_plugins = setup_plugins(&root_marker, root, &namespace, arg_str(&args, "harness"));
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
     let hook_installed = verified["hook_installed"].as_bool().unwrap_or(false);
 
@@ -3920,7 +3927,61 @@ pub async fn handle_bootstrap(
         "wiring": wiring_block,
         "verified": verified,
         "rule": "Zero-Action Start is now active: no file edits without a claimed task.",
+        "root_marker": root_marker.to_json(&namespace, root),
+        "root_hint": root_marker.message(&namespace, root),
     }))
+}
+
+/// Setup's plugin install, skipped when another namespace's marker owns the
+/// folder (a plugin config naming this namespace would disagree with it).
+fn setup_plugins(
+    root_marker: &crate::root_marker::SetupMarker,
+    root: &std::path::Path,
+    namespace: &str,
+    harness: Option<&str>,
+) -> Value {
+    if root_marker.installs_plugins() {
+        harness_plugins::auto_install_detected_plugins(
+            root,
+            harness_plugins::ConfigNamespace::Set(namespace),
+            harness,
+        )
+    } else {
+        json!({ "skipped": true, "reason": root_marker.message(namespace, root) })
+    }
+}
+
+/// Records the wires and triggers this build knows in the registry row's
+/// doctor_state (a locked merge, so a concurrent root or domain write is
+/// kept) and returns the ones recorded before.
+async fn record_setup_doctor_state(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut fields = Map::new();
+    fields.insert(
+        "configured_wires".to_string(),
+        json!(crate::task::wiring::known_wire_ids()),
+    );
+    fields.insert(
+        "configured_fires_on".to_string(),
+        json!(crate::task::wiring::VALID_FIRES_ON),
+    );
+    let previous = crate::registry::merge_doctor_state_fields(store, namespace, fields)
+        .await
+        .unwrap_or(Value::Null);
+    let strings = |key: &str| -> Vec<String> {
+        previous
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    (strings("configured_wires"), strings("configured_fires_on"))
 }
 
 // ── the wiring panel (docs/design-wiring-panel.md) ─────────────────────────
@@ -3952,22 +4013,9 @@ fi
 # (`neurostrata-mcp namespace resolve`); a failed lookup blocks the push.
 # The folder name, the namespace this gate checked before, is gated too.
 NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo "error: neurostrata-mcp namespace resolve failed — gate NOT run for this push (an older neurostrata-mcp without the namespace resolve command is a likely cause: upgrade it)" >&2; exit 1; }
-CHECKOUT_ROOT=$(git rev-parse --show-toplevel)
 FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 GATE_NAMESPACES=("$NAMESPACE")
 [ "$FOLDER_NAMESPACE" = "$NAMESPACE" ] || GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
-
-# A split marker (packages/api/.NeuroStrata/config.json -> Api) names a
-# namespace plugins claim tasks in. Enumerate nested-marker namespaces from
-# the CLI so their tasks reach the gate too; a failed lookup blocks the push.
-NESTED_NAMESPACES=$(neurostrata-mcp namespace gate-namespaces "$CHECKOUT_ROOT") || { echo "error: neurostrata-mcp namespace gate-namespaces failed — gate NOT run for this push" >&2; exit 1; }
-for NESTED_NAMESPACE in $NESTED_NAMESPACES; do
-    ALREADY=0
-    for GATE_NAMESPACE in "${GATE_NAMESPACES[@]}"; do
-        [ "$GATE_NAMESPACE" = "$NESTED_NAMESPACE" ] && ALREADY=1
-    done
-    [ "$ALREADY" -eq 1 ] || GATE_NAMESPACES+=("$NESTED_NAMESPACE")
-done
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
 # --strict maps an unavailable database to a blocking exit too, so a 1
@@ -4004,7 +4052,7 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 24c563b61cd80b638dd53f421d301cd739b16391d775fda31296dbd812827642
+# neurostrata-hook-sha256: 5a3b7ea2ec3f8b14761ee1a4efe8dc985a16706e8a18c820064fb5c52ac49e9c
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -4295,13 +4343,9 @@ if [ ! -f "$LEDGER" ]; then
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
-    # rewrite holds the same cross-process lock as the daemon's ledger writer,
-    # uses a unique EXCLUSIVE temp file (a planted symlink cannot be followed),
-    # keeps the original mode, and wraps legacy bare-array ledgers. An
-    # unparseable ledger or a missing node/python3 leaves the file as it is.
+    # rewrite goes through a temporary file and a rename; an unparseable
+    # ledger or a missing node/python3 leaves the file as it is.
     export LEDGER NAMESPACE
-    exec 9>"$LEDGER.lock" 2>/dev/null || true
-    command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
@@ -4309,20 +4353,16 @@ elif [ -n "$RESOLVED" ]; then
           const ns = process.env.NAMESPACE;
           let parsed;
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
-          const doc = Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed;
-          if (!doc || typeof doc !== "object") process.exit(0);
-          if (doc.namespace === ns) process.exit(0);
-          doc.namespace = ns;
-          const tmp = ledger + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
-          let mode;
-          try { mode = fs.statSync(ledger).mode; } catch {}
-          fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-          if (mode !== undefined) { try { fs.chmodSync(tmp, mode); } catch {} }
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) process.exit(0);
+          if (parsed.namespace === ns) process.exit(0);
+          parsed.namespace = ns;
+          const tmp = ledger + ".tmp-" + process.pid;
+          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + "\n");
           fs.renameSync(tmp, ledger);
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
-import json, os, sys, stat
+import json, os, sys
 ledger = os.environ["LEDGER"]
 ns = os.environ["NAMESPACE"]
 try:
@@ -4330,30 +4370,16 @@ try:
         parsed = json.load(f)
 except Exception:
     sys.exit(0)
-doc = {"namespace": ns, "queries": parsed} if isinstance(parsed, list) else parsed
-if not isinstance(doc, dict) or doc.get("namespace") == ns:
+if not isinstance(parsed, dict) or parsed.get("namespace") == ns:
     sys.exit(0)
-doc["namespace"] = ns
-tmp = f"{ledger}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
-fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-try:
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(doc, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    try:
-        os.chmod(tmp, stat.S_IMODE(os.stat(ledger).st_mode))
-    except OSError:
-        pass
-    os.replace(tmp, ledger)
-except Exception:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
+parsed["namespace"] = ns
+tmp = ledger + ".tmp-" + str(os.getpid())
+with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+    json.dump(parsed, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, ledger)
 ' 2>/dev/null || true
     fi
-    command -v flock >/dev/null 2>&1 && flock -u 9 2>/dev/null || true
-    exec 9>&- 2>/dev/null || true
 fi
 
 
@@ -5190,11 +5216,10 @@ pub async fn handle_task_setup(
     if !root.is_dir() {
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
-    let harness_plugins = harness_plugins::auto_install_detected_plugins(
-        root,
-        harness_plugins::ConfigNamespace::Set(&namespace),
-        arg_str(&args, "harness"),
-    );
+    let root_marker =
+        crate::root_marker::ensure_marker_for_setup(&store, Some(&emb), root, Some(&namespace))
+            .await;
+    let harness_plugins = setup_plugins(&root_marker, root, &namespace, arg_str(&args, "harness"));
 
     let scan = detect_project(root);
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
@@ -5399,35 +5424,7 @@ pub async fn handle_task_setup(
         }
     }
 
-    let rid = crate::registry::registry_row_id(&namespace);
-    let mut prev_wires: Vec<String> = Vec::new();
-    let mut prev_fires: Vec<String> = Vec::new();
-    if let Ok(Some((reg_vec, mut reg_payload))) = store.get(&namespace, &rid).await {
-        if let Some(ds) = reg_payload.metadata.get("doctor_state") {
-            if let Some(arr) = ds.get("configured_wires").and_then(|v| v.as_array()) {
-                prev_wires = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect();
-            }
-            if let Some(arr) = ds.get("configured_fires_on").and_then(|v| v.as_array()) {
-                prev_fires = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect();
-            }
-        }
-        if let Some(obj) = reg_payload.metadata.as_object_mut() {
-            let mut ds = obj
-                .get("doctor_state")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            ds["configured_wires"] = json!(crate::task::wiring::known_wire_ids());
-            ds["configured_fires_on"] = json!(crate::task::wiring::VALID_FIRES_ON);
-            obj.insert("doctor_state".to_string(), ds);
-        }
-        let _ = store.upsert(&namespace, &rid, reg_vec, reg_payload).await;
-    }
+    let (prev_wires, prev_fires) = record_setup_doctor_state(&store, &namespace).await;
     let (new_auto, new_rem, new_fires) =
         crate::task::wiring::compute_lifecycle_delta(&prev_wires, &prev_fires);
     let lifecycle_delta = json!({
@@ -5457,6 +5454,8 @@ pub async fn handle_task_setup(
         "verified": verified,
         "lifecycle_delta": lifecycle_delta,
         "harness_plugins": harness_plugins,
+        "root_marker": root_marker.to_json(&namespace, root),
+        "root_hint": root_marker.message(&namespace, root),
     }))
 }
 
@@ -6070,7 +6069,7 @@ mod tests {
         let scratch =
             std::env::temp_dir().join(format!("ns-scratch-hint-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&scratch).unwrap();
-        assert_eq!(walk_to_worktree_marker(&scratch), None);
+        assert!(!scratch.join(".git").exists() && !scratch.join(".NeuroStrata").exists());
         let worktree =
             std::env::temp_dir().join(format!("ns-real-worktree-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(worktree.join(".git")).unwrap();
@@ -8258,6 +8257,67 @@ mod tests {
         assert_eq!(
             stamped(without).await,
             (json!(main_scope.branch), json!(main_scope.worktree))
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_from_linked_worktree_keeps_worktree_scope() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        let linked = base.join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&main, &["init", "-b", "main"]);
+        git(&main, &["commit", "--allow-empty", "-m", "init"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &main);
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "linked work", 2).await;
+        let reply = handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": "ses_linked",
+                "project_root": linked.to_string_lossy(),
+            }),
+            store.clone(),
+        )
+        .await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+
+        let expected = gate::GateScope::capture(&linked);
+        assert_eq!(expected.branch.as_deref(), Some("feature/linked"));
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
+        assert_eq!(
+            payload.metadata["task"]["worktree"],
+            json!(expected.worktree)
         );
     }
 
@@ -12034,5 +12094,131 @@ mod tests {
             prompt.contains("NOT DEFINITION: does not apply to rootless podman sockets"),
             "governing memory in task view must emit boundary: {prompt}"
         );
+    }
+
+    // ── setup writes the project marker (root-marker spec 6.4) ───────────
+
+    #[tokio::test]
+    async fn task_setup_returns_root_hint_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("example-project");
+        std::fs::create_dir_all(repo.join(".git").join("hooks")).unwrap();
+        let store = store_with_namespace("webproj").await;
+        let call = || {
+            handle_task_setup(
+                json!({ "namespace": "webproj", "project_root": repo.to_string_lossy() }),
+                emb(),
+                store.clone(),
+            )
+        };
+
+        let parsed: Value = serde_json::from_str(&call().await).expect("json reply");
+        assert_eq!(parsed["root_marker"]["kind"], json!("written"), "{parsed}");
+        assert_eq!(parsed["root_marker"]["root"], json!(repo.to_string_lossy()));
+        let hint = parsed["root_hint"].as_str().expect("a hint line");
+        assert!(
+            hint.starts_with("Wrote ") && hint.contains("webproj"),
+            "{hint}"
+        );
+        assert!(repo.join(".NeuroStrata").join("config.json").exists());
+        // Existing fields are still there.
+        assert!(parsed["harness_plugins"].is_object() && parsed["instructions"].is_array());
+        assert_eq!(
+            crate::registry::cached_project_root(&store, "webproj")
+                .await
+                .unwrap(),
+            Some(repo.to_string_lossy().into_owned())
+        );
+
+        // A second setup reuses the marker; the hint field is null, not absent.
+        let parsed: Value = serde_json::from_str(&call().await).expect("json reply");
+        assert_eq!(parsed["root_marker"]["kind"], json!("reused"));
+        assert_eq!(parsed.get("root_hint"), Some(&Value::Null));
+
+        // Another namespace's marker: nothing written, plugins skipped.
+        let other = base.join("other");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        std::fs::create_dir_all(other.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            other.join(".NeuroStrata").join("config.json"),
+            br#"{"version":1,"namespace":"other-project"}"#,
+        )
+        .unwrap();
+        let reply = handle_task_setup(
+            json!({ "namespace": "webproj", "project_root": other.to_string_lossy() }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["root_marker"]["kind"], json!("other_namespace"));
+        assert_eq!(parsed["harness_plugins"]["skipped"], json!(true));
+        assert!(parsed["root_hint"]
+            .as_str()
+            .unwrap()
+            .contains("other-project"));
+        assert!(!other.join(".NeuroStrata").join("plugins").exists());
+
+        // Bootstrap carries the same two fields.
+        let fresh = base.join("fresh");
+        std::fs::create_dir_all(fresh.join(".git")).unwrap();
+        let reply = handle_bootstrap(
+            json!({ "namespace": "webproj2", "project_root": fresh.to_string_lossy() }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["root_marker"]["kind"], json!("written"), "{parsed}");
+        assert!(parsed["root_hint"].is_string());
+    }
+
+    #[tokio::test]
+    async fn task_setup_doctor_state_keeps_concurrent_project_root() {
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let wires: Vec<String> = crate::task::wiring::known_wire_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for i in 0..20 {
+            let store = crate::registry::tests::yield_store();
+            crate::registry::cache_project_root(
+                &store,
+                Some(&emb),
+                "example-project",
+                "/example/old",
+            )
+            .await;
+            let root = std::path::PathBuf::from(format!("/example/new-{i}"));
+            let ((prev_wires, _), _) = tokio::join!(
+                record_setup_doctor_state(&store, "example-project"),
+                crate::registry::set_project_root(&store, Some(&emb), "example-project", &root),
+            );
+            assert!(prev_wires.is_empty(), "round {i}");
+            assert_eq!(
+                crate::registry::cached_project_root(&store, "example-project")
+                    .await
+                    .unwrap(),
+                Some(root.to_string_lossy().into_owned()),
+                "round {i}: the root"
+            );
+            let (_, payload) = store
+                .get(
+                    "example-project",
+                    &crate::registry::registry_row_id("example-project"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                payload.metadata["doctor_state"]["configured_wires"],
+                json!(wires),
+                "round {i}: the doctor state"
+            );
+            // A second setup sees what the first recorded.
+            let (prev_wires, _) = record_setup_doctor_state(&store, "example-project").await;
+            assert_eq!(prev_wires, wires, "round {i}");
+        }
     }
 }

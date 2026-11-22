@@ -2301,6 +2301,7 @@ mod tests {
         // A real main checkout's .git holds HEAD; the worktree resolves the
         // main checkout through it.
         std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(dir.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
         let wt = dir.join(".claude").join("worktrees").join("agent-1");
         let gitdir = dir.join(".git").join("worktrees").join("agent-1");
         std::fs::create_dir_all(&gitdir).unwrap();
