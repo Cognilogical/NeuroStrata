@@ -7540,6 +7540,18 @@ fn is_valid_relation_name(name: &str) -> bool {
 /// the query text, so this is what bounds how large that text can get.
 const RELINK_BATCH: usize = 500;
 
+type EdgeCitations = std::collections::HashMap<(String, String), (String, Value)>;
+
+struct EdgeReplay<'a> {
+    namespace: &'a str,
+    generation: u64,
+    now: i64,
+    extractor: &'a str,
+    /// Present for a vault declaration: the binding and its citation share an
+    /// evidence id and the extractor reconciliation owns.
+    citations: Option<&'a EdgeCitations>,
+}
+
 /// Replays one relationship type in a couple of statements instead of one per
 /// edge.
 ///
@@ -7558,12 +7570,9 @@ fn create_missing_edges(
     conn: &Connection,
     rel_type: &str,
     pairs: &[(String, String)],
-    namespace: &str,
-    generation: u64,
-    now: i64,
-    extractor: &str,
+    replay: &EdgeReplay<'_>,
 ) -> Result<usize> {
-    let safe_extractor = escape_ladybug_string(extractor);
+    let safe_extractor = escape_ladybug_string(replay.extractor);
     if !is_valid_relation_name(rel_type) {
         anyhow::bail!(
             "invalid relation name for Cypher interpolation: {:?}",
@@ -7592,27 +7601,113 @@ fn create_missing_edges(
 
     let mut created = 0usize;
     for chunk in missing.chunks(RELINK_BATCH) {
+        // A cited chunk is the vault replay path: every endpoint was already
+        // checked against the namespace id set, so the edge carries the same
+        // evidence id as the citation written below.
+        let cited = replay
+            .citations
+            .is_some_and(|by_pair| chunk.iter().all(|pair| by_pair.contains_key(*pair)));
         let list = chunk
             .iter()
-            .map(|(from, to)| {
-                format!(
-                    "{{f: '{}', t: '{}'}}",
-                    escape_ladybug_string(from),
-                    escape_ladybug_string(to)
-                )
+            .map(|pair| {
+                if cited {
+                    let entry = &replay
+                        .citations
+                        .and_then(|by_pair| by_pair.get(*pair))
+                        .expect("cited chunk")
+                        .1;
+                    format!(
+                        "{{f: '{}', t: '{}', e: '{}'}}",
+                        escape_ladybug_string(&pair.0),
+                        escape_ladybug_string(&pair.1),
+                        escape_ladybug_string(
+                            entry
+                                .get("evidence_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                        )
+                    )
+                } else {
+                    format!(
+                        "{{f: '{}', t: '{}'}}",
+                        escape_ladybug_string(&pair.0),
+                        escape_ladybug_string(&pair.1)
+                    )
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");
 
         // Both ends must exist; a rule naming a file the ingester never reached
         // still produces nothing, exactly as before.
-        let safe_ns = escape_ladybug_string(namespace);
+        let safe_ns = escape_ladybug_string(replay.namespace);
+        let evidence = if cited { ", evidence_id: e.e" } else { "" };
         let query = format!(
-            "UNWIND [{}] AS e MATCH (a:Memory {{id: e.f}}), (b:Memory {{id: e.t}}) CREATE (a)-[:{} {{source: '{}', valid_from: {}, valid_to: 0, generation: {}, extractor: '{}'}}]->(b) RETURN count(*)",
-            list, rel_type, safe_ns, now, generation, safe_extractor
+            "UNWIND [{}] AS e MATCH (a:Memory {{id: e.f}}), (b:Memory {{id: e.t}}) CREATE (a)-[:{} {{source: '{}', valid_from: {}, valid_to: 0, generation: {}, extractor: '{}'{}}} ]->(b) RETURN count(*)",
+            list, rel_type, safe_ns, replay.now, replay.generation, safe_extractor, evidence
         );
         for row in conn.query(&query)? {
             created += format!("{}", row[0]).parse::<usize>().unwrap_or(0);
+        }
+    }
+
+    if let Some(by_pair) = replay.citations {
+        // The edge and its citation are one fact: only a replay that actually
+        // created the binding stamps its provenance.
+        let mut by_declarer: std::collections::HashMap<String, Vec<Value>> =
+            std::collections::HashMap::new();
+        for pair in &missing {
+            if let Some((declaring_id, entry)) = by_pair.get(*pair) {
+                by_declarer
+                    .entry(declaring_id.clone())
+                    .or_default()
+                    .push(entry.clone());
+            }
+        }
+        let safe_ns = escape_ladybug_string(replay.namespace);
+        for (declaring_id, entries) in by_declarer {
+            let safe_id = escape_ladybug_string(&declaring_id);
+            let read = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' RETURN m.metadata"
+            );
+            let mut rows = conn.query(&read)?;
+            let Some(row) = rows.next() else { continue };
+            let lbug::Value::String(meta_str) = &row[0] else {
+                continue;
+            };
+            let Ok(mut meta) = serde_json::from_str::<Value>(meta_str) else {
+                continue;
+            };
+            let Some(obj) = meta.as_object_mut() else {
+                continue;
+            };
+            let sources = obj
+                .entry("edge_sources".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if !sources.is_array() {
+                *sources = serde_json::json!([]);
+            }
+            let sources = sources.as_array_mut().expect("array");
+            let before = sources.len();
+            for entry in entries {
+                let cited = sources.iter().any(|existing| {
+                    existing.get("rel_type") == entry.get("rel_type")
+                        && existing.get("extractor") == entry.get("extractor")
+                        && existing.get("resolved_target") == entry.get("resolved_target")
+                });
+                if !cited {
+                    sources.push(entry);
+                }
+            }
+            if sources.len() != before {
+                if let Ok(new_meta) = serde_json::to_string(&meta) {
+                    let update = format!(
+                        "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' SET m.metadata = '{}'",
+                        escape_ladybug_string(&new_meta)
+                    );
+                    conn.query(&update)?;
+                }
+            }
         }
     }
 
@@ -12142,6 +12237,11 @@ impl VectorStore for LadybugStore {
         // the edge count.
         let mut wanted: std::collections::HashMap<&'static str, Vec<(String, String)>> =
             std::collections::HashMap::new();
+        // Vault declarations are replayed under the same ownership as their
+        // materialisation (`upsert`), so a later reconcile can retire them.
+        let mut vault_wanted: std::collections::HashMap<&'static str, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        let mut vault_citations: EdgeCitations = std::collections::HashMap::new();
         let mut by_suffix = 0usize;
         let mut mention_pairs: Vec<(String, String)> = Vec::new();
         let mut mention_updates: Vec<(String, String)> = Vec::new();
@@ -12178,7 +12278,19 @@ impl VectorStore for LadybugStore {
                 .get("exact_edge_targets")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            for edge in edge_specs(&memory.payload.metadata) {
+            let specs = edge_specs(&memory.payload.metadata);
+            // Built once per flagged declarer: the evidence id hashes the
+            // content, and every declaration on the row shares the same
+            // coordinates.
+            let provenance_source = (exact_edge_targets && !specs.is_empty()).then(|| {
+                EdgeProvenanceSource::from_row(
+                    &memory.payload.metadata,
+                    &memory.payload.location,
+                    &memory.payload.location_lines,
+                    &memory.payload.content,
+                )
+            });
+            for edge in specs {
                 let target = if exact_edge_targets {
                     match crate::parser::ingest::exact_target_match(
                         namespace,
@@ -12208,7 +12320,31 @@ impl VectorStore for LadybugStore {
                 } else {
                     (target, memory.id.clone())
                 };
-                wanted.entry(edge.rel_type).or_default().push(pair);
+                if let Some(source) = provenance_source.as_ref() {
+                    let orientation = if edge.points_at_target {
+                        "self_to_target"
+                    } else {
+                        "target_to_self"
+                    };
+                    let resolved_target = if edge.points_at_target {
+                        &pair.1
+                    } else {
+                        &pair.0
+                    };
+                    let (_, entry) = edge_provenance_entry(
+                        &memory.id,
+                        edge.rel_type,
+                        edge.declaration_index,
+                        &edge.target_id,
+                        resolved_target,
+                        orientation,
+                        source,
+                    );
+                    vault_citations.insert(pair.clone(), (memory.id.clone(), entry));
+                    vault_wanted.entry(edge.rel_type).or_default().push(pair);
+                } else {
+                    wanted.entry(edge.rel_type).or_default().push(pair);
+                }
             }
 
             // Mention linking (OxiRS §1.8): rediscover mentions against new index.
@@ -12251,6 +12387,7 @@ impl VectorStore for LadybugStore {
         }
 
         if wanted.is_empty()
+            && vault_wanted.is_empty()
             && active_paths.is_empty()
             && mention_pairs.is_empty()
             && mention_updates.is_empty()
@@ -12306,8 +12443,27 @@ impl VectorStore for LadybugStore {
             let _ = retire_replaced_stubs(conn, &namespace_owned, &active_paths)?;
             let mut created = 0usize;
             let relink_now = chrono::Utc::now().timestamp();
+            // Vault declarations first: a pair declared by both a flagged row
+            // and an ordinary row belongs to reconciliation.
+            let vault_replay = EdgeReplay {
+                namespace: &namespace_owned,
+                generation: active_gen,
+                now: relink_now,
+                extractor: "upsert",
+                citations: Some(&vault_citations),
+            };
+            for (rel_type, pairs) in &vault_wanted {
+                created += create_missing_edges(conn, rel_type, pairs, &vault_replay)?;
+            }
+            let relink_replay = EdgeReplay {
+                namespace: &namespace_owned,
+                generation: active_gen,
+                now: relink_now,
+                extractor: "relink",
+                citations: None,
+            };
             for (rel_type, pairs) in &wanted {
-                created += create_missing_edges(conn, rel_type, pairs, &namespace_owned, active_gen, relink_now, "relink")?;
+                created += create_missing_edges(conn, rel_type, pairs, &relink_replay)?;
             }
             // Only delete existing mention-detector edges if any are stale
             // (not present in the current mention_pairs set).
@@ -12334,7 +12490,18 @@ impl VectorStore for LadybugStore {
                 }
             }
             if !mention_pairs.is_empty() {
-                created += create_missing_edges(conn, "RELATES_TO", &mention_pairs, &namespace_owned, active_gen, relink_now, "mention-detector")?;
+                created += create_missing_edges(
+                    conn,
+                    "RELATES_TO",
+                    &mention_pairs,
+                    &EdgeReplay {
+                        namespace: &namespace_owned,
+                        generation: active_gen,
+                        now: relink_now,
+                        extractor: "mention-detector",
+                        citations: None,
+                    },
+                )?;
             }
             Ok(created)
         })

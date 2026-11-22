@@ -652,6 +652,69 @@ content version, `supersedes` stamp, or history row is created.
   and `declared_target` are labels carried positionally from the unchanged
   head's declaration list, not part of the replace key.
 
+### 3j. Replayed vault declarations belong to reconciliation
+
+#### Invariant
+
+A declaration belonging to a head carrying `exact_edge_targets` is
+materialised by `relink_edges` at the end of ingestion with
+`extractor = 'upsert'` — the same ownership as the import write path—not
+`'relink'`. Its `evidence_id` and `metadata.edge_sources` citation name the
+same binding with `extractor = 'upsert'`, so the row never cites a replayed
+edge under a different owner. Removing the WikiLink and reimporting therefore
+retires both the imported and replayed edges and their citations. Ordinary
+non-flagged replay edges keep `extractor = 'relink'`, and mention-detector
+edges keep `extractor = 'mention-detector'`; neither is reconciliation-owned
+or touched by a vault reconcile.
+
+#### Mechanism
+
+- The replay collection loop splits flags: a flagged row's resolved pairs go
+  into the vault batch together with an `edge_provenance_entry` built from
+  the stored head's coordinates; ordinary rows stay on the existing
+  `relink` batch. Flagged resolution itself is unchanged from §3d/§3e.
+- `create_missing_edges` takes an `EdgeReplay` owner descriptor. The vault
+  batch writes `extractor = 'upsert'` and the citation's `evidence_id` on
+  the edge, then stamps only the citations for pairs it actually created,
+  using the same `(rel_type, extractor, resolved_target)` replace key as
+  §3i. A repeat ingest that finds every edge present performs no metadata
+  write.
+- Vault pairs are processed before ordinary pairs, so a pair declared by both
+  a flagged row and an ordinary row is owned by reconciliation.
+- `reconcile_declared_edges` already deletes `extractor = 'upsert'` edges and
+  retires their provenance (§3a, §3h); it needs no new extractor because the
+  replay no longer mints a competing owner.
+
+#### Eval (failed on `bc83c12b`)
+
+- `reimport_retires_replayed_vault_declaration_edges`
+  - Import `a → ns::z` while only the bare alias `z` exists, so the first
+    import binds `a → z`. Seed an ordinary declarer whose target is also
+    absent (control).
+  - Create the literal `ns::z` and the control target through the memory API,
+    then run `relink_edges(ns, "code")`. Assert replay materialises
+    `a → ns::z` as `upsert` with a matching `edge_sources` citation, and the
+    control edge is an ordinary `relink` edge.
+  - Remove `a`'s WikiLink, reimport. Assert no `a` `RELATES_TO` edge remains
+    under any extractor, no `RELATES_TO` provenance remains, and the control
+    `relink` edge survives.
+  - On `bc83c12b` replay created `a → ns::z` as `relink`; reconciliation only
+    deletes `upsert`, so the removed link left the edge (and no citation)
+    live.
+
+#### Residual risk
+
+- An edge already created by a pre-fix replay keeps its `relink` owner; this
+  patch does not rewrite existing edges. The replay-ownership change ships in
+  the same unreleased stack as the replay path itself, so no deployed
+  database predates it; a row that did hit the intermediate build converges
+  when its declarer changes or the edge is replayed after removal.
+- Citation stamping adds one metadata read per flagged declarer only when a
+  replayed edge is newly created. A repeat ingest with no missing edges
+  writes neither edges nor metadata.
+- The edge and citation are still two statements inside one write turn; a
+  failure between them leaves the edge uncited, the same crash class as §3i.
+
 ---
 
 ## 4. #344 — Retired rows must not be exported
@@ -759,8 +822,10 @@ note whose *real* type changed is versioned.
   §3i),
   `exact_edge_targets` opt-out from `KnownIds` rewriting, from
   path-inferring edge materialisation, and from `relink_edges` declaration
-  replay (§3d), both using the shared verbatim-first match (§3e), and
-  provenance reconciliation inside the edge reconciler (§3h).
+  replay (§3d), both using the shared verbatim-first match (§3e),
+  reconciliation-owned replay of flagged declarations with matching citations
+  while ordinary replay keeps `relink` and mentions keep `mention-detector`
+  (§3j), and provenance reconciliation inside the edge reconciler (§3h).
 - `src/server.rs` — the `include_references` evals for retired and rebound
   citations, including retained-declaration and multiple-rebind coverage
   (§3h, §3i); no behaviour change.
@@ -799,6 +864,9 @@ note whose *real* type changed is versioned.
 - Reconciliation performs one metadata read per pass and writes metadata only
   when a provenance entry was removed. Ordinary rows and other relations are
   untouched.
+- Replay of a flagged declaration costs one content-hash provenance build per
+  declarer and, only when the edge is newly created, one metadata read/write
+  for its citation; repeat ingests with no missing edges add no writes.
 - The reconcile and the head write are two statements, not one transaction;
   the order makes a failed write safe at the cost of a crash window that can
   leave stale edges with the new head (repaired on the next changed import).
