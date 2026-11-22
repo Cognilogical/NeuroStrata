@@ -1585,7 +1585,6 @@ fn wire_harness_config(
                 let doc = with_namespace(
                     json!({
                         "id": "neurostrata-codex",
-                        "namespace": namespace,
                         "entry": abs_dist,
                         "cliHookRunner": abs_runner
                     }),
@@ -1773,6 +1772,7 @@ mod tests {
         let base = dunce::canonicalize(tmp.path()).unwrap();
         let main = base.join("platform");
         std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt")).unwrap();
+        std::fs::write(main.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::create_dir_all(main.join("src")).unwrap();
         // No configuration yet: the folder name, from any directory inside.
         assert_eq!(ns_of(&main), "platform");

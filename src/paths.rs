@@ -381,25 +381,18 @@ fn main_checkout_of_common(common: &Path) -> Option<PathBuf> {
     let parent = common.parent()?;
     // Ask git which checkout owns this git dir. It honours `core.bare` from
     // included config and reports the actual main worktree, so unrelated files
-    // beside a separate git dir are never mistaken for a checkout, and a real
-    // main checkout holding only `.git` is still recognised.
+    // beside a separate git dir are never mistaken for a checkout.
     if let Some(main) = git_main_worktree(common) {
-        if main == common {
-            // A separate git dir with no core.worktree: git calls the gitdir
-            // itself the worktree, which the linked worktree cannot borrow.
-            return None;
-        }
-        if main.is_dir() {
+        if main != common && main.is_dir() {
             return Some(main);
         }
     }
-    // Fallback when git cannot answer (synthetic git dirs, no git on PATH):
-    // a parent holding nothing but `.git` cannot be proven to be a checkout.
-    let holds_more_than_git = std::fs::read_dir(parent)
-        .ok()?
-        .filter_map(Result::ok)
-        .any(|entry| entry.file_name() != ".git");
-    holds_more_than_git.then(|| parent.to_path_buf())
+    // A separate git dir with no core.worktree makes git call the gitdir itself
+    // the worktree; synthetic dirs and hosts without git answer nothing at all.
+    // A common dir named `.git` that holds HEAD is a real checkout, so its
+    // parent owns it even when that parent holds nothing else. A `.git` dropped
+    // beside unrelated data has no HEAD and owns no worktree.
+    common.join("HEAD").exists().then(|| parent.to_path_buf())
 }
 
 /// The first (main) worktree git reports for the common git directory, or
