@@ -1682,7 +1682,11 @@ fn wire_harness_config(
         }
         "claude" => {
             if is_active || project_root.join(".claude").exists() {
-                let namespace = namespace.as_deref()?;
+                // No namespace to persist is no reason to skip the hooks:
+                // the plain runner discovers the namespace from the marker
+                // or a harness config at invocation time. Passing "" writes
+                // no namespace into Claude's config.
+                let namespace = namespace.as_deref().unwrap_or("");
                 let cfg_path = project_root.join(".claude/settings.local.json");
                 // The namespace lives in Claude's plugin config, as it does
                 // for the other harnesses; the command carries none.
@@ -2553,19 +2557,30 @@ mod tests {
         (tmp, dir)
     }
 
-    /// A refresh with no explicit namespace installs the plugin files and
-    /// writes no namespace into any config.
+    /// A refresh with no explicit namespace still wires the plain Claude
+    /// runner hooks: the runner discovers the namespace from the marker or
+    /// config at invocation time, so a project with no runner registration
+    /// must not lose guard checks, recall and worktree injection.
     #[test]
-    fn a_refresh_without_an_explicit_namespace_writes_plugin_files_only() {
+    fn a_refresh_without_an_explicit_namespace_wires_plain_claude_hooks() {
         let (_tmp, dir) = refresh_project();
         let _ = auto_install_detected_plugins(&dir, ConfigNamespace::Keep(None), Some("claude"));
         assert!(
             installed_runner(&dir, "claude").is_file(),
             "plugin files are installed"
         );
+        let matchers = claude_pre_tool_use_matchers(&dir);
+        let plain = format!(
+            "node \"{}\"",
+            plain_abs_path(&installed_runner(&dir, "claude"))
+        );
         assert!(
-            !dir.join(CLAUDE_SETTINGS).exists(),
-            "no Claude hooks without a namespace"
+            matchers.iter().any(|(_, cmd)| cmd == &plain),
+            "the plain Claude runner hook is registered: {matchers:?}"
+        );
+        assert!(
+            dir.join(CLAUDE_SETTINGS).exists(),
+            "Claude settings carry the hooks even without a namespace"
         );
         assert!(!dir.join(".codex/plugins/neurostrata.json").exists());
         assert_eq!(harness_namespaces_at(&dir), (Vec::new(), Vec::new()));
@@ -2608,17 +2623,22 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
-    /// An unusable namespace is never written, not even when a caller names it.
+    /// An unusable namespace is never persisted, but the plain Claude runner
+    /// hooks still get wired so discovery can name the namespace at runtime.
     #[test]
     fn an_unusable_namespace_is_never_written() {
         for bad in ["", "My Project"] {
             let (_tmp, dir) = refresh_project();
             let _ = auto_install_detected_plugins(&dir, ConfigNamespace::Set(bad), Some("claude"));
-            assert!(!dir.join(CLAUDE_SETTINGS).exists(), "{bad:?}");
+            let matchers = claude_pre_tool_use_matchers(&dir);
             assert!(
-                !dir.join(".codex/plugins/neurostrata.json").exists(),
-                "{bad:?}"
+                matchers
+                    .iter()
+                    .all(|(_, cmd)| !cmd.contains("NEUROSTRATA_NAMESPACE=")),
+                "no namespace baked into a hook for {bad:?}: {matchers:?}"
             );
+            assert!(!dir.join(".codex/plugins/neurostrata.json").exists());
+            assert_eq!(harness_namespaces_at(&dir), (Vec::new(), Vec::new()));
         }
     }
 
@@ -2758,13 +2778,11 @@ mod tests {
             Some("claude"),
         );
         let fresh = claude_pre_tool_use_matchers(tmp.path());
-        assert_eq!(fresh.len(), 1);
-        assert!(
-            fresh[0].0.split('|').any(|t| t == "NotebookEdit"),
-            "fresh install must guard NotebookEdit: {:?}",
-            fresh
-        );
-        let ours = fresh[0].1.clone();
+        let file_entry = fresh
+            .iter()
+            .find(|(matcher, _)| matcher.split('|').any(|t| t == "NotebookEdit"))
+            .expect("fresh install guards NotebookEdit");
+        let ours = file_entry.1.clone();
 
         let cfg = tmp.path().join(".claude/settings.local.json");
         let older = json!({
@@ -2791,16 +2809,25 @@ mod tests {
             Some("claude"),
         );
         let after = claude_pre_tool_use_matchers(tmp.path());
-        assert_eq!(
-            after,
-            vec![
-                (CLAUDE_PRE_TOOL_USE_MATCHER.to_string(), ours.clone()),
-                (
-                    LEGACY_CLAUDE_PRE_TOOL_USE_MATCHER.to_string(),
-                    "echo user-hook".to_string()
-                ),
-            ],
-            "only the installer's own entry is widened"
+        assert!(
+            after
+                .iter()
+                .any(|(matcher, cmd)| matcher == &CLAUDE_PRE_TOOL_USE_MATCHER && cmd == &ours),
+            "only the installer's own entry is widened: {after:?}"
+        );
+        assert!(
+            after.iter().any(
+                |(matcher, cmd)| matcher == &LEGACY_CLAUDE_PRE_TOOL_USE_MATCHER
+                    && cmd == "echo user-hook"
+            ),
+            "the user's hook is left untouched: {after:?}"
+        );
+        assert!(
+            after.len() == 3
+                && after
+                    .iter()
+                    .any(|(matcher, _)| matcher == &CLAUDE_SESSION_SCOPE_MATCHER),
+            "the session-scope runner hook is kept: {after:?}"
         );
     }
 
