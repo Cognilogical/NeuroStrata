@@ -15300,6 +15300,298 @@ mod tests {
         );
     }
 
+    /// #363: a rebind replaces only the citation for the binding it rebinds.
+    /// The unchanged declarer keeps another live declaration to `c`, so the
+    /// replacement set must add `ns::z` and leave `c`'s provenance in place.
+    #[tokio::test]
+    async fn rebound_declaration_preserves_retained_edge_provenance() {
+        use crate::vault_ld::vault_sync::{import_vault, VaultSyncConfig};
+        use crate::vault_ld::{VaultNote, YAML_LD_CONTEXT};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let vault = root.path().join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vaultprovretain";
+        store.init(ns).await.expect("init");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.path().to_path_buf()),
+            allowed_external_dirs: None,
+        };
+
+        let make_note = |id: &str, related: &[&str], content: &str| {
+            let mut note = VaultNote {
+                id: id.to_string(),
+                rdf_type: "yaml:fact".to_string(),
+                context: YAML_LD_CONTEXT.to_string(),
+                epistemic_tier: "fact".to_string(),
+                canonical_sha256: String::new(),
+                related: related.iter().map(|s| s.to_string()).collect(),
+                content: content.to_string(),
+            };
+            note.canonical_sha256 = note.fingerprint();
+            note
+        };
+        let preferred = format!("{ns}::z");
+        let linker = make_note(
+            "a",
+            &["c", preferred.as_str()],
+            "keeprebindprobe linker body",
+        );
+        let retained = make_note("c", &[], "retained target body");
+        let alias = make_note("z", &[], "body of the bare alias");
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write a");
+        std::fs::write(vault.join("c.md"), retained.to_markdown()).expect("write c");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write z");
+
+        let first = import_vault(config.clone(), store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        let a_targets =
+            |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| {
+                edges
+                    .iter()
+                    .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+                    .map(|(_, _, to, _)| to.clone())
+                    .collect::<Vec<_>>()
+            };
+        let before_edges = store.list_edges(ns).await.expect("list edges");
+        let mut before = a_targets(&before_edges);
+        before.sort();
+        assert_eq!(before, vec!["c".to_string(), "z".to_string()]);
+
+        let literal = make_note(&preferred, &[], "body of the verbatim note");
+        std::fs::write(vault.join("preferred.md"), literal.to_markdown()).expect("write preferred");
+        let second = import_vault(config, store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(second.notes_imported, 1, "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges after rebind");
+        let mut after = a_targets(&edges);
+        after.sort();
+        assert_eq!(
+            after,
+            vec!["c".to_string(), preferred.clone()],
+            "the retained and rebound edges must both stay live: {edges:?}"
+        );
+
+        let (_, head) = store
+            .get(ns, "a")
+            .await
+            .expect("read declarer after rebind")
+            .expect("declarer survives");
+        let live_sources = |target: &str| {
+            head.metadata["edge_sources"]
+                .as_array()
+                .map(|sources| {
+                    sources
+                        .iter()
+                        .filter(|s| {
+                            s["rel_type"] == "RELATES_TO"
+                                && s["extractor"] == "upsert"
+                                && s["orientation"] == "self_to_target"
+                                && s["resolved_target"] == target
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(live_sources("c"), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources(&preferred), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources("z"), 0, "{:?}", head.metadata);
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "keeprebindprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let refs = search_out
+            .lines()
+            .find_map(|line| line.strip_prefix("edge_references: "))
+            .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+            .unwrap_or_default();
+        let cited = |target: &str| {
+            refs.iter().any(|r| {
+                r["id"] == "a"
+                    && r["edge_sources"].as_array().is_some_and(|sources| {
+                        sources.iter().any(|s| {
+                            s["rel_type"] == "RELATES_TO" && s["resolved_target"] == target
+                        })
+                    })
+            })
+        };
+        assert!(
+            cited("c"),
+            "search must cite the retained edge: {search_out}"
+        );
+        assert!(
+            cited(&preferred),
+            "search must cite the rebound edge: {search_out}"
+        );
+        assert!(
+            !cited("z"),
+            "search must not cite the alias edge: {search_out}"
+        );
+    }
+
+    /// #363: two declarations rebinding in one import must both keep a
+    /// citation. A per-iteration replace that drops earlier replacements
+    /// leaves only the last target cited.
+    #[tokio::test]
+    async fn multiple_rebound_declarations_accumulate_edge_provenance() {
+        use crate::vault_ld::vault_sync::{import_vault, VaultSyncConfig};
+        use crate::vault_ld::{VaultNote, YAML_LD_CONTEXT};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let vault = root.path().join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vaultprovmulti";
+        store.init(ns).await.expect("init");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.path().to_path_buf()),
+            allowed_external_dirs: None,
+        };
+
+        let make_note = |id: &str, related: &[&str], content: &str| {
+            let mut note = VaultNote {
+                id: id.to_string(),
+                rdf_type: "yaml:fact".to_string(),
+                context: YAML_LD_CONTEXT.to_string(),
+                epistemic_tier: "fact".to_string(),
+                canonical_sha256: String::new(),
+                related: related.iter().map(|s| s.to_string()).collect(),
+                content: content.to_string(),
+            };
+            note.canonical_sha256 = note.fingerprint();
+            note
+        };
+        let preferred_y = format!("{ns}::y");
+        let preferred_z = format!("{ns}::z");
+        let linker = make_note(
+            "a",
+            &[preferred_y.as_str(), preferred_z.as_str()],
+            "multirebindprobe linker body",
+        );
+        let alias_y = make_note("y", &[], "body of the bare y alias");
+        let alias_z = make_note("z", &[], "body of the bare z alias");
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write a");
+        std::fs::write(vault.join("y.md"), alias_y.to_markdown()).expect("write y");
+        std::fs::write(vault.join("z.md"), alias_z.to_markdown()).expect("write z");
+
+        let first = import_vault(config.clone(), store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        for (name, id, content) in [
+            ("preferred-y", preferred_y.as_str(), "verbatim y body"),
+            ("preferred-z", preferred_z.as_str(), "verbatim z body"),
+        ] {
+            let literal = make_note(id, &[], content);
+            std::fs::write(vault.join(format!("{name}.md")), literal.to_markdown())
+                .expect("write preferred");
+        }
+        let second = import_vault(config, store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(second.notes_imported, 2, "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges after rebind");
+        let mut targets = edges
+            .iter()
+            .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+            .map(|(_, _, to, _)| to.clone())
+            .collect::<Vec<_>>();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![preferred_y.clone(), preferred_z.clone()],
+            "both rebound edges must stay live: {edges:?}"
+        );
+
+        let (_, head) = store
+            .get(ns, "a")
+            .await
+            .expect("read declarer after rebind")
+            .expect("declarer survives");
+        let live_sources = |target: &str| {
+            head.metadata["edge_sources"]
+                .as_array()
+                .map(|sources| {
+                    sources
+                        .iter()
+                        .filter(|s| {
+                            s["rel_type"] == "RELATES_TO"
+                                && s["extractor"] == "upsert"
+                                && s["orientation"] == "self_to_target"
+                                && s["resolved_target"] == target
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(live_sources(&preferred_y), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources(&preferred_z), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources("y"), 0, "{:?}", head.metadata);
+        assert_eq!(live_sources("z"), 0, "{:?}", head.metadata);
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "multirebindprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let refs = search_out
+            .lines()
+            .find_map(|line| line.strip_prefix("edge_references: "))
+            .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+            .unwrap_or_default();
+        for target in [&preferred_y, &preferred_z] {
+            assert!(
+                refs.iter().any(|r| {
+                    r["id"] == "a"
+                        && r["edge_sources"].as_array().is_some_and(|sources| {
+                            sources.iter().any(|s| {
+                                s["rel_type"] == "RELATES_TO" && s["resolved_target"] == *target
+                            })
+                        })
+                }),
+                "search must cite every rebound edge ({target}): {search_out}"
+            );
+        }
+    }
+
     /// The lexical empty-results path must still emit the additive response
     /// contract, otherwise `include_related` is a silent no-op and
     /// `graph_expanded_ids` disappears on exactly the path callers hit most.

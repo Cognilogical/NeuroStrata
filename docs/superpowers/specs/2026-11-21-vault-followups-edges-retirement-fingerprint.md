@@ -582,8 +582,11 @@ replacement entry names `declared_target = ns::z`, `resolved_target = ns::z`,
 and the same relation, declaration index and evidence id that `upsert` would
 stamp. Reconciliation then retires the alias entry with the alias edge, so the
 row never cites a target it is not bound to and never loses the citation for
-the edge it is bound to. The provenance update is metadata-only: no content
-version, `supersedes` stamp, or history row is created.
+the edge it is bound to. Rebinding one declaration never removes an entry for
+another binding: a retained declaration keeps its citation, and multiple
+rebinds in the same import each keep theirs, so `include_references` returns
+one citation per live target. The provenance update is metadata-only: no
+content version, `supersedes` stamp, or history row is created.
 
 #### Mechanism
 
@@ -594,9 +597,10 @@ version, `supersedes` stamp, or history row is created.
   shape and evidence id cannot drift between the two paths.
 - `VectorStore::rebind_declared_edges` takes the importing note's `declared`
   list, positionally aligned with `keep`. For each created edge it builds the
-  entry, dedupes by `(rel_type, extractor, resolved_target)`, and writes the
-  row's metadata once. The edge carries the same computed `evidence_id` as its
-  entry.
+  entry and replaces only an existing entry with the same
+  `(rel_type, extractor, resolved_target)` — the binding identity. Every other
+  entry survives, and one metadata write after the loop accumulates all new
+  entries. The edge carries the same computed `evidence_id` as its entry.
 - The subsequent reconciliation keep-set contains the preferred id, so it
   removes the alias edge and the alias entry and retains the replacement pair.
 
@@ -613,6 +617,24 @@ version, `supersedes` stamp, or history row is created.
     cites `ns::z` and not `z`.
   - On `414f7981` the edge rebound correctly but `edge_sources` was `[]`:
     reconciliation had retired the alias entry and the rebind minted none.
+- `rebound_declaration_preserves_retained_edge_provenance` (failed on
+  `79ac5a66`)
+  - Import an unchanged note with two declarations: `a → c` and `a → ns::z`,
+    where only the bare `z` alias exists. The first import binds `c` and `z`.
+  - Add the literal `ns::z` note while `a.md` is byte-identical; reimport.
+  - Assert both `a` edges are live (`c`, `ns::z`), `edge_sources` holds exactly
+    one `RELATES_TO` entry for each live target and none for `z`, and an
+    `include_references` search cites both `c` and `ns::z`.
+  - On `79ac5a66` the replacement `retain` kept only entries matching the new
+    binding, so `c`'s citation was deleted even though its edge stayed live.
+- `multiple_rebound_declarations_accumulate_edge_provenance` (failed on
+  `79ac5a66`)
+  - Same shape with `a → ns::y` and `a → ns::z` declared; both aliases exist,
+    then both literal notes arrive in one import.
+  - Assert both rebound edges are live, each has exactly one citation, the
+    alias citations are gone, and `include_references` cites both targets.
+  - On `79ac5a66` each iteration deleted the previous iteration's entry, so
+    only the last rebind (`ns::z`) remained cited.
 
 #### Residual risk
 
@@ -624,6 +646,11 @@ version, `supersedes` stamp, or history row is created.
   uncited, not wrongly cited; the next changed import of the head re-stamps
   provenance through `upsert`. A byte-identical import does not retry, same
   class as §3a.
+- Binding identity is `(rel_type, extractor, resolved_target)`; a declaration
+  whose target rebinds to the same id is one binding, so duplicate
+  declarations of that target collapse to one citation. `declaration_index`
+  and `declared_target` are labels carried positionally from the unchanged
+  head's declaration list, not part of the replace key.
 
 ---
 
@@ -727,16 +754,20 @@ note whose *real* type changed is versioned.
   `declared`/`keep` binding contract (§3g, §3i).
 - `src/store/ladybug.rs` — `extractor = 'upsert'` RELATES_TO reconciler,
   `rebind_declared_edges` materialiser that stamps replacement-edge provenance
-  through the shared `edge_provenance_entry` builder (§3g, §3i),
+  through the shared `edge_provenance_entry` builder and replaces only the
+  rebinding entry, preserving unrelated and earlier-rebind citations (§3g,
+  §3i),
   `exact_edge_targets` opt-out from `KnownIds` rewriting, from
   path-inferring edge materialisation, and from `relink_edges` declaration
   replay (§3d), both using the shared verbatim-first match (§3e), and
   provenance reconciliation inside the edge reconciler (§3h).
 - `src/server.rs` — the `include_references` evals for retired and rebound
-  citations (§3h, §3i); no behaviour change.
+  citations, including retained-declaration and multiple-rebind coverage
+  (§3h, §3i); no behaviour change.
 - `docs/features-api/mcp-and-http-api.md` — `include_references` citation
-  contract now states that provenance retires with its edge and that a rebind
-  cites its replacement edge.
+  contract now states that provenance retires with its edge, that a rebind
+  cites its replacement edge, and that a rebind preserves citations for every
+  other live target.
 - `src/parser/generation.rs` — `exact_target_spellings`, `exact_target_match`,
   and `exact_target_match_fallible`: the single verbatim-first alias rule and
   precedence selector shared by the vault importer and the store (§3e),

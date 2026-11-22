@@ -12068,14 +12068,16 @@ impl VectorStore for LadybugStore {
                                     }
                                     let sources = sources.as_array_mut().expect("array");
                                     for entry in fresh_entries {
-                                        // One citation per live binding: a
-                                        // retry replaces rather than stacks.
+                                        // One citation per live binding: only
+                                        // the entry for this binding is
+                                        // replaced, so retained declarations
+                                        // and earlier rebinds keep theirs.
                                         sources.retain(|existing| {
-                                            existing.get("rel_type") == entry.get("rel_type")
+                                            !(existing.get("rel_type") == entry.get("rel_type")
                                                 && existing.get("extractor")
                                                     == entry.get("extractor")
                                                 && existing.get("resolved_target")
-                                                    == entry.get("resolved_target")
+                                                    == entry.get("resolved_target"))
                                         });
                                         sources.push(entry);
                                     }
