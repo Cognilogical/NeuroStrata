@@ -2749,6 +2749,24 @@ mod tests {
         assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
     }
 
+    /// A commented `bare = true` is true: a bare repo with a `.git` common dir
+    /// must not lend its parent to a linked worktree as a main checkout.
+    #[test]
+    fn commented_core_bare_true_is_still_bare() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let project = base.join("bare-project");
+        let common = project.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        touch(&project.join("unrelated.txt"));
+        std::fs::write(common.join("config"), "[core]\n\tbare = true # comment\n").unwrap();
+        let wt = base.join("wt");
+        link_worktree(&wt, &common.join("worktrees").join("wt"));
+
+        assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
+    }
+
     /// `extensions.worktreeConfig` and config includes supply the main
     /// checkout's `core.worktree` even when the literal config does not.
     #[test]
