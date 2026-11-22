@@ -1432,20 +1432,42 @@ pub(crate) async fn root_set_with(
         None => {
             let mut fresh = RootConfig::new(ns);
             fresh.source_id = args.source_id.clone();
-            if matches!(read_marker(&target), MarkerRead::Absent) {
-                match write_new_marker(&target, &fresh).map_err(|e| e.to_string())? {
-                    WriteOutcome::Written => {}
-                    WriteOutcome::LostRace(MarkerRead::Valid(won))
-                        if won.namespace.eq_ignore_ascii_case(ns) => {}
-                    WriteOutcome::LostRace(_) => {
-                        return Err(format!(
+            // The early read said absent, but a competing writer may have
+            // published between it and the awaits above. Re-read and refuse
+            // a foreign marker here: only `write_new_marker` may claim an
+            // absent target, and only `--replace` may take one from another
+            // namespace.
+            match read_marker(&target) {
+                MarkerRead::Absent => {
+                    match write_new_marker(&target, &fresh).map_err(|e| e.to_string())? {
+                        WriteOutcome::Written => {}
+                        WriteOutcome::LostRace(MarkerRead::Valid(won))
+                            if won.namespace.eq_ignore_ascii_case(ns) => {}
+                        WriteOutcome::LostRace(_) => {
+                            return Err(format!(
                             "another writer published {} first; run `neurostrata-mcp root show`",
                             target.join(ROOT_CONFIG_REL).display()
                         ))
+                        }
                     }
                 }
-            } else {
-                replace_marker(&target, &fresh).map_err(|e| e.to_string())?;
+                MarkerRead::Valid(won) if won.namespace.eq_ignore_ascii_case(ns) => {}
+                other => {
+                    if !args.replace {
+                        let held = match &other {
+                            MarkerRead::Valid(cfg) => format!("namespace {}", cfg.namespace),
+                            MarkerRead::Unreadable { reason, .. } => {
+                                format!("an unreadable marker ({reason})")
+                            }
+                            MarkerRead::Absent => unreachable!(),
+                        };
+                        return Err(format!(
+                            "another writer published {} ({held}) first; pass --replace to change it",
+                            target.join(ROOT_CONFIG_REL).display()
+                        ));
+                    }
+                    replace_marker(&target, &fresh).map_err(|e| e.to_string())?;
+                }
             }
             true
         }
@@ -3226,6 +3248,56 @@ mod tests {
             cached(&store).await,
             Some(web.to_string_lossy().into_owned())
         );
+    }
+
+    /// A registry that, like a competing `root set`, publishes a foreign
+    /// marker in the target while this command awaits the first registry read.
+    struct CompetingWriterRegistry {
+        inner: StoreRegistry,
+        competitor: (PathBuf, String),
+    }
+
+    #[async_trait::async_trait]
+    impl RootRegistry for CompetingWriterRegistry {
+        async fn cached_root(&self, namespace: &str) -> Result<Option<String>, String> {
+            replace_marker(&self.competitor.0, &RootConfig::new(&self.competitor.1))
+                .map_err(|e| e.to_string())?;
+            self.inner.cached_root(namespace).await
+        }
+        async fn rows(&self, namespace: &str) -> Result<Vec<crate::traits::SearchResult>, String> {
+            self.inner.rows(namespace).await
+        }
+        async fn set_root(&self, namespace: &str, root: &Path) -> Result<(), String> {
+            self.inner.set_root(namespace, root).await
+        }
+        async fn finish(&self) {
+            self.inner.finish().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_competing_writer_marker_is_not_overwritten_without_replace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(&base, r#"["repo git-dir", "repo/target"]"#);
+        let target = base.join("repo/target");
+        let (store, emb) = mock();
+        let registry = CompetingWriterRegistry {
+            inner: StoreRegistry {
+                store: store.clone(),
+                emb: Some(emb.clone()),
+                checkpoint: false,
+            },
+            competitor: (target.clone(), "other-project".to_string()),
+        };
+        let err = root_set_with(&registry, &set_args(&target), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("another writer"), "{err}");
+        match read_marker(&target) {
+            MarkerRead::Valid(cfg) => assert_eq!(cfg.namespace, "other-project"),
+            other => panic!("the competing marker was overwritten: {other:?}"),
+        }
     }
 
     /// A registry that, like a second `root set` racing this one, moves the
