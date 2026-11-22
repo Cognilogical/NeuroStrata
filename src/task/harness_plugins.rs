@@ -1053,6 +1053,9 @@ impl NamespaceRoots {
     /// of its own: its own checkout first, then the main checkout.
     fn config_order(&self) -> Vec<&PathBuf> {
         let mut order: Vec<&PathBuf> = Vec::new();
+        // A nested directory keeps its own harness config. Try the path below
+        // the checkout root before the root's, as root-marker lookups do.
+        order.push(&self.dir);
         for root in self
             .own_root
             .iter()
@@ -2066,12 +2069,14 @@ fn wire_harness_config(
             None
         }
         "github-cli" => {
-            if is_active || project_root.join(".github").exists() {
+            let cfg_path =
+                project_root.join(".NeuroStrata/plugins/github-cli/copilot-extension.json");
+            // An installed config is evidence this harness is present: a refresh
+            // must rewrite it even without an active hint or a .github folder.
+            if is_active || project_root.join(".github").exists() || cfg_path.exists() {
                 if namespace.is_none() && !wire_without_namespace {
                     return None;
                 }
-                let cfg_path =
-                    project_root.join(".NeuroStrata/plugins/github-cli/copilot-extension.json");
                 let doc = with_namespace(
                     json!({
                         "id": "neurostrata-github-cli",
