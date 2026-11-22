@@ -1416,22 +1416,26 @@ fn sync_skills_and_agent_rules(
 /// Write `contents` to `path` through a temporary file in the same folder and
 /// a rename, so a reader (a git hook running `namespace resolve`) sees the old
 /// file or the new one, never a half-written one.
-fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
-    // One lock for every config in this process: a refresh touches a handful,
-    // and serializing them is simpler and safer than a per-path lock table.
-    let _guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// Unique temporary path for an atomic rewrite of `path`. The process-wide
+/// sequence keeps two in-process refreshes from deriving the same name;
+/// `create_new` at the call site also rejects a planted symlink.
+fn atomic_tmp_for(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    // PID alone lets two in-process refreshes derive the same temp path.
-    // A process-wide sequence plus create_new makes a planted symlink and a
-    // racing refresh both fail loudly instead of following/clobbering it.
-    let tmp = path.with_file_name(format!(
+    path.with_file_name(format!(
         ".{name}.tmp-{}-{}",
         std::process::id(),
         ATOMIC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    ))
+}
+
+fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    // One lock for every config in this process: a refresh touches a handful,
+    // and serializing them is simpler and safer than a per-path lock table.
+    let _guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = atomic_tmp_for(path);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
