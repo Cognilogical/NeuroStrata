@@ -43,7 +43,14 @@ const CORE_PKG_JSON: &str = include_str!("../../plugins/core/package.json");
 
 const CLI_HOOK_RUNNER_MJS: &str = r#"#!/usr/bin/env node
 import { readFileSync } from "node:fs";
+import { basename, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import plugin, * as mod from "./dist/index.js";
+
+// The installer writes this runner to <root>/.NeuroStrata/plugins/<harness>/;
+// the harness config of <root> is read first.
+const RUNNER_DIR = dirname(fileURLToPath(import.meta.url));
+const HARNESS = basename(RUNNER_DIR);
 
 async function main() {
   // Redirect all diagnostic logging to stderr so stdout carries only the
@@ -76,12 +83,22 @@ async function main() {
   } catch {
     return;
   }
+  // The namespace comes from the harness config the installer wrote; the
+  // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
+  // this config (the order of `neurostrata-mcp namespace resolve`).
+  const projectDir =
+    typeof mod.resolveHookProjectDir === "function"
+      ? mod.resolveHookProjectDir(HARNESS, event)
+      : typeof event.cwd === "string" && event.cwd
+        ? event.cwd
+        : process.cwd();
+  const config =
+    typeof mod.readHarnessConfig === "function"
+      ? mod.readHarnessConfig(HARNESS, projectDir, RUNNER_DIR)
+      : {};
   const init = mod.initialize ?? plugin?.initialize ?? plugin?.setup;
   if (typeof init === "function") {
-    // Pass the namespace only when it is set: an explicit undefined would
-    // override the one in .NeuroStrata/neurostrata-plugin.json.
-    const namespace = process.env.NEUROSTRATA_NAMESPACE;
-    await init({ config: namespace ? { namespace } : {} });
+    await init({ config, projectDir });
   }
   const handler =
     mod.handleHookEvent ??
@@ -227,59 +244,79 @@ fn runner_is_replaceable(old_path: &str, project_root: &Path, abs_runner: &str) 
     matches!(candidate.try_exists(), Ok(false))
 }
 
-/// Like [`runner_is_replaceable`], but a *missing* runner counts as the
-/// installer's only when its path ends with the installer's plugin location.
-/// Namespace resolution must not mistake a custom hook that merely names a
-/// `cli-hook.mjs` for installer configuration (and capture the push gate's
-/// namespace). The trailing plugin structure is compared, not the whole path,
-/// so a moved checkout whose old absolute prefix no longer exists is still
-/// recognised as ours.
-fn runner_is_installers_hook(old_path: &str, project_root: &Path, abs_runner: &str) -> bool {
-    if !runner_is_replaceable(old_path, project_root, abs_runner) {
+/// Whether a runner path is the installer's own runner (in any spelling) or
+/// sits where the installer puts one, `.NeuroStrata/plugins/claude/cli-hook.mjs`
+/// (a moved or renamed project's). Plain string work for the suffix, as in
+/// [`path_key`].
+fn at_installer_runner_place(old_path: &str, project_root: &Path, abs_runner: &str) -> bool {
+    let folded = old_path.replace('\\', "/").to_ascii_lowercase();
+    let rel = ".neurostrata/plugins/claude/cli-hook.mjs";
+    folded == rel
+        || folded.ends_with(&format!("/{rel}"))
+        || same_path_on_disk(&project_root.join(old_path).to_string_lossy(), abs_runner)
+}
+
+/// Claude's plugin config, next to its bundle (as GitHub CLI's is). The Claude
+/// hook command carries no namespace; the runner reads it from here.
+const CLAUDE_CONFIG_REL: &str = ".NeuroStrata/plugins/claude/neurostrata.json";
+
+/// The namespace Claude's plugin config names at `root`: `Ok(None)` when the
+/// file is missing or names no usable one, an error when it exists but
+/// cannot be read or parsed.
+fn claude_config_namespace_checked(root: &Path) -> Result<Option<String>, UnreadableConfig> {
+    Ok(read_config(&root.join(CLAUDE_CONFIG_REL))?
+        .as_ref()
+        .and_then(|doc| doc.get("namespace"))
+        .and_then(Value::as_str)
+        .and_then(usable_namespace))
+}
+
+/// The namespace Claude's plugin config names at `root`, when usable.
+fn claude_config_namespace(root: &Path) -> Option<String> {
+    claude_config_namespace_checked(root).ok().flatten()
+}
+
+/// Writes Claude's plugin config naming `namespace` and reads it back. `false`
+/// when it cannot be written or does not read back with that namespace.
+fn write_claude_config(project_root: &Path, namespace: &str) -> bool {
+    let path = project_root.join(CLAUDE_CONFIG_REL);
+    let doc = json!({ "id": "neurostrata-claude", "namespace": namespace });
+    let Ok(text) = serde_json::to_string_pretty(&doc) else {
+        return false;
+    };
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let unchanged = std::fs::read_to_string(&path).is_ok_and(|existing| existing == text);
+    if !unchanged && std::fs::write(&path, &text).is_err() {
         return false;
     }
-    // A runner that exists, or is the installer's own path, was already
-    // accepted. Only the "missing" branch needs the plugin-location check.
-    let candidate = project_root.join(old_path);
-    if matches!(candidate.try_exists(), Ok(false)) {
-        let Some(suffix) = plugin_location_suffix(abs_runner) else {
-            return false;
-        };
-        return candidate
-            .to_string_lossy()
-            .replace('\\', "/")
-            .to_ascii_lowercase()
-            .ends_with(&suffix);
-    }
-    true
+    claude_config_namespace(project_root).as_deref() == Some(namespace)
 }
 
-/// The trailing `.NeuroStrata/plugins/<harness>/cli-hook.mjs` structure of
-/// the installer's runner, lowercased with forward slashes. A missing runner
-/// must end with this to count as an installer hook.
-fn plugin_location_suffix(abs_runner: &str) -> Option<String> {
-    let normalized = abs_runner.replace('\\', "/");
-    let parts: Vec<&str> = normalized.split('/').collect();
-    let idx = parts
-        .iter()
-        .rposition(|p| p.eq_ignore_ascii_case(".NeuroStrata"))?;
-    Some(parts[idx..].join("/").to_ascii_lowercase())
-}
-
-/// Rewrite only the path of an installer-generated runner command. A command
-/// shaped `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"` whose runner basename
-/// matches the installer's runner, and whose runner is the installer's own or
-/// is missing, is ours to repair. A custom hook that merely carries the
-/// namespace environment variable, or runs a `cli-hook.mjs` installed
-/// elsewhere, is left untouched.
-fn repair_installer_hook_command(
+/// A Claude hook command the installer wrote, `node "<runner>"`, or an older
+/// installer's `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"`, whose runner
+/// basename matches the installer's runner and whose runner is the
+/// installer's own or is missing: the namespace it names (none for the plain
+/// form or an empty assignment) and its repaired form `node "<abs_runner>"`.
+/// `None` for any other command (a custom hook that merely carries the
+/// namespace variable, a `cli-hook.mjs` installed elsewhere, or a namespace
+/// that is not usable).
+fn installer_hook_parts(
     command: &str,
-    namespace: &str,
     abs_runner: &str,
     project_root: &Path,
-) -> Option<String> {
-    let prefix = format!("NEUROSTRATA_NAMESPACE={namespace} node \"");
-    let rest = command.strip_prefix(&prefix)?;
+) -> Option<(Option<String>, String)> {
+    let (raw_ns, rest, plain) = match command.strip_prefix("NEUROSTRATA_NAMESPACE=") {
+        Some(assigned) => {
+            let (ns, rest) = assigned.split_once(' ')?;
+            (ns, rest, false)
+        }
+        None => ("", command, true),
+    };
+    let rest = rest.strip_prefix("node \"")?;
     let close = rest.find('"')?;
     let old_path = &rest[..close];
     let suffix = &rest[close + 1..];
@@ -288,10 +325,199 @@ fn repair_installer_hook_command(
     if path_basename(old_path) != path_basename(abs_runner) {
         return None;
     }
+    // A plain `node "<...>/cli-hook.mjs"` is anyone's command; only one that
+    // runs the installer's runner, or a missing runner at the installer's
+    // place (`.NeuroStrata/plugins/claude/cli-hook.mjs` of a moved project),
+    // is ours to repair.
+    if plain && !at_installer_runner_place(old_path, project_root, abs_runner) {
+        return None;
+    }
     if !runner_is_replaceable(old_path, project_root, abs_runner) {
         return None;
     }
-    Some(format!("{prefix}{abs_runner}\"{suffix}"))
+    // An empty assignment (the daemon's old startup install) named nothing.
+    let namespace = if raw_ns.is_empty() {
+        None
+    } else {
+        Some(usable_namespace(raw_ns)?)
+    };
+    Some((namespace, format!("node \"{abs_runner}\"{suffix}")))
+}
+
+/// Repairs one Claude hook command the installer wrote (see
+/// [`installer_hook_parts`]) to `node "<abs_runner>"`. An older command's
+/// namespace, whatever it is, is kept: it is written to Claude's plugin config
+/// and read back before the assignment is dropped. When that fails, or the
+/// command is not ours, the answer is `None` and the old command stays.
+/// The installer repairs through [`repair_claude_hooks`]; only tests call this.
+#[cfg(test)]
+fn repair_installer_hook_command(
+    command: &str,
+    abs_runner: &str,
+    project_root: &Path,
+) -> Option<String> {
+    let (namespace, repaired) = installer_hook_parts(command, abs_runner, project_root)?;
+    if let Some(ns) = namespace {
+        if !write_claude_config(project_root, &ns) {
+            return None;
+        }
+    }
+    Some(repaired)
+}
+
+/// The Claude tools whose PreToolUse runs the runner for file recall and the
+/// guard.
+const CLAUDE_FILE_TOOLS_MATCHER: &str = "Read|Write|Edit|MultiEdit|Bash|Task";
+
+/// The NeuroStrata MCP tools whose PreToolUse runs the runner so it can pass
+/// the session's project folder as `worktree`.
+const CLAUDE_SESSION_SCOPE_MATCHER: &str = "mcp__.*__neurostrata_(task_claim|get_snapshot)";
+
+/// Adds an entry running `cmd` (with `matcher`, when given) to Claude's
+/// `event` hooks unless an entry whose matcher passes `matcher_counts`
+/// already runs the installer's runner. A user's own entries stay; an event
+/// value that is not a list is left alone.
+fn ensure_claude_hook(
+    hooks: &mut serde_json::Map<String, Value>,
+    event: &str,
+    matcher: Option<&str>,
+    matcher_counts: impl Fn(Option<&str>) -> bool,
+    cmd: &str,
+    runs: &impl Fn(&str) -> bool,
+) {
+    let Some(entries) = hooks
+        .entry(event)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+    else {
+        return;
+    };
+    let present = entries.iter().any(|entry| {
+        matcher_counts(entry.get("matcher").and_then(Value::as_str))
+            && entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+                .any(runs)
+    });
+    if present {
+        return;
+    }
+    let mut entry = json!({ "hooks": [{ "type": "command", "command": cmd }] });
+    if let Some(m) = matcher {
+        entry["matcher"] = Value::String(m.to_string());
+    }
+    entries.push(entry);
+}
+
+/// The order Claude hook events are read in for an older install's
+/// namespace; other events follow in the settings' order.
+const CLAUDE_HOOK_EVENT_ORDER: [&str; 3] = ["SessionStart", "PreToolUse", "Stop"];
+
+/// Calls `f` on every hook of `hooks` (a Claude settings `hooks` object),
+/// event by event in [`CLAUDE_HOOK_EVENT_ORDER`].
+fn for_each_claude_hook(hooks: &mut serde_json::Map<String, Value>, mut f: impl FnMut(&mut Value)) {
+    let mut events: Vec<String> = CLAUDE_HOOK_EVENT_ORDER
+        .iter()
+        .map(|e| e.to_string())
+        .filter(|e| hooks.contains_key(e))
+        .collect();
+    events.extend(
+        hooks
+            .keys()
+            .filter(|k| !CLAUDE_HOOK_EVENT_ORDER.contains(&k.as_str()))
+            .cloned(),
+    );
+    for event in events {
+        let Some(entries) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries {
+            if let Some(list) = entry.get_mut("hooks").and_then(Value::as_array_mut) {
+                list.iter_mut().for_each(&mut f);
+            }
+        }
+    }
+}
+
+/// Repairs the installer's own commands in a Claude settings `hooks` object
+/// (a Windows verbatim or moved runner path, or a namespace baked into the
+/// command) and writes Claude's plugin config. The config names the first
+/// namespace an older command baked in (events in
+/// [`CLAUDE_HOOK_EVENT_ORDER`]), else `namespace`; it is written once and read
+/// back. When that fails, commands that bake a namespace keep it and a
+/// warning is added; the hooks are installed anyway. User hooks are left
+/// untouched. Returns whether new hook entries may be added: not while old
+/// commands keep a baked namespace that a new plain command would lack, and
+/// not when the settings run a `cli-hook.mjs` of someone else's install.
+fn repair_claude_hooks(
+    hooks: &mut serde_json::Map<String, Value>,
+    namespace: &str,
+    abs_runner: &str,
+    project_root: &Path,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let parts = |hook: &Value| {
+        hook.get("command")
+            .and_then(Value::as_str)
+            .and_then(|command| installer_hook_parts(command, abs_runner, project_root))
+    };
+    let mut all_baked: Vec<String> = Vec::new();
+    let mut someone_elses_runner = false;
+    for_each_claude_hook(hooks, |hook| {
+        let parsed = parts(hook);
+        if parsed.is_none() {
+            let runner = hook
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(|c| c.split_once("node \"").map(|(_, rest)| rest))
+                .and_then(|rest| rest.split_once('"').map(|(path, _)| path));
+            if runner.is_some_and(|r| path_basename(r) == path_basename(abs_runner)) {
+                someone_elses_runner = true;
+            }
+        }
+        if let Some(ns) = parsed.and_then(|(ns, _)| ns) {
+            if !all_baked.iter().any(|b| b.eq_ignore_ascii_case(&ns)) {
+                all_baked.push(ns);
+            }
+        }
+    });
+    let baked = all_baked.first().cloned();
+    let config_ns = baked.clone().or_else(|| usable_namespace(namespace));
+    let config_ok = match &config_ns {
+        Some(ns) => write_claude_config(project_root, ns),
+        // An empty namespace names nothing to keep.
+        None => true,
+    };
+    if config_ok && all_baked.len() > 1 {
+        warnings.push(format!(
+            "older Claude hook commands named different namespaces ({}); all of them now use {} from the Claude plugin config {}",
+            all_baked.join(", "),
+            all_baked[0],
+            project_root.join(CLAUDE_CONFIG_REL).display()
+        ));
+    }
+    if !config_ok {
+        warnings.push(format!(
+            "could not write the Claude plugin config {}; {}",
+            project_root.join(CLAUDE_CONFIG_REL).display(),
+            if baked.is_some() {
+                "hook commands that name NEUROSTRATA_NAMESPACE keep it"
+            } else {
+                "the Claude hooks run without a configured namespace"
+            }
+        ));
+    }
+    for_each_claude_hook(hooks, |hook| {
+        if let Some((ns, repaired)) = parts(hook) {
+            if ns.is_none() || config_ok {
+                hook["command"] = Value::String(repaired);
+            }
+        }
+    });
+    (config_ok || baked.is_none()) && !someone_elses_runner
 }
 
 /// Codex tools the hook runs for: `apply_patch` edits files and `Bash` is
@@ -433,7 +659,6 @@ fn has_any_env(keys: &[&str]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamespaceSource {
     /// The project root marker (`.NeuroStrata/config.json`).
-    #[allow(dead_code)]
     Marker,
     /// A harness plugin config the installer wrote.
     HarnessConfig,
@@ -484,6 +709,9 @@ pub enum ResolveError {
     /// A harness config exists but could not be read, so the namespace it
     /// names is unknown and no answer is safe.
     UnreadableConfigs(Vec<UnreadableConfig>),
+    /// The project root marker (`.NeuroStrata/config.json`) that applies
+    /// cannot be read, so the namespace it names is unknown.
+    UnreadableMarker(UnreadableConfig),
     /// No source names a namespace and the folder name is not one.
     NoUsableNamespace { folder: String },
 }
@@ -500,6 +728,12 @@ impl std::fmt::Display for ResolveError {
                     listed.join("; ")
                 )
             }
+            ResolveError::UnreadableMarker(marker) => write!(
+                f,
+                "the project's namespace is unknown because the project marker {} could not be read: {}. Fix or remove the file",
+                marker.path.display(),
+                marker.reason
+            ),
             ResolveError::NoUsableNamespace { folder } => write!(
                 f,
                 "no namespace is configured and the folder name {folder:?} is not one (letters, digits, `-`, `_`, `.` and `:`, starting with a letter or digit); set NEUROSTRATA_NAMESPACE or configure a harness"
@@ -554,22 +788,6 @@ fn read_config(path: &Path) -> Result<Option<Value>, UnreadableConfig> {
         path: path.to_path_buf(),
         reason,
     };
-    // `metadata` follows a symlink, so a link to a FIFO/device or to an
-    // enormous file is rejected before `read` can block or exhaust memory.
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            if !meta.is_file() {
-                return Err(unreadable("it is not a regular file".to_string()));
-            }
-            if meta.len() > MAX_CONFIG_BYTES {
-                return Err(unreadable(format!(
-                    "it is larger than the {MAX_CONFIG_BYTES}-byte config limit"
-                )));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(unreadable(e.to_string())),
-    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -607,7 +825,7 @@ fn installer_hook_namespace(command: &str, root: &Path, abs_runner: &str) -> Opt
     if runner.contains('"') || path_basename(runner) != path_basename(abs_runner) {
         return None;
     }
-    runner_is_installers_hook(runner, root, abs_runner).then_some(ns)
+    runner_is_replaceable(runner, root, abs_runner).then_some(ns)
 }
 
 /// Claude's namespace in its settings: `NEUROSTRATA_NAMESPACE` in the `env`
@@ -645,32 +863,13 @@ fn harness_config_namespace(
     harness: &str,
 ) -> Result<Option<String>, UnreadableConfig> {
     if harness == "claude" {
+        // Claude's plugin config first; older installs kept the namespace in
+        // the settings (the `env` block or the hook command).
+        if let Some(ns) = claude_config_namespace_checked(root)? {
+            return Ok(Some(ns));
+        }
         return Ok(read_config(&root.join(CLAUDE_SETTINGS))?
             .and_then(|settings| claude_settings_namespace(root, &settings)));
-    }
-    // OpenCode actually loads `.NeuroStrata/neurostrata-plugin.json` (then
-    // `PluginConfig.json`) through the plugin core's `loadPluginConfigFromDisk`.
-    // The `.opencode/neurostrata-plugin.json` registration below is historic
-    // metadata the adapter never reads; when the effective config names a
-    // namespace it is the authority, so a stale registration cannot make the
-    // hooks resolve a different one.
-    if harness == "opencode" {
-        for rel in [
-            ".NeuroStrata/neurostrata-plugin.json",
-            ".NeuroStrata/PluginConfig.json",
-        ] {
-            if let Some(config) = read_config(&root.join(rel))? {
-                for pointer in ["/namespace", "/neurostrata/namespace"] {
-                    if let Some(ns) = config
-                        .pointer(pointer)
-                        .and_then(Value::as_str)
-                        .and_then(usable_namespace)
-                    {
-                        return Ok(Some(ns));
-                    }
-                }
-            }
-        }
     }
     let Some((_, rel, pointer)) = PLUGIN_NAMESPACE_CONFIGS
         .iter()
@@ -821,6 +1020,8 @@ impl NamespaceRoots {
 }
 
 /// The namespace for `dir` and where it came from, in this order:
+/// 0. the project root marker (`.NeuroStrata/config.json`), found as
+///    [`crate::root_marker::find_root_marker`] does;
 /// 1. a harness config (the first in the fixed order), read from the first
 ///    of `dir`'s checkout, its main checkout, or (outside git) `dir` itself
 ///    that has any;
@@ -831,13 +1032,25 @@ impl NamespaceRoots {
 /// 5. the main checkout's folder name; outside git, `dir`'s folder name, when
 ///    it is a usable namespace.
 ///
-/// A harness config that exists but cannot be read is an error, never
-/// skipped: the namespace it names is unknown.
+/// A marker or harness config that exists but cannot be read is an error,
+/// never skipped: the namespace it names is unknown.
 fn resolve_namespace_from(
     dir: &Path,
     env_namespace: Option<&str>,
 ) -> Result<ResolvedNamespace, ResolveError> {
     let roots = NamespaceRoots::of(dir)?;
+    let marker = crate::root_marker::find_root_marker(&roots.dir).map_err(|(path, reason)| {
+        ResolveError::UnreadableMarker(UnreadableConfig { path, reason })
+    })?;
+    if let Some(found) = marker {
+        // The marker decides alone: a harness config that cannot be read
+        // does not change the answer, and is not listed.
+        return Ok(ResolvedNamespace {
+            namespace: found.config.namespace,
+            source: NamespaceSource::Marker,
+            configs: roots.harness_namespaces().unwrap_or_default(),
+        });
+    }
     let configs = roots
         .harness_namespaces()
         .map_err(ResolveError::UnreadableConfigs)?;
@@ -895,7 +1108,8 @@ fn resolve_namespace_from(
 }
 
 /// The namespace a project's git hooks, `hooks install` and
-/// `neurostrata-mcp namespace resolve` use for `dir`: harness config, then
+/// `neurostrata-mcp namespace resolve` use for `dir`: the project marker
+/// (`.NeuroStrata/config.json`), then the harness config, then
 /// `NEUROSTRATA_NAMESPACE` from this process's environment, then the ledger,
 /// then the folder name.
 pub fn resolve_namespace(dir: &Path) -> Result<ResolvedNamespace, ResolveError> {
@@ -923,6 +1137,75 @@ pub(crate) fn namespace_for_refresh(
         Ok(_) | Err(ResolveError::NoUsableNamespace { .. }) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// The namespace `dir` names on purpose: the root marker's, else the single
+/// namespace that the harness configs, `NEUROSTRATA_NAMESPACE` and the ledger
+/// all agree on (a case-only difference counts as agreement; the first
+/// source's spelling is kept). The folder name never counts. `Err` lists the
+/// distinct candidates found (just the folder name when nothing names one);
+/// a marker that cannot be read is named in a warning on stderr and always
+/// gives `Err`, since the namespace it names is unknown.
+pub fn explicit_namespace(dir: &Path) -> Result<String, Vec<String>> {
+    let env = std::env::var("NEUROSTRATA_NAMESPACE").ok();
+    explicit_namespace_from(dir, env.as_deref())
+}
+
+fn explicit_namespace_from(dir: &Path, env_namespace: Option<&str>) -> Result<String, Vec<String>> {
+    let Ok(roots) = NamespaceRoots::of(dir) else {
+        return Err(Vec::new());
+    };
+    // A marker that cannot be read names a namespace nobody can know: the
+    // other sources are still listed, but none of them is the answer.
+    let marker_unreadable = match crate::root_marker::find_root_marker(&roots.dir) {
+        Ok(Some(found)) => return Ok(found.config.namespace),
+        Ok(None) => false,
+        Err((path, reason)) => {
+            eprintln!("{}", unreadable_marker_warning(&path, &reason));
+            true
+        }
+    };
+    let mut candidates: Vec<String> = Vec::new();
+    // A case-only difference is the same namespace (the store matches
+    // namespaces case-insensitively); the first source's spelling is kept.
+    let mut add = |ns: String| {
+        if !candidates.iter().any(|c| c.eq_ignore_ascii_case(&ns)) {
+            candidates.push(ns);
+        }
+    };
+    // A config that cannot be read names nothing here: the answer then rests
+    // on the sources that can be read, and an unreadable one never decides.
+    for (_, ns) in roots.harness_namespaces().unwrap_or_default() {
+        add(ns);
+    }
+    if let Some(ns) = env_namespace.and_then(usable_env_namespace) {
+        add(ns);
+    }
+    if let Some(ns) = roots.ledger_order().find_map(|root| {
+        let text =
+            std::fs::read_to_string(root.join(".NeuroStrata").join("session_queries.json")).ok()?;
+        let v: Value = serde_json::from_str(&text).ok()?;
+        usable_namespace(v.get("namespace")?.as_str()?)
+    }) {
+        add(ns);
+    }
+    match candidates.len() {
+        1 if !marker_unreadable => Ok(candidates.remove(0)),
+        0 => Err(resolve_namespace_from(dir, None)
+            .map(|r| r.namespace)
+            .into_iter()
+            .collect()),
+        _ => Err(candidates),
+    }
+}
+
+/// The one warning line, naming the file, for a project marker at `path`
+/// that cannot be read and is skipped.
+fn unreadable_marker_warning(path: &Path, reason: &str) -> String {
+    format!(
+        "warning: the project marker {} could not be read ({reason}); it is skipped",
+        path.display()
+    )
 }
 
 /// The namespace [`auto_install_detected_plugins`] writes into harness
@@ -1076,14 +1359,17 @@ pub fn detect_harnesses(
 }
 
 /// The namespaces the daemon's boot refresh may write into harness configs
-/// for `dir`, as `(harness, namespace)`: each harness keeps the one its own
-/// config already names. A harness's config is looked for in `dir` itself
+/// for `dir`, as `(harness, namespace)`: the root marker's for every harness
+/// when a marker applies, else each harness keeps the one its own config
+/// already names. A harness's config is looked for in `dir` itself
 /// first, then in `dir`'s checkout, its main checkout (for a linked
 /// worktree), or, outside git, `dir`; the first place that has one wins, and
 /// a config that cannot be read ends the search for that harness. A harness
 /// with no config anywhere is left out. Never the environment, the ledger or
 /// the folder name: the daemon's own environment says nothing about `dir`'s
-/// project, and a guessed name would overwrite the right one.
+/// project, and a guessed name would overwrite the right one. A marker that
+/// cannot be read is skipped with a one-line warning naming it; each harness
+/// then keeps its own config's namespace, as without a marker.
 pub fn boot_namespaces_for(dir: &Path) -> Vec<(String, String)> {
     let Ok(roots) = NamespaceRoots::of(dir) else {
         return Vec::new();
@@ -1096,6 +1382,18 @@ pub fn boot_namespaces_for(dir: &Path) -> Vec<(String, String)> {
     }
     let harnesses =
         std::iter::once("claude").chain(PLUGIN_NAMESPACE_CONFIGS.iter().map(|(h, _, _)| *h));
+    match crate::root_marker::find_root_marker(&roots.dir) {
+        Ok(Some(marker)) => {
+            return harnesses
+                .map(|h| (h.to_string(), marker.config.namespace.clone()))
+                .collect();
+        }
+        Ok(None) => {}
+        Err((path, reason)) => {
+            // The daemon's log, where its other boot warnings go.
+            tracing::warn!("{}", unreadable_marker_warning(&path, &reason));
+        }
+    }
     let mut found = Vec::new();
     for harness in harnesses {
         for place in &places {
@@ -1153,6 +1451,7 @@ pub fn auto_install_detected_plugins(
     }
     let base_dir = project_root.join(".NeuroStrata/plugins");
     let mut installed = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     // Bundle the shared plugin-core once so every harness adapter's relative
     // `../../core/dist/index.js` import resolves on disk under
@@ -1221,6 +1520,7 @@ pub fn auto_install_detected_plugins(
             active == Some(harness),
             &abs_dist,
             &abs_runner,
+            &mut warnings,
         );
 
         installed.push(json!({
@@ -1240,6 +1540,7 @@ pub fn auto_install_detected_plugins(
         "installed_plugins": installed,
         "skills_installed": skills_installed,
         "patched_agents": patched_agents,
+        "warnings": warnings,
     })
 }
 
@@ -1379,9 +1680,6 @@ fn sync_skills_and_agent_rules(
 /// a rename, so a reader (a git hook running `namespace resolve`) sees the old
 /// file or the new one, never a half-written one.
 fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
-    // One lock for every config in this process: a refresh touches a handful,
-    // and serializing them is simpler and safer than a per-path lock table.
-    let _guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -1433,6 +1731,7 @@ fn wire_harness_config(
     is_active: bool,
     abs_dist: &str,
     abs_runner: &str,
+    warnings: &mut Vec<String>,
 ) -> Option<String> {
     let write_json_if_changed = |path: &Path, val: &Value| -> Option<String> {
         if let Some(parent) = path.parent() {
@@ -1448,20 +1747,8 @@ fn wire_harness_config(
         Some(path.to_string_lossy().to_string())
     };
     // Read before anything below writes: the namespace this config keeps, or
-    // the one it gets, or none. A refresh (Keep) with no usable answer writes a
-    // namespace-neutral registration that discovers one at invocation time.
-    // An explicit but unusable Set value, or an unreadable config, stays
-    // unwritten (byte-identical) as before.
-    let wire_without_namespace = matches!(namespace, ConfigNamespace::Keep(_))
-        && namespace.for_harness(project_root, harness).is_none()
-        && !harness_config_namespace(project_root, harness).is_err();
+    // the one it gets, or none (the config is then left unwritten).
     let namespace = namespace.for_harness(project_root, harness);
-    let with_namespace = |mut doc: Value, ns: Option<&str>| -> Value {
-        if let Some(ns) = ns {
-            doc["namespace"] = json!(ns);
-        }
-        doc
-    };
 
     match harness {
         "opencode" => {
@@ -1546,19 +1833,11 @@ fn wire_harness_config(
         }
         "claude" => {
             if is_active || project_root.join(".claude").exists() {
-                if namespace.is_none() && !wire_without_namespace {
-                    return None;
-                }
-                // A refresh with no explicit namespace still registers the
-                // hook. The runner discovers the namespace at invocation time
-                // from the effective config/ledger, so the registration is
-                // namespace-neutral instead of being skipped entirely.
-                let namespace = namespace.as_deref();
+                let namespace = namespace.as_deref()?;
                 let cfg_path = project_root.join(".claude/settings.local.json");
-                let cmd = match namespace {
-                    Some(ns) => format!("NEUROSTRATA_NAMESPACE={ns} node \"{abs_runner}\""),
-                    None => format!("node \"{abs_runner}\""),
-                };
+                // The namespace lives in Claude's plugin config, as it does
+                // for the other harnesses; the command carries none.
+                let cmd = format!("node \"{abs_runner}\"");
                 let mut doc: Value = json!({});
                 let mut write_doc = false;
                 if cfg_path.exists() {
@@ -1578,48 +1857,49 @@ fn wire_harness_config(
                     if let Some(obj) = doc.as_object_mut() {
                         let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
                         if let Some(h_obj) = hooks.as_object_mut() {
-                            h_obj.entry("PreToolUse").or_insert_with(|| {
-                                json!([{
-                                    "matcher": CLAUDE_PRE_TOOL_USE_MATCHER,
-                                    "hooks": [{ "type": "command", "command": cmd.clone() }]
-                                }])
-                            });
-                            h_obj.entry("Stop").or_insert_with(|| {
-                                json!([{
-                                    "hooks": [{ "type": "command", "command": cmd.clone() }]
-                                }])
-                            });
-                            // Repair commands written by an older installer that
-                            // embedded a Windows verbatim path. Only rewrite our
-                            // own hook commands; user hooks, including ones that
-                            // run a cli-hook.mjs installed elsewhere, are left
-                            // untouched.
-                            for entries in h_obj.values_mut() {
-                                if let Some(arr) = entries.as_array_mut() {
-                                    for entry in arr {
-                                        if let Some(hooks) =
-                                            entry.get_mut("hooks").and_then(|v| v.as_array_mut())
-                                        {
-                                            for hook in hooks {
-                                                if let (Some(ns), Some(command)) = (
-                                                    namespace,
-                                                    hook.get("command").and_then(|v| v.as_str()),
-                                                ) {
-                                                    if let Some(repaired) =
-                                                        repair_installer_hook_command(
-                                                            command,
-                                                            ns,
-                                                            abs_runner,
-                                                            project_root,
-                                                        )
-                                                    {
-                                                        hook["command"] = Value::String(repaired);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                            let may_add = repair_claude_hooks(
+                                h_obj,
+                                namespace,
+                                abs_runner,
+                                project_root,
+                                warnings,
+                            );
+                            let runs = |command: &str| {
+                                installer_hook_parts(command, abs_runner, project_root).is_some()
+                            };
+                            if may_add {
+                                // Each event gets the runner unless an entry
+                                // already runs it, beside the user's own hooks.
+                                ensure_claude_hook(
+                                    h_obj,
+                                    "PreToolUse",
+                                    Some(CLAUDE_FILE_TOOLS_MATCHER),
+                                    |m| m != Some(CLAUDE_SESSION_SCOPE_MATCHER),
+                                    &cmd,
+                                    &runs,
+                                );
+                                // task_claim and get_snapshot get the session's
+                                // folder as `worktree` (claim scope from a linked
+                                // worktree).
+                                ensure_claude_hook(
+                                    h_obj,
+                                    "PreToolUse",
+                                    Some(CLAUDE_SESSION_SCOPE_MATCHER),
+                                    |m| m == Some(CLAUDE_SESSION_SCOPE_MATCHER),
+                                    &cmd,
+                                    &runs,
+                                );
+                                // SessionStart lets the runner record the session's
+                                // folder when Claude Code gives no CLAUDE_PROJECT_DIR.
+                                ensure_claude_hook(
+                                    h_obj,
+                                    "SessionStart",
+                                    None,
+                                    |_| true,
+                                    &cmd,
+                                    &runs,
+                                );
+                                ensure_claude_hook(h_obj, "Stop", None, |_| true, &cmd, &runs);
                             }
                             // An older installer wrote a matcher without
                             // NotebookEdit, so notebook edits skipped the
@@ -1654,36 +1934,28 @@ fn wire_harness_config(
         }
         "hermes" => {
             if is_active || project_root.join(".hermes").exists() {
-                if namespace.is_none() && !wire_without_namespace {
-                    return None;
-                }
+                let namespace = namespace.as_deref()?;
                 let cfg_path = project_root.join(".hermes/plugins/neurostrata.json");
-                let doc = with_namespace(
-                    json!({
-                        "id": "neurostrata-hermes",
-                        "entry": abs_dist,
-                        "cliHookRunner": abs_runner
-                    }),
-                    namespace.as_deref(),
-                );
+                let doc = json!({
+                    "id": "neurostrata-hermes",
+                    "namespace": namespace,
+                    "entry": abs_dist,
+                    "cliHookRunner": abs_runner
+                });
                 return write_json_if_changed(&cfg_path, &doc);
             }
             None
         }
         "codex" => {
             if is_active || project_root.join(".codex").exists() {
-                if namespace.is_none() && !wire_without_namespace {
-                    return None;
-                }
+                let namespace = namespace.as_deref()?;
                 let cfg_path = project_root.join(".codex/plugins/neurostrata.json");
-                let doc = with_namespace(
-                    json!({
-                        "id": "neurostrata-codex",
-                        "entry": abs_dist,
-                        "cliHookRunner": abs_runner
-                    }),
-                    namespace.as_deref(),
-                );
+                let doc = json!({
+                    "id": "neurostrata-codex",
+                    "namespace": namespace,
+                    "entry": abs_dist,
+                    "cliHookRunner": abs_runner
+                });
                 let cfg_written = write_json_if_changed(&cfg_path, &doc);
                 // Codex CLI never reads the file above: it runs hooks from
                 // `.codex/hooks.json` (or `[hooks]` in config.toml). Without
@@ -1694,36 +1966,28 @@ fn wire_harness_config(
         }
         "openclaw" => {
             if is_active || project_root.join(".openclaw").exists() {
-                if namespace.is_none() && !wire_without_namespace {
-                    return None;
-                }
+                let namespace = namespace.as_deref()?;
                 let cfg_path = project_root.join(".openclaw/plugins/neurostrata.json");
-                let doc = with_namespace(
-                    json!({
-                        "id": "neurostrata-openclaw",
-                        "entry": abs_dist
-                    }),
-                    namespace.as_deref(),
-                );
+                let doc = json!({
+                    "id": "neurostrata-openclaw",
+                    "namespace": namespace,
+                    "entry": abs_dist
+                });
                 return write_json_if_changed(&cfg_path, &doc);
             }
             None
         }
         "github-cli" => {
             if is_active || project_root.join(".github").exists() {
-                if namespace.is_none() && !wire_without_namespace {
-                    return None;
-                }
+                let namespace = namespace.as_deref()?;
                 let cfg_path =
                     project_root.join(".NeuroStrata/plugins/github-cli/copilot-extension.json");
-                let doc = with_namespace(
-                    json!({
-                        "id": "neurostrata-github-cli",
-                        "entry": abs_dist,
-                        "cliHookRunner": abs_runner
-                    }),
-                    namespace.as_deref(),
-                );
+                let doc = json!({
+                    "id": "neurostrata-github-cli",
+                    "namespace": namespace,
+                    "entry": abs_dist,
+                    "cliHookRunner": abs_runner
+                });
                 return write_json_if_changed(&cfg_path, &doc);
             }
             None
@@ -1813,6 +2077,155 @@ mod tests {
             src_of(dir),
             ("example-project".into(), NamespaceSource::FolderName)
         );
+    }
+
+    fn marker_at(dir: &Path, ns: &str) {
+        let cfg = crate::root_marker::RootConfig::new(ns);
+        std::fs::create_dir_all(dir).unwrap();
+        crate::root_marker::replace_marker(dir, &cfg).unwrap();
+    }
+
+    fn git_project() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(dir.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
+        (tmp, dir)
+    }
+
+    #[test]
+    fn marker_beats_harness_config_and_env() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        write_file(
+            &dir.join(".claude").join("settings.local.json"),
+            r#"{"env": {"NEUROSTRATA_NAMESPACE": "alpha"}}"#,
+        );
+        marker_at(&dir, "from-marker");
+        std::env::set_var("NEUROSTRATA_NAMESPACE", "beta");
+        assert_eq!(
+            src_of(&dir),
+            ("from-marker".into(), NamespaceSource::Marker)
+        );
+        // The daemon side honors the marker too.
+        assert_eq!(
+            namespace_for_refresh(&dir, false),
+            Ok(Some("from-marker".to_string()))
+        );
+        std::env::remove_var("NEUROSTRATA_NAMESPACE");
+    }
+
+    #[test]
+    fn split_marker_namespace_from_subfolder() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        marker_at(&dir, "whole");
+        let sub = dir.join("packages").join("api");
+        marker_at(&sub, "api-part");
+        std::fs::create_dir_all(sub.join("src")).unwrap();
+        assert_eq!(ns_of(&sub.join("src")), "api-part");
+        assert_eq!(ns_of(&dir), "whole");
+        assert_eq!(ns_of(&dir.join("packages")), "whole");
+    }
+
+    #[test]
+    fn worktree_uses_main_checkout_marker() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        marker_at(&dir, "from-main");
+        let wt = dir.join(".claude").join("worktrees").join("agent-1");
+        let gitdir = dir.join(".git").join("worktrees").join("agent-1");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        assert_eq!(src_of(&wt), ("from-main".into(), NamespaceSource::Marker));
+        assert!(boot_namespaces_for(&wt)
+            .iter()
+            .all(|(_, ns)| ns == "from-main"));
+        assert!(!boot_namespaces_for(&wt).is_empty());
+    }
+
+    #[test]
+    fn explicit_namespace_rejects_folder_name_only() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        assert_eq!(
+            explicit_namespace(&dir),
+            Err(vec!["example-project".to_string()])
+        );
+        // A single source is explicit.
+        std::env::set_var("NEUROSTRATA_NAMESPACE", "beta");
+        assert_eq!(explicit_namespace(&dir), Ok("beta".to_string()));
+        std::env::remove_var("NEUROSTRATA_NAMESPACE");
+        marker_at(&dir, "from-marker");
+        assert_eq!(explicit_namespace(&dir), Ok("from-marker".to_string()));
+    }
+
+    #[test]
+    fn explicit_namespace_rejects_disagreement() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        write_file(
+            &dir.join(".claude").join("settings.local.json"),
+            r#"{"env": {"NEUROSTRATA_NAMESPACE": "alpha"}}"#,
+        );
+        write_file(
+            &dir.join(".NeuroStrata").join("session_queries.json"),
+            r#"{"namespace": "from-ledger", "queries": []}"#,
+        );
+        assert_eq!(
+            explicit_namespace_from(&dir, Some("beta")),
+            Err(vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "from-ledger".to_string()
+            ])
+        );
+        assert_eq!(
+            explicit_namespace_from(&dir, Some("alpha")),
+            Err(vec!["alpha".to_string(), "from-ledger".to_string()])
+        );
+    }
+
+    #[test]
+    fn boot_uses_marker_namespace() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        write_file(
+            &dir.join(".hermes/plugins/neurostrata.json"),
+            r#"{"id": "neurostrata-hermes", "namespace": "from-config"}"#,
+        );
+        assert_eq!(
+            boot_namespaces_for(&dir),
+            vec![("hermes".to_string(), "from-config".to_string())]
+        );
+        marker_at(&dir, "from-marker");
+        let boot = boot_namespaces_for(&dir);
+        assert!(boot.contains(&("hermes".to_string(), "from-marker".to_string())));
+        assert!(boot.iter().all(|(_, ns)| ns == "from-marker"));
+    }
+
+    #[test]
+    fn namespace_resolve_cli_fails_on_unreadable_marker() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        write_file(&dir.join(".NeuroStrata").join("config.json"), "{ not json");
+        let err = resolve_namespace(&dir)
+            .expect_err("unreadable marker must fail")
+            .to_string();
+        assert!(err.contains("config.json"), "names the file: {err}");
+        // A refresh writes no namespace it cannot know.
+        assert!(namespace_for_refresh(&dir, true).is_err());
+        marker_at(&dir, "fixed");
+        assert_eq!(ns_of(&dir), "fixed");
     }
 
     #[test]
@@ -1982,6 +2395,7 @@ mod tests {
         let main = base.join("platform");
         std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt")).unwrap();
         std::fs::write(main.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(main.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
         std::fs::create_dir_all(main.join("src")).unwrap();
         // No configuration yet: the folder name, from any directory inside.
         assert_eq!(ns_of(&main), "platform");
@@ -2142,112 +2556,6 @@ mod tests {
         assert_eq!(ns(&format!("MY_{}", ours("a"))), None);
     }
 
-    /// #374 (finding r): a missing `cli-hook.mjs` outside the installer's
-    /// plugin location is a custom hook, not installer config; it must never
-    /// capture the namespace the push gate uses.
-    #[test]
-    fn a_missing_unrelated_runner_does_not_capture_the_namespace() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = dunce::canonicalize(tmp.path()).unwrap();
-        let runner = plain_abs_path(&installed_runner(&root, "claude"));
-        let ns = |command: &str| installer_hook_namespace(command, &root, &runner);
-        assert_eq!(
-            ns("NEUROSTRATA_NAMESPACE=attacker node \"C:/somewhere/cli-hook.mjs\"").as_deref(),
-            None,
-            "a missing unrelated cli-hook.mjs must not be treated as ours"
-        );
-        assert_eq!(
-            ns(&format!(
-                "NEUROSTRATA_NAMESPACE=attacker node \"{}\"",
-                root.join("unrelated/cli-hook.mjs").display()
-            )),
-            None
-        );
-        // The installer-shaped path is still ours (moved checkout).
-        assert_eq!(
-            ns("NEUROSTRATA_NAMESPACE=moved node \"D:/old/.NeuroStrata/plugins/claude/cli-hook.mjs\"")
-                .as_deref(),
-            Some("moved")
-        );
-    }
-
-    /// #374 (finding y): namespace lookup rejects config files that are not
-    /// regular files or that exceed the size bound before reading them.
-    #[test]
-    fn namespace_lookup_rejects_non_regular_and_oversized_configs() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path();
-        assert!(read_config(&dir.join("missing.json")).unwrap().is_none());
-        let as_dir = dir.join("as-dir.json");
-        std::fs::create_dir(&as_dir).unwrap();
-        assert!(
-            read_config(&as_dir).is_err(),
-            "a directory is not a regular file"
-        );
-        let big = dir.join("big.json");
-        // Valid JSON, but past the bound: the original code parsed it fully.
-        let mut padded = br#"{"namespace":"alpha"}"#.to_vec();
-        padded.resize(MAX_CONFIG_BYTES as usize + 1, b' ');
-        std::fs::write(&big, padded).unwrap();
-        assert!(
-            read_config(&big).is_err(),
-            "oversized config rejected before parsing"
-        );
-        let ok = dir.join("ok.json");
-        std::fs::write(&ok, r#"{"namespace":"alpha"}"#).unwrap();
-        assert!(read_config(&ok).unwrap().is_some());
-    }
-
-    /// #374 (finding Hq): OpenCode resolves its namespace from the config the
-    /// adapter actually loads, not the historical registration file.
-    #[test]
-    fn opencode_effective_config_outweighs_the_historical_registration() {
-        let _env = no_namespace_env();
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = dunce::canonicalize(tmp.path()).unwrap();
-        std::fs::create_dir_all(root.join(".NeuroStrata")).unwrap();
-        std::fs::create_dir_all(root.join(".opencode")).unwrap();
-        std::fs::write(
-            root.join(".NeuroStrata/neurostrata-plugin.json"),
-            r#"{"namespace":"actual"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join(".opencode/neurostrata-plugin.json"),
-            r#"{"neurostrata":{"namespace":"stale"}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            harness_config_namespace(&root, "opencode")
-                .unwrap()
-                .as_deref(),
-            Some("actual")
-        );
-        assert_eq!(ns_of(&root), "actual");
-    }
-
-    /// #374 (findings p/q/x/Hu): an atomic config refresh preserves the
-    /// original restrictive permissions and leaves no temporary file behind.
-    #[test]
-    #[cfg(unix)]
-    fn atomic_write_preserves_permissions_and_leaves_no_temp() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("cfg.json");
-        std::fs::write(&path, "old").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        write_atomically(&path, "new").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "refresh must not widen config permissions");
-        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
-            .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
-    }
-
     /// A custom Claude hook that sets the variable for its own script does not
     /// shadow the namespace in the installer's hook.
     #[test]
@@ -2379,28 +2687,21 @@ mod tests {
         (tmp, dir)
     }
 
-    /// A refresh with no explicit namespace installs the plugin files AND
-    /// wires namespace-neutral registrations: the runner discovers the
-    /// namespace at invocation time, so detected harnesses can invoke the
-    /// bundle (#374 findings z/Ho). No namespace value is baked into a config.
+    /// A refresh with no explicit namespace installs the plugin files and
+    /// writes no namespace into any config.
     #[test]
-    fn a_refresh_without_an_explicit_namespace_wires_namespace_neutral_hooks() {
+    fn a_refresh_without_an_explicit_namespace_writes_plugin_files_only() {
         let (_tmp, dir) = refresh_project();
         let _ = auto_install_detected_plugins(&dir, ConfigNamespace::Keep(None), Some("claude"));
         assert!(
             installed_runner(&dir, "claude").is_file(),
             "plugin files are installed"
         );
-        let cmds = hook_commands(&dir.join(CLAUDE_SETTINGS));
-        assert!(!cmds.is_empty(), "detected Claude harness is registered");
         assert!(
-            cmds.iter()
-                .all(|c| c.starts_with("node \"") && !c.contains("NEUROSTRATA_NAMESPACE=")),
-            "namespace-neutral Claude hooks: {cmds:?}"
+            !dir.join(CLAUDE_SETTINGS).exists(),
+            "no Claude hooks without a namespace"
         );
-        let codex = std::fs::read_to_string(dir.join(".codex/plugins/neurostrata.json"))
-            .expect("detected Codex harness is registered");
-        assert!(!codex.contains("namespace"), "no baked namespace: {codex}");
+        assert!(!dir.join(".codex/plugins/neurostrata.json").exists());
         assert_eq!(harness_namespaces_at(&dir), (Vec::new(), Vec::new()));
     }
 
@@ -2590,7 +2891,15 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("claude"),
         );
-        let fresh = claude_pre_tool_use_matchers(tmp.path());
+        // The installer also wires a session-scope hook; only the file-tools
+        // entry guards NotebookEdit.
+        let file_hooks = |root: &Path| {
+            claude_pre_tool_use_matchers(root)
+                .into_iter()
+                .filter(|(matcher, _)| !matcher.contains("mcp__"))
+                .collect::<Vec<_>>()
+        };
+        let fresh = file_hooks(tmp.path());
         assert_eq!(fresh.len(), 1);
         assert!(
             fresh[0].0.split('|').any(|t| t == "NotebookEdit"),
@@ -2623,7 +2932,7 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("claude"),
         );
-        let after = claude_pre_tool_use_matchers(tmp.path());
+        let after = file_hooks(tmp.path());
         assert_eq!(
             after,
             vec![
@@ -2734,7 +3043,7 @@ mod tests {
                         hooks.iter().any(|h| {
                             h["command"]
                                 .as_str()
-                                .map(|c| c.starts_with("NEUROSTRATA_NAMESPACE=TestProj node \""))
+                                .map(|c| c.starts_with("node \""))
                                 .unwrap_or(false)
                         })
                     })
@@ -2753,7 +3062,9 @@ mod tests {
             .expect("runner basename")
             .to_string_lossy()
             .to_string();
-        let verbatim = format!(r"\\?\C:\old\{}", basename);
+        // A moved project's runner at the installer's place, in verbatim form;
+        // a missing runner anywhere else is not the installer's to repair.
+        let verbatim = format!(r"\\?\C:\old\.NeuroStrata\plugins\claude\{}", basename);
         ours["hooks"][0]["command"] = json!(format!(
             "{}{}{}",
             &command[..open + 1],
@@ -2803,17 +3114,21 @@ mod tests {
             "verbatim path survived repair: {commands:?}"
         );
         assert!(
-            commands.iter().any(
-                |c| c.starts_with("NEUROSTRATA_NAMESPACE=TestProj node \"") && c.ends_with('"')
-            ),
+            commands
+                .iter()
+                .any(|c| c.starts_with("node \"") && c.ends_with('"')),
             "our repaired hook is present: {commands:?}"
         );
     }
 
     /// Settings whose PreToolUse, Stop and SessionStart hooks all run
-    /// `NEUROSTRATA_NAMESPACE=TestProj node "<runner>"`.
+    /// `NEUROSTRATA_NAMESPACE=TestProj node "<runner>"`, as older installers
+    /// wrote them.
     fn settings_with_runner(runner: &str) -> Value {
-        let cmd = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{runner}\"");
+        settings_with_command(&format!("NEUROSTRATA_NAMESPACE=TestProj node \"{runner}\""))
+    }
+
+    fn settings_with_command(cmd: &str) -> Value {
         json!({
             "hooks": {
                 "PreToolUse": [{
@@ -2884,13 +3199,340 @@ mod tests {
         let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
             .as_str()
             .expect("cli_hook_runner");
-        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert_eq!(commands.len(), 4, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "missing runner not repaired: {commands:?}"
         );
+        assert_eq!(
+            claude_config_namespace(tmp.path()).as_deref(),
+            Some("TestProj")
+        );
+    }
+
+    fn claude_config(root: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(root.join(CLAUDE_CONFIG_REL)).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn fresh_claude_install_writes_config_and_plain_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("example-project"),
+            Some("claude"),
+        );
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            claude_config(tmp.path()),
+            json!({"id": "neurostrata-claude", "namespace": "example-project"})
+        );
+        let commands = hook_commands(&tmp.path().join(".claude/settings.local.json"));
+        assert_eq!(commands.len(), 4, "{commands:?}");
+        let want = format!("node \"{abs_runner}\"");
+        assert!(commands.iter().all(|c| *c == want), "{commands:?}");
+        assert_eq!(
+            configured_namespace(tmp.path()).as_deref(),
+            Some("example-project")
+        );
+    }
+
+    #[test]
+    fn old_claude_install_is_repaired_keeping_its_namespace() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        // The marker names another namespace; the old command's is kept.
+        marker_at(&dir, "example-other");
+        let runner = dir.join(".NeuroStrata/plugins/claude/cli-hook.mjs");
+        let old = format!(
+            "NEUROSTRATA_NAMESPACE=example-project node \"{}\"",
+            runner.display()
+        );
+        assert_eq!(
+            repair_installer_hook_command(&old, &runner.to_string_lossy(), &dir),
+            Some(format!("node \"{}\"", runner.display()))
+        );
+        assert_eq!(
+            claude_config_namespace(&dir).as_deref(),
+            Some("example-project")
+        );
+
+        // Through the installer, called with the marker's namespace.
+        std::fs::remove_file(dir.join(CLAUDE_CONFIG_REL)).unwrap();
+        let cfg = dir.join(".claude/settings.local.json");
+        std::fs::write(
+            &cfg,
+            serde_json::to_string_pretty(&settings_with_command(&old)).unwrap(),
+        )
+        .unwrap();
+        let report = auto_install_detected_plugins(
+            &dir,
+            ConfigNamespace::Set("example-other"),
+            Some("claude"),
+        );
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .unwrap();
+        assert_eq!(claude_config(&dir)["namespace"], "example-project");
+        let want = format!("node \"{abs_runner}\"");
+        let commands = hook_commands(&cfg);
+        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert!(commands.iter().all(|c| *c == want), "{commands:?}");
+    }
+
+    #[test]
+    fn repair_keeps_old_command_when_config_write_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        // A folder where the config file goes: every write of it fails, on
+        // every platform (a read-only folder does not stop writes on Windows).
+        std::fs::create_dir_all(root.join(CLAUDE_CONFIG_REL)).unwrap();
+        let runner = root.join(".NeuroStrata/plugins/claude/cli-hook.mjs");
+        let old = format!(
+            "NEUROSTRATA_NAMESPACE=example-project node \"{}\"",
+            runner.display()
+        );
+        assert_eq!(
+            repair_installer_hook_command(&old, &runner.to_string_lossy(), root),
+            None
+        );
+
+        let cfg = root.join(".claude/settings.local.json");
+        let before = serde_json::to_string_pretty(&settings_with_command(&old)).unwrap();
+        std::fs::write(&cfg, &before).unwrap();
+        let report = auto_install_detected_plugins(
+            root,
+            ConfigNamespace::Set("example-project"),
+            Some("claude"),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            before,
+            "old command must stay"
+        );
+        assert_eq!(
+            report["warnings"].as_array().map(Vec::len),
+            Some(1),
+            "{report}"
+        );
+
+        // A fresh install still installs the hooks (fail-soft) and warns.
+        std::fs::remove_file(&cfg).unwrap();
+        let report = auto_install_detected_plugins(
+            root,
+            ConfigNamespace::Set("example-project"),
+            Some("claude"),
+        );
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .unwrap();
+        let commands = hook_commands(&cfg);
+        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert!(
+            commands
+                .iter()
+                .all(|c| *c == format!("node \"{abs_runner}\"")),
+            "{commands:?}"
+        );
+        let warning = report["warnings"][0].as_str().unwrap_or_default();
+        assert!(warning.contains("neurostrata.json"), "{report}");
+    }
+
+    #[test]
+    fn old_hooks_with_different_namespaces_keep_the_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let runner = root.join(".NeuroStrata/plugins/claude/cli-hook.mjs");
+        let baked = |ns: &str| format!("NEUROSTRATA_NAMESPACE={ns} node \"{}\"", runner.display());
+        let cfg = root.join(".claude/settings.local.json");
+        let settings = json!({"hooks": {
+            "PreToolUse": [{"matcher": "Read", "hooks": [{"type": "command", "command": baked("example-second")}]}],
+            "SessionStart": [{"hooks": [{"type": "command", "command": baked("example-first")}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": baked("example-third")}]}]
+        }});
+        std::fs::write(&cfg, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        let report = auto_install_detected_plugins(
+            root,
+            ConfigNamespace::Set("example-other"),
+            Some("claude"),
+        );
+        // SessionStart is read first, whatever order the settings keep.
+        assert_eq!(claude_config(root)["namespace"], "example-first");
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .unwrap();
+        let commands = hook_commands(&cfg);
+        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert!(
+            commands
+                .iter()
+                .all(|c| *c == format!("node \"{abs_runner}\"")),
+            "{commands:?}"
+        );
+        // The collapse is said, naming every namespace the hooks carried.
+        let warnings = report["warnings"].as_array().expect("warnings");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let warning = warnings[0].as_str().unwrap();
+        for ns in ["example-first", "example-second", "example-third"] {
+            assert!(warning.contains(ns), "{warning}");
+        }
+    }
+
+    #[test]
+    fn explicit_namespace_never_answers_past_an_unreadable_marker() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        write_file(
+            &dir.join(".hermes/plugins/neurostrata.json"),
+            r#"{"id": "neurostrata-hermes", "namespace": "alpha"}"#,
+        );
+        assert_eq!(explicit_namespace(&dir), Ok("alpha".to_string()));
+        write_file(
+            &dir.join(".NeuroStrata").join("config.json"),
+            r#"{"version": 2, "namespace": "beta"}"#,
+        );
+        assert_eq!(explicit_namespace(&dir), Err(vec!["alpha".to_string()]));
+    }
+
+    #[test]
+    fn explicit_namespace_treats_a_case_only_difference_as_one_namespace() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        write_file(
+            &dir.join(".hermes/plugins/neurostrata.json"),
+            r#"{"id": "neurostrata-hermes", "namespace": "Example-Project"}"#,
+        );
+        write_file(
+            &dir.join(".NeuroStrata").join("session_queries.json"),
+            r#"{"namespace": "example-project", "queries": []}"#,
+        );
+        // The first source's spelling, in the fixed order.
+        assert_eq!(
+            explicit_namespace_from(&dir, Some("EXAMPLE-PROJECT")),
+            Ok("Example-Project".to_string())
+        );
+    }
+
+    #[test]
+    fn boot_skips_an_unreadable_marker_and_keeps_each_config() {
+        let _env = no_namespace_env();
+        let (_tmp, dir) = git_project();
+        write_file(
+            &dir.join(".hermes/plugins/neurostrata.json"),
+            r#"{"id": "neurostrata-hermes", "namespace": "from-config"}"#,
+        );
+        write_file(&dir.join(".NeuroStrata").join("config.json"), "{ not json");
+        assert_eq!(
+            boot_namespaces_for(&dir),
+            vec![("hermes".to_string(), "from-config".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_plain_runner_is_repaired_only_at_the_installers_place() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        let abs_runner = plain_abs_path(&installed_runner(&root, "claude"));
+        // Someone's own runner, missing: not ours.
+        let other = root.join("tools").join("cli-hook.mjs");
+        assert_eq!(
+            installer_hook_parts(&format!("node \"{}\"", other.display()), &abs_runner, &root),
+            None
+        );
+        // A moved project's runner at the installer's place, missing: ours.
+        let moved = root
+            .join("moved")
+            .join(".NeuroStrata/plugins/claude/cli-hook.mjs");
+        assert_eq!(
+            installer_hook_parts(&format!("node \"{}\"", moved.display()), &abs_runner, &root),
+            Some((None, format!("node \"{abs_runner}\"")))
+        );
+        // The installer's own runner.
+        assert!(
+            installer_hook_parts(&format!("node \"{abs_runner}\""), &abs_runner, &root).is_some()
+        );
+    }
+
+    #[test]
+    fn the_runner_is_added_beside_a_users_own_hooks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let cfg = root.join(".claude/settings.local.json");
+        let settings = json!({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": "echo user-start"}]}],
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo user-bash"}]}]
+        }});
+        std::fs::write(&cfg, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+        let report = auto_install_detected_plugins(
+            root,
+            ConfigNamespace::Set("example-project"),
+            Some("claude"),
+        );
+        let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .unwrap();
+        let ours = format!("node \"{abs_runner}\"");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        let entries = |event: &str| doc["hooks"][event].as_array().cloned().unwrap_or_default();
+        let runs_ours = |entry: &Value| entry["hooks"][0]["command"] == json!(ours);
+        let start = entries("SessionStart");
+        assert_eq!(start.len(), 2, "{start:?}");
+        assert_eq!(start[0]["hooks"][0]["command"], "echo user-start");
+        assert!(runs_ours(&start[1]), "{start:?}");
+        let pre = entries("PreToolUse");
+        assert_eq!(pre[0]["hooks"][0]["command"], "echo user-bash");
+        let matchers: Vec<&str> = pre
+            .iter()
+            .filter(|e| runs_ours(e))
+            .filter_map(|e| e["matcher"].as_str())
+            .collect();
+        assert_eq!(
+            matchers,
+            vec![CLAUDE_PRE_TOOL_USE_MATCHER, CLAUDE_SESSION_SCOPE_MATCHER]
+        );
+        assert!(entries("Stop").iter().any(runs_ours));
+        // A second install adds nothing.
+        let before = std::fs::read_to_string(&cfg).unwrap();
+        auto_install_detected_plugins(
+            root,
+            ConfigNamespace::Set("example-project"),
+            Some("claude"),
+        );
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), before);
+    }
+
+    #[test]
+    fn configured_namespace_reads_claude_config_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        write_file(
+            &root.join(CLAUDE_CONFIG_REL),
+            r#"{"id": "neurostrata-claude", "namespace": "example-project"}"#,
+        );
+        assert_eq!(
+            configured_namespace(root).as_deref(),
+            Some("example-project")
+        );
+        // The config file outranks what older installs left in the settings.
+        write_file(
+            &root.join(".claude").join("settings.local.json"),
+            r#"{"env": {"NEUROSTRATA_NAMESPACE": "from-settings"}}"#,
+        );
+        assert_eq!(
+            configured_namespace(root).as_deref(),
+            Some("example-project")
+        );
+        std::fs::remove_file(root.join(CLAUDE_CONFIG_REL)).unwrap();
+        assert_eq!(configured_namespace(root).as_deref(), Some("from-settings"));
     }
 
     #[cfg(windows)]
@@ -2925,9 +3567,9 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("claude"),
         );
-        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert_eq!(commands.len(), 4, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "own verbatim runner not repaired: {commands:?}"
@@ -2972,9 +3614,9 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("claude"),
         );
-        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert_eq!(commands.len(), 4, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "own runner in other case not repaired: {commands:?}"
@@ -3156,6 +3798,7 @@ mod tests {
             true,
             "./.NeuroStrata/plugins/opencode/dist/index.js",
             "./.NeuroStrata/plugins/opencode/cli-hook.mjs",
+            &mut Vec::new(),
         );
         assert!(wired.is_some(), "loader should be wired for opencode");
         assert!(
@@ -3266,10 +3909,7 @@ mod tests {
             .unwrap()
             .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        write_file(
-            &dir.join(".NeuroStrata/config.json"),
-            r#"{"namespace":"from-marker"}"#,
-        );
+        marker_at(&dir, "from-marker");
         let got = resolve_namespace_from(&dir, Some("from-env")).expect("resolves");
         assert_eq!(got.namespace, "from-marker");
         assert_eq!(got.source, NamespaceSource::Marker);
@@ -3408,7 +4048,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".codex")).expect("create .codex");
         let _ = auto_install_detected_plugins(
             tmp.path(),
-            ConfigNamespace::Keep(Some("folder-name")),
+            ConfigNamespace::Set("TestProj"),
             Some("codex"),
         );
         let before = read_codex_hooks(tmp.path());
@@ -3421,7 +4061,7 @@ mod tests {
             assert_eq!(
                 read_codex_hooks(tmp.path()),
                 before,
-                "install with {other:?} must change nothing"
+                "refresh with {other:?} must change nothing"
             );
         }
         for command in codex_commands(&before, "PreToolUse") {
@@ -3504,7 +4144,12 @@ mod tests {
     #[test]
     fn installed_runner_passes_a_namespace_only_when_set() {
         assert!(!CLI_HOOK_RUNNER_MJS.contains("{ namespace: process.env.NEUROSTRATA_NAMESPACE }"));
-        assert!(CLI_HOOK_RUNNER_MJS.contains("namespace ? { namespace } : {}"));
+        // The namespace now comes from the harness config the installer wrote:
+        // `readHarnessConfig` returns `{}` when none is set, so an explicit
+        // `namespace: undefined` is never passed, and `projectDir` travels
+        // with it for root-lookup spelling.
+        assert!(CLI_HOOK_RUNNER_MJS.contains("readHarnessConfig(HARNESS, projectDir, RUNNER_DIR)"));
+        assert!(CLI_HOOK_RUNNER_MJS.contains(", projectDir });"));
     }
 
     /// Ownership is the installer's layout, read as literal text: a user's

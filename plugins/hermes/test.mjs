@@ -482,3 +482,73 @@ test("audit W1 follow-up (#326): a Stop runner event with a transcript reaches t
     console.info = originalInfo;
   }
 });
+
+// The project root marker walk is a copy of the core plugin's; the shared
+// fixture is the contract every copy (and the Rust daemon) must pass.
+import {
+  findRootMarker as markerWalk,
+  resolveConfig as resolveWithMarker,
+} from "./dist/index.js";
+import { rmSync as removeTree } from "node:fs";
+import {
+  buildLayout as buildMarkerLayout,
+  canonicalTempDir as markerTempDir,
+  fixtureMismatches,
+  under as underBase,
+} from "../../tests/fixtures/root-marker-layout.mjs";
+
+test("marker fixture cases match", () => {
+  assert.deepEqual(fixtureMismatches(markerWalk), []);
+});
+
+test("resolveConfig puts marker first", () => {
+  const base = markerTempDir("ns-adapter-marker-");
+  try {
+    buildMarkerLayout(base, ["repo git-dir", "repo marker:from-marker", "repo/sub"]);
+    const sub = underBase(base, "repo/sub");
+    assert.equal(resolveWithMarker({ namespace: "cfg-ns" }, sub).namespace, "from-marker");
+    removeTree(underBase(base, "repo/.NeuroStrata/config.json"));
+    assert.equal(resolveWithMarker({ namespace: "cfg-ns" }, sub).namespace, "cfg-ns");
+  } finally {
+    removeTree(base, { recursive: true, force: true });
+  }
+});
+
+test("an unreadable marker is skipped with one warning naming the file", () => {
+  const base = markerTempDir("ns-adapter-unreadable-");
+  const lines = [];
+  const original = console.error;
+  console.error = (...args) => lines.push(args.join(" "));
+  try {
+    buildMarkerLayout(base, [
+      "repo git-dir",
+      'repo marker-text:{"version": 1.0, "namespace": "example-project"}',
+    ]);
+    const repo = underBase(base, "repo");
+    assert.equal(markerWalk(repo), null);
+    assert.equal(resolveWithMarker({ namespace: "from-config" }, repo).namespace, "from-config");
+    assert.equal(lines.length, 1, JSON.stringify(lines));
+    assert.ok(lines[0].includes(underBase(base, "repo/.NeuroStrata/config.json")), lines[0]);
+  } finally {
+    console.error = original;
+    removeTree(base, { recursive: true, force: true });
+  }
+});
+
+test("claim scope: the runner passes the session folder as worktree on task_claim", async () => {
+  const mod = await import("./dist/index.js");
+  assert.equal(mod.isSessionScopedTool("mcp__neurostrata__neurostrata_get_snapshot"), true);
+  assert.equal(mod.isSessionScopedTool("neurostrata_task_update"), false);
+  const out = await mod.handleHookEvent({
+    hook_event_name: "PreToolUse",
+    tool_name: "neurostrata_task_claim",
+    tool_input: { id: "example-project-1" },
+  });
+  assert.equal(typeof out.hookSpecificOutput.updatedInput.worktree, "string");
+  const kept = await mod.handleHookEvent({
+    hook_event_name: "PreToolUse",
+    tool_name: "neurostrata_task_claim",
+    tool_input: { id: "example-project-1", project_root: "/own" },
+  });
+  assert.equal(kept.hookSpecificOutput.updatedInput, undefined);
+});

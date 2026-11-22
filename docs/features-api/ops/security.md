@@ -9,7 +9,7 @@
 | Threat Vector (OWASP LLM Top-10) | NeuroStrata Mitigation | Source Module |
 | :--- | :--- | :--- |
 | **Unauthorized Network Access** | Loopback-only HTTP binding (`127.0.0.1:34343`) + mandatory 256-bit Bearer Token (`~/.config/neurostrata/daemon.token`, `0600` permissions). | `src/server.rs`, `src/main.rs` |
-| **Arbitrary Path Traversal (`J6`)** | Caller-Path Authority (`check_caller_path`) canonicalizes every path passed to `/ingest`, `/backup`, `/export-graph`, and `/tasks/import`, restricting access to `startup_root` or explicit `allowed_external_dirs`. | `src/server.rs`, `src/config.rs` |
+| **Arbitrary Path Traversal (`J6`)** | Caller-Path Authority (`check_caller_path`) canonicalizes every path passed to `/ingest`, `/backup`, `/export-graph`, `/tasks/import`, and the root passed to `/cli/root` (`hooks install` and `root set` setting a cached root), restricting access to `startup_root` or explicit `allowed_external_dirs`. | `src/server.rs`, `src/config.rs` |
 | **Secret & Credential Leakage** | A fail-closed secret scanner **rejects** the write outright when the payload contains a credential, so sensitive material never reaches a vector index, the Episodic Buffer, or a Git-shared SynapticMesh record. | `src/secrets.rs`, `src/buffer.rs` |
 | **Cypher / SPARQL Injection** | Strict string escaping (backslashes escaped prior to quotes) and validated identifier checks across all LadybugDB Cypher and SPARQL (`spargebra` / `sparopt`) queries. | `src/store/ladybug.rs`, `src/rdf/sparql.rs` |
 | **Destructive Agent Hallucinations** | Zero destructive MCP tools: `delete`, `move`, and `restore` do not exist on the MCP JSON-RPC surface and can only be invoked by an operator via the CLI. | `src/server.rs`, `src/main.rs` |

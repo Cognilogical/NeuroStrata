@@ -607,6 +607,10 @@ pub enum RootSource {
     RegistryRoot,
     /// The nearest ancestor holding `.git` (directory or worktree file).
     Marker,
+    /// The root of the project marker (`.NeuroStrata/config.json`) for the
+    /// call's namespace, when it is also the namespace's cached root
+    /// ([`with_marker_spelling`]).
+    RootConfig,
     /// Absolute, but under no root this namespace knows: left unchanged.
     Outside,
 }
@@ -618,6 +622,7 @@ impl RootSource {
             RootSource::ProjectRoot => "project_root",
             RootSource::RegistryRoot => "registry_root",
             RootSource::Marker => "marker",
+            RootSource::RootConfig => "root_config",
             RootSource::Outside => "outside",
         }
     }
@@ -732,6 +737,83 @@ pub fn to_project_relative(
             root: None,
             alternates: Vec::new(),
         },
+    }
+}
+
+/// Whether `marker`'s root is `cached_root`, the namespace's cached registry
+/// root. A worktree's root matches in its main checkout's spelling (the
+/// registry caches it that way) or as itself (a root cached at the
+/// worktree), both sides compared canonically, so an alias of the same
+/// folder matches. No cached root, or one missing here, never matches.
+pub fn marker_root_is_cached_root(
+    marker: &crate::root_marker::FoundMarker,
+    cached_root: Option<&str>,
+) -> bool {
+    let Some(cached) = cached_root.and_then(host_path).and_then(|p| canonical(&p)) else {
+        return false;
+    };
+    let mapped = crate::root_marker::in_main_checkout(&marker.root);
+    [mapped, marker.root.clone()]
+        .into_iter()
+        .any(|root| canonical(&root).unwrap_or(root) == cached)
+}
+
+/// [`with_marker_spelling`] after checking that `marker` names
+/// `call_namespace` (ignoring case) and that its root is the cached root
+/// ([`marker_root_is_cached_root`]); in every other case `lookup` comes back
+/// unchanged. Tests use it to state those rules in one call.
+#[cfg(test)]
+pub fn with_root_config(
+    lookup: LookupPath,
+    input: &str,
+    marker: &crate::root_marker::FoundMarker,
+    cached_root: Option<&str>,
+    call_namespace: &str,
+) -> LookupPath {
+    if !marker.config.namespace.eq_ignore_ascii_case(call_namespace)
+        || !marker_root_is_cached_root(marker, cached_root)
+    {
+        return lookup;
+    }
+    with_marker_spelling(lookup, input, marker)
+}
+
+/// Add the project marker's spelling to a file lookup of absolute `input`
+/// (spec 6.2), for a caller that has already checked that `marker` names
+/// the call's namespace (under `server::resolve_namespace`'s case rules)
+/// and that its root is the cached root ([`marker_root_is_cached_root`]).
+/// Unless `lookup` is `Outside` or `Relative`, the path below the marker
+/// root, in its on-disk spelling, becomes `path`, and today's `path` and
+/// `alternates` follow in order. The
+/// marker root is the cached root, so this is a key today's resolution could
+/// already produce for the file; it only stops depending on the caller's
+/// `project_root`. In every other case `lookup` comes back unchanged.
+pub fn with_marker_spelling(
+    lookup: LookupPath,
+    input: &str,
+    marker: &crate::root_marker::FoundMarker,
+) -> LookupPath {
+    if matches!(lookup.source, RootSource::Outside | RootSource::Relative)
+        || !is_absolute_any(input)
+    {
+        return lookup;
+    }
+    let input = follow_parent_components(input);
+    let root = marker.root.to_string_lossy().to_string();
+    let Some(rel) = relative_to_on_disk(&input, &root) else {
+        return lookup;
+    };
+    let path = with_disk_spelling(&input, &root, rel);
+    let mut alternates = vec![lookup.path];
+    alternates.extend(lookup.alternates);
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(crate::parser::ingest::normalize_node_path(&path));
+    alternates.retain(|a| seen.insert(crate::parser::ingest::normalize_node_path(a)));
+    LookupPath {
+        path,
+        source: RootSource::RootConfig,
+        root: Some(root),
+        alternates,
     }
 }
 
@@ -890,7 +972,10 @@ pub fn lookup_forms(raw: &str, lookup: &LookupPath, known_root: Option<&str>) ->
                 forms.push(joined);
             }
         }
-        RootSource::ProjectRoot | RootSource::RegistryRoot | RootSource::Marker => {
+        RootSource::ProjectRoot
+        | RootSource::RegistryRoot
+        | RootSource::Marker
+        | RootSource::RootConfig => {
             forms.extend(lookup.alternates.iter().cloned());
         }
     }
@@ -1477,6 +1562,7 @@ mod tests {
         let root = canonical(tmp.path()).unwrap().join("example-project");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(root.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
         touch(&root.join("src").join("lib.rs"));
         let worktree = root.join(".claude").join("worktrees").join("agent-1");
         touch(&worktree.join("src").join("lib.rs"));
@@ -2470,6 +2556,174 @@ mod tests {
             Some(root.clone())
         );
     }
+
+    // ---- the project marker's spelling (spec 6.2) ----
+
+    fn found_marker(root: &Path, namespace: &str) -> crate::root_marker::FoundMarker {
+        crate::root_marker::FoundMarker {
+            root: root.to_path_buf(),
+            config: crate::root_marker::RootConfig::new(namespace),
+            via: crate::root_marker::FoundVia::OwnCheckout,
+        }
+    }
+
+    /// `<tmp>/repo` (a checkout) with `sub/a.rs`; returns (repo, file).
+    fn repo_with_sub_file(tmp: &Path) -> (PathBuf, String) {
+        let repo = dunce::canonicalize(tmp).unwrap().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(repo.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::write(repo.join("sub").join("a.rs"), "fn a() {}").unwrap();
+        let file = s(&repo.join("sub").join("a.rs"));
+        (repo, file)
+    }
+
+    #[test]
+    fn deeper_caller_root_also_queries_marker_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, file) = repo_with_sub_file(tmp.path());
+        let (repo_s, sub_s) = (s(&repo), s(&repo.join("sub")));
+        let today = to_project_relative(&file, Some(&sub_s), Some(&repo_s));
+        assert_eq!(today.path, "a.rs");
+        let today_forms = lookup_forms(&file, &today, Some(&sub_s));
+
+        // The marker's namespace is matched ignoring case.
+        let marker = found_marker(&repo, "Example-Project");
+        let got = with_root_config(
+            today.clone(),
+            &file,
+            &marker,
+            Some(&repo_s),
+            "example-project",
+        );
+        assert_eq!(got.path, "sub/a.rs");
+        assert_eq!(got.root.as_deref(), Some(repo_s.as_str()));
+        let forms = lookup_forms(&file, &got, Some(&sub_s));
+        assert_eq!(forms[0], "sub/a.rs");
+        // Every spelling today's resolution queried is still queried, in order.
+        assert_eq!(forms[1..].to_vec(), today_forms, "{forms:?}");
+        assert!(forms.contains(&"a.rs".to_string()), "{forms:?}");
+    }
+
+    #[test]
+    fn resolved_from_is_root_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, file) = repo_with_sub_file(tmp.path());
+        let repo_s = s(&repo);
+        let today = to_project_relative(&file, None, Some(&repo_s));
+        let got = with_root_config(
+            today,
+            &file,
+            &found_marker(&repo, "ns"),
+            Some(&repo_s),
+            "ns",
+        );
+        assert_eq!(got.source, RootSource::RootConfig);
+        assert_eq!(got.source.as_str(), "root_config");
+        assert_eq!(got.path, "sub/a.rs");
+    }
+
+    #[test]
+    fn existing_marker_wire_value_unchanged() {
+        // `marker` keeps meaning the nearest `.git` ancestor.
+        assert_eq!(RootSource::Marker.as_str(), "marker");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, file) = repo_with_sub_file(tmp.path());
+        let today = to_project_relative(&file, None, None);
+        assert_eq!(today.source, RootSource::Marker);
+        assert_eq!(today.source.as_str(), "marker");
+    }
+
+    #[test]
+    fn marker_root_differing_from_cache_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, file) = repo_with_sub_file(tmp.path());
+        let sub_s = s(&repo.join("sub"));
+        let marker = found_marker(&repo, "ns");
+        let today = to_project_relative(&file, None, Some(&sub_s));
+        for cached in [Some(sub_s.as_str()), None, Some("/no/such/folder")] {
+            let got = with_root_config(today.clone(), &file, &marker, cached, "ns");
+            assert_eq!(got, today, "cached {cached:?}");
+        }
+    }
+
+    #[test]
+    fn other_namespace_marker_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, file) = repo_with_sub_file(tmp.path());
+        let (repo_s, sub_s) = (s(&repo), s(&repo.join("sub")));
+        let today = to_project_relative(&file, Some(&sub_s), Some(&repo_s));
+        let got = with_root_config(
+            today.clone(),
+            &file,
+            &found_marker(&repo, "other"),
+            Some(&repo_s),
+            "ns",
+        );
+        assert_eq!(got, today);
+    }
+
+    #[test]
+    fn outside_relative_prefix_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _) = repo_with_sub_file(tmp.path());
+        let repo_s = s(&repo);
+        let marker = found_marker(&repo, "ns");
+
+        let relative = to_project_relative("sub/a.rs", None, Some(&repo_s));
+        let got = with_root_config(relative.clone(), "sub/a.rs", &marker, Some(&repo_s), "ns");
+        assert_eq!(got, relative);
+
+        let outside = LookupPath {
+            path: file_in_other_place(tmp.path()),
+            source: RootSource::Outside,
+            root: None,
+            alternates: Vec::new(),
+        };
+        let input = outside.path.clone();
+        let got = with_root_config(outside.clone(), &input, &marker, Some(&repo_s), "ns");
+        assert_eq!(got, outside);
+
+        // Prefix lookups never go through the marker: a folder below the
+        // cached root resolves relative to it, as before.
+        let forms = prefix_lookup_forms(&s(&repo.join("sub")), None, Some(&repo_s)).unwrap();
+        assert_eq!(forms[0], "sub", "{forms:?}");
+    }
+
+    fn file_in_other_place(tmp: &Path) -> String {
+        let other = dunce::canonicalize(tmp).unwrap().join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("b.rs"), "").unwrap();
+        s(&other.join("b.rs"))
+    }
+
+    #[test]
+    fn worktree_marker_root_matches_its_main_checkout_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _) = repo_with_sub_file(tmp.path());
+        let admin = repo.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let wt = dunce::canonicalize(tmp.path()).unwrap().join("wt");
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", s(&admin))).unwrap();
+        std::fs::write(wt.join("sub").join("a.rs"), "").unwrap();
+        let file = s(&wt.join("sub").join("a.rs"));
+
+        let repo_s = s(&repo);
+        let marker = crate::root_marker::FoundMarker {
+            via: crate::root_marker::FoundVia::MainCheckout,
+            ..found_marker(&wt, "ns")
+        };
+        assert!(marker_root_is_cached_root(&marker, Some(&repo_s)));
+        // A root cached at the worktree itself matches too.
+        assert!(marker_root_is_cached_root(&marker, Some(&s(&wt))));
+        let today = to_project_relative(&file, None, Some(&repo_s));
+        let got = with_root_config(today, &file, &marker, Some(&repo_s), "ns");
+        assert_eq!(got.source, RootSource::RootConfig);
+        assert_eq!(got.path, "sub/a.rs");
+    }
     /// A directory symlink followed by `..` must resolve on disk before the
     /// parent is collapsed; lexical normalization searches the link's parent.
     #[test]
@@ -2479,6 +2733,7 @@ mod tests {
         let root = base.join("root");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(root.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         let link = base.join("shortcut");
         if !dir_link(&root.join("src"), &link) {

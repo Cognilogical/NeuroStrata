@@ -1,0 +1,176 @@
+{
+  "_comment": [
+    "Shared cases for finding a path's project root marker (.NeuroStrata/config.json), spec section 6.1.",
+    "Read by the Rust test root_marker::tests::fixture_cases_match and by the harness plugin tests.",
+    "Each case is built in its own empty temporary folder; every path below is relative to that folder and uses '/'.",
+    "layout: entries created in order. An entry is '<path>' (create the folder) or '<path> <kind>', split at the first space:",
+    "  marker:<ns>          write <path>/.NeuroStrata/config.json as {\"version\":1,\"namespace\":\"<ns>\"}",
+    "  marker-text:<text>   write <text> (the rest of the entry, as is) to <path>/.NeuroStrata/config.json",
+    "  neurostrata-dir      create <path>/.NeuroStrata as an empty folder (no config.json: not a marker)",
+    "  neurostrata-link:<t> make <path>/.NeuroStrata a link to the folder <t> (a symlink, or a junction on Windows): not a marker",
+    "  git-dir              create <path>/.git as a folder (a regular checkout)",
+    "  git-file:<gitdir>    write the file <path>/.git containing 'gitdir: <gitdir>' (<gitdir> relative to <path>)",
+    "  commondir:<rel>      create the folder <path> and write <path>/commondir containing <rel> (a linked worktree's gitdir)",
+    "  file                 create an empty file at <path>",
+    "query: the path to resolve. expect.root: the folder the marker makes the project root, or null for none.",
+    "expect.namespace and expect.via (own_checkout | main_checkout | no_git) are present when expect.root is not null.",
+    "expect.unreadable, when present (with expect.root null): the folder whose marker decides but cannot be read; the Rust walk answers an error naming its config.json, the plugins answer none."
+  ],
+  "cases": [
+    {
+      "name": "plain repo",
+      "layout": ["repo git-dir", "repo marker:example-project", "repo/src/a"],
+      "query": "repo/src/a",
+      "expect": { "root": "repo", "namespace": "example-project", "via": "own_checkout" }
+    },
+    {
+      "name": "subfolder split wins",
+      "layout": [
+        "repo git-dir",
+        "repo marker:example-project",
+        "repo/packages/api marker:example-api",
+        "repo/packages/api/src"
+      ],
+      "query": "repo/packages/api/src",
+      "expect": { "root": "repo/packages/api", "namespace": "example-api", "via": "own_checkout" }
+    },
+    {
+      "name": "a file starts at its folder",
+      "layout": [
+        "repo git-dir",
+        "repo marker:example-project",
+        "repo/packages/api marker:example-api",
+        "repo/packages/api/main.rs file"
+      ],
+      "query": "repo/packages/api/main.rs",
+      "expect": { "root": "repo/packages/api", "namespace": "example-api", "via": "own_checkout" }
+    },
+    {
+      "name": "worktree under .claude/worktrees maps to the main checkout",
+      "layout": [
+        "repo git-dir",
+        "repo marker:example-project",
+        "repo/src",
+        "repo/.git/worktrees/wt commondir:../..",
+        "repo/.claude/worktrees/wt/src",
+        "repo/.claude/worktrees/wt git-file:../../../.git/worktrees/wt"
+      ],
+      "query": "repo/.claude/worktrees/wt/src",
+      "expect": { "root": "repo/.claude/worktrees/wt", "namespace": "example-project", "via": "main_checkout" }
+    },
+    {
+      "name": "worktree with its own top marker and a split in main: the split wins",
+      "layout": [
+        "repo git-dir",
+        "repo marker:example-project",
+        "repo/packages/api marker:example-api",
+        "repo/.git/worktrees/wt commondir:../..",
+        "wt/packages/api/src",
+        "wt git-file:../repo/.git/worktrees/wt",
+        "wt marker:example-project"
+      ],
+      "query": "wt/packages/api/src",
+      "expect": { "root": "wt/packages/api", "namespace": "example-api", "via": "main_checkout" }
+    },
+    {
+      "name": "folder new on the branch maps to its nearest ancestor in main",
+      "layout": [
+        "repo git-dir",
+        "repo marker:example-project",
+        "repo/packages/api marker:example-api",
+        "repo/.git/worktrees/wt commondir:../..",
+        "wt/packages/api/brand-new",
+        "wt git-file:../repo/.git/worktrees/wt"
+      ],
+      "query": "wt/packages/api/brand-new",
+      "expect": { "root": "wt/packages/api", "namespace": "example-api", "via": "main_checkout" }
+    },
+    {
+      "name": "submodule in main that is a plain folder in the worktree is not entered",
+      "layout": [
+        "repo git-dir",
+        "repo marker:example-project",
+        "repo/.git/modules/lib",
+        "repo/vendor/lib git-file:../../.git/modules/lib",
+        "repo/vendor/lib marker:example-lib",
+        "repo/vendor/lib/src",
+        "repo/.git/worktrees/wt commondir:../..",
+        "wt/vendor/lib/src",
+        "wt git-file:../repo/.git/worktrees/wt"
+      ],
+      "query": "wt/vendor/lib/src",
+      "expect": { "root": "wt", "namespace": "example-project", "via": "main_checkout" }
+    },
+    {
+      "name": "nested clone under a marked parent is not covered",
+      "layout": ["repo git-dir", "repo marker:example-project", "repo/nested git-dir", "repo/nested/src"],
+      "query": "repo/nested/src",
+      "expect": { "root": null }
+    },
+    {
+      "name": "bare-repo worktree uses its own checkout only",
+      "layout": [
+        "outer marker:example-outer",
+        "outer/bare.git/worktrees/wt commondir:../..",
+        "outer/wt/src",
+        "outer/wt git-file:../bare.git/worktrees/wt"
+      ],
+      "query": "outer/wt/src",
+      "expect": { "root": null }
+    },
+    {
+      "name": "no git: the first marker up",
+      "layout": ["notes marker:example-notes", "notes/a marker:example-a", "notes/a/b/c"],
+      "query": "notes/a/b/c",
+      "expect": { "root": "notes/a", "namespace": "example-a", "via": "no_git" }
+    },
+    {
+      "name": ".NeuroStrata without config.json is not a marker",
+      "layout": ["repo git-dir", "repo marker:example-project", "repo/sub neurostrata-dir", "repo/sub/x"],
+      "query": "repo/sub/x",
+      "expect": { "root": "repo", "namespace": "example-project", "via": "own_checkout" }
+    },
+    {
+      "name": ".NeuroStrata that is a link pointing elsewhere is not a marker",
+      "layout": [
+        "repo git-dir",
+        "repo marker:example-project",
+        "elsewhere marker:example-elsewhere",
+        "repo/sub neurostrata-link:elsewhere/.NeuroStrata"
+      ],
+      "query": "repo/sub",
+      "expect": { "root": "repo", "namespace": "example-project", "via": "own_checkout" }
+    },
+    {
+      "name": "folder that is itself a checkout top",
+      "layout": ["repo git-dir", "repo marker:example-project"],
+      "query": "repo",
+      "expect": { "root": "repo", "namespace": "example-project", "via": "own_checkout" }
+    },
+    {
+      "name": "version spelled 1.0 is unreadable, and the marker above it is not used",
+      "layout": [
+        "repo git-dir",
+        "repo marker:example-project",
+        "repo/sub marker-text:{\"version\": 1.0, \"namespace\": \"example-sub\"}"
+      ],
+      "query": "repo/sub",
+      "expect": { "root": null, "unreadable": "repo/sub" }
+    },
+    {
+      "name": "unknown version is unreadable",
+      "layout": ["repo git-dir", "repo marker-text:{\"version\": 2, \"namespace\": \"example-project\"}"],
+      "query": "repo",
+      "expect": { "root": null, "unreadable": "repo" }
+    },
+    {
+      "name": "a version field inside another field does not count",
+      "layout": [
+        "repo git-dir",
+        "repo marker-text:{\"version\": 1, \"namespace\": \"example-project\", \"extra\": {\"version\": 1.5}}"
+      ],
+      "query": "repo",
+      "expect": { "root": "repo", "namespace": "example-project", "via": "own_checkout" }
+    }
+  ]
+}

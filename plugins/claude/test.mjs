@@ -1,6 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { spawnSync } from "node:child_process";
+import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  buildLayout,
+  canonicalTempDir,
+  under,
+  writeMarker,
+} from "../../tests/fixtures/root-marker-layout.mjs";
 import plugin, {
   detectTaskIntentsLocal,
   parseGuardValidate,
@@ -453,4 +463,170 @@ test("buildSubagentContextHeader includes required fields", () => {
   // With null taskId
   const headerNull = buildSubagentContextHeader("other-ns", null);
   assert.ok(headerNull.includes("Active Task ID: \`unclaimed (claim a task first)\`"));
+});
+
+// ── The Claude hook runner's namespace (spec 6.3) ─────────────────────────
+// The runner is spawned as Claude Code runs it: a new process per event,
+// event JSON on stdin. The plugin logs its resolved namespace to stderr at
+// initialize; the endpoint points at a closed port so no daemon is reached.
+
+const RUNNER = fileURLToPath(new URL("./cli-hook.mjs", import.meta.url));
+
+function runnerEnv(extra) {
+  const env = { ...process.env };
+  delete env.CLAUDE_PROJECT_DIR;
+  delete env.NEUROSTRATA_NAMESPACE;
+  return { ...env, ...extra };
+}
+
+function runClaudeHook(event, cwd, env) {
+  const run = spawnSync(process.execPath, [RUNNER], {
+    input: JSON.stringify(event),
+    cwd,
+    env,
+    encoding: "utf8",
+    timeout: 30000,
+  });
+  return run.stderr ?? "";
+}
+
+function namespaceIn(stderr) {
+  const match = /plugin initialized[\s\S]*?namespace: '([^']*)'/.exec(stderr);
+  return match ? match[1] : `(none in stderr: ${stderr.slice(0, 300)})`;
+}
+
+/** repo (outer marker) with a split subfolder packages/api (inner marker). */
+function splitProject() {
+  const base = canonicalTempDir("ns-claude-runner-");
+  buildLayout(base, [
+    "repo git-dir",
+    "repo marker:example-outer",
+    "repo/packages/api marker:example-inner",
+  ]);
+  const repo = under(base, "repo");
+  for (const dir of [repo, under(base, "repo/packages/api")]) {
+    writeFileSync(
+      join(dir, ".NeuroStrata", "neurostrata-plugin.json"),
+      JSON.stringify({ endpoint: "http://127.0.0.1:1/mcp" })
+    );
+  }
+  return { base, repo, api: under(base, "repo/packages/api") };
+}
+
+const stopEvent = (cwd, extra = {}) => ({
+  hook_event_name: "Stop",
+  session_id: "runner-namespace-test",
+  cwd,
+  ...extra,
+});
+
+test("claude runner uses CLAUDE_PROJECT_DIR not cwd", () => {
+  const { base, repo, api } = splitProject();
+  try {
+    const top = runClaudeHook(stopEvent(api), api, runnerEnv({ CLAUDE_PROJECT_DIR: repo }));
+    assert.equal(namespaceIn(top), "example-outer");
+    // A session started inside the split subfolder uses the inner namespace.
+    const inner = runClaudeHook(stopEvent(api), api, runnerEnv({ CLAUDE_PROJECT_DIR: api }));
+    assert.equal(namespaceIn(inner), "example-inner");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("claude runner falls back to SessionStart folder when CLAUDE_PROJECT_DIR is unset", () => {
+  const { base, repo, api } = splitProject();
+  try {
+    const env = runnerEnv({});
+    const start = runClaudeHook(stopEvent(repo, { hook_event_name: "SessionStart" }), repo, env);
+    assert.equal(namespaceIn(start), "example-outer");
+    const later = runClaudeHook(stopEvent(api), api, env);
+    assert.equal(namespaceIn(later), "example-outer");
+    // Another session with no recorded start follows its own folder.
+    const other = runClaudeHook(stopEvent(api, { session_id: "another" }), api, env);
+    assert.equal(namespaceIn(other), "example-inner");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("cli hook passes harness config, not env, as config", () => {
+  const base = canonicalTempDir("ns-claude-runner-");
+  try {
+    buildLayout(base, ["repo git-dir", "repo neurostrata-dir"]);
+    const repo = under(base, "repo");
+    writeFileSync(
+      join(repo, ".NeuroStrata", "neurostrata-plugin.json"),
+      JSON.stringify({ endpoint: "http://127.0.0.1:1/mcp" })
+    );
+    const configFile = join(repo, ".NeuroStrata", "plugins", "claude", "neurostrata.json");
+    mkdirSync(dirname(configFile), { recursive: true });
+    writeFileSync(configFile, JSON.stringify({ id: "neurostrata-claude", namespace: "from-config" }));
+    const env = runnerEnv({ CLAUDE_PROJECT_DIR: repo, NEUROSTRATA_NAMESPACE: "from-env" });
+    assert.equal(namespaceIn(runClaudeHook(stopEvent(repo), repo, env)), "from-config");
+    rmSync(configFile);
+    assert.equal(namespaceIn(runClaudeHook(stopEvent(repo), repo, env)), "from-env");
+    // The project marker outranks both.
+    writeMarker(repo, "from-marker");
+    assert.equal(namespaceIn(runClaudeHook(stopEvent(repo), repo, env)), "from-marker");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+  const source = readFileSync(RUNNER, "utf8");
+  assert.ok(!source.includes("process.env.NEUROSTRATA_NAMESPACE"), "runner must not pass the env as config");
+});
+
+// The runner Claude Code actually runs is the one the installer embeds
+// (CLI_HOOK_RUNNER_MJS) and writes to <root>/.NeuroStrata/plugins/claude/;
+// it takes its harness from that folder's name.
+test("installed claude runner: config over env, and CLAUDE_PROJECT_DIR", () => {
+  const embedded = readFileSync(
+    new URL("../../src/task/harness_plugins.rs", import.meta.url),
+    "utf8"
+  ).match(/const CLI_HOOK_RUNNER_MJS: &str = r#"([\s\S]*?)"#;/);
+  assert.ok(embedded, "CLI_HOOK_RUNNER_MJS must be extractable");
+  const base = canonicalTempDir("ns-claude-installed-");
+  try {
+    buildLayout(base, ["repo git-dir", "repo neurostrata-dir", "repo/sub"]);
+    const repo = under(base, "repo");
+    const pluginDir = join(repo, ".NeuroStrata", "plugins", "claude");
+    mkdirSync(join(pluginDir, "dist"), { recursive: true });
+    copyFileSync(
+      fileURLToPath(new URL("./dist/index.js", import.meta.url)),
+      join(pluginDir, "dist", "index.js")
+    );
+    writeFileSync(join(pluginDir, "package.json"), JSON.stringify({ type: "module" }));
+    const runner = join(pluginDir, "cli-hook.mjs");
+    writeFileSync(runner, embedded[1]);
+    writeFileSync(
+      join(pluginDir, "neurostrata.json"),
+      JSON.stringify({ id: "neurostrata-claude", namespace: "from-config" })
+    );
+    const closedPort = JSON.stringify({ endpoint: "http://127.0.0.1:1/mcp" });
+    writeFileSync(join(repo, ".NeuroStrata", "neurostrata-plugin.json"), closedPort);
+    const run = (cwd, env) =>
+      namespaceIn(
+        spawnSync(process.execPath, [runner], {
+          input: JSON.stringify(stopEvent(cwd)),
+          cwd,
+          env,
+          encoding: "utf8",
+          timeout: 30000,
+        }).stderr ?? ""
+      );
+    const sub = under(base, "repo/sub");
+    assert.equal(
+      run(sub, runnerEnv({ CLAUDE_PROJECT_DIR: repo, NEUROSTRATA_NAMESPACE: "from-env" })),
+      "from-config"
+    );
+
+    // Markers: the session's folder decides, not the event's cwd.
+    writeMarker(repo, "example-outer");
+    const api = under(base, "repo/packages/api");
+    writeMarker(api, "example-inner");
+    writeFileSync(join(api, ".NeuroStrata", "neurostrata-plugin.json"), closedPort);
+    assert.equal(run(api, runnerEnv({ CLAUDE_PROJECT_DIR: repo })), "example-outer");
+    assert.equal(run(api, runnerEnv({ CLAUDE_PROJECT_DIR: api })), "example-inner");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

@@ -18,4 +18,4 @@ NeuroStrata ships as a single compiled Rust binary (`neurostrata-mcp`) that embe
 - **Dual Git Hooks (`pre-push` + `pre-commit`):** `neurostrata-mcp hooks install` (and automatic `hook_hygiene` on `get_snapshot`) installs `.git/hooks/pre-push` (running `neurostrata-mcp task gate <namespace> --strict` and project gates) and `.git/hooks/pre-commit` (recording the graph-query verification ledger).
 
 ## Philosophy
-Developers should never have to manually wire vector databases, write custom Git hooks, or maintain flat markdown TODO lists. A single prompt (*"Initialize NeuroStrata"*) bootstraps the project marker, ingests the AST, installs the harness plugin, and activates the three soft locks automatically.
+Developers should never have to manually wire vector databases, write custom Git hooks, or maintain flat markdown TODO lists. A single prompt (*"Initialize NeuroStrata"*) bootstraps the project marker (the `.NeuroStrata` folder and its `config.json`, which names the namespace; see [Project root](../ops/project-root.md)), ingests the AST, installs the harness plugin, and activates the three soft locks automatically.

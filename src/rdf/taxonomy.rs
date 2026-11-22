@@ -1509,6 +1509,9 @@ async fn execute_set_thesis(
     });
 
     // Atomically register core_pillars in the namespace domain_registry row under CAS.
+    // The row lock every registry-row writer takes, held from this read to the
+    // commit: a cached-root write in between would otherwise fail the CAS.
+    let row_guard = crate::registry::REGISTRY_ROW_LOCK.lock().await;
     let registry_id = crate::registry::registry_row_id(namespace);
     let existing_reg = store
         .get(namespace, &registry_id)
@@ -1555,6 +1558,7 @@ async fn execute_set_thesis(
             } => format!("CAS conflict while setting thesis on '{receipt_id}' ({superseded_by})"),
             other => other.to_string(),
         })?;
+    drop(row_guard);
 
     store.refresh_ontology(namespace).await;
 

@@ -506,18 +506,10 @@ pub async fn start_daemon(
     // Each harness config keeps its own namespace; a config naming none is
     // not written (an empty or made-up namespace is never written).
     let startup_root = resolve_project_root();
-    let _ = crate::task::harness_plugins::auto_install_detected_plugins(
-        &startup_root,
-        crate::task::harness_plugins::ConfigNamespace::Keep(None),
-        None,
-    );
+    let _ = crate::task::harness_plugins::boot_install_plugins(&startup_root);
     if let Ok(cfg) = crate::config::Config::load() {
         for dir in cfg.project_contexts.values() {
-            let _ = crate::task::harness_plugins::auto_install_detected_plugins(
-                dir,
-                crate::task::harness_plugins::ConfigNamespace::Keep(None),
-                None,
-            );
+            let _ = crate::task::harness_plugins::boot_install_project_context(dir);
         }
     }
     // The port the MCP proxy and CLI hardcode; changing it changes the wire
@@ -1166,6 +1158,7 @@ pub(crate) async fn start_daemon_on(
         .route("/export-graph", post(handle_export_graph))
         .route("/tasks/import", post(handle_tasks_import))
         .route("/cli/read", post(handle_cli_read))
+        .route("/cli/root", post(handle_cli_root))
         .route("/tasks/gate", post(handle_tasks_gate))
         .route("/bus/metrics", post(handle_bus_metrics))
         .route("/sparql", post(handle_http_sparql))
@@ -1673,17 +1666,94 @@ async fn handle_cli_read(
                 .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             serde_json::json!({ "rows": rows })
         }
+        // `root show`: the registry's cached project root for a namespace,
+        // matched case-insensitively the way tool calls are.
+        "project_root" => {
+            let requested = req.namespace.unwrap_or_default();
+            let ns = crate::server::resolve_namespace(&state.vector_store, &requested).await;
+            let root = crate::registry::cached_project_root(&state.vector_store, &ns)
+                .await
+                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            serde_json::json!({ "namespace": ns, "project_root": root })
+        }
         other => {
             return Err((
                 axum::http::StatusCode::BAD_REQUEST,
                 format!(
-                    "unknown read op '{}': expected 'namespaces' or 'list'",
+                    "unknown read op '{}': expected 'namespaces', 'list' or 'project_root'",
                     other
                 ),
             ))
         }
     };
     Ok(value.to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct RootReq {
+    op: String,
+    namespace: String,
+    root: String,
+}
+
+/// The one registry change `hooks install` and `root set` need from the
+/// daemon: set the namespace's cached root. Every file change (the marker,
+/// old markers, the user config) stays in the CLI process, which checked the
+/// folder before asking; this route only writes the registry row. The root
+/// is a caller path, so it passes the same policy as `/ingest` (startup root
+/// or `allowed_external_dirs`) and is used in its canonical form.
+async fn handle_cli_root(
+    State(state): State<AppState>,
+    Json(mut req): Json<RootReq>,
+) -> Result<String, (axum::http::StatusCode, String)> {
+    if std::path::Path::new(&req.root).is_absolute() {
+        let root = caller_path_refusal(&state, &req.root)?;
+        req.root = dunce::simplified(&root).to_string_lossy().into_owned();
+    }
+    cli_root_value(&state.vector_store, &state.embedder, &req)
+        .await
+        .map(|v| v.to_string())
+}
+
+async fn cli_root_value(
+    store: &Arc<dyn VectorStore>,
+    emb: &Arc<dyn Embedder>,
+    req: &RootReq,
+) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
+    match req.op.as_str() {
+        "cache_root" => {
+            let root = std::path::Path::new(&req.root);
+            if !root.is_absolute() {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!("root must be an absolute path, got '{}'", req.root),
+                ));
+            }
+            let ns = crate::server::resolve_namespace(store, &req.namespace).await;
+            // Only a folder the CLI already marked for this namespace: any
+            // other caller path would move the cache away from the marker.
+            let marked = crate::root_marker::in_main_checkout(root);
+            match crate::root_marker::read_marker(&marked) {
+                crate::root_marker::MarkerRead::Valid(cfg)
+                    if cfg.namespace.eq_ignore_ascii_case(&ns) => {}
+                _ => {
+                    return Err((
+                        axum::http::StatusCode::BAD_REQUEST,
+                        format!(
+                            "{} holds no project marker for '{ns}'; write the marker first (`neurostrata-mcp root set` or `hooks install`)",
+                            marked.display()
+                        ),
+                    ))
+                }
+            }
+            let ok = crate::registry::set_project_root(store, Some(emb), &ns, root).await;
+            Ok(serde_json::json!({ "ok": ok, "namespace": ns }))
+        }
+        other => Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("unknown root op '{other}': expected 'cache_root'"),
+        )),
+    }
 }
 
 /// How long to wait after a checkpoint that could not get its quiet moment.
@@ -2456,6 +2526,118 @@ async fn handle_http_learning_control(
     clippy::cloned_ref_to_slice_refs
 )]
 mod tests {
+    /// `/cli/root` takes a caller path, so it is held to the same policy as
+    /// `/ingest`: a root outside the startup root and the allowlist is
+    /// refused before the registry is touched.
+    #[tokio::test]
+    async fn cli_root_refuses_a_root_outside_the_caller_path_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let served = base.join("served");
+        let outside = base.join("outside");
+        for dir in [&served, &outside] {
+            std::fs::create_dir_all(dir).unwrap();
+            crate::root_marker::write_new_marker(
+                dir,
+                &crate::root_marker::RootConfig::new("example-project"),
+            )
+            .unwrap();
+        }
+        let state = caller_path_state(&served, vec![]).await;
+        let req = |root: &Path| RootReq {
+            op: "cache_root".to_string(),
+            namespace: "example-project".to_string(),
+            root: root.to_string_lossy().into_owned(),
+        };
+        let err = handle_cli_root(State(state.clone()), Json(req(&outside)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN, "{}", err.1);
+        assert!(err.1.contains("allowed_external_dirs"), "{}", err.1);
+        let inside = handle_cli_root(State(state.clone()), Json(req(&served))).await;
+        assert!(
+            !matches!(&inside, Err((code, _)) if *code == axum::http::StatusCode::FORBIDDEN),
+            "{inside:?}"
+        );
+        // The allowlist admits it.
+        let allowed = caller_path_state(&served, vec![outside.clone()]).await;
+        let listed = handle_cli_root(State(allowed), Json(req(&outside))).await;
+        assert!(
+            !matches!(&listed, Err((code, _)) if *code == axum::http::StatusCode::FORBIDDEN),
+            "{listed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_root_cache_root_op_sets_only_the_cache() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let store: std::sync::Arc<dyn crate::traits::VectorStore> =
+            std::sync::Arc::new(MockStore::new());
+        let emb: std::sync::Arc<dyn crate::traits::Embedder> = std::sync::Arc::new(StubEmbedder);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
+        std::fs::create_dir_all(&root).unwrap();
+        let req = |op: &str, root: &str| super::RootReq {
+            op: op.to_string(),
+            namespace: "example-project".to_string(),
+            root: root.to_string(),
+        };
+
+        // No marker, or one for another namespace: the caller path is refused.
+        let err = super::cli_root_value(&store, &emb, &req("cache_root", &root.to_string_lossy()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{}", err.1);
+        let other = crate::root_marker::RootConfig::new("other-project");
+        crate::root_marker::write_new_marker(&root, &other).unwrap();
+        let err = super::cli_root_value(&store, &emb, &req("cache_root", &root.to_string_lossy()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{}", err.1);
+        assert_eq!(
+            crate::registry::cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let cfg = crate::root_marker::RootConfig::new("example-project");
+        crate::root_marker::replace_marker(&root, &cfg).unwrap();
+        let v = super::cli_root_value(&store, &emb, &req("cache_root", &root.to_string_lossy()))
+            .await
+            .unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true), "{v}");
+        assert_eq!(v["namespace"], serde_json::json!("example-project"));
+        assert_eq!(
+            crate::registry::cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            Some(root.to_string_lossy().into_owned())
+        );
+        // The daemon writes no file in the folder: only the test's marker.
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(root.join(".NeuroStrata"))
+                .unwrap()
+                .count(),
+            1
+        );
+
+        // The removed writer ops and a relative root are refused.
+        for op in ["setup", "set"] {
+            let err = super::cli_root_value(&store, &emb, &req(op, &root.to_string_lossy()))
+                .await
+                .unwrap_err();
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{op}");
+        }
+        let err = super::cli_root_value(&store, &emb, &req("cache_root", "relative/dir"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn gate_scope_is_optional_for_older_cli_callers() {
         let old: TaskGateReq = serde_json::from_value(serde_json::json!({
