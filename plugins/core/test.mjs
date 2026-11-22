@@ -463,6 +463,7 @@ describe('TOOL_CLASSIFICATION sets', () => {
       'edit',
       'Edit',
       'MultiEdit',
+      'NotebookEdit',
       'patch_file',
       'apply_patch'
     ]) {
@@ -2873,6 +2874,46 @@ describe('round-8: Codex apply_patch extraction, decoded ledger matching, and ba
     }
   })
 
+  it('Claude NotebookEdit reaches guard_validate and file recall', async () => {
+    const { server, url, counters } = await createMockDaemonServer()
+    try {
+      await initialize({
+        config: {
+          namespace: 'r8-ns',
+          endpoint: url,
+          bearerToken: 'tok',
+          strictMode: true,
+          requestTimeoutMs: 500
+        },
+        tool: { hook: async () => {} },
+        hooks: {}
+      })
+      await handleHookEvent({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'NotebookEdit',
+        tool_input: {
+          notebook_path: 'notebooks/analysis.ipynb',
+          cell_id: 'c1',
+          new_source: '#!/usr/bin/env python3\nprint(1)',
+          edit_mode: 'replace'
+        }
+      })
+      assert.equal(counters.guardValidate, 1, 'NotebookEdit must be guarded')
+      assert.equal(counters.guardArgs[0].action_type, 'NotebookEdit')
+      assert.ok(
+        counters.guardArgs[0].payload.includes('new_source'),
+        `the cell body must reach guard_validate, got ${counters.guardArgs[0].payload}`
+      )
+      assert.ok(
+        counters.memoriesForFilePaths.includes('notebooks/analysis.ipynb'),
+        `the notebook path must be recalled, got ${JSON.stringify(counters.memoriesForFilePaths)}`
+      )
+    } finally {
+      server.close()
+      resetModuleState()
+    }
+  })
+
   it('beforeToolExec forwards a raw apply_patch string to guard_validate', async () => {
     const { server, url, counters } = await createMockDaemonServer()
     try {
@@ -3275,7 +3316,7 @@ describe('round-9: denied edit restores prefetch dedup state', () => {
 })
 
 describe('round-9: CLI hook runners flush stdout before exiting', () => {
-  it('awaits the stdout write before process.exit(0)', () => {
+  it('awaits the stdout write, then returns without process.exit', () => {
     const sources = [
       '../claude/cli-hook.mjs',
       '../codex/cli-hook.mjs',
@@ -3294,8 +3335,14 @@ describe('round-9: CLI hook runners flush stdout before exiting', () => {
       )
       const after = src.slice(idx + marker.length)
       assert.ok(
-        /^\s*process\.exit\(0\);/.test(after),
-        `${rel}: process.exit(0) must directly follow the awaited write`
+        /^\s*return;/.test(after),
+        `${rel}: the runner must return directly after the awaited write`
+      )
+      // process.exit while a daemon socket is open crashes node on Windows,
+      // and the host then treats the hook as failed.
+      assert.ok(
+        !/process\.exit\(0\)/.test(src),
+        `${rel}: the runner must not call process.exit(0)`
       )
       assert.ok(
         src.includes('const writeStdout = (text) =>'),

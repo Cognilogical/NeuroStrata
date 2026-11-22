@@ -25,6 +25,8 @@ Codex CLI runs hooks only from `.codex/hooks.json` (or `[hooks]` in its `config.
 
 Both call sites forward the analysable tool input as the guard payload. A raw-string input — notably Codex `apply_patch` (`input: "*** Update File: …"`) — is sent as the patch text itself instead of the `{}` that `firstRecord` would produce, so the daemon's file-mutation extraction can see the target and content. Object inputs remain JSON-encoded; the mutation counter and the Zero-Action shell exemption keep using the canonical payload.
 
+Claude Code `NotebookEdit` is a file-mutating tool like `Write` and `Edit`: it is in `MUTATING_FILE_TOOLS`, so its input (including the cell body in `new_source`) reaches `neurostrata_guard_validate`, and its `notebook_path` drives file-touch recall. The Claude hook the installer writes matches `Read|Write|Edit|MultiEdit|NotebookEdit|Bash|Task`; an install that still has the older matcher without `NotebookEdit` is widened on the next install or init.
+
 `neurostrata-1e14`: subagent context headers sanitize namespace and task labels to `[A-Za-z0-9_.:-]` before interpolation. Code Mode's `execute`/`mcp_execute` tool output is also excluded from task-intent intake.
 
 `neurostrata-nb9q`: subagent graph-first injection is agent- and harness-aware: read-only subagents (`reviewer`, `checker`, `checker-free`, `explore`) receive a skip note instead of directives to call MCP tools they do not have, and Code Mode harnesses reference `execute` with `tools.neurostrata.*`. Intent extraction from `read`/`grep`/`glob`/shell tool output is suppressed, because `TODO:`/`defer` in stdout or source comments is not a task obligation; user and assistant turns still nudge.
