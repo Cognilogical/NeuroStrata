@@ -8,7 +8,8 @@ import {
   rmSync,
   mkdtempSync,
   existsSync,
-  copyFileSync
+  copyFileSync,
+  symlinkSync
 } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join, isAbsolute, resolve, dirname } from 'node:path'
@@ -605,7 +606,35 @@ describe('project root marker and namespace order', () => {
     )
     const sessionPath = join(repo, '.NeuroStrata', 'active_session.json')
     const state = JSON.parse(readFileSync(sessionPath, 'utf8'))
-    assert.deepEqual(state.claude_session_dirs, { s1: repo })
+    assert.deepEqual(state.neurostrata_session_dirs, { s1: repo })
+  })
+
+  it('session folders use a NeuroStrata-native state key', () => {
+    const base = tempDir()
+    buildLayout(base, ['repo git-dir', 'repo neurostrata-dir', 'repo/packages/api'])
+    const repo = under(base, 'repo')
+    const api = under(base, 'repo/packages/api')
+    const sessionPath = join(repo, '.NeuroStrata', 'active_session.json')
+    writeFileSync(sessionPath, JSON.stringify({ neurostrata_session_dirs: { s1: repo } }))
+    const event = { session_id: 's1', cwd: api, hook_event_name: 'PreToolUse' }
+    assert.equal(resolveHookProjectDir('claude', event, {}), repo)
+  })
+
+  it('main-checkout marker walk stops at a directory symlink', () => {
+    const base = canonicalTempDir('ns-main-symlink-')
+    buildLayout(base, [
+      'repo git-dir',
+      'repo/.git/worktrees/wt commondir:../..',
+      'wt git-file:../repo/.git/worktrees/wt',
+      'wt/part',
+      'external marker:from-other'
+    ])
+    symlinkSync(
+      under(base, 'external'),
+      join(under(base, 'repo'), 'part'),
+      process.platform === 'win32' ? 'junction' : 'dir'
+    )
+    assert.equal(findRootMarker(under(base, 'wt/part/x')), null)
   })
 
   it('resolveHookProjectDir: a session file that cannot be parsed is left alone', () => {

@@ -103,7 +103,7 @@ export declare function readHarnessConfig(harness: string, projectDir: string, r
  * every `cd`, so for Claude this is the session's project folder:
  * `CLAUDE_PROJECT_DIR`, which Claude Code exports to hook processes as the
  * project root where the session started. Without it, the folder recorded
- * for this session at SessionStart (`claude_session_dirs` in
+ * for this session at SessionStart (`neurostrata_session_dirs` in
  * `.NeuroStrata/active_session.json`; never the home folder's), else the
  * event's `cwd`. Other harnesses use the event's `cwd`, else the process's.
  *

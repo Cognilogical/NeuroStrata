@@ -534,7 +534,18 @@ export function findRootMarker(startDir: string): FoundRootMarker | null {
     let dir = mainTop
     for (const part of pathParts(relative(top, start))) {
       dir = join(dir, part)
-      if (!isDirectory(dir) || existsSync(join(dir, '.git'))) break
+      let st
+      try {
+        st = lstatSync(dir)
+      } catch {
+        break
+      }
+      if (st.isSymbolicLink() || !st.isDirectory()) break
+      const realDir = canonicalPath(dir)
+      const realMain = canonicalPath(mainTop)
+      const below = realDir !== null && realMain !== null ? relative(realMain, realDir) : '..'
+      if (isAbsoluteAny(below) || pathParts(below)[0] === '..') break
+      if (existsSync(join(dir, '.git'))) break
       allowed.push(dir)
     }
     for (let i = allowed.length - 1; i >= 0; i--) {

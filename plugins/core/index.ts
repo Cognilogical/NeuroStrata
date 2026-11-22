@@ -480,7 +480,18 @@ export function findRootMarker(startDir: string): FoundRootMarker | null {
     let dir = mainTop
     for (const part of pathParts(relative(top, start))) {
       dir = join(dir, part)
-      if (!isDirectory(dir) || existsSync(join(dir, '.git'))) break
+      let st
+      try {
+        st = lstatSync(dir)
+      } catch {
+        break
+      }
+      if (st.isSymbolicLink() || !st.isDirectory()) break
+      const realDir = canonicalPath(dir)
+      const realMain = canonicalPath(mainTop)
+      const below = realDir !== null && realMain !== null ? relative(realMain, realDir) : '..'
+      if (isAbsoluteAny(below) || pathParts(below)[0] === '..') break
+      if (existsSync(join(dir, '.git'))) break
       allowed.push(dir)
     }
     for (let i = allowed.length - 1; i >= 0; i--) {
@@ -615,8 +626,8 @@ export function readHarnessConfig(
   return {}
 }
 
-/** How many SessionStart folders the Claude runner remembers. */
-const CLAUDE_SESSION_DIRS_KEEP = 20
+/** How many SessionStart folders the CLI runner remembers. */
+const NEUROSTRATA_SESSION_DIRS_KEEP = 20
 
 /**
  * The project folder a CLI hook runner resolves its namespace from. Claude
@@ -624,7 +635,7 @@ const CLAUDE_SESSION_DIRS_KEEP = 20
  * every `cd`, so for Claude this is the session's project folder:
  * `CLAUDE_PROJECT_DIR`, which Claude Code exports to hook processes as the
  * project root where the session started. Without it, the folder recorded
- * for this session at SessionStart (`claude_session_dirs` in
+ * for this session at SessionStart (`neurostrata_session_dirs` in
  * `.NeuroStrata/active_session.json`; never the home folder's), else the
  * event's `cwd`. Other harnesses use the event's `cwd`, else the process's.
  *
@@ -663,7 +674,7 @@ export function resolveHookProjectDir(
   } catch (err) {
     unparsable = (err as { code?: string })?.code !== 'ENOENT'
   }
-  const dirs = asRecord(state.claude_session_dirs)
+  const dirs = asRecord(state.neurostrata_session_dirs)
   const recorded = asString(dirs[sessionId])
   if (asString(event?.hook_event_name) === 'SessionStart') {
     if (recorded) return recorded
@@ -671,8 +682,8 @@ export function resolveHookProjectDir(
     if (!isDirectory(stateDir) || unparsable) return cwd
     const kept = Object.entries(dirs).filter(([id]) => id !== sessionId)
     kept.push([sessionId, cwd])
-    state.claude_session_dirs = Object.fromEntries(
-      kept.slice(-CLAUDE_SESSION_DIRS_KEEP)
+    state.neurostrata_session_dirs = Object.fromEntries(
+      kept.slice(-NEUROSTRATA_SESSION_DIRS_KEEP)
     )
     writeJsonAtomically(sessionPath, state)
     return cwd
