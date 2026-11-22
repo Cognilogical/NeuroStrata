@@ -1559,12 +1559,17 @@ pub(crate) async fn receipt_ledger_root(
     namespace: &str,
 ) -> Option<std::path::PathBuf> {
     if let Some(hint) = caller_root.map(str::trim).filter(|s| !s.is_empty()) {
+        let hint = std::path::Path::new(hint);
+        // A hint at or under a non-git home names no project at all. Stop
+        // here: falling through to the registry/directory rows or daemon CWD
+        // would write this home session's receipt into another project.
+        if is_home_without_git(hint) {
+            return None;
+        }
         // A caller hint is only trusted when it actually resolves inside a
         // worktree. A scratch dir with no marker falls through to the
         // registry/directory rows and daemon CWD, never becomes the root.
-        if let Some(root) =
-            walk_to_worktree_marker(&resolve_session_root_dir(std::path::Path::new(hint)))
-        {
+        if let Some(root) = walk_to_worktree_marker(&resolve_session_root_dir(hint)) {
             return Some(root);
         }
     }
@@ -8533,6 +8538,34 @@ mod tests {
         std::fs::create_dir_all(home.join(".git")).unwrap();
         let got = receipt_ledger_root(Some(home.to_str().unwrap()), &store, ns).await;
         assert_eq!(got, Some(home.clone()));
+    }
+
+    /// A caller hint under a non-git home names no project: receipt-root
+    /// resolution must stop there instead of landing in another project's
+    /// ledger through the registry or daemon-root fallbacks.
+    #[tokio::test]
+    async fn receipt_root_stops_at_a_non_git_home_hint() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, top, nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        let project = top.join("example-project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &nowhere);
+        let store = store_with_namespace("example-project").await;
+        crate::registry::cache_project_root(
+            &store,
+            Some(&emb()),
+            "example-project",
+            project.to_str().unwrap(),
+        )
+        .await;
+        let docs = home.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+
+        let got =
+            receipt_ledger_root(Some(docs.to_str().unwrap()), &store, "example-project").await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert_eq!(got, None, "a home hint must not resolve to another project");
     }
 
     #[tokio::test]
