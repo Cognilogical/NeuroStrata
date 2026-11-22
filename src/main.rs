@@ -3896,7 +3896,8 @@ mod tests {
 
     #[test]
     fn the_namespace_resolve_command_parses() {
-        let cli = Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
+        let cli =
+            Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
         match cli.command {
             Some(Commands::Namespace { action }) => {
                 assert_eq!(action, NamespaceCommands::Resolve { dir: None })
@@ -3907,7 +3908,12 @@ mod tests {
             .expect("parses with a dir");
         match cli.command {
             Some(Commands::Namespace { action }) => {
-                assert_eq!(action, NamespaceCommands::Resolve { dir: Some("some/dir".into()) })
+                assert_eq!(
+                    action,
+                    NamespaceCommands::Resolve {
+                        dir: Some("some/dir".into())
+                    }
+                )
             }
             other => panic!("expected Namespace/Resolve, got {:?}", other),
         }
@@ -6198,8 +6204,10 @@ async fn run() -> anyhow::Result<()> {
                 };
                 let configs = &resolved.configs;
                 if configs.iter().any(|(_, ns)| *ns != configs[0].1) {
-                    let listed: Vec<String> =
-                        configs.iter().map(|(harness, ns)| format!("{harness}={ns}")).collect();
+                    let listed: Vec<String> = configs
+                        .iter()
+                        .map(|(harness, ns)| format!("{harness}={ns}"))
+                        .collect();
                     eprintln!(
                         "warning: harness configs name different namespaces ({}); using {}",
                         listed.join(", "),
@@ -7403,16 +7411,15 @@ async fn run() -> anyhow::Result<()> {
                             // explicit source (a harness config or
                             // NEUROSTRATA_NAMESPACE), never the ledger or the
                             // folder name; each config keeps its own.
-                            let explicit =
-                                match crate::task::harness_plugins::namespace_for_refresh(
-                                    &root, true,
-                                ) {
-                                    Ok(ns) => ns,
-                                    Err(e) => {
-                                        eprintln!("warning: harness configs left as they are: {e}");
-                                        None
-                                    }
-                                };
+                            let explicit = match crate::task::harness_plugins::namespace_for_refresh(
+                                &root, true,
+                            ) {
+                                Ok(ns) => ns,
+                                Err(e) => {
+                                    eprintln!("warning: harness configs left as they are: {e}");
+                                    None
+                                }
+                            };
                             let _ = crate::task::harness_plugins::auto_install_detected_plugins(
                                 &root,
                                 crate::task::harness_plugins::ConfigNamespace::Keep(

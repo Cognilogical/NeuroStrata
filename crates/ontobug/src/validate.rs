@@ -4,15 +4,15 @@
 //! validation report into plain strings so callers need not depend on rudof's types.
 
 use crate::error::{Error, Result};
-use oxrdfio::{RdfParser, RdfFormat};
 use oxrdf::{NamedOrBlankNode, Term};
+use oxrdfio::{RdfFormat, RdfParser};
 use std::collections::BTreeMap;
 use std::fmt;
 
 // The rudof SHACL engine types; underlying rudof::ir::IRSchema etc.
+use rudof_iri::IriS;
 pub use rudof_rdf::rdf_core::RDFFormat;
 use rudof_rdf::rdf_impl::{OxigraphInMemory, ReaderMode};
-use rudof_iri::IriS;
 use shacl::ir::IRSchema;
 use shacl::rdf::ShaclParser;
 use shacl::validator::engine::{Engine, NativeEngine, SparqlEngine};
@@ -291,7 +291,11 @@ pub fn extract_shacl_shapes(ttl: &str) -> Result<Vec<ExtractedShaclShape>> {
                 Term::Literal(l) => l.value().to_owned(),
                 _ => q.object.to_string(),
             };
-            triples.push(Triple { subject: s, predicate: p, object: o });
+            triples.push(Triple {
+                subject: s,
+                predicate: p,
+                object: o,
+            });
         }
         Ok(triples)
     }

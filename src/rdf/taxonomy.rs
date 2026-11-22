@@ -3646,7 +3646,8 @@ pub async fn snapshot_taxonomy_readiness_view(
     namespace: &str,
 ) -> (bool, Vec<(String, String)>) {
     let now_ts = chrono::Utc::now().timestamp();
-    let Ok((active_rows, active_edges)) = load_active_rows_and_edges(store, namespace, now_ts).await
+    let Ok((active_rows, active_edges)) =
+        load_active_rows_and_edges(store, namespace, now_ts).await
     else {
         return (false, Vec::new());
     };

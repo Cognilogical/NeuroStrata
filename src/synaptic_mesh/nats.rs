@@ -99,14 +99,13 @@ impl MeshTransport for NatsMeshTransport {
             return Err(MeshTransportError::FrameTooLarge(payload.len()));
         }
 
-        let mut stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&endpoint))
-            .await
-            .map_err(|_| {
-                MeshTransportError::Io(format!("NATS connect timeout to {endpoint}"))
-            })?
-            .map_err(|e| {
-                MeshTransportError::Io(format!("NATS connect failed to {endpoint}: {e}"))
-            })?;
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&endpoint))
+                .await
+                .map_err(|_| MeshTransportError::Io(format!("NATS connect timeout to {endpoint}")))?
+                .map_err(|e| {
+                    MeshTransportError::Io(format!("NATS connect failed to {endpoint}: {e}"))
+                })?;
 
         let headers = format!(
             "NATS/1.0\r\nNats-Msg-Id: {}:{}\r\n\r\n",
@@ -166,18 +165,19 @@ impl MeshTransport for NatsMeshTransport {
         })
     }
 
-    async fn subscribe(
-        &self,
-    ) -> Result<broadcast::Receiver<MeshFrame>, MeshTransportError> {
+    async fn subscribe(&self) -> Result<broadcast::Receiver<MeshFrame>, MeshTransportError> {
         let endpoint = parse_nats_endpoint(&self.server_url)?;
-        let mut stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&endpoint))
-            .await
-            .map_err(|_| {
-                MeshTransportError::Io(format!("NATS subscribe connect timeout to {endpoint}"))
-            })?
-            .map_err(|e| {
-                MeshTransportError::Io(format!("NATS subscribe connect failed to {endpoint}: {e}"))
-            })?;
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&endpoint))
+                .await
+                .map_err(|_| {
+                    MeshTransportError::Io(format!("NATS subscribe connect timeout to {endpoint}"))
+                })?
+                .map_err(|e| {
+                    MeshTransportError::Io(format!(
+                        "NATS subscribe connect failed to {endpoint}: {e}"
+                    ))
+                })?;
 
         stream
             .write_all(
