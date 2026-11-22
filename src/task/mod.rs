@@ -1404,7 +1404,20 @@ pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
     if let Some(wt) = gate::GateScope::capture(dir).worktree {
         return std::path::PathBuf::from(wt);
     }
-    crate::formal_kernel::resolve_session_root(None, dir)
+    let resolved = crate::formal_kernel::resolve_session_root(None, dir);
+    if is_home_without_git(&resolved) {
+        // A markerless descendant of a non-git home is scratch, not a
+        // project. Hand back the home folder, which every writer rejects.
+        let check = dunce::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
+        for home in session_home_dirs() {
+            if let Ok(canonical) = dunce::canonicalize(&home) {
+                if check.starts_with(&canonical) {
+                    return canonical;
+                }
+            }
+        }
+    }
+    resolved
 }
 
 // Process-wide, not per thread: a test that points NEUROSTRATA_PROJECT_ROOT
@@ -1463,7 +1476,13 @@ pub(crate) fn is_home_without_git(dir: &std::path::Path) -> bool {
 }
 
 fn is_home_without_git_with(dir: &std::path::Path, homes: &[std::path::PathBuf]) -> bool {
-    is_any_home_folder(dir, homes) && !dir.join(".git").exists()
+    // A markerless descendant of a non-git home is just as much scratch as
+    // the home folder itself. `.NeuroStrata` or `.git` on the way up marks a
+    // real project and stops the walk before home.
+    matches!(
+        walk_to_session_marker_with(dir, homes),
+        SessionMarkerWalk::StoppedAtHome
+    )
 }
 
 /// Where a walk for a session-file root ended.
@@ -1483,7 +1502,13 @@ enum SessionMarkerWalk {
 /// (SynapticMesh keeps its node id there), and a walk that reaches it stops
 /// there rather than continuing above it.
 fn walk_to_session_marker(start: &std::path::Path) -> SessionMarkerWalk {
-    let homes = session_home_dirs();
+    walk_to_session_marker_with(start, &session_home_dirs())
+}
+
+fn walk_to_session_marker_with(
+    start: &std::path::Path,
+    homes: &[std::path::PathBuf],
+) -> SessionMarkerWalk {
     let start = if start.is_dir() {
         start
     } else {
@@ -8293,7 +8318,45 @@ mod tests {
             None,
             &[home.path().to_path_buf()],
         );
+        assert!(
+            !work.join(".NeuroStrata/active_session.json").exists(),
+            "a markerless folder under home is scratch, not a project"
+        );
+        // A marked descendant is a real non-git project and still gets state.
+        std::fs::create_dir_all(work.join(".NeuroStrata")).unwrap();
+        persist_active_session_file_with_home(
+            &work,
+            "example-project",
+            &[],
+            None,
+            &[home.path().to_path_buf()],
+        );
         assert!(work.join(".NeuroStrata/active_session.json").exists());
+    }
+
+    /// A markerless scratch folder below a non-git home is not a project:
+    /// neither root resolution nor a session writer may adopt it.
+    #[test]
+    fn markerless_scratch_under_home_gets_no_session_state() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, _top, _nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        let scratch = home.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let resolved = resolve_session_root_dir(&scratch);
+        assert_ne!(
+            resolved, scratch,
+            "resolution must not adopt a markerless home descendant"
+        );
+        persist_active_session_file_with_home(
+            &scratch,
+            "example-project",
+            &[],
+            None,
+            &[home.clone()],
+        );
+        assert!(!scratch.join(".NeuroStrata/active_session.json").exists());
     }
 
     /// Folders for the home-folder tests: `home` (the injected home folder,
