@@ -281,7 +281,12 @@ pub struct UnreadableConfig {
 
 impl std::fmt::Display for UnreadableConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} could not be read: {}", self.path.display(), self.reason)
+        write!(
+            f,
+            "{} could not be read: {}",
+            self.path.display(),
+            self.reason
+        )
     }
 }
 
@@ -336,10 +341,18 @@ const CLAUDE_SETTINGS: &str = ".claude/settings.local.json";
 /// the config file relative to the project root, and the JSON pointer of the
 /// namespace inside it.
 const PLUGIN_NAMESPACE_CONFIGS: [(&str, &str, &str); 5] = [
-    ("opencode", ".opencode/neurostrata-plugin.json", "/neurostrata/namespace"),
+    (
+        "opencode",
+        ".opencode/neurostrata-plugin.json",
+        "/neurostrata/namespace",
+    ),
     ("codex", ".codex/plugins/neurostrata.json", "/namespace"),
     ("hermes", ".hermes/plugins/neurostrata.json", "/namespace"),
-    ("openclaw", ".openclaw/plugins/neurostrata.json", "/namespace"),
+    (
+        "openclaw",
+        ".openclaw/plugins/neurostrata.json",
+        "/namespace",
+    ),
     (
         "github-cli",
         ".NeuroStrata/plugins/github-cli/copilot-extension.json",
@@ -351,7 +364,10 @@ const PLUGIN_NAMESPACE_CONFIGS: [(&str, &str, &str); 5] = [
 /// file when it exists but cannot be read or parsed (a UTF-8 byte order mark,
 /// as Windows PowerShell 5.1 writes, included).
 fn read_config(path: &Path) -> Result<Option<Value>, UnreadableConfig> {
-    let unreadable = |reason: String| UnreadableConfig { path: path.to_path_buf(), reason };
+    let unreadable = |reason: String| UnreadableConfig {
+        path: path.to_path_buf(),
+        reason,
+    };
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -408,7 +424,13 @@ fn claude_settings_namespace(root: &Path, settings: &Value) -> Option<String> {
         .values()
         .filter_map(Value::as_array)
         .flatten()
-        .flat_map(|entry| entry.get("hooks").and_then(Value::as_array).into_iter().flatten())
+        .flat_map(|entry| {
+            entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
         .filter_map(|hook| hook.get("command").and_then(Value::as_str))
         .find_map(|command| installer_hook_namespace(command, root, &abs_runner))
 }
@@ -416,12 +438,17 @@ fn claude_settings_namespace(root: &Path, settings: &Value) -> Option<String> {
 /// The usable namespace `harness`'s config under `root` names: `Ok(None)` when
 /// the config is missing or names none, an error when it exists but cannot be
 /// read or parsed.
-fn harness_config_namespace(root: &Path, harness: &str) -> Result<Option<String>, UnreadableConfig> {
+fn harness_config_namespace(
+    root: &Path,
+    harness: &str,
+) -> Result<Option<String>, UnreadableConfig> {
     if harness == "claude" {
         return Ok(read_config(&root.join(CLAUDE_SETTINGS))?
             .and_then(|settings| claude_settings_namespace(root, &settings)));
     }
-    let Some((_, rel, pointer)) = PLUGIN_NAMESPACE_CONFIGS.iter().find(|(h, _, _)| *h == harness)
+    let Some((_, rel, pointer)) = PLUGIN_NAMESPACE_CONFIGS
+        .iter()
+        .find(|(h, _, _)| *h == harness)
     else {
         return Ok(None);
     };
@@ -510,14 +537,24 @@ impl NamespaceRoots {
         let main_root = crate::paths::main_checkout_root(&dir_s);
         // Outside git, `dir` itself is the only place to look.
         let outside_git = (own_root.is_none() && main_root.is_none()).then(|| dir.clone());
-        Ok(NamespaceRoots { dir, own_root, main_root, outside_git })
+        Ok(NamespaceRoots {
+            dir,
+            own_root,
+            main_root,
+            outside_git,
+        })
     }
 
     /// Harness settings are untracked, so a linked worktree usually has none
     /// of its own: its own checkout first, then the main checkout.
     fn config_order(&self) -> Vec<&PathBuf> {
         let mut order: Vec<&PathBuf> = Vec::new();
-        for root in self.own_root.iter().chain(self.main_root.iter()).chain(self.outside_git.iter()) {
+        for root in self
+            .own_root
+            .iter()
+            .chain(self.main_root.iter())
+            .chain(self.outside_git.iter())
+        {
             if !order.contains(&root) {
                 order.push(root);
             }
@@ -527,7 +564,10 @@ impl NamespaceRoots {
 
     /// The ledger: the main checkout's first, then `dir`'s own.
     fn ledger_order(&self) -> impl Iterator<Item = &PathBuf> {
-        self.main_root.iter().chain(self.own_root.iter()).chain(self.outside_git.iter())
+        self.main_root
+            .iter()
+            .chain(self.own_root.iter())
+            .chain(self.outside_git.iter())
     }
 
     /// The harness configs of the first place in [`Self::config_order`] that
@@ -539,7 +579,11 @@ impl NamespaceRoots {
             let (found, errors) = harness_namespaces_at(root);
             unreadable.extend(errors);
             if !found.is_empty() {
-                return if unreadable.is_empty() { Ok(found) } else { Err(unreadable) };
+                return if unreadable.is_empty() {
+                    Ok(found)
+                } else {
+                    Err(unreadable)
+                };
             }
         }
         if unreadable.is_empty() {
@@ -567,7 +611,9 @@ fn resolve_namespace_from(
     env_namespace: Option<&str>,
 ) -> Result<ResolvedNamespace, ResolveError> {
     let roots = NamespaceRoots::of(dir)?;
-    let configs = roots.harness_namespaces().map_err(ResolveError::UnreadableConfigs)?;
+    let configs = roots
+        .harness_namespaces()
+        .map_err(ResolveError::UnreadableConfigs)?;
     let resolved = |namespace: String, source: NamespaceSource| ResolvedNamespace {
         namespace,
         source,
@@ -666,7 +712,10 @@ impl ConfigNamespace<'_> {
             },
             ConfigNamespace::Each(listed) => match harness_config_namespace(root, harness) {
                 Err(_) => None,
-                Ok(_) => listed.iter().find(|(h, _)| h == harness).map(|(_, ns)| ns.clone()),
+                Ok(_) => listed
+                    .iter()
+                    .find(|(h, _)| h == harness)
+                    .map(|(_, ns)| ns.clone()),
             },
         }
     }
@@ -968,10 +1017,7 @@ fn sync_skills_and_agent_rules(
         let needs_write = std::fs::read_to_string(path)
             .map(|existing| existing != content)
             .unwrap_or(true);
-        if needs_write && std::fs::write(path, content).is_err() {
-            return false;
-        }
-        true
+        !(needs_write && std::fs::write(path, content).is_err())
     };
 
     // 1. Always scaffold project-local .agents/skills/neurostrata/SKILL.md and .agents/agents/NeuroStrata-Task.md
@@ -1284,7 +1330,9 @@ fn wire_harness_config(
                                     let ours = entry["hooks"]
                                         .as_array()
                                         .map(|hooks| {
-                                            hooks.iter().any(|h| h["command"].as_str() == Some(cmd.as_str()))
+                                            hooks.iter().any(|h| {
+                                                h["command"].as_str() == Some(cmd.as_str())
+                                            })
                                         })
                                         .unwrap_or(false);
                                     if ours
@@ -1369,7 +1417,11 @@ mod tests {
     /// The namespace the harness installer recorded for the checkout at
     /// `root`: the first of [`harness_namespaces_at`].
     fn configured_namespace(root: &Path) -> Option<String> {
-        harness_namespaces_at(root).0.into_iter().next().map(|(_, ns)| ns)
+        harness_namespaces_at(root)
+            .0
+            .into_iter()
+            .next()
+            .map(|(_, ns)| ns)
     }
 
     /// The namespace `namespace resolve` prints for `dir`.
@@ -1403,7 +1455,9 @@ mod tests {
     fn harness_config_beats_env() {
         let _env = no_namespace_env();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let dir = dir.as_path();
         write_file(
@@ -1420,20 +1474,17 @@ mod tests {
             &dir.join(".NeuroStrata").join("session_queries.json"),
             r#"{"namespace": "from-ledger", "queries": []}"#,
         );
-        assert_eq!(
-            src_of(dir),
-            ("beta".into(), NamespaceSource::Env)
-        );
+        assert_eq!(src_of(dir), ("beta".into(), NamespaceSource::Env));
         std::env::remove_var("NEUROSTRATA_NAMESPACE");
-        assert_eq!(
-            src_of(dir),
-            ("from-ledger".into(), NamespaceSource::Ledger)
-        );
+        assert_eq!(src_of(dir), ("from-ledger".into(), NamespaceSource::Ledger));
         // The daemon's hook refresh never reads its own environment, and a
         // ledger answer is never written into harness configs.
         std::env::set_var("NEUROSTRATA_NAMESPACE", "beta");
         assert_eq!(namespace_for_refresh(dir, false), Ok(None));
-        assert_eq!(namespace_for_refresh(dir, true), Ok(Some("beta".to_string())));
+        assert_eq!(
+            namespace_for_refresh(dir, true),
+            Ok(Some("beta".to_string()))
+        );
         std::env::remove_var("NEUROSTRATA_NAMESPACE");
         std::fs::remove_file(dir.join(".NeuroStrata").join("session_queries.json")).unwrap();
         assert_eq!(
@@ -1445,10 +1496,15 @@ mod tests {
     #[test]
     fn boot_install_keeps_existing_plugin_namespace() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let cfg = dir.join(".hermes/plugins/neurostrata.json");
-        write_file(&cfg, r#"{"id": "neurostrata-hermes", "namespace": "example-project"}"#);
+        write_file(
+            &cfg,
+            r#"{"id": "neurostrata-hermes", "namespace": "example-project"}"#,
+        );
         boot_install_plugins(&dir);
         assert_eq!(namespace_in(&cfg), "example-project");
     }
@@ -1456,13 +1512,17 @@ mod tests {
     #[test]
     fn boot_install_without_any_config_writes_no_namespace_config() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join(".hermes")).unwrap();
         assert!(boot_namespaces_for(&dir).is_empty());
         boot_install_plugins(&dir);
         assert!(!dir.join(".hermes/plugins/neurostrata.json").exists());
-        assert!(dir.join(".NeuroStrata/plugins/hermes/dist/index.js").exists());
+        assert!(dir
+            .join(".NeuroStrata/plugins/hermes/dist/index.js")
+            .exists());
     }
 
     fn namespace_in(cfg: &Path) -> Value {
@@ -1475,18 +1535,28 @@ mod tests {
     #[test]
     fn boot_install_keeps_each_harness_namespace() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let codex = dir.join(".codex/plugins/neurostrata.json");
         let hermes = dir.join(".hermes/plugins/neurostrata.json");
-        write_file(&codex, r#"{"id": "neurostrata-codex", "namespace": "alpha"}"#);
-        write_file(&hermes, r#"{"id": "neurostrata-hermes", "namespace": "beta"}"#);
+        write_file(
+            &codex,
+            r#"{"id": "neurostrata-codex", "namespace": "alpha"}"#,
+        );
+        write_file(
+            &hermes,
+            r#"{"id": "neurostrata-hermes", "namespace": "beta"}"#,
+        );
         std::fs::create_dir_all(dir.join(".openclaw")).unwrap();
         boot_install_plugins(&dir);
         assert_eq!(namespace_in(&codex), "alpha");
         assert_eq!(namespace_in(&hermes), "beta");
         assert!(!dir.join(".openclaw/plugins/neurostrata.json").exists());
-        assert!(dir.join(".NeuroStrata/plugins/openclaw/dist/index.js").exists());
+        assert!(dir
+            .join(".NeuroStrata/plugins/openclaw/dist/index.js")
+            .exists());
     }
 
     /// A folder below the checkout top with its own harness config keeps
@@ -1494,13 +1564,21 @@ mod tests {
     #[test]
     fn boot_install_in_subfolder_reads_the_folder_itself_first() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let top = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let top = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(top.join(".git")).unwrap();
         let top_cfg = top.join(".hermes/plugins/neurostrata.json");
-        write_file(&top_cfg, r#"{"id": "neurostrata-hermes", "namespace": "outer"}"#);
+        write_file(
+            &top_cfg,
+            r#"{"id": "neurostrata-hermes", "namespace": "outer"}"#,
+        );
         let sub = top.join("packages").join("api");
         let sub_cfg = sub.join(".hermes/plugins/neurostrata.json");
-        write_file(&sub_cfg, r#"{"id": "neurostrata-hermes", "namespace": "api"}"#);
+        write_file(
+            &sub_cfg,
+            r#"{"id": "neurostrata-hermes", "namespace": "api"}"#,
+        );
         boot_install_plugins(&sub);
         assert_eq!(namespace_in(&sub_cfg), "api");
         assert_eq!(namespace_in(&top_cfg), "outer");
@@ -1512,13 +1590,20 @@ mod tests {
     #[test]
     fn boot_install_for_configured_project_uses_the_project_folder() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join(".NeuroStrata")).unwrap();
         let hermes = dir.join(".hermes/plugins/neurostrata.json");
-        write_file(&hermes, r#"{"id": "neurostrata-hermes", "namespace": "example-project"}"#);
+        write_file(
+            &hermes,
+            r#"{"id": "neurostrata-hermes", "namespace": "example-project"}"#,
+        );
         boot_install_project_context(&dir.join(".NeuroStrata"));
-        assert!(dir.join(".NeuroStrata/plugins/hermes/dist/index.js").exists());
+        assert!(dir
+            .join(".NeuroStrata/plugins/hermes/dist/index.js")
+            .exists());
         assert!(!dir.join(".NeuroStrata/.NeuroStrata").exists());
         assert_eq!(namespace_in(&hermes), "example-project");
     }
@@ -1535,7 +1620,9 @@ mod tests {
     fn disagreeing_harness_configs_use_fixed_order_and_are_listed() {
         let _env = no_namespace_env();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let dir = dir.as_path();
         write_file(
@@ -1549,7 +1636,10 @@ mod tests {
         assert_eq!(ns_of(dir), "a");
         assert_eq!(
             resolve_namespace(dir).unwrap().configs,
-            vec![("claude".to_string(), "a".to_string()), ("codex".to_string(), "b".to_string())]
+            vec![
+                ("claude".to_string(), "a".to_string()),
+                ("codex".to_string(), "b".to_string())
+            ]
         );
         // codex comes before hermes in the fixed order.
         std::fs::remove_file(dir.join(".claude").join("settings.local.json")).unwrap();
@@ -1585,7 +1675,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(configured_namespace(&main).as_deref(), Some("example-project"));
+        assert_eq!(
+            configured_namespace(&main).as_deref(),
+            Some("example-project")
+        );
         assert_eq!(ns_of(&main.join("src")), "example-project");
 
         // A linked worktree beside it, with no settings of its own, inherits it.
@@ -1596,7 +1689,10 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(
             wt.join(".git"),
-            format!("gitdir: {}\n", main.join(".git").join("worktrees").join("wt").display()),
+            format!(
+                "gitdir: {}\n",
+                main.join(".git").join("worktrees").join("wt").display()
+            ),
         )
         .unwrap();
         assert_eq!(ns_of(&wt), "example-project");
@@ -1668,7 +1764,10 @@ mod tests {
         let runner = plain_abs_path(&runner_path);
         let ns = |command: &str| installer_hook_namespace(command, &root, &runner);
         let ours = |n: &str| format!("NEUROSTRATA_NAMESPACE={n} node \"{runner}\"");
-        assert_eq!(ns(&ours("example-project")).as_deref(), Some("example-project"));
+        assert_eq!(
+            ns(&ours("example-project")).as_deref(),
+            Some("example-project")
+        );
         // A moved checkout's runner that no longer exists is still ours.
         assert_eq!(
             ns("NEUROSTRATA_NAMESPACE=moved node \"C:/gone/.NeuroStrata/plugins/claude/cli-hook.mjs\"")
@@ -1676,20 +1775,46 @@ mod tests {
             Some("moved")
         );
         // Someone else's script, or a runner that exists elsewhere, is not.
-        assert_eq!(ns("NEUROSTRATA_NAMESPACE=other node \"C:/x/notify.js\""), None);
+        assert_eq!(
+            ns("NEUROSTRATA_NAMESPACE=other node \"C:/x/notify.js\""),
+            None
+        );
         let elsewhere = root.join("elsewhere").join("cli-hook.mjs");
         write_file(&elsewhere, "// someone's own install");
         assert_eq!(
-            ns(&format!("NEUROSTRATA_NAMESPACE=other node \"{}\"", elsewhere.display())),
+            ns(&format!(
+                "NEUROSTRATA_NAMESPACE=other node \"{}\"",
+                elsewhere.display()
+            )),
             None
         );
         // Other shapes are not the installer's.
-        assert_eq!(ns(&format!("set NEUROSTRATA_NAMESPACE=a&& node \"{runner}\"")), None);
-        assert_eq!(ns(&format!("env NEUROSTRATA_NAMESPACE=a node \"{runner}\"")), None);
-        assert_eq!(ns(&format!("NEUROSTRATA_NAMESPACE=\"a\" node \"{runner}\"")), None);
-        assert_eq!(ns(&format!("NEUROSTRATA_NAMESPACE=My Project node \"{runner}\"")), None);
-        assert_eq!(ns(&format!("NEUROSTRATA_NAMESPACE= node \"{runner}\"")), None);
-        assert_eq!(ns(&format!("NEUROSTRATA_NAMESPACE=$NS node \"{runner}\"")), None);
+        assert_eq!(
+            ns(&format!("set NEUROSTRATA_NAMESPACE=a&& node \"{runner}\"")),
+            None
+        );
+        assert_eq!(
+            ns(&format!("env NEUROSTRATA_NAMESPACE=a node \"{runner}\"")),
+            None
+        );
+        assert_eq!(
+            ns(&format!("NEUROSTRATA_NAMESPACE=\"a\" node \"{runner}\"")),
+            None
+        );
+        assert_eq!(
+            ns(&format!(
+                "NEUROSTRATA_NAMESPACE=My Project node \"{runner}\""
+            )),
+            None
+        );
+        assert_eq!(
+            ns(&format!("NEUROSTRATA_NAMESPACE= node \"{runner}\"")),
+            None
+        );
+        assert_eq!(
+            ns(&format!("NEUROSTRATA_NAMESPACE=$NS node \"{runner}\"")),
+            None
+        );
         assert_eq!(ns(&format!("{} --flag", ours("a"))), None);
         assert_eq!(ns(&format!("MY_{}", ours("a"))), None);
     }
@@ -1700,7 +1825,9 @@ mod tests {
     fn a_custom_claude_hook_does_not_shadow_the_installers() {
         let _env = no_namespace_env();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let runner = plain_abs_path(&installed_runner(&dir, "claude"));
         write_file(
@@ -1713,7 +1840,10 @@ mod tests {
             }}))
             .unwrap(),
         );
-        assert_eq!(src_of(&dir), ("alpha".to_string(), NamespaceSource::HarnessConfig));
+        assert_eq!(
+            src_of(&dir),
+            ("alpha".to_string(), NamespaceSource::HarnessConfig)
+        );
     }
 
     /// A harness config that exists but cannot be read (invalid JSON, a UTF-8
@@ -1723,7 +1853,9 @@ mod tests {
     fn an_unreadable_harness_config_fails_the_lookup() {
         let _env = no_namespace_env();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let codex = dir.join(".codex").join("plugins").join("neurostrata.json");
         write_file(&codex, r#"{"namespace": "alpha"}"#);
@@ -1783,14 +1915,19 @@ mod tests {
     /// quotes is no namespace.
     #[test]
     fn only_environment_values_lose_their_quotes() {
-        assert_eq!(usable_env_namespace(" \"alpha\" ").as_deref(), Some("alpha"));
+        assert_eq!(
+            usable_env_namespace(" \"alpha\" ").as_deref(),
+            Some("alpha")
+        );
         assert_eq!(usable_env_namespace("'alpha'").as_deref(), Some("alpha"));
         assert_eq!(usable_env_namespace("\"alpha'"), None);
         assert_eq!(usable_namespace("\"alpha\""), None);
         assert_eq!(usable_namespace(" alpha"), None);
         let _env = no_namespace_env();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         write_file(
             &dir.join(".codex").join("plugins").join("neurostrata.json"),
@@ -1804,7 +1941,9 @@ mod tests {
     /// Detected harness folders for the refresh tests: Claude and codex.
     fn refresh_project() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::create_dir_all(dir.join(".codex")).unwrap();
@@ -1817,8 +1956,14 @@ mod tests {
     fn a_refresh_without_an_explicit_namespace_writes_plugin_files_only() {
         let (_tmp, dir) = refresh_project();
         let _ = auto_install_detected_plugins(&dir, ConfigNamespace::Keep(None), Some("claude"));
-        assert!(installed_runner(&dir, "claude").is_file(), "plugin files are installed");
-        assert!(!dir.join(CLAUDE_SETTINGS).exists(), "no Claude hooks without a namespace");
+        assert!(
+            installed_runner(&dir, "claude").is_file(),
+            "plugin files are installed"
+        );
+        assert!(
+            !dir.join(CLAUDE_SETTINGS).exists(),
+            "no Claude hooks without a namespace"
+        );
         assert!(!dir.join(".codex/plugins/neurostrata.json").exists());
         assert_eq!(harness_namespaces_at(&dir), (Vec::new(), Vec::new()));
     }
@@ -1831,8 +1976,11 @@ mod tests {
         let (_tmp, dir) = refresh_project();
         let codex = dir.join(".codex/plugins/neurostrata.json");
         write_file(&codex, r#"{"namespace": "beta"}"#);
-        let _ =
-            auto_install_detected_plugins(&dir, ConfigNamespace::Keep(Some("alpha")), Some("claude"));
+        let _ = auto_install_detected_plugins(
+            &dir,
+            ConfigNamespace::Keep(Some("alpha")),
+            Some("claude"),
+        );
         assert_eq!(
             harness_namespaces_at(&dir).0,
             vec![
@@ -1842,8 +1990,11 @@ mod tests {
         );
         let broken = "\u{feff}{\"namespace\": \"beta\"}";
         write_file(&codex, broken);
-        let _ =
-            auto_install_detected_plugins(&dir, ConfigNamespace::Keep(Some("alpha")), Some("claude"));
+        let _ = auto_install_detected_plugins(
+            &dir,
+            ConfigNamespace::Keep(Some("alpha")),
+            Some("claude"),
+        );
         assert_eq!(std::fs::read_to_string(&codex).unwrap(), broken);
         // No temporary file is left beside a config the refresh wrote.
         let leftovers: Vec<_> = std::fs::read_dir(dir.join(".claude"))
@@ -1861,13 +2012,19 @@ mod tests {
             let (_tmp, dir) = refresh_project();
             let _ = auto_install_detected_plugins(&dir, ConfigNamespace::Set(bad), Some("claude"));
             assert!(!dir.join(CLAUDE_SETTINGS).exists(), "{bad:?}");
-            assert!(!dir.join(".codex/plugins/neurostrata.json").exists(), "{bad:?}");
+            assert!(
+                !dir.join(".codex/plugins/neurostrata.json").exists(),
+                "{bad:?}"
+            );
         }
     }
 
     #[test]
     fn a_namespace_starts_with_a_letter_or_digit() {
-        assert_eq!(usable_namespace("example-project").as_deref(), Some("example-project"));
+        assert_eq!(
+            usable_namespace("example-project").as_deref(),
+            Some("example-project")
+        );
         assert_eq!(usable_namespace("v1.2_x").as_deref(), Some("v1.2_x"));
         for bad in ["", ".", "..", "--help", "-x", "_x", ".hidden", "a b", "$NS"] {
             assert_eq!(usable_namespace(bad), None, "{bad:?}");
@@ -1878,7 +2035,9 @@ mod tests {
     fn outside_git_the_directory_itself_is_read() {
         let _env = no_namespace_env();
         let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = dunce::canonicalize(tmp.path()).unwrap().join("loose-folder");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("loose-folder");
         std::fs::create_dir_all(dir.join(".opencode")).unwrap();
         if crate::paths::git_root_of_dir(&dir.to_string_lossy()).is_some() {
             eprintln!("skipped: the temp dir is inside a git checkout");
@@ -1905,8 +2064,14 @@ mod tests {
             return;
         }
         let expected = resolve_namespace(&here).map(|r| r.namespace);
-        assert_eq!(resolve_namespace(Path::new(".")).map(|r| r.namespace), expected);
-        assert_eq!(resolve_namespace(Path::new("src")).map(|r| r.namespace), expected);
+        assert_eq!(
+            resolve_namespace(Path::new(".")).map(|r| r.namespace),
+            expected
+        );
+        assert_eq!(
+            resolve_namespace(Path::new("src")).map(|r| r.namespace),
+            expected
+        );
     }
 
     #[test]
@@ -1921,7 +2086,11 @@ mod tests {
         )
         .expect("write custom-worker.md");
 
-        let report = auto_install_detected_plugins(tmp.path(), ConfigNamespace::Set("TestProj"), Some("claude"));
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         assert_eq!(report["active_harness"], json!("claude"));
         let installed = report["installed_plugins"]
             .as_array()
@@ -1980,7 +2149,11 @@ mod tests {
     fn claude_hook_matcher_covers_notebook_edit_and_widens_older_installs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
-        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let fresh = claude_pre_tool_use_matchers(tmp.path());
         assert_eq!(fresh.len(), 1);
         assert!(
@@ -2009,7 +2182,11 @@ mod tests {
         std::fs::write(&cfg, serde_json::to_string_pretty(&older).unwrap())
             .expect("write older settings");
 
-        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let after = claude_pre_tool_use_matchers(tmp.path());
         assert_eq!(
             after,
@@ -2027,7 +2204,11 @@ mod tests {
     #[test]
     fn wired_paths_never_use_the_windows_extended_length_prefix() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let report = auto_install_detected_plugins(tmp.path(), ConfigNamespace::Set("TestProj"), Some("claude"));
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let runner = report["installed_plugins"][0]["cli_hook_runner"]
             .as_str()
             .expect("cli_hook_runner");
@@ -2058,7 +2239,11 @@ mod tests {
         ];
         for (harness, cfg_rel) in cases {
             let tmp = tempfile::tempdir().expect("tempdir");
-            let report = auto_install_detected_plugins(tmp.path(), ConfigNamespace::Set("TestProj"), Some(harness));
+            let report = auto_install_detected_plugins(
+                tmp.path(),
+                ConfigNamespace::Set("TestProj"),
+                Some(harness),
+            );
             assert!(
                 report["ok"].as_bool().unwrap_or(true),
                 "{harness} install report"
@@ -2092,7 +2277,11 @@ mod tests {
     fn repairs_an_existing_verbatim_hook_command_without_touching_user_hooks() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
-        let report = auto_install_detected_plugins(tmp.path(), ConfigNamespace::Set("TestProj"), Some("claude"));
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         assert_eq!(report["active_harness"], json!("claude"));
         let cfg = tmp.path().join(".claude/settings.local.json");
         let raw = std::fs::read_to_string(&cfg).expect("read settings");
@@ -2151,7 +2340,11 @@ mod tests {
         std::fs::write(&cfg, serde_json::to_string_pretty(&doc).unwrap())
             .expect("write broken settings");
 
-        let _ = auto_install_detected_plugins(tmp.path(), ConfigNamespace::Set("TestProj"), Some("claude"));
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let raw = std::fs::read_to_string(&cfg).expect("read settings");
         assert!(
             raw.contains("neurostrata-mcp task gate TestProj --strict"),
@@ -2226,7 +2419,11 @@ mod tests {
         let before = serde_json::to_string_pretty(&settings_with_runner(&runner)).unwrap();
         std::fs::write(&cfg, &before).expect("write settings");
 
-        let _ = auto_install_detected_plugins(&project, ConfigNamespace::Set("TestProj"), Some("claude"));
+        let _ = auto_install_detected_plugins(
+            &project,
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let after = std::fs::read_to_string(&cfg).expect("read settings");
         assert_eq!(after, before, "custom hook commands were rewritten");
     }
@@ -2243,7 +2440,11 @@ mod tests {
         )
         .expect("write settings");
 
-        let report = auto_install_detected_plugins(tmp.path(), ConfigNamespace::Set("TestProj"), Some("claude"));
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
             .as_str()
             .expect("cli_hook_runner");
@@ -2262,7 +2463,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
         // First install puts the runner on disk and reports where it is.
-        let report = auto_install_detected_plugins(tmp.path(), ConfigNamespace::Set("TestProj"), Some("claude"));
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
             .as_str()
             .expect("cli_hook_runner")
@@ -2279,7 +2484,11 @@ mod tests {
         )
         .expect("write settings");
 
-        let _ = auto_install_detected_plugins(tmp.path(), ConfigNamespace::Set("TestProj"), Some("claude"));
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
         assert_eq!(commands.len(), 3, "{commands:?}");
@@ -2295,7 +2504,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let project = tmp.path().join("Pröj");
         std::fs::create_dir_all(project.join(".claude")).expect("create .claude");
-        let report = auto_install_detected_plugins(&project, ConfigNamespace::Set("TestProj"), Some("claude"));
+        let report = auto_install_detected_plugins(
+            &project,
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let abs_runner = report["installed_plugins"][0]["cli_hook_runner"]
             .as_str()
             .expect("cli_hook_runner")
@@ -2318,7 +2531,11 @@ mod tests {
         )
         .expect("write settings");
 
-        let _ = auto_install_detected_plugins(&project, ConfigNamespace::Set("TestProj"), Some("claude"));
+        let _ = auto_install_detected_plugins(
+            &project,
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
         assert_eq!(commands.len(), 3, "{commands:?}");
@@ -2388,7 +2605,11 @@ mod tests {
         )
         .expect("write root opencode.json");
 
-        let report = auto_install_detected_plugins(tmp.path(), ConfigNamespace::Set("TestProj"), Some("opencode"));
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("opencode"),
+        );
         assert_eq!(report["active_harness"], json!("opencode"));
 
         // Core plugin-core bundle must be present so relative imports resolve.
