@@ -207,6 +207,23 @@ pub fn mutate_session_ledger<F>(path: &std::path::Path, namespace: &str, mutate:
 where
     F: FnOnce(&mut Value),
 {
+    // The pre-commit hook rewrites this same ledger under the same lock. Take
+    // it before reading so a hook rename cannot drop a receipt we just wrote,
+    // and hold it until the rename below releases it on drop. A lock file we
+    // cannot open only degrades to the previous best-effort behavior.
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "session_queries.json".to_string());
+    let _lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(path.with_file_name(format!("{file_name}.lock")))
+        .ok()
+        .and_then(|file| {
+            use fs2::FileExt;
+            file.lock_exclusive().ok().map(|_| file)
+        });
     if let Some(parent) = path.parent() {
         if std::fs::create_dir_all(parent).is_err() {
             return;
@@ -245,10 +262,6 @@ where
     let Ok(serialized) = serde_json::to_string_pretty(&doc) else {
         return;
     };
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "session_queries.json".to_string());
     let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
     if std::fs::write(&tmp, serialized).is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -298,10 +311,7 @@ pub fn bump_tool_invocation(doc: &mut Value, tool: &str) {
     if !counters.is_object() {
         *counters = Value::Object(Map::new());
     }
-    let count = counters
-        .get(tool)
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let count = counters.get(tool).and_then(Value::as_u64).unwrap_or(0);
     counters
         .as_object_mut()
         .expect("tool_invocations is an object")
@@ -712,10 +722,7 @@ pub fn trigger_context_from_result(result_text: &str) -> (String, Vec<String>) {
             }
         }
     }
-    (
-        triggers.into_iter().next().unwrap_or_default(),
-        action_ids,
-    )
+    (triggers.into_iter().next().unwrap_or_default(), action_ids)
 }
 
 /// Fill `prescribed_action_ids` from the REAL response actions, leaving the
@@ -807,7 +814,10 @@ mod tests {
         let text = "Missing 'query' parameter.\n\n[search_contract] query=* top_k=5";
         assert_eq!(derive_status(text, false), ReceiptStatus::Failed);
         // Genuine empty search outcomes still classify as Empty, not Failed.
-        assert_eq!(derive_status(r#"{"memories":[]}"#, false), ReceiptStatus::Empty);
+        assert_eq!(
+            derive_status(r#"{"memories":[]}"#, false),
+            ReceiptStatus::Empty
+        );
         assert_eq!(
             derive_status("no relevant memories found.", false),
             ReceiptStatus::Empty
@@ -831,7 +841,11 @@ mod tests {
             )
         };
         assert_eq!(
-            mk("neurostrata_taxonomy", r#"{"operation":"advise","recommendations":[]}"#).operation,
+            mk(
+                "neurostrata_taxonomy",
+                r#"{"operation":"advise","recommendations":[]}"#
+            )
+            .operation,
             "advise"
         );
         assert_eq!(
@@ -866,7 +880,10 @@ mod tests {
             taxonomy_operation_fallback("advise", true, Some(&args)),
             "advise"
         );
-        assert_eq!(taxonomy_operation_fallback("taxonomy", true, None), "taxonomy");
+        assert_eq!(
+            taxonomy_operation_fallback("taxonomy", true, None),
+            "taxonomy"
+        );
     }
 
     // ---- Task 11 Fix 3: honest count/ids for remaining graph tools ----
@@ -890,10 +907,7 @@ mod tests {
     fn receipt_count_and_ids_locate() {
         let text = r#"{"locations":[{"path":"src/a.rs","scip_symbol":"foo"},{"id":"mem-2","symbol":"bar"}],"governing_rules":[{"id":"rule-1"}]}"#;
         assert_eq!(result_count(text), 2);
-        assert_eq!(
-            extract_returned_ids(text),
-            vec!["foo", "mem-2", "rule-1"]
-        );
+        assert_eq!(extract_returned_ids(text), vec!["foo", "mem-2", "rule-1"]);
         let empty = r#"{"locations":[],"governing_rules":[]}"#;
         assert_eq!(result_count(empty), 0);
         assert_eq!(derive_status(empty, false), ReceiptStatus::Empty);
@@ -911,10 +925,7 @@ mod tests {
     fn receipt_count_and_ids_diff_tour() {
         let text = r#"{"total_symbols_touched":2,"stops":[{"items":[{"symbol":"s1","path":"src/a.rs"},{"path":"src/b.rs"}]}],"governing_rules":[{"id":"rule-2"}]}"#;
         assert_eq!(result_count(text), 2);
-        assert_eq!(
-            extract_returned_ids(text),
-            vec!["s1", "src/b.rs", "rule-2"]
-        );
+        assert_eq!(extract_returned_ids(text), vec!["s1", "src/b.rs", "rule-2"]);
         // Fallback when stops is absent.
         assert_eq!(result_count(r#"{"total_symbols_touched":5}"#), 5);
         let empty = r#"{"stops":[]}"#;
@@ -924,7 +935,8 @@ mod tests {
 
     #[test]
     fn receipt_count_and_ids_taxonomy() {
-        let text = r#"{"operation":"advise","recommendations":[{"id":"rec-1"}],"gaps":[{"id":"gap-1"}]}"#;
+        let text =
+            r#"{"operation":"advise","recommendations":[{"id":"rec-1"}],"gaps":[{"id":"gap-1"}]}"#;
         assert_eq!(result_count(text), 2);
         assert_eq!(extract_returned_ids(text), vec!["rec-1", "gap-1"]);
         let single = r#"{"operation":"briefing","concept_id":"concept-1"}"#;
@@ -994,6 +1006,51 @@ mod tests {
             original,
             "quarantine copy must hold the untouched original"
         );
+    }
+
+    /// A hook rewriting the ledger holds `<ledger>.lock`; the daemon's single
+    /// mutation path must wait for it rather than rename a stale snapshot over
+    /// a receipt the hook has not seen.
+    #[test]
+    fn mutate_session_ledger_respects_an_external_hook_lock() {
+        use fs2::FileExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".NeuroStrata/session_queries.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"namespace":"ns","queries":[],"events":[]}"#).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path.with_file_name("session_queries.json.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+
+        let (called_tx, called_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let ledger = path.clone();
+        let writer = std::thread::spawn(move || {
+            mutate_session_ledger(&ledger, "ns", |doc| {
+                called_tx.send(()).unwrap();
+                proceed_rx.recv().unwrap();
+                append_event(doc, json!({"event_id": "from-daemon"}));
+            });
+        });
+
+        assert!(
+            called_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "the mutation must wait while the hook holds the ledger lock"
+        );
+        lock.unlock().unwrap();
+        called_rx
+            .recv()
+            .expect("mutation resumes after the hook releases");
+        proceed_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["events"][0]["event_id"], json!("from-daemon"));
     }
 
     #[test]

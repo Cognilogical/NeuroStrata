@@ -4309,6 +4309,9 @@ for raw_file in "${StagedFiles[@]}"; do
 done
 
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
+# The daemon mutates this ledger under the same lock; without it a hook could
+# rename a stale snapshot over a receipt written in between.
+rewrite_session_ledger_namespace() {
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
     printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
@@ -4352,6 +4355,14 @@ with open(tmp, "w", encoding="utf-8", newline="\n") as f:
 os.replace(tmp, ledger)
 ' 2>/dev/null || true
     fi
+fi
+}
+
+mkdir -p "$(dirname "$LEDGER")"
+if command -v flock >/dev/null 2>&1; then
+    ( flock -x 9; rewrite_session_ledger_namespace ) 9>"$LEDGER.lock"
+else
+    rewrite_session_ledger_namespace
 fi
 
 
@@ -6287,6 +6298,32 @@ mod tests {
             checked_in.contains("scripts/check-staged-quality.sh"),
             "the pre-commit hook must delegate to the project's staged-quality runner"
         );
+    }
+
+    /// Both pre-commit hook copies take the same ledger lock the daemon uses
+    /// around the namespace rewrite, so a stale hook snapshot cannot be
+    /// renamed over a receipt written in between.
+    #[test]
+    fn pre_commit_hook_serializes_its_ledger_rewrite() {
+        for source in [
+            SCAFFOLDED_PRE_COMMIT_HOOK,
+            include_str!("../../scripts/hooks/pre-commit"),
+        ] {
+            assert!(
+                source.contains("flock -x 9"),
+                "the hook must take an exclusive ledger lock"
+            );
+            assert!(
+                source.contains("9>\"$LEDGER.lock\""),
+                "the hook and the daemon must lock the same file"
+            );
+            let definition = source.find("rewrite_session_ledger_namespace() {");
+            let call = source.rfind("rewrite_session_ledger_namespace");
+            assert!(
+                definition.is_some_and(|d| call.is_some_and(|c| d < c)),
+                "the locked rewrite must call the shared function"
+            );
+        }
     }
 
     /// The pre-commit hook files the ledger under the namespace `namespace
