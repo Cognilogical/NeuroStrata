@@ -371,7 +371,11 @@ fn main_checkout_of_common(common: &Path) -> Option<PathBuf> {
         .ok()?
         .filter_map(Result::ok)
         .any(|entry| entry.file_name() != ".git");
-    holds_more_than_git.then(|| parent.to_path_buf())
+    // `git init --separate-git-dir <parent>/.git <checkout>` leaves a main
+    // checkout with nothing but `.git`: git still owns it, and records that in
+    // the git directory's own HEAD rather than in the parent's entries.
+    let holds_git_metadata = common.join("HEAD").is_file();
+    (holds_more_than_git || holds_git_metadata).then(|| parent.to_path_buf())
 }
 
 /// The `[core]` settings [`main_checkout_of_common`] reads.
@@ -2046,6 +2050,23 @@ mod tests {
         // The same layout with `bare = false` and the parent holding that
         // `.git` is an ordinary main checkout.
         std::fs::write(common.join("config"), "[core]\n\tbare = false\n").unwrap();
+        assert_eq!(main_checkout_root(&s(&wt)), Some(project.clone()));
+    }
+
+    /// A main checkout whose working directory holds nothing but `.git` is
+    /// still a checkout when that git directory has Git's own `HEAD` metadata.
+    #[test]
+    fn main_checkout_with_only_dot_git_and_head_is_recognized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let project = base.join("example-project");
+        let common = project.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        touch(&common.join("HEAD"));
+        std::fs::write(common.join("config"), "[core]\n\tbare = false\n").unwrap();
+        let wt = base.join("agent-1");
+        link_worktree(&wt, &common.join("worktrees").join("agent-1"));
+
         assert_eq!(main_checkout_root(&s(&wt)), Some(project.clone()));
     }
 
