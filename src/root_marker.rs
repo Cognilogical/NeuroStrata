@@ -1918,7 +1918,15 @@ mod tests {
                 );
             } else {
                 match kind {
-                    "git-dir" => std::fs::create_dir_all(path.join(".git")).unwrap(),
+                    "git-dir" => {
+                        let git_dir = path.join(".git");
+                        std::fs::create_dir_all(&git_dir).unwrap();
+                        // A checkout's common dir carries HEAD and a config;
+                        // main_checkout_of_common uses them to tell a checkout
+                        // apart from a dropped git dir.
+                        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+                        std::fs::write(git_dir.join("config"), "[core]\n\tbare = false\n").unwrap();
+                    }
                     "neurostrata-dir" => {
                         std::fs::create_dir_all(path.join(".NeuroStrata")).unwrap()
                     }
