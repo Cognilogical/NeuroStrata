@@ -4025,7 +4025,7 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 5a3b7ea2ec3f8b14761ee1a4efe8dc985a16706e8a18c820064fb5c52ac49e9c
+# neurostrata-hook-sha256: 64205469189211752148cb6897d3deac0d42e1bc2c9188da06bcc8ef2d2202c4
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
