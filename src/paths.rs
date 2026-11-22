@@ -2808,6 +2808,34 @@ mod tests {
         assert_eq!(main_checkout_root(&s(&wt)), Some(sep.clone()));
     }
 
+    /// An included config's `core.bare = true` is the effective value: a
+    /// top-level `bare = false` must not make the common dir's parent a main
+    /// checkout.
+    #[test]
+    fn included_core_bare_true_overrides_the_top_level_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let project = base.join("bare-project");
+        let common = project.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        touch(&project.join("unrelated.txt"));
+        let inc = base.join("included-config");
+        std::fs::write(&inc, "[core]\n\tbare = true\n").unwrap();
+        std::fs::write(
+            common.join("config"),
+            format!(
+                "[core]\n\tbare = false\n[include]\n\tpath = {}\n",
+                s(&inc).replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let wt = base.join("wt");
+        link_worktree(&wt, &common.join("worktrees").join("wt"));
+
+        assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
+    }
+
     /// A checkout holding only its `.git` is still the main checkout; a
     /// common `.git` dropped beside unrelated data is not a checkout.
     #[test]
