@@ -270,6 +270,17 @@ fn shell_literal_value(text: &str) -> Option<(String, &str)> {
     }
 }
 
+/// Whether a single-quoted runner path is one the installer wrote: it sits at
+/// the installer's layout, `<root>/.NeuroStrata/plugins/codex/cli-hook.mjs`,
+/// in any checkout (a moved or copied project). The path is literal text,
+/// so `$` or `%` in it are ordinary characters, and a user's own
+/// `cli-hook.mjs` elsewhere is never claimed, present or not.
+fn is_installer_codex_runner(path: &str) -> bool {
+    path.replace('\\', "/")
+        .to_ascii_lowercase()
+        .ends_with("/.neurostrata/plugins/codex/cli-hook.mjs")
+}
+
 /// The installer's Codex hook command. It carries no namespace: the callers
 /// that refresh it (`hook_hygiene` from `get_snapshot`, `hooks install`,
 /// daemon boot) only have a folder-name guess or nothing, so the runner
@@ -323,9 +334,7 @@ fn wire_codex_hooks(project_root: &Path, abs_runner: &str) -> Option<String> {
                 else {
                     continue;
                 };
-                if path_basename(&old_path) == path_basename(abs_runner)
-                    && runner_is_replaceable(&old_path, project_root, abs_runner)
-                {
+                if is_installer_codex_runner(&old_path) {
                     if command != cmd {
                         hook["command"] = Value::String(cmd.clone());
                     }
@@ -1695,5 +1704,56 @@ mod tests {
     fn installed_runner_passes_a_namespace_only_when_set() {
         assert!(!CLI_HOOK_RUNNER_MJS.contains("{ namespace: process.env.NEUROSTRATA_NAMESPACE }"));
         assert!(CLI_HOOK_RUNNER_MJS.contains("namespace ? { namespace } : {}"));
+    }
+
+    /// Ownership is the installer's layout, read as literal text: a user's
+    /// own (missing) `cli-hook.mjs` is never claimed, and a moved checkout
+    /// whose old path holds `$` or `%` is repointed, not duplicated (Codex
+    /// review on #368).
+    #[test]
+    fn codex_refresh_owns_only_the_installer_layout_literally() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).expect("create .codex");
+        let report = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("cli_hook_runner")
+            .to_string();
+        let ours = format!("node {}", shell_literal(&runner));
+        let user_policy = format!(
+            "node {}",
+            shell_literal(&tmp.path().join("tools/project-policy/cli-hook.mjs").to_string_lossy())
+        );
+        let moved = format!(
+            "node {}",
+            shell_literal(
+                &tmp.path()
+                    .join("old $HOME %USERPROFILE% copy/.NeuroStrata/plugins/codex/cli-hook.mjs")
+                    .to_string_lossy()
+            )
+        );
+        let user = json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": user_policy }] },
+                    { "matcher": "apply_patch|Bash", "hooks": [{ "type": "command", "command": moved }] }
+                ],
+                "Stop": [{ "hooks": [{ "type": "command", "command": moved }] }]
+            }
+        });
+        std::fs::write(
+            tmp.path().join(".codex/hooks.json"),
+            serde_json::to_string_pretty(&user).unwrap(),
+        )
+        .expect("write");
+
+        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("codex"));
+        let doc = read_codex_hooks(tmp.path());
+        assert_eq!(
+            codex_commands(&doc, "PreToolUse"),
+            vec![user_policy, ours.clone()],
+            "user hook kept as written; moved installer hook repointed in place"
+        );
+        assert_eq!(codex_commands(&doc, "Stop"), vec![ours]);
     }
 }
