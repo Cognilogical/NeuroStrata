@@ -456,11 +456,25 @@ stored payload. A foreign- or mesh-owned head is never rebound: its edges stay
 exactly as stored and the turn remains a silent no-op for that head, matching
 the unchanged path's prior behavior.
 
+A rebind is also a `RELATES_TO`-only operation, so it may act only on a
+`RELATES_TO` declaration. An unchanged head is queued only when
+`metadata.vault_source` or `metadata.exact_edge_targets` marks it
+vault-import-owned, and its declaration set comes from the head's
+`related`/`related_to` arrays only. `VaultNote::from_payload` unions
+`governs`/`depends_on` into the exported link set, so a store-owned rule's
+round-trip looks unchanged; replaying that union as a rebind would add an
+unintended `RELATES_TO` beside the rule's `GOVERNS` edge. Store-owned
+rules and memories keep their original relationship types untouched.
+
 #### Mechanism
 
 - The planning loop runs the same `writable_prior` sovereignty gate used for a
-  changed head before recording `(id, related)` for an unchanged declaration.
-  A protected head is dropped at `continue` without an error or edge mutation.
+  changed head before recording an unchanged declaration. A protected head is
+  dropped at `continue` without an error or edge mutation.
+- `vault_declared_targets(prior)` returns the sorted, deduplicated
+  `related`/`related_to` set only for a vault-import-owned head; every other
+  head is skipped, so `governs`/`depends_on` links are never rebound as
+  `RELATES_TO`.
 - The write loop collects the ids whose head upsert succeeded
   (`imported_ids`).
 - After the deferred replay, an unchanged declarer recomputes
@@ -496,6 +510,15 @@ the unchanged path's prior behavior.
     import rebound the protected head (`["ns::z"] vs ["z"]`).
 - `owned_unchanged_declarer_still_rebinds_preferred_target` is the control:
   a writable unchanged declarer still follows the newly imported preferred id.
+- `unchanged_owned_rule_keeps_governs_without_relates_to_rebind` (failed on
+  `3a6ad8a3`)
+  - Seed an owned rule `rule-r` with `governs: [target-b]` (GOVERNS edge) and
+    `target-b`; export, import byte-identical, then edit `target-b` and import
+    again.
+  - Assert `rule-r` keeps its content and `canonical_sha256`, its `GOVERNS`
+    edge survives, and no `rule-r → target-b` `RELATES_TO` edge exists.
+  - On `3a6ad8a3` the unchanged rule entered the declarer queue and the
+    exported `governs` link was rebound as `RELATES_TO`, producing both edges.
 
 #### Residual risk
 
@@ -512,6 +535,11 @@ the unchanged path's prior behavior.
   preferred id that was already stored but whose edge was mis-bound by an
   older build is not re-detected without comparing materialised edges, which
   this fix intentionally does not do.
+- The vault-ownership gate trusts `vault_source`/`exact_edge_targets` in the
+  head metadata. A store-owned row that copied those markers would be treated
+  as a vault declaration; import owns both keys on the heads it writes, and a
+  row without them keeps its original relationship types even if its vault
+  export rendered `governs`/`depends_on` as links.
 
 ### 3h. Provenance retires with the edge it cites
 
@@ -806,8 +834,8 @@ note whose *real* type changed is versioned.
 
 - `src/vault_ld/mod.rs` — v2 fingerprint, legacy fingerprint, version const.
 - `src/vault_ld/vault_sync.rs` — `related_to` head key, deferred-edge retry,
-  pending-preferred-target replay (§3f), unchanged-declarer edge rebind (§3g),
-  retirement export filter, history-id
+  pending-preferred-target replay (§3f), unchanged-declarer edge rebind with
+  its vault-ownership/`related`-only scope (§3g), retirement export filter, history-id
   import guard, `fingerprint_version` stamp, `exact_edge_targets` stamp,
   per-head `reconcile_declared_edges` call after a successful upsert, updated
   `import_reconciles_preserved_edge_fields_with_edited_links`

@@ -778,6 +778,39 @@ async fn exact_keep_targets(
     }
 }
 
+/// The `RELATES_TO` declarations an unchanged head may rebind. Only a
+/// vault-import-owned head stores the vault render (`related`/`related_to`);
+/// store-owned rows keep relationship-typed keys (`governs`, `depends_on`),
+/// which must never be replayed as `RELATES_TO`. `None` means the head is not
+/// a vault declaration.
+fn vault_declared_targets(prior: &crate::traits::MemoryPayload) -> Option<Vec<String>> {
+    let metadata = &prior.metadata;
+    let vault_owned = metadata
+        .get("vault_source")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || metadata
+            .get("exact_edge_targets")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if !vault_owned {
+        return None;
+    }
+    let mut declared = Vec::new();
+    for key in ["related", "related_to"] {
+        if let Some(targets) = metadata.get(key).and_then(Value::as_array) {
+            declared.extend(
+                targets
+                    .iter()
+                    .filter_map(|target| target.as_str().map(str::to_string)),
+            );
+        }
+    }
+    declared.sort();
+    declared.dedup();
+    Some(declared)
+}
+
 /// WikiLink targets with no corresponding note in the vault. BTreeSet gives
 /// deterministic order for queryable stub minting. An own-namespace prefix is
 /// an alias only when the bare note exists, so unresolved ids keep the spelling
@@ -1196,7 +1229,9 @@ pub async fn import_vault_with_limits(
                 // the same sovereignty gate as a changed one. A protected head
                 // stays a silent no-op, exactly as the unchanged path was before.
                 if writable_prior(principal, prior).is_ok() {
-                    unchanged_declarers.push((note.id.clone(), note.related.clone()));
+                    if let Some(declared) = vault_declared_targets(prior) {
+                        unchanged_declarers.push((note.id.clone(), declared));
+                    }
                 }
                 continue;
             }
@@ -4992,11 +5027,33 @@ mod tests {
                     user_id: owner.to_string(),
                     agent_name: None,
                     location_lines: String::new(),
-                    metadata,
+                    metadata: metadata.clone(),
                 },
             )
             .await
             .expect("seed declarer");
+        // A real import writes the vault's preferred id into the head while the
+        // initial upsert can bind the stored alias. Restamp the declaration so
+        // the fixture never asserts a link the vault did not declare.
+        let mut declared = metadata;
+        declared["related_to"] = serde_json::json!([preferred.clone()]);
+        store
+            .upsert(
+                ns,
+                "a",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: linker.content.clone(),
+                    memory_type: "fact".to_string(),
+                    location: String::new(),
+                    user_id: owner.to_string(),
+                    agent_name: None,
+                    location_lines: String::new(),
+                    metadata: declared,
+                },
+            )
+            .await
+            .expect("restamp declarer");
         let before = store
             .get(ns, "a")
             .await
@@ -5152,6 +5209,131 @@ mod tests {
             vec![preferred],
             "an owned unchanged declarer must rebind its preferred target: {:?}",
             edges
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// PR #363: a store-owned rule's `governs` declaration survives the vault
+    /// round-trip only as GOVERNS. The unchanged-declarer queue must not replay
+    /// the exported link union as a second RELATES_TO declaration.
+    #[tokio::test]
+    async fn unchanged_owned_rule_keeps_governs_without_relates_to_rebind() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-vault-governs-unchanged-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vaultgoverns";
+        store.init(ns).await.expect("init");
+        let mut config = vault_config(&root, &vault, ns);
+        config.principal = Some("me".to_string());
+
+        let payload = |content: &str, memory_type: &str, metadata: serde_json::Value| {
+            crate::traits::MemoryPayload {
+                content: content.to_string(),
+                memory_type: memory_type.to_string(),
+                location: String::new(),
+                user_id: "me".to_string(),
+                agent_name: None,
+                location_lines: String::new(),
+                metadata,
+            }
+        };
+        store
+            .upsert(
+                ns,
+                "target-b",
+                vec![0.0; 4],
+                payload("governed body", "fact", serde_json::json!({})),
+            )
+            .await
+            .expect("seed governed target");
+        store
+            .upsert(
+                ns,
+                "rule-r",
+                vec![0.0; 4],
+                payload(
+                    "rule body",
+                    "rule",
+                    serde_json::json!({"governs": ["target-b"]}),
+                ),
+            )
+            .await
+            .expect("seed rule");
+
+        let mut export_config = config.clone();
+        export_config.vault_path = vault.clone();
+        export_config.output_dir = vault.clone();
+        export_vault(export_config, store.clone())
+            .await
+            .expect("export");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(
+            first.notes_imported, 0,
+            "an unchanged round-trip must not rewrite: {:?}",
+            first.errors
+        );
+
+        let (_, before) = store
+            .get(ns, "rule-r")
+            .await
+            .expect("get rule")
+            .expect("rule exists");
+
+        let mut edited = note("target-b", &[]);
+        edited.content = "edited governed body".to_string();
+        edited.canonical_sha256 = edited.fingerprint();
+        std::fs::write(vault.join("target-b.md"), edited.to_markdown()).expect("edit target");
+
+        let second = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(
+            second.notes_imported, 1,
+            "only the edited target is new: {:?}",
+            second.errors
+        );
+
+        let (_, after) = store
+            .get(ns, "rule-r")
+            .await
+            .expect("get rule after")
+            .expect("rule survives");
+        assert_eq!(
+            after.content, before.content,
+            "rule content must not change"
+        );
+        assert_eq!(
+            after.metadata.get("canonical_sha256"),
+            before.metadata.get("canonical_sha256"),
+            "rule identity must not change"
+        );
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            edges
+                .iter()
+                .any(|(from, rel, to, _)| from == "rule-r" && rel == "GOVERNS" && to == "target-b"),
+            "the GOVERNS edge must survive: {edges:?}"
+        );
+        assert!(
+            relates_to_targets(&edges, "rule-r").is_empty(),
+            "an exported governs link must not rebind as RELATES_TO: {edges:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
