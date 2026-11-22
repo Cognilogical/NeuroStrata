@@ -2322,9 +2322,10 @@ async fn root_show_cached_root(
 ) -> crate::root_marker::CachedRoot {
     use crate::root_marker::CachedRoot;
     if probe == DaemonProbe::Responsive {
-        if let Err(e) =
-            gate_verify_daemon(fetch_daemon_info().await.as_ref(), daemon::exe_fingerprint())
-        {
+        if let Err(e) = gate_verify_daemon(
+            fetch_daemon_info().await.as_ref(),
+            daemon::exe_fingerprint(),
+        ) {
             return CachedRoot::Unknown(e);
         }
         let reply = async {
@@ -2338,7 +2339,9 @@ async fn root_show_cached_root(
             if !res.status().is_success() {
                 return Err(format!("the daemon answered {} on /cli/read", res.status()));
             }
-            res.json::<serde_json::Value>().await.map_err(|e| e.to_string())
+            res.json::<serde_json::Value>()
+                .await
+                .map_err(|e| e.to_string())
         }
         .await;
         return match reply {
@@ -4066,7 +4069,12 @@ mod tests {
             .expect("parses with a dir");
         match cli.command {
             Some(Commands::Root { action }) => {
-                assert_eq!(action, RootCommands::Show { dir: Some("some/dir".into()) })
+                assert_eq!(
+                    action,
+                    RootCommands::Show {
+                        dir: Some("some/dir".into())
+                    }
+                )
             }
             other => panic!("expected Root/Show, got {:?}", other),
         }
@@ -4076,7 +4084,10 @@ mod tests {
     fn root_show_bindings_missing_config_is_none_unreadable_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.json");
-        assert_eq!(root_show_bindings_from(&path), Ok(std::collections::HashMap::new()));
+        assert_eq!(
+            root_show_bindings_from(&path),
+            Ok(std::collections::HashMap::new())
+        );
         std::fs::write(&path, b"{ not json").unwrap();
         let err = root_show_bindings_from(&path).unwrap_err();
         assert!(err.contains(&path.display().to_string()), "{err}");
@@ -4084,7 +4095,8 @@ mod tests {
 
     #[test]
     fn the_namespace_resolve_command_parses() {
-        let cli = Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
+        let cli =
+            Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
         match cli.command {
             Some(Commands::Namespace { action }) => {
                 assert_eq!(action, NamespaceCommands::Resolve { dir: None })
@@ -4095,7 +4107,12 @@ mod tests {
             .expect("parses with a dir");
         match cli.command {
             Some(Commands::Namespace { action }) => {
-                assert_eq!(action, NamespaceCommands::Resolve { dir: Some("some/dir".into()) })
+                assert_eq!(
+                    action,
+                    NamespaceCommands::Resolve {
+                        dir: Some("some/dir".into())
+                    }
+                )
             }
             other => panic!("expected Namespace/Resolve, got {:?}", other),
         }
@@ -6398,8 +6415,10 @@ async fn run() -> anyhow::Result<()> {
                 };
                 let configs = &resolved.configs;
                 if configs.iter().any(|(_, ns)| *ns != configs[0].1) {
-                    let listed: Vec<String> =
-                        configs.iter().map(|(harness, ns)| format!("{harness}={ns}")).collect();
+                    let listed: Vec<String> = configs
+                        .iter()
+                        .map(|(harness, ns)| format!("{harness}={ns}"))
+                        .collect();
                     eprintln!(
                         "warning: harness configs name different namespaces ({}); using {}",
                         listed.join(", "),
@@ -6451,7 +6470,9 @@ async fn run() -> anyhow::Result<()> {
                 let bindings = root_show_bindings();
                 println!(
                     "{}",
-                    crate::root_marker::format_root_show(&folder, &found, &namespace, &cached, &bindings)
+                    crate::root_marker::format_root_show(
+                        &folder, &found, &namespace, &cached, &bindings
+                    )
                 );
             }
         }
@@ -7650,16 +7671,15 @@ async fn run() -> anyhow::Result<()> {
                             // explicit source (a harness config or
                             // NEUROSTRATA_NAMESPACE), never the ledger or the
                             // folder name; each config keeps its own.
-                            let explicit =
-                                match crate::task::harness_plugins::namespace_for_refresh(
-                                    &root, true,
-                                ) {
-                                    Ok(ns) => ns,
-                                    Err(e) => {
-                                        eprintln!("warning: harness configs left as they are: {e}");
-                                        None
-                                    }
-                                };
+                            let explicit = match crate::task::harness_plugins::namespace_for_refresh(
+                                &root, true,
+                            ) {
+                                Ok(ns) => ns,
+                                Err(e) => {
+                                    eprintln!("warning: harness configs left as they are: {e}");
+                                    None
+                                }
+                            };
                             let _ = crate::task::harness_plugins::auto_install_detected_plugins(
                                 &root,
                                 crate::task::harness_plugins::ConfigNamespace::Keep(
