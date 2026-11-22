@@ -1022,7 +1022,7 @@ mod tests {
         let _ = SystemGit.git(&dir, &["merge", "-q", "right"]);
         write(&dir, "sub/f.rs", "fixed\n");
         git(&dir, &["add", "-A"]);
-        git(&dir, &["commit", "-q", "--no-edit"]);
+        git(&dir, &["commit", "-q", "-m", "merge fix"]);
         let sha = git(&dir, &["rev-parse", "HEAD"]);
         let got = namespaces_for_push(&dir, &new_branch(&sha, "merged")).unwrap();
         assert_eq!(got, set(&["proj", "sub-ns"]));
