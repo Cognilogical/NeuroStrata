@@ -2373,7 +2373,10 @@ enum CliReadStore {
 /// The read source for the `root` commands, or why there is none.
 async fn open_cli_read_store(probe: DaemonProbe) -> Result<CliReadStore, String> {
     if probe == DaemonProbe::Responsive {
-        gate_verify_daemon(fetch_daemon_info().await.as_ref(), daemon::exe_fingerprint())?;
+        gate_verify_daemon(
+            fetch_daemon_info().await.as_ref(),
+            daemon::exe_fingerprint(),
+        )?;
         return Ok(CliReadStore::Daemon);
     }
     let config = Config::load().map_err(|e| format!("the config could not be read: {e}"))?;
@@ -2423,10 +2426,12 @@ async fn open_cli_read_store(probe: DaemonProbe) -> Result<CliReadStore, String>
     // retention count; skip the open when it would remove one.
     let keep = LadybugStore::configured_snapshot_retention_count().max(1);
     if crate::storage::snapshot::list_wal_recovery_artifacts(&config.db_path).len() > keep {
-        return Err("opening the store would prune old write-ahead-log recovery copies".to_string());
+        return Err(
+            "opening the store would prune old write-ahead-log recovery copies".to_string(),
+        );
     }
-    let dimensions = embed::configured_dimensions()
-        .map_err(|e| format!("the store could not be read: {e}"))?;
+    let dimensions =
+        embed::configured_dimensions().map_err(|e| format!("the store could not be read: {e}"))?;
     let store = LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
         .map_err(|e| format!("the store could not be read: {e}"))?;
     Ok(CliReadStore::Direct(Arc::new(store), lock))
@@ -2447,7 +2452,9 @@ async fn cli_read_op(
     if !res.status().is_success() {
         return Err(format!("the daemon answered {} on /cli/read", res.status()));
     }
-    res.json::<serde_json::Value>().await.map_err(|e| e.to_string())
+    res.json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The registry's cached root for `root show`, read from [`open_cli_read_store`].
@@ -2531,7 +2538,10 @@ impl crate::root_marker::RootRegistry for DaemonRootRegistry {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            return Err(format!("the daemon answered {status} on /cli/root: {}", body.trim()));
+            return Err(format!(
+                "the daemon answered {status} on /cli/root: {}",
+                body.trim()
+            ));
         }
         match res.json::<serde_json::Value>().await {
             Ok(v) if v["ok"].as_bool() == Some(true) => Ok(()),
@@ -2541,13 +2551,36 @@ impl crate::root_marker::RootRegistry for DaemonRootRegistry {
     }
 }
 
+/// Opens a store the CLI itself writes when no daemon answers. `new()` alone
+/// does not create the `Memory` table, so `init()` must run before the store
+/// is exposed through [`crate::root_marker::StoreRegistry`]: its first
+/// `cached_root()` calls `get()`, which executes `MATCH (m:Memory)`.
+async fn prepare_direct_write_store(
+    db_path: &std::path::Path,
+    namespace: &str,
+) -> Result<LadybugStore, String> {
+    let dimensions = embed::configured_dimensions()
+        .map_err(|e| format!("the store could not be opened: {e}"))?;
+    let store = LadybugStore::new(db_path.to_string_lossy().to_string(), dimensions)
+        .map_err(|e| format!("the store could not be opened: {e}"))?;
+    store
+        .init(namespace)
+        .await
+        .map_err(|e| format!("the store could not be initialized: {e}"))?;
+    Ok(store)
+}
+
 /// The registry the marker writers (`root set`, `hooks install`) use: the
 /// answering daemon, else the store opened here. Never starts a daemon.
 async fn open_cli_root_registry(
     probe: DaemonProbe,
+    namespace: &str,
 ) -> Result<Box<dyn crate::root_marker::RootRegistry>, String> {
     if probe == DaemonProbe::Responsive {
-        gate_verify_daemon(fetch_daemon_info().await.as_ref(), daemon::exe_fingerprint())?;
+        gate_verify_daemon(
+            fetch_daemon_info().await.as_ref(),
+            daemon::exe_fingerprint(),
+        )?;
         return Ok(Box::new(DaemonRootRegistry));
     }
     let config = Config::load().map_err(|e| format!("the config could not be read: {e}"))?;
@@ -2560,10 +2593,7 @@ async fn open_cli_root_registry(
                 .to_string(),
         );
     }
-    let dimensions = embed::configured_dimensions()
-        .map_err(|e| format!("the store could not be opened: {e}"))?;
-    let store = LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
-        .map_err(|e| format!("the store could not be opened: {e}"))?;
+    let store = prepare_direct_write_store(&config.db_path, namespace).await?;
     Ok(Box::new(crate::root_marker::StoreRegistry {
         store: Arc::new(store),
         emb: embed::build_embedder().ok(),
@@ -2573,7 +2603,7 @@ async fn open_cli_root_registry(
 
 /// `root set`: the file work here, the cache through the daemon or the store.
 async fn run_root_set(args: &crate::root_marker::RootSetArgs) -> Result<Vec<String>, String> {
-    let registry = open_cli_root_registry(probe_daemon().await).await?;
+    let registry = open_cli_root_registry(probe_daemon().await, &args.namespace).await?;
     let result = crate::root_marker::root_set_with(registry.as_ref(), args, None).await;
     registry.finish().await;
     result
@@ -2616,10 +2646,15 @@ where
     // top's) whose namespace is not the one being installed, or whose
     // checkout top belongs to another namespace: the hooks are the checkout
     // top's, so the caller is sent there (replacing a marker would not help).
-    if let (Ok(ns), Ok(Some(split))) = (&namespace, crate::root_marker::find_root_marker(caller_dir)) {
+    if let (Ok(ns), Ok(Some(split))) =
+        (&namespace, crate::root_marker::find_root_marker(caller_dir))
+    {
         // `relative_to_on_disk` answers only for a folder strictly below.
-        let deeper =
-            crate::paths::relative_to_on_disk(&split.root.to_string_lossy(), &root.to_string_lossy()).is_some();
+        let deeper = crate::paths::relative_to_on_disk(
+            &split.root.to_string_lossy(),
+            &root.to_string_lossy(),
+        )
+        .is_some();
         let top_is_other = matches!(
             crate::root_marker::find_root_marker(root),
             Ok(Some(top)) if !top.config.namespace.eq_ignore_ascii_case(ns)
@@ -2641,12 +2676,21 @@ where
     }
     let chosen: Option<String> = namespace.as_ref().ok().cloned();
     let (message, marker_root, failed) = match namespace {
-        Err(candidates) => (SetupMarker::AskNamespace(candidates).message("", root), None, false),
+        Err(candidates) => (
+            SetupMarker::AskNamespace(candidates).message("", root),
+            None,
+            false,
+        ),
         Ok(ns) => match open_registry().await {
-            Err(why) => (Some(format!("No .NeuroStrata/config.json written: {why}.")), None, false),
+            Err(why) => (
+                Some(format!("No .NeuroStrata/config.json written: {why}.")),
+                None,
+                false,
+            ),
             Ok(registry) => {
                 let outcome =
-                    crate::root_marker::ensure_marker_with(registry.as_ref(), root, Some(&ns)).await;
+                    crate::root_marker::ensure_marker_with(registry.as_ref(), root, Some(&ns))
+                        .await;
                 registry.finish().await;
                 if !outcome.installs_plugins() {
                     report.err.extend(outcome.message(&ns, root));
@@ -2675,17 +2719,24 @@ where
                 (Some(ns), true, _) => ConfigNamespace::Set(ns),
                 (Some(ns), false, true) => ConfigNamespace::Keep(Some(ns)),
                 _ => {
-                    refreshed = match crate::task::harness_plugins::namespace_for_refresh(root, true) {
-                        Ok(ns) => ns,
-                        Err(e) => {
-                            report.err.push(format!("warning: harness configs left as they are: {e}"));
-                            None
-                        }
-                    };
+                    refreshed =
+                        match crate::task::harness_plugins::namespace_for_refresh(root, true) {
+                            Ok(ns) => ns,
+                            Err(e) => {
+                                report.err.push(format!(
+                                    "warning: harness configs left as they are: {e}"
+                                ));
+                                None
+                            }
+                        };
                     ConfigNamespace::Keep(refreshed.as_deref())
                 }
             };
-            let _ = crate::task::harness_plugins::auto_install_detected_plugins(root, config_namespace, None);
+            let _ = crate::task::harness_plugins::auto_install_detected_plugins(
+                root,
+                config_namespace,
+                None,
+            );
             report.out.push(format!(
                 "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
                 target.display()
@@ -2696,9 +2747,11 @@ where
             } else {
                 report.out.extend(message);
             }
-            report
-                .out
-                .extend(marker_root.as_deref().and_then(crate::root_marker::commit_advice));
+            report.out.extend(
+                marker_root
+                    .as_deref()
+                    .and_then(crate::root_marker::commit_advice),
+            );
         }
         Err(e) => {
             report.err.extend(message);
@@ -2789,8 +2842,8 @@ async fn run_root_audit(
     // A config that cannot be read is an error: dropping its bindings would
     // turn refs bound to another root into fixable rows. A missing one has
     // no bindings.
-    let bindings =
-        root_show_bindings().map_err(|e| anyhow::anyhow!("root audit cannot read the config: {e}"))?;
+    let bindings = root_show_bindings()
+        .map_err(|e| anyhow::anyhow!("root audit cannot read the config: {e}"))?;
     let report = match source {
         CliReadStore::Daemon => {
             let v = cli_read_op(
@@ -2800,11 +2853,23 @@ async fn run_root_audit(
             .await
             .map_err(|e| anyhow::anyhow!("root audit cannot read the store: daemon: {e}"))?;
             let rows: Vec<crate::traits::SearchResult> = serde_json::from_value(v["rows"].clone())?;
-            crate::root_audit::audit_rows_for(&rows, &namespace, &root, planned.as_deref(), &bindings)
+            crate::root_audit::audit_rows_for(
+                &rows,
+                &namespace,
+                &root,
+                planned.as_deref(),
+                &bindings,
+            )
         }
         CliReadStore::Direct(store, _lock) => {
-            crate::root_audit::audit_namespace(&store, &namespace, &root, planned.as_deref(), &bindings)
-                .await?
+            crate::root_audit::audit_namespace(
+                &store,
+                &namespace,
+                &root,
+                planned.as_deref(),
+                &bindings,
+            )
+            .await?
         }
     };
     if json {
@@ -3436,6 +3501,32 @@ async fn run_list(read: &ReadSource, namespace: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn direct_write_store_is_initialized_before_registry_access() {
+        let tmp = std::env::temp_dir().join(format!("ns-direct-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("fresh.db");
+        {
+            let store = LadybugStore::new(db.to_string_lossy().to_string(), 4).unwrap();
+            let arc: Arc<dyn VectorStore> = Arc::new(store);
+            assert!(
+                crate::registry::cached_project_root(&arc, "probe")
+                    .await
+                    .is_err(),
+                "a fresh store has no Memory table until init runs"
+            );
+        }
+        let store = prepare_direct_write_store(&db, "probe").await.unwrap();
+        let arc: Arc<dyn VectorStore> = Arc::new(store);
+        assert!(
+            crate::registry::cached_project_root(&arc, "probe")
+                .await
+                .is_ok(),
+            "init creates the Memory table the registry reads"
+        );
+    }
 
     #[test]
     fn copy_snapshot_into_place_is_failure_atomic_and_cleans_up_on_error() {
@@ -4460,7 +4551,11 @@ mod tests {
         }
 
         let cli = Cli::try_parse_from([
-            "neurostrata-mcp", "hooks", "install", "--namespace", "example-project",
+            "neurostrata-mcp",
+            "hooks",
+            "install",
+            "--namespace",
+            "example-project",
         ])
         .expect("hooks install parses --namespace");
         match cli.command {
@@ -4474,8 +4569,16 @@ mod tests {
     #[test]
     fn root_set_command_parses() {
         let cli = Cli::try_parse_from([
-            "neurostrata-mcp", "root", "set", "some/dir", "--namespace", "example-project",
-            "--source-id", "example-src", "--replace", "--force",
+            "neurostrata-mcp",
+            "root",
+            "set",
+            "some/dir",
+            "--namespace",
+            "example-project",
+            "--source-id",
+            "example-src",
+            "--replace",
+            "--force",
         ])
         .expect("parses");
         match cli.command {
@@ -4505,7 +4608,12 @@ mod tests {
             .expect("parses with a dir");
         match cli.command {
             Some(Commands::Root { action }) => {
-                assert_eq!(action, RootCommands::Show { dir: Some("some/dir".into()) })
+                assert_eq!(
+                    action,
+                    RootCommands::Show {
+                        dir: Some("some/dir".into())
+                    }
+                )
             }
             other => panic!("expected Root/Show, got {:?}", other),
         }
@@ -4515,7 +4623,10 @@ mod tests {
     fn root_show_bindings_missing_config_is_none_unreadable_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.json");
-        assert_eq!(root_show_bindings_from(&path), Ok(std::collections::HashMap::new()));
+        assert_eq!(
+            root_show_bindings_from(&path),
+            Ok(std::collections::HashMap::new())
+        );
         std::fs::write(&path, b"{ not json").unwrap();
         let err = root_show_bindings_from(&path).unwrap_err();
         assert!(err.contains(&path.display().to_string()), "{err}");
@@ -4527,12 +4638,23 @@ mod tests {
         match cli.command {
             Some(Commands::Root { action }) => assert_eq!(
                 action,
-                RootCommands::Audit { dir: None, namespace: None, for_root: None, json: false }
+                RootCommands::Audit {
+                    dir: None,
+                    namespace: None,
+                    for_root: None,
+                    json: false
+                }
             ),
             other => panic!("expected Root/Audit, got {:?}", other),
         }
         let cli = Cli::try_parse_from([
-            "neurostrata-mcp", "root", "audit", "some/dir", "--namespace", "example-project", "--json",
+            "neurostrata-mcp",
+            "root",
+            "audit",
+            "some/dir",
+            "--namespace",
+            "example-project",
+            "--json",
         ])
         .expect("parses with a dir, a namespace and --json");
         match cli.command {
@@ -4552,7 +4674,12 @@ mod tests {
         match cli.command {
             Some(Commands::Root { action }) => assert_eq!(
                 action,
-                RootCommands::Audit { dir: None, namespace: None, for_root: Some("/repo".into()), json: false }
+                RootCommands::Audit {
+                    dir: None,
+                    namespace: None,
+                    for_root: Some("/repo".into()),
+                    json: false
+                }
             ),
             other => panic!("expected Root/Audit, got {:?}", other),
         }
@@ -4560,7 +4687,8 @@ mod tests {
 
     #[test]
     fn the_namespace_resolve_command_parses() {
-        let cli = Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
+        let cli =
+            Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
         match cli.command {
             Some(Commands::Namespace { action }) => {
                 assert_eq!(action, NamespaceCommands::Resolve { dir: None })
@@ -4571,7 +4699,12 @@ mod tests {
             .expect("parses with a dir");
         match cli.command {
             Some(Commands::Namespace { action }) => {
-                assert_eq!(action, NamespaceCommands::Resolve { dir: Some("some/dir".into()) })
+                assert_eq!(
+                    action,
+                    NamespaceCommands::Resolve {
+                        dir: Some("some/dir".into())
+                    }
+                )
             }
             other => panic!("expected Namespace/Resolve, got {:?}", other),
         }
@@ -6337,9 +6470,20 @@ mod tests {
     fn hooks_repo(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
         let root = dunce::canonicalize(tmp.path()).unwrap().join(name);
         std::fs::create_dir_all(&root).unwrap();
-        for args in [&["init", "-q"][..], &["config", "core.hooksPath", ".git/hooks"][..]] {
-            let out = std::process::Command::new("git").args(args).current_dir(&root).output().unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        for args in [
+            &["init", "-q"][..],
+            &["config", "core.hooksPath", ".git/hooks"][..],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         root
     }
@@ -6370,13 +6514,23 @@ mod tests {
         })
         .await;
         assert_eq!(report.code, 0, "{report:?}");
-        assert!(root.join(".git").join("hooks").join("pre-push").is_file(), "{report:?}");
         assert!(
-            report.out.iter().any(|l| l.contains("hooks install --namespace <ns>") && l.contains("example-project")),
+            root.join(".git").join("hooks").join("pre-push").is_file(),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .out
+                .iter()
+                .any(|l| l.contains("hooks install --namespace <ns>")
+                    && l.contains("example-project")),
             "{report:?}"
         );
         assert!(!marker_file(&root).exists());
-        assert!(!opened.load(std::sync::atomic::Ordering::SeqCst), "no registry needed to ask");
+        assert!(
+            !opened.load(std::sync::atomic::Ordering::SeqCst),
+            "no registry needed to ask"
+        );
     }
 
     #[tokio::test]
@@ -6389,14 +6543,21 @@ mod tests {
         // The daemon's hook refresh on a clone with only a folder name to go on.
         crate::task::hook_hygiene(&root);
         assert_eq!(
-            crate::task::harness_plugins::resolve_namespace(&root).expect("resolves").configs,
+            crate::task::harness_plugins::resolve_namespace(&root)
+                .expect("resolves")
+                .configs,
             Vec::<(String, String)>::new(),
             "no harness config may carry the folder name"
         );
-        let report = run_hooks_install(&root, &root, false, None, || async { Ok(mock_registry()) }).await;
+        let report =
+            run_hooks_install(&root, &root, false, None, || async { Ok(mock_registry()) }).await;
         assert_eq!(report.code, 0, "{report:?}");
         assert!(
-            report.out.iter().any(|l| l.contains("hooks install --namespace <ns>") && l.contains("example-project")),
+            report
+                .out
+                .iter()
+                .any(|l| l.contains("hooks install --namespace <ns>")
+                    && l.contains("example-project")),
             "{report:?}"
         );
         assert!(!marker_file(&root).exists(), "{report:?}");
@@ -6407,11 +6568,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = hooks_repo(&tmp, "example-project");
         std::fs::create_dir_all(root.join(".NeuroStrata")).unwrap();
-        std::fs::write(marker_file(&root), br#"{"version":1,"namespace":"other-project"}"#).unwrap();
-        let report =
-            run_hooks_install(&root, &root, false, Some("example-project"), || async { Ok(mock_registry()) }).await;
+        std::fs::write(
+            marker_file(&root),
+            br#"{"version":1,"namespace":"other-project"}"#,
+        )
+        .unwrap();
+        let report = run_hooks_install(&root, &root, false, Some("example-project"), || async {
+            Ok(mock_registry())
+        })
+        .await;
         assert_eq!(report.code, 1, "{report:?}");
-        assert!(report.err.iter().any(|l| l.contains("other-project")), "{report:?}");
+        assert!(
+            report.err.iter().any(|l| l.contains("other-project")),
+            "{report:?}"
+        );
         assert!(report.out.is_empty(), "{report:?}");
         assert!(!root.join(".git").join("hooks").join("pre-push").exists());
         assert!(!root.join(".git").join("hooks").join("pre-commit").exists());
@@ -6457,16 +6627,29 @@ mod tests {
         let root = hooks_repo(&tmp, "example-project");
         std::fs::create_dir_all(root.join(".claude")).unwrap();
         for run in 1..=2 {
-            let report = run_hooks_install(&root, &root, false, None, || async { Ok(mock_registry()) }).await;
+            let report =
+                run_hooks_install(&root, &root, false, None, || async { Ok(mock_registry()) })
+                    .await;
             assert_eq!(report.code, 0, "run {run}: {report:?}");
             assert!(
-                report.out.iter().any(|l| l.contains("hooks install --namespace <ns>")),
+                report
+                    .out
+                    .iter()
+                    .any(|l| l.contains("hooks install --namespace <ns>")),
                 "run {run}: {report:?}"
             );
             assert!(!marker_file(&root).exists(), "run {run}: {report:?}");
-            assert_eq!(harness_config_namespaces(&root), Vec::<(String, String)>::new(), "run {run}");
+            assert_eq!(
+                harness_config_namespaces(&root),
+                Vec::<(String, String)>::new(),
+                "run {run}"
+            );
         }
-        assert!(root.join(".NeuroStrata").join("plugins").join("claude").exists());
+        assert!(root
+            .join(".NeuroStrata")
+            .join("plugins")
+            .join("claude")
+            .exists());
     }
 
     /// `--namespace` is the plugins' namespace too, even when the marker
@@ -6486,7 +6669,10 @@ mod tests {
         assert!(!marker_file(&root).exists());
         let configs = harness_config_namespaces(&root);
         assert!(!configs.is_empty(), "{report:?}");
-        assert!(configs.iter().all(|(_, ns)| ns == "team-project"), "{configs:?}");
+        assert!(
+            configs.iter().all(|(_, ns)| ns == "team-project"),
+            "{configs:?}"
+        );
     }
 
     /// The marker is written but the cached root cannot be set: the hooks
@@ -6506,7 +6692,10 @@ mod tests {
         assert_eq!(report.code, 1, "{report:?}");
         assert!(root.join(".git").join("hooks").join("pre-push").is_file());
         assert!(marker_file(&root).is_file());
-        assert!(report.err.iter().any(|l| l.contains("could not be set")), "{report:?}");
+        assert!(
+            report.err.iter().any(|l| l.contains("could not be set")),
+            "{report:?}"
+        );
     }
 
     /// Run inside a split subfolder of another namespace, `hooks install`
@@ -6521,14 +6710,23 @@ mod tests {
         let api = root.join("api");
         for (dir, ns) in [(&root, "outer-project"), (&api, "inner-project")] {
             std::fs::create_dir_all(dir.join(".NeuroStrata")).unwrap();
-            std::fs::write(marker_file(dir), format!(r#"{{"version":1,"namespace":"{ns}"}}"#)).unwrap();
+            std::fs::write(
+                marker_file(dir),
+                format!(r#"{{"version":1,"namespace":"{ns}"}}"#),
+            )
+            .unwrap();
         }
         for namespace in [Some("outer-project"), None, Some("inner-project")] {
-            let report =
-                run_hooks_install(&root, &api, false, namespace, || async { Ok(mock_registry()) }).await;
+            let report = run_hooks_install(&root, &api, false, namespace, || async {
+                Ok(mock_registry())
+            })
+            .await;
             assert_eq!(report.code, 1, "{namespace:?}: {report:?}");
             let text = report.err.join("\n");
-            assert!(text.contains("inner-project") && text.contains("split"), "{text}");
+            assert!(
+                text.contains("inner-project") && text.contains("split"),
+                "{text}"
+            );
             assert!(!text.contains("--replace"), "{text}");
             assert!(!root.join(".git").join("hooks").join("pre-push").exists());
         }
@@ -6542,14 +6740,22 @@ mod tests {
     async fn hooks_install_with_namespace_writes_marker_and_hooks() {
         let tmp = tempfile::tempdir().unwrap();
         let root = hooks_repo(&tmp, "example-project");
-        let report =
-            run_hooks_install(&root, &root, false, Some("example-project"), || async { Ok(mock_registry()) }).await;
+        let report = run_hooks_install(&root, &root, false, Some("example-project"), || async {
+            Ok(mock_registry())
+        })
+        .await;
         assert_eq!(report.code, 0, "{report:?}");
         assert!(root.join(".git").join("hooks").join("pre-push").is_file());
         assert!(marker_file(&root).is_file());
-        assert!(report.out.iter().any(|l| l.starts_with("Wrote ")), "{report:?}");
+        assert!(
+            report.out.iter().any(|l| l.starts_with("Wrote ")),
+            "{report:?}"
+        );
         // The file is neither committed nor ignored: one line suggests either.
-        assert!(report.out.iter().any(|l| l.contains(".gitignore")), "{report:?}");
+        assert!(
+            report.out.iter().any(|l| l.contains(".gitignore")),
+            "{report:?}"
+        );
     }
 }
 
@@ -7088,8 +7294,10 @@ async fn run() -> anyhow::Result<()> {
                 if resolved.source != crate::task::harness_plugins::NamespaceSource::Marker
                     && configs.iter().any(|(_, ns)| *ns != configs[0].1)
                 {
-                    let listed: Vec<String> =
-                        configs.iter().map(|(harness, ns)| format!("{harness}={ns}")).collect();
+                    let listed: Vec<String> = configs
+                        .iter()
+                        .map(|(harness, ns)| format!("{harness}={ns}"))
+                        .collect();
                     eprintln!(
                         "warning: harness configs name different namespaces ({}); using {}",
                         listed.join(", "),
@@ -7143,17 +7351,31 @@ async fn run() -> anyhow::Result<()> {
                 let bindings = root_show_bindings();
                 println!(
                     "{}",
-                    crate::root_marker::format_root_show(&folder, &found, &namespace, &cached, &bindings)
+                    crate::root_marker::format_root_show(
+                        &folder, &found, &namespace, &cached, &bindings
+                    )
                 );
             }
-            RootCommands::Audit { dir, namespace, for_root, json } => {
+            RootCommands::Audit {
+                dir,
+                namespace,
+                for_root,
+                json,
+            } => {
                 let code =
-                    run_root_audit(dir.as_ref(), namespace.as_deref(), for_root.as_ref(), *json).await?;
+                    run_root_audit(dir.as_ref(), namespace.as_deref(), for_root.as_ref(), *json)
+                        .await?;
                 if code != 0 {
                     std::process::exit(code);
                 }
             }
-            RootCommands::Set { dir, namespace, source_id, replace, force } => {
+            RootCommands::Set {
+                dir,
+                namespace,
+                source_id,
+                replace,
+                force,
+            } => {
                 let cwd = std::env::current_dir()?;
                 let args = crate::root_marker::RootSetArgs {
                     dir: cwd.join(dir),
@@ -8365,9 +8587,19 @@ async fn run() -> anyhow::Result<()> {
                     }
                     let caller_dir = std::env::current_dir().unwrap_or_else(|_| root.clone());
                     let caller_dir = dunce::canonicalize(&caller_dir).unwrap_or(caller_dir);
-                    let report = run_hooks_install(&root, &caller_dir, force, namespace.as_deref(), || async {
-                        open_cli_root_registry(probe_daemon().await).await
-                    })
+                    let report = run_hooks_install(
+                        &root,
+                        &caller_dir,
+                        force,
+                        namespace.as_deref(),
+                        || async {
+                            open_cli_root_registry(
+                                probe_daemon().await,
+                                namespace.as_deref().unwrap_or(""),
+                            )
+                            .await
+                        },
+                    )
                     .await;
                     for line in &report.out {
                         println!("{line}");
