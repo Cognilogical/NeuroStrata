@@ -342,20 +342,6 @@ fn plugin_location_suffix(abs_runner: &str) -> Option<String> {
     Some(parts[idx..].join("/").to_ascii_lowercase())
 }
 
-/// Rewrite only the path of an installer-generated runner command. A command
-/// shaped `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"` whose runner basename
-/// matches the installer's runner, and whose runner is the installer's own or
-/// is missing, is ours to repair. A custom hook that merely carries the
-/// namespace environment variable, or runs a `cli-hook.mjs` installed
-/// elsewhere, is left untouched.
-fn repair_installer_hook_command(
-    command: &str,
-    abs_runner: &str,
-    project_root: &Path,
-) -> Option<(Option<String>, String)> {
-    installer_hook_parts(command, abs_runner, project_root)
-}
-
 /// A Claude hook command the installer wrote, `node "<runner>"`, or an older
 /// installer's `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"`, whose runner
 /// basename matches the installer's runner and whose runner is the
