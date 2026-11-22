@@ -6070,7 +6070,7 @@ mod tests {
         let scratch =
             std::env::temp_dir().join(format!("ns-scratch-hint-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&scratch).unwrap();
-        assert!(!has_worktree_marker(&scratch));
+        assert_eq!(walk_to_worktree_marker(&scratch), None);
         let worktree =
             std::env::temp_dir().join(format!("ns-real-worktree-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(worktree.join(".git")).unwrap();
