@@ -598,10 +598,11 @@ impl NamespaceRoots {
 /// 1. a harness config (the first in the fixed order), read from the first
 ///    of `dir`'s checkout, its main checkout, or (outside git) `dir` itself
 ///    that has any;
-/// 2. `env_namespace` (`NEUROSTRATA_NAMESPACE`), when usable;
-/// 3. the `namespace` field of the graph-lookup ledger
+/// 2. a project marker (`.NeuroStrata/config.json`), from the same roots;
+/// 3. `env_namespace` (`NEUROSTRATA_NAMESPACE`), when usable;
+/// 4. the `namespace` field of the graph-lookup ledger
 ///    (`.NeuroStrata/session_queries.json`), the main checkout's then `dir`'s;
-/// 4. the main checkout's folder name; outside git, `dir`'s folder name, when
+/// 5. the main checkout's folder name; outside git, `dir`'s folder name, when
 ///    it is a usable namespace.
 ///
 /// A harness config that exists but cannot be read is an error, never
@@ -621,6 +622,22 @@ fn resolve_namespace_from(
     };
     if let Some((_, ns)) = configs.first() {
         return Ok(resolved(ns.clone(), NamespaceSource::HarnessConfig));
+    }
+    // The project marker is an explicit answer too: a project can name its
+    // namespace in `.NeuroStrata/config.json` without any harness config.
+    for root in roots.config_order() {
+        let marker = root.join(".NeuroStrata").join("config.json");
+        if let Some(ns) = std::fs::read_to_string(marker)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|v| {
+                v.get("namespace")
+                    .and_then(Value::as_str)
+                    .and_then(usable_namespace)
+            })
+        {
+            return Ok(resolved(ns, NamespaceSource::Marker));
+        }
     }
     if let Some(ns) = env_namespace.and_then(usable_env_namespace) {
         return Ok(resolved(ns, NamespaceSource::Env));
@@ -2849,5 +2866,23 @@ mod tests {
 
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640, "the original mode must survive the rename");
+    }
+
+    /// A project marker that names a namespace outranks the process
+    /// environment, even when no harness config names one.
+    #[test]
+    fn project_marker_namespace_beats_environment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        write_file(
+            &dir.join(".NeuroStrata/config.json"),
+            r#"{"namespace":"from-marker"}"#,
+        );
+        let got = resolve_namespace_from(&dir, Some("from-env")).expect("resolves");
+        assert_eq!(got.namespace, "from-marker");
+        assert_eq!(got.source, NamespaceSource::Marker);
     }
 }
