@@ -2198,15 +2198,13 @@ async fn _with_watch(
                             let followed_hint = args_ref
                                 .and_then(|a| a.get("followed_trigger_id"))
                                 .and_then(Value::as_str);
-                            if let Some((proof_id, followed_trigger)) =
-                                mint_followed_action_id(
-                                    name,
-                                    fields.operation.as_str(),
-                                    args_ref,
-                                    followed_hint,
-                                    &ns,
-                                )
-                            {
+                            if let Some((proof_id, followed_trigger)) = mint_followed_action_id(
+                                name,
+                                fields.operation.as_str(),
+                                args_ref,
+                                followed_hint,
+                                &ns,
+                            ) {
                                 fields.followed_action_ids = vec![proof_id];
                                 if fields.trigger_id.trim().is_empty() {
                                     fields.trigger_id = followed_trigger;
@@ -2252,7 +2250,11 @@ async fn _with_watch(
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty());
                             crate::task::record_graph_query_with_root(
-                                &store, ns, name, hint, caller_root,
+                                &store,
+                                ns,
+                                name,
+                                hint,
+                                caller_root,
                             )
                             .await;
                         }
@@ -6893,19 +6895,21 @@ async fn handle_get_snapshot(
     // never counted or named. Tool diversity is read fail-soft from the session
     // ledger; no ledger means an honest 0, never a fabricated count.
     let (has_thesis, concept_statuses) = match crate::traits::VectorStore::as_any(store.as_ref())
-        .downcast_ref::<crate::store::ladybug::LadybugStore>()
-    {
+        .downcast_ref::<crate::store::ladybug::LadybugStore>(
+    ) {
         Some(ls) => crate::rdf::taxonomy::snapshot_taxonomy_readiness_view(ls, namespace).await,
         None => (false, Vec::new()),
     };
     let readiness_concepts: Vec<crate::task::snapshot_readiness::ReadinessConcept> =
         concept_statuses
             .into_iter()
-            .map(|(slug, epistemic_status)| crate::task::snapshot_readiness::ReadinessConcept {
-                slug,
-                restricted: false,
-                epistemic_status,
-            })
+            .map(
+                |(slug, epistemic_status)| crate::task::snapshot_readiness::ReadinessConcept {
+                    slug,
+                    restricted: false,
+                    epistemic_status,
+                },
+            )
             .collect();
     // Only work in flight may attract tool receipts; done/retired tasks must
     // not inflate diversity. Status mapping is the gate's own enum -> string.
@@ -6974,13 +6978,15 @@ async fn handle_get_snapshot(
         None => snapshot,
     };
 
-    Ok(match project_root
-        .as_deref()
-        .and_then(|root| crate::root_marker::root_hint(namespace, std::path::Path::new(root)))
-    {
-        Some(hint) => format!("{snapshot}\n{hint}"),
-        None => snapshot,
-    })
+    Ok(
+        match project_root
+            .as_deref()
+            .and_then(|root| crate::root_marker::root_hint(namespace, std::path::Path::new(root)))
+        {
+            Some(hint) => format!("{snapshot}\n{hint}"),
+            None => snapshot,
+        },
+    )
 }
 
 async fn handle_ingest_directory(
@@ -11410,11 +11416,7 @@ fn graph_expanded_ids_from_results(results: &[SearchResult]) -> Vec<String> {
 
 /// Append the response contract as one additive JSON line. Older report
 /// fields stay byte-identical; parsers that ignore unknown lines are unaffected.
-fn finalize_search_report(
-    report: String,
-    arguments: &Value,
-    results: &[SearchResult],
-) -> String {
+fn finalize_search_report(report: String, arguments: &Value, results: &[SearchResult]) -> String {
     let ids = graph_expanded_ids_from_results(results);
     crate::search::append_search_contract_line(report, arguments, ids)
 }
@@ -11427,7 +11429,11 @@ async fn handle_search_memory(
     let query = match arguments.get("query").and_then(|q| q.as_str()) {
         Some(q) => q,
         None => {
-            return finalize_search_report("Missing 'query' parameter.".to_string(), &arguments, &[])
+            return finalize_search_report(
+                "Missing 'query' parameter.".to_string(),
+                &arguments,
+                &[],
+            )
         }
     };
     let namespace = match arguments.get("namespace").and_then(|n| n.as_str()) {
@@ -15737,6 +15743,721 @@ mod tests {
             text.contains("lexical-inhouse"),
             "the derivation is visible: {text}"
         );
+    }
+
+    /// #363: provenance must retire with the edge it cites. Removing the last
+    /// WikiLink deletes the stored edge; an `edge_sources` entry left behind
+    /// would keep citing the deleted relationship to `include_references`.
+    #[tokio::test]
+    async fn removed_wikilink_retires_edge_source_provenance() {
+        use crate::vault_ld::vault_sync::{import_vault, VaultSyncConfig};
+        use crate::vault_ld::{VaultNote, YAML_LD_CONTEXT};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let vault = root.path().join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vault_edge_provenance";
+        store.init(ns).await.expect("init");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.path().to_path_buf()),
+            allowed_external_dirs: None,
+        };
+
+        let make_note = |id: &str, related: &[&str], content: &str| {
+            let mut note = VaultNote {
+                id: id.to_string(),
+                rdf_type: "yaml:fact".to_string(),
+                context: YAML_LD_CONTEXT.to_string(),
+                epistemic_tier: "fact".to_string(),
+                canonical_sha256: String::new(),
+                related: related.iter().map(|s| s.to_string()).collect(),
+                content: content.to_string(),
+            };
+            note.canonical_sha256 = note.fingerprint();
+            note
+        };
+        let declarer = "provenance-declarer";
+        let target = "provenance-target";
+        let mut a = make_note(declarer, &[target], "provenanceprobe linker body");
+        let b = make_note(target, &[], "target body");
+        std::fs::write(vault.join(format!("{declarer}.md")), a.to_markdown()).expect("write a");
+        std::fs::write(vault.join(format!("{target}.md")), b.to_markdown()).expect("write b");
+
+        import_vault(config.clone(), store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("first import");
+
+        let refs_for = |out: &str| -> Vec<serde_json::Value> {
+            out.lines()
+                .find_map(|line| line.strip_prefix("edge_references: "))
+                .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+                .unwrap_or_default()
+        };
+        let cites_target = |refs: &[serde_json::Value]| {
+            refs.iter().any(|r| {
+                r["id"] == declarer
+                    && r["edge_sources"].as_array().is_some_and(|sources| {
+                        sources.iter().any(|s| s["resolved_target"] == target)
+                    })
+            })
+        };
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "provenanceprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            cites_target(&refs_for(&search_out)),
+            "control: the live edge must be cited: {search_out}"
+        );
+
+        // Remove the final WikiLink and reimport the changed note.
+        a.related.clear();
+        a.content = "provenanceprobe linker body without links".to_string();
+        a.canonical_sha256 = a.fingerprint();
+        std::fs::write(vault.join(format!("{declarer}.md")), a.to_markdown()).expect("rewrite a");
+        let second = import_vault(config, store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            !edges
+                .iter()
+                .any(|(from, rel, _, _)| from == declarer && rel == "RELATES_TO"),
+            "the removed link must retire its edge: {edges:?}"
+        );
+
+        let (_, head) = store
+            .get(ns, declarer)
+            .await
+            .expect("read declarer")
+            .expect("declarer exists");
+        let stale = head
+            .metadata
+            .get("edge_sources")
+            .and_then(|v| v.as_array())
+            .is_some_and(|sources| sources.iter().any(|s| s["resolved_target"] == target));
+        assert!(
+            !stale,
+            "provenance for the deleted edge must be retired: {:?}",
+            head.metadata
+        );
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "provenanceprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(
+            !cites_target(&refs_for(&search_out)),
+            "search must not cite the deleted relationship: {search_out}"
+        );
+    }
+
+    /// #363: an unchanged declarer rebound to a newly imported preferred id
+    /// keeps a citation for the live edge. The alias entry retires with its
+    /// edge; the replacement edge carries its own declaration provenance.
+    #[tokio::test]
+    async fn rebound_declaration_keeps_edge_source_provenance() {
+        use crate::vault_ld::vault_sync::{import_vault, VaultSyncConfig};
+        use crate::vault_ld::{VaultNote, YAML_LD_CONTEXT};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let vault = root.path().join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vaultprov";
+        store.init(ns).await.expect("init");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.path().to_path_buf()),
+            allowed_external_dirs: None,
+        };
+
+        let make_note = |id: &str, related: &[&str], content: &str| {
+            let mut note = VaultNote {
+                id: id.to_string(),
+                rdf_type: "yaml:fact".to_string(),
+                context: YAML_LD_CONTEXT.to_string(),
+                epistemic_tier: "fact".to_string(),
+                canonical_sha256: String::new(),
+                related: related.iter().map(|s| s.to_string()).collect(),
+                content: content.to_string(),
+            };
+            note.canonical_sha256 = note.fingerprint();
+            note
+        };
+        let preferred = format!("{ns}::z");
+        let linker = make_note("a", &[preferred.as_str()], "rebindprobe linker body");
+        let alias = make_note("z", &[], "body of the bare alias");
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write a");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write z");
+
+        let first = import_vault(config.clone(), store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        let targets = |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| {
+            edges
+                .iter()
+                .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+                .map(|(_, _, to, _)| to.clone())
+                .collect::<Vec<_>>()
+        };
+        let before_edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            targets(&before_edges),
+            vec!["z".to_string()],
+            "the first import binds the stored alias: {before_edges:?}"
+        );
+        let (_, before) = store
+            .get(ns, "a")
+            .await
+            .expect("read declarer")
+            .expect("declarer exists");
+
+        let literal = make_note(&preferred, &[], "body of the verbatim note");
+        std::fs::write(vault.join("preferred.md"), literal.to_markdown()).expect("write preferred");
+        let second = import_vault(config, store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(second.notes_imported, 1, "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges after rebind");
+        assert_eq!(
+            targets(&edges),
+            vec![preferred.clone()],
+            "the unchanged declarer must rebind its preferred target: {edges:?}"
+        );
+
+        let (_, after) = store
+            .get(ns, "a")
+            .await
+            .expect("read declarer after rebind")
+            .expect("declarer survives");
+        assert_eq!(
+            after.content, before.content,
+            "head content must not change"
+        );
+        assert_eq!(
+            after.metadata.get("canonical_sha256"),
+            before.metadata.get("canonical_sha256"),
+            "head identity must not change"
+        );
+        assert_eq!(
+            after.metadata.get("supersedes"),
+            None,
+            "an edge rebind must not supersede the head: {:?}",
+            after.metadata
+        );
+        let history_rows = store
+            .list(ns, None, None)
+            .await
+            .expect("list rows")
+            .into_iter()
+            .filter(|row| row.id.starts_with("a.vault-history."))
+            .count();
+        assert_eq!(history_rows, 0, "no history version may be created");
+
+        let sources = after.metadata["edge_sources"]
+            .as_array()
+            .expect("rebound declarer must carry provenance");
+        assert!(
+            sources.iter().any(|s| s["rel_type"] == "RELATES_TO"
+                && s["declared_target"] == preferred
+                && s["resolved_target"] == preferred
+                && s["extractor"] == "upsert"),
+            "the rebound edge must cite its declaration: {sources:?}"
+        );
+        assert!(
+            !sources
+                .iter()
+                .any(|s| s["rel_type"] == "RELATES_TO" && s["resolved_target"] == "z"),
+            "the retired alias citation must go: {sources:?}"
+        );
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "rebindprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let refs = search_out
+            .lines()
+            .find_map(|line| line.strip_prefix("edge_references: "))
+            .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+            .unwrap_or_default();
+        let cites = |target: &str| {
+            refs.iter().any(|r| {
+                r["id"] == "a"
+                    && r["edge_sources"].as_array().is_some_and(|sources| {
+                        sources.iter().any(|s| {
+                            s["rel_type"] == "RELATES_TO" && s["resolved_target"] == target
+                        })
+                    })
+            })
+        };
+        assert!(
+            cites(&preferred),
+            "search must cite the live rebound edge: {search_out}"
+        );
+        assert!(
+            !cites("z"),
+            "search must not cite the retired alias edge: {search_out}"
+        );
+    }
+
+    /// #363: a rebind replaces only the citation for the binding it rebinds.
+    /// The unchanged declarer keeps another live declaration to `c`, so the
+    /// replacement set must add `ns::z` and leave `c`'s provenance in place.
+    #[tokio::test]
+    async fn rebound_declaration_preserves_retained_edge_provenance() {
+        use crate::vault_ld::vault_sync::{import_vault, VaultSyncConfig};
+        use crate::vault_ld::{VaultNote, YAML_LD_CONTEXT};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let vault = root.path().join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vaultprovretain";
+        store.init(ns).await.expect("init");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.path().to_path_buf()),
+            allowed_external_dirs: None,
+        };
+
+        let make_note = |id: &str, related: &[&str], content: &str| {
+            let mut note = VaultNote {
+                id: id.to_string(),
+                rdf_type: "yaml:fact".to_string(),
+                context: YAML_LD_CONTEXT.to_string(),
+                epistemic_tier: "fact".to_string(),
+                canonical_sha256: String::new(),
+                related: related.iter().map(|s| s.to_string()).collect(),
+                content: content.to_string(),
+            };
+            note.canonical_sha256 = note.fingerprint();
+            note
+        };
+        let preferred = format!("{ns}::z");
+        let linker = make_note(
+            "a",
+            &["c", preferred.as_str()],
+            "keeprebindprobe linker body",
+        );
+        let retained = make_note("c", &[], "retained target body");
+        let alias = make_note("z", &[], "body of the bare alias");
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write a");
+        std::fs::write(vault.join("c.md"), retained.to_markdown()).expect("write c");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write z");
+
+        let first = import_vault(config.clone(), store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        let a_targets =
+            |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)]| {
+                edges
+                    .iter()
+                    .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+                    .map(|(_, _, to, _)| to.clone())
+                    .collect::<Vec<_>>()
+            };
+        let before_edges = store.list_edges(ns).await.expect("list edges");
+        let mut before = a_targets(&before_edges);
+        before.sort();
+        assert_eq!(before, vec!["c".to_string(), "z".to_string()]);
+
+        let literal = make_note(&preferred, &[], "body of the verbatim note");
+        std::fs::write(vault.join("preferred.md"), literal.to_markdown()).expect("write preferred");
+        let second = import_vault(config, store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(second.notes_imported, 1, "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges after rebind");
+        let mut after = a_targets(&edges);
+        after.sort();
+        assert_eq!(
+            after,
+            vec!["c".to_string(), preferred.clone()],
+            "the retained and rebound edges must both stay live: {edges:?}"
+        );
+
+        let (_, head) = store
+            .get(ns, "a")
+            .await
+            .expect("read declarer after rebind")
+            .expect("declarer survives");
+        let live_sources = |target: &str| {
+            head.metadata["edge_sources"]
+                .as_array()
+                .map(|sources| {
+                    sources
+                        .iter()
+                        .filter(|s| {
+                            s["rel_type"] == "RELATES_TO"
+                                && s["extractor"] == "upsert"
+                                && s["orientation"] == "self_to_target"
+                                && s["resolved_target"] == target
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(live_sources("c"), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources(&preferred), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources("z"), 0, "{:?}", head.metadata);
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "keeprebindprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let refs = search_out
+            .lines()
+            .find_map(|line| line.strip_prefix("edge_references: "))
+            .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+            .unwrap_or_default();
+        let cited = |target: &str| {
+            refs.iter().any(|r| {
+                r["id"] == "a"
+                    && r["edge_sources"].as_array().is_some_and(|sources| {
+                        sources.iter().any(|s| {
+                            s["rel_type"] == "RELATES_TO" && s["resolved_target"] == target
+                        })
+                    })
+            })
+        };
+        assert!(
+            cited("c"),
+            "search must cite the retained edge: {search_out}"
+        );
+        assert!(
+            cited(&preferred),
+            "search must cite the rebound edge: {search_out}"
+        );
+        assert!(
+            !cited("z"),
+            "search must not cite the alias edge: {search_out}"
+        );
+    }
+
+    /// #363: two declarations rebinding in one import must both keep a
+    /// citation. A per-iteration replace that drops earlier replacements
+    /// leaves only the last target cited.
+    #[tokio::test]
+    async fn multiple_rebound_declarations_accumulate_edge_provenance() {
+        use crate::vault_ld::vault_sync::{import_vault, VaultSyncConfig};
+        use crate::vault_ld::{VaultNote, YAML_LD_CONTEXT};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let vault = root.path().join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vaultprovmulti";
+        store.init(ns).await.expect("init");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.path().to_path_buf()),
+            allowed_external_dirs: None,
+        };
+
+        let make_note = |id: &str, related: &[&str], content: &str| {
+            let mut note = VaultNote {
+                id: id.to_string(),
+                rdf_type: "yaml:fact".to_string(),
+                context: YAML_LD_CONTEXT.to_string(),
+                epistemic_tier: "fact".to_string(),
+                canonical_sha256: String::new(),
+                related: related.iter().map(|s| s.to_string()).collect(),
+                content: content.to_string(),
+            };
+            note.canonical_sha256 = note.fingerprint();
+            note
+        };
+        let preferred_y = format!("{ns}::y");
+        let preferred_z = format!("{ns}::z");
+        let linker = make_note(
+            "a",
+            &[preferred_y.as_str(), preferred_z.as_str()],
+            "multirebindprobe linker body",
+        );
+        let alias_y = make_note("y", &[], "body of the bare y alias");
+        let alias_z = make_note("z", &[], "body of the bare z alias");
+        std::fs::write(vault.join("a.md"), linker.to_markdown()).expect("write a");
+        std::fs::write(vault.join("y.md"), alias_y.to_markdown()).expect("write y");
+        std::fs::write(vault.join("z.md"), alias_z.to_markdown()).expect("write z");
+
+        let first = import_vault(config.clone(), store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        for (name, id, content) in [
+            ("preferred-y", preferred_y.as_str(), "verbatim y body"),
+            ("preferred-z", preferred_z.as_str(), "verbatim z body"),
+        ] {
+            let literal = make_note(id, &[], content);
+            std::fs::write(vault.join(format!("{name}.md")), literal.to_markdown())
+                .expect("write preferred");
+        }
+        let second = import_vault(config, store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(second.notes_imported, 2, "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges after rebind");
+        let mut targets = edges
+            .iter()
+            .filter(|(from, rel, _, _)| from == "a" && rel == "RELATES_TO")
+            .map(|(_, _, to, _)| to.clone())
+            .collect::<Vec<_>>();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![preferred_y.clone(), preferred_z.clone()],
+            "both rebound edges must stay live: {edges:?}"
+        );
+
+        let (_, head) = store
+            .get(ns, "a")
+            .await
+            .expect("read declarer after rebind")
+            .expect("declarer survives");
+        let live_sources = |target: &str| {
+            head.metadata["edge_sources"]
+                .as_array()
+                .map(|sources| {
+                    sources
+                        .iter()
+                        .filter(|s| {
+                            s["rel_type"] == "RELATES_TO"
+                                && s["extractor"] == "upsert"
+                                && s["orientation"] == "self_to_target"
+                                && s["resolved_target"] == target
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(live_sources(&preferred_y), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources(&preferred_z), 1, "{:?}", head.metadata);
+        assert_eq!(live_sources("y"), 0, "{:?}", head.metadata);
+        assert_eq!(live_sources("z"), 0, "{:?}", head.metadata);
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "multirebindprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let refs = search_out
+            .lines()
+            .find_map(|line| line.strip_prefix("edge_references: "))
+            .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+            .unwrap_or_default();
+        for target in [&preferred_y, &preferred_z] {
+            assert!(
+                refs.iter().any(|r| {
+                    r["id"] == "a"
+                        && r["edge_sources"].as_array().is_some_and(|sources| {
+                            sources.iter().any(|s| {
+                                s["rel_type"] == "RELATES_TO" && s["resolved_target"] == *target
+                            })
+                        })
+                }),
+                "search must cite every rebound edge ({target}): {search_out}"
+            );
+        }
+    }
+
+    /// #363: two declarations on one exact-mode head can name the same target
+    /// under different relationships. Replay must cite each edge by
+    /// `(relationship, resolved target)`, not by endpoints alone; otherwise the
+    /// second citation replaces the first and `include_references` reports one
+    /// relationship for both edges.
+    #[tokio::test]
+    async fn replay_cites_both_relations_when_they_share_a_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(dir.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vault_multi_relation";
+        store.init(ns).await.expect("init");
+
+        let upsert = |id: &str, content: &str, metadata: serde_json::Value| {
+            let store = store.clone();
+            let id = id.to_string();
+            let content = content.to_string();
+            async move {
+                store
+                    .upsert(
+                        ns,
+                        &id,
+                        vec![0.0; 4],
+                        crate::traits::MemoryPayload {
+                            content,
+                            user_id: "default".to_string(),
+                            memory_type: "fact".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata,
+                        },
+                    )
+                    .await
+                    .expect("seed memory");
+            }
+        };
+
+        // The target is absent when the head is written, so both declarations
+        // defer to replay.
+        upsert(
+            "multi-relation",
+            "multirelationprobe head body",
+            serde_json::json!({
+                "exact_edge_targets": true,
+                "related_to": ["shared-target"],
+                "depends_on": ["shared-target"]
+            }),
+        )
+        .await;
+        upsert("shared-target", "shared target body", serde_json::json!({})).await;
+
+        store
+            .relink_edges(ns, "code")
+            .await
+            .expect("replay declarations");
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        let rels = ["RELATES_TO", "DEPENDS_ON"];
+        for rel in rels {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(from, edge_rel, to, prov)| from == "multi-relation"
+                        && edge_rel == rel
+                        && to == "shared-target"
+                        && prov.as_ref().and_then(|p| p.extractor.as_deref()) == Some("upsert")),
+                "replay must materialise the {rel} edge: {edges:?}"
+            );
+        }
+
+        let (_, head) = store
+            .get(ns, "multi-relation")
+            .await
+            .expect("read declarer")
+            .expect("declarer exists");
+        let sources = head
+            .metadata
+            .get("edge_sources")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for rel in rels {
+            assert_eq!(
+                sources
+                    .iter()
+                    .filter(|s| s["rel_type"] == rel && s["resolved_target"] == "shared-target")
+                    .count(),
+                1,
+                "each relation must keep its own citation ({rel}): {sources:?}"
+            );
+        }
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "multirelationprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        let refs = search_out
+            .lines()
+            .find_map(|line| line.strip_prefix("edge_references: "))
+            .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+            .unwrap_or_default();
+        for rel in rels {
+            assert!(
+                refs.iter().any(|r| {
+                    r["id"] == "multi-relation"
+                        && r["edge_sources"].as_array().is_some_and(|sources| {
+                            sources.iter().any(|s| {
+                                s["rel_type"] == rel && s["resolved_target"] == "shared-target"
+                            })
+                        })
+                }),
+                "search must cite the {rel} edge ({rel}): {search_out}"
+            );
+        }
     }
 
     /// The lexical empty-results path must still emit the additive response
@@ -22668,23 +23389,17 @@ mod tests {
             })),
         };
         let (bus, _seen) = recording_bus();
-        let _ = process_mcp_request(
-            request,
-            Arc::new(StubEmbedder),
-            store,
-            ingests,
-            None,
-            bus,
-        )
-        .await;
+        let _ =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
         let ledger = root.join(".NeuroStrata").join("session_queries.json");
         let text = std::fs::read_to_string(&ledger)
             .unwrap_or_else(|e| panic!("no receipt ledger at {}: {e}", ledger.display()));
         let doc: serde_json::Value = serde_json::from_str(&text).expect("ledger json");
         let events = doc["events"].as_array().expect("events");
         assert!(
-            events.iter().any(|e| e["tool"] == "neurostrata_search_memory"
-                && e["namespace"] == "global"),
+            events
+                .iter()
+                .any(|e| e["tool"] == "neurostrata_search_memory" && e["namespace"] == "global"),
             "missing-namespace call must still record a receipt: {events:?}"
         );
     }
@@ -24648,8 +25363,8 @@ mod context_plan_tests {
                 .expect("upsert governing rule");
         }
 
-        let (result, measured) = super::context_plan_benchmark_instrumentation::measure(
-            handle_context_plan(
+        let (result, measured) =
+            super::context_plan_benchmark_instrumentation::measure(handle_context_plan(
                 &serde_json::json!({
                     "namespace": "ns",
                     "query": "rule",
@@ -24658,9 +25373,8 @@ mod context_plan_tests {
                 }),
                 embedder.clone(),
                 store.clone(),
-            ),
-        )
-        .await;
+            ))
+            .await;
         let snap = measured.snapshot;
         let plan: serde_json::Value = serde_json::from_str(&result).expect("plan json");
 
