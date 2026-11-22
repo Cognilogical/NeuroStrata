@@ -3126,6 +3126,9 @@ mod tests {
         let src_main = repo.join("src");
         std::fs::create_dir_all(repo.join(".git/worktrees/wt")).unwrap();
         std::fs::write(repo.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
+        // A linked worktree's common dir counts as a checkout only with HEAD
+        // (paths::main_checkout_of_common); without it no marker is found.
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::create_dir_all(src_main.join(".NeuroStrata")).unwrap();
         std::fs::write(
             src_main.join(".NeuroStrata/config.json"),
