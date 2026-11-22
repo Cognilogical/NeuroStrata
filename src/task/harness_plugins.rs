@@ -884,8 +884,9 @@ impl NamespaceRoots {
 /// 2. `env_namespace` (`NEUROSTRATA_NAMESPACE`), when usable;
 /// 3. the `namespace` field of the graph-lookup ledger
 ///    (`.NeuroStrata/session_queries.json`), the main checkout's then `dir`'s;
-/// 4. the main checkout's folder name; outside git, `dir`'s folder name, when
-///    it is a usable namespace.
+/// 4. this checkout's folder name (a linked worktree's own basename, matching
+///    the plugins' `discoverProjectNamespace()`); outside git, `dir`'s folder
+///    name, when it is a usable namespace.
 ///
 /// A marker or harness config that exists but cannot be read is an error,
 /// never skipped: the namespace it names is unknown.
@@ -933,8 +934,11 @@ fn resolve_namespace_from(
             return Ok(resolved(ns, NamespaceSource::Ledger));
         }
     }
+    // The worktree the session runs in is the answer, not the main checkout
+    // it was linked from: the plugins fall back to this checkout's basename
+    // too, and a commit writes this namespace into the ledger.
     let folder = roots
-        .main_root
+        .own_root
         .as_deref()
         .unwrap_or(roots.dir.as_path())
         .file_name()
@@ -2336,7 +2340,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(configured_namespace(&main), None);
-        assert_eq!(ns_of(&wt), "platform");
+        // No source names one: fall back to this worktree's own basename, as
+        // the plugins' discoverProjectNamespace() does. Using the main
+        // checkout's basename here switches namespaces after a commit writes
+        // it into the ledger.
+        assert_eq!(ns_of(&wt), "platform-wt");
 
         // With no harness setting, the main checkout's ledger names it before
         // the folder name does.
@@ -3380,9 +3388,12 @@ mod tests {
             .filter(|e| runs_ours(e))
             .filter_map(|e| e["matcher"].as_str())
             .collect();
+        // The legacy and fresh file-tool matchers are spelled alike, so the
+        // #333 widening applies to a fresh install too: notebook edits are
+        // guarded.
         assert_eq!(
             matchers,
-            vec![CLAUDE_FILE_TOOLS_MATCHER, CLAUDE_SESSION_SCOPE_MATCHER]
+            vec![CLAUDE_PRE_TOOL_USE_MATCHER, CLAUDE_SESSION_SCOPE_MATCHER]
         );
         assert!(entries("Stop").iter().any(runs_ours));
         // A second install adds nothing.

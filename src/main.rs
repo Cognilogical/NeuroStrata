@@ -907,12 +907,12 @@ pub(crate) enum NamespaceCommands {
     /// .claude/settings.local.json; then the opencode, codex, hermes,
     /// openclaw or GitHub CLI plugin config) in the checkout or its main
     /// checkout, else NEUROSTRATA_NAMESPACE, else the namespace in
-    /// .NeuroStrata/session_queries.json, else the main checkout's folder
-    /// name. Harness configs that disagree are reported on stderr unless the
-    /// marker decides; the first in that order wins. Exits non-zero, naming
-    /// the cause, when the directory does not exist, the marker or a harness
-    /// config cannot be read, or no usable namespace is found. The git hooks
-    /// call this.
+    /// .NeuroStrata/session_queries.json, else this checkout's folder name
+    /// (a linked worktree's own basename). Harness configs that disagree are
+    /// reported on stderr unless the marker decides; the first in that order
+    /// wins. Exits non-zero, naming the cause, when the directory does not
+    /// exist, the marker or a harness config cannot be read, or no usable
+    /// namespace is found. The git hooks call this.
     Resolve {
         /// Directory inside the project (default: the current directory)
         dir: Option<std::path::PathBuf>,
