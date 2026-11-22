@@ -3829,7 +3829,8 @@ pub async fn handle_bootstrap(
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let root = std::path::Path::new(project_root);
     let root_marker =
-        crate::root_marker::ensure_marker_for_setup(&store, Some(&emb), root, Some(&namespace)).await;
+        crate::root_marker::ensure_marker_for_setup(&store, Some(&emb), root, Some(&namespace))
+            .await;
     let harness_plugins = setup_plugins(&root_marker, root, &namespace, arg_str(&args, "harness"));
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
     let hook_installed = verified["hook_installed"].as_bool().unwrap_or(false);
@@ -3974,7 +3975,11 @@ async fn record_setup_doctor_state(
         previous
             .get(key)
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     (strings("configured_wires"), strings("configured_fires_on"))
@@ -4356,13 +4361,9 @@ if [ ! -f "$LEDGER" ]; then
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
-    # rewrite holds the same cross-process lock as the daemon's ledger writer,
-    # uses a unique EXCLUSIVE temp file (a planted symlink cannot be followed),
-    # keeps the original mode, and wraps legacy bare-array ledgers. An
-    # unparseable ledger or a missing node/python3 leaves the file as it is.
+    # rewrite goes through a temporary file and a rename; an unparseable
+    # ledger or a missing node/python3 leaves the file as it is.
     export LEDGER NAMESPACE
-    exec 9>"$LEDGER.lock" 2>/dev/null || true
-    command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
@@ -4370,20 +4371,16 @@ elif [ -n "$RESOLVED" ]; then
           const ns = process.env.NAMESPACE;
           let parsed;
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
-          const doc = Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed;
-          if (!doc || typeof doc !== "object") process.exit(0);
-          if (doc.namespace === ns) process.exit(0);
-          doc.namespace = ns;
-          const tmp = ledger + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
-          let mode;
-          try { mode = fs.statSync(ledger).mode; } catch {}
-          fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-          if (mode !== undefined) { try { fs.chmodSync(tmp, mode); } catch {} }
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) process.exit(0);
+          if (parsed.namespace === ns) process.exit(0);
+          parsed.namespace = ns;
+          const tmp = ledger + ".tmp-" + process.pid;
+          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + "\n");
           fs.renameSync(tmp, ledger);
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
-import json, os, sys, stat
+import json, os, sys
 ledger = os.environ["LEDGER"]
 ns = os.environ["NAMESPACE"]
 try:
@@ -4391,30 +4388,16 @@ try:
         parsed = json.load(f)
 except Exception:
     sys.exit(0)
-doc = {"namespace": ns, "queries": parsed} if isinstance(parsed, list) else parsed
-if not isinstance(doc, dict) or doc.get("namespace") == ns:
+if not isinstance(parsed, dict) or parsed.get("namespace") == ns:
     sys.exit(0)
-doc["namespace"] = ns
-tmp = f"{ledger}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
-fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-try:
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(doc, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    try:
-        os.chmod(tmp, stat.S_IMODE(os.stat(ledger).st_mode))
-    except OSError:
-        pass
-    os.replace(tmp, ledger)
-except Exception:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
+parsed["namespace"] = ns
+tmp = ledger + ".tmp-" + str(os.getpid())
+with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+    json.dump(parsed, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, ledger)
 ' 2>/dev/null || true
     fi
-    command -v flock >/dev/null 2>&1 && flock -u 9 2>/dev/null || true
-    exec 9>&- 2>/dev/null || true
 fi
 
 
@@ -5249,7 +5232,8 @@ pub async fn handle_task_setup(
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
     let root_marker =
-        crate::root_marker::ensure_marker_for_setup(&store, Some(&emb), root, Some(&namespace)).await;
+        crate::root_marker::ensure_marker_for_setup(&store, Some(&emb), root, Some(&namespace))
+            .await;
     let harness_plugins = setup_plugins(&root_marker, root, &namespace, arg_str(&args, "harness"));
 
     let scan = detect_project(root);
@@ -6101,10 +6085,8 @@ mod tests {
             std::env::temp_dir().join(format!("ns-scratch-hint-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&scratch).unwrap();
         assert!(!scratch.join(".git").exists() && !scratch.join(".NeuroStrata").exists());
-        let worktree = std::env::temp_dir().join(format!(
-            "ns-real-worktree-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let worktree =
+            std::env::temp_dir().join(format!("ns-real-worktree-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(worktree.join(".git")).unwrap();
         crate::registry::cache_project_root(&store, Some(&emb()), ns, worktree.to_str().unwrap())
             .await;
@@ -6287,7 +6269,8 @@ mod tests {
 
     /// The pre-commit hook files the ledger under the namespace `namespace
     /// resolve` answered: an older ledger naming another one is updated, its
-    /// recorded lookups kept; a failed lookup leaves the ledger as it is.
+    /// recorded lookups kept; a failed lookup leaves the ledger as it is and
+    /// its reason reaches the hook's stderr.
     #[test]
     fn pre_commit_hook_updates_the_ledger_namespace_to_the_resolved_one() {
         let Some(bash) = hook_bash() else {
@@ -6339,14 +6322,23 @@ mod tests {
                 cmd.env("STUB_RESOLVE_EXIT", code);
             }
             let out = cmd.output().expect("the hook runs");
-            assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             String::from_utf8_lossy(&out.stderr).to_string()
         };
         let read = || -> Value {
             serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap()
         };
         let stderr = run(Some("1"));
-        assert_eq!(std::fs::read_to_string(&ledger).unwrap(), seeded, "a failed lookup changes nothing");
+        assert_eq!(
+            std::fs::read_to_string(&ledger).unwrap(),
+            seeded,
+            "a failed lookup changes nothing"
+        );
         assert!(
             stderr.contains("the project marker could not be read"),
             "a failed lookup says why: {stderr}"
@@ -8336,7 +8328,14 @@ exit 0
         git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
         git(
             &main,
-            &["worktree", "add", "-q", "-b", "feature/linked", &linked.to_string_lossy()],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature/linked",
+                &linked.to_string_lossy(),
+            ],
         );
         crate::root_marker::replace_marker(&main, &crate::root_marker::RootConfig::new("MyProj"))
             .unwrap();
@@ -8391,7 +8390,11 @@ exit 0
 
         // With the session's folder as `worktree`: the linked worktree's scope.
         let with_wt = create_task(&store, "MyProj", "linked work", 2).await;
-        claim(with_wt.clone(), json!({ "worktree": linked.to_string_lossy() })).await;
+        claim(
+            with_wt.clone(),
+            json!({ "worktree": linked.to_string_lossy() }),
+        )
+        .await;
         let expected = gate::GateScope::capture(&linked);
         assert_eq!(expected.branch.as_deref(), Some("feature/linked"));
         assert_eq!(
@@ -8435,7 +8438,13 @@ exit 0
         git(&main, &["commit", "--allow-empty", "-m", "init"]);
         git(
             &main,
-            &["worktree", "add", "-b", "feature/linked", linked.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/linked",
+                linked.to_str().unwrap(),
+            ],
         );
 
         std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &main);
@@ -12261,12 +12270,17 @@ exit 0
         assert_eq!(parsed["root_marker"]["kind"], json!("written"), "{parsed}");
         assert_eq!(parsed["root_marker"]["root"], json!(repo.to_string_lossy()));
         let hint = parsed["root_hint"].as_str().expect("a hint line");
-        assert!(hint.starts_with("Wrote ") && hint.contains("webproj"), "{hint}");
+        assert!(
+            hint.starts_with("Wrote ") && hint.contains("webproj"),
+            "{hint}"
+        );
         assert!(repo.join(".NeuroStrata").join("config.json").exists());
         // Existing fields are still there.
         assert!(parsed["harness_plugins"].is_object() && parsed["instructions"].is_array());
         assert_eq!(
-            crate::registry::cached_project_root(&store, "webproj").await.unwrap(),
+            crate::registry::cached_project_root(&store, "webproj")
+                .await
+                .unwrap(),
             Some(repo.to_string_lossy().into_owned())
         );
 
@@ -12293,7 +12307,10 @@ exit 0
         let parsed: Value = serde_json::from_str(&reply).expect("json reply");
         assert_eq!(parsed["root_marker"]["kind"], json!("other_namespace"));
         assert_eq!(parsed["harness_plugins"]["skipped"], json!(true));
-        assert!(parsed["root_hint"].as_str().unwrap().contains("other-project"));
+        assert!(parsed["root_hint"]
+            .as_str()
+            .unwrap()
+            .contains("other-project"));
         assert!(!other.join(".NeuroStrata").join("plugins").exists());
 
         // Bootstrap carries the same two fields.
@@ -12319,8 +12336,13 @@ exit 0
             .collect();
         for i in 0..20 {
             let store = crate::registry::tests::yield_store();
-            crate::registry::cache_project_root(&store, Some(&emb), "example-project", "/example/old")
-                .await;
+            crate::registry::cache_project_root(
+                &store,
+                Some(&emb),
+                "example-project",
+                "/example/old",
+            )
+            .await;
             let root = std::path::PathBuf::from(format!("/example/new-{i}"));
             let ((prev_wires, _), _) = tokio::join!(
                 record_setup_doctor_state(&store, "example-project"),
@@ -12328,12 +12350,17 @@ exit 0
             );
             assert!(prev_wires.is_empty(), "round {i}");
             assert_eq!(
-                crate::registry::cached_project_root(&store, "example-project").await.unwrap(),
+                crate::registry::cached_project_root(&store, "example-project")
+                    .await
+                    .unwrap(),
                 Some(root.to_string_lossy().into_owned()),
                 "round {i}: the root"
             );
             let (_, payload) = store
-                .get("example-project", &crate::registry::registry_row_id("example-project"))
+                .get(
+                    "example-project",
+                    &crate::registry::registry_row_id("example-project"),
+                )
                 .await
                 .unwrap()
                 .unwrap();

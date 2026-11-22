@@ -145,7 +145,7 @@ function topLevelVersionSpellings(text) {
             while (k < text.length && /\s/.test(text[k]))
                 k++;
             const number = /^-?[0-9][0-9.eE+-]*/.exec(text.slice(k));
-            found.push(number ? number[0] : text[k] ?? '');
+            found.push(number ? number[0] : (text[k] ?? ''));
             i = k;
             continue;
         }
@@ -218,6 +218,14 @@ function isDirectory(p) {
     catch {
         return false;
     }
+}
+/** Canonical `child` inside canonical `parent`, compared by path components. */
+function canonicalInside(child, parent) {
+    if (child === parent)
+        return true;
+    const unix = parent.endsWith('/') ? parent : parent + '/';
+    const win = parent.endsWith('\\') ? parent : parent + '\\';
+    return child.startsWith(unix) || child.startsWith(win);
 }
 function isFile(p) {
     try {
@@ -301,7 +309,11 @@ function linkedMainCheckout(top) {
 /** The marker in `dir`: valid, unreadable, or null when there is none. */
 function readRootMarker(dir) {
     const path = join(dir, '.NeuroStrata', 'config.json');
-    const unreadable = (reason) => ({ valid: false, path, reason });
+    const unreadable = (reason) => ({
+        valid: false,
+        path,
+        reason
+    });
     let text;
     try {
         text = readFileSync(path, 'utf8');
@@ -329,10 +341,13 @@ function readRootMarker(dir) {
     if (doc.version !== 1 || versions.length !== 1 || versions[0] !== '1') {
         return unreadable('its version is not 1');
     }
-    if (typeof doc.namespace !== 'string' || !NAMESPACE_PATTERN.test(doc.namespace)) {
+    if (typeof doc.namespace !== 'string' ||
+        !NAMESPACE_PATTERN.test(doc.namespace)) {
         return unreadable('its namespace is missing or not a namespace');
     }
-    if (sourceId !== undefined && sourceId !== null && typeof sourceId !== 'string') {
+    if (sourceId !== undefined &&
+        sourceId !== null &&
+        typeof sourceId !== 'string') {
         return unreadable('its source_id is not a string');
     }
     return { valid: true, namespace: doc.namespace };
@@ -411,22 +426,24 @@ export function findRootMarker(startDir) {
     const mainTop = linkedMainCheckout(top);
     if (mainTop !== null) {
         const allowed = [mainTop];
+        const mainCanonical = canonicalPath(mainTop) ?? mainTop;
         let dir = mainTop;
         for (const part of pathParts(relative(top, start))) {
             dir = join(dir, part);
-            let st;
+            // Same guard as the Rust main_checkout_walk: a symlink/junction or a
+            // folder that canonicalizes outside the main checkout belongs to
+            // another project, so its markers must not enter this walk.
+            let realDir = null;
             try {
-                st = lstatSync(dir);
+                const st = lstatSync(dir);
+                if (st.isSymbolicLink() || !st.isDirectory())
+                    break;
+                realDir = canonicalPath(dir);
             }
             catch {
                 break;
             }
-            if (st.isSymbolicLink() || !st.isDirectory())
-                break;
-            const realDir = canonicalPath(dir);
-            const realMain = canonicalPath(mainTop);
-            const below = realDir !== null && realMain !== null ? relative(realMain, realDir) : '..';
-            if (isAbsoluteAny(below) || pathParts(below)[0] === '..')
+            if (realDir === null || !canonicalInside(realDir, mainCanonical))
                 break;
             if (existsSync(join(dir, '.git')))
                 break;
@@ -496,11 +513,26 @@ export function findProjectRoot(startDir = process.cwd(), home = homedir()) {
 /** Each harness's plugin config, relative to the project root, and the
  * namespace's place inside it. The installer writes these files. */
 const HARNESS_CONFIG_FILES = {
-    claude: { file: ['.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'], key: ['namespace'] },
-    opencode: { file: ['.opencode', 'neurostrata-plugin.json'], key: ['neurostrata', 'namespace'] },
-    codex: { file: ['.codex', 'plugins', 'neurostrata.json'], key: ['namespace'] },
-    hermes: { file: ['.hermes', 'plugins', 'neurostrata.json'], key: ['namespace'] },
-    openclaw: { file: ['.openclaw', 'plugins', 'neurostrata.json'], key: ['namespace'] },
+    claude: {
+        file: ['.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'],
+        key: ['namespace']
+    },
+    opencode: {
+        file: ['.opencode', 'neurostrata-plugin.json'],
+        key: ['neurostrata', 'namespace']
+    },
+    codex: {
+        file: ['.codex', 'plugins', 'neurostrata.json'],
+        key: ['namespace']
+    },
+    hermes: {
+        file: ['.hermes', 'plugins', 'neurostrata.json'],
+        key: ['namespace']
+    },
+    openclaw: {
+        file: ['.openclaw', 'plugins', 'neurostrata.json'],
+        key: ['namespace']
+    },
     'github-cli': {
         file: ['.NeuroStrata', 'plugins', 'github-cli', 'copilot-extension.json'],
         key: ['namespace']
@@ -553,15 +585,15 @@ export function readHarnessConfig(harness, projectDir, runnerDir) {
     }
     return {};
 }
-/** How many SessionStart folders the CLI runner remembers. */
-const NEUROSTRATA_SESSION_DIRS_KEEP = 20;
+/** How many SessionStart folders the Claude runner remembers. */
+const CLAUDE_SESSION_DIRS_KEEP = 20;
 /**
  * The project folder a CLI hook runner resolves its namespace from. Claude
  * Code starts a new hook process per event, and the event's `cwd` follows
  * every `cd`, so for Claude this is the session's project folder:
  * `CLAUDE_PROJECT_DIR`, which Claude Code exports to hook processes as the
  * project root where the session started. Without it, the folder recorded
- * for this session at SessionStart (`neurostrata_session_dirs` in
+ * for this session at SessionStart (`claude_session_dirs` in
  * `.NeuroStrata/active_session.json`; never the home folder's), else the
  * event's `cwd`. Other harnesses use the event's `cwd`, else the process's.
  *
@@ -591,7 +623,9 @@ export function resolveHookProjectDir(harness, event = {}, env = process.env, ho
     let unparsable = false;
     try {
         const parsed = JSON.parse(readFileSync(sessionPath, 'utf8'));
-        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        if (typeof parsed === 'object' &&
+            parsed !== null &&
+            !Array.isArray(parsed)) {
             state = parsed;
         }
         else {
@@ -601,7 +635,7 @@ export function resolveHookProjectDir(harness, event = {}, env = process.env, ho
     catch (err) {
         unparsable = err?.code !== 'ENOENT';
     }
-    const dirs = asRecord(state.neurostrata_session_dirs);
+    const dirs = asRecord(state.claude_session_dirs);
     const recorded = asString(dirs[sessionId]);
     if (asString(event?.hook_event_name) === 'SessionStart') {
         if (recorded)
@@ -611,7 +645,7 @@ export function resolveHookProjectDir(harness, event = {}, env = process.env, ho
             return cwd;
         const kept = Object.entries(dirs).filter(([id]) => id !== sessionId);
         kept.push([sessionId, cwd]);
-        state.neurostrata_session_dirs = Object.fromEntries(kept.slice(-NEUROSTRATA_SESSION_DIRS_KEEP));
+        state.claude_session_dirs = Object.fromEntries(kept.slice(-CLAUDE_SESSION_DIRS_KEEP));
         writeJsonAtomically(sessionPath, state);
         return cwd;
     }
@@ -638,7 +672,10 @@ function writeJsonAtomically(path, value) {
     }
 }
 /** The NeuroStrata tools whose scope follows the session's project folder. */
-const SESSION_SCOPED_TOOLS = ['neurostrata_task_claim', 'neurostrata_get_snapshot'];
+const SESSION_SCOPED_TOOLS = [
+    'neurostrata_task_claim',
+    'neurostrata_get_snapshot'
+];
 /**
  * Whether `toolName` is one of [SESSION_SCOPED_TOOLS], bare or as a harness
  * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,

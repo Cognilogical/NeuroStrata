@@ -369,12 +369,17 @@ impl ConfigLock {
             .into_owned();
         let path = config_path.with_file_name(format!("{name}.lock"));
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Could not create config directory {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Could not create config directory {}", parent.display())
+            })?;
         }
         let started = std::time::Instant::now();
         loop {
-            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
                 Ok(mut file) => {
                     let _ = writeln!(file, "{}", std::process::id());
                     return Ok(ConfigLock { path });
@@ -428,7 +433,11 @@ fn break_stale_lock(path: &Path) {
     let mut breaker = path.as_os_str().to_owned();
     breaker.push(".break");
     let breaker = PathBuf::from(breaker);
-    match fs::OpenOptions::new().write(true).create_new(true).open(&breaker) {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&breaker)
+    {
         Ok(file) => {
             drop(file);
             if is_stale(path) {
@@ -794,7 +803,10 @@ mod tests {
         );
         let config = Config::load_from(&config_path).unwrap();
         assert_eq!(config.project_contexts.get("example-project"), Some(&live));
-        assert!(!config_path.with_file_name("config.json.lock").exists(), "lock released");
+        assert!(
+            !config_path.with_file_name("config.json.lock").exists(),
+            "lock released"
+        );
     }
 
     #[test]
@@ -838,12 +850,15 @@ mod tests {
                 locked_tx.send(()).unwrap();
                 let mut config = Config::load_from(&config_path).unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(300));
-                config.bind_project_context("example-project", &explicit).unwrap();
+                config
+                    .bind_project_context("example-project", &explicit)
+                    .unwrap();
                 config.save_to(&config_path).unwrap();
             })
         };
         locked_rx.recv().unwrap();
-        let outcome = bind_project_context_if_free_at(&config_path, "example-project", &other).unwrap();
+        let outcome =
+            bind_project_context_if_free_at(&config_path, "example-project", &other).unwrap();
         a.join().unwrap();
 
         let live = fs::canonicalize(&explicit).unwrap();
@@ -861,15 +876,24 @@ mod tests {
             let lock = config_path.with_file_name("config.json.lock");
             fs::write(&lock, "12345").unwrap();
             let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
-            fs::File::options().write(true).open(&lock).unwrap().set_modified(old).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&lock)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
 
             let inside = std::sync::Arc::new(AtomicUsize::new(0));
             let most = std::sync::Arc::new(AtomicUsize::new(0));
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
             let waiters: Vec<_> = (0..4)
                 .map(|_| {
-                    let (config_path, inside, most, barrier) =
-                        (config_path.clone(), inside.clone(), most.clone(), barrier.clone());
+                    let (config_path, inside, most, barrier) = (
+                        config_path.clone(),
+                        inside.clone(),
+                        most.clone(),
+                        barrier.clone(),
+                    );
                     std::thread::spawn(move || {
                         barrier.wait();
                         let _held = ConfigLock::acquire(&config_path).unwrap();
@@ -900,7 +924,12 @@ mod tests {
         let lock = config_path.with_file_name("config.json.lock");
         fs::write(&lock, "12345").unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
-        fs::File::options().write(true).open(&lock).unwrap().set_modified(old).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         let held = ConfigLock::acquire(&config_path).unwrap();
         assert!(lock.exists());
         drop(held);

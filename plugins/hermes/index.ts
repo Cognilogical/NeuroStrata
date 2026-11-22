@@ -6,7 +6,13 @@
  * prompt auto-injection without requiring @opencode/plugin import.
  */
 
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import {
+  existsSync,
+  lstatSync,
+  readFileSync,
+  realpathSync,
+  statSync
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 
@@ -169,7 +175,7 @@ function topLevelVersionSpellings(text: string): string[] {
       k++
       while (k < text.length && /\s/.test(text[k])) k++
       const number = /^-?[0-9][0-9.eE+-]*/.exec(text.slice(k))
-      found.push(number ? number[0] : text[k] ?? '')
+      found.push(number ? number[0] : (text[k] ?? ''))
       i = k
       continue
     }
@@ -241,6 +247,14 @@ function isDirectory(p: string): boolean {
   } catch {
     return false
   }
+}
+
+/** Canonical `child` inside canonical `parent`, compared by path components. */
+function canonicalInside(child: string, parent: string): boolean {
+  if (child === parent) return true
+  const unix = parent.endsWith('/') ? parent : parent + '/'
+  const win = parent.endsWith('\\') ? parent : parent + '\\'
+  return child.startsWith(unix) || child.startsWith(win)
 }
 
 function isFile(p: string): boolean {
@@ -325,7 +339,11 @@ function linkedMainCheckout(top: string): string | null {
 /** The marker in `dir`: valid, unreadable, or null when there is none. */
 function readRootMarker(dir: string): MarkerRead | null {
   const path = join(dir, '.NeuroStrata', 'config.json')
-  const unreadable = (reason: string): MarkerRead => ({ valid: false, path, reason })
+  const unreadable = (reason: string): MarkerRead => ({
+    valid: false,
+    path,
+    reason
+  })
   let text: string
   try {
     text = readFileSync(path, 'utf8')
@@ -350,10 +368,17 @@ function readRootMarker(dir: string): MarkerRead | null {
   if (doc.version !== 1 || versions.length !== 1 || versions[0] !== '1') {
     return unreadable('its version is not 1')
   }
-  if (typeof doc.namespace !== 'string' || !NAMESPACE_PATTERN.test(doc.namespace)) {
+  if (
+    typeof doc.namespace !== 'string' ||
+    !NAMESPACE_PATTERN.test(doc.namespace)
+  ) {
     return unreadable('its namespace is missing or not a namespace')
   }
-  if (sourceId !== undefined && sourceId !== null && typeof sourceId !== 'string') {
+  if (
+    sourceId !== undefined &&
+    sourceId !== null &&
+    typeof sourceId !== 'string'
+  ) {
     return unreadable('its source_id is not a string')
   }
   return { valid: true, namespace: doc.namespace }
@@ -434,20 +459,22 @@ export function findRootMarker(startDir: string): FoundRootMarker | null {
   const mainTop = linkedMainCheckout(top)
   if (mainTop !== null) {
     const allowed = [mainTop]
+    const mainCanonical = canonicalPath(mainTop) ?? mainTop
     let dir = mainTop
     for (const part of pathParts(relative(top, start))) {
       dir = join(dir, part)
-      let st
+      // Same guard as the Rust main_checkout_walk: a symlink/junction or a
+      // folder that canonicalizes outside the main checkout belongs to
+      // another project, so its markers must not enter this walk.
+      let realDir: string | null = null
       try {
-        st = lstatSync(dir)
+        const st = lstatSync(dir)
+        if (st.isSymbolicLink() || !st.isDirectory()) break
+        realDir = canonicalPath(dir)
       } catch {
         break
       }
-      if (st.isSymbolicLink() || !st.isDirectory()) break
-      const realDir = canonicalPath(dir)
-      const realMain = canonicalPath(mainTop)
-      const below = realDir !== null && realMain !== null ? relative(realMain, realDir) : '..'
-      if (isAbsoluteAny(below) || pathParts(below)[0] === '..') break
+      if (realDir === null || !canonicalInside(realDir, mainCanonical)) break
       if (existsSync(join(dir, '.git'))) break
       allowed.push(dir)
     }
@@ -477,17 +504,33 @@ export function findRootMarker(startDir: string): FoundRootMarker | null {
 
 /** Each harness's plugin config, relative to the project root, and the
  * namespace's place inside it. The installer writes these files. */
-const HARNESS_CONFIG_FILES: Record<string, { file: string[]; key: string[] }> = {
-  claude: { file: ['.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'], key: ['namespace'] },
-  opencode: { file: ['.opencode', 'neurostrata-plugin.json'], key: ['neurostrata', 'namespace'] },
-  codex: { file: ['.codex', 'plugins', 'neurostrata.json'], key: ['namespace'] },
-  hermes: { file: ['.hermes', 'plugins', 'neurostrata.json'], key: ['namespace'] },
-  openclaw: { file: ['.openclaw', 'plugins', 'neurostrata.json'], key: ['namespace'] },
-  'github-cli': {
-    file: ['.NeuroStrata', 'plugins', 'github-cli', 'copilot-extension.json'],
-    key: ['namespace']
+const HARNESS_CONFIG_FILES: Record<string, { file: string[]; key: string[] }> =
+  {
+    claude: {
+      file: ['.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'],
+      key: ['namespace']
+    },
+    opencode: {
+      file: ['.opencode', 'neurostrata-plugin.json'],
+      key: ['neurostrata', 'namespace']
+    },
+    codex: {
+      file: ['.codex', 'plugins', 'neurostrata.json'],
+      key: ['namespace']
+    },
+    hermes: {
+      file: ['.hermes', 'plugins', 'neurostrata.json'],
+      key: ['namespace']
+    },
+    openclaw: {
+      file: ['.openclaw', 'plugins', 'neurostrata.json'],
+      key: ['namespace']
+    },
+    'github-cli': {
+      file: ['.NeuroStrata', 'plugins', 'github-cli', 'copilot-extension.json'],
+      key: ['namespace']
+    }
   }
-}
 
 /**
  * The namespace `harness`'s plugin config names for the project at
@@ -1124,7 +1167,10 @@ let pluginCtx: any | null = null
 let sessionProjectDir: string | undefined
 
 /** The NeuroStrata tools whose scope follows the session's project folder. */
-const SESSION_SCOPED_TOOLS = ['neurostrata_task_claim', 'neurostrata_get_snapshot']
+const SESSION_SCOPED_TOOLS = [
+  'neurostrata_task_claim',
+  'neurostrata_get_snapshot'
+]
 
 /**
  * Whether `toolName` is one of SESSION_SCOPED_TOOLS, bare or as a host
@@ -1155,7 +1201,8 @@ export function addSessionWorktree(
   projectDir: string | undefined
 ): boolean {
   if (!isSessionScopedTool(toolName) || !projectDir) return false
-  if (args === null || typeof args !== 'object' || Array.isArray(args)) return false
+  if (args === null || typeof args !== 'object' || Array.isArray(args))
+    return false
   if (
     asString(args.worktree) ||
     asString(args.project_root) ||

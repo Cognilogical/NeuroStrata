@@ -253,7 +253,11 @@ fn judge(raw: &str, roots: &Roots) -> Verdict {
     }
     let under_current = roots.current.join(&key);
     if !roots.planned {
-        return if under_current.exists() { Verdict::Keep } else { Verdict::Missing };
+        return if under_current.exists() {
+            Verdict::Keep
+        } else {
+            Verdict::Missing
+        };
     }
     // A planned root: a key that names a file under the current root is
     // spelled relative to the planned root; one that does not, but names a
@@ -409,9 +413,9 @@ pub fn audit_rows_for(
             // memory that would get a call is left for the user to decide.
             let location = payload.location.as_str();
             if location_is_path(location) {
-                let same = first_raw
-                    .flatten()
-                    .is_some_and(|first| spelled_key(&first, &roots) == spelled_key(location, &roots));
+                let same = first_raw.flatten().is_some_and(|first| {
+                    spelled_key(&first, &roots) == spelled_key(location, &roots)
+                });
                 location_conflict = !same;
             }
         } else if location_is_path(&payload.location) {
@@ -533,10 +537,10 @@ pub async fn audit_namespace(
     Ok(audit_rows_for(&rows, namespace, root, planned, bindings))
 }
 
-/// Every relative path key a row stores: `location`, `refs` files and the
-/// `governs` entries that name paths (never memory ids or domains; a bare
-/// name only when a file of that name exists under `root`).
-fn relative_keys(row: &SearchResult, root: &Path) -> Vec<String> {
+/// Every path key a row stores, relative or absolute: `location`, `refs`
+/// files and the `governs` entries that name paths (never memory ids or
+/// domains; a bare name only when a file of that name exists under `root`).
+fn path_keys(row: &SearchResult, root: &Path) -> Vec<String> {
     let payload = &row.payload;
     let mut keys = Vec::new();
     if location_is_path(&payload.location) {
@@ -562,8 +566,15 @@ fn relative_keys(row: &SearchResult, root: &Path) -> Vec<String> {
                 .map(str::to_string),
         );
     }
-    keys.retain(|k| !crate::paths::is_absolute_any(k));
     keys
+}
+
+/// Every relative path key a row stores.
+fn relative_keys(row: &SearchResult, root: &Path) -> Vec<String> {
+    path_keys(row, root)
+        .into_iter()
+        .filter(|k| !crate::paths::is_absolute_any(k))
+        .collect()
 }
 
 /// [`rows_lost_in`] over the namespace's rows read from a store, for tests.
@@ -595,7 +606,31 @@ pub fn rows_lost_in(rows: &[SearchResult], current: &Path, new: &Path) -> Vec<St
 /// ids of active rows with a relative stored key that names an existing file
 /// or folder under `current` but nothing under `new`.
 pub fn rows_missing_under(rows: &[SearchResult], current: &Path, new: &Path) -> Vec<String> {
-    rows_losing(rows, current, |_, key| !new.join(key).exists())
+    let mut lost = rows_losing(rows, current, |_, key| !new.join(key).exists());
+    // An absolute anchor under `current` is also lost: lookups join relative
+    // requests to the cached root, so the old spelling stops matching once
+    // the root moves to `new`.
+    let current_canon = dunce::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
+    let now = now_secs();
+    for row in rows.iter().filter(|r| is_auditable(r, now)) {
+        if lost.contains(&row.id) {
+            continue;
+        }
+        let anchored_under_current = path_keys(row, current).into_iter().any(|key| {
+            if !crate::paths::is_absolute_any(&key) {
+                return false;
+            }
+            let path = PathBuf::from(&key);
+            path.exists()
+                && dunce::canonicalize(&path)
+                    .is_ok_and(|p| p.starts_with(&current_canon) && p != current_canon)
+        });
+        if anchored_under_current {
+            lost.push(row.id.clone());
+        }
+    }
+    lost.sort();
+    lost
 }
 
 /// Ids of active rows with a relative key that names something under
@@ -944,9 +979,15 @@ mod tests {
         touch(&root, "src/a.rs");
         let only_undecided =
             store_with(vec![("m1", payload("Rule.", "src/gone.rs", json!({})))]).await;
-        let report = audit_namespace(&only_undecided, "example-project", &root, None, &HashMap::new())
-            .await
-            .unwrap();
+        let report = audit_namespace(
+            &only_undecided,
+            "example-project",
+            &root,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(report.needs_decision.len(), 1);
         assert_eq!(report.exit_code(), 0);
         let with_fixable = store_with(vec![(
@@ -954,9 +995,15 @@ mod tests {
             payload("Rule.", &abs(&root, "src/a.rs"), json!({})),
         )])
         .await;
-        let report = audit_namespace(&with_fixable, "example-project", &root, None, &HashMap::new())
-            .await
-            .unwrap();
+        let report = audit_namespace(
+            &with_fixable,
+            "example-project",
+            &root,
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(report.fixable.len(), 1);
         assert_eq!(
             report.fixable[0].supersede_args["locations"],
@@ -1139,7 +1186,14 @@ mod tests {
         touch(&top, "top.rs");
         let b = abs(&sub, "b.rs");
         let rows = vec![
-            ("m1", payload("Rule a.", "a.rs", json!({ "refs": [{ "file": "a.rs", "lines": "2" }] }))),
+            (
+                "m1",
+                payload(
+                    "Rule a.",
+                    "a.rs",
+                    json!({ "refs": [{ "file": "a.rs", "lines": "2" }] }),
+                ),
+            ),
             ("m2", payload("Rule b.", &b, json!({ "governs": [b] }))),
             // Already a key of the planned root.
             ("m3", payload("Rule top.", "top.rs", json!({}))),
@@ -1149,10 +1203,16 @@ mod tests {
         let report = audit_namespace(&store, "example-project", &sub, Some(&top), &HashMap::new())
             .await
             .unwrap();
-        let fixed: HashMap<&str, &Value> =
-            report.fixable.iter().map(|r| (r.id.as_str(), &r.supersede_args)).collect();
+        let fixed: HashMap<&str, &Value> = report
+            .fixable
+            .iter()
+            .map(|r| (r.id.as_str(), &r.supersede_args))
+            .collect();
         assert_eq!(fixed.len(), 2, "{:?}", report);
-        assert_eq!(fixed["m1"]["locations"], json!([{ "path": "sub/a.rs", "lines": "2" }]));
+        assert_eq!(
+            fixed["m1"]["locations"],
+            json!([{ "path": "sub/a.rs", "lines": "2" }])
+        );
         assert_eq!(fixed["m2"]["locations"], json!([{ "path": "sub/b.rs" }]));
         assert_eq!(fixed["m2"]["governs"], json!(["sub/b.rs"]));
         assert_eq!(
@@ -1166,7 +1226,14 @@ mod tests {
 
         // The corrected rows lose nothing when the root moves up.
         let corrected = vec![
-            ("m1", payload("Rule a.", "sub/a.rs", json!({ "refs": [{ "file": "sub/a.rs" }] }))),
+            (
+                "m1",
+                payload(
+                    "Rule a.",
+                    "sub/a.rs",
+                    json!({ "refs": [{ "file": "sub/a.rs" }] }),
+                ),
+            ),
             ("m3", payload("Rule top.", "top.rs", json!({}))),
         ];
         let rows: Vec<SearchResult> = store_with(corrected)
@@ -1182,9 +1249,15 @@ mod tests {
         // A planned root that does not contain the file: the key cannot be
         // spelled there, so it is left for a decision.
         let (_other_tmp, other) = tmp_root();
-        let report = audit_namespace(&store, "example-project", &sub, Some(&other), &HashMap::new())
-            .await
-            .unwrap();
+        let report = audit_namespace(
+            &store,
+            "example-project",
+            &sub,
+            Some(&other),
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
         assert!(report.needs_decision.contains(&UndecidedRow {
             id: "m1".to_string(),
             path: "a.rs".to_string(),
@@ -1202,10 +1275,23 @@ mod tests {
         touch(&root, "README.md");
         let a = abs(&root, "src/a.rs");
         let store = store_with(vec![
-            ("m1", payload("Rule.", "README.md", json!({ "refs": [{ "file": a }] }))),
-            ("m2", payload("Rule.", "src/a.rs", json!({ "refs": [{ "file": a }] }))),
+            (
+                "m1",
+                payload("Rule.", "README.md", json!({ "refs": [{ "file": a }] })),
+            ),
+            (
+                "m2",
+                payload("Rule.", "src/a.rs", json!({ "refs": [{ "file": a }] })),
+            ),
             // Nothing to rewrite: no call, so no decision either.
-            ("m3", payload("Rule.", "README.md", json!({ "refs": [{ "file": "src/a.rs" }] }))),
+            (
+                "m3",
+                payload(
+                    "Rule.",
+                    "README.md",
+                    json!({ "refs": [{ "file": "src/a.rs" }] }),
+                ),
+            ),
         ])
         .await;
         let report = audit_namespace(&store, "example-project", &root, None, &HashMap::new())
@@ -1232,7 +1318,10 @@ mod tests {
         let sub = top.join("sub");
         touch(&sub, "Cargo.toml");
         let store = store_with(vec![
-            ("m1", payload("Rule.", "", json!({ "governs": ["Cargo.toml"] }))),
+            (
+                "m1",
+                payload("Rule.", "", json!({ "governs": ["Cargo.toml"] })),
+            ),
             // No such file: a domain or an id, not a key.
             ("m2", payload("Rule.", "", json!({ "governs": ["auth"] }))),
         ])
@@ -1245,7 +1334,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.fixable.len(), 1, "{report:?}");
-        assert_eq!(report.fixable[0].supersede_args["governs"], json!(["sub/Cargo.toml"]));
+        assert_eq!(
+            report.fixable[0].supersede_args["governs"],
+            json!(["sub/Cargo.toml"])
+        );
     }
 
     /// Between unrelated roots a key is lost only when its file is missing
@@ -1265,7 +1357,39 @@ mod tests {
         .list("example-project", None, None)
         .await
         .unwrap();
-        assert_eq!(rows_missing_under(&rows, &old, &new), vec!["m1".to_string()]);
+        assert_eq!(
+            rows_missing_under(&rows, &old, &new),
+            vec!["m1".to_string()]
+        );
+    }
+
+    /// An absolute anchor under the old checkout is a loss too: after the
+    /// root moves, lookups join relative requests to the new root, so the
+    /// old absolute spelling no longer matches.
+    #[tokio::test]
+    async fn rows_missing_under_flags_absolute_anchors_under_the_old_root() {
+        let (_tmp, base) = tmp_root();
+        let (old, new) = (base.join("old"), base.join("new"));
+        touch(&old, "a.rs");
+        touch(&new, "a.rs");
+        let old_abs = abs(&old, "a.rs");
+        let new_abs = abs(&new, "a.rs");
+        let rows: Vec<SearchResult> = store_with(vec![
+            ("m1", payload("Rule.", &old_abs, json!({}))),
+            ("m2", payload("Rule.", &new_abs, json!({}))),
+            (
+                "m3",
+                payload("Rule.", "", json!({ "refs": [{ "file": old_abs }] })),
+            ),
+        ])
+        .await
+        .list("example-project", None, None)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows_missing_under(&rows, &old, &new),
+            vec!["m1".to_string(), "m3".to_string()]
+        );
     }
 
     /// A binding spelled differently for the same folder is this root, not
@@ -1277,18 +1401,33 @@ mod tests {
         touch(&root, "src/a.rs");
         let a = abs(&root, "src/a.rs");
         let raw = root.to_string_lossy().into_owned();
-        let respelled = format!("{}{}", raw[..1].to_ascii_lowercase(), raw[1..].replace('\\', "/"));
+        let respelled = format!(
+            "{}{}",
+            raw[..1].to_ascii_lowercase(),
+            raw[1..].replace('\\', "/")
+        );
         let mut bindings = HashMap::new();
-        bindings.insert("this-src".to_string(), PathBuf::from(respelled).join(".NeuroStrata"));
+        bindings.insert(
+            "this-src".to_string(),
+            PathBuf::from(respelled).join(".NeuroStrata"),
+        );
         let store = store_with(vec![(
             "m1",
-            payload("Rule.", &a, json!({ "refs": [{ "file": a, "source_context": { "source_id": "this-src" } }] })),
+            payload(
+                "Rule.",
+                &a,
+                json!({ "refs": [{ "file": a, "source_context": { "source_id": "this-src" } }] }),
+            ),
         )])
         .await;
         let report = audit_namespace(&store, "example-project", &root, None, &bindings)
             .await
             .unwrap();
-        assert!(report.needs_decision.is_empty(), "{:?}", report.needs_decision);
+        assert!(
+            report.needs_decision.is_empty(),
+            "{:?}",
+            report.needs_decision
+        );
         assert_eq!(report.fixable.len(), 1);
     }
 }

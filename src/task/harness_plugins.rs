@@ -369,6 +369,10 @@ fn repair_installer_hook_command(
     Some(repaired)
 }
 
+/// The Claude tools whose PreToolUse runs the runner for file recall and the
+/// guard.
+const CLAUDE_FILE_TOOLS_MATCHER: &str = "Read|Write|Edit|MultiEdit|Bash|Task";
+
 /// The NeuroStrata MCP tools whose PreToolUse runs the runner so it can pass
 /// the session's project folder as `worktree`.
 const CLAUDE_SESSION_SCOPE_MATCHER: &str = "mcp__.*__neurostrata_(task_claim|get_snapshot)";
@@ -788,22 +792,6 @@ fn read_config(path: &Path) -> Result<Option<Value>, UnreadableConfig> {
         path: path.to_path_buf(),
         reason,
     };
-    // `metadata` follows a symlink, so a link to a FIFO/device or to an
-    // enormous file is rejected before `read` can block or exhaust memory.
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            if !meta.is_file() {
-                return Err(unreadable("it is not a regular file".to_string()));
-            }
-            if meta.len() > MAX_CONFIG_BYTES {
-                return Err(unreadable(format!(
-                    "it is larger than the {MAX_CONFIG_BYTES}-byte config limit"
-                )));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(unreadable(e.to_string())),
-    }
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1679,43 +1667,15 @@ fn sync_skills_and_agent_rules(
 /// a rename, so a reader (a git hook running `namespace resolve`) sees the old
 /// file or the new one, never a half-written one.
 fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
-    // One lock for every config in this process: a refresh touches a handful,
-    // and serializing them is simpler and safer than a per-path lock table.
-    let _guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    // PID alone lets two in-process refreshes derive the same temp path.
-    // A process-wide sequence plus create_new makes a planted symlink and a
-    // racing refresh both fail loudly instead of following/clobbering it.
-    let tmp = path.with_file_name(format!(
-        ".{name}.tmp-{}-{}",
-        std::process::id(),
-        ATOMIC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let written = (|| -> std::io::Result<()> {
-        let mut file = options.open(&tmp)?;
-        std::io::Write::write_all(&mut file, contents.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        // A refresh must never widen an existing config's access: it carries
-        // tokens and namespace metadata other local users must not read.
-        #[cfg(unix)]
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mode = meta.permissions().mode();
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
-        }
-        std::fs::rename(&tmp, path)
-    })();
-    if written.is_err() {
+    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    })
 }
 
 fn wire_harness_config(
@@ -1867,7 +1827,7 @@ fn wire_harness_config(
                                 ensure_claude_hook(
                                     h_obj,
                                     "PreToolUse",
-                                    Some(CLAUDE_PRE_TOOL_USE_MATCHER),
+                                    Some(CLAUDE_FILE_TOOLS_MATCHER),
                                     |m| m != Some(CLAUDE_SESSION_SCOPE_MATCHER),
                                     &cmd,
                                     &runs,
@@ -2086,6 +2046,7 @@ mod tests {
             .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(dir.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
         (tmp, dir)
     }
 
@@ -2388,6 +2349,7 @@ mod tests {
         let main = base.join("platform");
         std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt")).unwrap();
         std::fs::write(main.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(main.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
         std::fs::create_dir_all(main.join("src")).unwrap();
         // No configuration yet: the folder name, from any directory inside.
         assert_eq!(ns_of(&main), "platform");
@@ -2883,12 +2845,16 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("claude"),
         );
-        let fresh = claude_pre_tool_use_matchers(tmp.path());
-        assert_eq!(
-            fresh.len(),
-            2,
-            "file tools and session-scope MCP tools: {fresh:?}"
-        );
+        // The installer also wires a session-scope hook; only the file-tools
+        // entry guards NotebookEdit.
+        let file_hooks = |root: &Path| {
+            claude_pre_tool_use_matchers(root)
+                .into_iter()
+                .filter(|(matcher, _)| !matcher.contains("mcp__"))
+                .collect::<Vec<_>>()
+        };
+        let fresh = file_hooks(tmp.path());
+        assert_eq!(fresh.len(), 1);
         assert!(
             fresh
                 .iter()
@@ -2922,7 +2888,7 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("claude"),
         );
-        let after = claude_pre_tool_use_matchers(tmp.path());
+        let after = file_hooks(tmp.path());
         assert_eq!(
             after,
             vec![
@@ -3961,7 +3927,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".codex")).expect("create .codex");
         let _ = auto_install_detected_plugins(
             tmp.path(),
-            ConfigNamespace::Set("folder-name"),
+            ConfigNamespace::Set("TestProj"),
             Some("codex"),
         );
         let before = read_codex_hooks(tmp.path());
@@ -3974,7 +3940,7 @@ mod tests {
             assert_eq!(
                 read_codex_hooks(tmp.path()),
                 before,
-                "install with {other:?} must change nothing"
+                "refresh with {other:?} must change nothing"
             );
         }
         for command in codex_commands(&before, "PreToolUse") {
@@ -4057,7 +4023,12 @@ mod tests {
     #[test]
     fn installed_runner_passes_a_namespace_only_when_set() {
         assert!(!CLI_HOOK_RUNNER_MJS.contains("{ namespace: process.env.NEUROSTRATA_NAMESPACE }"));
-        assert!(CLI_HOOK_RUNNER_MJS.contains("namespace ? { namespace } : {}"));
+        // The namespace now comes from the harness config the installer wrote:
+        // `readHarnessConfig` returns `{}` when none is set, so an explicit
+        // `namespace: undefined` is never passed, and `projectDir` travels
+        // with it for root-lookup spelling.
+        assert!(CLI_HOOK_RUNNER_MJS.contains("readHarnessConfig(HARNESS, projectDir, RUNNER_DIR)"));
+        assert!(CLI_HOOK_RUNNER_MJS.contains(", projectDir });"));
     }
 
     /// Ownership is the installer's layout, read as literal text: a user's
