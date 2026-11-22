@@ -694,10 +694,11 @@ pub enum ConfigNamespace<'a> {
     /// none gets this one when given, else is left unwritten (plugin files
     /// only). A config that cannot be read is left as it is.
     Keep(Option<&'a str>),
-    /// The daemon's boot refresh: each harness gets the namespace listed for
-    /// it ([`boot_namespaces_for`]); a harness not listed, or whose config
-    /// cannot be read, is left unwritten.
-    Each(&'a [(String, String)]),
+    /// The daemon's boot refresh with a project-scoped fallback: a harness
+    /// keeps its own namespace, and a harness whose config names none gets
+    /// `fallback` so a detected harness is still wired. An unreadable config
+    /// is left as it is.
+    EachWithFallback(&'a [(String, String)], &'a str),
 }
 
 impl ConfigNamespace<'_> {
@@ -711,13 +712,16 @@ impl ConfigNamespace<'_> {
                 Ok(None) => fallback.and_then(usable_namespace),
                 Err(_) => None,
             },
-            ConfigNamespace::Each(listed) => match harness_config_namespace(root, harness) {
-                Err(_) => None,
-                Ok(_) => listed
-                    .iter()
-                    .find(|(h, _)| h == harness)
-                    .map(|(_, ns)| ns.clone()),
-            },
+            ConfigNamespace::EachWithFallback(listed, fallback) => {
+                match harness_config_namespace(root, harness) {
+                    Err(_) => None,
+                    Ok(_) => listed
+                        .iter()
+                        .find(|(h, _)| h == harness)
+                        .map(|(_, ns)| ns.clone())
+                        .or_else(|| usable_namespace(fallback)),
+                }
+            }
         }
     }
 }
@@ -870,13 +874,35 @@ pub fn boot_namespaces_for(dir: &Path) -> Vec<(String, String)> {
     found
 }
 
+/// A project-scoped namespace derived from the checkout folder name, used on
+/// the initialization path (daemon boot, snapshot refresh) to wire a detected
+/// harness whose config names no namespace. Never the daemon's environment:
+/// one daemon serves every project, so its own namespace is not this
+/// project's.
+fn project_namespace(dir: &Path) -> Option<String> {
+    let roots = NamespaceRoots::of(dir).ok()?;
+    let folder = roots
+        .main_root
+        .as_deref()
+        .unwrap_or(roots.dir.as_path())
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    usable_namespace(&folder)
+}
+
 /// The daemon's boot-time refresh for `dir`. Bundles are always refreshed;
-/// each harness config is rewritten only with the namespace
-/// [`boot_namespaces_for`] keeps for that harness, so configs that disagree
-/// stay as they are and a harness without one is never given one.
+/// each harness config keeps its own namespace, and a detected harness whose
+/// config names none gets the project-scoped fallback so it is wired too. An
+/// unreadable config is left as it is.
 pub fn boot_install_plugins(dir: &Path) -> Value {
     let namespaces = boot_namespaces_for(dir);
-    auto_install_detected_plugins(dir, ConfigNamespace::Each(&namespaces), None)
+    let fallback = project_namespace(dir).unwrap_or_default();
+    auto_install_detected_plugins(
+        dir,
+        ConfigNamespace::EachWithFallback(&namespaces, &fallback),
+        None,
+    )
 }
 
 /// The daemon's boot-time refresh for a configured project. The config
@@ -907,10 +933,12 @@ pub fn auto_install_detected_plugins(
             "active_harness": active,
             "detected_harnesses": detected,
             "installed_plugins": [],
+            "errors": [],
         });
     }
     let base_dir = project_root.join(".NeuroStrata/plugins");
     let mut installed = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
 
     // Bundle the shared plugin-core once so every harness adapter's relative
     // `../../core/dist/index.js` import resolves on disk under
@@ -918,19 +946,13 @@ pub fn auto_install_detected_plugins(
     if !detected.is_empty() {
         let core_dir = base_dir.join("core");
         let core_dist = core_dir.join("dist");
-        if std::fs::create_dir_all(&core_dist).is_ok() {
+        if let Err(err) = std::fs::create_dir_all(&core_dist) {
+            errors.push(format!("{}: {err}", core_dist.display()));
+        } else {
             let core_index = core_dist.join("index.js");
             let core_pkg = core_dir.join("package.json");
-            let write_if_changed = |path: &Path, content: &str| {
-                let needs_write = std::fs::read_to_string(path)
-                    .map(|existing| existing != content)
-                    .unwrap_or(true);
-                if needs_write {
-                    let _ = std::fs::write(path, content);
-                }
-            };
-            write_if_changed(&core_index, CORE_INDEX_JS);
-            write_if_changed(&core_pkg, CORE_PKG_JSON);
+            write_plugin_file(&core_index, CORE_INDEX_JS, &mut errors);
+            write_plugin_file(&core_pkg, CORE_PKG_JSON, &mut errors);
         }
     }
 
@@ -940,32 +962,29 @@ pub fn auto_install_detected_plugins(
         };
         let plugin_dir = base_dir.join(harness);
         let dist_dir = plugin_dir.join("dist");
-        if std::fs::create_dir_all(&dist_dir).is_err() {
+        if let Err(err) = std::fs::create_dir_all(&dist_dir) {
+            errors.push(format!("{}: {err}", dist_dir.display()));
             continue;
         }
         let dist_index = dist_dir.join("index.js");
         let pkg_path = plugin_dir.join("package.json");
         let runner_path = plugin_dir.join("cli-hook.mjs");
 
-        let write_if_changed = |path: &Path, content: &str| {
-            let needs_write = std::fs::read_to_string(path)
-                .map(|existing| existing != content)
-                .unwrap_or(true);
-            if needs_write {
-                let _ = std::fs::write(path, content);
-            }
-        };
-
-        write_if_changed(&dist_index, index_js);
-        write_if_changed(&pkg_path, pkg_json);
-        write_if_changed(&runner_path, CLI_HOOK_RUNNER_MJS);
+        write_plugin_file(&dist_index, index_js, &mut errors);
+        write_plugin_file(&pkg_path, pkg_json, &mut errors);
+        write_plugin_file(&runner_path, CLI_HOOK_RUNNER_MJS, &mut errors);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&runner_path) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o755);
-                let _ = std::fs::set_permissions(&runner_path, perms);
+            match std::fs::metadata(&runner_path) {
+                Ok(meta) => {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o755);
+                    if let Err(err) = std::fs::set_permissions(&runner_path, perms) {
+                        errors.push(format!("{}: {err}", runner_path.display()));
+                    }
+                }
+                Err(err) => errors.push(format!("{}: {err}", runner_path.display())),
             }
         }
 
@@ -990,7 +1009,7 @@ pub fn auto_install_detected_plugins(
     }
 
     let (skills_installed, patched_agents) =
-        sync_skills_and_agent_rules(project_root, active, &detected);
+        sync_skills_and_agent_rules(project_root, active, &detected, &mut errors);
 
     json!({
         "active_harness": active,
@@ -998,6 +1017,7 @@ pub fn auto_install_detected_plugins(
         "installed_plugins": installed,
         "skills_installed": skills_installed,
         "patched_agents": patched_agents,
+        "errors": errors,
     })
 }
 
@@ -1005,20 +1025,28 @@ fn sync_skills_and_agent_rules(
     project_root: &Path,
     active: Option<&str>,
     detected: &[&str],
+    errors: &mut Vec<String>,
 ) -> (Vec<String>, Vec<String>) {
     let mut skills_installed = Vec::new();
     let mut patched_agents = Vec::new();
 
-    let write_file_if_changed = |path: &Path, content: &str| -> bool {
+    let mut write_file_if_changed = |path: &Path, content: &str| -> bool {
         if let Some(parent) = path.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                errors.push(format!("{}: {err}", parent.display()));
                 return false;
             }
         }
         let needs_write = std::fs::read_to_string(path)
             .map(|existing| existing != content)
             .unwrap_or(true);
-        !(needs_write && std::fs::write(path, content).is_err())
+        if needs_write {
+            if let Err(err) = std::fs::write(path, content) {
+                errors.push(format!("{}: {err}", path.display()));
+                return false;
+            }
+        }
+        true
     };
 
     // 1. Always scaffold project-local .agents/skills/neurostrata/SKILL.md and .agents/agents/NeuroStrata-Task.md
@@ -1120,14 +1148,34 @@ fn sync_skills_and_agent_rules(
                 None
             };
             if let Some(updated) = updated {
-                if std::fs::write(&path, updated).is_ok() {
-                    patched_agents.push(path.to_string_lossy().to_string());
+                match std::fs::write(&path, updated) {
+                    Ok(()) => patched_agents.push(path.to_string_lossy().to_string()),
+                    Err(err) => errors.push(format!("{}: {err}", path.display())),
                 }
             }
         }
     }
 
     (skills_installed, patched_agents)
+}
+
+/// Write `content` to `path` only when it differs. Filesystem failures are
+/// reported to `errors` rather than silently skipped, so a boot refresh that
+/// leaves plugins stale is visible to the operator.
+fn write_plugin_file(path: &Path, content: &str, errors: &mut Vec<String>) -> bool {
+    let needs_write = std::fs::read_to_string(path)
+        .map(|existing| existing != content)
+        .unwrap_or(true);
+    if !needs_write {
+        return true;
+    }
+    match std::fs::write(path, content) {
+        Ok(()) => true,
+        Err(err) => {
+            errors.push(format!("{}: {err}", path.display()));
+            false
+        }
+    }
 }
 
 /// Write `contents` to `path` through a temporary file in the same folder and
@@ -2840,5 +2888,32 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "permissions became {mode:o}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new secret value");
+    }
+
+    #[test]
+    fn boot_install_reports_write_failures() {
+        let (_tmp, dir) = refresh_project();
+        // A file where the plugins directory must go makes the refresh fail.
+        std::fs::write(dir.join(".NeuroStrata"), b"not a directory").unwrap();
+        let report = boot_install_plugins(&dir);
+        let errors = report.get("errors").and_then(|v| v.as_array());
+        assert!(
+            errors.is_some_and(|e| !e.is_empty()),
+            "expected installation errors in {report:?}"
+        );
+    }
+
+    #[test]
+    fn each_with_fallback_wires_missing_and_keeps_own() {
+        let (_tmp, dir) = refresh_project();
+        let listed = vec![("codex".to_string(), "beta".to_string())];
+        let ns = ConfigNamespace::EachWithFallback(&listed, "example-project");
+        // codex already has its own namespace in the boot ledger.
+        assert_eq!(ns.for_harness(&dir, "codex").as_deref(), Some("beta"));
+        // claude has no config namespace; the project-scoped fallback wires it.
+        assert_eq!(
+            ns.for_harness(&dir, "claude").as_deref(),
+            Some("example-project")
+        );
     }
 }

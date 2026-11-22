@@ -491,6 +491,20 @@ struct GraphQuery {
     pub clear: bool,
 }
 
+/// Surface plugin-install failures from a boot refresh. The installer is
+/// fail-soft, so without this a permissions or disk-space error leaves plugins
+/// stale while daemon startup looks healthy.
+fn log_boot_plugin_errors(label: &str, report: &serde_json::Value) {
+    let Some(errors) = report.get("errors").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for err in errors {
+        if let Some(msg) = err.as_str() {
+            tracing::warn!("harness plugin boot refresh ({label}) failed: {msg}");
+        }
+    }
+}
+
 pub async fn start_daemon(
     embedder: Arc<dyn Embedder>,
     vector_store: Arc<dyn VectorStore>,
@@ -506,10 +520,13 @@ pub async fn start_daemon(
     // Each harness config keeps its own namespace; a config naming none is
     // not written (an empty or made-up namespace is never written).
     let startup_root = resolve_project_root();
-    let _ = crate::task::harness_plugins::boot_install_plugins(&startup_root);
+    let report = crate::task::harness_plugins::boot_install_plugins(&startup_root);
+    log_boot_plugin_errors("startup root", &report);
     if let Ok(cfg) = crate::config::Config::load() {
         for dir in cfg.project_contexts.values() {
-            let _ = crate::task::harness_plugins::boot_install_project_context(dir);
+            let project = dir.to_string_lossy().to_string();
+            let report = crate::task::harness_plugins::boot_install_project_context(dir);
+            log_boot_plugin_errors(&format!("project context {project}"), &report);
         }
     }
     // The port the MCP proxy and CLI hardcode; changing it changes the wire

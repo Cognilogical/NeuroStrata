@@ -5902,9 +5902,11 @@ async fn handle_get_snapshot(
             .min_by_key(|p| p.len())
             .map(|s| s.to_string())
     });
+    // Pass the snapshot's resolved namespace so a detected harness with no
+    // config namespace still gets wired on this zero-touch init path.
     let hooks_line = inferred_root
         .as_ref()
-        .map(|r| crate::task::hook_hygiene(std::path::Path::new(r)))
+        .map(|r| crate::task::hook_hygiene_with_namespace(std::path::Path::new(r), Some(namespace)))
         .unwrap_or_default();
 
     // Default recall hides tombstoned rows. The snapshot is the operator's

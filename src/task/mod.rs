@@ -776,7 +776,10 @@ fn golden_prompt_lines(golden_rules: &[SearchResult], snippet_len: usize) -> Vec
 /// Map task metadata into the canonical R4 `TaskContext` so
 /// `routing::evaluate_triggers` has a production caller at task-context build
 /// time. Absent/neutral metadata fires nothing (honest abstention).
-fn task_routing_triggers(namespace: &str, metadata: &Value) -> Vec<crate::task::routing::RouteTrigger> {
+fn task_routing_triggers(
+    namespace: &str,
+    metadata: &Value,
+) -> Vec<crate::task::routing::RouteTrigger> {
     let flag = |key: &str| metadata.get(key).and_then(Value::as_bool).unwrap_or(false);
     crate::task::routing::evaluate_triggers(crate::task::routing::TaskContext {
         namespace: namespace.to_string(),
@@ -1103,9 +1106,7 @@ pub async fn build_task_graph_context(
         next_hop_calls.push(crate::task::routing::next_action(&trigger, &lookup_ids));
     }
 
-    let expansion_error_value = expansion_error
-        .map(Value::String)
-        .unwrap_or(Value::Null);
+    let expansion_error_value = expansion_error.map(Value::String).unwrap_or(Value::Null);
 
     let auto_retrieved_context = json!({
         "query": payload.content,
@@ -3818,12 +3819,11 @@ pub async fn handle_bootstrap(
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let root = std::path::Path::new(project_root);
-    let harness_plugins =
-        harness_plugins::auto_install_detected_plugins(
-            root,
-            harness_plugins::ConfigNamespace::Set(&namespace),
-            arg_str(&args, "harness"),
-        );
+    let harness_plugins = harness_plugins::auto_install_detected_plugins(
+        root,
+        harness_plugins::ConfigNamespace::Set(&namespace),
+        arg_str(&args, "harness"),
+    );
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
     let hook_installed = verified["hook_installed"].as_bool().unwrap_or(false);
 
@@ -4409,16 +4409,30 @@ pub(crate) fn git_hooks_dir(root: &std::path::Path) -> std::path::PathBuf {
 /// The daemon's own `NEUROSTRATA_NAMESPACE` is not read: one daemon serves
 /// every project.
 pub(crate) fn hook_hygiene(root: &std::path::Path) -> String {
-    hook_hygiene_reading_env(root, false)
+    hook_hygiene_reading_env(root, false, None)
+}
+
+/// Hook hygiene during `get_snapshot`, where the snapshot's already-resolved
+/// namespace is available: wire a detected harness whose config names no
+/// namespace with it, while configs that name their own keep theirs.
+pub(crate) fn hook_hygiene_with_namespace(
+    root: &std::path::Path,
+    fallback: Option<&str>,
+) -> String {
+    hook_hygiene_reading_env(root, false, fallback)
 }
 
 /// [`hook_hygiene`] for a CLI run in the project, where
 /// `NEUROSTRATA_NAMESPACE` is the user's, as the git hooks see it.
 pub(crate) fn hook_hygiene_from_cli(root: &std::path::Path) -> String {
-    hook_hygiene_reading_env(root, true)
+    hook_hygiene_reading_env(root, true, None)
 }
 
-fn hook_hygiene_reading_env(root: &std::path::Path, read_env: bool) -> String {
+fn hook_hygiene_reading_env(
+    root: &std::path::Path,
+    read_env: bool,
+    fallback: Option<&str>,
+) -> String {
     if !root.join(".git").exists() {
         return String::new();
     }
@@ -4429,11 +4443,18 @@ fn hook_hygiene_reading_env(root: &std::path::Path, read_env: bool) -> String {
     // refreshed.
     let (explicit, warning) = match harness_plugins::namespace_for_refresh(root, read_env) {
         Ok(ns) => (ns, None),
-        Err(e) => (None, Some(format!("HOOKS: harness configs left as they are: {e}"))),
+        Err(e) => (
+            None,
+            Some(format!("HOOKS: harness configs left as they are: {e}")),
+        ),
     };
+    // An explicit namespace outranks the caller's fallback; the fallback only
+    // wires a config that named none. Each config keeps its own namespace in
+    // either case (Keep semantics).
+    let effective = explicit.as_deref().or(fallback);
     let _ = harness_plugins::auto_install_detected_plugins(
         root,
-        harness_plugins::ConfigNamespace::Keep(explicit.as_deref()),
+        harness_plugins::ConfigNamespace::Keep(effective),
         None,
     );
     let status = hook_hygiene_files(root);
@@ -5151,12 +5172,11 @@ pub async fn handle_task_setup(
     if !root.is_dir() {
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
-    let harness_plugins =
-        harness_plugins::auto_install_detected_plugins(
-            root,
-            harness_plugins::ConfigNamespace::Set(&namespace),
-            arg_str(&args, "harness"),
-        );
+    let harness_plugins = harness_plugins::auto_install_detected_plugins(
+        root,
+        harness_plugins::ConfigNamespace::Set(&namespace),
+        arg_str(&args, "harness"),
+    );
 
     let scan = detect_project(root);
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
@@ -5725,8 +5745,7 @@ mod tests {
     /// never silently skips a guard the hook claims to run.
     #[test]
     fn bootstrap_scaffolds_every_prepush_project_gate() {
-        let root =
-            std::env::temp_dir().join(format!("ns-scaffold-gates-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("ns-scaffold-gates-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
         std::fs::write(root.join(".git").join("config"), "[core]\n").unwrap();
@@ -5790,8 +5809,7 @@ mod tests {
     #[test]
     fn hook_hygiene_seeds_all_tracked_hook_artifacts_on_fresh_project() {
         use std::os::unix::fs::PermissionsExt;
-        let root =
-            std::env::temp_dir().join(format!("ns-hygiene-seed-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("ns-hygiene-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
 
@@ -5831,6 +5849,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// get_snapshot passes its resolved namespace so a detected harness with
+    /// no config namespace still gets wired (zero-touch), while a config that
+    /// names its own namespace keeps it.
+    #[cfg(unix)]
+    #[test]
+    fn hook_hygiene_with_namespace_wires_detected_harness() {
+        let root = std::env::temp_dir().join(format!("ns-hygiene-wire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+
+        let _ = hook_hygiene_with_namespace(&root, Some("proj-ns"));
+        let settings = std::fs::read_to_string(root.join(".claude/settings.local.json"))
+            .expect("claude settings should be wired with the fallback namespace");
+        assert!(
+            settings.contains("proj-ns"),
+            "expected proj-ns in {settings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The scaffolded guard must be the canonical script, not an empty stub.
     #[test]
     fn scaffolded_task_coverage_gate_is_valid_bash() {
@@ -5846,8 +5885,7 @@ mod tests {
             SCAFFOLDED_TASK_COVERAGE_GATE.contains("untracked work items"),
             "the guard must carry the task-ID gate marker"
         );
-        let path =
-            std::env::temp_dir().join(format!("ns-gate-scaffold-{}.sh", std::process::id()));
+        let path = std::env::temp_dir().join(format!("ns-gate-scaffold-{}.sh", std::process::id()));
         std::fs::write(&path, SCAFFOLDED_TASK_COVERAGE_GATE).unwrap();
         let syntax = std::process::Command::new("bash")
             .arg("-n")
@@ -5975,18 +6013,11 @@ mod tests {
         let store = temp_store().await;
         let ns = "RegRootNs";
         store.init(ns).await.expect("init namespace schema");
-        let worktree = std::env::temp_dir().join(format!(
-            "ns-ledger-registry-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let worktree =
+            std::env::temp_dir().join(format!("ns-ledger-registry-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(worktree.join(".git")).unwrap();
-        crate::registry::cache_project_root(
-            &store,
-            Some(&emb()),
-            ns,
-            worktree.to_str().unwrap(),
-        )
-        .await;
+        crate::registry::cache_project_root(&store, Some(&emb()), ns, worktree.to_str().unwrap())
+            .await;
         assert_eq!(
             crate::registry::cached_project_root(&store, ns)
                 .await
@@ -6023,8 +6054,7 @@ mod tests {
             ledger.exists(),
             "receipt must be written under the registry project_root, not daemon CWD"
         );
-        let doc: Value =
-            serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
         assert_eq!(doc["events"][0]["event_id"], "evt-registry");
         assert_eq!(
             receipt_ledger_root(None, &store, ns).await,
@@ -6040,24 +6070,15 @@ mod tests {
         let store = temp_store().await;
         let ns = "HintRootNs";
         store.init(ns).await.expect("init namespace schema");
-        let scratch = std::env::temp_dir().join(format!(
-            "ns-scratch-hint-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let scratch =
+            std::env::temp_dir().join(format!("ns-scratch-hint-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&scratch).unwrap();
         assert!(!scratch.join(".git").exists() && !scratch.join(".NeuroStrata").exists());
-        let worktree = std::env::temp_dir().join(format!(
-            "ns-real-worktree-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let worktree =
+            std::env::temp_dir().join(format!("ns-real-worktree-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(worktree.join(".git")).unwrap();
-        crate::registry::cache_project_root(
-            &store,
-            Some(&emb()),
-            ns,
-            worktree.to_str().unwrap(),
-        )
-        .await;
+        crate::registry::cache_project_root(&store, Some(&emb()), ns, worktree.to_str().unwrap())
+            .await;
         assert_eq!(
             receipt_ledger_root(Some(scratch.to_str().unwrap()), &store, ns).await,
             Some(worktree),
@@ -6256,7 +6277,9 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let repo = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(repo.join(".NeuroStrata")).unwrap();
         git_stdout_in(&repo, &["init", "-q"]);
         let ledger = repo.join(".NeuroStrata").join("session_queries.json");
@@ -6279,7 +6302,9 @@ mod tests {
             if let Some(bin) = bash.parent() {
                 dirs.push(bin.to_path_buf());
             }
-            dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+            dirs.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
             let mut cmd = std::process::Command::new(&bash);
             cmd.arg(&hook)
                 .current_dir(&repo)
@@ -6289,13 +6314,22 @@ mod tests {
                 cmd.env("STUB_RESOLVE_EXIT", code);
             }
             let out = cmd.output().expect("the hook runs");
-            assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         let read = || -> Value {
             serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap()
         };
         run(Some("1"));
-        assert_eq!(std::fs::read_to_string(&ledger).unwrap(), seeded, "a failed lookup changes nothing");
+        assert_eq!(
+            std::fs::read_to_string(&ledger).unwrap(),
+            seeded,
+            "a failed lookup changes nothing"
+        );
         run(None);
         let doc = read();
         assert_eq!(doc["namespace"], json!("alpha"));
@@ -6327,9 +6361,13 @@ mod tests {
         let inherited: Vec<std::path::PathBuf> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
                 .filter(|d| {
-                    ["neurostrata-mcp", "neurostrata-mcp.exe", "neurostrata-mcp.cmd"]
-                        .iter()
-                        .all(|name| !d.join(name).is_file())
+                    [
+                        "neurostrata-mcp",
+                        "neurostrata-mcp.exe",
+                        "neurostrata-mcp.cmd",
+                    ]
+                    .iter()
+                    .all(|name| !d.join(name).is_file())
                 })
                 .collect();
         let run = |with_stub: bool, envs: &[(&str, &str)]| -> (Option<i32>, String) {
@@ -6353,22 +6391,40 @@ mod tests {
                 cmd.env(key, value);
             }
             let out = cmd.output().expect("the hook runs");
-            (out.status.code(), String::from_utf8_lossy(&out.stderr).to_string())
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
         };
         let (code, stderr) = run(false, &[]);
         assert_eq!(code, Some(1), "no neurostrata-mcp on PATH blocks the push");
-        assert!(stderr.contains("error: neurostrata-mcp not found"), "{stderr}");
-        let (code, stderr) = run(true, &[("STUB_RESOLVE_EXIT", "2")]);
-        assert_eq!(code, Some(1), "a namespace resolve that exits 2 blocks the push");
         assert!(
-            stderr.contains("error: neurostrata-mcp namespace resolve failed — gate NOT run for this push")
-                && stderr.contains("upgrade it"),
+            stderr.contains("error: neurostrata-mcp not found"),
+            "{stderr}"
+        );
+        let (code, stderr) = run(true, &[("STUB_RESOLVE_EXIT", "2")]);
+        assert_eq!(
+            code,
+            Some(1),
+            "a namespace resolve that exits 2 blocks the push"
+        );
+        assert!(
+            stderr.contains(
+                "error: neurostrata-mcp namespace resolve failed — gate NOT run for this push"
+            ) && stderr.contains("upgrade it"),
             "a failed resolve is announced, never silent: {stderr}"
         );
         let (code, stderr) = run(true, &[("STUB_GATE_EXIT", "2")]);
         assert_eq!(code, Some(1), "a gate that exits 2 blocks the push");
-        assert!(stderr.contains("the gate could NOT run for this push"), "{stderr}");
-        assert_eq!(run(true, &[]).0, Some(0), "a passing gate lets the push through");
+        assert!(
+            stderr.contains("the gate could NOT run for this push"),
+            "{stderr}"
+        );
+        assert_eq!(
+            run(true, &[]).0,
+            Some(0),
+            "a passing gate lets the push through"
+        );
     }
 
     /// `neurostrata-mcp hooks install` and `scripts/install-hooks.sh` must
@@ -6535,14 +6591,16 @@ mod tests {
             .expect("task exists")
             .1
             .metadata;
-        assert_eq!(after, before, "record_tool_receipt must not mutate task counters");
+        assert_eq!(
+            after, before,
+            "record_tool_receipt must not mutate task counters"
+        );
 
         // Attribution still lands on the receipt, and no legacy row is written.
         let ledger_path = tmp.path().join(".NeuroStrata/session_queries.json");
-        let ledger: Value = serde_json::from_str(
-            &std::fs::read_to_string(&ledger_path).expect("ledger written"),
-        )
-        .expect("valid ledger");
+        let ledger: Value =
+            serde_json::from_str(&std::fs::read_to_string(&ledger_path).expect("ledger written"))
+                .expect("valid ledger");
         assert_eq!(ledger["events"][0]["task_id"].as_str(), Some(task_id));
         assert_eq!(
             ledger["queries"].as_array().map(|a| a.len()),
@@ -10500,10 +10558,7 @@ mod tests {
             .any(|a| a == "T_HIGH_BLAST:abc123"));
 
         // Isolated worktree ledger seeded with that attributed receipt.
-        let tmp = std::env::temp_dir().join(format!(
-            "ns-advisory-e2e-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let tmp = std::env::temp_dir().join(format!("ns-advisory-e2e-{}", uuid::Uuid::new_v4()));
         let ns_dir = tmp.join(".NeuroStrata");
         std::fs::create_dir_all(&ns_dir).unwrap();
         let mut event = fields.to_value();
@@ -10574,8 +10629,7 @@ mod tests {
 
         // Exact followed-proof of the prescribed action id resolves it.
         let mut proven_related = related;
-        proven_related["followed_action_ids"] =
-            serde_json::json!(["T_HIGH_BLAST:abc123"]);
+        proven_related["followed_action_ids"] = serde_json::json!(["T_HIGH_BLAST:abc123"]);
         let resolved = serde_json::json!({
             "events_version": 1,
             "events": [event, proven_related]
@@ -11548,9 +11602,16 @@ mod tests {
         };
         let (ctx, _prompt) =
             build_task_graph_context(&store, "probe", "task-1", &[0.0f32; 4], &payload).await;
-        let edges = ctx["related_edges"].as_array().expect("related_edges array");
-        assert!(!edges.is_empty(), "related_edges must be non-empty: {edges:?}");
-        let calls = ctx["next_hop_calls"].as_array().expect("next_hop_calls array");
+        let edges = ctx["related_edges"]
+            .as_array()
+            .expect("related_edges array");
+        assert!(
+            !edges.is_empty(),
+            "related_edges must be non-empty: {edges:?}"
+        );
+        let calls = ctx["next_hop_calls"]
+            .as_array()
+            .expect("next_hop_calls array");
         assert!(!calls.is_empty(), "next_hop_calls must be non-empty");
         assert_eq!(calls[0]["tool"], "neurostrata_related");
         assert_eq!(calls[0]["trigger_id"], "T_SEED_EXPAND");
@@ -11577,10 +11638,8 @@ mod tests {
     #[test]
     fn task_routing_triggers_use_canonical_contract() {
         assert!(task_routing_triggers("ns", &json!({})).is_empty());
-        let routes = task_routing_triggers(
-            "ns",
-            &json!({"task_type": "feature", "strategic": true}),
-        );
+        let routes =
+            task_routing_triggers("ns", &json!({"task_type": "feature", "strategic": true}));
         let ids: Vec<&str> = routes.iter().map(|r| r.id).collect();
         assert_eq!(ids, vec!["T_DOMAIN_NEW", "T_STRATEGIC"]);
         assert_eq!(routes[1].tool, "neurostrata_taxonomy");
@@ -11640,8 +11699,15 @@ mod tests {
         };
         let (ctx, prompt) =
             build_task_graph_context(&store, "probe", "task-1", &[0.5f32; 4], &payload).await;
-        assert!(prompt.chars().count() <= 3500, "prompt too long: {}", prompt.chars().count());
-        assert!(prompt.contains("golden-1"), "golden rule must survive truncation: {prompt}");
+        assert!(
+            prompt.chars().count() <= 3500,
+            "prompt too long: {}",
+            prompt.chars().count()
+        );
+        assert!(
+            prompt.contains("golden-1"),
+            "golden rule must survive truncation: {prompt}"
+        );
         let golden = ctx["golden_rules"].as_array().expect("golden_rules");
         assert!(!golden.is_empty(), "golden_rules must remain present");
     }
