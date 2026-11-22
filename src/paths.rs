@@ -2425,6 +2425,40 @@ mod tests {
         assert_eq!(main_checkout_root(&s(&wt)), Some(project.clone()));
     }
 
+    /// Unrelated files beside a separate git directory do not make its parent
+    /// a checkout: only Git's own metadata establishes ownership.
+    #[test]
+    fn unrelated_entries_do_not_make_a_parent_the_main_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let data = base.join("data");
+        let common = data.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        touch(&data.join("unrelated.txt"));
+        std::fs::write(common.join("config"), "[core]\n\tbare = false\n").unwrap();
+        let wt = base.join("agent-1");
+        link_worktree(&wt, &common.join("worktrees").join("agent-1"));
+
+        assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
+    }
+
+    /// A main checkout whose working directory holds nothing but `.git` is
+    /// still a checkout when that git directory has Git's own `HEAD` metadata.
+    #[test]
+    fn main_checkout_with_only_dot_git_and_head_is_recognized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let project = base.join("example-project");
+        let common = project.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        touch(&common.join("HEAD"));
+        std::fs::write(common.join("config"), "[core]\n\tbare = false\n").unwrap();
+        let wt = base.join("agent-1");
+        link_worktree(&wt, &common.join("worktrees").join("agent-1"));
+
+        assert_eq!(main_checkout_root(&s(&wt)), Some(project.clone()));
+    }
+
     /// `git init --separate-git-dir data/proj/.git sep` + `git worktree add`:
     /// the common directory is `data/proj/.git`, but `data/proj` is no
     /// checkout. The real main checkout `sep` is named nowhere git keeps
