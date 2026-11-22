@@ -4710,6 +4710,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_namespace_resolve_command_parses() {
+        let cli =
+            Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
+        match cli.command {
+            Some(Commands::Namespace { action }) => {
+                assert_eq!(action, NamespaceCommands::Resolve { dir: None })
+            }
+            other => panic!("expected Namespace/Resolve, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve", "some/dir"])
+            .expect("parses with a dir");
+        match cli.command {
+            Some(Commands::Namespace { action }) => {
+                assert_eq!(
+                    action,
+                    NamespaceCommands::Resolve {
+                        dir: Some("some/dir".into())
+                    }
+                )
+            }
+            other => panic!("expected Namespace/Resolve, got {:?}", other),
+        }
+    }
+
     /// Task 7's operator surface: both commands exist as spelled here, and
     /// `archive` takes the namespace and the id in the order the tool surface
     /// names them -- a swapped pair would archive a row that does not exist
