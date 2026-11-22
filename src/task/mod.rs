@@ -4363,12 +4363,13 @@ if [ ! -f "$LEDGER" ]; then
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
-    # rewrite holds the same cross-process lock as the daemon's ledger writer,
-    # uses a unique EXCLUSIVE temp file (a planted symlink cannot be followed),
+    # rewrite holds the same cross-process lock as the daemon's ledger writer
+    # where `flock` exists (Linux; not Git Bash or stock macOS), uses a unique
+    # EXCLUSIVE temp file (a planted symlink cannot be followed),
     # keeps the original mode, and wraps legacy bare-array ledgers. An
     # unparseable ledger or a missing node/python3 leaves the file as it is.
     export LEDGER NAMESPACE
-    exec 9>"$LEDGER.lock" 2>/dev/null || true
+    exec 9>>"$LEDGER.lock" 2>/dev/null || true
     command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true
     if command -v node >/dev/null 2>&1; then
         node -e '
@@ -4379,7 +4380,7 @@ elif [ -n "$RESOLVED" ]; then
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
           const doc = Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed;
           if (!doc || typeof doc !== "object") process.exit(0);
-          if (doc.namespace === ns) process.exit(0);
+          if (!Array.isArray(parsed) && doc.namespace === ns) process.exit(0);
           doc.namespace = ns;
           const tmp = ledger + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
           let mode;
@@ -4399,7 +4400,7 @@ try:
 except Exception:
     sys.exit(0)
 doc = {"namespace": ns, "queries": parsed} if isinstance(parsed, list) else parsed
-if not isinstance(doc, dict) or doc.get("namespace") == ns:
+if not isinstance(doc, dict) or (not isinstance(parsed, list) and doc.get("namespace") == ns):
     sys.exit(0)
 doc["namespace"] = ns
 tmp = f"{ledger}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
@@ -6303,11 +6304,10 @@ mod tests {
     fn pre_commit_ledger_rewrite_locks_and_writes_an_exclusive_temp() {
         let hook = SCAFFOLDED_PRE_COMMIT_HOOK;
         for needle in [
-            "exec 9>\"$LEDGER.lock\"",
+            "exec 9>>\"$LEDGER.lock\"",
             "flock 9",
             "flock -u 9",
             "flag: \"wx\", mode: 0o600",
-            "Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed",
             "import json, os, sys, stat",
             "os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600",
             "stat.S_IMODE(os.stat(ledger).st_mode)",
@@ -6318,6 +6318,70 @@ mod tests {
             !hook.contains("ledger + \".tmp-\" + process.pid;"),
             "a pid-only temp name lets a planted symlink be followed"
         );
+    }
+
+    /// Review of the #374 restore: the hook wrapped a bare-array ledger and
+    /// then saw `namespace === ns` and exited, so the file was never
+    /// rewritten. Runs the hook's own node and python3 snippets on a bare
+    /// array and checks the file is wrapped; skips an interpreter that is
+    /// not installed.
+    #[test]
+    fn pre_commit_ledger_rewrite_wraps_a_bare_array_ledger() {
+        fn snippet<'a>(hook: &'a str, start: &str, end: &str) -> &'a str {
+            let from = hook.find(start).expect("snippet start") + start.len();
+            let len = hook[from..].find(end).expect("snippet end");
+            &hook[from..from + len]
+        }
+        // The ledger rewrite's snippets, not the earlier namespace lookup's.
+        let anchor = "export LEDGER NAMESPACE";
+        let hook = &SCAFFOLDED_PRE_COMMIT_HOOK[SCAFFOLDED_PRE_COMMIT_HOOK
+            .find(anchor)
+            .expect("ledger rewrite")..];
+        let node = snippet(hook, "node -e '", "' 2>/dev/null");
+        let python = snippet(hook, "python3 -c '", "' 2>/dev/null");
+        let mut ran = 0;
+        for (program, flag, code) in [("node", "-e", node), ("python3", "-c", python)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = tmp.path().join("session_queries.json");
+            std::fs::write(&ledger, "[{\"query\":\"q\"}]").unwrap();
+            let status = match std::process::Command::new(program)
+                .args([flag, code])
+                .env("LEDGER", &ledger)
+                .env("NAMESPACE", "proj")
+                .status()
+            {
+                Ok(status) => status,
+                Err(_) => {
+                    eprintln!("skipped {program}: not installed");
+                    continue;
+                }
+            };
+            assert!(status.success(), "{program} snippet failed");
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+            assert_eq!(doc["namespace"], "proj", "{program} left {doc}");
+            assert_eq!(doc["queries"][0]["query"], "q", "{program} lost the rows");
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("skipped: neither node nor python3 is installed");
+        }
+    }
+
+    /// Review of the #374 restore (carried fix "the test that thought /tmp
+    /// was a worktree"): the OS temp root's marker is ignored only when the
+    /// temp root is above the walk's start, never when it is the start, and
+    /// no other folder is treated as the temp root.
+    #[test]
+    fn only_the_temp_root_above_the_start_is_skipped() {
+        let temp = std::env::temp_dir();
+        let below = tempfile::tempdir().unwrap();
+        assert!(is_shared_temp_ancestor(&temp, below.path()));
+        assert!(!is_shared_temp_ancestor(&temp, &temp));
+        assert!(!is_shared_temp_ancestor(
+            below.path(),
+            &below.path().join("x")
+        ));
     }
 
     /// #380 dropped the exec bit on `scripts/hooks/pre-commit`; the

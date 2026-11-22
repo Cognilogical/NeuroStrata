@@ -255,12 +255,13 @@ if [ ! -f "$LEDGER" ]; then
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
-    # rewrite holds the same cross-process lock as the daemon's ledger writer,
-    # uses a unique EXCLUSIVE temp file (a planted symlink cannot be followed),
+    # rewrite holds the same cross-process lock as the daemon's ledger writer
+    # where `flock` exists (Linux; not Git Bash or stock macOS), uses a unique
+    # EXCLUSIVE temp file (a planted symlink cannot be followed),
     # keeps the original mode, and wraps legacy bare-array ledgers. An
     # unparseable ledger or a missing node/python3 leaves the file as it is.
     export LEDGER NAMESPACE
-    exec 9>"$LEDGER.lock" 2>/dev/null || true
+    exec 9>>"$LEDGER.lock" 2>/dev/null || true
     command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true
     if command -v node >/dev/null 2>&1; then
         node -e '
@@ -271,7 +272,7 @@ elif [ -n "$RESOLVED" ]; then
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
           const doc = Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed;
           if (!doc || typeof doc !== "object") process.exit(0);
-          if (doc.namespace === ns) process.exit(0);
+          if (!Array.isArray(parsed) && doc.namespace === ns) process.exit(0);
           doc.namespace = ns;
           const tmp = ledger + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
           let mode;
@@ -291,7 +292,7 @@ try:
 except Exception:
     sys.exit(0)
 doc = {"namespace": ns, "queries": parsed} if isinstance(parsed, list) else parsed
-if not isinstance(doc, dict) or doc.get("namespace") == ns:
+if not isinstance(doc, dict) or (not isinstance(parsed, list) and doc.get("namespace") == ns):
     sys.exit(0)
 doc["namespace"] = ns
 tmp = f"{ledger}.tmp-{os.getpid()}-{os.urandom(6).hex()}"

@@ -3616,4 +3616,26 @@ mod tests {
             "{found:?}"
         );
     }
+
+    /// Review of the #374 restore: the test above calls the `_with` form
+    /// directly. This one goes through `miscased_marker_folders`, so a
+    /// linked worktree must find its main checkout on its own.
+    #[test]
+    fn miscased_marker_folders_finds_the_main_checkout_of_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(
+            &base,
+            r#"["repo git-dir", "repo/.git/worktrees/wt commondir:../..",
+                "wt git-file:../repo/.git/worktrees/wt"]"#,
+        );
+        std::fs::create_dir_all(base.join("repo/.nEuRoStRaTa")).unwrap();
+        let found = miscased_marker_folders(&base.join("wt"));
+        assert!(
+            found
+                .iter()
+                .any(|p| p == &base.join("repo").join(".nEuRoStRaTa")),
+            "{found:?}"
+        );
+    }
 }

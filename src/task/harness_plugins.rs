@@ -329,7 +329,7 @@ fn write_claude_config(project_root: &Path, namespace: &str) -> bool {
         }
     }
     let unchanged = std::fs::read_to_string(&path).is_ok_and(|existing| existing == text);
-    if !unchanged && std::fs::write(&path, &text).is_err() {
+    if !unchanged && write_atomically(&path, &text).is_err() {
         return false;
     }
     claude_config_namespace(project_root).as_deref() == Some(namespace)
@@ -371,7 +371,10 @@ fn installer_hook_parts(
     if plain && !at_installer_runner_place(old_path, project_root, abs_runner) {
         return None;
     }
-    if !runner_is_replaceable(old_path, project_root, abs_runner) {
+    // The strict check: a missing runner counts only at the installer's plugin
+    // location, so a custom `NEUROSTRATA_NAMESPACE=x node "<gone>/cli-hook.mjs"`
+    // is not migrated into Claude's plugin config on the next refresh.
+    if !runner_is_installers_hook(old_path, project_root, abs_runner) {
         return None;
     }
     // An empty assignment (the daemon's old startup install) named nothing.
@@ -1105,8 +1108,8 @@ impl NamespaceRoots {
 /// 0. the project root marker (`.NeuroStrata/config.json`), found as
 ///    [`crate::root_marker::find_root_marker`] does;
 /// 1. a harness config (the first in the fixed order), read from the first
-///    of `dir`'s checkout, its main checkout, or (outside git) `dir` itself
-///    that has any;
+///    of `dir` itself, its checkout, its main checkout, or (outside git)
+///    `dir` that has any;
 /// 2. `env_namespace` (`NEUROSTRATA_NAMESPACE`), when usable;
 /// 3. the `namespace` field of the graph-lookup ledger
 ///    (`.NeuroStrata/session_queries.json`), the main checkout's then `dir`'s;
@@ -3439,7 +3442,10 @@ mod tests {
     fn repairs_a_runner_path_that_no_longer_exists() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
-        let gone = tmp.path().join("moved-away/cli-hook.mjs");
+        // A moved project: the old runner sat at the installer's plugin location.
+        let gone = tmp
+            .path()
+            .join("moved-away/.NeuroStrata/plugins/claude/cli-hook.mjs");
         let cfg = tmp.path().join(".claude/settings.local.json");
         std::fs::write(
             &cfg,
@@ -3714,6 +3720,28 @@ mod tests {
         // The installer's own runner.
         assert!(
             installer_hook_parts(&format!("node \"{abs_runner}\""), &abs_runner, &root).is_some()
+        );
+    }
+
+    /// Review of the #374 restore: an older-style command naming a namespace
+    /// and a missing `cli-hook.mjs` outside the plugin location is someone's
+    /// own hook. Repair must not migrate its namespace into Claude's plugin
+    /// config, which `namespace resolve` reads first.
+    #[test]
+    fn a_prefixed_custom_runner_is_not_migrated_into_the_plugin_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        let abs_runner = plain_abs_path(&installed_runner(&root, "claude"));
+        let other = root.join("tools").join("cli-hook.mjs");
+        let custom = format!("NEUROSTRATA_NAMESPACE=x node \"{}\"", other.display());
+        assert_eq!(installer_hook_parts(&custom, &abs_runner, &root), None);
+        let moved = root
+            .join("moved")
+            .join(".NeuroStrata/plugins/claude/cli-hook.mjs");
+        let older = format!("NEUROSTRATA_NAMESPACE=x node \"{}\"", moved.display());
+        assert_eq!(
+            installer_hook_parts(&older, &abs_runner, &root),
+            Some((Some("x".to_string()), format!("node \"{abs_runner}\"")))
         );
     }
 
