@@ -7,9 +7,16 @@
 //! types) cannot carry them. Raw query/content text is never retained: only
 //! SHA-256 digests are written.
 
+use fs2::FileExt as _;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+/// Process-wide counter for collision-free ledger temp names: a PID alone
+/// cannot separate two writers inside one process.
+static LEDGER_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Ledger schema version for the additive `events[]` section. Legacy
 /// `queries[]` stays untouched for compatibility but is excluded from every
@@ -207,6 +214,32 @@ pub fn mutate_session_ledger<F>(path: &std::path::Path, namespace: &str, mutate:
 where
     F: FnOnce(&mut Value),
 {
+    // The pre-commit hook and this daemon both read-modify-write this ledger.
+    // Hold one cross-process advisory lock for the whole operation so neither
+    // writer's rename discards the other's receipts or recorded queries.
+    let lock_path = path.with_file_name(format!(
+        "{}.lock",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "session_queries.json".to_string())
+    ));
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .ok();
+    if let Some(file) = lock_file.as_ref() {
+        let _ = file.lock_exclusive();
+    }
+    mutate_session_ledger_inner(path, namespace, mutate)
+    // `lock_file` is dropped here, releasing the advisory lock.
+}
+
+fn mutate_session_ledger_inner<F>(path: &std::path::Path, namespace: &str, mutate: F)
+where
+    F: FnOnce(&mut Value),
+{
     if let Some(parent) = path.parent() {
         if std::fs::create_dir_all(parent).is_err() {
             return;
@@ -262,12 +295,32 @@ where
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "session_queries.json".to_string());
-    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
-    if std::fs::write(&tmp, serialized).is_err() {
+    let tmp = path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        LEDGER_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&tmp)?;
+        std::io::Write::write_all(&mut file, serialized.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(path) {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return;
     }
-    if let Err(err) = std::fs::rename(&tmp, path) {
+    if let Err(err) = written {
         let _ = std::fs::remove_file(&tmp);
         tracing::warn!(
             "atomic rename of session ledger {} failed: {err}",
