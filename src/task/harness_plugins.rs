@@ -1151,11 +1151,23 @@ fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
     // staged path is refused instead of being followed to its target.
     {
         use std::io::Write;
-        let mut staged = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Start private even when the process umask is lax (e.g. 022).
+            options.mode(0o600);
+        }
+        let mut staged = options.open(&tmp)?;
         staged.write_all(contents.as_bytes())?;
+    }
+    // A private config keeps its existing mode across the replace; a new
+    // file inherits the restrictive mode the staged file was created with.
+    #[cfg(unix)]
+    if let Ok(existing) = std::fs::metadata(path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, existing.permissions())?;
     }
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -2819,5 +2831,23 @@ mod tests {
         write_atomically(&target, "{\"ok\":true}").expect("write with a fresh staged name");
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"ok\":true}");
+    }
+
+    /// An atomic replacement must not widen a private config's permissions:
+    /// the staged file starts restrictive and inherits the old mode.
+    #[test]
+    #[cfg(unix)]
+    fn write_atomically_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap();
+        let target = dir.join("settings.local.json");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_atomically(&target, "new").expect("write");
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "the original mode must survive the rename");
     }
 }
