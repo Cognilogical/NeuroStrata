@@ -813,10 +813,18 @@ pub async fn cache_project_root_unless_marked(
         Ok(Some(cached)) => {
             let cached = std::path::Path::new(&cached);
             if cached.is_dir() {
-                if let Ok(Some(found)) = crate::root_marker::find_root_marker(cached) {
-                    if found.config.namespace.eq_ignore_ascii_case(namespace) {
+                match crate::root_marker::find_root_marker(cached) {
+                    Ok(Some(found)) if found.config.namespace.eq_ignore_ascii_case(namespace) => {
+                        return
+                    }
+                    Err((path, reason)) => {
+                        tracing::warn!(
+                            "root marker {} is unreadable ({reason}); the cached project_root of '{namespace}' was left as it is",
+                            path.display()
+                        );
                         return;
                     }
+                    _ => {}
                 }
             }
         }
@@ -1016,7 +1024,9 @@ pub(crate) mod tests {
         for ns in ["example-project", "Example-Project"] {
             cache_project_root_unless_marked(&store, Some(&emb), ns, &sub).await;
             assert_eq!(
-                cached_project_root(&store, "example-project").await.unwrap(),
+                cached_project_root(&store, "example-project")
+                    .await
+                    .unwrap(),
                 Some(root.clone())
             );
         }
@@ -1030,7 +1040,9 @@ pub(crate) mod tests {
         .unwrap();
         cache_project_root_unless_marked(&store, Some(&emb), "example-project", &sub).await;
         assert_eq!(
-            cached_project_root(&store, "example-project").await.unwrap(),
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
             Some(root.clone())
         );
 
@@ -1041,8 +1053,50 @@ pub(crate) mod tests {
         let elsewhere = elsewhere.to_string_lossy().into_owned();
         cache_project_root_unless_marked(&store, Some(&emb), "example-project", &elsewhere).await;
         assert_eq!(
-            cached_project_root(&store, "example-project").await.unwrap(),
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
             Some(root)
+        );
+    }
+
+    /// The cached checkout's marker is unreadable: an unmarked second clone
+    /// must not relocate the pinned root, just as a caller's own unreadable
+    /// marker is a warning-and-no-op.
+    #[tokio::test]
+    async fn unmarked_caller_keeps_a_cached_root_with_an_unreadable_marker() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let pinned = base.join("pinned");
+        let caller = base.join("caller");
+        for dir in [&pinned, &caller] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::create_dir_all(pinned.join(".git")).unwrap();
+        write_marker(&pinned, "example-project");
+        std::fs::write(pinned.join(".NeuroStrata").join("config.json"), b"{ no").unwrap();
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        cache_project_root(
+            &store,
+            Some(&emb),
+            "example-project",
+            &pinned.to_string_lossy(),
+        )
+        .await;
+        cache_project_root_unless_marked(
+            &store,
+            Some(&emb),
+            "example-project",
+            &caller.to_string_lossy(),
+        )
+        .await;
+        assert_eq!(
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            Some(pinned.to_string_lossy().into_owned())
         );
     }
 
@@ -1061,14 +1115,21 @@ pub(crate) mod tests {
         }
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
         let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
-        cache_project_root(&store, Some(&emb), "example-project", &old.to_string_lossy()).await;
+        cache_project_root(
+            &store,
+            Some(&emb),
+            "example-project",
+            &old.to_string_lossy(),
+        )
+        .await;
 
         let held = REGISTRY_ROW_LOCK.lock().await;
         let task = {
             let (store, emb) = (store.clone(), emb.clone());
             let caller = caller.to_string_lossy().into_owned();
             tokio::spawn(async move {
-                cache_project_root_unless_marked(&store, Some(&emb), "example-project", &caller).await
+                cache_project_root_unless_marked(&store, Some(&emb), "example-project", &caller)
+                    .await
             })
         };
         // Let the caller run up to the lock.
@@ -1076,13 +1137,20 @@ pub(crate) mod tests {
         // A marker writer pins the root while the caller waits.
         write_marker(&pinned, "example-project");
         assert!(
-            cache_project_root_locked(&store, Some(&emb), "example-project", &pinned.to_string_lossy())
-                .await
+            cache_project_root_locked(
+                &store,
+                Some(&emb),
+                "example-project",
+                &pinned.to_string_lossy()
+            )
+            .await
         );
         drop(held);
         task.await.unwrap();
         assert_eq!(
-            cached_project_root(&store, "example-project").await.unwrap(),
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
             Some(pinned.to_string_lossy().into_owned())
         );
     }
@@ -1101,7 +1169,9 @@ pub(crate) mod tests {
         let first = repo.to_string_lossy().into_owned();
         cache_project_root_unless_marked(&store, Some(&emb), "example-project", &first).await;
         assert_eq!(
-            cached_project_root(&store, "example-project").await.unwrap(),
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
             Some(first)
         );
         let plain = base.join("plain");
@@ -1109,7 +1179,9 @@ pub(crate) mod tests {
         let second = plain.to_string_lossy().into_owned();
         cache_project_root_unless_marked(&store, Some(&emb), "example-project", &second).await;
         assert_eq!(
-            cached_project_root(&store, "example-project").await.unwrap(),
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
             Some(second)
         );
     }
@@ -1123,7 +1195,9 @@ pub(crate) mod tests {
         let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
         set_project_root(&store, Some(&emb), "example-project", &base).await;
         assert_eq!(
-            cached_project_root(&store, "example-project").await.unwrap(),
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
             Some(base.to_string_lossy().into_owned())
         );
     }
@@ -1239,7 +1313,9 @@ pub(crate) mod tests {
             );
             assert_eq!(warning, None, "round {i}");
             assert_eq!(
-                cached_project_root(&store, "example-project").await.unwrap(),
+                cached_project_root(&store, "example-project")
+                    .await
+                    .unwrap(),
                 Some(root),
                 "round {i}: the cached root"
             );
@@ -1265,7 +1341,9 @@ pub(crate) mod tests {
                 set_project_root(&store, Some(&emb), "example-project", &root),
             );
             assert_eq!(
-                cached_project_root(&store, "example-project").await.unwrap(),
+                cached_project_root(&store, "example-project")
+                    .await
+                    .unwrap(),
                 Some(root.to_string_lossy().into_owned()),
                 "round {i}: the root"
             );
@@ -1297,11 +1375,21 @@ pub(crate) mod tests {
                 .current_dir(&main)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "-b", "main"]);
         git(&["commit", "--allow-empty", "-m", "init"]);
-        git(&["worktree", "add", "-b", "feature/linked", linked.to_str().unwrap()]);
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "feature/linked",
+            linked.to_str().unwrap(),
+        ]);
         std::fs::create_dir_all(linked.join("pkg")).unwrap();
         // A main checkout holding only `.git` is not taken as one (it may be
         // a separate git dir); a real checkout holds files.
@@ -1311,7 +1399,9 @@ pub(crate) mod tests {
         let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
         set_project_root(&store, Some(&emb), "example-project", &linked.join("pkg")).await;
         assert_eq!(
-            cached_project_root(&store, "example-project").await.unwrap(),
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
             Some(main.join("pkg").to_string_lossy().into_owned())
         );
     }
