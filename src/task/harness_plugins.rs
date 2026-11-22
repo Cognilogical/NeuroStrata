@@ -1164,8 +1164,14 @@ fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    // `create_new` is O_EXCL: an attacker-planted symlink at the predictable
-    // staged path is refused instead of being followed to its target.
+    write_staged_atomically(&tmp, path, contents)
+}
+
+/// The security-relevant part of [`write_atomically`], with the staged path
+/// supplied by the caller so it can be tested against a planted symlink.
+fn write_staged_atomically(staged: &Path, path: &Path, contents: &str) -> std::io::Result<()> {
+    // `create_new` is O_EXCL: a symlink planted at the staged path is refused
+    // instead of being followed to its target.
     {
         use std::io::Write;
         let mut options = std::fs::OpenOptions::new();
@@ -1176,18 +1182,18 @@ fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
             // Start private even when the process umask is lax (e.g. 022).
             options.mode(0o600);
         }
-        let mut staged = options.open(&tmp)?;
-        staged.write_all(contents.as_bytes())?;
+        let mut staged_file = options.open(staged)?;
+        staged_file.write_all(contents.as_bytes())?;
     }
     // A private config keeps its existing mode across the replace; a new
     // file inherits the restrictive mode the staged file was created with.
     #[cfg(unix)]
     if let Ok(existing) = std::fs::metadata(path) {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, existing.permissions())?;
+        std::fs::set_permissions(staged, existing.permissions())?;
     }
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
+    std::fs::rename(staged, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(staged);
     })
 }
 
@@ -2813,9 +2819,9 @@ mod tests {
         );
     }
 
-    /// A predictable temp path must never be used as a symlink hop: a staged
-    /// write into a symlink placed there would overwrite the link's target and
-    /// then rename the link itself into place.
+    /// A staged path must never be used as a symlink hop: a write into a
+    /// symlink placed there would overwrite the link's target and then rename
+    /// the link itself into place.
     #[test]
     #[cfg(unix)]
     fn write_atomically_refuses_a_symlink_at_the_temp_path() {
@@ -2825,10 +2831,10 @@ mod tests {
         let target = dir.join("config.json");
         let victim = dir.join("victim.json");
         std::fs::write(&victim, "original").unwrap();
-        let staged = dir.join(format!(".config.json.tmp-{}", std::process::id()));
+        let staged = dir.join(".config.json.tmp-planted");
         symlink(&victim, &staged).unwrap();
 
-        let result = write_atomically(&target, "{\"ok\":true}");
+        let result = write_staged_atomically(&staged, &target, "{\"ok\":true}");
 
         assert!(
             result.is_err(),
