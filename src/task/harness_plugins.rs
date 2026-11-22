@@ -1409,6 +1409,9 @@ pub fn detect_harnesses(
         push_unique("codex");
     }
     if project_root.join(".github/copilot").exists()
+        || project_root
+            .join(".NeuroStrata/plugins/github-cli/copilot-extension.json")
+            .exists()
         || home
             .as_ref()
             .map(|h| h.join(".config/gh").exists() || h.join(".config/github-copilot").exists())
@@ -2358,8 +2361,12 @@ mod tests {
     }
 
     fn namespace_in(cfg: &Path) -> Value {
+        field_in(cfg, "namespace")
+    }
+
+    fn field_in(cfg: &Path, key: &str) -> Value {
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(cfg).unwrap()).unwrap();
-        doc["namespace"].clone()
+        doc[key].clone()
     }
 
     /// Configs that disagree each keep their own namespace at boot, and a
@@ -2375,16 +2382,20 @@ mod tests {
         let hermes = dir.join(".hermes/plugins/neurostrata.json");
         write_file(
             &codex,
-            r#"{"id": "neurostrata-codex", "namespace": "alpha"}"#,
+            r#"{"id": "neurostrata-codex", "namespace": "alpha", "entry": "stale"}"#,
         );
         write_file(
             &hermes,
-            r#"{"id": "neurostrata-hermes", "namespace": "beta"}"#,
+            r#"{"id": "neurostrata-hermes", "namespace": "beta", "entry": "stale"}"#,
         );
         std::fs::create_dir_all(dir.join(".openclaw")).unwrap();
         boot_install_plugins(&dir);
         assert_eq!(namespace_in(&codex), "alpha");
         assert_eq!(namespace_in(&hermes), "beta");
+        // A refresh must actually rewrite plugin paths, not just preserve
+        // the pre-seeded namespace (PR #375 review).
+        assert_ne!(field_in(&codex, "entry"), json!("stale"));
+        assert_ne!(field_in(&hermes, "entry"), json!("stale"));
         assert!(!dir.join(".openclaw/plugins/neurostrata.json").exists());
         assert!(dir
             .join(".NeuroStrata/plugins/openclaw/dist/index.js")
@@ -2403,17 +2414,20 @@ mod tests {
         let top_cfg = top.join(".hermes/plugins/neurostrata.json");
         write_file(
             &top_cfg,
-            r#"{"id": "neurostrata-hermes", "namespace": "outer"}"#,
+            r#"{"id": "neurostrata-hermes", "namespace": "outer", "entry": "stale"}"#,
         );
         let sub = top.join("packages").join("api");
         let sub_cfg = sub.join(".hermes/plugins/neurostrata.json");
         write_file(
             &sub_cfg,
-            r#"{"id": "neurostrata-hermes", "namespace": "api"}"#,
+            r#"{"id": "neurostrata-hermes", "namespace": "api", "entry": "stale"}"#,
         );
         boot_install_plugins(&sub);
         assert_eq!(namespace_in(&sub_cfg), "api");
         assert_eq!(namespace_in(&top_cfg), "outer");
+        assert_ne!(field_in(&sub_cfg, "entry"), json!("stale"));
+        // The enclosing checkout must not be refreshed by a subfolder call.
+        assert_eq!(field_in(&top_cfg, "entry"), json!("stale"));
     }
 
     /// A configured project is stored as its `.NeuroStrata` folder; the boot
@@ -4077,6 +4091,86 @@ mod tests {
             snippet.contains("memories_for_file"),
             "snippet must still direct to memories_for_file"
         );
+    }
+
+    /// PR #375 review: an existing GitHub CLI config is evidence the harness
+    /// is present, so a refresh rewrites its stale paths.
+    #[test]
+    fn existing_github_cli_config_alone_triggers_a_refresh() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap();
+        let cfg = dir.join(".NeuroStrata/plugins/github-cli/copilot-extension.json");
+        write_file(
+            &cfg,
+            r#"{"id":"neurostrata-github-cli","namespace":"beta","entry":"stale"}"#,
+        );
+        let listed = vec![("github-cli".to_string(), "beta".to_string())];
+        let report =
+            auto_install_detected_plugins(&dir, ConfigNamespace::Each(&listed), Some("claude"));
+        let installed = report["installed_plugins"].as_array().unwrap();
+        assert!(
+            installed
+                .iter()
+                .any(|v| v["harness"].as_str() == Some("github-cli")),
+            "github-cli not refreshed: {installed:?}"
+        );
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_ne!(doc["entry"], json!("stale"), "stale config left in place");
+    }
+
+    /// PR #375 review: a nested folder's own harness config wins, also when
+    /// the folder is named by a RELATIVE path; the fixture's namespace differs
+    /// from the enclosing checkout's.
+    #[test]
+    fn a_relative_nested_project_resolves_its_own_namespace() {
+        let _env = no_namespace_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let top = base.join("outer-project");
+        std::fs::create_dir_all(top.join(".git")).unwrap();
+        write_file(
+            &top.join(CLAUDE_SETTINGS),
+            r#"{"env": {"NEUROSTRATA_NAMESPACE": "outer"}}"#,
+        );
+        let nested = top.join("packages").join("inner");
+        write_file(
+            &nested.join(CLAUDE_SETTINGS),
+            r#"{"env": {"NEUROSTRATA_NAMESPACE": "inner"}}"#,
+        );
+        assert_eq!(ns_of(&top), "outer");
+        assert_eq!(ns_of(&nested), "inner");
+        let here = dunce::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let Some(relative) = relative_path_from(&here, &nested) else {
+            eprintln!("skipped: the temp dir is on another drive than the cwd");
+            return;
+        };
+        assert_eq!(
+            resolve_namespace(&relative)
+                .map(|r| r.namespace)
+                .ok()
+                .as_deref(),
+            Some("inner"),
+            "relative path {relative:?} resolved to the checkout namespace"
+        );
+    }
+
+    /// `target` spelled relative to `base`; `None` when they share no root
+    /// (another drive on Windows).
+    fn relative_path_from(base: &Path, target: &Path) -> Option<PathBuf> {
+        let b: Vec<_> = base.components().collect();
+        let t: Vec<_> = target.components().collect();
+        let common = b.iter().zip(t.iter()).take_while(|(a, b)| a == b).count();
+        if common == 0 {
+            return None;
+        }
+        let mut out = PathBuf::new();
+        for _ in common..b.len() {
+            out.push("..");
+        }
+        for c in &t[common..] {
+            out.push(c.as_os_str());
+        }
+        Some(out)
     }
 
     fn read_codex_hooks(root: &Path) -> Value {
