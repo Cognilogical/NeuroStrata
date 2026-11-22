@@ -289,34 +289,6 @@ fn plugin_location_suffix(abs_runner: &str) -> Option<String> {
     Some(parts[idx..].join("/").to_ascii_lowercase())
 }
 
-/// Rewrite only the path of an installer-generated runner command. A command
-/// shaped `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"` whose runner basename
-/// matches the installer's runner, and whose runner is the installer's own or
-/// is missing, is ours to repair. A custom hook that merely carries the
-/// namespace environment variable, or runs a `cli-hook.mjs` installed
-/// elsewhere, is left untouched.
-fn repair_installer_hook_command(
-    command: &str,
-    namespace: &str,
-    abs_runner: &str,
-    project_root: &Path,
-) -> Option<String> {
-    let prefix = format!("NEUROSTRATA_NAMESPACE={namespace} node \"");
-    let rest = command.strip_prefix(&prefix)?;
-    let close = rest.find('"')?;
-    let old_path = &rest[..close];
-    let suffix = &rest[close + 1..];
-    // Windows separators are legal in a verbatim path even when the test
-    // that exercises this runs on Unix, so do not use platform Path parsing.
-    if path_basename(old_path) != path_basename(abs_runner) {
-        return None;
-    }
-    if !runner_is_replaceable(old_path, project_root, abs_runner) {
-        return None;
-    }
-    Some(format!("{prefix}{abs_runner}\"{suffix}"))
-}
-
 /// Whether a runner path is the installer's own runner (in any spelling) or
 /// sits where the installer puts one, `.NeuroStrata/plugins/claude/cli-hook.mjs`
 /// (a moved or renamed project's). Plain string work for the suffix, as in
@@ -960,6 +932,30 @@ fn harness_config_namespace(
         return Ok(read_config(&root.join(CLAUDE_SETTINGS))?
             .and_then(|settings| claude_settings_namespace(root, &settings)));
     }
+    // OpenCode actually loads `.NeuroStrata/neurostrata-plugin.json` (then
+    // `PluginConfig.json`) through the plugin core's `loadPluginConfigFromDisk`.
+    // The `.opencode/neurostrata-plugin.json` registration below is historic
+    // metadata the adapter never reads; when the effective config names a
+    // namespace it is the authority, so a stale registration cannot make the
+    // hooks resolve a different one.
+    if harness == "opencode" {
+        for rel in [
+            ".NeuroStrata/neurostrata-plugin.json",
+            ".NeuroStrata/PluginConfig.json",
+        ] {
+            if let Some(config) = read_config(&root.join(rel))? {
+                for pointer in ["/namespace", "/neurostrata/namespace"] {
+                    if let Some(ns) = config
+                        .pointer(pointer)
+                        .and_then(Value::as_str)
+                        .and_then(usable_namespace)
+                    {
+                        return Ok(Some(ns));
+                    }
+                }
+            }
+        }
+    }
     let Some((_, rel, pointer)) = PLUGIN_NAMESPACE_CONFIGS
         .iter()
         .find(|(h, _, _)| *h == harness)
@@ -1167,11 +1163,11 @@ fn resolve_namespace_from(
             return Ok(resolved(ns, NamespaceSource::Ledger));
         }
     }
-    // The worktree the session runs in is the answer, not the main checkout
-    // it was linked from: the plugins fall back to this checkout's basename
-    // too, and a commit writes this namespace into the ledger.
+    // The main checkout's folder is the stable project name: a linked
+    // worktree's own basename is just its branch name and changes with every
+    // checkout, which would silently switch the namespace a hook resolves.
     let folder = roots
-        .own_root
+        .main_root
         .as_deref()
         .unwrap_or(roots.dir.as_path())
         .file_name()
@@ -1959,19 +1955,15 @@ fn wire_harness_config(
         }
         "claude" => {
             if is_active || project_root.join(".claude").exists() {
-                if namespace.is_none() && !wire_without_namespace {
-                    return None;
-                }
-                // A refresh with no explicit namespace still registers the
-                // hook. The runner discovers the namespace at invocation time
-                // from the effective config/ledger, so the registration is
-                // namespace-neutral instead of being skipped entirely.
-                let namespace = namespace.as_deref();
+                // No namespace to persist is no reason to skip the hooks:
+                // the plain runner discovers the namespace from the marker
+                // or a harness config at invocation time. Passing "" writes
+                // no namespace into Claude's config.
+                let namespace = namespace.as_deref().unwrap_or("");
                 let cfg_path = project_root.join(".claude/settings.local.json");
-                let cmd = match namespace {
-                    Some(ns) => format!("NEUROSTRATA_NAMESPACE={ns} node \"{abs_runner}\""),
-                    None => format!("node \"{abs_runner}\""),
-                };
+                // The namespace lives in Claude's plugin config, as it does
+                // for the other harnesses; the command carries none.
+                let cmd = format!("node \"{abs_runner}\"");
                 let mut doc: Value = json!({});
                 let mut write_doc = false;
                 if cfg_path.exists() {
@@ -1991,11 +1983,9 @@ fn wire_harness_config(
                     if let Some(obj) = doc.as_object_mut() {
                         let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
                         if let Some(h_obj) = hooks.as_object_mut() {
-                            // #378: repair old hook commands the installer wrote,
-                            // keeping the marker-first namespace in plugin config.
                             let may_add = repair_claude_hooks(
                                 h_obj,
-                                namespace.unwrap_or(""),
+                                namespace,
                                 abs_runner,
                                 project_root,
                                 warnings,
@@ -2036,38 +2026,6 @@ fn wire_harness_config(
                                     &runs,
                                 );
                                 ensure_claude_hook(h_obj, "Stop", None, |_| true, &cmd, &runs);
-                            }
-                            // Repair commands written by an older installer that
-                            // embedded a Windows verbatim path. Only rewrite our
-                            // own hook commands; user hooks, including ones that
-                            // run a cli-hook.mjs installed elsewhere, are left
-                            // untouched.
-                            for entries in h_obj.values_mut() {
-                                if let Some(arr) = entries.as_array_mut() {
-                                    for entry in arr {
-                                        if let Some(hooks) =
-                                            entry.get_mut("hooks").and_then(|v| v.as_array_mut())
-                                        {
-                                            for hook in hooks {
-                                                if let (Some(ns), Some(command)) = (
-                                                    namespace,
-                                                    hook.get("command").and_then(|v| v.as_str()),
-                                                ) {
-                                                    if let Some(repaired) =
-                                                        repair_installer_hook_command(
-                                                            command,
-                                                            ns,
-                                                            abs_runner,
-                                                            project_root,
-                                                        )
-                                                    {
-                                                        hook["command"] = Value::String(repaired);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
                             }
                             // An older installer wrote a matcher without
                             // NotebookEdit, so notebook edits skipped the
@@ -3217,7 +3175,14 @@ mod tests {
             Some("claude"),
         );
         let fresh = claude_pre_tool_use_matchers(tmp.path());
-        assert_eq!(fresh.len(), 1);
+        // PR #378 wires the file-tool guard and the session-scope runner as
+        // two entries on a fresh install. The single-entry expectation came
+        // from before that hook existed; assert both matchers explicitly.
+        assert_eq!(
+            fresh.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(),
+            vec![CLAUDE_PRE_TOOL_USE_MATCHER, CLAUDE_SESSION_SCOPE_MATCHER],
+            "fresh install wires both runners: {fresh:?}"
+        );
         assert!(
             fresh[0].0.split('|').any(|t| t == "NotebookEdit"),
             "fresh install must guard NotebookEdit: {:?}",
