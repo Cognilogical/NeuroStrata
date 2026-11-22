@@ -95,10 +95,12 @@ fn unique_events(ledger: &Value) -> Vec<&Value> {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     events(ledger)
         .iter()
-        .filter(|event| match event.get("event_id").and_then(Value::as_str) {
-            Some(id) if !id.is_empty() => seen.insert(id),
-            _ => true,
-        })
+        .filter(
+            |event| match event.get("event_id").and_then(Value::as_str) {
+                Some(id) if !id.is_empty() => seen.insert(id),
+                _ => true,
+            },
+        )
         .collect()
 }
 
@@ -283,7 +285,12 @@ fn nonempty_outcome(event: &Value) -> bool {
     if event.get("status").and_then(Value::as_str) == Some("empty") {
         return false;
     }
-    if event.get("result_count").and_then(Value::as_u64).unwrap_or(0) > 0 {
+    if event
+        .get("result_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
         return true;
     }
     event
@@ -657,7 +664,10 @@ mod tests {
         };
         let alone = report_for(&prescribing);
         assert!(
-            alone.unresolved_trigger_ids.iter().any(|t| t == T_AMBIGUOUS),
+            alone
+                .unresolved_trigger_ids
+                .iter()
+                .any(|t| t == T_AMBIGUOUS),
             "prescription alone must stay unresolved"
         );
         let mut with_locate = prescribing.clone();
@@ -670,7 +680,10 @@ mod tests {
         }));
         let resolved = report_for(&with_locate);
         assert!(
-            resolved.unresolved_trigger_ids.iter().all(|t| t != T_AMBIGUOUS),
+            resolved
+                .unresolved_trigger_ids
+                .iter()
+                .all(|t| t != T_AMBIGUOUS),
             "a genuine locate receipt resolves T_AMBIGUOUS"
         );
     }
@@ -759,14 +772,17 @@ mod tests {
             None,
             "no hint => no honest trigger for related"
         );
-        assert!(dispatch_proof(
-            HIGH_BLAST_TOOL,
-            Some("related"),
-            Some(&json!({ "namespace": "NS", "id": "seed", "max_hops": 2 })),
-            None,
-            "NS"
-        )
-        .is_none(), "a hint-less related call must abstain");
+        assert!(
+            dispatch_proof(
+                HIGH_BLAST_TOOL,
+                Some("related"),
+                Some(&json!({ "namespace": "NS", "id": "seed", "max_hops": 2 })),
+                None,
+                "NS"
+            )
+            .is_none(),
+            "a hint-less related call must abstain"
+        );
         // A compatibility-checked hint de-aliases seed expansion.
         assert_eq!(
             dispatch_proof(
@@ -812,14 +828,17 @@ mod tests {
             "NS"
         )
         .is_none());
-        assert!(dispatch_proof(
-            DIFF_TOOL,
-            Some("diff_tour"),
-            Some(&json!({ "namespace": "NS", "diff_text": "  " })),
-            None,
-            "NS"
-        )
-        .is_none(), "an empty diff_text cannot be honestly dispatched");
+        assert!(
+            dispatch_proof(
+                DIFF_TOOL,
+                Some("diff_tour"),
+                Some(&json!({ "namespace": "NS", "diff_text": "  " })),
+                None,
+                "NS"
+            )
+            .is_none(),
+            "an empty diff_text cannot be honestly dispatched"
+        );
         let diff = dispatch_proof(
             DIFF_TOOL,
             Some("diff_tour"),
@@ -829,7 +848,10 @@ mod tests {
         )
         .expect("a real diff has a proof plan");
         assert_eq!(diff.trigger, T_DIFF);
-        assert_eq!(diff.args, json!({ "namespace": "NS", "diff_text": " real diff " }));
+        assert_eq!(
+            diff.args,
+            json!({ "namespace": "NS", "diff_text": " real diff " })
+        );
     }
 
     // oy5c C12/C13: resolution receipt must be at or after the prescription.
@@ -873,7 +895,10 @@ mod tests {
                 "followed_action_ids": ["T_HIGH_BLAST:evicted-proof"]
             }]
         });
-        let applicable = vec![T_HIGH_BLAST.to_string(), "T_HIGH_BLAST:evicted-proof".to_string()];
+        let applicable = vec![
+            T_HIGH_BLAST.to_string(),
+            "T_HIGH_BLAST:evicted-proof".to_string(),
+        ];
         let r = compute_advisories(&AdvisoryInput {
             ledger: &ledger,
             active_task_ids: &active,
@@ -942,8 +967,14 @@ mod tests {
             })
             .diff_tour_recommended
         };
-        assert!(check(&mk(vec![], 2, "success")), "no proof stays unresolved");
-        assert!(check(&mk(vec!["T_DIFF:diff-proof"], 0, "empty")), "empty outcome stays unresolved");
+        assert!(
+            check(&mk(vec![], 2, "success")),
+            "no proof stays unresolved"
+        );
+        assert!(
+            check(&mk(vec!["T_DIFF:diff-proof"], 0, "empty")),
+            "empty outcome stays unresolved"
+        );
         assert!(!check(&mk(vec!["T_DIFF:diff-proof"], 2, "success")));
     }
 
@@ -988,7 +1019,10 @@ mod tests {
             .any(|w| w == W_ONTOLOGY_STRATEGIC_MISS)
         };
         assert!(check(&mk(vec![], 3)), "no proof stays a strategic miss");
-        assert!(check(&mk(vec!["T_STRATEGIC:advice-proof"], 0)), "empty result stays a miss");
+        assert!(
+            check(&mk(vec!["T_STRATEGIC:advice-proof"], 0)),
+            "empty result stays a miss"
+        );
         assert!(!check(&mk(vec!["T_STRATEGIC:advice-proof"], 3)));
     }
 }

@@ -15,7 +15,7 @@
 //! ```
 
 use crate::error::{Error, Result};
-use crate::registry::{RDF_TYPE, SchemaGraph, SchemaRole};
+use crate::registry::{SchemaGraph, SchemaRole, RDF_TYPE};
 use lbug::{Connection, Database, LogicalType, SystemConfig, Value};
 use oxrdf::{GraphName, GraphNameRef, NamedNode};
 use std::collections::BTreeSet;
@@ -2035,12 +2035,11 @@ mod tests {
         let back = store.load_entries().unwrap();
         assert_eq!(back.len(), 3);
         assert!(back.contains(&entries[0]));
-        assert!(
-            back.iter()
-                .any(|e| e.graph.to_string() == "<https://ex.org/shapes>"
-                    && e.role == SchemaRole::Shacl
-                    && e.applies_to.is_empty())
-        );
+        assert!(back
+            .iter()
+            .any(|e| e.graph.to_string() == "<https://ex.org/shapes>"
+                && e.role == SchemaRole::Shacl
+                && e.applies_to.is_empty()));
         // The default graph round-trips through its label.
         let mut d = SchemaGraph::new(GraphName::DefaultGraph, SchemaRole::Ontology);
         d.applies_to = vec![GraphName::DefaultGraph];

@@ -2537,8 +2537,11 @@ mod tests {
         let outside = base.join("outside");
         for dir in [&served, &outside] {
             std::fs::create_dir_all(dir).unwrap();
-            crate::root_marker::write_new_marker(dir, &crate::root_marker::RootConfig::new("example-project"))
-                .unwrap();
+            crate::root_marker::write_new_marker(
+                dir,
+                &crate::root_marker::RootConfig::new("example-project"),
+            )
+            .unwrap();
         }
         let state = caller_path_state(&served, vec![]).await;
         let req = |root: &Path| RootReq {
@@ -2546,7 +2549,9 @@ mod tests {
             namespace: "example-project".to_string(),
             root: root.to_string_lossy().into_owned(),
         };
-        let err = handle_cli_root(State(state.clone()), Json(req(&outside))).await.unwrap_err();
+        let err = handle_cli_root(State(state.clone()), Json(req(&outside)))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN, "{}", err.1);
         assert!(err.1.contains("allowed_external_dirs"), "{}", err.1);
         let inside = handle_cli_root(State(state.clone()), Json(req(&served))).await;
@@ -2566,10 +2571,13 @@ mod tests {
     #[tokio::test]
     async fn cli_root_cache_root_op_sets_only_the_cache() {
         use crate::guard::testkit::{MockStore, StubEmbedder};
-        let store: std::sync::Arc<dyn crate::traits::VectorStore> = std::sync::Arc::new(MockStore::new());
+        let store: std::sync::Arc<dyn crate::traits::VectorStore> =
+            std::sync::Arc::new(MockStore::new());
         let emb: std::sync::Arc<dyn crate::traits::Embedder> = std::sync::Arc::new(StubEmbedder);
         let tmp = tempfile::tempdir().unwrap();
-        let root = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let root = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(&root).unwrap();
         let req = |op: &str, root: &str| super::RootReq {
             op: op.to_string(),
@@ -2588,7 +2596,12 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{}", err.1);
-        assert_eq!(crate::registry::cached_project_root(&store, "example-project").await.unwrap(), None);
+        assert_eq!(
+            crate::registry::cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            None
+        );
 
         let cfg = crate::root_marker::RootConfig::new("example-project");
         crate::root_marker::replace_marker(&root, &cfg).unwrap();
@@ -2598,12 +2611,19 @@ mod tests {
         assert_eq!(v["ok"], serde_json::json!(true), "{v}");
         assert_eq!(v["namespace"], serde_json::json!("example-project"));
         assert_eq!(
-            crate::registry::cached_project_root(&store, "example-project").await.unwrap(),
+            crate::registry::cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
             Some(root.to_string_lossy().into_owned())
         );
         // The daemon writes no file in the folder: only the test's marker.
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
-        assert_eq!(std::fs::read_dir(root.join(".NeuroStrata")).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(root.join(".NeuroStrata"))
+                .unwrap()
+                .count(),
+            1
+        );
 
         // The removed writer ops and a relative root are refused.
         for op in ["setup", "set"] {

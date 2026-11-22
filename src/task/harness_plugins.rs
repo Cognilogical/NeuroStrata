@@ -3,7 +3,19 @@
 //! and `neurostrata_get_snapshot`).
 
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+/// Namespace resolution reads untracked config files from the checkout, which
+/// a contributor can replace with a symlink to a special file or a huge file.
+/// Anything past this bound is unreadable, never slurped into memory.
+const MAX_CONFIG_BYTES: u64 = 1_048_576;
+
+/// Serialize same-process config rewrites. Two refreshes that race on one
+/// config must not derive the same temporary path and clobber each other.
+static CONFIG_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 const OPENCODE_INDEX_JS: &str = include_str!("../../plugins/opencode/dist/index.js");
 const OPENCODE_PKG_JSON: &str = include_str!("../../plugins/opencode/package.json");
@@ -226,7 +238,9 @@ fn runner_is_replaceable(old_path: &str, project_root: &Path, abs_runner: &str) 
         return true;
     }
     // Only a definite "not found" counts as missing; an unreadable path is
-    // left alone.
+    // left alone. Repair may repoint any missing `cli-hook.mjs` to the
+    // installer's runner; namespace resolution uses the stricter
+    // `runner_is_installers_hook` below.
     matches!(candidate.try_exists(), Ok(false))
 }
 
@@ -2028,6 +2042,7 @@ mod tests {
             .join("example-project");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(dir.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
         (tmp, dir)
     }
 
@@ -2330,6 +2345,7 @@ mod tests {
         let main = base.join("platform");
         std::fs::create_dir_all(main.join(".git").join("worktrees").join("wt")).unwrap();
         std::fs::write(main.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(main.join(".git").join("config"), "[core]\n\tbare = false\n").unwrap();
         std::fs::create_dir_all(main.join("src")).unwrap();
         // No configuration yet: the folder name, from any directory inside.
         assert_eq!(ns_of(&main), "platform");

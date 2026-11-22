@@ -1719,15 +1719,26 @@ mod tests {
             save_custom_insight(&store, ns, def.clone()),
         )
         .await;
-        assert!(save.is_err(), "save_custom_insight ran while the row lock was held");
+        assert!(
+            save.is_err(),
+            "save_custom_insight ran while the row lock was held"
+        );
         let remove = tokio::time::timeout(
             std::time::Duration::from_millis(200),
             remove_custom_insight(&store, ns, "lock-probe"),
         )
         .await;
-        assert!(remove.is_err(), "remove_custom_insight ran while the row lock was held");
+        assert!(
+            remove.is_err(),
+            "remove_custom_insight ran while the row lock was held"
+        );
         drop(held);
-        save_custom_insight(&store, ns, def).await.expect("saves once the lock is free");
-        assert_eq!(remove_custom_insight(&store, ns, "lock-probe").await, Ok(true));
+        save_custom_insight(&store, ns, def)
+            .await
+            .expect("saves once the lock is free");
+        assert_eq!(
+            remove_custom_insight(&store, ns, "lock-probe").await,
+            Ok(true)
+        );
     }
 }

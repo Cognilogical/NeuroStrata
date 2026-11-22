@@ -4,10 +4,19 @@ mod metrics;
 use metrics::*;
 
 fn label(id: &str, gain: u8) -> RelevanceLabel {
-    RelevanceLabel { id: id.to_string(), gain }
+    RelevanceLabel {
+        id: id.to_string(),
+        gain,
+    }
 }
 
-fn query(id: &str, category: QueryCategory, ndcg: f64, recall: f64, precision: f64) -> QueryMetrics {
+fn query(
+    id: &str,
+    category: QueryCategory,
+    ndcg: f64,
+    recall: f64,
+    precision: f64,
+) -> QueryMetrics {
     QueryMetrics {
         query_id: id.to_string(),
         category,
@@ -148,7 +157,12 @@ fn summarize_arm_computes_means_and_preserves_queries() {
 fn gate_passes_qualifying_arm4_result() {
     let (arm3, arm4) = qualifying_arms();
     let report = gate_ok(&arm3, &arm4);
-    assert_eq!(report.verdict, GateVerdict::Pass, "violations: {:?}", report.violations);
+    assert_eq!(
+        report.verdict,
+        GateVerdict::Pass,
+        "violations: {:?}",
+        report.violations
+    );
     assert!(report.violations.is_empty());
 }
 
@@ -158,7 +172,12 @@ fn gate_passes_via_recall_alternative_when_ndcg_flat() {
     arm4.ndcg_at_10 = arm3.ndcg_at_10 * 1.01; // below 5% relative gain
     arm4.recall_at_5 = arm3.recall_at_5 + 0.10; // 10pp recall gain
     let report = gate_ok(&arm3, &arm4);
-    assert_eq!(report.verdict, GateVerdict::Pass, "violations: {:?}", report.violations);
+    assert_eq!(
+        report.verdict,
+        GateVerdict::Pass,
+        "violations: {:?}",
+        report.violations
+    );
 }
 
 #[test]
@@ -168,7 +187,10 @@ fn gate_rejects_insufficient_ndcg_and_recall_lift() {
     arm4.recall_at_5 = arm3.recall_at_5 + 0.02;
     let report = gate_ok(&arm3, &arm4);
     assert_eq!(report.verdict, GateVerdict::Fail);
-    assert!(report.violations.iter().any(|v| v.code == "insufficient_lift"));
+    assert!(report
+        .violations
+        .iter()
+        .any(|v| v.code == "insufficient_lift"));
 }
 
 #[test]
@@ -179,7 +201,10 @@ fn gate_rejects_insufficient_ontology_subset_lift() {
     arm4.queries[1].recall_at_5 = 0.45;
     let report = gate_ok(&arm3, &arm4);
     assert_eq!(report.verdict, GateVerdict::Fail);
-    assert!(report.violations.iter().any(|v| v.code == "insufficient_ontology_subset_lift"));
+    assert!(report
+        .violations
+        .iter()
+        .any(|v| v.code == "insufficient_ontology_subset_lift"));
 }
 
 #[test]
@@ -188,7 +213,10 @@ fn gate_rejects_insufficient_ontology_targeted_lift() {
     arm4.ontology_recall_at_5 = arm3.ontology_recall_at_5 + 0.05;
     let report = gate_ok(&arm3, &arm4);
     assert_eq!(report.verdict, GateVerdict::Fail);
-    assert!(report.violations.iter().any(|v| v.code == "insufficient_ontology_targeted_lift"));
+    assert!(report
+        .violations
+        .iter()
+        .any(|v| v.code == "insufficient_ontology_targeted_lift"));
 }
 
 #[test]
@@ -197,7 +225,10 @@ fn gate_rejects_precision_drop_over_two_points() {
     arm4.precision_at_5 = arm3.precision_at_5 - 0.03;
     let report = gate_ok(&arm3, &arm4);
     assert_eq!(report.verdict, GateVerdict::Fail);
-    assert!(report.violations.iter().any(|v| v.code == "precision_drop_exceeded"));
+    assert!(report
+        .violations
+        .iter()
+        .any(|v| v.code == "precision_drop_exceeded"));
 }
 
 #[test]
@@ -205,7 +236,10 @@ fn gate_allows_exactly_two_point_precision_drop() {
     let (arm3, mut arm4) = qualifying_arms();
     arm4.precision_at_5 = arm3.precision_at_5 - 0.02;
     let report = gate_ok(&arm3, &arm4);
-    assert!(!report.violations.iter().any(|v| v.code == "precision_drop_exceeded"));
+    assert!(!report
+        .violations
+        .iter()
+        .any(|v| v.code == "precision_drop_exceeded"));
 }
 
 #[test]
@@ -214,7 +248,10 @@ fn gate_rejects_forbidden_identity_hit_in_arm4() {
     arm4.queries[0].forbidden_hits = vec!["foreign-project-doc".to_string()];
     let report = gate_ok(&arm3, &arm4);
     assert_eq!(report.verdict, GateVerdict::Fail);
-    assert!(report.violations.iter().any(|v| v.code == "forbidden_identity_hit"));
+    assert!(report
+        .violations
+        .iter()
+        .any(|v| v.code == "forbidden_identity_hit"));
 }
 
 #[test]
@@ -224,7 +261,10 @@ fn gate_rejects_p95_overhead_above_25ms_even_with_low_relative() {
     arm4.p95_ms = 430.0; // 30ms absolute overhead, 7.5% relative
     let report = gate_ok(&arm3, &arm4);
     assert_eq!(report.verdict, GateVerdict::Fail);
-    assert!(report.violations.iter().any(|v| v.code == "p95_overhead_exceeded"));
+    assert!(report
+        .violations
+        .iter()
+        .any(|v| v.code == "p95_overhead_exceeded"));
 }
 
 #[test]
@@ -234,7 +274,10 @@ fn gate_rejects_p95_overhead_above_10_percent() {
     arm4.p95_ms = 112.0; // 12ms absolute, 12% relative
     let report = gate_ok(&arm3, &arm4);
     assert_eq!(report.verdict, GateVerdict::Fail);
-    assert!(report.violations.iter().any(|v| v.code == "p95_overhead_exceeded"));
+    assert!(report
+        .violations
+        .iter()
+        .any(|v| v.code == "p95_overhead_exceeded"));
 }
 
 #[test]
@@ -243,10 +286,16 @@ fn gate_zero_p95_baseline_fails_only_above_25ms_absolute() {
     arm3.p95_ms = 0.0;
     arm4.p95_ms = 20.0;
     let pass = gate_ok(&arm3, &arm4);
-    assert!(!pass.violations.iter().any(|v| v.code == "p95_overhead_exceeded"));
+    assert!(!pass
+        .violations
+        .iter()
+        .any(|v| v.code == "p95_overhead_exceeded"));
     arm4.p95_ms = 30.0;
     let fail = gate_ok(&arm3, &arm4);
-    assert!(fail.violations.iter().any(|v| v.code == "p95_overhead_exceeded"));
+    assert!(fail
+        .violations
+        .iter()
+        .any(|v| v.code == "p95_overhead_exceeded"));
 }
 
 #[test]
@@ -254,9 +303,15 @@ fn gate_rejects_excessive_derived_storage() {
     let (arm3, arm4) = qualifying_arms();
     let report = evaluate_thresholds(&arm3, &arm4, 5, 100, true, &[]); // exactly 5%, not below
     assert_eq!(report.verdict, GateVerdict::Fail);
-    assert!(report.violations.iter().any(|v| v.code == "derived_storage_exceeded"));
+    assert!(report
+        .violations
+        .iter()
+        .any(|v| v.code == "derived_storage_exceeded"));
     let ok = evaluate_thresholds(&arm3, &arm4, 4, 100, true, &[]);
-    assert!(!ok.violations.iter().any(|v| v.code == "derived_storage_exceeded"));
+    assert!(!ok
+        .violations
+        .iter()
+        .any(|v| v.code == "derived_storage_exceeded"));
 }
 
 #[test]
@@ -274,7 +329,10 @@ fn gate_reports_non_finite_metrics_as_violations() {
     arm4.ndcg_at_10 = f64::NAN;
     let report = gate_ok(&arm3, &arm4);
     assert_eq!(report.verdict, GateVerdict::Fail);
-    assert!(report.violations.iter().any(|v| v.code == "non_finite_metric"));
+    assert!(report
+        .violations
+        .iter()
+        .any(|v| v.code == "non_finite_metric"));
 }
 
 #[test]
@@ -291,7 +349,10 @@ fn serde_rejects_unknown_fields_on_strict_structs() {
     assert!(serde_json::from_str::<RelevanceLabel>(extra).is_err());
     let (arm3, _) = qualifying_arms();
     let mut value = serde_json::to_value(&arm3).unwrap();
-    value.as_object_mut().unwrap().insert("bogus".into(), serde_json::json!(1));
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("bogus".into(), serde_json::json!(1));
     assert!(serde_json::from_value::<ArmMetrics>(value).is_err());
 }
 
@@ -333,7 +394,12 @@ fn gate_zero_ndcg_baseline_passes_only_via_recall_alternative() {
     assert_eq!(relative_gain(0.0, 0.75), 0.0);
     arm4.recall_at_5 = arm3.recall_at_5 + 0.06; // >= 5pp recall alternative
     let report = gate_ok(&arm3, &arm4);
-    assert_eq!(report.verdict, GateVerdict::Pass, "violations: {:?}", report.violations);
+    assert_eq!(
+        report.verdict,
+        GateVerdict::Pass,
+        "violations: {:?}",
+        report.violations
+    );
 }
 
 #[test]
@@ -341,16 +407,15 @@ fn gate_rejects_zero_fixture_payload_byte_count_as_invalid() {
     let (arm3, arm4) = qualifying_arms();
     let report = evaluate_thresholds(&arm3, &arm4, 0, 0, true, &[]);
     assert_eq!(report.verdict, GateVerdict::Fail);
-    assert!(report.violations.iter().any(|v| v.code == "invalid_byte_counts"));
+    assert!(report
+        .violations
+        .iter()
+        .any(|v| v.code == "invalid_byte_counts"));
 }
 
 #[test]
 fn per_query_p95_medians_require_three_consistent_iterations() {
-    let samples = vec![
-        vec![10.0, 20.0],
-        vec![12.0, 18.0],
-        vec![14.0, 22.0],
-    ];
+    let samples = vec![vec![10.0, 20.0], vec![12.0, 18.0], vec![14.0, 22.0]];
     let medians = per_query_p95_medians(&samples).unwrap();
     assert!((medians[0] - 12.0).abs() < 1e-12);
     assert!((medians[1] - 20.0).abs() < 1e-12);
@@ -387,16 +452,15 @@ fn ndcg_at_deduplicates_relevant_labels_using_maximum_gain() {
     let relevant = vec![label("a", 1), label("a", 3), label("b", 2)];
     let ranked = vec!["a".to_string(), "b".to_string()];
     let score = ndcg_at(&ranked, &relevant, 10);
-    assert!((score - 1.0).abs() < 1e-12, "duplicate labels inflated ideal DCG: {score}");
+    assert!(
+        (score - 1.0).abs() < 1e-12,
+        "duplicate labels inflated ideal DCG: {score}"
+    );
 }
 
 #[test]
 fn per_query_p95_medians_still_use_three_iteration_medians() {
-    let samples = vec![
-        vec![10.0, 20.0],
-        vec![12.0, 18.0],
-        vec![14.0, 22.0],
-    ];
+    let samples = vec![vec![10.0, 20.0], vec![12.0, 18.0], vec![14.0, 22.0]];
     let medians = per_query_p95_medians(&samples).unwrap();
     assert!((medians[0] - 12.0).abs() < 1e-12);
     assert!((medians[1] - 20.0).abs() < 1e-12);

@@ -127,7 +127,10 @@ pub fn is_valid_namespace(ns: &str) -> bool {
 /// unknown `version` or a bad `namespace` is `Unreadable`, never `Absent`.
 pub fn read_marker(dir: &Path) -> MarkerRead {
     let path = dir.join(ROOT_CONFIG_REL);
-    let unreadable = |reason: String| MarkerRead::Unreadable { path: path.clone(), reason };
+    let unreadable = |reason: String| MarkerRead::Unreadable {
+        path: path.clone(),
+        reason,
+    };
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return MarkerRead::Absent,
@@ -177,18 +180,27 @@ pub fn replace_marker(dir: &Path, cfg: &RootConfig) -> Result<(), MarkerError> {
 /// serialized config to a fresh temporary file beside the target.
 fn prepare(dir: &Path, cfg: &RootConfig) -> Result<(PathBuf, PathBuf), MarkerError> {
     if let Some(reason) = cfg.invalid_reason() {
-        return Err(MarkerError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, reason)));
+        return Err(MarkerError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            reason,
+        )));
     }
     if !marker_dir_is_safe(dir) {
-        return Err(MarkerError::Unsafe(".NeuroStrata is not a real folder inside the target"));
+        return Err(MarkerError::Unsafe(
+            ".NeuroStrata is not a real folder inside the target",
+        ));
     }
-    let mut body = serde_json::to_vec_pretty(cfg)
-        .map_err(|err| MarkerError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, err)))?;
+    let mut body = serde_json::to_vec_pretty(cfg).map_err(|err| {
+        MarkerError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+    })?;
     body.push(b'\n');
     let target = dir.join(ROOT_CONFIG_REL);
     let tmp = temp_name(&target);
     let written = (|| {
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         file.write_all(&body)?;
         file.sync_all()
     })();
@@ -206,7 +218,10 @@ fn temp_name(target: &Path) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    target.with_file_name(format!("config.json.tmp-{}-{nanos}-{n}", std::process::id()))
+    target.with_file_name(format!(
+        "config.json.tmp-{}-{nanos}-{n}",
+        std::process::id()
+    ))
 }
 
 /// True when `dir/.NeuroStrata` is a real directory inside `dir` (not a
@@ -267,7 +282,9 @@ fn has_git_below(dir: &Path, depth: usize) -> bool {
         return false;
     };
     entries.flatten().any(|entry| {
-        let is_real_dir = entry.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink());
+        let is_real_dir = entry
+            .file_type()
+            .is_ok_and(|t| t.is_dir() && !t.is_symlink());
         if !is_real_dir {
             return false;
         }
@@ -440,7 +457,9 @@ fn canonical_through_existing(path: &Path) -> PathBuf {
 /// worktree's file), in `dir`'s spelling: the rule of
 /// [`crate::paths::git_root_of_dir`], which answers with `/` on Windows.
 fn checkout_top(dir: &Path) -> Option<PathBuf> {
-    dir.ancestors().find(|d| d.join(".git").exists()).map(Path::to_path_buf)
+    dir.ancestors()
+        .find(|d| d.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 /// The main checkout when `top` is a linked worktree's top, else `None`.
@@ -496,7 +515,10 @@ fn marker_at(dir: &Path) -> Option<(PathBuf, MarkerRead)> {
         Err(err) => {
             return Some((
                 dir.to_path_buf(),
-                MarkerRead::Unreadable { path: folder, reason: err.to_string() },
+                MarkerRead::Unreadable {
+                    path: folder,
+                    reason: err.to_string(),
+                },
             ))
         }
     }
@@ -510,7 +532,9 @@ fn marker_at(dir: &Path) -> Option<(PathBuf, MarkerRead)> {
 }
 
 fn depth_below(dir: &Path, top: &Path) -> usize {
-    dir.strip_prefix(top).map(|rel| rel.components().count()).unwrap_or(0)
+    dir.strip_prefix(top)
+        .map(|rel| rel.components().count())
+        .unwrap_or(0)
 }
 
 /// How deep `root show` looks below its folder for other markers.
@@ -535,7 +559,10 @@ fn collect_nested(dir: &Path, depth: usize, found: &mut Vec<(PathBuf, MarkerRead
         return;
     };
     for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink()) {
+        if !entry
+            .file_type()
+            .is_ok_and(|t| t.is_dir() && !t.is_symlink())
+        {
             continue;
         }
         let name = entry.file_name();
@@ -581,14 +608,20 @@ pub fn format_root_show(
         Ok(Some(found)) => {
             let marker_dir = found.marker_dir();
             out.push(format!("marker root: {}", found.root.display()));
-            out.push(format!("marker file: {}", marker_dir.join(ROOT_CONFIG_REL).display()));
+            out.push(format!(
+                "marker file: {}",
+                marker_dir.join(ROOT_CONFIG_REL).display()
+            ));
             out.push(format!("found via: {}", found.via.as_str()));
             out.push(format!("namespace: {}", found.config.namespace));
             out.push(format!(
                 "source_id: {}",
                 found.config.source_id.as_deref().unwrap_or("none")
             ));
-            out.push(format!("git tracks the marker: {}", git_tracks_marker(&marker_dir, found.via)));
+            out.push(format!(
+                "git tracks the marker: {}",
+                git_tracks_marker(&marker_dir, found.via)
+            ));
             marker_root = Some(found.root.clone());
         }
         Ok(None) => {
@@ -596,7 +629,10 @@ pub fn format_root_show(
             out.push(format!("namespace without a marker: {namespace}"));
         }
         Err((path, reason)) => {
-            out.push(format!("marker root: unreadable marker {}: {reason}", path.display()));
+            out.push(format!(
+                "marker root: unreadable marker {}: {reason}",
+                path.display()
+            ));
             out.push(format!("namespace without a marker: {namespace}"));
         }
     }
@@ -615,7 +651,8 @@ pub fn format_root_show(
             ));
             // A worktree's root is cached in the main checkout's spelling.
             let differs = marker_root.as_deref().is_some_and(|m| {
-                !same_folder(Path::new(root), m) && !same_folder(Path::new(root), &in_main_checkout(m))
+                !same_folder(Path::new(root), m)
+                    && !same_folder(Path::new(root), &in_main_checkout(m))
             });
             if differs {
                 out.push(
@@ -641,7 +678,9 @@ pub fn format_root_show(
             .into_iter()
             .filter(|(path, _)| {
                 let rel = path.strip_prefix(&main_root).ok();
-                !nested.iter().any(|(own, _)| own.strip_prefix(&walk_root).ok() == rel)
+                !nested
+                    .iter()
+                    .any(|(own, _)| own.strip_prefix(&walk_root).ok() == rel)
             })
             .collect()
     };
@@ -651,18 +690,22 @@ pub fn format_root_show(
         walk_root.display(),
         if count == 0 { "none".to_string() } else { count.to_string() }
     ));
-    let labeled = nested
-        .iter()
-        .map(|hit| (hit, ""))
-        .chain(main_only.iter().map(|hit| (hit, ", only in the main checkout")));
+    let labeled = nested.iter().map(|hit| (hit, "")).chain(
+        main_only
+            .iter()
+            .map(|hit| (hit, ", only in the main checkout")),
+    );
     for ((path, read), label) in labeled {
         match read {
-            MarkerRead::Valid(cfg) => {
-                out.push(format!("  {} (namespace {}{label})", path.display(), cfg.namespace))
-            }
-            MarkerRead::Unreadable { reason, .. } => {
-                out.push(format!("  {} (unreadable: {reason}{label})", path.display()))
-            }
+            MarkerRead::Valid(cfg) => out.push(format!(
+                "  {} (namespace {}{label})",
+                path.display(),
+                cfg.namespace
+            )),
+            MarkerRead::Unreadable { reason, .. } => out.push(format!(
+                "  {} (unreadable: {reason}{label})",
+                path.display()
+            )),
             MarkerRead::Absent => {}
         }
     }
@@ -672,7 +715,11 @@ pub fn format_root_show(
             missing.sort();
             out.push(format!(
                 "project-context bindings to missing folders: {}",
-                if missing.is_empty() { "none".to_string() } else { missing.len().to_string() }
+                if missing.is_empty() {
+                    "none".to_string()
+                } else {
+                    missing.len().to_string()
+                }
             ));
             for (source_id, path) in missing {
                 out.push(format!("  {source_id} -> {}", path.display()));
@@ -736,7 +783,11 @@ pub enum SetupMarker {
     /// A marker for the namespace covers `root` (written now when `written`),
     /// and the cached root stays `cached`: a usable folder outside `root`'s
     /// tree (another clone, or an older copy). Only `root set` moves it.
-    KeptCache { root: PathBuf, cached: PathBuf, written: bool },
+    KeptCache {
+        root: PathBuf,
+        cached: PathBuf,
+        written: bool,
+    },
     /// The cached root is a subfolder of the checkout top: nothing written,
     /// the caller picks one with `root set`.
     AskRoot { top: PathBuf, sub: PathBuf },
@@ -754,7 +805,11 @@ pub enum SetupMarker {
     /// A marker for the namespace covers `root` (written now when `written`),
     /// but the cached root could not be set to it, for `reason`: the marker
     /// spelling stays off until it is. A failure: `hooks install` exits 1.
-    CacheNotSet { root: PathBuf, written: bool, reason: String },
+    CacheNotSet {
+        root: PathBuf,
+        written: bool,
+        reason: String,
+    },
 }
 
 impl SetupMarker {
@@ -782,7 +837,9 @@ impl SetupMarker {
     pub fn root(&self) -> Option<&Path> {
         match self {
             SetupMarker::Reused(root) | SetupMarker::Written(root) => Some(root),
-            SetupMarker::KeptCache { root, .. } | SetupMarker::CacheNotSet { root, .. } => Some(root),
+            SetupMarker::KeptCache { root, .. } | SetupMarker::CacheNotSet { root, .. } => {
+                Some(root)
+            }
             _ => None,
         }
     }
@@ -866,7 +923,9 @@ impl SetupMarker {
                 out["top"] = serde_json::json!(top.to_string_lossy());
                 out["sub"] = serde_json::json!(sub.to_string_lossy());
             }
-            SetupMarker::AskNamespace(candidates) => out["candidates"] = serde_json::json!(candidates),
+            SetupMarker::AskNamespace(candidates) => {
+                out["candidates"] = serde_json::json!(candidates)
+            }
             SetupMarker::OtherNamespace(other) => out["namespace"] = serde_json::json!(other),
             SetupMarker::RootChangeBlocked(ids) => out["memory_ids"] = serde_json::json!(ids),
             SetupMarker::Refused(reason) => out["reason"] = serde_json::json!(reason),
@@ -964,7 +1023,8 @@ impl RootRegistry for StoreRegistry {
 
     async fn set_root(&self, namespace: &str, root: &Path) -> Result<(), String> {
         let namespace = crate::server::resolve_namespace(&self.store, namespace).await;
-        if crate::registry::set_project_root(&self.store, self.emb.as_ref(), &namespace, root).await {
+        if crate::registry::set_project_root(&self.store, self.emb.as_ref(), &namespace, root).await
+        {
             Ok(())
         } else {
             Err("the registry row could not be written".to_string())
@@ -1082,7 +1142,11 @@ pub async fn ensure_marker_for_setup(
     project_dir: &Path,
     namespace: Option<&str>,
 ) -> SetupMarker {
-    let registry = StoreRegistry { store: store.clone(), emb: emb.cloned(), checkpoint: false };
+    let registry = StoreRegistry {
+        store: store.clone(),
+        emb: emb.cloned(),
+        checkpoint: false,
+    };
     ensure_marker_with(&registry, project_dir, namespace).await
 }
 
@@ -1122,15 +1186,27 @@ pub async fn ensure_marker_with(
             return SetupMarker::Refused("the cached root could not be read");
         }
     };
-    let finished = |root: PathBuf, written: bool, settled: Result<Option<PathBuf>, String>| match settled {
-        Err(reason) => {
-            tracing::warn!("the cached root of '{namespace}' could not be set to {}: {reason}", root.display());
-            SetupMarker::CacheNotSet { root, written, reason }
-        }
-        Ok(Some(cached)) => SetupMarker::KeptCache { root, cached, written },
-        Ok(None) if written => SetupMarker::Written(root),
-        Ok(None) => SetupMarker::Reused(root),
-    };
+    let finished =
+        |root: PathBuf, written: bool, settled: Result<Option<PathBuf>, String>| match settled {
+            Err(reason) => {
+                tracing::warn!(
+                    "the cached root of '{namespace}' could not be set to {}: {reason}",
+                    root.display()
+                );
+                SetupMarker::CacheNotSet {
+                    root,
+                    written,
+                    reason,
+                }
+            }
+            Ok(Some(cached)) => SetupMarker::KeptCache {
+                root,
+                cached,
+                written,
+            },
+            Ok(None) if written => SetupMarker::Written(root),
+            Ok(None) => SetupMarker::Reused(root),
+        };
     match find_root_marker(&dir) {
         Err(_) => {
             return SetupMarker::Refused(
@@ -1175,7 +1251,9 @@ pub async fn ensure_marker_with(
         Ok(_) => {}
         Err(e) => {
             tracing::warn!("the memories of '{namespace}' could not be listed: {e}");
-            return SetupMarker::Refused("the memories could not be listed for the root-change check");
+            return SetupMarker::Refused(
+                "the memories could not be listed for the root-change check",
+            );
         }
     }
     match write_new_marker(&target, &RootConfig::new(namespace.clone())) {
@@ -1227,7 +1305,11 @@ pub async fn root_set(
     emb: Option<&std::sync::Arc<dyn crate::traits::Embedder>>,
     args: &RootSetArgs,
 ) -> Result<Vec<String>, String> {
-    let registry = StoreRegistry { store: store.clone(), emb: emb.cloned(), checkpoint: false };
+    let registry = StoreRegistry {
+        store: store.clone(),
+        emb: emb.cloned(),
+        checkpoint: false,
+    };
     root_set_with(&registry, args, None).await
 }
 
@@ -1266,7 +1348,10 @@ pub(crate) async fn root_set_with(
 ) -> Result<Vec<String>, String> {
     let ns = args.namespace.as_str();
     if !args.dir.is_absolute() || !args.dir.is_dir() {
-        return Err(format!("{} is not an existing absolute folder", args.dir.display()));
+        return Err(format!(
+            "{} is not an existing absolute folder",
+            args.dir.display()
+        ));
     }
     if !is_valid_namespace(ns) {
         return Err(format!(
@@ -1283,7 +1368,10 @@ pub(crate) async fn root_set_with(
         ));
     }
     if let Some(reason) = refuse_root_target(&target) {
-        return Err(format!("refused: {} is a {reason}, which cannot be a project root", target.display()));
+        return Err(format!(
+            "refused: {} is a {reason}, which cannot be a project root",
+            target.display()
+        ));
     }
     let existing = read_marker(&target);
     match &existing {
@@ -1317,7 +1405,10 @@ pub(crate) async fn root_set_with(
     let lost = lost_by_change(registry, ns, current.as_deref(), &target).await?;
     let mut lines = Vec::new();
     if !lost.is_empty() {
-        let from = current.as_deref().map(|p| p.display().to_string()).unwrap_or_default();
+        let from = current
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         if !args.force {
             return Err(format!(
                 "changing the root of {ns} from {from} to {} would stop {} memories matching: {}. \
@@ -1411,15 +1502,21 @@ pub(crate) async fn root_set_with(
         match std::fs::remove_file(&old_file) {
             Ok(()) => lines.push(format!("Removed the old marker {}.", old_file.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("could not remove the old marker {}: {e}", old_file.display())),
+            Err(e) => {
+                return Err(format!(
+                    "could not remove the old marker {}: {e}",
+                    old_file.display()
+                ))
+            }
         }
     }
 
     if let Some(source_id) = &args.source_id {
         match crate::config::bind_project_context_if_free(source_id, &target.join(".NeuroStrata")) {
-            Ok(crate::config::BindOutcome::Bound) => {
-                lines.push(format!("Bound project context {source_id} to {}.", target.display()))
-            }
+            Ok(crate::config::BindOutcome::Bound) => lines.push(format!(
+                "Bound project context {source_id} to {}.",
+                target.display()
+            )),
             Ok(crate::config::BindOutcome::AlreadyBoundHere) => {}
             Ok(crate::config::BindOutcome::LiveElsewhere(path)) => lines.push(format!(
                 "Project context {source_id} stays bound to {}; recorded in the marker only.",
@@ -1430,7 +1527,8 @@ pub(crate) async fn root_set_with(
     }
     let top = crate::paths::main_checkout_root(&target.to_string_lossy());
     if top.as_deref().is_some_and(|top| !same_folder(top, &target)) {
-        lines.push("Commit .NeuroStrata/config.json so other clones use the same root.".to_string());
+        lines
+            .push("Commit .NeuroStrata/config.json so other clones use the same root.".to_string());
     }
     Ok(lines)
 }
@@ -1449,7 +1547,9 @@ pub fn commit_advice(root: &Path) -> Option<String> {
             .ok()
             .map(|s| s.success())
     };
-    if git(&["ls-files", "--error-unmatch", ROOT_CONFIG_REL])? || git(&["check-ignore", "-q", ROOT_CONFIG_REL])? {
+    if git(&["ls-files", "--error-unmatch", ROOT_CONFIG_REL])?
+        || git(&["check-ignore", "-q", ROOT_CONFIG_REL])?
+    {
         return None;
     }
     Some(
@@ -1512,7 +1612,8 @@ mod tests {
         cfg.namespace = "example-project-2".into();
         replace_marker(tmp.path(), &cfg).unwrap();
         let raw: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(tmp.path().join(ROOT_CONFIG_REL)).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(tmp.path().join(ROOT_CONFIG_REL)).unwrap())
+                .unwrap();
         assert_eq!(raw["future"], serde_json::json!({"a": 1}));
         assert_eq!(raw["namespace"], "example-project-2");
         assert_eq!(read_marker(tmp.path()), MarkerRead::Valid(cfg));
@@ -1532,7 +1633,10 @@ mod tests {
             tmp.path(),
             b"\xEF\xBB\xBF{\r\n  \"version\": 1,\r\n  \"namespace\": \"example-project\"\r\n}\r\n",
         );
-        assert_eq!(read_marker(tmp.path()), MarkerRead::Valid(RootConfig::new("example-project")));
+        assert_eq!(
+            read_marker(tmp.path()),
+            MarkerRead::Valid(RootConfig::new("example-project"))
+        );
     }
 
     #[test]
@@ -1546,14 +1650,19 @@ mod tests {
         ] {
             write_raw(tmp.path(), body);
             match read_marker(tmp.path()) {
-                MarkerRead::Unreadable { path, .. } => assert_eq!(path, tmp.path().join(ROOT_CONFIG_REL)),
+                MarkerRead::Unreadable { path, .. } => {
+                    assert_eq!(path, tmp.path().join(ROOT_CONFIG_REL))
+                }
                 other => panic!("{:?} read as {other:?}", String::from_utf8_lossy(body)),
             }
         }
         // A writer refuses a config it could not read back.
         let mut cfg = RootConfig::new("example-project");
         cfg.version = 2;
-        assert!(matches!(replace_marker(tmp.path(), &cfg), Err(MarkerError::Io(_))));
+        assert!(matches!(
+            replace_marker(tmp.path(), &cfg),
+            Err(MarkerError::Io(_))
+        ));
     }
 
     #[test]
@@ -1568,7 +1677,10 @@ mod tests {
         write_raw(tmp.path(), br#"{"version":1,"namespace":"team:proj"}"#);
         assert!(matches!(read_marker(tmp.path()), MarkerRead::Valid(_)));
         write_raw(tmp.path(), br#"{"version":1,"namespace":"-x"}"#);
-        assert!(matches!(read_marker(tmp.path()), MarkerRead::Unreadable { .. }));
+        assert!(matches!(
+            read_marker(tmp.path()),
+            MarkerRead::Unreadable { .. }
+        ));
     }
 
     #[test]
@@ -1576,7 +1688,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let first = RootConfig::new("example-project");
         let second = RootConfig::new("other-project");
-        assert_eq!(write_new_marker(tmp.path(), &first).unwrap(), WriteOutcome::Written);
+        assert_eq!(
+            write_new_marker(tmp.path(), &first).unwrap(),
+            WriteOutcome::Written
+        );
         assert_eq!(
             write_new_marker(tmp.path(), &second).unwrap(),
             WriteOutcome::LostRace(MarkerRead::Valid(first))
@@ -1617,7 +1732,12 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let (reads, bad) = reader.join().unwrap();
         assert!(reads > 0);
-        assert!(bad.is_empty(), "{} of {reads} reads failed, first: {:?}", bad.len(), bad[0]);
+        assert!(
+            bad.is_empty(),
+            "{} of {reads} reads failed, first: {:?}",
+            bad.len(),
+            bad[0]
+        );
     }
 
     /// Links `link` to `target` as a directory symlink, or on Windows as a
@@ -1670,7 +1790,9 @@ mod tests {
         }
         assert_eq!(find_root_marker(&link), Ok(None));
         // The target itself still finds its own marker.
-        let found = find_root_marker(&outer.join("src").join("a.rs")).unwrap().unwrap();
+        let found = find_root_marker(&outer.join("src").join("a.rs"))
+            .unwrap()
+            .unwrap();
         assert_eq!(found.root, outer);
         // A marker in the link's own checkout decides for the link.
         write_raw(&inner, br#"{"version":1,"namespace":"inner"}"#);
@@ -1684,7 +1806,9 @@ mod tests {
         // A missing folder is created as a real directory.
         let fresh = tempfile::tempdir().unwrap();
         assert!(marker_dir_is_safe(fresh.path()));
-        assert!(std::fs::symlink_metadata(fresh.path().join(".NeuroStrata")).unwrap().is_dir());
+        assert!(std::fs::symlink_metadata(fresh.path().join(".NeuroStrata"))
+            .unwrap()
+            .is_dir());
 
         // A file named .NeuroStrata is not a folder.
         let file = tempfile::tempdir().unwrap();
@@ -1698,7 +1822,10 @@ mod tests {
         // A link pointing elsewhere is refused and nothing is written there.
         let elsewhere = tempfile::tempdir().unwrap();
         let linked = tempfile::tempdir().unwrap();
-        assert!(link_dir(elsewhere.path(), &linked.path().join(".NeuroStrata")), "could not create a link");
+        assert!(
+            link_dir(elsewhere.path(), &linked.path().join(".NeuroStrata")),
+            "could not create a link"
+        );
         assert!(!marker_dir_is_safe(linked.path()));
         assert!(matches!(
             write_new_marker(linked.path(), &RootConfig::new("example-project")),
@@ -1714,16 +1841,30 @@ mod tests {
     #[test]
     fn home_and_root_are_refused() {
         let home = tempfile::tempdir().unwrap();
-        assert_eq!(refuse_root_target_with(home.path(), Some(home.path())), Some("home folder"));
+        assert_eq!(
+            refuse_root_target_with(home.path(), Some(home.path())),
+            Some("home folder")
+        );
         std::fs::create_dir(home.path().join(".git")).unwrap();
-        assert_eq!(refuse_root_target_with(home.path(), Some(home.path())), Some("home folder"));
+        assert_eq!(
+            refuse_root_target_with(home.path(), Some(home.path())),
+            Some("home folder")
+        );
 
         let project = home.path().join("example-project");
         std::fs::create_dir_all(project.join(".git")).unwrap();
         assert_eq!(refuse_root_target_with(&project, Some(home.path())), None);
 
-        let fs_root = dunce::canonicalize(home.path()).unwrap().ancestors().last().unwrap().to_path_buf();
-        assert_eq!(refuse_root_target_with(&fs_root, None), Some("filesystem root"));
+        let fs_root = dunce::canonicalize(home.path())
+            .unwrap()
+            .ancestors()
+            .last()
+            .unwrap()
+            .to_path_buf();
+        assert_eq!(
+            refuse_root_target_with(&fs_root, None),
+            Some("filesystem root")
+        );
     }
 
     #[test]
@@ -1736,8 +1877,14 @@ mod tests {
 
         let repo = ws.join("a").join("b").join("example-project");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
-        assert_eq!(refuse_root_target_with(ws, None), Some("folder contains a git checkout"));
-        assert_eq!(refuse_root_target_with(&ws.join("a"), None), Some("folder contains a git checkout"));
+        assert_eq!(
+            refuse_root_target_with(ws, None),
+            Some("folder contains a git checkout")
+        );
+        assert_eq!(
+            refuse_root_target_with(&ws.join("a"), None),
+            Some("folder contains a git checkout")
+        );
         // The checkout and folders inside it may be roots.
         assert_eq!(refuse_root_target_with(&repo, None), None);
         std::fs::create_dir_all(repo.join("sub")).unwrap();
@@ -1748,7 +1895,10 @@ mod tests {
         std::fs::create_dir_all(deep.path().join("1/2/3/4/5/.git")).unwrap();
         assert_eq!(refuse_root_target_with(deep.path(), None), None);
         std::fs::create_dir_all(deep.path().join("1/2/3/4/.git")).unwrap();
-        assert_eq!(refuse_root_target_with(deep.path(), None), Some("folder contains a git checkout"));
+        assert_eq!(
+            refuse_root_target_with(deep.path(), None),
+            Some("folder contains a git checkout")
+        );
         let skipped = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(skipped.path().join("node_modules/pkg/.git")).unwrap();
         std::fs::create_dir_all(skipped.path().join("target/x/.git")).unwrap();
@@ -1760,7 +1910,8 @@ mod tests {
     /// `rel` (with `/`) under `base`, in this host's separators: `mklink`
     /// does not accept `/`.
     fn under(base: &Path, rel: &str) -> PathBuf {
-        rel.split('/').fold(base.to_path_buf(), |path, part| path.join(part))
+        rel.split('/')
+            .fold(base.to_path_buf(), |path, part| path.join(part))
     }
 
     /// Builds one fixture `layout` under `base`; the format is documented in
@@ -1778,7 +1929,10 @@ mod tests {
                 continue;
             };
             if let Some(ns) = kind.strip_prefix("marker:") {
-                write_raw(&path, format!(r#"{{"version":1,"namespace":"{ns}"}}"#).as_bytes());
+                write_raw(
+                    &path,
+                    format!(r#"{{"version":1,"namespace":"{ns}"}}"#).as_bytes(),
+                );
             } else if let Some(text) = kind.strip_prefix("marker-text:") {
                 write_raw(&path, text.as_bytes());
             } else if let Some(gitdir) = kind.strip_prefix("git-file:") {
@@ -1800,7 +1954,9 @@ mod tests {
                         std::fs::write(path.join(".git").join("HEAD"), "ref: refs/heads/main\n")
                             .unwrap();
                     }
-                    "neurostrata-dir" => std::fs::create_dir_all(path.join(".NeuroStrata")).unwrap(),
+                    "neurostrata-dir" => {
+                        std::fs::create_dir_all(path.join(".NeuroStrata")).unwrap()
+                    }
                     "file" => {
                         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                         std::fs::write(&path, b"").unwrap();
@@ -1831,7 +1987,9 @@ mod tests {
             let got = find_root_marker(&under(tmp.path(), case["query"].as_str().unwrap()));
             if let Some(folder) = expect["unreadable"].as_str() {
                 let (path, _) = got.expect_err(name);
-                let want = under(&base, folder).join(".NeuroStrata").join("config.json");
+                let want = under(&base, folder)
+                    .join(".NeuroStrata")
+                    .join("config.json");
                 assert_eq!(
                     dunce::canonicalize(&path).unwrap_or(path),
                     dunce::canonicalize(&want).unwrap_or(want),
@@ -1839,13 +1997,18 @@ mod tests {
                 );
                 continue;
             }
-            let got = got.unwrap_or_else(|(path, reason)| panic!("{name}: unreadable {path:?}: {reason}"));
+            let got = got
+                .unwrap_or_else(|(path, reason)| panic!("{name}: unreadable {path:?}: {reason}"));
             match expect["root"].as_str() {
                 None => assert_eq!(got, None, "{name}"),
                 Some(root) => {
                     let got = got.unwrap_or_else(|| panic!("{name}: no marker found"));
                     assert_eq!(got.root, under(&base, root), "{name}");
-                    assert_eq!(got.config.namespace, expect["namespace"].as_str().unwrap(), "{name}");
+                    assert_eq!(
+                        got.config.namespace,
+                        expect["namespace"].as_str().unwrap(),
+                        "{name}"
+                    );
                     assert_eq!(got.via.as_str(), expect["via"].as_str().unwrap(), "{name}");
                 }
             }
@@ -1865,7 +2028,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let found = find_root_marker(&base.join("wt/packages/api")).unwrap().unwrap();
+        let found = find_root_marker(&base.join("wt/packages/api"))
+            .unwrap()
+            .unwrap();
         assert_eq!(found.via, FoundVia::MainCheckout);
         assert_eq!(found.root, base.join("wt/packages/api"));
         assert_eq!(found.marker_dir(), base.join("repo/packages/api"));
@@ -1902,7 +2067,11 @@ mod tests {
             .arg(repo.join("sub"))
             .output()
             .unwrap();
-        assert!(made.status.success(), "mklink /J failed: {}", String::from_utf8_lossy(&made.stderr));
+        assert!(
+            made.status.success(),
+            "mklink /J failed: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
         for through in [junction.clone(), junction.join("deep")] {
             let found = find_root_marker(&through).unwrap().unwrap();
             assert_eq!(found.root, repo, "{}", through.display());
@@ -1946,12 +2115,21 @@ mod tests {
         let base = dunce::canonicalize(tmp.path()).unwrap();
         let repo = base.join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
-        write_raw(&repo, br#"{"version":1,"namespace":"example-project","source_id":"example-src"}"#);
-        write_raw(&repo.join("packages/api"), br#"{"version":1,"namespace":"example-api"}"#);
+        write_raw(
+            &repo,
+            br#"{"version":1,"namespace":"example-project","source_id":"example-src"}"#,
+        );
+        write_raw(
+            &repo.join("packages/api"),
+            br#"{"version":1,"namespace":"example-api"}"#,
+        );
         write_raw(&repo.join("packages/bad"), b"nope");
         // A nested clone's marker is another checkout's, not listed.
         std::fs::create_dir_all(repo.join("clone/.git")).unwrap();
-        write_raw(&repo.join("clone"), br#"{"version":1,"namespace":"example-clone"}"#);
+        write_raw(
+            &repo.join("clone"),
+            br#"{"version":1,"namespace":"example-clone"}"#,
+        );
 
         let found = find_root_marker(&repo);
         let bindings = std::collections::HashMap::from([
@@ -1965,16 +2143,28 @@ mod tests {
             &CachedRoot::Known(Some(base.join("old").to_string_lossy().into_owned())),
             &Ok(bindings.clone()),
         );
-        assert!(text.contains(&format!("marker root: {}", repo.display())), "{text}");
+        assert!(
+            text.contains(&format!("marker root: {}", repo.display())),
+            "{text}"
+        );
         assert!(text.contains("found via: own_checkout"), "{text}");
         assert!(text.contains("source_id: example-src"), "{text}");
         assert!(text.contains("(missing)"), "{text}");
         assert!(text.contains("hint: the marker root differs"), "{text}");
-        assert!(text.contains(&format!("nested markers below {} (", repo.display())), "{text}");
+        assert!(
+            text.contains(&format!("nested markers below {} (", repo.display())),
+            "{text}"
+        );
         assert!(text.contains("(namespace example-api)"), "{text}");
         assert!(text.contains("(unreadable:"), "{text}");
         assert!(!text.contains("example-clone"), "{text}");
-        assert!(text.contains(&format!("  gone -> {}", base.join("gone/.NeuroStrata").display())), "{text}");
+        assert!(
+            text.contains(&format!(
+                "  gone -> {}",
+                base.join("gone/.NeuroStrata").display()
+            )),
+            "{text}"
+        );
         assert!(!text.contains("  here ->"), "{text}");
 
         let empty = tempfile::tempdir().unwrap();
@@ -1985,13 +2175,22 @@ mod tests {
             &CachedRoot::Unknown("no daemon, store locked".into()),
             &Ok(std::collections::HashMap::new()),
         );
-        assert!(text.contains("cached root: unknown (no daemon, store locked)"), "{text}");
-        assert!(text.contains("other checkouts not entered): none"), "{text}");
+        assert!(
+            text.contains("cached root: unknown (no daemon, store locked)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("other checkouts not entered): none"),
+            "{text}"
+        );
         assert!(text.contains("missing folders: none"), "{text}");
     }
 
     fn layout(base: &Path, json: &str) {
-        build_layout(base, &serde_json::from_str::<Vec<serde_json::Value>>(json).unwrap());
+        build_layout(
+            base,
+            &serde_json::from_str::<Vec<serde_json::Value>>(json).unwrap(),
+        );
     }
 
     fn show(dir: &Path, cached: &Path) -> String {
@@ -2020,14 +2219,23 @@ mod tests {
         // top marker: both are cached as the main checkout's top.
         let via_main = under(&base, "repo/.claude/worktrees/wt");
         let own = base.join("own");
-        assert_eq!(find_root_marker(&via_main).unwrap().unwrap().via, FoundVia::MainCheckout);
-        assert_eq!(find_root_marker(&own).unwrap().unwrap().via, FoundVia::OwnCheckout);
+        assert_eq!(
+            find_root_marker(&via_main).unwrap().unwrap().via,
+            FoundVia::MainCheckout
+        );
+        assert_eq!(
+            find_root_marker(&own).unwrap().unwrap().via,
+            FoundVia::OwnCheckout
+        );
         for dir in [&via_main, &own] {
             let text = show(dir, &repo);
             assert!(!text.contains("hint:"), "{text}");
             let text = show(dir, &base.join("elsewhere"));
             assert!(text.contains("hint: the marker root differs"), "{text}");
-            assert!(text.contains("root set") && text.contains("hooks install"), "{text}");
+            assert!(
+                text.contains("root set") && text.contains("hooks install"),
+                "{text}"
+            );
         }
         // Outside a worktree the cached root is compared as it is.
         assert!(!show(&repo, &repo).contains("hint:"));
@@ -2047,19 +2255,33 @@ mod tests {
     fn missing_path_uses_nearest_existing_parent() {
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
-        layout(&base, r#"["repo git-dir", "repo marker:example-project", "repo/sub marker:example-sub"]"#);
-        let found = find_root_marker(&under(&base, "repo/gone/deeper/a.rs")).unwrap().unwrap();
+        layout(
+            &base,
+            r#"["repo git-dir", "repo marker:example-project", "repo/sub marker:example-sub"]"#,
+        );
+        let found = find_root_marker(&under(&base, "repo/gone/deeper/a.rs"))
+            .unwrap()
+            .unwrap();
         assert_eq!(found.root, base.join("repo"));
-        let found = find_root_marker(&under(&base, "repo/sub/new/b.rs")).unwrap().unwrap();
+        let found = find_root_marker(&under(&base, "repo/sub/new/b.rs"))
+            .unwrap()
+            .unwrap();
         assert_eq!(found.root, under(&base, "repo/sub"));
         assert_eq!(found.config.namespace, "example-sub");
         // The root comes back in canonical spelling, whatever the input's.
         #[cfg(windows)]
         {
             let raw = under(&base, "repo/gone/x").to_string_lossy().into_owned();
-            let lower = format!("{}{}", raw[..1].to_ascii_lowercase(), raw[1..].replace('\\', "/"));
+            let lower = format!(
+                "{}{}",
+                raw[..1].to_ascii_lowercase(),
+                raw[1..].replace('\\', "/")
+            );
             let found = find_root_marker(Path::new(&lower)).unwrap().unwrap();
-            assert_eq!(found.root.to_string_lossy(), base.join("repo").to_string_lossy());
+            assert_eq!(
+                found.root.to_string_lossy(),
+                base.join("repo").to_string_lossy()
+            );
         }
     }
 
@@ -2074,8 +2296,20 @@ mod tests {
         );
         let dir = under(&base, "repo/a/b");
         let text = show(&dir, &base.join("repo"));
-        assert!(text.contains(&format!("nested markers below {} (", base.join("repo").display())), "{text}");
-        assert!(text.contains(&format!("  {} (namespace example-d)", under(&base, "repo/c/d").display())), "{text}");
+        assert!(
+            text.contains(&format!(
+                "nested markers below {} (",
+                base.join("repo").display()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "  {} (namespace example-d)",
+                under(&base, "repo/c/d").display()
+            )),
+            "{text}"
+        );
         // With no marker, the walk is below the given folder.
         let plain = tempfile::tempdir().unwrap();
         let plain = dunce::canonicalize(plain.path()).unwrap();
@@ -2087,18 +2321,39 @@ mod tests {
             &CachedRoot::Known(None),
             &Ok(std::collections::HashMap::new()),
         );
-        assert!(text.contains(&format!("nested markers below {} (", plain.join("x").display())), "{text}");
+        assert!(
+            text.contains(&format!(
+                "nested markers below {} (",
+                plain.join("x").display()
+            )),
+            "{text}"
+        );
     }
 
     #[test]
     fn null_source_id_is_unreadable() {
         let tmp = tempfile::tempdir().unwrap();
-        write_raw(tmp.path(), br#"{"version":1,"namespace":"example-project","source_id":null}"#);
-        assert!(matches!(read_marker(tmp.path()), MarkerRead::Unreadable { .. }));
-        write_raw(tmp.path(), br#"{"version":1,"namespace":"example-project","source_id":7}"#);
-        assert!(matches!(read_marker(tmp.path()), MarkerRead::Unreadable { .. }));
+        write_raw(
+            tmp.path(),
+            br#"{"version":1,"namespace":"example-project","source_id":null}"#,
+        );
+        assert!(matches!(
+            read_marker(tmp.path()),
+            MarkerRead::Unreadable { .. }
+        ));
+        write_raw(
+            tmp.path(),
+            br#"{"version":1,"namespace":"example-project","source_id":7}"#,
+        );
+        assert!(matches!(
+            read_marker(tmp.path()),
+            MarkerRead::Unreadable { .. }
+        ));
         // Left out is still fine.
-        write_raw(tmp.path(), br#"{"version":1,"namespace":"example-project"}"#);
+        write_raw(
+            tmp.path(),
+            br#"{"version":1,"namespace":"example-project"}"#,
+        );
         assert!(matches!(read_marker(tmp.path()), MarkerRead::Valid(_)));
     }
 
@@ -2114,8 +2369,13 @@ mod tests {
                 "other git-dir", "other/sub marker:example-other", "other/sub/x"]"#,
         );
         // The main checkout's `pkg` is a link into another repository.
-        assert!(link_dir(&under(&base, "other/sub"), &under(&base, "repo/pkg")), "could not create a link");
-        let found = find_root_marker(&under(&base, "wt/pkg/x")).unwrap().unwrap();
+        assert!(
+            link_dir(&under(&base, "other/sub"), &under(&base, "repo/pkg")),
+            "could not create a link"
+        );
+        let found = find_root_marker(&under(&base, "wt/pkg/x"))
+            .unwrap()
+            .unwrap();
         assert_eq!(found.config.namespace, "example-project");
         assert_eq!(found.root, base.join("wt"));
         assert_eq!(found.via, FoundVia::MainCheckout);
@@ -2156,7 +2416,11 @@ mod tests {
         // A real checkout with the marker untracked: exit 1, "no".
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        let init = std::process::Command::new("git").arg("-C").arg(&repo).args(["init", "-q"]).status();
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .status();
         if !init.is_ok_and(|s| s.success()) {
             eprintln!("skipped the untracked half: git init failed");
             return;
@@ -2189,12 +2453,20 @@ mod tests {
         );
         // The worktree's own copy is listed once, without the label.
         assert!(
-            text.contains(&format!("  {} (namespace example-web)", under(&base, "wt/packages/web").display())),
+            text.contains(&format!(
+                "  {} (namespace example-web)",
+                under(&base, "wt/packages/web").display()
+            )),
             "{text}"
         );
-        assert!(!text.contains(&under(&base, "repo/packages/web").display().to_string()), "{text}");
+        assert!(
+            !text.contains(&under(&base, "repo/packages/web").display().to_string()),
+            "{text}"
+        );
         // The marker it lists is the one find_root_marker answers there.
-        let found = find_root_marker(&under(&base, "wt/packages/api")).unwrap().unwrap();
+        let found = find_root_marker(&under(&base, "wt/packages/api"))
+            .unwrap()
+            .unwrap();
         assert_eq!(found.config.namespace, "example-api");
     }
 
@@ -2205,8 +2477,11 @@ mod tests {
         let repo = base.join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir_all(repo.join(".neurostrata")).unwrap();
-        std::fs::write(repo.join(".neurostrata/config.json"), br#"{"version":1,"namespace":"example-project"}"#)
-            .unwrap();
+        std::fs::write(
+            repo.join(".neurostrata/config.json"),
+            br#"{"version":1,"namespace":"example-project"}"#,
+        )
+        .unwrap();
         let text = format_root_show(
             &repo,
             &find_root_marker(&repo),
@@ -2247,7 +2522,11 @@ mod tests {
         #[cfg(windows)]
         {
             let raw = repo.to_string_lossy().into_owned();
-            let other = format!("{}{}", raw[..1].to_ascii_lowercase(), raw[1..].replace('\\', "/"));
+            let other = format!(
+                "{}{}",
+                raw[..1].to_ascii_lowercase(),
+                raw[1..].replace('\\', "/")
+            );
             assert!(same_folder(Path::new(&other), &repo));
         }
     }
@@ -2268,10 +2547,17 @@ mod tests {
     }
 
     async fn cached(store: &Arc<dyn VectorStore>) -> Option<String> {
-        crate::registry::cached_project_root(store, NS).await.unwrap()
+        crate::registry::cached_project_root(store, NS)
+            .await
+            .unwrap()
     }
 
-    async fn rule_at(store: &Arc<dyn VectorStore>, id: &str, location: &str, metadata: serde_json::Value) {
+    async fn rule_at(
+        store: &Arc<dyn VectorStore>,
+        id: &str,
+        location: &str,
+        metadata: serde_json::Value,
+    ) {
         store
             .upsert(
                 NS,
@@ -2315,7 +2601,10 @@ mod tests {
         let got = ensure_marker_for_setup(&store, Some(&emb), &repo.join("src"), Some(NS)).await;
         assert_eq!(got, SetupMarker::Written(repo.clone()));
         assert_eq!(read_marker(&repo), MarkerRead::Valid(RootConfig::new(NS)));
-        assert_eq!(cached(&store).await, Some(repo.to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(repo.to_string_lossy().into_owned())
+        );
         assert!(got.message(NS, &repo).unwrap().starts_with("Wrote "));
 
         // From the linked worktree: the marker goes to the main checkout's top.
@@ -2323,7 +2612,8 @@ mod tests {
         let base = dunce::canonicalize(tmp.path()).unwrap();
         layout(&base, WORKTREE);
         let (store, emb) = mock();
-        let got = ensure_marker_for_setup(&store, Some(&emb), &under(&base, "wt/src"), Some(NS)).await;
+        let got =
+            ensure_marker_for_setup(&store, Some(&emb), &under(&base, "wt/src"), Some(NS)).await;
         assert_eq!(got, SetupMarker::Written(base.join("repo")));
         assert!(!has_marker(&base.join("wt")));
         // A second setup reuses it.
@@ -2340,8 +2630,13 @@ mod tests {
             layout(&base, WORKTREE);
             let (store, emb) = mock();
             cache_root(&store, &emb, &base.join(cache)).await;
-            let got = ensure_marker_for_setup(&store, Some(&emb), &base.join("repo"), Some(NS)).await;
-            assert_eq!(got, SetupMarker::Written(base.join("repo")), "cache {cache}");
+            let got =
+                ensure_marker_for_setup(&store, Some(&emb), &base.join("repo"), Some(NS)).await;
+            assert_eq!(
+                got,
+                SetupMarker::Written(base.join("repo")),
+                "cache {cache}"
+            );
             assert!(has_marker(&base.join("repo")));
         }
     }
@@ -2355,28 +2650,52 @@ mod tests {
         let (store, emb) = mock();
         cache_root(&store, &emb, &repo.join("pkg")).await;
         let got = ensure_marker_for_setup(&store, Some(&emb), &repo, Some(NS)).await;
-        assert_eq!(got, SetupMarker::AskRoot { top: repo.clone(), sub: repo.join("pkg") });
+        assert_eq!(
+            got,
+            SetupMarker::AskRoot {
+                top: repo.clone(),
+                sub: repo.join("pkg")
+            }
+        );
         assert!(!has_marker(&repo) && !has_marker(&repo.join("pkg")));
         let message = got.message(NS, &repo).unwrap();
-        assert!(message.contains(&format!("root set {}", repo.join("pkg").display())), "{message}");
-        assert!(message.contains(&format!("root set {}", repo.display())), "{message}");
+        assert!(
+            message.contains(&format!("root set {}", repo.join("pkg").display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("root set {}", repo.display())),
+            "{message}"
+        );
         assert!(message.contains("root audit"), "{message}");
-        assert_eq!(cached(&store).await, Some(repo.join("pkg").to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(repo.join("pkg").to_string_lossy().into_owned())
+        );
     }
 
     #[tokio::test]
     async fn other_namespace_marker_installs_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
-        layout(&base, r#"["repo git-dir", "repo marker:other-project", "repo/src"]"#);
+        layout(
+            &base,
+            r#"["repo git-dir", "repo marker:other-project", "repo/src"]"#,
+        );
         let (store, emb) = mock();
-        let got = ensure_marker_for_setup(&store, Some(&emb), &under(&base, "repo/src"), Some(NS)).await;
-        assert_eq!(got, SetupMarker::OtherNamespace("other-project".to_string()));
+        let got =
+            ensure_marker_for_setup(&store, Some(&emb), &under(&base, "repo/src"), Some(NS)).await;
+        assert_eq!(
+            got,
+            SetupMarker::OtherNamespace("other-project".to_string())
+        );
         assert!(!got.installs_plugins());
         assert!(got.message(NS, &base).unwrap().contains("root set"));
         assert_eq!(cached(&store).await, None);
         // The marker is untouched.
-        let MarkerRead::Valid(cfg) = read_marker(&base.join("repo")) else { panic!() };
+        let MarkerRead::Valid(cfg) = read_marker(&base.join("repo")) else {
+            panic!()
+        };
         assert_eq!(cfg.namespace, "other-project");
     }
 
@@ -2392,11 +2711,17 @@ mod tests {
 
         // Only the folder name: no marker, asks with that one candidate.
         let got = ensure_marker_for_setup(&store, Some(&emb), &repo, None).await;
-        assert_eq!(got, SetupMarker::AskNamespace(vec!["example-project".to_string()]));
+        assert_eq!(
+            got,
+            SetupMarker::AskNamespace(vec!["example-project".to_string()])
+        );
         assert!(!has_marker(&repo));
         // Asking does not stop the hook and plugin install.
         assert!(got.installs_plugins());
-        assert!(got.message(NS, &repo).unwrap().contains("hooks install --namespace <ns>"));
+        assert!(got
+            .message(NS, &repo)
+            .unwrap()
+            .contains("hooks install --namespace <ns>"));
 
         // Harness configs that disagree: both candidates listed.
         std::fs::create_dir_all(repo.join(".claude")).unwrap();
@@ -2412,7 +2737,10 @@ mod tests {
         )
         .unwrap();
         let got = ensure_marker_for_setup(&store, Some(&emb), &repo, None).await;
-        assert_eq!(got, SetupMarker::AskNamespace(vec!["alpha".to_string(), "beta".to_string()]));
+        assert_eq!(
+            got,
+            SetupMarker::AskNamespace(vec!["alpha".to_string(), "beta".to_string()])
+        );
         assert!(!has_marker(&repo));
         assert_eq!(cached(&store).await, None);
     }
@@ -2428,7 +2756,9 @@ mod tests {
         let (store, emb) = mock();
         let got = ensure_marker_for_setup(&store, Some(&emb), &repo, Some("team:proj")).await;
         assert_eq!(got, SetupMarker::Written(repo.clone()));
-        let MarkerRead::Valid(cfg) = read_marker(&repo) else { panic!() };
+        let MarkerRead::Valid(cfg) = read_marker(&repo) else {
+            panic!()
+        };
         assert_eq!(cfg.namespace, "team:proj");
 
         // One explicit source is enough without the flag.
@@ -2445,7 +2775,9 @@ mod tests {
         let (store, emb) = mock();
         let got = ensure_marker_for_setup(&store, Some(&emb), &repo, None).await;
         assert_eq!(got, SetupMarker::Written(repo.clone()));
-        let MarkerRead::Valid(cfg) = read_marker(&repo) else { panic!() };
+        let MarkerRead::Valid(cfg) = read_marker(&repo) else {
+            panic!()
+        };
         assert_eq!(cfg.namespace, "alpha");
     }
 
@@ -2464,11 +2796,20 @@ mod tests {
         rule_at(&store, "rule-a", "a.rs", serde_json::json!({})).await;
 
         let got = ensure_marker_for_setup(&store, Some(&emb), &proj, Some(NS)).await;
-        assert_eq!(got, SetupMarker::RootChangeBlocked(vec!["rule-a".to_string()]));
+        assert_eq!(
+            got,
+            SetupMarker::RootChangeBlocked(vec!["rule-a".to_string()])
+        );
         assert!(!has_marker(&proj));
-        assert_eq!(cached(&store).await, Some(proj.join("sub").to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(proj.join("sub").to_string_lossy().into_owned())
+        );
         let message = got.message(NS, &proj).unwrap();
-        assert!(message.contains("rule-a") && message.contains("root audit"), "{message}");
+        assert!(
+            message.contains("rule-a") && message.contains("root audit"),
+            "{message}"
+        );
 
         // Setup at the cached root itself changes nothing and writes.
         let got = ensure_marker_for_setup(&store, Some(&emb), &proj.join("sub"), Some(NS)).await;
@@ -2494,18 +2835,31 @@ mod tests {
         let got = ensure_marker_for_setup(&store, Some(&emb), &clone2, Some(NS)).await;
         assert_eq!(
             got,
-            SetupMarker::KeptCache { root: clone2.clone(), cached: clone1.clone(), written: true }
+            SetupMarker::KeptCache {
+                root: clone2.clone(),
+                cached: clone1.clone(),
+                written: true
+            }
         );
         assert_eq!(got.kind(), "written");
         assert!(has_marker(&clone2));
-        assert_eq!(cached(&store).await, Some(clone1.to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(clone1.to_string_lossy().into_owned())
+        );
         let message = got.message(NS, &clone2).unwrap();
-        assert!(message.contains(&format!("stays {}", clone1.display())), "{message}");
+        assert!(
+            message.contains(&format!("stays {}", clone1.display())),
+            "{message}"
+        );
         assert!(message.contains("root set"), "{message}");
         // Again: the marker is reused and the cache still kept.
         let again = ensure_marker_for_setup(&store, Some(&emb), &clone2, Some(NS)).await;
         assert_eq!(again.kind(), "reused");
-        assert_eq!(cached(&store).await, Some(clone1.to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(clone1.to_string_lossy().into_owned())
+        );
     }
 
     #[tokio::test]
@@ -2514,7 +2868,10 @@ mod tests {
         // and setup or `hooks install` runs first in a second clone.
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
-        layout(&base, r#"["clone1 git-dir", "clone1/a.rs file", "clone2 git-dir", "clone2/a.rs file"]"#);
+        layout(
+            &base,
+            r#"["clone1 git-dir", "clone1/a.rs file", "clone2 git-dir", "clone2/a.rs file"]"#,
+        );
         let (clone1, clone2) = (base.join("clone1"), base.join("clone2"));
         let (store, emb) = mock();
         cache_root(&store, &emb, &clone1).await;
@@ -2523,10 +2880,17 @@ mod tests {
         let got = ensure_marker_for_setup(&store, Some(&emb), &clone2, Some(NS)).await;
         assert_eq!(
             got,
-            SetupMarker::KeptCache { root: clone2.clone(), cached: clone1.clone(), written: true }
+            SetupMarker::KeptCache {
+                root: clone2.clone(),
+                cached: clone1.clone(),
+                written: true
+            }
         );
         assert!(has_marker(&clone2) && !has_marker(&clone1));
-        assert_eq!(cached(&store).await, Some(clone1.to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(clone1.to_string_lossy().into_owned())
+        );
         assert_eq!(
             got.message(NS, &clone2).unwrap(),
             format!(
@@ -2544,13 +2908,21 @@ mod tests {
         cache_root(&store, &emb, &base.join("gone")).await;
         let got = ensure_marker_for_setup(&store, Some(&emb), &clone1, Some(NS)).await;
         assert_eq!(got, SetupMarker::Written(clone1.clone()));
-        assert_eq!(cached(&store).await, Some(clone1.to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(clone1.to_string_lossy().into_owned())
+        );
 
         // `root set` still moves the cache to an unrelated folder.
         let (store, emb) = mock();
         cache_root(&store, &emb, &clone1).await;
-        root_set(&store, Some(&emb), &set_args(&clone2)).await.unwrap();
-        assert_eq!(cached(&store).await, Some(clone2.to_string_lossy().into_owned()));
+        root_set(&store, Some(&emb), &set_args(&clone2))
+            .await
+            .unwrap();
+        assert_eq!(
+            cached(&store).await,
+            Some(clone2.to_string_lossy().into_owned())
+        );
     }
 
     #[test]
@@ -2569,7 +2941,10 @@ mod tests {
                     // An embedder, so the winner can also create the registry row.
                     let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
                     std::thread::spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
                         barrier.wait();
                         rt.block_on(ensure_marker_for_setup(&store, Some(&emb), &repo, Some(ns)))
                     })
@@ -2579,11 +2954,19 @@ mod tests {
             let written: Vec<_> = outcomes.iter().filter(|o| o.kind() == "written").collect();
             assert_eq!(written.len(), 1, "round {round}: {outcomes:?}");
             assert!(
-                outcomes.iter().any(|o| matches!(o, SetupMarker::OtherNamespace(_))),
+                outcomes
+                    .iter()
+                    .any(|o| matches!(o, SetupMarker::OtherNamespace(_))),
                 "round {round}: {outcomes:?}"
             );
-            let MarkerRead::Valid(cfg) = read_marker(&repo) else { panic!() };
-            let winner = if outcomes[0].kind() == "written" { "example-a" } else { "example-b" };
+            let MarkerRead::Valid(cfg) = read_marker(&repo) else {
+                panic!()
+            };
+            let winner = if outcomes[0].kind() == "written" {
+                "example-a"
+            } else {
+                "example-b"
+            };
             assert_eq!(cfg.namespace, winner, "round {round}");
         }
     }
@@ -2592,7 +2975,10 @@ mod tests {
     async fn setup_refuses_linked_neurostrata_and_temp_root() {
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
-        layout(&base, r#"["elsewhere", "repo git-dir", "repo neurostrata-link:elsewhere"]"#);
+        layout(
+            &base,
+            r#"["elsewhere", "repo git-dir", "repo neurostrata-link:elsewhere"]"#,
+        );
         let (store, emb) = mock();
         let got = ensure_marker_for_setup(&store, Some(&emb), &base.join("repo"), Some(NS)).await;
         assert_eq!(got.kind(), "refused", "{got:?}");
@@ -2600,8 +2986,12 @@ mod tests {
 
         let temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
         let got = ensure_marker_for_setup(&store, Some(&emb), &temp, Some(NS)).await;
-        assert_eq!(got, SetupMarker::Refused("the system temp folder is not a project root"));
-        let got = ensure_marker_for_setup(&store, Some(&emb), Path::new("relative"), Some(NS)).await;
+        assert_eq!(
+            got,
+            SetupMarker::Refused("the system temp folder is not a project root")
+        );
+        let got =
+            ensure_marker_for_setup(&store, Some(&emb), Path::new("relative"), Some(NS)).await;
         assert_eq!(got.kind(), "refused");
     }
 
@@ -2646,17 +3036,33 @@ mod tests {
         cache_root(&store, &emb, &repo.join("sub")).await;
         rule_at(&store, "rule-a", "a.rs", serde_json::json!({})).await;
 
-        let err = root_set(&store, Some(&emb), &set_args(&repo)).await.unwrap_err();
-        assert!(err.contains("rule-a") && err.contains("root audit") && err.contains(ROOT_GUIDE), "{err}");
+        let err = root_set(&store, Some(&emb), &set_args(&repo))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("rule-a") && err.contains("root audit") && err.contains(ROOT_GUIDE),
+            "{err}"
+        );
         assert!(!has_marker(&repo));
-        assert_eq!(cached(&store).await, Some(repo.join("sub").to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(repo.join("sub").to_string_lossy().into_owned())
+        );
 
         let mut forced = set_args(&repo);
         forced.force = true;
         let lines = root_set(&store, Some(&emb), &forced).await.unwrap();
-        assert!(lines.iter().any(|l| l.starts_with("--force") && l.contains("rule-a")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("--force") && l.contains("rule-a")),
+            "{lines:?}"
+        );
         assert!(has_marker(&repo));
-        assert_eq!(cached(&store).await, Some(repo.to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(repo.to_string_lossy().into_owned())
+        );
     }
 
     #[tokio::test]
@@ -2668,15 +3074,34 @@ mod tests {
         let (store, emb) = mock();
         cache_root(&store, &emb, &repo.join("sub")).await;
         rule_at(&store, "rule-a", "a.rs", serde_json::json!({})).await;
-        assert!(root_set(&store, Some(&emb), &set_args(&repo)).await.is_err());
+        assert!(root_set(&store, Some(&emb), &set_args(&repo))
+            .await
+            .is_err());
 
         // The correction: the old row is superseded by one keyed to the new root.
-        rule_at(&store, "rule-a", "a.rs", serde_json::json!({ "superseded_by": "rule-a2" })).await;
-        rule_at(&store, "rule-a2", "sub/a.rs", serde_json::json!({ "supersedes": "rule-a" })).await;
-        let lines = root_set(&store, Some(&emb), &set_args(&repo)).await.unwrap();
+        rule_at(
+            &store,
+            "rule-a",
+            "a.rs",
+            serde_json::json!({ "superseded_by": "rule-a2" }),
+        )
+        .await;
+        rule_at(
+            &store,
+            "rule-a2",
+            "sub/a.rs",
+            serde_json::json!({ "supersedes": "rule-a" }),
+        )
+        .await;
+        let lines = root_set(&store, Some(&emb), &set_args(&repo))
+            .await
+            .unwrap();
         assert!(!lines.iter().any(|l| l.starts_with("--force")), "{lines:?}");
         assert!(has_marker(&repo));
-        assert_eq!(cached(&store).await, Some(repo.to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(repo.to_string_lossy().into_owned())
+        );
     }
 
     #[tokio::test]
@@ -2684,14 +3109,19 @@ mod tests {
         for stop in [RootSetStep::Published, RootSetStep::RegistryUpdated] {
             let tmp = tempfile::tempdir().unwrap();
             let base = dunce::canonicalize(tmp.path()).unwrap();
-            layout(&base, r#"["repo git-dir", "repo/old marker:example-project", "repo/new"]"#);
+            layout(
+                &base,
+                r#"["repo git-dir", "repo/old marker:example-project", "repo/new"]"#,
+            );
             let repo = base.join("repo");
             let (old, new) = (repo.join("old"), repo.join("new"));
             let (store, emb) = mock();
             cache_root(&store, &emb, &old).await;
 
             // Another marker for the namespace in this checkout: --replace needed.
-            let err = root_set(&store, Some(&emb), &set_args(&new)).await.unwrap_err();
+            let err = root_set(&store, Some(&emb), &set_args(&new))
+                .await
+                .unwrap_err();
             assert!(err.contains("--replace"), "{err}");
             assert!(!has_marker(&new));
 
@@ -2699,7 +3129,17 @@ mod tests {
             args.replace = true;
             // Interrupted after the step: both markers are there and root show
             // lists both.
-            root_set_with(&StoreRegistry { store: store.clone(), emb: Some(emb.clone()), checkpoint: false }, &args, Some(stop)).await.unwrap();
+            root_set_with(
+                &StoreRegistry {
+                    store: store.clone(),
+                    emb: Some(emb.clone()),
+                    checkpoint: false,
+                },
+                &args,
+                Some(stop),
+            )
+            .await
+            .unwrap();
             assert!(has_marker(&new) && has_marker(&old), "{stop:?}");
             let shown = format_root_show(
                 &repo,
@@ -2708,16 +3148,37 @@ mod tests {
                 &CachedRoot::Known(cached(&store).await),
                 &Ok(std::collections::HashMap::new()),
             );
-            assert!(shown.contains(&format!("  {} (namespace {NS})", old.display())), "{shown}");
-            assert!(shown.contains(&format!("  {} (namespace {NS})", new.display())), "{shown}");
-            let expected_cache = if stop == RootSetStep::Published { &old } else { &new };
-            assert_eq!(cached(&store).await, Some(expected_cache.to_string_lossy().into_owned()));
+            assert!(
+                shown.contains(&format!("  {} (namespace {NS})", old.display())),
+                "{shown}"
+            );
+            assert!(
+                shown.contains(&format!("  {} (namespace {NS})", new.display())),
+                "{shown}"
+            );
+            let expected_cache = if stop == RootSetStep::Published {
+                &old
+            } else {
+                &new
+            };
+            assert_eq!(
+                cached(&store).await,
+                Some(expected_cache.to_string_lossy().into_owned())
+            );
 
             // Rerunning the same command finishes.
             let lines = root_set(&store, Some(&emb), &args).await.unwrap();
             assert!(has_marker(&new) && !has_marker(&old), "{stop:?}: {lines:?}");
-            assert!(lines.iter().any(|l| l.starts_with("Removed the old marker")), "{lines:?}");
-            assert_eq!(cached(&store).await, Some(new.to_string_lossy().into_owned()));
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.starts_with("Removed the old marker")),
+                "{lines:?}"
+            );
+            assert_eq!(
+                cached(&store).await,
+                Some(new.to_string_lossy().into_owned())
+            );
         }
     }
 
@@ -2735,8 +3196,13 @@ mod tests {
         assert!(has_marker(&repo));
 
         let (store, emb) = mock();
-        let lines = root_set(&store, Some(&emb), &set_args(&repo)).await.unwrap();
-        assert!(lines.iter().any(|l| l.starts_with("Cached root of")), "{lines:?}");
+        let lines = root_set(&store, Some(&emb), &set_args(&repo))
+            .await
+            .unwrap();
+        assert!(
+            lines.iter().any(|l| l.starts_with("Cached root of")),
+            "{lines:?}"
+        );
     }
 
     /// Setup whose cache write fails reports it: the marker is written, the
@@ -2750,7 +3216,14 @@ mod tests {
         // No registry row and no embedder to create one.
         let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
         let got = ensure_marker_for_setup(&store, None, &repo, Some(NS)).await;
-        let SetupMarker::CacheNotSet { root, written, reason } = &got else { panic!("{got:?}") };
+        let SetupMarker::CacheNotSet {
+            root,
+            written,
+            reason,
+        } = &got
+        else {
+            panic!("{got:?}")
+        };
         assert_eq!((root, *written), (&repo, true));
         assert_eq!(reason, "the registry row could not be written");
         assert!(got.failed() && got.installs_plugins());
@@ -2758,7 +3231,10 @@ mod tests {
         assert_eq!(got.root(), Some(repo.as_path()));
         assert!(has_marker(&repo));
         let message = got.message(NS, &repo).unwrap();
-        assert!(message.contains("could not be set") && message.contains("root set"), "{message}");
+        assert!(
+            message.contains("could not be set") && message.contains("root set"),
+            "{message}"
+        );
         assert_eq!(got.to_json(NS, &repo)["reason"], serde_json::json!(reason));
         // A rerun that still cannot set it says so again (not "reused").
         let again = ensure_marker_for_setup(&store, None, &repo, Some(NS)).await;
@@ -2773,23 +3249,40 @@ mod tests {
     async fn root_set_to_a_sibling_checks_rows_by_file_existence() {
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
-        layout(&base, r#"["api git-dir", "api/a.rs file", "api/both.rs file", "web git-dir", "web/both.rs file"]"#);
+        layout(
+            &base,
+            r#"["api git-dir", "api/a.rs file", "api/both.rs file", "web git-dir", "web/both.rs file"]"#,
+        );
         let (api, web) = (base.join("api"), base.join("web"));
         let (store, emb) = mock();
         cache_root(&store, &emb, &api).await;
         rule_at(&store, "rule-a", "a.rs", serde_json::json!({})).await;
         rule_at(&store, "rule-both", "both.rs", serde_json::json!({})).await;
 
-        let err = root_set(&store, Some(&emb), &set_args(&web)).await.unwrap_err();
-        assert!(err.contains("rule-a") && !err.contains("rule-both"), "{err}");
-        assert!(err.contains(&format!("root audit --for-root {}", web.display())), "{err}");
+        let err = root_set(&store, Some(&emb), &set_args(&web))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("rule-a") && !err.contains("rule-both"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("root audit --for-root {}", web.display())),
+            "{err}"
+        );
         assert!(!has_marker(&web));
-        assert_eq!(cached(&store).await, Some(api.to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(api.to_string_lossy().into_owned())
+        );
 
         // Once the file exists under the new root too, nothing is lost.
         std::fs::write(web.join("a.rs"), b"").unwrap();
         root_set(&store, Some(&emb), &set_args(&web)).await.unwrap();
-        assert_eq!(cached(&store).await, Some(web.to_string_lossy().into_owned()));
+        assert_eq!(
+            cached(&store).await,
+            Some(web.to_string_lossy().into_owned())
+        );
     }
 
     /// A registry that, like a second `root set` racing this one, moves the
@@ -2817,21 +3310,37 @@ mod tests {
     async fn replace_keeps_an_old_marker_that_became_the_cached_root_again() {
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
-        layout(&base, r#"["repo git-dir", "repo/old marker:example-project", "repo/new"]"#);
+        layout(
+            &base,
+            r#"["repo git-dir", "repo/old marker:example-project", "repo/new"]"#,
+        );
         let repo = base.join("repo");
         let (old, new) = (repo.join("old"), repo.join("new"));
         let (store, emb) = mock();
         cache_root(&store, &emb, &old).await;
         let registry = RacedRegistry {
-            inner: StoreRegistry { store: store.clone(), emb: Some(emb.clone()), checkpoint: false },
+            inner: StoreRegistry {
+                store: store.clone(),
+                emb: Some(emb.clone()),
+                checkpoint: false,
+            },
             back_to: old.clone(),
         };
         let mut args = set_args(&new);
         args.replace = true;
         let lines = root_set_with(&registry, &args, None).await.unwrap();
-        assert!(has_marker(&old), "the cached root keeps its marker: {lines:?}");
-        assert!(lines.iter().any(|l| l.starts_with("Kept the old marker")), "{lines:?}");
-        assert_eq!(cached(&store).await, Some(old.to_string_lossy().into_owned()));
+        assert!(
+            has_marker(&old),
+            "the cached root keeps its marker: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("Kept the old marker")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            cached(&store).await,
+            Some(old.to_string_lossy().into_owned())
+        );
     }
 
     /// Without a daemon the CLI reads the store directly: the namespace is
@@ -2845,8 +3354,13 @@ mod tests {
         let repo = base.join("repo");
         let (store, emb) = mock();
         let stored = "Example-Project";
-        crate::registry::cache_project_root(&store, Some(&emb), stored, &repo.join("sub").to_string_lossy())
-            .await;
+        crate::registry::cache_project_root(
+            &store,
+            Some(&emb),
+            stored,
+            &repo.join("sub").to_string_lossy(),
+        )
+        .await;
         store
             .upsert(
                 stored,
@@ -2864,32 +3378,55 @@ mod tests {
             )
             .await
             .unwrap();
-        let err = root_set(&store, Some(&emb), &set_args(&repo)).await.unwrap_err();
+        let err = root_set(&store, Some(&emb), &set_args(&repo))
+            .await
+            .unwrap_err();
         assert!(err.contains("rule-a"), "{err}");
         let mut forced = set_args(&repo);
         forced.force = true;
         root_set(&store, Some(&emb), &forced).await.unwrap();
         assert_eq!(
-            crate::registry::cached_project_root(&store, stored).await.unwrap(),
+            crate::registry::cached_project_root(&store, stored)
+                .await
+                .unwrap(),
             Some(repo.to_string_lossy().into_owned())
         );
-        assert_eq!(cached(&store).await, None, "no second registry row under the typed spelling");
+        assert_eq!(
+            cached(&store).await,
+            None,
+            "no second registry row under the typed spelling"
+        );
     }
 
     #[tokio::test]
     async fn split_under_other_namespace_allowed() {
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
-        layout(&base, r#"["repo git-dir", "repo marker:outer-project", "repo/packages/api"]"#);
+        layout(
+            &base,
+            r#"["repo git-dir", "repo marker:outer-project", "repo/packages/api"]"#,
+        );
         let api = under(&base, "repo/packages/api");
         let (store, emb) = mock();
         let lines = root_set(&store, Some(&emb), &set_args(&api)).await.unwrap();
-        let MarkerRead::Valid(inner) = read_marker(&api) else { panic!() };
+        let MarkerRead::Valid(inner) = read_marker(&api) else {
+            panic!()
+        };
         assert_eq!(inner.namespace, NS);
-        let MarkerRead::Valid(outer) = read_marker(&base.join("repo")) else { panic!() };
+        let MarkerRead::Valid(outer) = read_marker(&base.join("repo")) else {
+            panic!()
+        };
         assert_eq!(outer.namespace, "outer-project");
-        assert!(lines.iter().any(|l| l.starts_with("Commit .NeuroStrata/config.json")), "{lines:?}");
-        assert_eq!(cached(&store).await, Some(api.to_string_lossy().into_owned()));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("Commit .NeuroStrata/config.json")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            cached(&store).await,
+            Some(api.to_string_lossy().into_owned())
+        );
     }
 
     #[tokio::test]
@@ -2899,14 +3436,21 @@ mod tests {
         layout(&base, r#"["repo git-dir", "repo marker:other-project"]"#);
         let repo = base.join("repo");
         let (store, emb) = mock();
-        let err = root_set(&store, Some(&emb), &set_args(&repo)).await.unwrap_err();
-        assert!(err.contains("other-project") && err.contains("--replace"), "{err}");
+        let err = root_set(&store, Some(&emb), &set_args(&repo))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("other-project") && err.contains("--replace"),
+            "{err}"
+        );
         assert_eq!(cached(&store).await, None);
 
         let mut args = set_args(&repo);
         args.replace = true;
         root_set(&store, Some(&emb), &args).await.unwrap();
-        let MarkerRead::Valid(cfg) = read_marker(&repo) else { panic!() };
+        let MarkerRead::Valid(cfg) = read_marker(&repo) else {
+            panic!()
+        };
         assert_eq!(cfg.namespace, NS);
     }
 
@@ -2916,16 +3460,30 @@ mod tests {
         let base = dunce::canonicalize(tmp.path()).unwrap();
         layout(&base, r#"["repo git-dir", "repo/sub", "top git-dir"]"#);
         let (store, emb) = mock();
-        let lines = root_set(&store, Some(&emb), &set_args(&under(&base, "repo/sub"))).await.unwrap();
-        assert!(lines.iter().any(|l| l == "Commit .NeuroStrata/config.json so other clones use the same root."), "{lines:?}");
+        let lines = root_set(&store, Some(&emb), &set_args(&under(&base, "repo/sub")))
+            .await
+            .unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "Commit .NeuroStrata/config.json so other clones use the same root."),
+            "{lines:?}"
+        );
 
         let (store, emb) = mock();
-        let lines = root_set(&store, Some(&emb), &set_args(&base.join("top"))).await.unwrap();
+        let lines = root_set(&store, Some(&emb), &set_args(&base.join("top")))
+            .await
+            .unwrap();
         assert!(!lines.iter().any(|l| l.starts_with("Commit")), "{lines:?}");
         // A non-git parent of checkouts is refused.
         if let Some(base) = base_outside_git(&tmp) {
-            let err = root_set(&store, Some(&emb), &set_args(&base)).await.unwrap_err();
-            assert!(err.contains("refused") && err.contains("git checkout"), "{err}");
+            let err = root_set(&store, Some(&emb), &set_args(&base))
+                .await
+                .unwrap_err();
+            assert!(
+                err.contains("refused") && err.contains("git checkout"),
+                "{err}"
+            );
         }
     }
 }
