@@ -1454,6 +1454,22 @@ fn is_any_home_folder(dir: &std::path::Path, homes: &[std::path::PathBuf]) -> bo
     homes.iter().any(|h| is_home_folder(dir, Some(h)))
 }
 
+/// The OS temp root is shared scratch space, not a project: a `.NeuroStrata`
+/// left there by an earlier fallback write must not capture every scratch
+/// folder beneath it (issue #322). Ignore that marker only when it is an
+/// *ancestor* of the walk's start; a caller naming the temp root itself keeps
+/// its own marker.
+fn is_shared_temp_ancestor(dir: &std::path::Path, start: &std::path::Path) -> bool {
+    if dir == start {
+        return false;
+    }
+    let temp = std::env::temp_dir();
+    match (dunce::canonicalize(dir), dunce::canonicalize(&temp)) {
+        (Ok(d), Ok(t)) => d == t,
+        _ => dir == temp.as_path(),
+    }
+}
+
 /// True when `dir` is the user's home folder and holds no `.git`. Such a
 /// folder is never a project, so no session file (`active_session.json`,
 /// `session_queries.json`) is written there: `~/.NeuroStrata` belongs to
@@ -1501,7 +1517,7 @@ fn walk_to_session_marker(start: &std::path::Path) -> SessionMarkerWalk {
         if is_home(dir) {
             return SessionMarkerWalk::StoppedAtHome;
         }
-        if dir.join(".NeuroStrata").exists() {
+        if dir.join(".NeuroStrata").exists() && !is_shared_temp_ancestor(dir, start) {
             return SessionMarkerWalk::Root(dir.to_path_buf());
         }
         cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
