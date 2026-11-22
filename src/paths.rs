@@ -367,11 +367,46 @@ fn main_checkout_of_common(common: &Path) -> Option<PathBuf> {
         return None;
     }
     let parent = common.parent()?;
+    // Ask git which checkout owns this git dir. It honours `core.bare` from
+    // included config and reports the actual main worktree, so unrelated files
+    // beside a separate git dir are never mistaken for a checkout, and a real
+    // main checkout holding only `.git` is still recognised.
+    if let Some(main) = git_main_worktree(common) {
+        if main == common {
+            // A separate git dir with no core.worktree: git calls the gitdir
+            // itself the worktree, which the linked worktree cannot borrow.
+            return None;
+        }
+        if main.is_dir() {
+            return Some(main);
+        }
+    }
+    // Fallback when git cannot answer (synthetic git dirs, no git on PATH):
+    // a parent holding nothing but `.git` cannot be proven to be a checkout.
     let holds_more_than_git = std::fs::read_dir(parent)
         .ok()?
         .filter_map(Result::ok)
         .any(|entry| entry.file_name() != ".git");
     holds_more_than_git.then(|| parent.to_path_buf())
+}
+
+/// The first (main) worktree git reports for the common git directory, or
+/// `None` when git is unavailable or this is not a usable repository.
+fn git_main_worktree(common: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(common)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let line = text.lines().find(|line| line.starts_with("worktree "))?;
+    let raw = line.trim_start_matches("worktree ").trim();
+    let path = host_path(raw)?;
+    canonical(&path)
 }
 
 /// The `[core]` settings [`main_checkout_of_common`] reads.
@@ -386,35 +421,60 @@ struct CoreConfig {
 /// is boolean true, as git reads it.
 fn core_config(common: &Path) -> CoreConfig {
     let mut out = CoreConfig::default();
-    let Ok(text) = std::fs::read_to_string(common.join("config")) else {
-        return out;
+    core_config_file(&common.join("config"), 0, &mut out);
+    out
+}
+
+/// Parse one git config file into `out`, walking `[include] path = ...`
+/// directives so an included `core.bare`/`core.worktree` counts. Relative
+/// includes resolve against the including file's directory, as git does.
+/// Later definitions win; depth bounds a malicious include cycle.
+fn core_config_file(path: &Path, depth: usize, out: &mut CoreConfig) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
     };
     let mut in_core = false;
+    let mut in_include = false;
     for line in text.lines() {
         let line = line.trim();
         if let Some(section) = line.strip_prefix('[') {
             let name = section.split(']').next().unwrap_or("").trim();
             in_core = name.eq_ignore_ascii_case("core");
+            in_include = name.eq_ignore_ascii_case("include");
             continue;
         }
-        if !in_core || line.starts_with(['#', ';']) {
+        if line.starts_with(['#', ';']) {
             continue;
         }
         let (key, value) = match line.split_once('=') {
             Some((k, v)) => (k.trim(), Some(v.trim().trim_matches('"'))),
             None => (line, None),
         };
-        if key.eq_ignore_ascii_case("bare") {
-            out.bare = value.is_none_or(|v| {
-                ["true", "yes", "on", "1"]
-                    .iter()
-                    .any(|t| v.eq_ignore_ascii_case(t))
-            });
-        } else if key.eq_ignore_ascii_case("worktree") {
-            out.worktree = value.filter(|v| !v.is_empty()).map(str::to_string);
+        if in_core {
+            if key.eq_ignore_ascii_case("bare") {
+                out.bare = value.is_none_or(|v| {
+                    ["true", "yes", "on", "1"]
+                        .iter()
+                        .any(|t| v.eq_ignore_ascii_case(t))
+                });
+            } else if key.eq_ignore_ascii_case("worktree") {
+                out.worktree = value.filter(|v| !v.is_empty()).map(str::to_string);
+            }
+        } else if in_include && key.eq_ignore_ascii_case("path") {
+            if let Some(v) = value.filter(|v| !v.is_empty()) {
+                let raw = Path::new(v);
+                let included = if raw.is_absolute() {
+                    raw.to_path_buf()
+                } else {
+                    path.parent().unwrap_or(raw).join(raw)
+                };
+                core_config_file(&included, depth + 1, out);
+            }
         }
     }
-    out
 }
 
 /// Where the root that relativized a lookup path came from.
@@ -993,6 +1053,114 @@ pub fn prefix_lookup_forms(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// #374 (finding w): a non-bare main checkout holding only `.git` is still
+    /// the main checkout a linked worktree borrows.
+    #[test]
+    fn real_worktree_of_only_dot_git_main_checkout_uses_main_folder_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let main = base.join("the-main-project");
+        run_git(&base, &["init", "-q", "the-main-project"]);
+        std::fs::write(main.join("README"), "x").unwrap();
+        run_git(&main, &["add", "README"]);
+        run_git(&main, &["commit", "-qm", "init"]);
+        let wt = base.join("linked");
+        run_git(
+            &main,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        // Leave the main checkout holding only `.git`.
+        std::fs::remove_file(main.join("README")).unwrap();
+        assert_eq!(std::fs::read_dir(&main).unwrap().count(), 1);
+        assert_eq!(
+            main_checkout_of_common(&main.join(".git")),
+            Some(main.clone())
+        );
+        assert_eq!(main_checkout_root(&s(&wt)), Some(main));
+    }
+
+    /// #374 (findings v/Hw): a bare repo whose `core.bare` comes from an
+    /// included config must not let a linked worktree borrow its parent.
+    #[test]
+    fn real_bare_repo_via_included_config_is_not_the_main_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let common = base.join("project").join(".git");
+        run_git(&base, &["init", "-q", "--bare", common.to_str().unwrap()]);
+        // Move `core.bare` into an included file, leaving the main config false.
+        std::fs::write(common.join("included.config"), "[core]\n\tbare = true\n").unwrap();
+        let cfg = std::fs::read_to_string(common.join("config")).unwrap();
+        let cfg = cfg
+            .lines()
+            .filter(|l| !l.contains("bare"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            common.join("config"),
+            format!("{cfg}\n[include]\n\tpath = included.config\n"),
+        )
+        .unwrap();
+        let wt = base.join("project").join("main");
+        run_git(
+            &common,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        assert_eq!(main_checkout_of_common(&common), None);
+        assert_eq!(main_checkout_root(&s(&wt)), Some(wt));
+    }
+
+    /// #374 (finding Hw): effective `core.bare`/`core.worktree` can come from
+    /// an included config; reading only `<common>/config` misses it.
+    #[test]
+    fn core_config_follows_includes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = tmp.path().to_path_buf();
+        std::fs::write(
+            common.join("config"),
+            "[include]\n\tpath = extra.config\n[core]\n\trepositoryformatversion = 0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            common.join("extra.config"),
+            "[core]\n\tbare = true\n\tworktree = /tmp/from-include\n",
+        )
+        .unwrap();
+        let core = core_config(&common);
+        assert!(core.bare, "included core.bare must be honored");
+        assert_eq!(core.worktree.as_deref(), Some("/tmp/from-include"));
+    }
+
+    /// #374 (finding Hw): a bounded include cycle cannot hang resolution.
+    #[test]
+    fn core_config_include_cycle_is_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = tmp.path().to_path_buf();
+        std::fs::write(
+            common.join("config"),
+            "[include]\n\tpath = config\n[core]\n\tbare = false\n",
+        )
+        .unwrap();
+        let core = core_config(&common);
+        assert!(!core.bare);
+    }
 
     // ---- pure, host-independent ----
 
