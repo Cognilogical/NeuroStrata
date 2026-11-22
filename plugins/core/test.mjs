@@ -3183,7 +3183,7 @@ describe('round-9: denied edit restores prefetch dedup state', () => {
 })
 
 describe('round-9: CLI hook runners flush stdout before exiting', () => {
-  it('awaits the stdout write before process.exit(0)', () => {
+  it('awaits the stdout write, then returns without process.exit', () => {
     const sources = [
       '../claude/cli-hook.mjs',
       '../codex/cli-hook.mjs',
@@ -3202,8 +3202,14 @@ describe('round-9: CLI hook runners flush stdout before exiting', () => {
       )
       const after = src.slice(idx + marker.length)
       assert.ok(
-        /^\s*process\.exit\(0\);/.test(after),
-        `${rel}: process.exit(0) must directly follow the awaited write`
+        /^\s*return;/.test(after),
+        `${rel}: the runner must return directly after the awaited write`
+      )
+      // process.exit while a daemon socket is open crashes node on Windows,
+      // and the host then treats the hook as failed.
+      assert.ok(
+        !/process\.exit\(0\)/.test(src),
+        `${rel}: the runner must not call process.exit(0)`
       )
       assert.ok(
         src.includes('const writeStdout = (text) =>'),
