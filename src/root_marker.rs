@@ -1224,7 +1224,15 @@ mod tests {
                 );
             } else {
                 match kind {
-                    "git-dir" => std::fs::create_dir_all(path.join(".git")).unwrap(),
+                    "git-dir" => {
+                        let git = path.join(".git");
+                        std::fs::create_dir_all(&git).unwrap();
+                        // A real checkout's git dir has HEAD (see
+                        // paths::main_checkout_of_common); without it a linked
+                        // worktree's common dir is not recognised as a checkout.
+                        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+                        std::fs::write(git.join("config"), "[core]\n\tbare = false\n").unwrap();
+                    }
                     "neurostrata-dir" => {
                         std::fs::create_dir_all(path.join(".NeuroStrata")).unwrap()
                     }
