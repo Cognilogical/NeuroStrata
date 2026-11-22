@@ -33,7 +33,10 @@ async function main() {
   } catch {
     return;
   }
-  await initialize({ config: { namespace: process.env.NEUROSTRATA_NAMESPACE } });
+  // Pass the namespace only when it is set: an explicit undefined would
+  // override the one in .NeuroStrata/neurostrata-plugin.json.
+  const namespace = process.env.NEUROSTRATA_NAMESPACE;
+  await initialize({ config: namespace ? { namespace } : {} });
   // Handler chain: execute.before-style handleHookEvent takes precedence, then
   // the Claude handleClaudeHookEvent alias, falling back to the default export.
   const handler = plugin.handleHookEvent ?? plugin.handleClaudeHookEvent ?? plugin;
