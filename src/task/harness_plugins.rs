@@ -1038,6 +1038,49 @@ fn explicit_namespace_from(dir: &Path, env_namespace: Option<&str>) -> Result<St
     }
 }
 
+/// Every namespace a push gate must check for `dir`: the namespace the hooks
+/// resolve first, the checkout folder's name, and each nested project marker
+/// below the checkout (markers only in a linked worktree's main checkout
+/// included). A split marker such as `packages/api/.NeuroStrata/config.json`
+/// names a namespace plugins claim tasks in, so its tasks must reach `task
+/// gate` even though the hook resolves from the checkout root. Deduped case-
+/// insensitively, in that order.
+pub fn gate_namespaces(dir: &Path) -> Result<Vec<String>, ResolveError> {
+    let mut names = vec![resolve_namespace(dir)?.namespace];
+    let roots = NamespaceRoots::of(dir)?;
+    let checkout = roots.own_root.as_deref().unwrap_or(roots.dir.as_path());
+    let mut add = |name: String| {
+        if usable_namespace(&name).is_some()
+            && !names.iter().any(|known| known.eq_ignore_ascii_case(&name))
+        {
+            names.push(name);
+        }
+    };
+    if let Some(folder) = checkout.file_name() {
+        add(folder.to_string_lossy().to_string());
+    }
+    let nested = |root: &Path| -> Vec<String> {
+        crate::root_marker::nested_markers(root)
+            .into_iter()
+            .filter_map(|(_, read)| match read {
+                crate::root_marker::MarkerRead::Valid(cfg) => Some(cfg.namespace),
+                _ => None,
+            })
+            .collect()
+    };
+    for name in nested(checkout) {
+        add(name);
+    }
+    if let Some(main) = roots.main_root.as_deref() {
+        if main != checkout {
+            for name in nested(main) {
+                add(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// The one warning line, naming the file, for a project marker at `path`
 /// that cannot be read and is skipped.
 fn unreadable_marker_warning(path: &Path, reason: &str) -> String {
@@ -1835,6 +1878,31 @@ mod tests {
     fn write_file(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    /// A split marker in a subfolder names a namespace plugins claim tasks
+    /// in; the push gate must include it even though the hook resolves from
+    /// the checkout root.
+    #[test]
+    fn gate_namespaces_include_nested_markers() {
+        let _env = no_namespace_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = dunce::canonicalize(tmp.path()).unwrap().join("platform");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_file(
+            &repo.join(".NeuroStrata/config.json"),
+            r#"{"version":1,"namespace":"Platform"}"#,
+        );
+        write_file(
+            &repo.join("packages/api/.NeuroStrata/config.json"),
+            r#"{"version":1,"namespace":"Api"}"#,
+        );
+        let names = gate_namespaces(&repo).expect("gate namespaces");
+        assert_eq!(names[0], "Platform");
+        assert!(
+            names.iter().any(|n| n == "Api"),
+            "the nested marker namespace must reach the task gate: {names:?}"
+        );
     }
 
     /// A harness config the installer wrote outranks the environment, which
@@ -2684,7 +2752,11 @@ mod tests {
     fn claude_hook_matcher_covers_notebook_edit_and_widens_older_installs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
-        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let fresh = claude_pre_tool_use_matchers(tmp.path());
         assert_eq!(fresh.len(), 1);
         assert!(
@@ -2713,7 +2785,11 @@ mod tests {
         std::fs::write(&cfg, serde_json::to_string_pretty(&older).unwrap())
             .expect("write older settings");
 
-        let _ = auto_install_detected_plugins(tmp.path(), "TestProj", Some("claude"));
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
         let after = claude_pre_tool_use_matchers(tmp.path());
         assert_eq!(
             after,
