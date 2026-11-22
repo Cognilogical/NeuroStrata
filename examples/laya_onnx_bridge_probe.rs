@@ -61,11 +61,15 @@ fn read_manifest(bundle_dir: &Path) -> Result<(serde_json::Value, Calibration)> 
     }
     let raw = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("reading {}", manifest_path.display()))?;
-    let manifest: serde_json::Value =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", manifest_path.display()))?;
+    let manifest: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
 
-    let cal = extract_calibration(&manifest)
-        .ok_or_else(|| anyhow!("manifest {} has no usable scale/bias calibration", manifest_path.display()))?;
+    let cal = extract_calibration(&manifest).ok_or_else(|| {
+        anyhow!(
+            "manifest {} has no usable scale/bias calibration",
+            manifest_path.display()
+        )
+    })?;
     Ok((manifest, cal))
 }
 
@@ -133,7 +137,10 @@ fn build_temp_bundle(root: &Path) -> Result<Calibration> {
         .collect();
     std::fs::write(&model_path, &model_bytes)?;
 
-    let cal = Calibration { scale: 0.5, bias: -0.25 };
+    let cal = Calibration {
+        scale: 0.5,
+        bias: -0.25,
+    };
     let manifest = serde_json::json!({
         "model_sha256": sha256_of_file(&model_path)?,
         "model_version": "v0.1.0-probe",

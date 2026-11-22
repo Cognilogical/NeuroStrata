@@ -295,7 +295,9 @@ fn empty_lookup_without_usable_seed_abstains() {
     let resp = recommended_next_actions(0, &[], 0, true, "NeuroStrata", None);
     assert_eq!(resp["status"], "empty");
     assert_eq!(resp["next_actions"].as_array().unwrap().len(), 0);
-    let reason = resp["suppressed_reason"].as_str().expect("suppressed_reason");
+    let reason = resp["suppressed_reason"]
+        .as_str()
+        .expect("suppressed_reason");
     assert!(
         reason.contains("no usable") && reason.contains("narrow"),
         "reason was {reason:?}"
@@ -392,6 +394,9 @@ fn query_failure_response_keeps_legacy_fields_and_adds_receipt_fields() {
     );
     let lowered = resp.to_string().to_ascii_lowercase();
     for forbidden in ["no governance", "no rules", "governance absence"] {
-        assert!(!lowered.contains(forbidden), "field claims absence: {forbidden}");
+        assert!(
+            !lowered.contains(forbidden),
+            "field claims absence: {forbidden}"
+        );
     }
 }

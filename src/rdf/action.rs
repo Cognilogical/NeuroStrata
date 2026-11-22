@@ -7845,7 +7845,10 @@ mod tests {
             .iter()
             .map(|d| (d.before_status.as_str(), d.after_status.as_str()))
             .collect();
-        assert_eq!(statuses, vec![("blocked", "in_progress"), ("in_progress", "open")]);
+        assert_eq!(
+            statuses,
+            vec![("blocked", "in_progress"), ("in_progress", "open")]
+        );
 
         let (_, reverted_task) = store.get(ns, "task-1").await.unwrap().unwrap();
         assert_eq!(reverted_task.metadata["task"]["status"], json!("open"));
@@ -7866,7 +7869,10 @@ mod tests {
         )
         .await
         .expect("re-apply two-step-task");
-        let stale_receipt_id = apply_again.receipt_id().expect("applied receipt").to_string();
+        let stale_receipt_id = apply_again
+            .receipt_id()
+            .expect("applied receipt")
+            .to_string();
 
         store
             .upsert(

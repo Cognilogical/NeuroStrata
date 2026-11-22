@@ -2,18 +2,18 @@
 
 #![allow(dead_code)]
 
-#[path = "../../src/context/model.rs"]
-mod model;
-#[path = "../../src/context/source.rs"]
-mod source;
 #[path = "../../src/context/freshness.rs"]
 mod freshness;
+#[path = "../../src/context/model.rs"]
+mod model;
 #[path = "../../src/context/plan.rs"]
 mod plan;
 #[path = "../../src/context/render.rs"]
 mod render;
 #[path = "../../src/context/service.rs"]
 mod service;
+#[path = "../../src/context/source.rs"]
+mod source;
 
 use model::{ContextPlan, ContextRequest, Degradation, EgressPolicy, SourceIdentity};
 use service::ContextService;
@@ -80,7 +80,10 @@ fn plan_with_items_dedups_budgets_and_truncates() {
 
 #[test]
 fn source_resolve_sets_relative_path() {
-    let id = source::resolve("src/lib.rs", std::env::temp_dir().to_string_lossy().as_ref());
+    let id = source::resolve(
+        "src/lib.rs",
+        std::env::temp_dir().to_string_lossy().as_ref(),
+    );
     assert_eq!(id.relative_path, "src/lib.rs");
 }
 
@@ -99,8 +102,18 @@ fn freshness_changed_hash() {
 fn plan_dedups_and_budgets() {
     use model::ContextItem;
     let items = vec![
-        ContextItem { id: "a".into(), memory_type: "rule".into(), content: "hello".into(), freshness: None },
-        ContextItem { id: "a".into(), memory_type: "rule".into(), content: "hello2".into(), freshness: None },
+        ContextItem {
+            id: "a".into(),
+            memory_type: "rule".into(),
+            content: "hello".into(),
+            freshness: None,
+        },
+        ContextItem {
+            id: "a".into(),
+            memory_type: "rule".into(),
+            content: "hello2".into(),
+            freshness: None,
+        },
     ];
     let out = plan::rank_dedup_budget(items, 1000usize);
     assert_eq!(out.len(), 1);

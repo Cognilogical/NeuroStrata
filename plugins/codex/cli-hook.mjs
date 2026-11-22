@@ -1,6 +1,16 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
-import plugin, { initialize, onTurnEnd } from "./dist/index.js";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import plugin, {
+  initialize,
+  onTurnEnd,
+  readHarnessConfig,
+  resolveHookProjectDir
+} from "./dist/index.js";
+
+const HARNESS = "codex";
+const RUNNER_DIR = dirname(fileURLToPath(import.meta.url));
 
 async function main() {
   // Redirect all diagnostic logging to stderr so stdout carries only the
@@ -33,10 +43,11 @@ async function main() {
   } catch {
     return;
   }
-  // Pass the namespace only when it is set: an explicit undefined would
-  // override the one in .NeuroStrata/neurostrata-plugin.json.
-  const namespace = process.env.NEUROSTRATA_NAMESPACE;
-  await initialize({ config: namespace ? { namespace } : {} });
+  // The namespace comes from the harness config the installer wrote; the
+  // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
+  // this config (the order of `neurostrata-mcp namespace resolve`).
+  const projectDir = resolveHookProjectDir(HARNESS, event);
+  await initialize({ config: readHarnessConfig(HARNESS, projectDir, RUNNER_DIR), projectDir });
   const handler = plugin.handleHookEvent ?? plugin.handleClaudeHookEvent ?? plugin;
   if (typeof handler === "function") {
     const out = await handler(event);

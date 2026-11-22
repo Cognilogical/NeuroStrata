@@ -37,19 +37,96 @@ export type ResolvedConfig = PluginConfig;
 /** Allowlist namespace/task tokens before code-span interpolation (#316). */
 export declare function sanitizeSubagentHeaderToken(value: string): string;
 /**
- * Resolve `namespace` in strict priority order:
- *  1. pluginConfig.namespace (non-empty trimmed string)
- *  2. process.env.NEUROSTRATA_NAMESPACE (non-empty trimmed string)
- *  3. discoverProjectNamespace(cwd)
+ * Resolve `namespace` in strict priority order, the same order as
+ * `neurostrata-mcp namespace resolve`:
+ *  1. the project root marker (`.NeuroStrata/config.json`, findRootMarker(cwd))
+ *  2. pluginConfig.namespace (the harness config; non-empty trimmed string)
+ *  3. process.env.NEUROSTRATA_NAMESPACE (non-empty trimmed string)
+ *  4. discoverProjectNamespace(cwd)
  * Never falls back to a hardcoded "NeuroStrata".
  */
 export declare function resolveConfig(pluginConfig?: unknown, cwd?: string): PluginConfig;
+/** Which walk found a project root marker. */
+export type RootMarkerVia = 'own' | 'main' | 'nogit';
+export interface FoundRootMarker {
+    /** The project root, in the start path's own checkout. */
+    root: string;
+    namespace: string;
+    via: RootMarkerVia;
+}
 /**
- * Walk up from resolve(startDir) to the filesystem root looking for `.git`
- * (dir or file) or `.NeuroStrata`; return the directory containing it, or
- * resolve(startDir) if none found.
+ * A namespace value as written, or undefined when it is not one: empty, an
+ * unexpanded variable, or anything but `[A-Za-z0-9_.:-]` starting with a
+ * letter or digit. The Rust installer's `usable_namespace` rule.
  */
-export declare function findProjectRoot(startDir?: string): string;
+export declare function usableNamespace(raw: unknown): string | undefined;
+/**
+ * The marker that decides `startDir`'s project root, or null. `startDir`
+ * must be absolute on this host; for a file the walk starts at its folder.
+ *  1. Own checkout: from the start folder up to its checkout top, inclusive;
+ *     the deepest marker wins.
+ *  2. Linked worktree: the start folder mapped into the main checkout,
+ *     walked from its nearest existing folder up to the main checkout's top,
+ *     never entering a folder with its own `.git`. Steps 1 and 2 both run;
+ *     the deeper marker wins, at equal depth the own checkout's.
+ *  3. Outside git: the first marker above the start folder.
+ * When the winning marker cannot be read the answer is null, with one
+ * warning line naming the file: the caller falls back to the other namespace
+ * sources, never to a marker further up.
+ */
+export declare function findRootMarker(startDir: string): FoundRootMarker | null;
+/**
+ * Walk up from resolve(startDir) looking for `.git` (dir or file); return the
+ * directory containing it. With no `.git` above (pass 2), the nearest folder
+ * holding a valid project marker (`.NeuroStrata/config.json`), else the
+ * nearest folder holding `.NeuroStrata` other than the home folder, else
+ * resolve(startDir).
+ */
+export declare function findProjectRoot(startDir?: string, home?: string): string;
+/**
+ * The namespace `harness`'s plugin config names for the project at
+ * `projectDir`, read from its checkout's top, then (for a linked worktree,
+ * whose untracked configs usually live only in the main checkout) the main
+ * checkout's; outside git from `projectDir` itself. Empty when none names a
+ * usable namespace.
+ *
+ * `runnerDir` is the folder of the hook runner the installer wrote,
+ * `<root>/.NeuroStrata/plugins/<harness>/`: the config of the project that
+ * installed it, `<root>`, is read first.
+ */
+export declare function readHarnessConfig(harness: string, projectDir: string, runnerDir?: string): {
+    namespace?: string;
+};
+/**
+ * The project folder a CLI hook runner resolves its namespace from. Claude
+ * Code starts a new hook process per event, and the event's `cwd` follows
+ * every `cd`, so for Claude this is the session's project folder:
+ * `CLAUDE_PROJECT_DIR`, which Claude Code exports to hook processes as the
+ * project root where the session started. Without it, the folder recorded
+ * for this session at SessionStart (`claude_session_dirs` in
+ * `.NeuroStrata/active_session.json`; never the home folder's), else the
+ * event's `cwd`. Other harnesses use the event's `cwd`, else the process's.
+ *
+ * SessionStart also fires on resume, clear and compact, when the event's
+ * `cwd` may have moved: a folder already recorded for the session is kept.
+ * The file is replaced whole (temp + rename), and never when it exists but
+ * cannot be parsed, so the other fields it holds are not lost.
+ */
+export declare function resolveHookProjectDir(harness: string, event?: Record<string, unknown>, env?: Record<string, string | undefined>, home?: string): string;
+/**
+ * Whether `toolName` is one of [SESSION_SCOPED_TOOLS], bare or as a harness
+ * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
+ * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
+ */
+export declare function isSessionScopedTool(toolName: string): boolean;
+/**
+ * Claim scope from a linked worktree (design 6.5): `neurostrata_task_claim`
+ * and `neurostrata_get_snapshot` without `worktree`, `project_root` or `cwd`
+ * are scoped by the daemon to the namespace's registry root, the main
+ * checkout when a marker applies. This passes the session's project folder
+ * as `worktree` instead. Changes `args` in place; true when it did.
+ */
+export declare function addSessionWorktree(toolName: string, args: Record<string, unknown>, projectDir: string | undefined): boolean;
 /**
  * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
  *    if it parses as JSON with a non-empty string .namespace, return it trimmed.

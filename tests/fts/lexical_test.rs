@@ -139,7 +139,11 @@ fn row_class_filters_hide_tasks_archived_retired_registry_and_conflicts() {
         ..SearchOptions::default()
     };
     let all = index.search("ns", "needle", &opts).hits;
-    assert_eq!(all.len(), 3, "task, archived and live; retired/registry/conflict/structural stay out");
+    assert_eq!(
+        all.len(),
+        3,
+        "task, archived and live; retired/registry/conflict/structural stay out"
+    );
 }
 
 #[test]
@@ -254,8 +258,7 @@ fn field_weights_are_the_documented_defaults() {
     // Weight slots are positional: ALL_FIELDS[i] owns DEFAULT_FIELD_WEIGHTS[i]
     // (the same mapping `weight_index()` bakes into scoring), so Content
     // carries the 1.0 default and Symbol is boosted ×2.
-    let slot =
-        |field: Field| fts::ALL_FIELDS.iter().position(|f| *f == field).unwrap();
+    let slot = |field: Field| fts::ALL_FIELDS.iter().position(|f| *f == field).unwrap();
     assert_eq!(slot(Field::Content), 0);
     assert_eq!(slot(Field::Symbol), 1);
     assert_eq!(fts::DEFAULT_FIELD_WEIGHTS[slot(Field::Content)], 1.0);

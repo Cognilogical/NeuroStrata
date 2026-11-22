@@ -677,8 +677,8 @@ fn shipped_has_source_exists_and_preserves_provenance_semantics() {
 /// counterpart in src/rdf/provenance.rs.
 #[test]
 fn provenance_stand_in_matches_shipped_epistemic_semantics() {
-    let shipped = std::fs::read_to_string("src/rdf/provenance.rs")
-        .expect("src/rdf/provenance.rs readable");
+    let shipped =
+        std::fs::read_to_string("src/rdf/provenance.rs").expect("src/rdf/provenance.rs readable");
     let test_src = std::fs::read_to_string("tests/shacl_validation_test.rs")
         .expect("tests/shacl_validation_test.rs readable");
 

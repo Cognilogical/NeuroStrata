@@ -11,8 +11,8 @@
 //! empty registry from one. Oxigraph remains only as the RDF parser and model.
 
 use crate::error::{Error, Result};
-use crate::ladybug::{LadybugSchemaStore, NamespaceInfo, Projected, TripleRow, graph_token};
-use crate::registry::{self, RDF_TYPE, SchemaGraph, SchemaRole, owl, rdfs};
+use crate::ladybug::{graph_token, LadybugSchemaStore, NamespaceInfo, Projected, TripleRow};
+use crate::registry::{self, owl, rdfs, SchemaGraph, SchemaRole, RDF_TYPE};
 use crate::validate::{self, Mode, Report, ShexResult};
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode};

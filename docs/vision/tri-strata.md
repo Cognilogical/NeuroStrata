@@ -29,3 +29,4 @@ Within any Tier 2 project namespace, memories can be tagged with a declarative `
 Developers and parallel subagents frequently work across multiple Git worktrees or directory checkouts of the same repository. NeuroStrata prevents path drift across checkouts using stable source anchors:
 - Repository-relative `governs` targets (`NeuroStrata::src/server.rs`) remain independent of transient worktree directory paths.
 - `neurostrata-mcp project-context bind <source-id> <marker-path>` registers `.NeuroStrata` project markers so `export-graph` and file-governance lookups resolve deterministically from any linked worktree.
+- The project marker is the `.NeuroStrata` folder at the project root; its `config.json` names the project's namespace and marks that folder as the root. `neurostrata-mcp hooks install`, `neurostrata-mcp root set`, `neurostrata_task_setup` and `neurostrata_bootstrap` write it (see `docs/features-api/ops/project-root.md`).
