@@ -4,6 +4,7 @@
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const OPENCODE_INDEX_JS: &str = include_str!("../../plugins/opencode/dist/index.js");
 const OPENCODE_PKG_JSON: &str = include_str!("../../plugins/opencode/package.json");
@@ -1133,12 +1134,54 @@ fn sync_skills_and_agent_rules(
 /// a rename, so a reader (a git hook running `namespace resolve`) sees the old
 /// file or the new one, never a half-written one.
 fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, contents)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // A unique name plus create_new (O_EXCL) means a concurrent refresh never
+    // shares a temporary file, and a planted symlink cannot redirect the write.
+    let tmp = path.with_file_name(format!(
+        ".{name}.tmp-{}-{nanos}-{nonce}",
+        std::process::id()
+    ));
+    #[cfg(unix)]
+    let existing_mode = std::fs::metadata(path).ok().map(|m| m.permissions().mode());
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&tmp)?;
+    let written = (|| {
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    // Rename carries the temporary file's permissions onto the destination:
+    // copy the old mode first so refreshing a mode-0600 config cannot make
+    // its secrets readable to other local users.
+    #[cfg(unix)]
+    if let Some(mode) = existing_mode {
+        if let Err(err) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+    }
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
@@ -2756,5 +2799,46 @@ mod tests {
             snippet.contains("memories_for_file"),
             "snippet must still direct to memories_for_file"
         );
+    }
+
+    #[test]
+    fn write_atomically_uses_unique_exclusive_temps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        let writes: Vec<String> = (0..4)
+            .map(|i| format!("{{\"n\":{}}}\n", "x".repeat(100_000 + i)))
+            .collect();
+        std::thread::scope(|scope| {
+            for body in &writes {
+                let path = &path;
+                scope.spawn(move || write_atomically(path, body).unwrap());
+            }
+        });
+        let final_body = std::fs::read_to_string(&path).unwrap();
+        assert!(writes.contains(&final_body), "torn or partial file");
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files left behind: {leftovers:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.local.json");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomically(&path, "new secret value").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "permissions became {mode:o}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new secret value");
     }
 }
