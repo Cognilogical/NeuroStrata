@@ -351,10 +351,6 @@ fn repair_installer_hook_command(
     Some(repaired)
 }
 
-/// The Claude tools whose PreToolUse runs the runner for file recall and the
-/// guard.
-const CLAUDE_FILE_TOOLS_MATCHER: &str = "Read|Write|Edit|MultiEdit|Bash|Task";
-
 /// The NeuroStrata MCP tools whose PreToolUse runs the runner so it can pass
 /// the session's project folder as `worktree`.
 const CLAUDE_SESSION_SCOPE_MATCHER: &str = "mcp__.*__neurostrata_(task_claim|get_snapshot)";
@@ -1679,7 +1675,7 @@ fn wire_harness_config(
                                 ensure_claude_hook(
                                     h_obj,
                                     "PreToolUse",
-                                    Some(CLAUDE_FILE_TOOLS_MATCHER),
+                                    Some(CLAUDE_PRE_TOOL_USE_MATCHER),
                                     |m| m != Some(CLAUDE_SESSION_SCOPE_MATCHER),
                                     &cmd,
                                     &runs,
@@ -2690,9 +2686,15 @@ mod tests {
             Some("claude"),
         );
         let fresh = claude_pre_tool_use_matchers(tmp.path());
-        assert_eq!(fresh.len(), 1);
+        assert_eq!(
+            fresh.len(),
+            2,
+            "file tools and session-scope MCP tools: {fresh:?}"
+        );
         assert!(
-            fresh[0].0.split('|').any(|t| t == "NotebookEdit"),
+            fresh
+                .iter()
+                .any(|(m, _)| m.split('|').any(|t| t == "NotebookEdit")),
             "fresh install must guard NotebookEdit: {:?}",
             fresh
         );
@@ -2731,8 +2733,9 @@ mod tests {
                     LEGACY_CLAUDE_PRE_TOOL_USE_MATCHER.to_string(),
                     "echo user-hook".to_string()
                 ),
+                (CLAUDE_SESSION_SCOPE_MATCHER.to_string(), ours.clone()),
             ],
-            "only the installer's own entry is widened"
+            "only the installer's own entry is widened; session-scope stays"
         );
     }
 
@@ -3287,7 +3290,7 @@ mod tests {
             .collect();
         assert_eq!(
             matchers,
-            vec![CLAUDE_FILE_TOOLS_MATCHER, CLAUDE_SESSION_SCOPE_MATCHER]
+            vec![CLAUDE_PRE_TOOL_USE_MATCHER, CLAUDE_SESSION_SCOPE_MATCHER]
         );
         assert!(entries("Stop").iter().any(runs_ours));
         // A second install adds nothing.
