@@ -317,6 +317,14 @@ except Exception:
     command -v flock >/dev/null 2>&1 && flock -u 9 2>/dev/null || true
     exec 9>&- 2>/dev/null || true
 fi
+}
+
+mkdir -p "$(dirname "$LEDGER")"
+if command -v flock >/dev/null 2>&1; then
+    ( flock -x 9; rewrite_session_ledger_namespace ) 9>"$LEDGER.lock"
+else
+    rewrite_session_ledger_namespace
+fi
 
 
 # Spec §6 R6.1: this hook never fabricates `tool:"pre-commit"` ledger rows.
