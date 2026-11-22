@@ -2100,25 +2100,33 @@ mod tests {
     }
 
     /// `namespace resolve some/dir` takes a relative directory against the
-    /// current one, as a shell user expects.
+    /// current one. The relative directory resolves to a DIFFERENT namespace,
+    /// so an implementation that ignores `dir` and always answers for the
+    /// current directory fails this test.
     #[test]
     fn a_relative_directory_resolves_against_the_current_one() {
         let _env = no_namespace_env();
         let here = std::env::current_dir().unwrap();
-        // Outside a git checkout (a source tarball) `src` is its own folder.
         if crate::paths::git_root_of_dir(&here.to_string_lossy()).is_none() {
             eprintln!("skipped: the crate is not inside a git checkout");
             return;
         }
-        let expected = resolve_namespace(&here).map(|r| r.namespace);
-        assert_eq!(
-            resolve_namespace(Path::new(".")).map(|r| r.namespace),
-            expected
+        let name = format!("ns-relative-{}", uuid::Uuid::new_v4());
+        let rel = Path::new(&name);
+        let abs = here.join(rel);
+        std::fs::create_dir_all(abs.join(".git")).unwrap();
+        write_file(
+            &abs.join(".NeuroStrata/config.json"),
+            r#"{"namespace":"relative-marker"}"#,
         );
-        assert_eq!(
-            resolve_namespace(Path::new("src")).map(|r| r.namespace),
-            expected
+
+        assert_ne!(
+            ns_of(&here),
+            "relative-marker",
+            "fixture must differ from cwd"
         );
+        assert_eq!(ns_of(rel), "relative-marker");
+        let _ = std::fs::remove_dir_all(&abs);
     }
 
     #[test]
