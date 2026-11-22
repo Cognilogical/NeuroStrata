@@ -47,7 +47,14 @@ async function main() {
   // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
   // this config (the order of `neurostrata-mcp namespace resolve`).
   const projectDir = resolveHookProjectDir(HARNESS, event);
-  await initialize({ config: readHarnessConfig(HARNESS, projectDir, RUNNER_DIR), projectDir });
+  const config = readHarnessConfig(HARNESS, projectDir, RUNNER_DIR);
+  // Pass the namespace only when set: an explicit undefined would override
+  // the one in .NeuroStrata/neurostrata-plugin.json.
+  const namespace = process.env.NEUROSTRATA_NAMESPACE;
+  await initialize({
+    config: config.namespace ? config : namespace ? { namespace } : {},
+    projectDir
+  });
   // Handler chain: execute.before-style handleHookEvent takes precedence, then
   // the Claude handleClaudeHookEvent alias, falling back to the default export.
   const handler = plugin.handleHookEvent ?? plugin.handleClaudeHookEvent ?? plugin;
