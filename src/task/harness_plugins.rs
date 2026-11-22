@@ -1753,15 +1753,43 @@ fn write_plugin_file(path: &Path, content: &str, errors: &mut Vec<String>) -> bo
 /// a rename, so a reader (a git hook running `namespace resolve`) sees the old
 /// file or the new one, never a half-written one.
 fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    // One lock for every config in this process: a refresh touches a handful,
+    // and serializing them is simpler and safer than a per-path lock table.
+    let _guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+    // PID alone lets two in-process refreshes derive the same temp path.
+    // A process-wide sequence plus create_new makes a planted symlink and a
+    // racing refresh both fail loudly instead of following/clobbering it.
+    let tmp = path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        ATOMIC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = options.open(&tmp)?;
+        std::io::Write::write_all(&mut file, contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        // A refresh must never widen an existing config's access: it carries
+        // tokens and namespace metadata other local users must not read.
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
-    })
+    }
+    written
 }
 
 fn wire_harness_config(
@@ -1894,10 +1922,11 @@ fn wire_harness_config(
                     write_doc = true;
                 }
                 if write_doc {
+                    let mut may_add = false;
                     if let Some(obj) = doc.as_object_mut() {
                         let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
                         if let Some(h_obj) = hooks.as_object_mut() {
-                            let may_add = repair_claude_hooks(
+                            may_add = repair_claude_hooks(
                                 h_obj,
                                 namespace,
                                 abs_runner,
@@ -1964,6 +1993,24 @@ fn wire_harness_config(
                                         entry["matcher"] = json!(CLAUDE_PRE_TOOL_USE_MATCHER);
                                     }
                                 }
+                            }
+                        }
+                    }
+                    // A caller that already resolved the namespace (get_snapshot,
+                    // hook_hygiene_with_namespace) leaves an explicit answer in the
+                    // settings' env block; hook commands stay plain. Reading back the
+                    // plugin config keeps this consistent with an older install's
+                    // baked namespace and adds nothing when that write failed.
+                    if may_add {
+                        if let (Some(persisted), Some(obj)) =
+                            (claude_config_namespace(project_root), doc.as_object_mut())
+                        {
+                            let env = obj.entry("env".to_string()).or_insert_with(|| json!({}));
+                            if let Some(env_obj) = env.as_object_mut() {
+                                env_obj.insert(
+                                    "NEUROSTRATA_NAMESPACE".to_string(),
+                                    Value::String(persisted),
+                                );
                             }
                         }
                     }
