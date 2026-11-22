@@ -89,6 +89,19 @@ const IMPORT_OWNED_METADATA_KEYS: [&str; 18] = [
     "archived_by_vault_import",
 ];
 
+/// Edge declarations a retired history copy must not carry into `upsert`.
+/// Reconciliation only owns the live head's edges, so a copied declaration
+/// would materialise a fresh, active edge from knowledge that is retired.
+const HISTORY_EDGE_DECLARATION_KEYS: [&str; 7] = [
+    "related_to",
+    "related",
+    "governs",
+    "depends_on",
+    "contained_by",
+    "extracted_from",
+    "edge_sources",
+];
+
 /// Resource caps for a vault import/export. The default entry points use the
 /// published constants; tests tighten them to exercise fail-closed paths.
 #[derive(Debug, Clone)]
@@ -858,6 +871,16 @@ fn retire_metadata(metadata: &mut serde_json::Value, new_id: &str, now: i64) {
     }
 }
 
+/// Drop the declarations whose only consumer is edge materialisation. Content,
+/// type, task state and the retirement stamps stay on the copy.
+fn strip_history_edge_declarations(metadata: &mut serde_json::Value) {
+    if let Some(obj) = metadata.as_object_mut() {
+        for key in HISTORY_EDGE_DECLARATION_KEYS {
+            obj.remove(key);
+        }
+    }
+}
+
 /// A failed history rollback must be surfaced, never treated as success.
 fn cleanup_orphan_error(history_id: &str, cleanup_err: &str) -> String {
     format!(
@@ -1292,6 +1315,7 @@ pub async fn import_vault_with_limits(
             // already came across in the wholesale copy above.
             let history_id = format!("{}.vault-history.{}", note.id, uuid::Uuid::new_v4());
             retire_metadata(&mut prior.metadata, &note.id, now);
+            strip_history_edge_declarations(&mut prior.metadata);
             metadata["supersedes"] = serde_json::json!(history_id);
             history = Some((history_id, hv, prior));
         }
@@ -1747,7 +1771,13 @@ mod tests {
         assert_eq!(head.metadata["related"], serde_json::json!(["second"]));
         let history_id = head.metadata["supersedes"].as_str().expect("supersedes");
         let (_, history) = store.get(ns, history_id).await.unwrap().unwrap();
-        assert_eq!(history.metadata["related"], serde_json::json!(["first"]));
+        assert_eq!(history.content, "Same body");
+        assert!(
+            history.metadata.get("related").is_none()
+                && history.metadata.get("related_to").is_none(),
+            "a retired copy must not keep edge declarations: {:?}",
+            history.metadata
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3483,6 +3513,139 @@ mod tests {
             exported.related,
             vec!["kept-edge".to_string()],
             "the next export must not resurrect deleted links"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex review 4656373077: a retired history copy must not materialise
+    /// the edge declarations its live head no longer carries.
+    #[tokio::test]
+    async fn history_copy_does_not_materialize_retired_edges() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-history-edges-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_history_edges";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+
+        let mut alpha = note("alpha-note", &["beta-note"]);
+        alpha.content = "Alpha body".to_string();
+        alpha.canonical_sha256 = alpha.fingerprint();
+        std::fs::write(vault.join("alpha-note.md"), alpha.to_markdown()).expect("write alpha");
+        let mut beta = note("beta-note", &[]);
+        beta.content = "Beta body".to_string();
+        beta.canonical_sha256 = beta.fingerprint();
+        std::fs::write(vault.join("beta-note.md"), beta.to_markdown()).expect("write beta");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("first import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert_eq!(first.notes_imported, 2, "{:?}", first.errors);
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert_eq!(
+            relates_to_targets(&edges, "alpha-note"),
+            vec!["beta-note".to_string()],
+            "control: the first import materialises the link: {:?}",
+            edges
+        );
+
+        // Structured state the import does not own must ride along into the
+        // retired copy.
+        let (_, mut head) = store
+            .get(ns, "alpha-note")
+            .await
+            .expect("get alpha")
+            .expect("alpha exists");
+        head.metadata["task"] = serde_json::json!({
+            "id": "task-1",
+            "status": "in_progress"
+        });
+        let vector = TestEmbedder
+            .embed(&head.content)
+            .await
+            .expect("embed alpha");
+        store
+            .upsert(ns, "alpha-note", vector, head)
+            .await
+            .expect("stamp task state");
+
+        let mut edited = note("alpha-note", &[]);
+        edited.content = "Alpha body".to_string();
+        edited.canonical_sha256 = edited.fingerprint();
+        std::fs::write(vault.join("alpha-note.md"), edited.to_markdown()).expect("rewrite alpha");
+        let second = import_vault(config, store.clone(), std::sync::Arc::new(TestEmbedder))
+            .await
+            .expect("second import");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert_eq!(second.notes_imported, 1, "{:?}", second.errors);
+
+        let rows = store.list(ns, None, None).await.expect("list rows");
+        let history: Vec<_> = rows
+            .iter()
+            .filter(|row| row.id.starts_with("alpha-note.vault-history."))
+            .collect();
+        assert_eq!(history.len(), 1, "the changed head leaves one history copy");
+        let history = history[0];
+        let history_id = history.id.clone();
+        assert_eq!(history.payload.content, "Alpha body");
+        assert_eq!(history.payload.memory_type, "fact");
+        assert_eq!(
+            history.payload.metadata["task"],
+            serde_json::json!({"id": "task-1", "status": "in_progress"}),
+            "retirement must preserve structured state: {:?}",
+            history.payload.metadata
+        );
+        assert!(
+            history
+                .payload
+                .metadata
+                .get("valid_to")
+                .and_then(serde_json::Value::as_i64)
+                .is_some(),
+            "the copy must stay retired: {:?}",
+            history.payload.metadata
+        );
+
+        let edges = store
+            .list_edges(ns)
+            .await
+            .expect("list edges after reimport");
+        assert!(
+            edges.iter().all(|(from, _, _, _)| from != &history.id),
+            "a retired copy must not originate live edges: {:?}",
+            edges
+        );
+        assert!(
+            relates_to_targets(&edges, "alpha-note").is_empty(),
+            "the current head no longer links beta: {:?}",
+            edges
+        );
+
+        // RDF projects the stored edge set, so the retired relationship must
+        // be absent from it as well.
+        let projected: Vec<(String, crate::traits::MemoryPayload)> =
+            rows.into_iter().map(|row| (row.id, row.payload)).collect();
+        let quads = crate::rdf::rows_to_quads(&projected, ns, crate::rdf::Tier::Domain, 0, &edges);
+        let relates_to = crate::rdf::namespace::relation_predicate("RELATES_TO");
+        let retired_subject = format!("urn:neurostrata:memory:{history_id}");
+        let retired_relation = quads.iter().any(|quad| {
+            quad.subject == retired_subject
+                && quad.predicate == relates_to
+                && matches!(&quad.object, crate::rdf::QuadObject::Iri(iri) if iri.ends_with(":beta-note"))
+        });
+        assert!(
+            !retired_relation,
+            "RDF must not project the retired relationship: {quads:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -801,6 +801,64 @@ row is created.
   turn; a failure returns from replay before the transaction commits, so it
   cannot publish a half-reconciled graph.
 
+### 3l. Retired history copies carry no edge declarations
+
+#### Invariant
+
+A `<id>.vault-history.<uuid>` copy is retired knowledge and must not originate
+a live graph edge. The history payload keeps content, `memory_type`, owner,
+`task` state, and the `{valid_to, superseded_by, archived_by_vault_import}`
+stamps, but carries no edge declaration for `upsert` to materialise. The live
+head's reconciled declaration set remains the only edge set for that note, so
+removing a WikiLink and reimporting leaves no `RELATES_TO` edge from either the
+head or any history row, in `list_edges` or RDF projection.
+
+#### Mechanism
+
+- `import_vault` builds the history payload from the prior head, stamps
+  retirement, then calls `strip_history_edge_declarations`. It removes exactly
+  the keys that feed edge materialisation or cite its provenance:
+  `related_to`, `related`, `governs`, `depends_on`, `contained_by`,
+  `extracted_from`, `edge_sources`.
+- `related` is the vault render, not a relation key, but it is dropped so a
+  retired copy cannot later be read as a declaration. `edge_sources` is
+  dropped because its citations would name edges the copy never created.
+- Only the history copy is stripped; the live head is built by the existing
+  import-owned overlay and reconciliation path. `LadybugStore::upsert` is
+  unchanged, so ordinary callers keep their current declaration semantics.
+- Strip rather than a store-level retired-row guard is the narrower fix:
+  `mention_symbol_ids` indexes only ingested symbol rows, so the removed
+  declaration keys are the only path from a retired vault copy to a vault
+  edge. A guarded `upsert` would change every retired write, including
+  non-vault callers, to fix a producer the importer owns.
+
+#### Eval (failed on `e0a4cc23`)
+
+- `history_copy_does_not_materialize_retired_edges`
+  - Import `alpha-note → beta-note`; stamp `metadata.task` on the head; remove
+    the link and reimport.
+  - Assert the retired copy keeps content `Alpha body`, `memory_type` `fact`,
+    and the task state, and is stamped `valid_to`. Assert no edge originates
+    at the history id, `alpha-note` has no `RELATES_TO` target, and
+    `rows_to_quads` projects no retired `RELATES_TO` triple to `beta-note`.
+  - On `e0a4cc23` the history upsert materialised
+    `alpha-note.vault-history.… → beta-note` with `valid_to = 0`.
+- `related_only_edit_creates_history_and_updates_edges` (updated assertion)
+  - A related-only edit still versions the head; the history copy keeps its
+    content but no longer carries `related`/`related_to`.
+
+#### Residual risk
+
+- A database that already materialised a history edge before this patch keeps
+  it: the retired copy is not re-upserted, so the strip never runs for it.
+  `list_edges`/RDF expose the stale edge until an operator retires it. New
+  history rows are clean from this change forward.
+- Content can still name an ingested symbol, and mention detection runs for
+  non-ingestor rows. That path creates `mention-detector` provenance from the
+  copy only toward a symbol path present in its prose, not toward the vault
+  note whose declaration was removed; it is the pre-existing §3d class and is
+  outside this reconciliation-owned edge set.
+
 ---
 
 ## 4. #344 — Retired rows must not be exported
@@ -897,7 +955,8 @@ note whose *real* type changed is versioned.
   import guard, `fingerprint_version` stamp, `exact_edge_targets` stamp,
   per-head `reconcile_declared_edges` call after a successful upsert, updated
   `import_reconciles_preserved_edge_fields_with_edited_links`
-  assertion (that key now exists by design), and the #363 evals.
+  assertion (that key now exists by design), history-copy edge-declaration
+  strip (§3l), and the #363 evals.
 - `src/traits.rs` — `VectorStore::reconcile_declared_edges` default no-op,
   `VectorStore::rebind_declared_edges` default no-op, and the rebind's
   `declared`/`keep` binding contract (§3g, §3i).
@@ -965,3 +1024,6 @@ note whose *real* type changed is versioned.
 - The reconcile and the head write are two statements, not one transaction;
   the order makes a failed write safe at the cost of a crash window that can
   leave stale edges with the new head (repaired on the next changed import).
+- The history strip removes up to seven metadata keys from the retired copy;
+  it adds no write and no store branch. A copy written by a pre-fix build
+  keeps whatever edge it already materialised until an operator retires it.
