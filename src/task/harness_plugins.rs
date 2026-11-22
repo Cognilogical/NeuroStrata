@@ -1140,7 +1140,13 @@ fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    // A PID alone is shared by every writer in a process (and across a setup
+    // and a snapshot refresh), so give each write its own staged name.
+    let tmp = path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
     // `create_new` is O_EXCL: an attacker-planted symlink at the predictable
     // staged path is refused instead of being followed to its target.
     {
@@ -2796,5 +2802,22 @@ mod tests {
             !target.exists(),
             "the symlink must not be renamed into place"
         );
+    }
+
+    /// Concurrent config writes to the same path must not share a staged
+    /// filename: an occupied predictable path must not break a write.
+    #[test]
+    fn write_atomically_uses_a_unique_staged_name_per_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap();
+        let target = dir.join("config.json");
+        // Occupy the old PID-based staged path with a directory. A unique
+        // staged name is unaffected; a shared one cannot be opened at all.
+        let staged = dir.join(format!(".config.json.tmp-{}", std::process::id()));
+        std::fs::create_dir(&staged).unwrap();
+
+        write_atomically(&target, "{\"ok\":true}").expect("write with a fresh staged name");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"ok\":true}");
     }
 }
