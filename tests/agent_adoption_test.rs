@@ -4,10 +4,10 @@
 //! crate-free `task::routing` module from its real path -- the same pattern
 //! `tests/graph_read/memories_for_file_test.rs` uses for its ranking helpers.
 
-#[path = "../src/graph_read/memories_for_file.rs"]
-mod memories_for_file;
 #[path = "../src/task/graph_advisories.rs"]
 mod graph_advisories;
+#[path = "../src/graph_read/memories_for_file.rs"]
+mod memories_for_file;
 #[path = "../src/task/routing.rs"]
 mod routing;
 #[path = "../src/task/snapshot_readiness.rs"]
@@ -641,9 +641,8 @@ fn precommit_no_longer_fabricates_ledger_rows() {
         .get("queries")
         .and_then(Value::as_array)
         .map(|rows| {
-            rows.iter().all(|row| {
-                row.get("tool").and_then(Value::as_str) != Some("pre-commit")
-            })
+            rows.iter()
+                .all(|row| row.get("tool").and_then(Value::as_str) != Some("pre-commit"))
         })
         .unwrap_or(true);
     assert!(
@@ -686,7 +685,10 @@ fn receipt_fields_are_digest_only() {
     let v = sample_receipt(raw_query, raw_content).to_value();
     let obj = v.as_object().expect("receipt must be a JSON object");
     assert!(!obj.contains_key("query"), "raw query must never be stored");
-    assert!(!obj.contains_key("content"), "raw content must never be stored");
+    assert!(
+        !obj.contains_key("content"),
+        "raw content must never be stored"
+    );
     let qd = tool_receipts::digest(raw_query);
     let cd = tool_receipts::digest(raw_content);
     assert_eq!(v["query_digest"].as_str(), Some(qd.as_str()));
@@ -725,8 +727,14 @@ fn receipt_tool_invocations_are_additive_only() {
     tool_receipts::bump_tool_invocation(&mut doc, "neurostrata_related");
     tool_receipts::bump_tool_invocation(&mut doc, "neurostrata_related");
     tool_receipts::bump_tool_invocation(&mut doc, "neurostrata_taxonomy");
-    assert_eq!(doc["tool_invocations"]["neurostrata_related"].as_u64(), Some(2));
-    assert_eq!(doc["tool_invocations"]["neurostrata_taxonomy"].as_u64(), Some(1));
+    assert_eq!(
+        doc["tool_invocations"]["neurostrata_related"].as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        doc["tool_invocations"]["neurostrata_taxonomy"].as_u64(),
+        Some(1)
+    );
     assert!(doc.get("quota").is_none());
     assert!(doc.get("gate").is_none());
     assert!(doc.get("nudge").is_none());
@@ -755,7 +763,14 @@ fn receipts_are_private_and_digest_only() {
     let mut candidates = doc["queries"].as_array().cloned().unwrap_or_default();
     candidates.extend(doc["events"].as_array().cloned().unwrap_or_default());
 
-    let shareable = ["rule", "fact", "procedure", "action_type", "thesis", "concept"];
+    let shareable = [
+        "rule",
+        "fact",
+        "procedure",
+        "action_type",
+        "thesis",
+        "concept",
+    ];
     let exported = mesh_exportable_rows(&candidates, &shareable);
     assert!(
         exported.iter().all(|row| row.get("event_id").is_none()),
@@ -792,7 +807,10 @@ fn receipt_status_reflects_real_outcome_not_dispatch_time() {
 
     assert_eq!(mk(&empty, false).status, ReceiptStatus::Empty);
     assert_eq!(mk(&unsupported, false).status, ReceiptStatus::Unsupported);
-    assert_eq!(mk("No relevant memories found.", false).status, ReceiptStatus::Empty);
+    assert_eq!(
+        mk("No relevant memories found.", false).status,
+        ReceiptStatus::Empty
+    );
     assert_eq!(mk("boom", true).status, ReceiptStatus::Failed);
 
     let ok = mk(&success, false);
@@ -827,11 +845,18 @@ fn every_graph_tool_has_post_dispatch_receipt_path() {
         .to_value();
         assert_eq!(receipt["tool"].as_str(), Some(*tool));
         assert_eq!(receipt["status"].as_str(), Some("success"));
-        assert_eq!(receipt.as_object().unwrap().len(), RECEIPT_FIELD_NAMES.len());
+        assert_eq!(
+            receipt.as_object().unwrap().len(),
+            RECEIPT_FIELD_NAMES.len()
+        );
         assert!(!route_class(tool).is_empty());
         covered.insert(*tool);
     }
-    assert_eq!(covered.len(), 8, "R8 requires all eight graph tools covered");
+    assert_eq!(
+        covered.len(),
+        8,
+        "R8 requires all eight graph tools covered"
+    );
     for required in [
         "neurostrata_memories_for_file",
         "neurostrata_related",
@@ -914,7 +939,10 @@ fn validate_warns_only_on_unresolved_applicable_triggers() {
         clean["recommendations"].as_array().unwrap().is_empty(),
         "a genuine one-hop lookup must not warn"
     );
-    assert!(clean["unresolved_trigger_ids"].as_array().unwrap().is_empty());
+    assert!(clean["unresolved_trigger_ids"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     // Applicable T_HIGH_BLAST with no genuine related receipt: the prescribed
     // action was emitted, but the escalation dispatch failed. The one-hop
@@ -954,7 +982,11 @@ fn validate_warns_only_on_unresolved_applicable_triggers() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(codes, vec![W_GRAPH_NO_EXPANSION], "only the unmet escalation warns");
+    assert_eq!(
+        codes,
+        vec![W_GRAPH_NO_EXPANSION],
+        "only the unmet escalation warns"
+    );
     assert_eq!(report["high_blast_radius_unexplored"], true);
     assert_eq!(
         report["unresolved_trigger_ids"],

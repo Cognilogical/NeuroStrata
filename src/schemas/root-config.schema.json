@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NeuroStrata project root marker",
+  "description": "The file .NeuroStrata/config.json. The folder that holds it is a NeuroStrata project root. NeuroStrata checks the same rules in code (src/root_marker.rs); this schema documents them and is not loaded at runtime.",
+  "type": "object",
+  "required": ["version", "namespace"],
+  "properties": {
+    "version": {
+      "description": "File format version. A file with any other version is treated as unreadable.",
+      "type": "integer",
+      "const": 1
+    },
+    "namespace": {
+      "description": "The NeuroStrata namespace this project uses. Starts with a letter or digit.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+    },
+    "source_id": {
+      "description": "Optional source identifier. Recorded only.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

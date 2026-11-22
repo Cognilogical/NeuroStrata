@@ -494,6 +494,11 @@ pub fn build_merged_registry_payload(
     }
 }
 
+/// Serializes every read-modify-write of a registry row in this process.
+/// A `tokio` mutex (guards are held across awaits) and not reentrant: a
+/// function that holds it must not call another function that takes it.
+pub(crate) static REGISTRY_ROW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Read-merge-write the registry under a process-wide mutex (the guard is held
 /// across awaits, so this is a `tokio` mutex). `None` on success; `Some(warning)`
 /// when the cache did not stick -- the write it belongs to has already been
@@ -504,9 +509,7 @@ pub async fn write_registry(
     namespace: &str,
     domains: &[String],
 ) -> Option<String> {
-    static REGISTRY_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    let _guard = REGISTRY_MUTEX.lock().await;
+    let _guard = REGISTRY_ROW_LOCK.lock().await;
     let registry_id = registry_row_id(namespace);
     // Read existing row (metadata + vector) for merge. Fail the write on a
     // read error: merging `wanted_slugs` into an empty "existing" would
@@ -776,18 +779,95 @@ pub async fn cache_project_root(
     emb: Option<&Arc<dyn Embedder>>,
     namespace: &str,
     project_root: &str,
+) -> bool {
+    let _guard = REGISTRY_ROW_LOCK.lock().await;
+    cache_project_root_locked(store, emb, namespace, project_root).await
+}
+
+/// Like [`cache_project_root`], but a namespace whose root a marker names is
+/// left alone: only the marker's writers change that root. An unreadable
+/// marker is no reason to overwrite a root that may be right, so it is a
+/// no-op too (one warning). The checks run under the row lock, so a marker
+/// writer that sets the cached root between them and the write is seen.
+pub async fn cache_project_root_unless_marked(
+    store: &Arc<dyn VectorStore>,
+    emb: Option<&Arc<dyn Embedder>>,
+    namespace: &str,
+    project_root: &str,
 ) {
+    let _guard = REGISTRY_ROW_LOCK.lock().await;
+    match crate::root_marker::find_root_marker(std::path::Path::new(project_root)) {
+        Ok(Some(found)) if found.config.namespace.eq_ignore_ascii_case(namespace) => return,
+        Err((path, reason)) => {
+            tracing::warn!(
+                "root marker {} is unreadable ({reason}); the cached project_root of '{namespace}' was left as it is",
+                path.display()
+            );
+            return;
+        }
+        _ => {}
+    }
+    // A caller outside the marked checkout (a second clone without the
+    // marker, a scratch folder) must not move a root the marker pinned.
+    match cached_project_root(store, namespace).await {
+        Ok(Some(cached)) => {
+            let cached = std::path::Path::new(&cached);
+            if cached.is_dir() {
+                match crate::root_marker::find_root_marker(cached) {
+                    Ok(Some(found)) if found.config.namespace.eq_ignore_ascii_case(namespace) => {
+                        return
+                    }
+                    Err((path, reason)) => {
+                        tracing::warn!(
+                            "root marker {} is unreadable ({reason}); the cached project_root of '{namespace}' was left as it is",
+                            path.display()
+                        );
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("{e}; the cached project_root of '{namespace}' was left as it is");
+            return;
+        }
+    }
+    cache_project_root_locked(store, emb, namespace, project_root).await;
+}
+
+/// Set the namespace's cached root to `root` (for the marker's writers). A
+/// root inside a linked worktree is stored in its main checkout's spelling.
+/// `false` when the row could not be written (or is missing and there is no
+/// embedder to create it).
+pub async fn set_project_root(
+    store: &Arc<dyn VectorStore>,
+    emb: Option<&Arc<dyn Embedder>>,
+    namespace: &str,
+    root: &std::path::Path,
+) -> bool {
+    let spelled = crate::root_marker::in_main_checkout(root);
+    cache_project_root(store, emb, namespace, &spelled.to_string_lossy()).await
+}
+
+async fn cache_project_root_locked(
+    store: &Arc<dyn VectorStore>,
+    emb: Option<&Arc<dyn Embedder>>,
+    namespace: &str,
+    project_root: &str,
+) -> bool {
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,
         _ => {
-            let Some(emb) = emb else { return };
+            let Some(emb) = emb else { return false };
             let content = registry_content(namespace);
             let vector = match emb.embed(&content).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("cache_project_root embed failed for '{namespace}': {e}");
-                    return;
+                    return false;
                 }
             };
             (
@@ -812,7 +892,73 @@ pub async fn cache_project_root(
     }
     if let Err(e) = store.upsert(namespace, &registry_id, vector, payload).await {
         tracing::warn!("registry upsert failed for '{namespace}:{registry_id}': {e}");
+        return false;
     }
+    true
+}
+
+/// Merge `doctor_state` into the registry row, re-reading the row under the
+/// row lock so a concurrent write to another field (project_root, domain
+/// slugs) is kept. A missing row is left missing.
+pub async fn write_doctor_state(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    doctor_state: Value,
+) {
+    let _guard = REGISTRY_ROW_LOCK.lock().await;
+    let registry_id = registry_row_id(namespace);
+    let (vector, mut payload) = match store.get(namespace, &registry_id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("registry row read failed for '{namespace}': {e}");
+            return;
+        }
+    };
+    if let Some(obj) = payload.metadata.as_object_mut() {
+        obj.insert("doctor_state".to_string(), doctor_state);
+    }
+    if let Err(e) = store.upsert(namespace, &registry_id, vector, payload).await {
+        tracing::warn!("failed to persist doctor_state into {namespace}::{registry_id}: {e}");
+    }
+}
+
+/// Merge `fields` into the row's `doctor_state` object (other doctor_state
+/// keys and other row fields kept), under the row lock with a fresh read.
+/// Returns the doctor_state as it was before, or `None` when there is no row
+/// (left missing) or it could not be read.
+pub async fn merge_doctor_state_fields(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    fields: serde_json::Map<String, Value>,
+) -> Option<Value> {
+    let _guard = REGISTRY_ROW_LOCK.lock().await;
+    let registry_id = registry_row_id(namespace);
+    let (vector, mut payload) = match store.get(namespace, &registry_id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!("registry row read failed for '{namespace}': {e}");
+            return None;
+        }
+    };
+    let previous = payload
+        .metadata
+        .get("doctor_state")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if let Some(obj) = payload.metadata.as_object_mut() {
+        let mut state = match previous.clone() {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        state.extend(fields);
+        obj.insert("doctor_state".to_string(), Value::Object(state));
+    }
+    if let Err(e) = store.upsert(namespace, &registry_id, vector, payload).await {
+        tracing::warn!("failed to persist doctor_state into {namespace}::{registry_id}: {e}");
+    }
+    Some(previous)
 }
 
 /// The `project_root` cached on the namespace's registry row by
@@ -847,8 +993,418 @@ pub async fn cached_project_root(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    fn write_marker(dir: &std::path::Path, ns: &str) {
+        std::fs::create_dir_all(dir.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            dir.join(".NeuroStrata").join("config.json"),
+            format!(r#"{{"version":1,"namespace":"{ns}"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn marked_namespace_cache_ignores_a_caller_root() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        write_marker(&repo, "example-project");
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let root = repo.to_string_lossy().into_owned();
+        cache_project_root(&store, Some(&emb), "example-project", &root).await;
+
+        let sub = repo.join("sub").to_string_lossy().into_owned();
+        // The marker names the namespace in any case spelling.
+        for ns in ["example-project", "Example-Project"] {
+            cache_project_root_unless_marked(&store, Some(&emb), ns, &sub).await;
+            assert_eq!(
+                cached_project_root(&store, "example-project")
+                    .await
+                    .unwrap(),
+                Some(root.clone())
+            );
+        }
+
+        // A broken marker is no reason to overwrite either.
+        write_marker(&repo.join("sub"), "x");
+        std::fs::write(
+            repo.join("sub").join(".NeuroStrata").join("config.json"),
+            b"{ no",
+        )
+        .unwrap();
+        cache_project_root_unless_marked(&store, Some(&emb), "example-project", &sub).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            Some(root.clone())
+        );
+
+        // A caller folder outside the marked checkout (no marker of its own)
+        // does not move the cached root either.
+        let elsewhere = base.join("scratch");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let elsewhere = elsewhere.to_string_lossy().into_owned();
+        cache_project_root_unless_marked(&store, Some(&emb), "example-project", &elsewhere).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            Some(root)
+        );
+    }
+
+    /// The cached checkout's marker is unreadable: an unmarked second clone
+    /// must not relocate the pinned root, just as a caller's own unreadable
+    /// marker is a warning-and-no-op.
+    #[tokio::test]
+    async fn unmarked_caller_keeps_a_cached_root_with_an_unreadable_marker() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let pinned = base.join("pinned");
+        let caller = base.join("caller");
+        for dir in [&pinned, &caller] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::create_dir_all(pinned.join(".git")).unwrap();
+        write_marker(&pinned, "example-project");
+        std::fs::write(pinned.join(".NeuroStrata").join("config.json"), b"{ no").unwrap();
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        cache_project_root(
+            &store,
+            Some(&emb),
+            "example-project",
+            &pinned.to_string_lossy(),
+        )
+        .await;
+        cache_project_root_unless_marked(
+            &store,
+            Some(&emb),
+            "example-project",
+            &caller.to_string_lossy(),
+        )
+        .await;
+        assert_eq!(
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            Some(pinned.to_string_lossy().into_owned())
+        );
+    }
+
+    /// A caller that started before a marker writer pinned the root sees the
+    /// pin: its checks run under the row lock, not before it.
+    #[tokio::test]
+    async fn unmarked_caller_waiting_on_the_lock_keeps_a_root_pinned_meanwhile() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let old = base.join("old");
+        let pinned = base.join("pinned");
+        let caller = base.join("caller");
+        for dir in [&old, &pinned, &caller] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        cache_project_root(
+            &store,
+            Some(&emb),
+            "example-project",
+            &old.to_string_lossy(),
+        )
+        .await;
+
+        let held = REGISTRY_ROW_LOCK.lock().await;
+        let task = {
+            let (store, emb) = (store.clone(), emb.clone());
+            let caller = caller.to_string_lossy().into_owned();
+            tokio::spawn(async move {
+                cache_project_root_unless_marked(&store, Some(&emb), "example-project", &caller)
+                    .await
+            })
+        };
+        // Let the caller run up to the lock.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // A marker writer pins the root while the caller waits.
+        write_marker(&pinned, "example-project");
+        assert!(
+            cache_project_root_locked(
+                &store,
+                Some(&emb),
+                "example-project",
+                &pinned.to_string_lossy()
+            )
+            .await
+        );
+        drop(held);
+        task.await.unwrap();
+        assert_eq!(
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            Some(pinned.to_string_lossy().into_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn unmarked_namespace_cache_still_follows_callers() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        // A marker that names another namespace does not pin this one.
+        write_marker(&repo, "other-project");
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let first = repo.to_string_lossy().into_owned();
+        cache_project_root_unless_marked(&store, Some(&emb), "example-project", &first).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            Some(first)
+        );
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let second = plain.to_string_lossy().into_owned();
+        cache_project_root_unless_marked(&store, Some(&emb), "example-project", &second).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            Some(second)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_project_root_stores_the_given_root() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        set_project_root(&store, Some(&emb), "example-project", &base).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            Some(base.to_string_lossy().into_owned())
+        );
+    }
+
+    /// A store whose `get` yields after reading, so two read-modify-write
+    /// sequences on one row interleave unless something serializes them.
+    struct YieldStore {
+        inner: crate::guard::testkit::MockStore,
+    }
+    impl crate::traits::AsAny for YieldStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    #[async_trait::async_trait]
+    impl VectorStore for YieldStore {
+        async fn init(&self, ns: &str) -> anyhow::Result<()> {
+            self.inner.init(ns).await
+        }
+        async fn upsert(
+            &self,
+            ns: &str,
+            id: &str,
+            v: Vec<f32>,
+            p: MemoryPayload,
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
+            self.inner.upsert(ns, id, v, p).await
+        }
+        async fn search(
+            &self,
+            ns: &str,
+            v: Vec<f32>,
+            l: usize,
+            it: bool,
+            ia: bool,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner.search(ns, v, l, it, ia).await
+        }
+        async fn delete(&self, ns: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(ns, id).await
+        }
+        async fn clear_ingested(&self, ns: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(ns).await
+        }
+        async fn relink_edges(&self, ns: &str, sk: &str) -> anyhow::Result<usize> {
+            self.inner.relink_edges(ns, sk).await
+        }
+        async fn list(
+            &self,
+            ns: &str,
+            u: Option<&str>,
+            mt: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner.list(ns, u, mt).await
+        }
+        async fn get(
+            &self,
+            ns: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
+            let found = self.inner.get(ns, id).await;
+            tokio::task::yield_now().await;
+            found
+        }
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+        async fn export_graph(
+            &self,
+            ir: bool,
+            ia: bool,
+            pc: &std::collections::HashMap<String, std::path::PathBuf>,
+            ao: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner.export_graph(ir, ia, pc, ao).await
+        }
+        async fn increment_access_count(&self, ns: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(ns, id).await
+        }
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+    }
+
+    pub(crate) fn yield_store() -> Arc<dyn VectorStore> {
+        Arc::new(YieldStore {
+            inner: crate::guard::testkit::MockStore::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn cache_write_and_domain_registry_write_both_survive() {
+        use crate::guard::testkit::StubEmbedder;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        for i in 0..50 {
+            let store = yield_store();
+            let root = format!("/example/root-{i}");
+            let domains = vec!["auth".to_string()];
+            let (_, warning) = tokio::join!(
+                cache_project_root(&store, Some(&emb), "example-project", &root),
+                write_registry(&store, &emb, "example-project", &domains),
+            );
+            assert_eq!(warning, None, "round {i}");
+            assert_eq!(
+                cached_project_root(&store, "example-project")
+                    .await
+                    .unwrap(),
+                Some(root),
+                "round {i}: the cached root"
+            );
+            assert_eq!(
+                read_domains(&store, "example-project").await.unwrap(),
+                domains,
+                "round {i}: the domain registry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_state_write_keeps_concurrent_project_root() {
+        use crate::guard::testkit::StubEmbedder;
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        for i in 0..20 {
+            let store = yield_store();
+            cache_project_root(&store, Some(&emb), "example-project", "/example/old").await;
+            let root = std::path::PathBuf::from(format!("/example/new-{i}"));
+            let state = serde_json::json!({ "session_counter": i });
+            tokio::join!(
+                write_doctor_state(&store, "example-project", state),
+                set_project_root(&store, Some(&emb), "example-project", &root),
+            );
+            assert_eq!(
+                cached_project_root(&store, "example-project")
+                    .await
+                    .unwrap(),
+                Some(root.to_string_lossy().into_owned()),
+                "round {i}: the root"
+            );
+            let (_, payload) = store
+                .get("example-project", &registry_row_id("example-project"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                payload.metadata["doctor_state"]["session_counter"],
+                serde_json::json!(i),
+                "round {i}: the doctor state"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_project_root_maps_linked_worktree_to_main_checkout() {
+        use crate::guard::testkit::{MockStore, StubEmbedder};
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        let linked = base.join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(&main)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["commit", "--allow-empty", "-m", "init"]);
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "feature/linked",
+            linked.to_str().unwrap(),
+        ]);
+        std::fs::create_dir_all(linked.join("pkg")).unwrap();
+        // A main checkout holding only `.git` is not taken as one (it may be
+        // a separate git dir); a real checkout holds files.
+        std::fs::create_dir_all(main.join("pkg")).unwrap();
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        set_project_root(&store, Some(&emb), "example-project", &linked.join("pkg")).await;
+        assert_eq!(
+            cached_project_root(&store, "example-project")
+                .await
+                .unwrap(),
+            Some(main.join("pkg").to_string_lossy().into_owned())
+        );
+    }
 
     #[test]
     fn a_registry_row_id_is_stable_and_namespaced() {
@@ -1323,6 +1879,8 @@ pub async fn enrichment_start(
     holder_id: &str,
 ) -> Result<Value, String> {
     let _guard = ENRICHMENT_MUTEX.lock().await;
+    // Lock order: enrichment first, then the row lock; never the reverse.
+    let _row_guard = REGISTRY_ROW_LOCK.lock().await;
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,
@@ -1411,6 +1969,8 @@ pub async fn enrichment_commit(
     telemetry: Value,
 ) -> Result<(), String> {
     let _guard = ENRICHMENT_MUTEX.lock().await;
+    // Lock order: enrichment first, then the row lock; never the reverse.
+    let _row_guard = REGISTRY_ROW_LOCK.lock().await;
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,
@@ -1457,6 +2017,8 @@ pub async fn enrichment_fail(
     error: &str,
 ) -> Result<(), String> {
     let _guard = ENRICHMENT_MUTEX.lock().await;
+    // Lock order: enrichment first, then the row lock; never the reverse.
+    let _row_guard = REGISTRY_ROW_LOCK.lock().await;
     let registry_id = registry_row_id(namespace);
     let (vector, mut payload) = match store.get(namespace, &registry_id).await {
         Ok(Some(found)) => found,

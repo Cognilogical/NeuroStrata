@@ -26,7 +26,11 @@ fn cross_scope_default_same_namespace() {
     assert!(source::same_namespace("ns", "ns"));
     assert!(source::cross_scope_authorized("ns", "ns", &[]));
     assert!(!source::cross_scope_authorized("ns", "other", &[]));
-    assert!(source::cross_scope_authorized("ns", "other", &["other".to_string()]));
+    assert!(source::cross_scope_authorized(
+        "ns",
+        "other",
+        &["other".to_string()]
+    ));
 }
 
 #[test]
@@ -123,6 +127,12 @@ fn receipts_never_leak_raw_query_or_content() {
     let serialized = receipt.to_string();
     assert!(!serialized.contains(raw_query));
     assert!(!serialized.contains(raw_content));
-    assert_eq!(receipt["query_digest"].as_str(), Some(digest(raw_query).as_str()));
-    assert_eq!(receipt["content_digest"].as_str(), Some(digest(raw_content).as_str()));
+    assert_eq!(
+        receipt["query_digest"].as_str(),
+        Some(digest(raw_query).as_str())
+    );
+    assert_eq!(
+        receipt["content_digest"].as_str(),
+        Some(digest(raw_content).as_str())
+    );
 }

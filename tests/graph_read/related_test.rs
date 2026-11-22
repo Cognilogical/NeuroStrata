@@ -54,7 +54,18 @@ fn depth_two_traversal_returns_nodes_and_edges() {
     ];
     let edges = vec![edge("A", "RELATES_TO", "B"), edge("B", "RELATES_TO", "C")];
 
-    let result = graph_read_related("A", &nodes, &edges, &[], Direction::Both, 2, &[], 25, 0, None);
+    let result = graph_read_related(
+        "A",
+        &nodes,
+        &edges,
+        &[],
+        Direction::Both,
+        2,
+        &[],
+        25,
+        0,
+        None,
+    );
 
     // Depth-2 means the traversal reaches C through B.
     assert_eq!(ids(&result), vec!["A", "B", "C"]);
@@ -76,7 +87,18 @@ fn depth_one_stops_at_the_first_hop() {
     ];
     let edges = vec![edge("A", "RELATES_TO", "B"), edge("B", "RELATES_TO", "C")];
 
-    let result = graph_read_related("A", &nodes, &edges, &[], Direction::Both, 1, &[], 25, 0, None);
+    let result = graph_read_related(
+        "A",
+        &nodes,
+        &edges,
+        &[],
+        Direction::Both,
+        1,
+        &[],
+        25,
+        0,
+        None,
+    );
     assert_eq!(ids(&result), vec!["A", "B"]);
     assert_eq!(result.total, 2);
 }
@@ -98,8 +120,18 @@ fn relates_to_is_supporting_never_governance() {
         edge("seed", "EXTRACTED_FROM", "extracted"),
     ];
 
-    let result =
-        graph_read_related("seed", &nodes, &edges, &[], Direction::Both, 1, &[], 25, 0, None);
+    let result = graph_read_related(
+        "seed",
+        &nodes,
+        &edges,
+        &[],
+        Direction::Both,
+        1,
+        &[],
+        25,
+        0,
+        None,
+    );
 
     let role_of = |source: &str, target: &str| {
         result
@@ -133,27 +165,71 @@ fn cursor_paginates_deterministically() {
         edge("A", "RELATES_TO", "E"),
     ];
 
-    let page1 = graph_read_related("A", &nodes, &edges, &[], Direction::Both, 1, &[], 2, 0, None);
+    let page1 = graph_read_related(
+        "A",
+        &nodes,
+        &edges,
+        &[],
+        Direction::Both,
+        1,
+        &[],
+        2,
+        0,
+        None,
+    );
     assert_eq!(ids(&page1), vec!["A", "B"]);
     assert_eq!(page1.total, 5);
-    assert!(page1.truncated, "more pages remain, so truncated must be set");
-    let cursor = page1.next_cursor.clone().expect("a next_cursor when pages remain");
+    assert!(
+        page1.truncated,
+        "more pages remain, so truncated must be set"
+    );
+    let cursor = page1
+        .next_cursor
+        .clone()
+        .expect("a next_cursor when pages remain");
     assert_eq!(cursor.offset, 2);
 
-    let page2 =
-        graph_read_related("A", &nodes, &edges, &[], Direction::Both, 1, &[], 2, 0, Some(&cursor));
+    let page2 = graph_read_related(
+        "A",
+        &nodes,
+        &edges,
+        &[],
+        Direction::Both,
+        1,
+        &[],
+        2,
+        0,
+        Some(&cursor),
+    );
     assert_eq!(ids(&page2), vec!["C", "D"]);
 
-    let cursor = page2.next_cursor.clone().expect("a next_cursor when pages remain");
-    let page3 =
-        graph_read_related("A", &nodes, &edges, &[], Direction::Both, 1, &[], 2, 0, Some(&cursor));
+    let cursor = page2
+        .next_cursor
+        .clone()
+        .expect("a next_cursor when pages remain");
+    let page3 = graph_read_related(
+        "A",
+        &nodes,
+        &edges,
+        &[],
+        Direction::Both,
+        1,
+        &[],
+        2,
+        0,
+        Some(&cursor),
+    );
     assert_eq!(ids(&page3), vec!["E"]);
     assert!(page3.next_cursor.is_none(), "final page carries no cursor");
 }
 
 #[test]
 fn stale_cursor_generation_restarts_from_the_first_page() {
-    let nodes = vec![node("A", "rule", true), node("B", "fact", true), node("C", "fact", true)];
+    let nodes = vec![
+        node("A", "rule", true),
+        node("B", "fact", true),
+        node("C", "fact", true),
+    ];
     let edges = vec![edge("A", "RELATES_TO", "B"), edge("A", "RELATES_TO", "C")];
 
     // A cursor from an older generation (or a different query) must not skip
@@ -194,7 +270,18 @@ fn private_or_retired_nodes_are_not_returned_nor_crossed() {
         edge("C", "RELATES_TO", "D"),
     ];
 
-    let result = graph_read_related("A", &nodes, &edges, &[], Direction::Both, 2, &[], 25, 0, None);
+    let result = graph_read_related(
+        "A",
+        &nodes,
+        &edges,
+        &[],
+        Direction::Both,
+        2,
+        &[],
+        25,
+        0,
+        None,
+    );
     assert_eq!(ids(&result), vec!["A", "B"]);
     assert!(result
         .edges
@@ -207,14 +294,29 @@ fn private_or_retired_nodes_are_not_returned_nor_crossed() {
 fn cyclic_graph_terminates_within_budget() {
     // A triangle A -> B -> C -> A must terminate, not loop forever, and never
     // exceed the node budget.
-    let nodes = vec![node("A", "rule", true), node("B", "fact", true), node("C", "fact", true)];
+    let nodes = vec![
+        node("A", "rule", true),
+        node("B", "fact", true),
+        node("C", "fact", true),
+    ];
     let edges = vec![
         edge("A", "RELATES_TO", "B"),
         edge("B", "RELATES_TO", "C"),
         edge("C", "RELATES_TO", "A"),
     ];
 
-    let result = graph_read_related("A", &nodes, &edges, &[], Direction::Both, 2, &[], 25, 0, None);
+    let result = graph_read_related(
+        "A",
+        &nodes,
+        &edges,
+        &[],
+        Direction::Both,
+        2,
+        &[],
+        25,
+        0,
+        None,
+    );
     assert_eq!(result.total, 3);
     assert!(result.total <= MAX_NODES);
     assert!(result.edges.len() <= MAX_EDGES);
@@ -232,7 +334,18 @@ fn node_and_edge_budgets_are_enforced() {
         edges.push(edge("A", "RELATES_TO", &id));
     }
 
-    let result = graph_read_related("A", &nodes, &edges, &[], Direction::Both, 1, &[], 25, 0, None);
+    let result = graph_read_related(
+        "A",
+        &nodes,
+        &edges,
+        &[],
+        Direction::Both,
+        1,
+        &[],
+        25,
+        0,
+        None,
+    );
     assert_eq!(result.nodes.len(), MAX_NODES);
     assert!(result.truncated, "budget exhaustion must set truncated");
 }
@@ -245,10 +358,24 @@ fn clamps_and_direction_allowlist_hold() {
     assert_eq!(clamp_limit(1000), 25);
 
     // Outgoing direction does not follow an incoming-only stored edge.
-    let nodes = vec![node("A", "rule", true), node("B", "fact", true), node("C", "fact", true)];
+    let nodes = vec![
+        node("A", "rule", true),
+        node("B", "fact", true),
+        node("C", "fact", true),
+    ];
     let edges = vec![edge("B", "GOVERNS", "A"), edge("A", "GOVERNS", "C")];
-    let result =
-        graph_read_related("A", &nodes, &edges, &[], Direction::Outgoing, 1, &[], 25, 0, None);
+    let result = graph_read_related(
+        "A",
+        &nodes,
+        &edges,
+        &[],
+        Direction::Outgoing,
+        1,
+        &[],
+        25,
+        0,
+        None,
+    );
     // Only A -> C is outgoing from A; B -> A is incoming and must not be followed.
     assert_eq!(ids(&result), vec!["A", "C"]);
 }

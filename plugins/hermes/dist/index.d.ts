@@ -28,6 +28,49 @@ export interface PluginConfig {
     };
 }
 export declare function resolveConfig(raw: unknown, cwd?: string): PluginConfig;
+/** Which walk found a project root marker. */
+export type RootMarkerVia = 'own' | 'main' | 'nogit';
+export interface FoundRootMarker {
+    /** The project root, in the start path's own checkout. */
+    root: string;
+    namespace: string;
+    via: RootMarkerVia;
+}
+/**
+ * A namespace value as written, or undefined when it is not one: empty, an
+ * unexpanded variable, or anything but `[A-Za-z0-9_.:-]` starting with a
+ * letter or digit. The Rust installer's `usable_namespace` rule.
+ */
+export declare function usableNamespace(raw: unknown): string | undefined;
+/**
+ * The marker that decides `startDir`'s project root, or null. `startDir`
+ * must be absolute on this host; for a file the walk starts at its folder.
+ *  1. Own checkout: from the start folder up to its checkout top, inclusive;
+ *     the deepest marker wins.
+ *  2. Linked worktree: the start folder mapped into the main checkout,
+ *     walked from its nearest existing folder up to the main checkout's top,
+ *     never entering a folder with its own `.git`. Steps 1 and 2 both run;
+ *     the deeper marker wins, at equal depth the own checkout's.
+ *  3. Outside git: the first marker above the start folder.
+ * When the winning marker cannot be read the answer is null, with one
+ * warning line naming the file: the caller falls back to the other namespace
+ * sources, never to a marker further up.
+ */
+export declare function findRootMarker(startDir: string): FoundRootMarker | null;
+/**
+ * The namespace `harness`'s plugin config names for the project at
+ * `projectDir`, read from its checkout's top, then (for a linked worktree,
+ * whose untracked configs usually live only in the main checkout) the main
+ * checkout's; outside git from `projectDir` itself. Empty when none names a
+ * usable namespace.
+ *
+ * `runnerDir` is the folder of the hook runner the installer wrote,
+ * `<root>/.NeuroStrata/plugins/<harness>/`: the config of the project that
+ * installed it, `<root>`, is read first.
+ */
+export declare function readHarnessConfig(harness: string, projectDir: string, runnerDir?: string): {
+    namespace?: string;
+};
 /**
  * Walk up from resolve(startDir) to the filesystem root looking for `.git`
  * (dir or file) or `.NeuroStrata`; return the directory containing it, or
@@ -128,6 +171,22 @@ export declare function sanitizeSubagentHeaderToken(value: string): string;
 export declare function buildSubagentContextHeader(namespace: string, taskId: string | null): string;
 export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null): boolean;
 export declare function resetClientForTesting(): void;
+/**
+ * Whether `toolName` is one of SESSION_SCOPED_TOOLS, bare or as a host
+ * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
+ * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
+ * A copy of core's `isSessionScopedTool`.
+ */
+export declare function isSessionScopedTool(toolName: string): boolean;
+/**
+ * Claim scope from a linked worktree (design 6.5): passes the session's
+ * project folder as `worktree` on `neurostrata_task_claim` and
+ * `neurostrata_get_snapshot` calls that carry no `worktree`, `project_root`
+ * or `cwd`, which the daemon would otherwise scope to the namespace's
+ * registry root (the main checkout when a marker applies). Changes `args`
+ * in place; true when it did. A copy of core's `addSessionWorktree`.
+ */
+export declare function addSessionWorktree(toolName: string, args: Record<string, unknown>, projectDir: string | undefined): boolean;
 export declare function initialize(ctx: any): Promise<void>;
 export declare function onTurnEnd(turn: {
     role: 'user' | 'assistant';

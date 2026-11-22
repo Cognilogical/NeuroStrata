@@ -1,7 +1,7 @@
-#[path = "../../src/search.rs"]
-mod search;
 #[path = "../../src/task/routing.rs"]
 mod routing;
+#[path = "../../src/search.rs"]
+mod search;
 
 use search::{
     append_search_contract_line, passes_filters, SearchFilters, SearchMemoryContract,
@@ -23,7 +23,10 @@ fn missing_query_error_carries_additive_search_contract() {
         out.starts_with("Missing 'query' parameter.\n\nsearch_contract: "),
         "error text must stay byte-identical and contract appended: {out}"
     );
-    let line = out.split("search_contract: ").nth(1).expect("contract line");
+    let line = out
+        .split("search_contract: ")
+        .nth(1)
+        .expect("contract line");
     let contract: serde_json::Value = serde_json::from_str(line).expect("contract JSON");
     assert_eq!(contract["mode"], "hybrid", "hybrid default on error path");
     assert_eq!(contract["graph_expanded_ids"], json!([]));
@@ -297,9 +300,13 @@ fn routing_contract_tool_names_match_agent_prompt() {
         if sigs.is_empty() {
             continue;
         }
-        let checked: Vec<&String> = args.iter().filter(|a| !ambient.contains(&a.as_str())).collect();
+        let checked: Vec<&String> = args
+            .iter()
+            .filter(|a| !ambient.contains(&a.as_str()))
+            .collect();
         assert!(
-            sigs.iter().any(|sig| checked.iter().all(|a| line_has_token(sig, a))),
+            sigs.iter()
+                .any(|sig| checked.iter().all(|a| line_has_token(sig, a))),
             "no tracked-site {tool} signature carries required args {checked:?}"
         );
     }
@@ -322,10 +329,19 @@ fn routing_contract_tool_names_match_agent_prompt() {
         "neurostrata_related",
         "neurostrata_sparql_query",
     ] {
-        assert!(agent_prompt.contains(tool), "agent prompt missing tool {tool}");
+        assert!(
+            agent_prompt.contains(tool),
+            "agent prompt missing tool {tool}"
+        );
     }
-    assert!(agent_prompt.contains("max_hops"), "related must document max_hops");
-    assert!(!agent_prompt.contains("`depth`"), "related must not document depth");
+    assert!(
+        agent_prompt.contains("max_hops"),
+        "related must document max_hops"
+    );
+    assert!(
+        !agent_prompt.contains("`depth`"),
+        "related must not document depth"
+    );
     assert!(agent_prompt.contains("\"hybrid\"") && agent_prompt.contains("(default)"));
     assert!(agent_prompt.contains("include_references: true"));
     assert!(!agent_prompt.contains("include_related"));

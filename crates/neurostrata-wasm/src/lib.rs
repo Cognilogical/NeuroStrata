@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use wasm_bindgen::prelude::*;
 
 #[path = "../../../src/fts/mod.rs"]
@@ -47,7 +47,11 @@ pub struct SnapshotEdge {
 
 // §5.4 Ported pure JSON predicates (native sources: src/synaptic_mesh/conflict.rs, src/registry.rs)
 pub fn is_conflicting_metadata(metadata: &serde_json::Value) -> bool {
-    metadata.get("mesh").and_then(|m| m.get("conflict")).and_then(|v| v.as_bool()).unwrap_or(false)
+    metadata
+        .get("mesh")
+        .and_then(|m| m.get("conflict"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 pub fn is_registry_row(metadata: &serde_json::Value) -> bool {
@@ -66,15 +70,35 @@ pub struct ReadOptions {
 }
 
 pub const STRUCTURAL_TYPES: [&str; 8] = [
-    "directory", "file", "markdown", "freshness_flag", "guard_event",
-    "community_summary", "digital_twin", "digital_twin_schema",
+    "directory",
+    "file",
+    "markdown",
+    "freshness_flag",
+    "guard_event",
+    "community_summary",
+    "digital_twin",
+    "digital_twin_schema",
 ];
 
 pub fn is_visible(rec: &SnapshotRecord, now_unix: i64, opts: &ReadOptions) -> bool {
-    if rec.payload.metadata.get("valid_to").and_then(|v| v.as_i64()).map(|vt| vt > 0 && vt <= now_unix).unwrap_or(false) {
+    if rec
+        .payload
+        .metadata
+        .get("valid_to")
+        .and_then(|v| v.as_i64())
+        .map(|vt| vt > 0 && vt <= now_unix)
+        .unwrap_or(false)
+    {
         return false;
     }
-    if rec.payload.metadata.get("archived").and_then(|v| v.as_bool()).unwrap_or(false) && !opts.include_archived {
+    if rec
+        .payload
+        .metadata
+        .get("archived")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && !opts.include_archived
+    {
         return false;
     }
     if is_conflicting_metadata(&rec.payload.metadata) {
@@ -141,7 +165,10 @@ pub struct WasmStore {
 
 impl WasmStore {
     pub fn new(now_unix: i64) -> Self {
-        Self { namespaces: BTreeMap::new(), now_unix }
+        Self {
+            namespaces: BTreeMap::new(),
+            now_unix,
+        }
     }
 
     pub fn from_snapshot(file: SnapshotFile, now_unix: i64) -> Result<(Self, LoadReport), String> {
@@ -153,11 +180,17 @@ impl WasmStore {
         let mut skipped = 0usize;
         let mut warnings: Vec<LoadWarning> = Vec::new();
         for rec in file.records {
-            if rec.id.trim().is_empty() || rec.namespace.trim().is_empty()
-                || rec.payload.content.trim().is_empty() || rec.payload.memory_type.trim().is_empty()
-                || !rec.payload.metadata.is_object() {
+            if rec.id.trim().is_empty()
+                || rec.namespace.trim().is_empty()
+                || rec.payload.content.trim().is_empty()
+                || rec.payload.memory_type.trim().is_empty()
+                || !rec.payload.metadata.is_object()
+            {
                 skipped += 1;
-                warnings.push(LoadWarning { id: rec.id.clone(), reason: "InvalidRecord".to_string() });
+                warnings.push(LoadWarning {
+                    id: rec.id.clone(),
+                    reason: "InvalidRecord".to_string(),
+                });
                 continue;
             }
             let ns = rec.namespace.clone();
@@ -165,7 +198,10 @@ impl WasmStore {
             if let Some(vec) = &rec.vector {
                 if vec.is_empty() {
                     skipped += 1;
-                    warnings.push(LoadWarning { id: id.clone(), reason: "DimensionMismatch".to_string() });
+                    warnings.push(LoadWarning {
+                        id: id.clone(),
+                        reason: "DimensionMismatch".to_string(),
+                    });
                     continue;
                 }
                 // Validate against existing namespace state BEFORE creating or
@@ -175,20 +211,30 @@ impl WasmStore {
                 if let Some(existing) = store.namespaces.get(&ns) {
                     if existing.vector_dims.map_or(false, |dims| dims != vec.len()) {
                         skipped += 1;
-                        warnings.push(LoadWarning { id: id.clone(), reason: "DimensionMismatch".to_string() });
+                        warnings.push(LoadWarning {
+                            id: id.clone(),
+                            reason: "DimensionMismatch".to_string(),
+                        });
                         continue;
                     }
                     if let Some(expected) = &existing.embedding_id {
                         if !expected.is_empty()
-                            && rec.embedding_id.as_deref().map_or(true, |e| e != expected) {
+                            && rec.embedding_id.as_deref().map_or(true, |e| e != expected)
+                        {
                             skipped += 1;
-                            warnings.push(LoadWarning { id: id.clone(), reason: "EmbeddingMismatch".to_string() });
+                            warnings.push(LoadWarning {
+                                id: id.clone(),
+                                reason: "EmbeddingMismatch".to_string(),
+                            });
                             continue;
                         }
                     }
                 }
             }
-            let ns_data = store.namespaces.entry(ns.clone()).or_insert_with(NamespaceData::new);
+            let ns_data = store
+                .namespaces
+                .entry(ns.clone())
+                .or_insert_with(NamespaceData::new);
             if let Some(vec) = &rec.vector {
                 if ns_data.vector_dims.is_none() {
                     ns_data.vector_dims = Some(vec.len());
@@ -201,38 +247,75 @@ impl WasmStore {
             }
             let was_duplicate = ns_data.records.contains_key(&id);
             if was_duplicate {
-                warnings.push(LoadWarning { id: id.clone(), reason: "DuplicateId".to_string() });
+                warnings.push(LoadWarning {
+                    id: id.clone(),
+                    reason: "DuplicateId".to_string(),
+                });
                 ns_data.lexical.remove(&ns, &id);
             }
-            let mut doc = fts::LexicalDoc::new(&id, &ns, &rec.payload.memory_type, &rec.payload.content);
+            let mut doc =
+                fts::LexicalDoc::new(&id, &ns, &rec.payload.memory_type, &rec.payload.content);
             doc.location = rec.payload.location.clone();
-            doc.symbol = rec.payload.metadata.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            doc.archived = rec.payload.metadata.get("archived").and_then(|v| v.as_bool()).unwrap_or(false);
-            doc.valid_from = rec.payload.metadata.get("valid_from").and_then(|v| v.as_i64());
-            doc.valid_to = rec.payload.metadata.get("valid_to").and_then(|v| v.as_i64());
+            doc.symbol = rec
+                .payload
+                .metadata
+                .get("symbol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            doc.archived = rec
+                .payload
+                .metadata
+                .get("archived")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            doc.valid_from = rec
+                .payload
+                .metadata
+                .get("valid_from")
+                .and_then(|v| v.as_i64());
+            doc.valid_to = rec
+                .payload
+                .metadata
+                .get("valid_to")
+                .and_then(|v| v.as_i64());
             doc.structural = STRUCTURAL_TYPES.contains(&rec.payload.memory_type.as_str());
             doc.registry = is_registry_row(&rec.payload.metadata);
             doc.conflicting = is_conflicting_metadata(&rec.payload.metadata);
             ns_data.lexical.add(doc);
             ns_data.records.insert(id.clone(), rec);
-            if !was_duplicate { loaded += 1; }
+            if !was_duplicate {
+                loaded += 1;
+            }
         }
         for edge in file.edges {
             for (_, ns_data) in store.namespaces.iter_mut() {
                 // An edge is only meaningful inside a namespace that contains
                 // BOTH endpoints.
                 if ns_data.records.contains_key(&edge.source)
-                    && ns_data.records.contains_key(&edge.target) {
+                    && ns_data.records.contains_key(&edge.target)
+                {
                     ns_data.edges.push(edge.clone());
                 }
             }
         }
-        Ok((store, LoadReport { ok: true, loaded, skipped, warnings, error: None }))
+        Ok((
+            store,
+            LoadReport {
+                ok: true,
+                loaded,
+                skipped,
+                warnings,
+                error: None,
+            },
+        ))
     }
 }
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() { return 0.0; }
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
     let mut dot = 0.0f32;
     let mut norm_a_sq = 0.0f32;
     let mut norm_b_sq = 0.0f32;
@@ -243,7 +326,11 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
     let norm_a = norm_a_sq.sqrt();
     let norm_b = norm_b_sq.sqrt();
-    if norm_a <= f32::EPSILON || norm_b <= f32::EPSILON { 0.0 } else { dot / (norm_a * norm_b) }
+    if norm_a <= f32::EPSILON || norm_b <= f32::EPSILON {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
 }
 
 #[wasm_bindgen]
@@ -255,27 +342,54 @@ pub struct WasmEngine {
 impl WasmEngine {
     #[wasm_bindgen(constructor)]
     pub fn new(now_unix: f64) -> Self {
-        let n = if now_unix.is_finite() { now_unix as i64 } else { 0 };
-        Self { store: WasmStore::new(n) }
+        let n = if now_unix.is_finite() {
+            now_unix as i64
+        } else {
+            0
+        };
+        Self {
+            store: WasmStore::new(n),
+        }
     }
 
     pub fn load_snapshot(&mut self, json: &str) -> String {
         let parsed: SnapshotFile = match serde_json::from_str(json) {
             Ok(f) => f,
-            Err(e) => return serde_json::to_string(&LoadReport { ok: false, loaded: 0, skipped: 0, warnings: vec![], error: Some(format!("invalid snapshot JSON: {}", e)) }).unwrap(),
+            Err(e) => {
+                return serde_json::to_string(&LoadReport {
+                    ok: false,
+                    loaded: 0,
+                    skipped: 0,
+                    warnings: vec![],
+                    error: Some(format!("invalid snapshot JSON: {}", e)),
+                })
+                .unwrap()
+            }
         };
         match WasmStore::from_snapshot(parsed, self.store.now_unix) {
             Ok((new_store, report)) => {
                 self.store = new_store;
                 serde_json::to_string(&report).unwrap()
             }
-            Err(msg) => {
-                serde_json::to_string(&LoadReport { ok: false, loaded: 0, skipped: 0, warnings: vec![], error: Some(msg) }).unwrap()
-            }
+            Err(msg) => serde_json::to_string(&LoadReport {
+                ok: false,
+                loaded: 0,
+                skipped: 0,
+                warnings: vec![],
+                error: Some(msg),
+            })
+            .unwrap(),
         }
     }
 
-    pub fn search(&self, namespace: &str, query: &str, limit: usize, include_tasks: bool, include_archived: bool) -> String {
+    pub fn search(
+        &self,
+        namespace: &str,
+        query: &str,
+        limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
+    ) -> String {
         if query.trim().is_empty() || !self.store.namespaces.contains_key(namespace) {
             return "[]".to_string();
         }
@@ -295,17 +409,33 @@ impl WasmEngine {
         let mut result: Vec<SearchHit> = Vec::new();
         for hit in hits.hits {
             let sim = 1.0 - hit.score;
-            result.push(SearchHit { id: hit.id, score: sim });
+            result.push(SearchHit {
+                id: hit.id,
+                score: sim,
+            });
         }
         result.sort_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap().then_with(|| a.id.cmp(&b.id))
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap()
+                .then_with(|| a.id.cmp(&b.id))
         });
         result.truncate(clamped_limit);
         serde_json::to_string(&result).unwrap()
     }
 
-    pub fn get_memory(&self, namespace: &str, id: &str, include_tasks: bool, include_archived: bool) -> String {
-        let opts = ReadOptions { include_tasks, include_archived, include_structural: false };
+    pub fn get_memory(
+        &self,
+        namespace: &str,
+        id: &str,
+        include_tasks: bool,
+        include_archived: bool,
+    ) -> String {
+        let opts = ReadOptions {
+            include_tasks,
+            include_archived,
+            include_structural: false,
+        };
         if let Some(ns) = self.store.namespaces.get(namespace) {
             if let Some(rec) = ns.records.get(id) {
                 if is_visible(rec, self.store.now_unix, &opts) {
@@ -326,11 +456,25 @@ impl WasmEngine {
             include_archived: Option<bool>,
         }
         let filter: ListFilter = if filter_json.trim().is_empty() {
-            ListFilter { memory_type: None, domain: None, include_tasks: None, include_archived: None }
+            ListFilter {
+                memory_type: None,
+                domain: None,
+                include_tasks: None,
+                include_archived: None,
+            }
         } else {
             match serde_json::from_str(filter_json) {
                 Ok(f) => f,
-                Err(_) => return serde_json::to_string(&LoadReport { ok: false, loaded: 0, skipped: 0, warnings: vec![], error: Some("invalid filter JSON".to_string()) }).unwrap(),
+                Err(_) => {
+                    return serde_json::to_string(&LoadReport {
+                        ok: false,
+                        loaded: 0,
+                        skipped: 0,
+                        warnings: vec![],
+                        error: Some("invalid filter JSON".to_string()),
+                    })
+                    .unwrap()
+                }
             }
         };
         let opts = ReadOptions {
@@ -339,15 +483,27 @@ impl WasmEngine {
             include_structural: false,
         };
         if let Some(ns) = self.store.namespaces.get(namespace) {
-            let mut matches: Vec<&SnapshotRecord> = ns.records.values()
+            let mut matches: Vec<&SnapshotRecord> = ns
+                .records
+                .values()
                 .filter(|rec| is_visible(rec, self.store.now_unix, &opts))
                 .filter(|rec| {
-                    if let Some(mt) = &filter.memory_type { rec.payload.memory_type == *mt } else { true }
+                    if let Some(mt) = &filter.memory_type {
+                        rec.payload.memory_type == *mt
+                    } else {
+                        true
+                    }
                 })
                 .filter(|rec| {
                     if let Some(dom) = &filter.domain {
-                        rec.payload.metadata.get("domain").and_then(|v| v.as_str()).map_or(false, |s| s == dom)
-                    } else { true }
+                        rec.payload
+                            .metadata
+                            .get("domain")
+                            .and_then(|v| v.as_str())
+                            .map_or(false, |s| s == dom)
+                    } else {
+                        true
+                    }
                 })
                 .collect();
             matches.sort_by(|a, b| a.id.cmp(&b.id));
@@ -358,9 +514,20 @@ impl WasmEngine {
         "[]".to_string()
     }
 
-    pub fn neighbors(&self, namespace: &str, id: &str, relation: &str, direction: &str, max_hops: usize, limit: usize) -> String {
+    pub fn neighbors(
+        &self,
+        namespace: &str,
+        id: &str,
+        relation: &str,
+        direction: &str,
+        max_hops: usize,
+        limit: usize,
+    ) -> String {
         let allowed = if relation.trim().is_empty() {
-            related::DEFAULT_RELATIONS.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+            related::DEFAULT_RELATIONS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
         } else {
             if !related::is_allowed_relation(relation) {
                 return r#"{"error":"invalid relation"}"#.to_string();
@@ -379,7 +546,11 @@ impl WasmEngine {
             Some(n) => n,
             None => return r#"{"error":"unknown namespace"}"#.to_string(),
         };
-        let opts = ReadOptions { include_tasks: true, include_archived: true, include_structural: true };
+        let opts = ReadOptions {
+            include_tasks: true,
+            include_archived: true,
+            include_structural: true,
+        };
         let mut nodes: Vec<related::NodeSpec> = Vec::new();
         let mut edges: Vec<related::EdgeSpec> = Vec::new();
         for (_id, rec) in &ns.records {
@@ -388,9 +559,24 @@ impl WasmEngine {
                 id: rec.id.clone(),
                 memory_type: rec.payload.memory_type.clone(),
                 content: rec.payload.content.clone(),
-                domain: rec.payload.metadata.get("domain").and_then(|v| v.as_str()).map(String::from),
-                freshness: rec.payload.metadata.get("freshness").and_then(|v| v.as_str()).map(String::from),
-                lifecycle: rec.payload.metadata.get("lifecycle").and_then(|v| v.as_str()).map(String::from),
+                domain: rec
+                    .payload
+                    .metadata
+                    .get("domain")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                freshness: rec
+                    .payload
+                    .metadata
+                    .get("freshness")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                lifecycle: rec
+                    .payload
+                    .metadata
+                    .get("lifecycle")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
                 visible,
             });
         }
@@ -424,7 +610,15 @@ impl WasmEngine {
         serde_json::to_string(&names).unwrap()
     }
 
-    pub fn vector_search(&self, namespace: &str, query_vec: &[f32], embedding_id: &str, limit: usize, include_tasks: bool, include_archived: bool) -> String {
+    pub fn vector_search(
+        &self,
+        namespace: &str,
+        query_vec: &[f32],
+        embedding_id: &str,
+        limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
+    ) -> String {
         let ns = match self.store.namespaces.get(namespace) {
             Some(n) => n,
             None => return "[]".to_string(),
@@ -434,13 +628,38 @@ impl WasmEngine {
         }
         let expected_dims = ns.vector_dims.unwrap();
         if query_vec.len() != expected_dims {
-            return serde_json::to_string(&LoadReport { ok: false, loaded: 0, skipped: 0, warnings: vec![], error: Some(format!("vector dimension mismatch: expected {}, got {}", expected_dims, query_vec.len())) }).unwrap();
+            return serde_json::to_string(&LoadReport {
+                ok: false,
+                loaded: 0,
+                skipped: 0,
+                warnings: vec![],
+                error: Some(format!(
+                    "vector dimension mismatch: expected {}, got {}",
+                    expected_dims,
+                    query_vec.len()
+                )),
+            })
+            .unwrap();
         }
-        if ns.embedding_id.as_deref() != Some(embedding_id) && !embedding_id.is_empty() && ns.embedding_id.is_some() {
-            return serde_json::to_string(&LoadReport { ok: false, loaded: 0, skipped: 0, warnings: vec![], error: Some("embedding mismatch".to_string()) }).unwrap();
+        if ns.embedding_id.as_deref() != Some(embedding_id)
+            && !embedding_id.is_empty()
+            && ns.embedding_id.is_some()
+        {
+            return serde_json::to_string(&LoadReport {
+                ok: false,
+                loaded: 0,
+                skipped: 0,
+                warnings: vec![],
+                error: Some("embedding mismatch".to_string()),
+            })
+            .unwrap();
         }
         let clamped_limit = limit.max(1).min(100);
-        let opts = ReadOptions { include_tasks, include_archived, include_structural: false };
+        let opts = ReadOptions {
+            include_tasks,
+            include_archived,
+            include_structural: false,
+        };
         let mut hits: Vec<SearchHit> = Vec::new();
         for (_id, rec) in &ns.records {
             if !is_visible(rec, self.store.now_unix, &opts) {
@@ -449,12 +668,18 @@ impl WasmEngine {
             if let Some(vec) = &rec.vector {
                 if vec.len() == expected_dims {
                     let score = cosine_similarity(query_vec, vec);
-                    hits.push(SearchHit { id: rec.id.clone(), score });
+                    hits.push(SearchHit {
+                        id: rec.id.clone(),
+                        score,
+                    });
                 }
             }
         }
         hits.sort_by(|a, b| {
-            b.score.partial_cmp(&a.score).unwrap().then_with(|| a.id.cmp(&b.id))
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap()
+                .then_with(|| a.id.cmp(&b.id))
         });
         hits.truncate(clamped_limit);
         serde_json::to_string(&hits).unwrap()
@@ -485,14 +710,22 @@ mod tests {
 
     #[test]
     fn load_version_reject() {
-        let file = SnapshotFile { version: 99, records: vec![], edges: vec![] };
+        let file = SnapshotFile {
+            version: 99,
+            records: vec![],
+            edges: vec![],
+        };
         assert!(WasmStore::from_snapshot(file, 0).is_err());
     }
 
     #[test]
     fn duplicate_id_warning() {
         let rec = sample_record("x", "ns", "hello", "rule");
-        let file = SnapshotFile { version: 1, records: vec![rec.clone(), rec], edges: vec![] };
+        let file = SnapshotFile {
+            version: 1,
+            records: vec![rec.clone(), rec],
+            edges: vec![],
+        };
         let (_, report) = WasmStore::from_snapshot(file, 0).unwrap();
         assert!(report.ok);
         assert_eq!(report.warnings.len(), 1);
@@ -506,10 +739,17 @@ mod tests {
         rec.vector = Some(vec![1.0, 2.0]);
         let mut rec2 = sample_record("y", "ns", "hello", "rule");
         rec2.vector = Some(vec![1.0, 2.0, 3.0]);
-        let file = SnapshotFile { version: 1, records: vec![rec, rec2], edges: vec![] };
+        let file = SnapshotFile {
+            version: 1,
+            records: vec![rec, rec2],
+            edges: vec![],
+        };
         let (_, report) = WasmStore::from_snapshot(file, 0).unwrap();
         assert!(report.skipped >= 1);
-        assert!(report.warnings.iter().any(|w| w.reason == "DimensionMismatch"));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.reason == "DimensionMismatch"));
     }
 
     #[test]
@@ -520,10 +760,17 @@ mod tests {
         let mut rec2 = sample_record("y", "ns", "hello", "rule");
         rec2.vector = Some(vec![1.0]);
         rec2.embedding_id = Some("b".to_string());
-        let file = SnapshotFile { version: 1, records: vec![rec, rec2], edges: vec![] };
+        let file = SnapshotFile {
+            version: 1,
+            records: vec![rec, rec2],
+            edges: vec![],
+        };
         let (_, report) = WasmStore::from_snapshot(file, 0).unwrap();
         assert!(report.skipped >= 1);
-        assert!(report.warnings.iter().any(|w| w.reason == "EmbeddingMismatch"));
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.reason == "EmbeddingMismatch"));
     }
 
     #[test]
@@ -532,12 +779,33 @@ mod tests {
         rec.payload.metadata = serde_json::json!({ "valid_to": 100 });
         assert!(!is_visible(&rec, 100, &ReadOptions::default()));
         rec.payload.metadata = serde_json::json!({ "archived": true });
-        assert!(!is_visible(&rec, 0, &ReadOptions { include_archived: false, ..Default::default() }));
-        assert!(is_visible(&rec, 0, &ReadOptions { include_archived: true, ..Default::default() }));
+        assert!(!is_visible(
+            &rec,
+            0,
+            &ReadOptions {
+                include_archived: false,
+                ..Default::default()
+            }
+        ));
+        assert!(is_visible(
+            &rec,
+            0,
+            &ReadOptions {
+                include_archived: true,
+                ..Default::default()
+            }
+        ));
         rec.payload.metadata = serde_json::json!({});
         rec.payload.memory_type = "task".to_string();
         assert!(!is_visible(&rec, 0, &ReadOptions::default()));
-        assert!(is_visible(&rec, 0, &ReadOptions { include_tasks: true, ..Default::default() }));
+        assert!(is_visible(
+            &rec,
+            0,
+            &ReadOptions {
+                include_tasks: true,
+                ..Default::default()
+            }
+        ));
     }
 
     #[test]
@@ -594,12 +862,21 @@ mod tests {
         // RELATES_TO is the only undirected relation, so GOVERNS honors
         // direction: "in" from m1 must reach nothing beyond the seed node.
         let nb_in = engine.neighbors("ns", "m1", "", "in", 1, 10);
-        assert!(!nb_in.contains(r#""id":"m2""#), "neighbors(in) from m1 must not reach m2, got: {nb_in}");
+        assert!(
+            !nb_in.contains(r#""id":"m2""#),
+            "neighbors(in) from m1 must not reach m2, got: {nb_in}"
+        );
         // Symmetry check from the target side.
         let nb_out_from_m2 = engine.neighbors("ns", "m2", "", "out", 1, 10);
-        assert!(!nb_out_from_m2.contains(r#""id":"m1""#), "neighbors(out) from m2 must not reach m1, got: {nb_out_from_m2}");
+        assert!(
+            !nb_out_from_m2.contains(r#""id":"m1""#),
+            "neighbors(out) from m2 must not reach m1, got: {nb_out_from_m2}"
+        );
         let nb_in_target = engine.neighbors("ns", "m2", "", "in", 1, 10);
-        assert!(nb_in_target.contains(r#""id":"m1""#), "neighbors(in) from m2: {nb_in_target}");
+        assert!(
+            nb_in_target.contains(r#""id":"m1""#),
+            "neighbors(in) from m2: {nb_in_target}"
+        );
     }
 
     #[test]
@@ -608,16 +885,22 @@ mod tests {
         // DimensionMismatch), so the namespace must never appear.
         let mut rec = sample_record("x", "skipped-ns", "hello", "rule");
         rec.vector = Some(vec![]);
-        let file = SnapshotFile { version: 1, records: vec![rec], edges: vec![] };
+        let file = SnapshotFile {
+            version: 1,
+            records: vec![rec],
+            edges: vec![],
+        };
         let (store, report) = WasmStore::from_snapshot(file, 0).unwrap();
         assert_eq!(report.skipped, 1);
-        assert!(!store.namespaces.contains_key("skipped-ns"),
-            "store namespaces: {:?}", store.namespaces.keys());
+        assert!(
+            !store.namespaces.contains_key("skipped-ns"),
+            "store namespaces: {:?}",
+            store.namespaces.keys()
+        );
         let mut engine = WasmEngine::new(0.0);
         let json = r#"{"version":1,"records":[{"id":"x","namespace":"skipped-ns","payload":{"content":"hello","user_id":"u","memory_type":"rule","agent_name":"a","location":"l","location_lines":"1","metadata":{}},"vector":[]}],"edges":[]}"#;
         engine.load_snapshot(json);
         let ns = engine.namespaces();
         assert_eq!(ns, "[]", "namespaces: {ns}");
     }
-
 }
