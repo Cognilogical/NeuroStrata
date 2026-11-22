@@ -1909,10 +1909,9 @@ fn wire_harness_config(
                 // namespace-neutral instead of being skipped entirely.
                 let namespace = namespace.as_deref();
                 let cfg_path = project_root.join(".claude/settings.local.json");
-                let cmd = match namespace {
-                    Some(ns) => format!("NEUROSTRATA_NAMESPACE={ns} node \"{abs_runner}\""),
-                    None => format!("node \"{abs_runner}\""),
-                };
+                // The namespace lives in Claude's plugin config, as it does
+                // for the other harnesses; the command carries none.
+                let cmd = format!("node \"{abs_runner}\"");
                 let mut doc: Value = json!({});
                 let mut write_doc = false;
                 if cfg_path.exists() {
@@ -3774,7 +3773,7 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("claude"),
         );
-        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
         assert_eq!(commands.len(), 4, "{commands:?}");
         assert!(
@@ -3821,7 +3820,7 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("claude"),
         );
-        let want = format!("NEUROSTRATA_NAMESPACE=TestProj node \"{abs_runner}\"");
+        let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
         assert_eq!(commands.len(), 4, "{commands:?}");
         assert!(

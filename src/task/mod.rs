@@ -4107,7 +4107,7 @@ LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 NAMESPACE=""
 RESOLVED=""
 if command -v neurostrata-mcp >/dev/null 2>&1; then
-    if NAMESPACE=$(neurostrata-mcp namespace resolve 2>/dev/null) && [ -n "$NAMESPACE" ]; then
+    if NAMESPACE=$(neurostrata-mcp namespace resolve) && [ -n "$NAMESPACE" ]; then
         RESOLVED=1
     else
         NAMESPACE=""
