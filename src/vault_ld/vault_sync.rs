@@ -4867,8 +4867,18 @@ mod tests {
             "head type must not change"
         );
         assert_eq!(after.user_id, before.user_id, "head owner must not change");
+        // Edge provenance follows the edge it cites, so a rebind may retire an
+        // entry without rewriting identity-bearing head metadata.
+        let without_provenance = |metadata: &serde_json::Value| {
+            let mut trimmed = metadata.clone();
+            if let Some(obj) = trimmed.as_object_mut() {
+                obj.remove("edge_sources");
+            }
+            trimmed
+        };
         assert_eq!(
-            after.metadata, before.metadata,
+            without_provenance(&after.metadata),
+            without_provenance(&before.metadata),
             "an unchanged declarer's head must not be rewritten"
         );
         assert_eq!(

@@ -513,6 +513,68 @@ the unchanged path's prior behavior.
   older build is not re-detected without comparing materialised edges, which
   this fix intentionally does not do.
 
+### 3h. Provenance retires with the edge it cites
+
+#### Invariant
+
+`metadata.edge_sources` cites only edges that the row actually has. When
+declaration reconciliation retires a stale declared edge, it also removes the
+`upsert`-owned provenance entry for that relation and target — including when
+the replacement declaration set is empty. Entries for other relations
+(`GOVERNS`, `DEPENDS_ON`, …), entries owned by another extractor (mentions),
+and rows that carry no provenance are untouched. The metadata update runs on
+the same reconciliation path as the edge delete and writes the row's metadata
+only, so it never creates a content version, `supersedes` stamp, or history
+row.
+
+#### Mechanism
+
+- `LadybugStore::reconcile_declared_edges` reads `m.metadata` after deleting
+  stale outgoing `extractor = 'upsert'` edges and retains a provenance entry
+  only when it matches the reconciled `rel_type`, is `extractor = 'upsert'`
+  with `orientation = 'self_to_target'`, and its `resolved_target` is in the
+  keep set. An empty keep set therefore clears every entry the reconciler
+  owns for that relation.
+- The provenance write is skipped when nothing was removed; a read or write
+  failure propagates as a reconciliation error (the caller reports it) rather
+  than being swallowed.
+- Nonempty declarations were already covered at the write path: `upsert`
+  replaces `edge_sources` whenever it resolves at least one declaration. The
+  gap was the empty declaration, where `upsert` writes nothing and import
+  preserves the prior field.
+
+#### Eval (failed on `3b4c647b`)
+
+- `removed_wikilink_retires_edge_source_provenance`
+  - Import `provenance-declarer → provenance-target`; assert a search with
+    `include_references: true` cites the target (control).
+  - Remove the declarer's final WikiLink, reimport; assert the `RELATES_TO`
+    edge is gone, the stored metadata no longer contains a provenance entry
+    for the target, and the same search no longer cites it.
+  - On `3b4c647b` the edge was deleted but `edge_sources` still cited
+    `provenance-target`, so both the metadata read and the search report kept
+    the deleted relationship.
+- `reconcile_retires_edge_sources_with_the_edge` (store-level control)
+  - A declarer with `related_to` and `governs`; reconcile `RELATES_TO` with an
+    empty keep set.
+  - Assert the `RELATES_TO` provenance and edge are gone, the `GOVERNS`
+    provenance and edge survive, and an ordinary row gains no provenance.
+
+#### Residual risk
+
+- An unchanged-declarer rebind creates the preferred edge but does not mint a
+  new provenance entry; reconciliation removes the stale alias entry, so the
+  rebound edge is uncited until the head is written again. This is a citation
+  gap, not a wrong citation, and is preferred to citing a deleted target.
+- A database that already performed a buggy removal before this patch keeps
+  its stale entry until that note changes: a byte-identical reimport is a
+  no-op and never reaches reconciliation (same class as the edge orphan in
+  §3a). Touching the note or a changed import converges it.
+- The edge delete and the metadata write are two statements. A failure between
+  them leaves the edge gone with stale provenance and reports an error; the
+  next changed import reconciles again. The reverse (provenance removed, edge
+  kept) cannot happen because the provenance pass runs after the delete.
+
 ---
 
 ## 4. #344 — Retired rows must not be exported
@@ -616,7 +678,11 @@ note whose *real* type changed is versioned.
   `rebind_declared_edges` edge-only materialiser (§3g),
   `exact_edge_targets` opt-out from `KnownIds` rewriting, from
   path-inferring edge materialisation, and from `relink_edges` declaration
-  replay (§3d), both using the shared verbatim-first match (§3e).
+  replay (§3d), both using the shared verbatim-first match (§3e), and
+  provenance reconciliation inside the edge reconciler (§3h).
+- `src/server.rs` — the `include_references` eval (§3h); no behaviour change.
+- `docs/features-api/mcp-and-http-api.md` — `include_references` citation
+  contract now states that provenance retires with its edge.
 - `src/parser/generation.rs` — `exact_target_spellings`, `exact_target_match`,
   and `exact_target_match_fallible`: the single verbatim-first alias rule and
   precedence selector shared by the vault importer and the store (§3e),
@@ -642,7 +708,11 @@ note whose *real* type changed is versioned.
   that declarer replays, not the whole vault.
 - An unchanged declarer costs one keep-set read after the write phase and, when
   a preferred target arrived, one edge-create plus one reconcile statement. The
-  head row is never rewritten, so no version or history row appears.
+  head row is never rewritten, so no version or history row appears; its
+  `edge_sources` may change when a stale citation is retired (§3h).
+- Reconciliation performs one metadata read per pass and writes metadata only
+  when a provenance entry was removed. Ordinary rows and other relations are
+  untouched.
 - The reconcile and the head write are two statements, not one transaction;
   the order makes a failed write safe at the cost of a crash window that can
   leave stale edges with the new head (repaired on the next changed import).

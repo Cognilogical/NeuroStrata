@@ -11813,20 +11813,68 @@ impl VectorStore for LadybugStore {
             for row in conn.query(&stale_query)? {
                 stale.push(format!("{}", row[0]));
             }
-            if stale.is_empty() {
-                return Ok(0);
+            if !stale.is_empty() {
+                let stale_list = stale
+                    .iter()
+                    .map(|t| format!("'{}'", escape_ladybug_string(t)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let delete_query = format!(
+                    "MATCH (a:Memory {{id: '{safe_id}'}})-[r:{rel_type}]->(b:Memory) \
+                     WHERE a.namespace = '{safe_ns}' AND r.extractor = 'upsert' \
+                     AND b.id IN [{stale_list}] DELETE r"
+                );
+                conn.query(&delete_query)?;
             }
-            let stale_list = stale
-                .iter()
-                .map(|t| format!("'{}'", escape_ladybug_string(t)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let delete_query = format!(
-                "MATCH (a:Memory {{id: '{safe_id}'}})-[r:{rel_type}]->(b:Memory) \
-                 WHERE a.namespace = '{safe_ns}' AND r.extractor = 'upsert' \
-                 AND b.id IN [{stale_list}] DELETE r"
+            // Import preserves `edge_sources`, and `upsert` replaces it only
+            // for a nonempty declaration, so a removed link leaves provenance
+            // that cites a deleted edge. Retire that entry with the edge.
+            let keep_set: std::collections::HashSet<&str> =
+                keep.iter().map(String::as_str).collect();
+            let meta_query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' \
+                 RETURN m.metadata"
             );
-            conn.query(&delete_query)?;
+            let mut rows = conn.query(&meta_query)?;
+            if let Some(row) = rows.next() {
+                if let lbug::Value::String(meta_str) = &row[0] {
+                    if let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                        let mut changed = false;
+                        if let Some(sources) =
+                            meta.get_mut("edge_sources").and_then(|v| v.as_array_mut())
+                        {
+                            let before = sources.len();
+                            sources.retain(|source| {
+                                let owns_edge = source.get("rel_type").and_then(|v| v.as_str())
+                                    == Some(rel_type.as_str())
+                                    && source.get("extractor").and_then(|v| v.as_str())
+                                        == Some("upsert")
+                                    && source.get("orientation").and_then(|v| v.as_str())
+                                        == Some("self_to_target");
+                                if !owns_edge {
+                                    return true;
+                                }
+                                source
+                                    .get("resolved_target")
+                                    .and_then(|v| v.as_str())
+                                    .map(|target| keep_set.contains(target))
+                                    .unwrap_or(true)
+                            });
+                            changed = sources.len() != before;
+                        }
+                        if changed {
+                            if let Ok(new_meta) = serde_json::to_string(&meta) {
+                                let update_query = format!(
+                                    "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' \
+                                     SET m.metadata = '{}'",
+                                    escape_ladybug_string(&new_meta)
+                                );
+                                conn.query(&update_query)?;
+                            }
+                        }
+                    }
+                }
+            }
             Ok(stale.len())
         })
         .await
@@ -24787,6 +24835,99 @@ eurostrata\src\daemon.rs",
         assert_eq!(es.get("line_start").and_then(|v| v.as_i64()), Some(10));
         assert_eq!(es.get("line_end").and_then(|v| v.as_i64()), Some(25));
         assert_eq!(es.get("extractor").and_then(|v| v.as_str()), Some("upsert"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #363: the reconciler owns both the declared edge and the provenance
+    /// citation for it. An empty replacement set retires the relation without
+    /// touching another relation's entry or an ordinary row.
+    #[tokio::test]
+    async fn reconcile_retires_edge_sources_with_the_edge() {
+        let dir = std::env::temp_dir().join(format!("ns-reconcile-prov-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("init");
+        let v = vec![0.1, 0.2, 0.3, 0.4];
+        for id in ["target-b", "target-c"] {
+            store
+                .upsert(
+                    "probe",
+                    id,
+                    v.clone(),
+                    retired_test_payload("fact", "agent", json!({})),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "declarer",
+                v.clone(),
+                retired_test_payload(
+                    "rule",
+                    "agent",
+                    json!({"related_to": ["target-b"], "governs": ["target-c"]}),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "ordinary",
+                v,
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+
+        let removed = store
+            .reconcile_declared_edges("probe", "declarer", "RELATES_TO", &[])
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+
+        let (_, head) = store
+            .get("probe", "declarer")
+            .await
+            .unwrap()
+            .expect("declarer exists");
+        let sources = head.metadata["edge_sources"]
+            .as_array()
+            .expect("edge_sources array");
+        assert!(
+            !sources.iter().any(|s| s["rel_type"] == "RELATES_TO"),
+            "the retired relation's provenance must go: {sources:?}"
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|s| s["rel_type"] == "GOVERNS" && s["resolved_target"] == "target-c"),
+            "another relation's provenance must survive: {sources:?}"
+        );
+        let edges = store.list_edges("probe").await.unwrap();
+        assert!(
+            !edges
+                .iter()
+                .any(|(from, rel, _, _)| from == "declarer" && rel == "RELATES_TO"),
+            "the declared RELATES_TO edge must be retired: {edges:?}"
+        );
+        assert!(
+            edges.iter().any(|(from, rel, to, _)| from == "declarer"
+                && rel == "GOVERNS"
+                && to == "target-c"),
+            "the unrelated edge must survive: {edges:?}"
+        );
+        let (_, ordinary) = store
+            .get("probe", "ordinary")
+            .await
+            .unwrap()
+            .expect("ordinary row exists");
+        assert!(
+            ordinary.metadata.get("edge_sources").is_none(),
+            "an ordinary row must not gain provenance: {:?}",
+            ordinary.metadata
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

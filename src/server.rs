@@ -14999,6 +14999,137 @@ mod tests {
         );
     }
 
+    /// #363: provenance must retire with the edge it cites. Removing the last
+    /// WikiLink deletes the stored edge; an `edge_sources` entry left behind
+    /// would keep citing the deleted relationship to `include_references`.
+    #[tokio::test]
+    async fn removed_wikilink_retires_edge_source_provenance() {
+        use crate::vault_ld::vault_sync::{import_vault, VaultSyncConfig};
+        use crate::vault_ld::{VaultNote, YAML_LD_CONTEXT};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let vault = root.path().join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: Arc<dyn VectorStore> = Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.path().join("db"), 4)
+                .expect("open temp database"),
+        );
+        let ns = "vault_edge_provenance";
+        store.init(ns).await.expect("init");
+        let config = VaultSyncConfig {
+            namespace: ns.to_string(),
+            vault_path: vault.clone(),
+            output_dir: vault.clone(),
+            principal: None,
+            project_root: Some(root.path().to_path_buf()),
+            allowed_external_dirs: None,
+        };
+
+        let make_note = |id: &str, related: &[&str], content: &str| {
+            let mut note = VaultNote {
+                id: id.to_string(),
+                rdf_type: "yaml:fact".to_string(),
+                context: YAML_LD_CONTEXT.to_string(),
+                epistemic_tier: "fact".to_string(),
+                canonical_sha256: String::new(),
+                related: related.iter().map(|s| s.to_string()).collect(),
+                content: content.to_string(),
+            };
+            note.canonical_sha256 = note.fingerprint();
+            note
+        };
+        let declarer = "provenance-declarer";
+        let target = "provenance-target";
+        let mut a = make_note(declarer, &[target], "provenanceprobe linker body");
+        let b = make_note(target, &[], "target body");
+        std::fs::write(vault.join(format!("{declarer}.md")), a.to_markdown()).expect("write a");
+        std::fs::write(vault.join(format!("{target}.md")), b.to_markdown()).expect("write b");
+
+        import_vault(config.clone(), store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("first import");
+
+        let refs_for = |out: &str| -> Vec<serde_json::Value> {
+            out.lines()
+                .find_map(|line| line.strip_prefix("edge_references: "))
+                .and_then(|rest| serde_json::from_str::<Vec<serde_json::Value>>(rest.trim()).ok())
+                .unwrap_or_default()
+        };
+        let cites_target = |refs: &[serde_json::Value]| {
+            refs.iter().any(|r| {
+                r["id"] == declarer
+                    && r["edge_sources"].as_array().is_some_and(|sources| {
+                        sources.iter().any(|s| s["resolved_target"] == target)
+                    })
+            })
+        };
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "provenanceprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            cites_target(&refs_for(&search_out)),
+            "control: the live edge must be cited: {search_out}"
+        );
+
+        // Remove the final WikiLink and reimport the changed note.
+        a.related.clear();
+        a.content = "provenanceprobe linker body without links".to_string();
+        a.canonical_sha256 = a.fingerprint();
+        std::fs::write(vault.join(format!("{declarer}.md")), a.to_markdown()).expect("rewrite a");
+        let second = import_vault(config, store.clone(), Arc::new(StubEmbedder))
+            .await
+            .expect("reimport");
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+
+        let edges = store.list_edges(ns).await.expect("list edges");
+        assert!(
+            !edges
+                .iter()
+                .any(|(from, rel, _, _)| from == declarer && rel == "RELATES_TO"),
+            "the removed link must retire its edge: {edges:?}"
+        );
+
+        let (_, head) = store
+            .get(ns, declarer)
+            .await
+            .expect("read declarer")
+            .expect("declarer exists");
+        let stale = head
+            .metadata
+            .get("edge_sources")
+            .and_then(|v| v.as_array())
+            .is_some_and(|sources| sources.iter().any(|s| s["resolved_target"] == target));
+        assert!(
+            !stale,
+            "provenance for the deleted edge must be retired: {:?}",
+            head.metadata
+        );
+
+        let search_out = handle_search_memory(
+            serde_json::json!({
+                "namespace": ns,
+                "query": "provenanceprobe",
+                "mode": "lexical-inhouse",
+                "include_references": true
+            }),
+            Arc::new(StubEmbedder),
+            store,
+        )
+        .await;
+        assert!(
+            !cites_target(&refs_for(&search_out)),
+            "search must not cite the deleted relationship: {search_out}"
+        );
+    }
+
     /// The lexical empty-results path must still emit the additive response
     /// contract, otherwise `include_related` is a silent no-op and
     /// `graph_expanded_ids` disappears on exactly the path callers hit most.
