@@ -4402,6 +4402,145 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// PR #363: replay owns the whole binding set of an exact-mode
+    /// declaration, not just the edges it creates. When the preferred verbatim
+    /// target appears, the alias edge the first import bound and its citation
+    /// must be retired with it; ordinary relink edges stay untouched.
+    #[tokio::test]
+    async fn replay_reconciles_obsolete_exact_bindings() {
+        let root = std::env::temp_dir().join(format!(
+            "ns-vault-replay-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "ns";
+        store.init(ns).await.expect("init");
+        let config = vault_config(&root, &vault, ns);
+        let preferred = format!("{ns}::z");
+
+        let mut a = note("a", &[preferred.as_str()]);
+        a.content = "links the alias until the verbatim note exists".to_string();
+        a.canonical_sha256 = a.fingerprint();
+        let mut alias = note("z", &[]);
+        alias.content = "body of the bare alias".to_string();
+        alias.canonical_sha256 = alias.fingerprint();
+        std::fs::write(vault.join("a.md"), a.to_markdown()).expect("write a");
+        std::fs::write(vault.join("z.md"), alias.to_markdown()).expect("write z");
+
+        let first = import_vault(
+            config.clone(),
+            store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        let relates_from =
+            |edges: &[(String, String, String, Option<crate::rdf::EdgeProvenance>)],
+             from: &str|
+             -> Vec<String> {
+                edges
+                    .iter()
+                    .filter(|(source, rel, _, _)| source == from && rel == "RELATES_TO")
+                    .map(|(_, _, target, _)| target.clone())
+                    .collect()
+            };
+        assert_eq!(
+            relates_from(&store.list_edges(ns).await.expect("initial edges"), "a"),
+            vec!["z".to_string()],
+            "the first import binds the only stored candidate"
+        );
+
+        let upsert = |id: &str, content: &str, metadata: Value| {
+            let store = store.clone();
+            let id = id.to_string();
+            let content = content.to_string();
+            async move {
+                store
+                    .upsert(
+                        ns,
+                        &id,
+                        vec![0.0; 4],
+                        crate::traits::MemoryPayload {
+                            content,
+                            user_id: "default".to_string(),
+                            memory_type: "fact".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata,
+                        },
+                    )
+                    .await
+                    .expect("memory api upsert");
+            }
+        };
+        upsert(
+            &preferred,
+            "body of the verbatim note",
+            serde_json::json!({}),
+        )
+        .await;
+        // Control: this pair only becomes resolvable during replay, so its
+        // edge is created by the ordinary relink path in the same pass.
+        upsert(
+            "control",
+            "ordinary declarer",
+            serde_json::json!({"related_to": ["control-target"]}),
+        )
+        .await;
+        upsert("control-target", "ordinary target", serde_json::json!({})).await;
+
+        store
+            .relink_edges(ns, "code")
+            .await
+            .expect("replay declarations");
+
+        let edges = store.list_edges(ns).await.expect("edges after replay");
+        assert_eq!(
+            relates_from(&edges, "a"),
+            vec![preferred.clone()],
+            "replay must retire the obsolete alias binding: {edges:?}"
+        );
+        assert!(
+            edges.iter().any(|(from, rel, to, prov)| from == "control"
+                && rel == "RELATES_TO"
+                && to == "control-target"
+                && prov.as_ref().and_then(|p| p.extractor.as_deref()) == Some("relink")),
+            "the ordinary relink edge must survive: {edges:?}"
+        );
+
+        let (_, head) = store
+            .get(ns, "a")
+            .await
+            .expect("get declarer")
+            .expect("declarer exists");
+        let sources = head
+            .metadata
+            .get("edge_sources")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            sources.iter().any(
+                |s| s["rel_type"] == "RELATES_TO" && s["resolved_target"] == preferred.as_str()
+            ),
+            "the preferred binding keeps its citation: {sources:?}"
+        );
+        assert!(
+            !sources
+                .iter()
+                .any(|s| s["rel_type"] == "RELATES_TO" && s["resolved_target"] == "z"),
+            "the retired alias edge must not leave provenance: {sources:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// PR #363: an exported note's own id can carry the namespace and a
     /// numeric middle segment (`<ns>::7::path`). A WikiLink naming it must
     /// bind that verbatim row, not treat the prefix as an alias and mint a

@@ -743,6 +743,64 @@ or touched by a vault reconcile.
 - The edge and citation are still two statements inside one write turn; a
   failure between them leaves the edge uncited, the same crash class as §3i.
 
+### 3k. Replay reconciles obsolete exact bindings
+
+#### Invariant
+
+Replay owns the whole binding set of an `exact_edge_targets` declarer, not
+only the edges it is about to create. When the preferred verbatim target
+appears and replay materialises `a → ns::z`, the alias edge `a → z` bound by
+the first import — and its `metadata.edge_sources` citation — is retired in
+the same replay turn. The declarer then has exactly one relationship for one
+declaration in `list_edges` and RDF projection. Ordinary `relink` edges and
+`mention-detector` edges are not reconciliation-owned and survive. The retire
+is edge- and metadata-only: no content version, `supersedes` stamp, or history
+row is created.
+
+#### Mechanism
+
+- The replay loop records a `(declarer id, rel_type)` keep set for every
+  outgoing exact-mode declaration. The entry is created before target
+  resolution, so a declaration whose target is absent keeps an empty keep set
+  and still retires the obsolete binding it replaced.
+- The reconciler body of `reconcile_declared_edges` is extracted into a
+  connection-scoped helper. Both the trait method and `relink_edges` call it,
+  so replay runs the delete and provenance retire inside its existing write
+  turn instead of opening a nested write. Deletion is restricted exactly as in
+  §3h: outgoing edges with `extractor = 'upsert'` whose target is not in keep,
+  plus `upsert`/`self_to_target` citations for that relation and target.
+- Replay reconciles after creating the vault batch and before replaying the
+  ordinary batch. A pair declared by both a flagged row and an ordinary row
+  therefore loses its obsolete `upsert` edge first and is re-created with
+  `extractor = 'relink'` for the ordinary declaration in the same pass.
+
+#### Eval (failed on `b325c8ae`)
+
+- `replay_reconciles_obsolete_exact_bindings`
+  - Import `a → ns::z` while only the bare alias `z` exists, so the first
+    import binds `a → z`. Seed an ordinary declarer whose target is also
+    absent (control).
+  - Create the literal `ns::z` and the control target through the memory API,
+    then run `relink_edges(ns, "code")`.
+  - Assert the only `a` `RELATES_TO` edge ends at `ns::z`, `a → z` is gone,
+    `edge_sources` cites `ns::z` and no longer cites `z`, and the control edge
+    is still an ordinary `relink` edge.
+  - On `b325c8ae` replay added the preferred edge but left the alias live:
+    `["ns::z", "z"]`.
+
+#### Residual risk
+
+- The keep set is the *current* resolved declaration set, so a temporarily
+  missing exact target retires its previous binding until a later replay
+  re-creates it. This is the same authoritative-declaration semantics the
+  import reconciler already applies; an ingest is the repair point.
+- Reconciliation covers outgoing (`self_to_target`) declarations, matching
+  the existing reconciler; an incoming exact-mode declaration is not
+  reconciled by this pass.
+- Edge delete and provenance removal are two statements but run in one write
+  turn; a failure returns from replay before the transaction commits, so it
+  cannot publish a half-reconciled graph.
+
 ---
 
 ## 4. #344 — Retired rows must not be exported
@@ -853,7 +911,9 @@ note whose *real* type changed is versioned.
   replay (§3d), both using the shared verbatim-first match (§3e),
   reconciliation-owned replay of flagged declarations with matching citations
   while ordinary replay keeps `relink` and mentions keep `mention-detector`
-  (§3j), and provenance reconciliation inside the edge reconciler (§3h).
+  (§3j), replay-time reconciliation of each flagged declarer's obsolete
+  bindings and citations against its current exact keep set (§3k), and
+  provenance reconciliation inside the edge reconciler (§3h).
 - `src/server.rs` — the `include_references` evals for retired and rebound
   citations, including retained-declaration and multiple-rebind coverage
   (§3h, §3i); no behaviour change.
@@ -895,6 +955,13 @@ note whose *real* type changed is versioned.
 - Replay of a flagged declaration costs one content-hash provenance build per
   declarer and, only when the edge is newly created, one metadata read/write
   for its citation; repeat ingests with no missing edges add no writes.
+- Replay now reconciles each flagged declarer against its exact keep set once
+  per `(declarer, rel_type)` per ingest: one delete query and one metadata
+  read, with a metadata write only when a citation was removed. Repeat ingests
+  whose bindings already match perform no mutation.
+- The replay reconcile follows the current resolved declaration set, not the
+  historical edge set: a preferred target that is temporarily absent retires
+  its old binding until a later ingest rebinds it.
 - The reconcile and the head write are two statements, not one transaction;
   the order makes a failed write safe at the cost of a crash window that can
   leave stale edges with the new head (repaired on the next changed import).

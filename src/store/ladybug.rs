@@ -7714,6 +7714,104 @@ fn create_missing_edges(
     Ok(created)
 }
 
+/// Deletes the `upsert`-owned edges and citations of one declaration that its
+/// current keep set no longer names. Shared with replay so the reconciliation
+/// runs inside the caller's write turn instead of opening a nested one.
+fn reconcile_declared_edges_on(
+    conn: &Connection,
+    namespace: &str,
+    id: &str,
+    rel_type: &str,
+    keep: &[String],
+) -> Result<usize> {
+    // A caller that cannot name a real relation could interpolate arbitrary
+    // Cypher into the label position.
+    if !is_valid_relation_name(rel_type) {
+        anyhow::bail!("invalid relation name for edge reconciliation: {rel_type}");
+    }
+    let safe_ns = escape_ladybug_string(namespace);
+    let safe_id = escape_ladybug_string(id);
+    // `upsert` is the only provenance this reconciler owns: mention
+    // links are refreshed by their own pass, and hand-authored edges
+    // have no declaration to reconcile against.
+    let mut stale_query = format!(
+        "MATCH (a:Memory {{id: '{safe_id}'}})-[r:{rel_type}]->(b:Memory) \
+         WHERE a.namespace = '{safe_ns}' AND r.extractor = 'upsert'"
+    );
+    if !keep.is_empty() {
+        let keep_list = keep
+            .iter()
+            .map(|t| format!("'{}'", escape_ladybug_string(t)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        stale_query.push_str(&format!(" AND NOT b.id IN [{keep_list}]"));
+    }
+    stale_query.push_str(" RETURN b.id");
+    let mut stale = Vec::new();
+    for row in conn.query(&stale_query)? {
+        stale.push(format!("{}", row[0]));
+    }
+    if !stale.is_empty() {
+        let stale_list = stale
+            .iter()
+            .map(|t| format!("'{}'", escape_ladybug_string(t)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let delete_query = format!(
+            "MATCH (a:Memory {{id: '{safe_id}'}})-[r:{rel_type}]->(b:Memory) \
+             WHERE a.namespace = '{safe_ns}' AND r.extractor = 'upsert' \
+             AND b.id IN [{stale_list}] DELETE r"
+        );
+        conn.query(&delete_query)?;
+    }
+    // Import preserves `edge_sources`, and `upsert` replaces it only
+    // for a nonempty declaration, so a removed link leaves provenance
+    // that cites a deleted edge. Retire that entry with the edge.
+    let keep_set: std::collections::HashSet<&str> = keep.iter().map(String::as_str).collect();
+    let meta_query = format!(
+        "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' \
+         RETURN m.metadata"
+    );
+    let mut rows = conn.query(&meta_query)?;
+    if let Some(row) = rows.next() {
+        if let lbug::Value::String(meta_str) = &row[0] {
+            if let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
+                let mut changed = false;
+                if let Some(sources) = meta.get_mut("edge_sources").and_then(|v| v.as_array_mut()) {
+                    let before = sources.len();
+                    sources.retain(|source| {
+                        let owns_edge = source.get("rel_type").and_then(|v| v.as_str())
+                            == Some(rel_type)
+                            && source.get("extractor").and_then(|v| v.as_str()) == Some("upsert")
+                            && source.get("orientation").and_then(|v| v.as_str())
+                                == Some("self_to_target");
+                        if !owns_edge {
+                            return true;
+                        }
+                        source
+                            .get("resolved_target")
+                            .and_then(|v| v.as_str())
+                            .map(|target| keep_set.contains(target))
+                            .unwrap_or(true)
+                    });
+                    changed = sources.len() != before;
+                }
+                if changed {
+                    if let Ok(new_meta) = serde_json::to_string(&meta) {
+                        let update_query = format!(
+                            "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' \
+                             SET m.metadata = '{}'",
+                            escape_ladybug_string(&new_meta)
+                        );
+                        conn.query(&update_query)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(stale.len())
+}
+
 impl LadybugStore {
     /// Public wrapper for internal list — used by SPARQL projection.
     pub async fn list_memories(
@@ -11933,101 +12031,12 @@ impl VectorStore for LadybugStore {
         rel_type: &str,
         keep: &[String],
     ) -> Result<usize> {
-        // A caller that cannot name a real relation could interpolate arbitrary
-        // Cypher into the label position.
-        if !is_valid_relation_name(rel_type) {
-            anyhow::bail!("invalid relation name for edge reconciliation: {rel_type}");
-        }
         let namespace = namespace.to_string();
         let id = id.to_string();
         let rel_type = rel_type.to_string();
         let keep = keep.to_vec();
         self.write_with_deadline("reconciling declared edges", move |conn| {
-            let safe_ns = escape_ladybug_string(&namespace);
-            let safe_id = escape_ladybug_string(&id);
-            // `upsert` is the only provenance this reconciler owns: mention
-            // links are refreshed by their own pass, and hand-authored edges
-            // have no declaration to reconcile against.
-            let mut stale_query = format!(
-                "MATCH (a:Memory {{id: '{safe_id}'}})-[r:{rel_type}]->(b:Memory) \
-                 WHERE a.namespace = '{safe_ns}' AND r.extractor = 'upsert'"
-            );
-            if !keep.is_empty() {
-                let keep_list = keep
-                    .iter()
-                    .map(|t| format!("'{}'", escape_ladybug_string(t)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                stale_query.push_str(&format!(" AND NOT b.id IN [{keep_list}]"));
-            }
-            stale_query.push_str(" RETURN b.id");
-            let mut stale = Vec::new();
-            for row in conn.query(&stale_query)? {
-                stale.push(format!("{}", row[0]));
-            }
-            if !stale.is_empty() {
-                let stale_list = stale
-                    .iter()
-                    .map(|t| format!("'{}'", escape_ladybug_string(t)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let delete_query = format!(
-                    "MATCH (a:Memory {{id: '{safe_id}'}})-[r:{rel_type}]->(b:Memory) \
-                     WHERE a.namespace = '{safe_ns}' AND r.extractor = 'upsert' \
-                     AND b.id IN [{stale_list}] DELETE r"
-                );
-                conn.query(&delete_query)?;
-            }
-            // Import preserves `edge_sources`, and `upsert` replaces it only
-            // for a nonempty declaration, so a removed link leaves provenance
-            // that cites a deleted edge. Retire that entry with the edge.
-            let keep_set: std::collections::HashSet<&str> =
-                keep.iter().map(String::as_str).collect();
-            let meta_query = format!(
-                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' \
-                 RETURN m.metadata"
-            );
-            let mut rows = conn.query(&meta_query)?;
-            if let Some(row) = rows.next() {
-                if let lbug::Value::String(meta_str) = &row[0] {
-                    if let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(meta_str) {
-                        let mut changed = false;
-                        if let Some(sources) =
-                            meta.get_mut("edge_sources").and_then(|v| v.as_array_mut())
-                        {
-                            let before = sources.len();
-                            sources.retain(|source| {
-                                let owns_edge = source.get("rel_type").and_then(|v| v.as_str())
-                                    == Some(rel_type.as_str())
-                                    && source.get("extractor").and_then(|v| v.as_str())
-                                        == Some("upsert")
-                                    && source.get("orientation").and_then(|v| v.as_str())
-                                        == Some("self_to_target");
-                                if !owns_edge {
-                                    return true;
-                                }
-                                source
-                                    .get("resolved_target")
-                                    .and_then(|v| v.as_str())
-                                    .map(|target| keep_set.contains(target))
-                                    .unwrap_or(true)
-                            });
-                            changed = sources.len() != before;
-                        }
-                        if changed {
-                            if let Ok(new_meta) = serde_json::to_string(&meta) {
-                                let update_query = format!(
-                                    "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' \
-                                     SET m.metadata = '{}'",
-                                    escape_ladybug_string(&new_meta)
-                                );
-                                conn.query(&update_query)?;
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(stale.len())
+            reconcile_declared_edges_on(conn, &namespace, &id, &rel_type, &keep)
         })
         .await
     }
@@ -12242,6 +12251,11 @@ impl VectorStore for LadybugStore {
         let mut vault_wanted: std::collections::HashMap<&'static str, Vec<(String, String)>> =
             std::collections::HashMap::new();
         let mut vault_citations: EdgeCitations = std::collections::HashMap::new();
+        // The resolved outgoing binding set replay owns per declarer. It is
+        // recorded before resolution so a declaration whose target is absent
+        // still retires the alias binding it replaced.
+        let mut vault_keep: std::collections::HashMap<(String, &'static str), Vec<String>> =
+            std::collections::HashMap::new();
         let mut by_suffix = 0usize;
         let mut mention_pairs: Vec<(String, String)> = Vec::new();
         let mut mention_updates: Vec<(String, String)> = Vec::new();
@@ -12291,6 +12305,11 @@ impl VectorStore for LadybugStore {
                 )
             });
             for edge in specs {
+                if exact_edge_targets && edge.points_at_target {
+                    vault_keep
+                        .entry((memory.id.clone(), edge.rel_type))
+                        .or_default();
+                }
                 let target = if exact_edge_targets {
                     match crate::parser::ingest::exact_target_match(
                         namespace,
@@ -12320,6 +12339,12 @@ impl VectorStore for LadybugStore {
                 } else {
                     (target, memory.id.clone())
                 };
+                if exact_edge_targets && edge.points_at_target {
+                    vault_keep
+                        .entry((memory.id.clone(), edge.rel_type))
+                        .or_default()
+                        .push(pair.1.clone());
+                }
                 if let Some(source) = provenance_source.as_ref() {
                     let orientation = if edge.points_at_target {
                         "self_to_target"
@@ -12388,6 +12413,7 @@ impl VectorStore for LadybugStore {
 
         if wanted.is_empty()
             && vault_wanted.is_empty()
+            && vault_keep.is_empty()
             && active_paths.is_empty()
             && mention_pairs.is_empty()
             && mention_updates.is_empty()
@@ -12454,6 +12480,18 @@ impl VectorStore for LadybugStore {
             };
             for (rel_type, pairs) in &vault_wanted {
                 created += create_missing_edges(conn, rel_type, pairs, &vault_replay)?;
+            }
+            // Replay owns the exact binding set, so retire what the preferred
+            // targets replaced before ordinary declarations replay: a pair
+            // both declare is then re-created under its own owner.
+            for ((declarer, rel_type), keep) in &vault_keep {
+                reconcile_declared_edges_on(
+                    conn,
+                    &namespace_owned,
+                    declarer,
+                    *rel_type,
+                    keep,
+                )?;
             }
             let relink_replay = EdgeReplay {
                 namespace: &namespace_owned,
