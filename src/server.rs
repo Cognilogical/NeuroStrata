@@ -17944,6 +17944,7 @@ mod tests {
         let admin = repo.join(".git").join("worktrees").join("wt");
         std::fs::create_dir_all(&admin).expect("admin");
         std::fs::write(admin.join("commondir"), "../..\n").expect("commondir");
+        std::fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
         // A main checkout holds more than its `.git`.
         std::fs::create_dir_all(repo.join("src")).expect("main src");
         let wt = base.join("wt");
