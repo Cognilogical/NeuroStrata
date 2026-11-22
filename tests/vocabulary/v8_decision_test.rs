@@ -68,4 +68,3 @@ fn vocabulary_version_and_tool_summaries_are_consistent() {
         "src/store/ladybug.rs still carries stale superseded \"Vocabulary v2\" comments"
     );
 }
-

@@ -17,6 +17,8 @@ The engine unifies:
 - Counterfactual copy-on-write ontology scenarios
 - Fail-closed kinetic actions with bitemporal revert logs
 
+Memory and session state belong to a project. The home folder is never a session root unless it is itself a git checkout, so for a session started in the home folder, or in a folder under it that is not a project, neither the daemon nor the harness plugins write session files into the home folder.
+
 ## Three-Strata Cognitive Architecture
 
 The memory model is organized into three strata that mirror the cognitive sciences:

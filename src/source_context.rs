@@ -143,7 +143,7 @@ pub(crate) fn resolve_graph_output_path(
     anyhow::bail!("no .NeuroStrata marker found; pass --source-id or an explicit output path")
 }
 
-fn is_valid_marker_directory(marker: &Path) -> bool {
+pub(crate) fn is_valid_marker_directory(marker: &Path) -> bool {
     if !marker.is_absolute()
         || marker.file_name().and_then(|name| name.to_str()) != Some(".NeuroStrata")
     {

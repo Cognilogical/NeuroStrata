@@ -653,6 +653,25 @@ pub fn persist_active_session_file(
     golden_rules: &[SearchResult],
     active_task: Option<(&str, &MemoryPayload)>,
 ) {
+    persist_active_session_file_with_home(
+        project_root,
+        namespace,
+        golden_rules,
+        active_task,
+        &session_home_dirs(),
+    );
+}
+
+fn persist_active_session_file_with_home(
+    project_root: &std::path::Path,
+    namespace: &str,
+    golden_rules: &[SearchResult],
+    active_task: Option<(&str, &MemoryPayload)>,
+    homes: &[std::path::PathBuf],
+) {
+    if is_home_without_git_with(project_root, homes) {
+        return;
+    }
     let ns_dir = project_root.join(".NeuroStrata");
     let session_path = ns_dir.join("active_session.json");
     let mut active: Map<String, Value> = std::fs::read_to_string(&session_path)
@@ -1388,43 +1407,140 @@ pub fn resolve_session_root_dir(dir: &std::path::Path) -> std::path::PathBuf {
     crate::formal_kernel::resolve_session_root(None, dir)
 }
 
-/// Walk a candidate root up to the enclosing `.git`/`.NeuroStrata` marker.
-fn walk_to_worktree_marker(mut root: std::path::PathBuf) -> std::path::PathBuf {
-    while !root.as_os_str().is_empty()
-        && !root.join(".git").exists()
-        && !root.join(".NeuroStrata").exists()
-    {
-        match root.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => root = parent.to_path_buf(),
-            _ => break,
+// Process-wide, not per thread: a test that points NEUROSTRATA_PROJECT_ROOT
+// into its fake home must have every concurrent test see that folder as the
+// home folder too, or another test's lookup could write a ledger there.
+// The fake home is added to the real one, never put in its place: a test
+// running at the same time still stops at the real home folder.
+#[cfg(test)]
+static TEST_HOME_DIR: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Also treat `home` as a home folder until the guard drops. Hold
+/// `daemon::project_root_env_test_lock()` while the guard lives.
+#[cfg(test)]
+pub(crate) fn override_home_dir_for_test(home: &std::path::Path) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            *TEST_HOME_DIR.lock().unwrap_or_else(|p| p.into_inner()) = None;
         }
     }
-    root
+    *TEST_HOME_DIR.lock().unwrap_or_else(|p| p.into_inner()) = Some(home.to_path_buf());
+    Reset
 }
 
-fn has_worktree_marker(root: &std::path::Path) -> bool {
-    root.join(".git").exists() || root.join(".NeuroStrata").exists()
+/// The user's home folder. Tests can add a fake one next to it.
+fn session_home_dirs() -> Vec<std::path::PathBuf> {
+    let mut homes = Vec::new();
+    #[cfg(test)]
+    homes.extend(
+        TEST_HOME_DIR
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone(),
+    );
+    homes.extend(dirs::home_dir());
+    homes
+}
+
+pub(crate) fn is_home_folder(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    let Some(home) = home.and_then(|h| dunce::canonicalize(h).ok()) else {
+        return false;
+    };
+    dunce::canonicalize(dir).is_ok_and(|d| d == home)
+}
+
+fn is_any_home_folder(dir: &std::path::Path, homes: &[std::path::PathBuf]) -> bool {
+    homes.iter().any(|h| is_home_folder(dir, Some(h)))
+}
+
+/// True when `dir` is the user's home folder and holds no `.git`. Such a
+/// folder is never a project, so no session file (`active_session.json`,
+/// `session_queries.json`) is written there: `~/.NeuroStrata` belongs to
+/// SynapticMesh, not to a project.
+pub(crate) fn is_home_without_git(dir: &std::path::Path) -> bool {
+    is_home_without_git_with(dir, &session_home_dirs())
+}
+
+fn is_home_without_git_with(dir: &std::path::Path, homes: &[std::path::PathBuf]) -> bool {
+    is_any_home_folder(dir, homes) && !dir.join(".git").exists()
+}
+
+/// Where a walk for a session-file root ended.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionMarkerWalk {
+    /// The nearest folder holding `.git` or `.NeuroStrata`.
+    Root(std::path::PathBuf),
+    /// The walk reached the home folder without finding `.git`.
+    StoppedAtHome,
+    /// No folder from the start up to the filesystem root holds a marker.
+    NotFound,
+}
+
+/// Find the session-file root for `start` (a folder, or a file whose folder
+/// is used): the nearest folder holding `.git` or `.NeuroStrata`. The home
+/// folder without `.git` is never a root, even with `.NeuroStrata`
+/// (SynapticMesh keeps its node id there), and a walk that reaches it stops
+/// there rather than continuing above it.
+fn walk_to_session_marker(start: &std::path::Path) -> SessionMarkerWalk {
+    let homes = session_home_dirs();
+    let start = if start.is_dir() {
+        start
+    } else {
+        match start.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => return SessionMarkerWalk::NotFound,
+        }
+    };
+    let is_home = |dir: &std::path::Path| is_any_home_folder(dir, &homes);
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() {
+            return SessionMarkerWalk::Root(dir.to_path_buf());
+        }
+        if is_home(dir) {
+            return SessionMarkerWalk::StoppedAtHome;
+        }
+        if dir.join(".NeuroStrata").exists() {
+            return SessionMarkerWalk::Root(dir.to_path_buf());
+        }
+        cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
+    }
+    SessionMarkerWalk::NotFound
+}
+
+/// Walk a candidate root to its session-file root; `None` when there is none.
+fn walk_to_worktree_marker(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    if root.as_os_str().is_empty() {
+        return None;
+    }
+    match walk_to_session_marker(root) {
+        SessionMarkerWalk::Root(r) => Some(r),
+        SessionMarkerWalk::StoppedAtHome | SessionMarkerWalk::NotFound => None,
+    }
 }
 
 /// The single ledger-root policy shared by the receipt recorder and by
 /// `task_validate`: an explicit caller worktree hint wins; otherwise prefer
 /// the namespace registry's `project_root` then registered directory rows, and
-/// only fall back to the daemon CWD last. Mirrors `record_graph_query_with_root`
-/// so a daemon running outside the checkout writes and reads the same ledger.
+/// only fall back to the daemon CWD last. Each candidate is walked up to the
+/// nearest folder holding `.git` or `.NeuroStrata`; the home folder without
+/// `.git` never qualifies. `None` when no candidate qualifies: the
+/// recorder then writes nothing, rather than creating `.NeuroStrata` in the
+/// home folder or at a drive root.
 pub(crate) async fn receipt_ledger_root(
     caller_root: Option<&str>,
     store: &Arc<dyn VectorStore>,
     namespace: &str,
-) -> std::path::PathBuf {
+) -> Option<std::path::PathBuf> {
     if let Some(hint) = caller_root.map(str::trim).filter(|s| !s.is_empty()) {
-        let candidate =
-            walk_to_worktree_marker(resolve_session_root_dir(std::path::Path::new(hint)));
         // A caller hint is only trusted when it actually resolves inside a
-        // worktree (`.git`/`.NeuroStrata`). A scratch dir with no marker must
-        // fall through to the registry/directory rows and daemon CWD, never
-        // become the ledger root.
-        if has_worktree_marker(&candidate) {
-            return candidate;
+        // worktree. A scratch dir with no marker falls through to the
+        // registry/directory rows and daemon CWD, never becomes the root.
+        if let Some(root) =
+            walk_to_worktree_marker(&resolve_session_root_dir(std::path::Path::new(hint)))
+        {
+            return Some(root);
         }
     }
     let ns = crate::server::resolve_namespace(store, namespace).await;
@@ -1436,9 +1552,8 @@ pub(crate) async fn receipt_ledger_root(
                 .and_then(Value::as_str)
                 .filter(|p| !p.trim().is_empty())
             {
-                let candidate = walk_to_worktree_marker(std::path::PathBuf::from(p));
-                if has_worktree_marker(&candidate) {
-                    return candidate;
+                if let Some(root) = walk_to_worktree_marker(std::path::Path::new(p)) {
+                    return Some(root);
                 }
             }
         }
@@ -1451,14 +1566,13 @@ pub(crate) async fn receipt_ledger_root(
                 .get("absolute_path")
                 .and_then(Value::as_str)
             {
-                let candidate = walk_to_worktree_marker(std::path::PathBuf::from(p));
-                if has_worktree_marker(&candidate) {
-                    return candidate;
+                if let Some(root) = walk_to_worktree_marker(std::path::Path::new(p)) {
+                    return Some(root);
                 }
             }
         }
     }
-    walk_to_worktree_marker(crate::daemon::resolve_project_root())
+    walk_to_worktree_marker(&crate::daemon::resolve_project_root())
 }
 
 /// Record a graph or memory lookup against any active `in_progress` task in
@@ -1537,24 +1651,22 @@ async fn record_graph_query_inner(
                 .to_string_lossy()
                 .into_owned()
         });
+    // A hint under the home folder (no `.git` on the way up) names no
+    // project: the task is still stamped, but no ledger gets the entry.
+    let mut hint_under_home = false;
     if project_root.is_none() {
         let hint_path = std::path::Path::new(query_hint);
         if hint_path.is_absolute() {
-            let mut cur = if hint_path.is_dir() {
-                Some(hint_path)
-            } else {
-                hint_path.parent()
-            };
-            while let Some(dir) = cur {
-                if dir.join(".git").exists() || dir.join(".NeuroStrata").exists() {
+            match walk_to_session_marker(hint_path) {
+                SessionMarkerWalk::Root(dir) => {
                     project_root = Some(dir.to_string_lossy().to_string());
-                    break;
                 }
-                cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
+                SessionMarkerWalk::StoppedAtHome => hint_under_home = true,
+                SessionMarkerWalk::NotFound => {}
             }
         }
     }
-    if project_root.is_none() {
+    if project_root.is_none() && !hint_under_home {
         if let Ok(Some((_, registry))) =
             store.get(&ns, &crate::registry::registry_row_id(&ns)).await
         {
@@ -1569,7 +1681,7 @@ async fn record_graph_query_inner(
             }
         }
     }
-    if project_root.is_none() {
+    if project_root.is_none() && !hint_under_home {
         if let Ok(dirs) = store.list(&ns, None, Some("directory")).await {
             for d in &dirs {
                 if let Some(p) = d
@@ -1631,24 +1743,13 @@ async fn record_graph_query_inner(
             }
         }
     }
-    if project_root.is_none() {
+    if project_root.is_none() && !hint_under_home {
         // Start from `resolve_project_root()` (which honors `NEUROSTRATA_PROJECT_ROOT`
-        // before falling back to `std::env::current_dir()`) and walk up through
-        // parent directories looking for `.git` or `.NeuroStrata`.
-        let start = crate::daemon::resolve_project_root();
-        if !start.as_os_str().is_empty() {
-            let mut cur = start;
-            loop {
-                if cur.join(".git").exists() || cur.join(".NeuroStrata").exists() {
-                    project_root = Some(cur.to_string_lossy().to_string());
-                    break;
-                }
-                match cur.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => cur = parent.to_path_buf(),
-                    _ => break,
-                }
-            }
-        }
+        // before falling back to `std::env::current_dir()`) and walk up to the
+        // nearest folder holding `.git` or `.NeuroStrata`.
+        // No root found (home folder, drive root): nothing is written.
+        project_root = walk_to_worktree_marker(&crate::daemon::resolve_project_root())
+            .map(|root| root.to_string_lossy().into_owned());
     }
     let governed_prefix = if query_hint.ends_with('/')
         || (project_root.is_some()
@@ -1669,7 +1770,7 @@ async fn record_graph_query_inner(
         // Bare module/domain keyword: widen to directory coverage.
         format!("{}/", query_hint)
     };
-    if let Some(root) = project_root {
+    if let Some(root) = project_root.filter(|r| !is_home_without_git(std::path::Path::new(r))) {
         let ledger_path = std::path::Path::new(&root).join(".NeuroStrata/session_queries.json");
         // NOTE (spec §6 R6.2): this is the PRE-dispatch legacy path. It writes
         // only the legacy `queries[]` row + the single task stamp above; it must
@@ -1778,10 +1879,9 @@ pub async fn record_tool_receipt(
     // versioned `events[]` receipt and the additive `tool_invocations`
     // counter. Legacy `queries[]` rows belong exclusively to the handler-
     // internal ledger recorders, so none are written here.
-    let root = receipt_ledger_root(caller_root, store, &ns).await;
-    if root.as_os_str().is_empty() {
+    let Some(root) = receipt_ledger_root(caller_root, store, &ns).await else {
         return;
-    }
+    };
     let ledger_path = root.join(".NeuroStrata/session_queries.json");
     let tool = fields.tool.clone();
     tool_receipts::mutate_session_ledger(&ledger_path, &ns, |doc| {
@@ -2283,6 +2383,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             None
         }
     };
+    let hint_root = explicit_root.clone().or_else(|| session_root.clone());
     if let Some(root) = session_root {
         let golden = collect_golden_rules(&store, &namespace, None).await;
         persist_active_session_file(&root, &namespace, &golden, Some((&id, &task.payload)));
@@ -2304,7 +2405,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
-    encode(&json!({
+    let mut reply = json!({
         "id": id,
         "namespace": namespace,
         "status": task.status().as_str(),
@@ -2313,7 +2414,14 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         "task": task_summary(&id, &task.payload),
         "auto_retrieved_context": hits_json,
         "subagent_prompt_injection": subagent_prompt,
-    }))
+    });
+    if let Some(hint) = hint_root
+        .as_deref()
+        .and_then(|root| crate::root_marker::root_hint(&namespace, root))
+    {
+        reply["root_hint"] = json!(hint);
+    }
+    encode(&reply)
 }
 
 // ── tool: neurostrata_task_update ──────────────────────────────────────────
@@ -3480,12 +3588,13 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
     let caller_hint = arg_str(&args, "worktree")
         .or_else(|| arg_str(&args, "project_root"))
         .or_else(|| arg_str(&args, "cwd"));
-    let root = receipt_ledger_root(caller_hint, &store, &namespace).await;
-    let ledger: Value =
-        std::fs::read_to_string(root.join(".NeuroStrata").join("session_queries.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| json!({ "events": [] }));
+    let ledger: Value = receipt_ledger_root(caller_hint, &store, &namespace)
+        .await
+        .and_then(|root| {
+            std::fs::read_to_string(root.join(".NeuroStrata").join("session_queries.json")).ok()
+        })
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({ "events": [] }));
     let mut applicable: Vec<String> = args
         .get("applicable_triggers")
         .and_then(Value::as_array)
@@ -3718,11 +3827,10 @@ pub async fn handle_bootstrap(
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let root = std::path::Path::new(project_root);
-    let harness_plugins = harness_plugins::auto_install_detected_plugins(
-        root,
-        harness_plugins::ConfigNamespace::Set(&namespace),
-        arg_str(&args, "harness"),
-    );
+    let root_marker =
+        crate::root_marker::ensure_marker_for_setup(&store, Some(&emb), root, Some(&namespace))
+            .await;
+    let harness_plugins = setup_plugins(&root_marker, root, &namespace, arg_str(&args, "harness"));
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
     let hook_installed = verified["hook_installed"].as_bool().unwrap_or(false);
 
@@ -3819,7 +3927,61 @@ pub async fn handle_bootstrap(
         "wiring": wiring_block,
         "verified": verified,
         "rule": "Zero-Action Start is now active: no file edits without a claimed task.",
+        "root_marker": root_marker.to_json(&namespace, root),
+        "root_hint": root_marker.message(&namespace, root),
     }))
+}
+
+/// Setup's plugin install, skipped when another namespace's marker owns the
+/// folder (a plugin config naming this namespace would disagree with it).
+fn setup_plugins(
+    root_marker: &crate::root_marker::SetupMarker,
+    root: &std::path::Path,
+    namespace: &str,
+    harness: Option<&str>,
+) -> Value {
+    if root_marker.installs_plugins() {
+        harness_plugins::auto_install_detected_plugins(
+            root,
+            harness_plugins::ConfigNamespace::Set(namespace),
+            harness,
+        )
+    } else {
+        json!({ "skipped": true, "reason": root_marker.message(namespace, root) })
+    }
+}
+
+/// Records the wires and triggers this build knows in the registry row's
+/// doctor_state (a locked merge, so a concurrent root or domain write is
+/// kept) and returns the ones recorded before.
+async fn record_setup_doctor_state(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut fields = Map::new();
+    fields.insert(
+        "configured_wires".to_string(),
+        json!(crate::task::wiring::known_wire_ids()),
+    );
+    fields.insert(
+        "configured_fires_on".to_string(),
+        json!(crate::task::wiring::VALID_FIRES_ON),
+    );
+    let previous = crate::registry::merge_doctor_state_fields(store, namespace, fields)
+        .await
+        .unwrap_or(Value::Null);
+    let strings = |key: &str| -> Vec<String> {
+        previous
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    (strings("configured_wires"), strings("configured_fires_on"))
 }
 
 // ── the wiring panel (docs/design-wiring-panel.md) ─────────────────────────
@@ -3939,11 +4101,12 @@ LEDGER="$ROOT/.NeuroStrata/session_queries.json"
 # The namespace configured for this project (harness settings; folder name
 # last), resolved in one place: `neurostrata-mcp namespace resolve`. The
 # ledger's own field and the folder name are fallbacks when the binary is
-# not on PATH or the lookup fails.
+# not on PATH or the lookup fails; a failed lookup's reason (an unreadable
+# project marker or harness config) stays on stderr.
 NAMESPACE=""
 RESOLVED=""
 if command -v neurostrata-mcp >/dev/null 2>&1; then
-    if NAMESPACE=$(neurostrata-mcp namespace resolve 2>/dev/null) && [ -n "$NAMESPACE" ]; then
+    if NAMESPACE=$(neurostrata-mcp namespace resolve) && [ -n "$NAMESPACE" ]; then
         RESOLVED=1
     else
         NAMESPACE=""
@@ -4180,13 +4343,9 @@ if [ ! -f "$LEDGER" ]; then
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
-    # rewrite holds the same cross-process lock as the daemon's ledger writer,
-    # uses a unique EXCLUSIVE temp file (a planted symlink cannot be followed),
-    # keeps the original mode, and wraps legacy bare-array ledgers. An
-    # unparseable ledger or a missing node/python3 leaves the file as it is.
+    # rewrite goes through a temporary file and a rename; an unparseable
+    # ledger or a missing node/python3 leaves the file as it is.
     export LEDGER NAMESPACE
-    exec 9>"$LEDGER.lock" 2>/dev/null || true
-    command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
@@ -4194,20 +4353,16 @@ elif [ -n "$RESOLVED" ]; then
           const ns = process.env.NAMESPACE;
           let parsed;
           try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
-          const doc = Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed;
-          if (!doc || typeof doc !== "object") process.exit(0);
-          if (doc.namespace === ns) process.exit(0);
-          doc.namespace = ns;
-          const tmp = ledger + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
-          let mode;
-          try { mode = fs.statSync(ledger).mode; } catch {}
-          fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-          if (mode !== undefined) { try { fs.chmodSync(tmp, mode); } catch {} }
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) process.exit(0);
+          if (parsed.namespace === ns) process.exit(0);
+          parsed.namespace = ns;
+          const tmp = ledger + ".tmp-" + process.pid;
+          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + "\n");
           fs.renameSync(tmp, ledger);
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
-import json, os, sys, stat
+import json, os, sys
 ledger = os.environ["LEDGER"]
 ns = os.environ["NAMESPACE"]
 try:
@@ -4215,30 +4370,16 @@ try:
         parsed = json.load(f)
 except Exception:
     sys.exit(0)
-doc = {"namespace": ns, "queries": parsed} if isinstance(parsed, list) else parsed
-if not isinstance(doc, dict) or doc.get("namespace") == ns:
+if not isinstance(parsed, dict) or parsed.get("namespace") == ns:
     sys.exit(0)
-doc["namespace"] = ns
-tmp = f"{ledger}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
-fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-try:
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(doc, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    try:
-        os.chmod(tmp, stat.S_IMODE(os.stat(ledger).st_mode))
-    except OSError:
-        pass
-    os.replace(tmp, ledger)
-except Exception:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
+parsed["namespace"] = ns
+tmp = ledger + ".tmp-" + str(os.getpid())
+with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+    json.dump(parsed, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, ledger)
 ' 2>/dev/null || true
     fi
-    command -v flock >/dev/null 2>&1 && flock -u 9 2>/dev/null || true
-    exec 9>&- 2>/dev/null || true
 fi
 
 
@@ -5075,11 +5216,10 @@ pub async fn handle_task_setup(
     if !root.is_dir() {
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
-    let harness_plugins = harness_plugins::auto_install_detected_plugins(
-        root,
-        harness_plugins::ConfigNamespace::Set(&namespace),
-        arg_str(&args, "harness"),
-    );
+    let root_marker =
+        crate::root_marker::ensure_marker_for_setup(&store, Some(&emb), root, Some(&namespace))
+            .await;
+    let harness_plugins = setup_plugins(&root_marker, root, &namespace, arg_str(&args, "harness"));
 
     let scan = detect_project(root);
     let (wiring_block, verified, wire_instruction) = wiring_panel(root, &namespace);
@@ -5284,35 +5424,7 @@ pub async fn handle_task_setup(
         }
     }
 
-    let rid = crate::registry::registry_row_id(&namespace);
-    let mut prev_wires: Vec<String> = Vec::new();
-    let mut prev_fires: Vec<String> = Vec::new();
-    if let Ok(Some((reg_vec, mut reg_payload))) = store.get(&namespace, &rid).await {
-        if let Some(ds) = reg_payload.metadata.get("doctor_state") {
-            if let Some(arr) = ds.get("configured_wires").and_then(|v| v.as_array()) {
-                prev_wires = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect();
-            }
-            if let Some(arr) = ds.get("configured_fires_on").and_then(|v| v.as_array()) {
-                prev_fires = arr
-                    .iter()
-                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                    .collect();
-            }
-        }
-        if let Some(obj) = reg_payload.metadata.as_object_mut() {
-            let mut ds = obj
-                .get("doctor_state")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            ds["configured_wires"] = json!(crate::task::wiring::known_wire_ids());
-            ds["configured_fires_on"] = json!(crate::task::wiring::VALID_FIRES_ON);
-            obj.insert("doctor_state".to_string(), ds);
-        }
-        let _ = store.upsert(&namespace, &rid, reg_vec, reg_payload).await;
-    }
+    let (prev_wires, prev_fires) = record_setup_doctor_state(&store, &namespace).await;
     let (new_auto, new_rem, new_fires) =
         crate::task::wiring::compute_lifecycle_delta(&prev_wires, &prev_fires);
     let lifecycle_delta = json!({
@@ -5342,6 +5454,8 @@ pub async fn handle_task_setup(
         "verified": verified,
         "lifecycle_delta": lifecycle_delta,
         "harness_plugins": harness_plugins,
+        "root_marker": root_marker.to_json(&namespace, root),
+        "root_hint": root_marker.message(&namespace, root),
     }))
 }
 
@@ -5940,7 +6054,7 @@ mod tests {
         assert_eq!(doc["events"][0]["event_id"], "evt-registry");
         assert_eq!(
             receipt_ledger_root(None, &store, ns).await,
-            worktree,
+            Some(worktree),
             "validation reads the same root the recorder wrote"
         );
     }
@@ -5955,7 +6069,7 @@ mod tests {
         let scratch =
             std::env::temp_dir().join(format!("ns-scratch-hint-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&scratch).unwrap();
-        assert!(!has_worktree_marker(&scratch));
+        assert!(!scratch.join(".git").exists() && !scratch.join(".NeuroStrata").exists());
         let worktree =
             std::env::temp_dir().join(format!("ns-real-worktree-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(worktree.join(".git")).unwrap();
@@ -5963,7 +6077,7 @@ mod tests {
             .await;
         assert_eq!(
             receipt_ledger_root(Some(scratch.to_str().unwrap()), &store, ns).await,
-            worktree,
+            Some(worktree),
             "unmarked scratch hint must fall through to the registry root"
         );
     }
@@ -6140,7 +6254,8 @@ mod tests {
 
     /// The pre-commit hook files the ledger under the namespace `namespace
     /// resolve` answered: an older ledger naming another one is updated, its
-    /// recorded lookups kept; a failed lookup leaves the ledger as it is.
+    /// recorded lookups kept; a failed lookup leaves the ledger as it is and
+    /// its reason reaches the hook's stderr.
     #[test]
     fn pre_commit_hook_updates_the_ledger_namespace_to_the_resolved_one() {
         let Some(bash) = hook_bash() else {
@@ -6177,7 +6292,7 @@ mod tests {
         std::fs::create_dir_all(&stub_dir).unwrap();
         write_exec_hook(
             &stub_dir.join("neurostrata-mcp"),
-            "#!/bin/sh\nif [ \"$1\" = namespace ]; then\n    [ -n \"$STUB_RESOLVE_EXIT\" ] && exit \"$STUB_RESOLVE_EXIT\"\n    echo alpha\n    exit 0\nfi\nexit 0\n",
+            "#!/bin/sh\nif [ \"$1\" = namespace ]; then\n    if [ -n \"$STUB_RESOLVE_EXIT\" ]; then\n        echo 'error: namespace resolve: the project marker could not be read' >&2\n        exit \"$STUB_RESOLVE_EXIT\"\n    fi\n    echo alpha\n    exit 0\nfi\nexit 0\n",
         );
         let run = |resolve_exit: Option<&str>| {
             let mut dirs = vec![stub_dir.clone()];
@@ -6202,15 +6317,20 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&out.stderr)
             );
+            String::from_utf8_lossy(&out.stderr).to_string()
         };
         let read = || -> Value {
             serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap()
         };
-        run(Some("1"));
+        let stderr = run(Some("1"));
         assert_eq!(
             std::fs::read_to_string(&ledger).unwrap(),
             seeded,
             "a failed lookup changes nothing"
+        );
+        assert!(
+            stderr.contains("the project marker could not be read"),
+            "a failed lookup says why: {stderr}"
         );
         run(None);
         let doc = read();
@@ -8029,6 +8149,178 @@ mod tests {
         );
     }
 
+    /// Claim scope from a linked worktree of a marked namespace (design 6.5):
+    /// the registry root is the main checkout, so a claim without `worktree`
+    /// is stamped with the main checkout's branch; the plugins pass the
+    /// session's folder as `worktree`, and the claim keeps the linked
+    /// worktree's branch and worktree.
+    #[tokio::test]
+    async fn claim_from_a_linked_worktree_of_a_marked_namespace_keeps_its_scope_with_worktree() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let main = base.join("example-project");
+        let linked = base.join("example-project-wt");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature/linked",
+                &linked.to_string_lossy(),
+            ],
+        );
+        crate::root_marker::replace_marker(&main, &crate::root_marker::RootConfig::new("MyProj"))
+            .unwrap();
+
+        let store = store_with_namespace("MyProj").await;
+        let rid = crate::registry::registry_row_id("MyProj");
+        let reg_vec = StubEmbedder.embed("registry").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &rid,
+                reg_vec,
+                MemoryPayload {
+                    content: "registry".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "structural".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "project_root": main.to_string_lossy().to_string() }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let claim = |id: String, extra: Value| {
+            let store = store.clone();
+            async move {
+                let mut args = json!({
+                    "namespace": "MyProj",
+                    "id": id,
+                    "assignee": "agent-a",
+                    "session_id": "ses_wt"
+                });
+                if let (Some(args), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+                    args.extend(extra.clone());
+                }
+                let reply = handle_task_claim(args, store).await;
+                assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+            }
+        };
+        let stamped = |id: String| {
+            let store = store.clone();
+            async move {
+                let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+                (
+                    payload.metadata["task"]["branch"].clone(),
+                    payload.metadata["task"]["worktree"].clone(),
+                )
+            }
+        };
+
+        // With the session's folder as `worktree`: the linked worktree's scope.
+        let with_wt = create_task(&store, "MyProj", "linked work", 2).await;
+        claim(
+            with_wt.clone(),
+            json!({ "worktree": linked.to_string_lossy() }),
+        )
+        .await;
+        let expected = gate::GateScope::capture(&linked);
+        assert_eq!(expected.branch.as_deref(), Some("feature/linked"));
+        assert_eq!(
+            stamped(with_wt).await,
+            (json!(expected.branch), json!(expected.worktree))
+        );
+
+        // Without it: the registry root, the main checkout.
+        let without = create_task(&store, "MyProj", "unscoped work", 2).await;
+        claim(without.clone(), json!({})).await;
+        let main_scope = gate::GateScope::capture(&main);
+        assert_eq!(main_scope.branch.as_deref(), Some("main"));
+        assert_eq!(
+            stamped(without).await,
+            (json!(main_scope.branch), json!(main_scope.worktree))
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_from_linked_worktree_keeps_worktree_scope() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        let linked = base.join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&main, &["init", "-b", "main"]);
+        git(&main, &["commit", "--allow-empty", "-m", "init"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &main);
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "linked work", 2).await;
+        let reply = handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": "ses_linked",
+                "project_root": linked.to_string_lossy(),
+            }),
+            store.clone(),
+        )
+        .await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+
+        let expected = gate::GateScope::capture(&linked);
+        assert_eq!(expected.branch.as_deref(), Some("feature/linked"));
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(payload.metadata["task"]["branch"], json!(expected.branch));
+        assert_eq!(
+            payload.metadata["task"]["worktree"],
+            json!(expected.worktree)
+        );
+    }
+
     #[test]
     fn task_summary_exposes_branch_and_worktree() {
         let payload = MemoryPayload {
@@ -8086,6 +8378,245 @@ mod tests {
         .unwrap();
         assert_eq!(list["tasks"][0]["branch"], json!("feature/scope"));
         assert_eq!(list["tasks"][0]["worktree"], json!("/wt/scope"));
+    }
+
+    #[test]
+    fn home_folder_gets_no_session_file() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".NeuroStrata")).unwrap();
+        persist_active_session_file_with_home(
+            home.path(),
+            "example-project",
+            &[],
+            None,
+            &[home.path().to_path_buf()],
+        );
+        assert!(!home
+            .path()
+            .join(".NeuroStrata/active_session.json")
+            .exists());
+        let work = home.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        persist_active_session_file_with_home(
+            &work,
+            "example-project",
+            &[],
+            None,
+            &[home.path().to_path_buf()],
+        );
+        assert!(work.join(".NeuroStrata/active_session.json").exists());
+    }
+
+    /// Folders for the home-folder tests: `home` (the injected home folder,
+    /// holding `.NeuroStrata` as SynapticMesh leaves it), `top` (a non-git
+    /// project under it, holding `.NeuroStrata`) and `nowhere` (no marker,
+    /// for `NEUROSTRATA_PROJECT_ROOT`). Every walk ends at `home` at the
+    /// latest, so folders above the temp folder never affect the result.
+    fn home_test_layout() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = dunce::canonicalize(tmp.path()).unwrap();
+        let top = home.join("top");
+        let nowhere = home.join("nowhere");
+        std::fs::create_dir_all(home.join(".NeuroStrata")).unwrap();
+        std::fs::create_dir_all(top.join(".NeuroStrata")).unwrap();
+        std::fs::create_dir_all(&nowhere).unwrap();
+        (tmp, home, top, nowhere)
+    }
+
+    fn ledger_at(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(".NeuroStrata").join("session_queries.json")
+    }
+
+    #[tokio::test]
+    async fn ledger_hint_walk_keeps_ancestor_neurostrata_except_home() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, top, nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &nowhere);
+        let repo = top.join("scratch");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let file = repo.join("src").join("a.rs");
+        std::fs::write(&file, "x").unwrap();
+        let store = store_with_namespace("example-project").await;
+        let hint = file.to_string_lossy().to_string();
+
+        // A deep file in a non-git project finds the project's `.NeuroStrata`.
+        record_graph_query_with_root(&store, "example-project", "t", &hint, None).await;
+        assert!(ledger_at(&top).exists());
+        assert!(!ledger_at(&home).exists());
+        assert!(!ledger_at(&nowhere).exists());
+
+        // The nearest marker wins: a `.git` below it takes the entry.
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        record_graph_query_with_root(&store, "example-project", "t", &hint, None).await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(ledger_at(&repo).exists());
+        assert!(!ledger_at(&home).exists());
+    }
+
+    #[tokio::test]
+    async fn ledger_hint_under_home_writes_nothing() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, top, nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        // A registry root that would otherwise catch it. The daemon root is
+        // a marker-free folder, so lookups from tests running alongside
+        // (which read the same variable) cannot write into `project`.
+        let project = top.join("example-project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &nowhere);
+        let store = store_with_namespace("example-project").await;
+        crate::registry::cache_project_root(
+            &store,
+            Some(&emb()),
+            "example-project",
+            project.to_str().unwrap(),
+        )
+        .await;
+        let docs = home.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        for file in [docs.join("a.md"), home.join("b.md")] {
+            std::fs::write(&file, "x").unwrap();
+            let hint = file.to_string_lossy().to_string();
+            record_graph_query_with_root(&store, "example-project", "t", &hint, None).await;
+        }
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(!ledger_at(&home).exists());
+        assert!(!ledger_at(&docs).exists());
+        assert!(
+            !ledger_at(&project).exists(),
+            "a hint under home stops; no fallback write"
+        );
+
+        // A home folder that is a git checkout is a project.
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let hint = docs.join("a.md").to_string_lossy().to_string();
+        record_graph_query_with_root(&store, "example-project", "t", &hint, None).await;
+        assert!(ledger_at(&home).exists());
+    }
+
+    #[tokio::test]
+    async fn daemon_root_walk_skips_home_but_keeps_ancestor_neurostrata() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, top, nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        let store = store_with_namespace("example-project").await;
+        for daemon_root in [&home, &nowhere] {
+            std::env::set_var("NEUROSTRATA_PROJECT_ROOT", daemon_root);
+            record_graph_query_with_root(&store, "example-project", "t", "related", None).await;
+        }
+        assert!(!ledger_at(&home).exists());
+        assert!(!nowhere.join(".NeuroStrata").exists());
+
+        let sub = top.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &sub);
+        record_graph_query_with_root(&store, "example-project", "t", "related", None).await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(ledger_at(&top).exists());
+        assert!(!sub.join(".NeuroStrata").exists());
+    }
+
+    #[test]
+    fn session_marker_walk_without_marker_finds_nothing() {
+        let rel = std::path::Path::new("ns-no-such-folder-7f3a").join("sub");
+        assert_eq!(walk_to_session_marker(&rel), SessionMarkerWalk::NotFound);
+        assert_eq!(walk_to_worktree_marker(&rel), None);
+        assert_eq!(walk_to_worktree_marker(std::path::Path::new("")), None);
+    }
+
+    #[tokio::test]
+    async fn receipt_ledger_root_never_answers_home() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, top, nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        let store = temp_store().await;
+        let ns = "example-project";
+        store.init(ns).await.expect("init namespace schema");
+        let sub = top.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // (a) home without .git: as hint and as daemon root.
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &home);
+        let got = receipt_ledger_root(Some(home.to_str().unwrap()), &store, ns).await;
+        assert_eq!(got, None);
+        // (b) an ancestor `.NeuroStrata` that is not home is a root.
+        let got = receipt_ledger_root(Some(sub.to_str().unwrap()), &store, ns).await;
+        assert_eq!(got, Some(top.clone()));
+        // (c) no qualifying marker: no root, and the recorder writes nothing.
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &nowhere);
+        assert_eq!(receipt_ledger_root(None, &store, ns).await, None);
+        let fields = tool_receipts::ReceiptFields::new(
+            "evt-none".to_string(),
+            0,
+            "sess-none".to_string(),
+            String::new(),
+            ns.to_string(),
+            "neurostrata_related".to_string(),
+            "related".to_string(),
+            String::new(),
+            "graph_read".to_string(),
+            true,
+            tool_receipts::ReceiptStatus::Success,
+            0,
+            1,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            "q",
+            "r",
+        );
+        record_tool_receipt(&store, fields, Some(nowhere.to_str().unwrap())).await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(!nowhere.join(".NeuroStrata").exists());
+        assert!(!ledger_at(&home).exists());
+        assert!(!ledger_at(&top).exists());
+
+        // Home that is a git checkout is a project.
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let got = receipt_ledger_root(Some(home.to_str().unwrap()), &store, ns).await;
+        assert_eq!(got, Some(home.clone()));
+    }
+
+    #[tokio::test]
+    async fn claim_from_home_keeps_its_worktree_stamp() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        let (_tmp, home, _top, nowhere) = home_test_layout();
+        let _home = override_home_dir_for_test(&home);
+        std::env::set_var("NEUROSTRATA_PROJECT_ROOT", &nowhere);
+        let store = store_with_namespace("example-project").await;
+        let id = create_task(&store, "example-project", "work started from home", 2).await;
+        let reply = handle_task_claim(
+            json!({
+                "namespace": "example-project",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": "ses_home",
+                "worktree": home.to_string_lossy(),
+            }),
+            store.clone(),
+        )
+        .await;
+        std::env::remove_var("NEUROSTRATA_PROJECT_ROOT");
+        assert!(reply.contains("\"status\": \"in_progress\""), "{}", reply);
+        let (_, payload) = store.get("example-project", &id).await.unwrap().unwrap();
+        let worktree = payload.metadata["task"]["worktree"]
+            .as_str()
+            .map(|w| dunce::canonicalize(w).unwrap());
+        assert_eq!(
+            worktree,
+            Some(home.clone()),
+            "a claim from home must not be stored unattributed"
+        );
+        assert!(!home
+            .join(".NeuroStrata")
+            .join("active_session.json")
+            .exists());
     }
 
     #[tokio::test]
@@ -11563,5 +12094,131 @@ mod tests {
             prompt.contains("NOT DEFINITION: does not apply to rootless podman sockets"),
             "governing memory in task view must emit boundary: {prompt}"
         );
+    }
+
+    // ── setup writes the project marker (root-marker spec 6.4) ───────────
+
+    #[tokio::test]
+    async fn task_setup_returns_root_hint_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("example-project");
+        std::fs::create_dir_all(repo.join(".git").join("hooks")).unwrap();
+        let store = store_with_namespace("webproj").await;
+        let call = || {
+            handle_task_setup(
+                json!({ "namespace": "webproj", "project_root": repo.to_string_lossy() }),
+                emb(),
+                store.clone(),
+            )
+        };
+
+        let parsed: Value = serde_json::from_str(&call().await).expect("json reply");
+        assert_eq!(parsed["root_marker"]["kind"], json!("written"), "{parsed}");
+        assert_eq!(parsed["root_marker"]["root"], json!(repo.to_string_lossy()));
+        let hint = parsed["root_hint"].as_str().expect("a hint line");
+        assert!(
+            hint.starts_with("Wrote ") && hint.contains("webproj"),
+            "{hint}"
+        );
+        assert!(repo.join(".NeuroStrata").join("config.json").exists());
+        // Existing fields are still there.
+        assert!(parsed["harness_plugins"].is_object() && parsed["instructions"].is_array());
+        assert_eq!(
+            crate::registry::cached_project_root(&store, "webproj")
+                .await
+                .unwrap(),
+            Some(repo.to_string_lossy().into_owned())
+        );
+
+        // A second setup reuses the marker; the hint field is null, not absent.
+        let parsed: Value = serde_json::from_str(&call().await).expect("json reply");
+        assert_eq!(parsed["root_marker"]["kind"], json!("reused"));
+        assert_eq!(parsed.get("root_hint"), Some(&Value::Null));
+
+        // Another namespace's marker: nothing written, plugins skipped.
+        let other = base.join("other");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        std::fs::create_dir_all(other.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            other.join(".NeuroStrata").join("config.json"),
+            br#"{"version":1,"namespace":"other-project"}"#,
+        )
+        .unwrap();
+        let reply = handle_task_setup(
+            json!({ "namespace": "webproj", "project_root": other.to_string_lossy() }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["root_marker"]["kind"], json!("other_namespace"));
+        assert_eq!(parsed["harness_plugins"]["skipped"], json!(true));
+        assert!(parsed["root_hint"]
+            .as_str()
+            .unwrap()
+            .contains("other-project"));
+        assert!(!other.join(".NeuroStrata").join("plugins").exists());
+
+        // Bootstrap carries the same two fields.
+        let fresh = base.join("fresh");
+        std::fs::create_dir_all(fresh.join(".git")).unwrap();
+        let reply = handle_bootstrap(
+            json!({ "namespace": "webproj2", "project_root": fresh.to_string_lossy() }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["root_marker"]["kind"], json!("written"), "{parsed}");
+        assert!(parsed["root_hint"].is_string());
+    }
+
+    #[tokio::test]
+    async fn task_setup_doctor_state_keeps_concurrent_project_root() {
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        let wires: Vec<String> = crate::task::wiring::known_wire_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for i in 0..20 {
+            let store = crate::registry::tests::yield_store();
+            crate::registry::cache_project_root(
+                &store,
+                Some(&emb),
+                "example-project",
+                "/example/old",
+            )
+            .await;
+            let root = std::path::PathBuf::from(format!("/example/new-{i}"));
+            let ((prev_wires, _), _) = tokio::join!(
+                record_setup_doctor_state(&store, "example-project"),
+                crate::registry::set_project_root(&store, Some(&emb), "example-project", &root),
+            );
+            assert!(prev_wires.is_empty(), "round {i}");
+            assert_eq!(
+                crate::registry::cached_project_root(&store, "example-project")
+                    .await
+                    .unwrap(),
+                Some(root.to_string_lossy().into_owned()),
+                "round {i}: the root"
+            );
+            let (_, payload) = store
+                .get(
+                    "example-project",
+                    &crate::registry::registry_row_id("example-project"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                payload.metadata["doctor_state"]["configured_wires"],
+                json!(wires),
+                "round {i}: the doctor state"
+            );
+            // A second setup sees what the first recorded.
+            let (prev_wires, _) = record_setup_doctor_state(&store, "example-project").await;
+            assert_eq!(prev_wires, wires, "round {i}");
+        }
     }
 }

@@ -28,8 +28,8 @@ use search::{
 };
 
 use recall_metrics::{
-    acquire_test_lock, domain_filter_snapshot, record_domain_query, record_promotion,
-    record_recall, recall_snapshot,
+    acquire_test_lock, domain_filter_snapshot, recall_snapshot, record_domain_query,
+    record_promotion, record_recall,
 };
 
 /// The recall→promotion join: a promotion of an id that a previous recall in
@@ -79,8 +79,14 @@ fn counters_reflect_recorded_events() {
     let before = recall_snapshot();
     let before_promoted = before["recall_promotions"].as_u64().unwrap_or(0);
 
-    record_recall("r12-counters-ns", &["55555555-5555-5555-5555-555555555555".to_string()]);
-    assert!(record_promotion("r12-counters-ns", "55555555-5555-5555-5555-555555555555"));
+    record_recall(
+        "r12-counters-ns",
+        &["55555555-5555-5555-5555-555555555555".to_string()],
+    );
+    assert!(record_promotion(
+        "r12-counters-ns",
+        "55555555-5555-5555-5555-555555555555"
+    ));
 
     let after = recall_snapshot();
     assert_eq!(
@@ -181,7 +187,10 @@ fn exact_match_predicates_match_exactly_and_nothing_else() {
     };
     assert!(type_allowed("fact", &filters));
     assert!(!type_allowed("Fact", &filters), "match is case-exact");
-    assert!(!type_allowed("factor", &filters), "match is not a substring");
+    assert!(
+        !type_allowed("factor", &filters),
+        "match is not a substring"
+    );
     assert!(!type_allowed("code_ast", &filters));
 
     // code_ast stays opt-in.
@@ -207,10 +216,22 @@ fn exact_match_predicates_match_exactly_and_nothing_else() {
     assert!(path_prefix_matches("anything", None));
 
     // Fact shape: exact-shaped keys, checked on the decision object itself.
-    assert!(fact_shape_matches(&serde_json::json!({"decision": {"component": "c"}}), "decision"));
-    assert!(!fact_shape_matches(&serde_json::json!({"Decision": {}}), "decision"), "key is exact");
-    assert!(!fact_shape_matches(&serde_json::json!({"decision": null}), "decision"), "a null key is absent");
-    assert!(fact_shape_matches(&serde_json::json!({"topology": {}}), "topology"));
+    assert!(fact_shape_matches(
+        &serde_json::json!({"decision": {"component": "c"}}),
+        "decision"
+    ));
+    assert!(
+        !fact_shape_matches(&serde_json::json!({"Decision": {}}), "decision"),
+        "key is exact"
+    );
+    assert!(
+        !fact_shape_matches(&serde_json::json!({"decision": null}), "decision"),
+        "a null key is absent"
+    );
+    assert!(fact_shape_matches(
+        &serde_json::json!({"topology": {}}),
+        "topology"
+    ));
     assert!(fact_shape_matches(&serde_json::json!({}), "any"));
 
     // Staleness: exclude exactly "changed"-unless-verified, nothing else.

@@ -18,9 +18,15 @@
  *   masked by a silent local fallback.
  */
 
-import { existsSync, readFileSync } from 'node:fs'
+import {
+  existsSync,
+  lstatSync,
+  readFileSync,
+  realpathSync,
+  statSync
+} from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 
 // ──────────────────────────────────────────────────────────────────────
 // Types (mirror MCP tool signatures & OpenClaw plugin API)
@@ -181,7 +187,10 @@ export function resolveConfig(raw: unknown, cwd = process.cwd()): PluginConfig {
     DEFAULT_CONFIG.endpoint
   // Preserve the exact namespace for MCP routing; sanitization happens only
   // where the value is interpolated into a prompt header (#329 review).
+  // Same order as the core plugin and `neurostrata-mcp namespace resolve`:
+  // project marker, harness config, NEUROSTRATA_NAMESPACE, discovery.
   const namespace =
+    findRootMarker(resolve(cwd))?.namespace ??
     asString(input.namespace) ??
     asString(process.env.NEUROSTRATA_NAMESPACE) ??
     discoverProjectNamespace(cwd)
@@ -201,6 +210,474 @@ export function resolveConfig(raw: unknown, cwd = process.cwd()): PluginConfig {
         DEFAULT_CONFIG.intentDetection.injectReminder
     }
   }
+}
+
+// Copied from plugins/core/index.ts: this adapter does not bundle the core.
+// Keep the two copies in step; the shared fixture tests both.
+// The project root marker walk (`.NeuroStrata/config.json`). This mirrors
+// `root_marker::find_root_marker` in the Rust daemon step for step; the
+// shared cases in tests/fixtures/root-marker-cases.json are the contract both
+// must pass. Only file-system reads, no process starts (#309).
+
+/** Which walk found a project root marker. */
+export type RootMarkerVia = 'own' | 'main' | 'nogit'
+
+export interface FoundRootMarker {
+  /** The project root, in the start path's own checkout. */
+  root: string
+  namespace: string
+  via: RootMarkerVia
+}
+
+type MarkerRead =
+  | { valid: true; namespace: string }
+  | { valid: false; path: string; reason: string }
+
+/** Marker files already warned about in this process: one line each. */
+const warnedMarkers = new Set<string>()
+
+/**
+ * Says on stderr, once per file, that the project marker at `path` cannot be
+ * read and is skipped: the namespace then comes from the other sources, as
+ * `neurostrata-mcp` does with its own warning (design section 5).
+ */
+function warnUnreadableMarker(path: string, reason: string): void {
+  if (warnedMarkers.has(path)) return
+  warnedMarkers.add(path)
+  console.error(
+    `[NeuroStrata] warning: the project marker ${path} could not be read (${reason}); it is skipped`
+  )
+}
+
+/**
+ * The raw spelling of every top-level `version` value in a JSON object text
+ * that already parsed. JSON.parse reads `1.0` as 1, but the daemon's reader
+ * (an unsigned integer) refuses it, so the spelling is checked here.
+ */
+function topLevelVersionSpellings(text: string): string[] {
+  const found: string[] = []
+  let depth = 0
+  let i = 0
+  while (i < text.length) {
+    const c = text[i]
+    if (c === '"') {
+      let j = i + 1
+      while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1
+      const literal = text.slice(i, j + 1)
+      i = j + 1
+      if (depth !== 1) continue
+      let k = i
+      while (k < text.length && /\s/.test(text[k])) k++
+      if (text[k] !== ':' || JSON.parse(literal) !== 'version') continue
+      k++
+      while (k < text.length && /\s/.test(text[k])) k++
+      const number = /^-?[0-9][0-9.eE+-]*/.exec(text.slice(k))
+      found.push(number ? number[0] : (text[k] ?? ''))
+      i = k
+      continue
+    }
+    if (c === '{' || c === '[') depth++
+    else if (c === '}' || c === ']') depth--
+    i++
+  }
+  return found
+}
+
+const NAMESPACE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/
+
+/**
+ * A namespace value as written, or undefined when it is not one: empty, an
+ * unexpanded variable, or anything but `[A-Za-z0-9_.:-]` starting with a
+ * letter or digit. The Rust installer's `usable_namespace` rule.
+ */
+export function usableNamespace(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const ns = raw.trim().replace(/^["']+|["']+$/g, '')
+  return NAMESPACE_PATTERN.test(ns) ? ns : undefined
+}
+
+/** Absolute on this host: a drive or UNC path on Windows, `/` elsewhere. */
+function isHostAbsolute(p: string): boolean {
+  if (process.platform === 'win32') {
+    return /^[A-Za-z]:[\\/]/.test(p) || /^[\\/]{2}[^\\/]/.test(p)
+  }
+  return p.startsWith('/')
+}
+
+/** Absolute on any host, for paths git wrote into `.git` and `commondir`. */
+function isAbsoluteAny(p: string): boolean {
+  return p.startsWith('/') || p.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(p)
+}
+
+/** The canonical spelling of an existing path, as Rust's `dunce` gives it. */
+function canonicalPath(p: string): string | null {
+  try {
+    const real = realpathSync.native(p)
+    // Drop the verbatim prefix where a plain spelling exists.
+    if (real.startsWith('\\\\?\\UNC\\')) return '\\\\' + real.slice(8)
+    if (real.startsWith('\\\\?\\')) return real.slice(4)
+    return real
+  } catch {
+    return null
+  }
+}
+
+/** `p` canonicalized through its nearest existing ancestor. */
+function canonicalThroughExisting(p: string): string {
+  const missing: string[] = []
+  let existing = p
+  while (true) {
+    const canonical = canonicalPath(existing)
+    if (canonical !== null) {
+      return missing.reduceRight((acc, part) => join(acc, part), canonical)
+    }
+    const parent = dirname(existing)
+    if (parent === existing) return p
+    missing.push(basename(existing))
+    existing = parent
+  }
+}
+
+function isDirectory(p: string): boolean {
+  try {
+    return statSync(p).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/** Canonical `child` inside canonical `parent`, compared by path components. */
+function canonicalInside(child: string, parent: string): boolean {
+  if (child === parent) return true
+  const unix = parent.endsWith('/') ? parent : parent + '/'
+  const win = parent.endsWith('\\') ? parent : parent + '\\'
+  return child.startsWith(unix) || child.startsWith(win)
+}
+
+function isFile(p: string): boolean {
+  try {
+    return statSync(p).isFile()
+  } catch {
+    return false
+  }
+}
+
+function ancestorsOf(dir: string): string[] {
+  const out: string[] = []
+  let current = dir
+  while (true) {
+    out.push(current)
+    const next = dirname(current)
+    if (next === current) return out
+    current = next
+  }
+}
+
+function pathParts(rel: string): string[] {
+  return rel.split(/[\\/]/).filter((part) => part !== '' && part !== '.')
+}
+
+/** The nearest folder at or above `dir` holding `.git` (folder or file). */
+function checkoutTop(dir: string): string | null {
+  return ancestorsOf(dir).find((d) => existsSync(join(d, '.git'))) ?? null
+}
+
+/** `rel` against `base` unless it is already absolute. */
+function joinedGitPath(base: string, rel: string): string {
+  return isAbsoluteAny(rel) ? rel : join(base, rel)
+}
+
+/** The gitdir a checkout's `.git` FILE names (relative to the checkout). */
+function gitdirOfFile(checkout: string): string | null {
+  let text: string
+  try {
+    text = readFileSync(join(checkout, '.git'), 'utf8')
+  } catch {
+    return null
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (trimmed.startsWith('gitdir:')) {
+      return joinedGitPath(checkout, trimmed.slice('gitdir:'.length).trim())
+    }
+  }
+  return null
+}
+
+/** The common directory a linked worktree's gitdir names in `commondir`. */
+function linkedCommonDir(gitdir: string): string | null {
+  try {
+    const common = readFileSync(join(gitdir, 'commondir'), 'utf8').trim()
+    return joinedGitPath(gitdir, common)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The main checkout when `top` is a linked worktree's top (its gitdir names
+ * a `commondir` that is a checkout's `.git`), else null. A submodule (no
+ * `commondir`) or a bare repository's worktree (common dir not `.git`) has
+ * none.
+ */
+function linkedMainCheckout(top: string): string | null {
+  if (isDirectory(join(top, '.git'))) return null
+  const gitdir = gitdirOfFile(top)
+  const common = gitdir === null ? null : linkedCommonDir(gitdir)
+  if (common === null) return null
+  const normalized = resolve(common)
+  if (basename(normalized) !== '.git') return null
+  const main = canonicalPath(dirname(normalized))
+  if (main === null) return null
+  const own = canonicalPath(top) ?? top
+  return main === own ? null : main
+}
+
+/** The marker in `dir`: valid, unreadable, or null when there is none. */
+function readRootMarker(dir: string): MarkerRead | null {
+  const path = join(dir, '.NeuroStrata', 'config.json')
+  const unreadable = (reason: string): MarkerRead => ({
+    valid: false,
+    path,
+    reason
+  })
+  let text: string
+  try {
+    text = readFileSync(path, 'utf8')
+  } catch (err) {
+    return (err as { code?: string })?.code === 'ENOENT'
+      ? null
+      : unreadable(String((err as Error)?.message ?? err))
+  }
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1)
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return unreadable('it is not valid JSON')
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return unreadable('it is not a JSON object')
+  }
+  const doc = parsed as Record<string, unknown>
+  const sourceId = doc.source_id
+  const versions = topLevelVersionSpellings(text)
+  if (doc.version !== 1 || versions.length !== 1 || versions[0] !== '1') {
+    return unreadable('its version is not 1')
+  }
+  if (
+    typeof doc.namespace !== 'string' ||
+    !NAMESPACE_PATTERN.test(doc.namespace)
+  ) {
+    return unreadable('its namespace is missing or not a namespace')
+  }
+  if (
+    sourceId !== undefined &&
+    sourceId !== null &&
+    typeof sourceId !== 'string'
+  ) {
+    return unreadable('its source_id is not a string')
+  }
+  return { valid: true, namespace: doc.namespace }
+}
+
+/**
+ * The marker in `dir` when there is one to report. A `.NeuroStrata` that is
+ * a link pointing elsewhere, or a folder without `config.json`, is none.
+ */
+function markerAt(dir: string): MarkerRead | null {
+  const folder = join(dir, '.NeuroStrata')
+  try {
+    const st = lstatSync(folder)
+    if (st.isSymbolicLink() || !st.isDirectory()) return null
+  } catch {
+    return null
+  }
+  const realFolder = canonicalPath(folder)
+  const realDir = canonicalPath(dir)
+  if (realFolder === null || realDir === null) return null
+  if (realFolder !== join(realDir, '.NeuroStrata')) return null
+  return readRootMarker(dir)
+}
+
+function depthBelow(dir: string, top: string): number {
+  return pathParts(relative(top, dir)).length
+}
+
+/**
+ * The marker that decides `startDir`'s project root, or null. `startDir`
+ * must be absolute on this host; for a file the walk starts at its folder.
+ *  1. Own checkout: from the start folder up to its checkout top, inclusive;
+ *     the deepest marker wins.
+ *  2. Linked worktree: the start folder mapped into the main checkout,
+ *     walked from its nearest existing folder up to the main checkout's top,
+ *     never entering a folder with its own `.git`. Steps 1 and 2 both run;
+ *     the deeper marker wins, at equal depth the own checkout's.
+ *  3. Outside git: the first marker above the start folder.
+ * When the winning marker cannot be read the answer is null, with one
+ * warning line naming the file: the caller falls back to the other namespace
+ * sources, never to a marker further up.
+ */
+export function findRootMarker(startDir: string): FoundRootMarker | null {
+  if (typeof startDir !== 'string' || !isHostAbsolute(startDir)) return null
+  let start = canonicalThroughExisting(startDir)
+  if (isFile(start)) start = dirname(start)
+
+  const decide = (
+    root: string,
+    read: MarkerRead,
+    via: RootMarkerVia
+  ): FoundRootMarker | null => {
+    if (read.valid) return { root, namespace: read.namespace, via }
+    warnUnreadableMarker(read.path, read.reason)
+    return null
+  }
+
+  const top = checkoutTop(start)
+  if (top === null) {
+    for (const dir of ancestorsOf(start)) {
+      const read = markerAt(dir)
+      if (read) return decide(dir, read, 'nogit')
+    }
+    return null
+  }
+
+  let own: { depth: number; root: string; read: MarkerRead } | null = null
+  for (const dir of ancestorsOf(start)) {
+    const read = markerAt(dir)
+    if (read) {
+      own = { depth: depthBelow(dir, top), root: dir, read }
+      break
+    }
+    if (dir === top) break
+  }
+
+  let main: { depth: number; root: string; read: MarkerRead } | null = null
+  const mainTop = linkedMainCheckout(top)
+  if (mainTop !== null) {
+    const allowed = [mainTop]
+    const mainCanonical = canonicalPath(mainTop) ?? mainTop
+    let dir = mainTop
+    for (const part of pathParts(relative(top, start))) {
+      dir = join(dir, part)
+      // Same guard as the Rust main_checkout_walk: a symlink/junction or a
+      // folder that canonicalizes outside the main checkout belongs to
+      // another project, so its markers must not enter this walk.
+      let realDir: string | null = null
+      try {
+        const st = lstatSync(dir)
+        if (st.isSymbolicLink() || !st.isDirectory()) break
+        realDir = canonicalPath(dir)
+      } catch {
+        break
+      }
+      if (realDir === null || !canonicalInside(realDir, mainCanonical)) break
+      if (existsSync(join(dir, '.git'))) break
+      allowed.push(dir)
+    }
+    for (let i = allowed.length - 1; i >= 0; i--) {
+      const read = markerAt(allowed[i])
+      if (read) {
+        const below = relative(mainTop, allowed[i])
+        main = {
+          depth: depthBelow(allowed[i], mainTop),
+          root: below === '' ? top : join(top, below),
+          read
+        }
+        break
+      }
+    }
+  }
+
+  if (own && main) {
+    return main.depth > own.depth
+      ? decide(main.root, main.read, 'main')
+      : decide(own.root, own.read, 'own')
+  }
+  if (own) return decide(own.root, own.read, 'own')
+  if (main) return decide(main.root, main.read, 'main')
+  return null
+}
+
+/** Each harness's plugin config, relative to the project root, and the
+ * namespace's place inside it. The installer writes these files. */
+const HARNESS_CONFIG_FILES: Record<string, { file: string[]; key: string[] }> =
+  {
+    claude: {
+      file: ['.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'],
+      key: ['namespace']
+    },
+    opencode: {
+      file: ['.opencode', 'neurostrata-plugin.json'],
+      key: ['neurostrata', 'namespace']
+    },
+    codex: {
+      file: ['.codex', 'plugins', 'neurostrata.json'],
+      key: ['namespace']
+    },
+    hermes: {
+      file: ['.hermes', 'plugins', 'neurostrata.json'],
+      key: ['namespace']
+    },
+    openclaw: {
+      file: ['.openclaw', 'plugins', 'neurostrata.json'],
+      key: ['namespace']
+    },
+    'github-cli': {
+      file: ['.NeuroStrata', 'plugins', 'github-cli', 'copilot-extension.json'],
+      key: ['namespace']
+    }
+  }
+
+/**
+ * The namespace `harness`'s plugin config names for the project at
+ * `projectDir`, read from its checkout's top, then (for a linked worktree,
+ * whose untracked configs usually live only in the main checkout) the main
+ * checkout's; outside git from `projectDir` itself. Empty when none names a
+ * usable namespace.
+ *
+ * `runnerDir` is the folder of the hook runner the installer wrote,
+ * `<root>/.NeuroStrata/plugins/<harness>/`: the config of the project that
+ * installed it, `<root>`, is read first.
+ */
+export function readHarnessConfig(
+  harness: string,
+  projectDir: string,
+  runnerDir?: string
+): { namespace?: string } {
+  const spec = HARNESS_CONFIG_FILES[harness]
+  if (!spec) return {}
+  const roots: Array<string | null> = []
+  if (typeof runnerDir === 'string' && runnerDir !== '') {
+    const plugins = dirname(resolve(runnerDir))
+    const stateDir = dirname(plugins)
+    if (
+      basename(resolve(runnerDir)) === harness &&
+      basename(plugins) === 'plugins' &&
+      basename(stateDir) === '.NeuroStrata'
+    ) {
+      roots.push(dirname(stateDir))
+    }
+  }
+  if (typeof projectDir === 'string' && projectDir !== '') {
+    const start = canonicalThroughExisting(resolve(projectDir))
+    const top = checkoutTop(start)
+    roots.push(...(top === null ? [start] : [top, linkedMainCheckout(top)]))
+  }
+  for (const root of roots) {
+    if (root === null) continue
+    try {
+      let value: unknown = JSON.parse(
+        readFileSync(join(root, ...spec.file), 'utf8').replace(/^\uFEFF/, '')
+      )
+      for (const key of spec.key) value = asRecord(value)[key]
+      const namespace = usableNamespace(value)
+      if (namespace) return { namespace }
+    } catch {
+      // missing or malformed: try the next root
+    }
+  }
+  return {}
 }
 
 /**
@@ -891,6 +1368,56 @@ let mcpClient!: NeuroStrataMCPClient
  */
 let pluginCtx: OpenClawPluginContext | null = null
 
+/** The project folder this session runs in, from the host or the runner. */
+let sessionProjectDir: string | undefined
+
+/** The NeuroStrata tools whose scope follows the session's project folder. */
+const SESSION_SCOPED_TOOLS = [
+  'neurostrata_task_claim',
+  'neurostrata_get_snapshot'
+]
+
+/**
+ * Whether `toolName` is one of SESSION_SCOPED_TOOLS, bare or as a host
+ * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
+ * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
+ * A copy of core's `isSessionScopedTool`.
+ */
+export function isSessionScopedTool(toolName: string): boolean {
+  const name = String(toolName ?? '')
+  return SESSION_SCOPED_TOOLS.some(
+    (tool) =>
+      name === tool ||
+      (name.endsWith(tool) && /[_.:]$/.test(name.slice(0, -tool.length)))
+  )
+}
+
+/**
+ * Claim scope from a linked worktree (design 6.5): passes the session's
+ * project folder as `worktree` on `neurostrata_task_claim` and
+ * `neurostrata_get_snapshot` calls that carry no `worktree`, `project_root`
+ * or `cwd`, which the daemon would otherwise scope to the namespace's
+ * registry root (the main checkout when a marker applies). Changes `args`
+ * in place; true when it did. A copy of core's `addSessionWorktree`.
+ */
+export function addSessionWorktree(
+  toolName: string,
+  args: Record<string, unknown>,
+  projectDir: string | undefined
+): boolean {
+  if (!isSessionScopedTool(toolName) || !projectDir) return false
+  if (args === null || typeof args !== 'object' || Array.isArray(args))
+    return false
+  if (
+    asString(args.worktree) ||
+    asString(args.project_root) ||
+    asString(args.cwd)
+  )
+    return false
+  args.worktree = projectDir
+  return true
+}
+
 function requireCtx(): OpenClawPluginContext {
   if (!pluginCtx) {
     throw new Error('NeuroStrata plugin used before initialize()')
@@ -902,7 +1429,8 @@ export async function initialize(
   ctx: (Partial<OpenClawPluginContext> & Record<string, unknown>) | undefined
 ): Promise<void> {
   pluginCtx = (ctx as OpenClawPluginContext) ?? null
-  config = resolveConfig(ctx?.config ?? ctx ?? {})
+  sessionProjectDir = asString(ctx?.projectDir) ?? process.cwd()
+  config = resolveConfig(ctx?.config ?? ctx ?? {}, sessionProjectDir)
 
   const token = config.bearerToken ?? loadDaemonToken(config.tokenFile)
   mcpClient = new NeuroStrataMCPClient({
@@ -1137,11 +1665,17 @@ export async function handleHookEvent(
       await runActionGuard(toolName, JSON.stringify(toolInput))
     )
   }
+  const scoped = addSessionWorktree(
+    toolName,
+    toolInput,
+    sessionProjectDir ?? asString(event.cwd) ?? process.cwd()
+  )
   return {
     continue: true,
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
-      permissionDecision: 'allow'
+      permissionDecision: 'allow',
+      ...(scoped ? { updatedInput: toolInput } : {})
     }
   }
 }

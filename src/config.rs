@@ -344,6 +344,161 @@ impl Config {
     }
 }
 
+/// How long a `config.json.lock` may sit before it is taken as left behind by
+/// a process that died holding it.
+const CONFIG_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long [`ConfigLock::acquire`] waits for a live lock.
+const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// An exclusive lock on the user config: the file `<config>.lock` beside it,
+/// created with `create_new` and removed on drop; one left older than
+/// [`CONFIG_LOCK_STALE`] by a dead process is broken (see
+/// `break_stale_lock`). A read-check-write of the
+/// config holds it so two writers cannot overwrite each other in between.
+pub struct ConfigLock {
+    path: PathBuf,
+}
+
+impl ConfigLock {
+    pub fn acquire(config_path: &Path) -> Result<Self> {
+        let name = config_path
+            .file_name()
+            .context("Config path must name a file")?
+            .to_string_lossy()
+            .into_owned();
+        let path = config_path.with_file_name(format!("{name}.lock"));
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Could not create config directory {}", parent.display())
+            })?;
+        }
+        let started = std::time::Instant::now();
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", std::process::id());
+                    return Ok(ConfigLock { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if is_stale(&path) {
+                        break_stale_lock(&path);
+                        continue;
+                    }
+                    if started.elapsed() > CONFIG_LOCK_WAIT {
+                        anyhow::bail!(
+                            "the user config is locked by {} (another NeuroStrata command is writing it)",
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                // Windows answers "access denied" while another process's
+                // delete or rename of the lock file is still pending: the
+                // lock is changing hands, so wait like for a held lock.
+                Err(e)
+                    if cfg!(windows)
+                        && e.kind() == std::io::ErrorKind::PermissionDenied
+                        && started.elapsed() <= CONFIG_LOCK_WAIT =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("Could not create {}", path.display()))
+                }
+            }
+        }
+    }
+}
+
+fn is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > CONFIG_LOCK_STALE)
+}
+
+/// Remove the stale lock at `path`, serialized by a short-lived second lock
+/// (`<lock>.break`) and re-checked under it: two waiters that both saw the
+/// same stale file cannot both remove "it", because the second one would
+/// find the first one's successor fresh and leave it alone. A `.break` file
+/// itself older than the stale limit was left by a process that died while
+/// breaking, and is removed.
+fn break_stale_lock(path: &Path) {
+    let mut breaker = path.as_os_str().to_owned();
+    breaker.push(".break");
+    let breaker = PathBuf::from(breaker);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&breaker)
+    {
+        Ok(file) => {
+            drop(file);
+            if is_stale(path) {
+                let _ = fs::remove_file(path);
+            }
+            let _ = fs::remove_file(&breaker);
+        }
+        Err(_) => {
+            if is_stale(&breaker) {
+                let _ = fs::remove_file(&breaker);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// What [`bind_project_context_if_free`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BindOutcome {
+    Bound,
+    AlreadyBoundHere,
+    /// The id is bound to this other `.NeuroStrata` folder, which exists.
+    LiveElsewhere(PathBuf),
+}
+
+/// Bind `source_id` to the `.NeuroStrata` folder `marker_dir` only when the id
+/// is unbound or bound to a folder that no longer exists; a live binding is
+/// never replaced (spec section 4). The check and the write hold
+/// [`ConfigLock`].
+pub fn bind_project_context_if_free(source_id: &str, marker_dir: &Path) -> Result<BindOutcome> {
+    bind_project_context_if_free_at(&Config::default_path()?, source_id, marker_dir)
+}
+
+pub(crate) fn bind_project_context_if_free_at(
+    config_path: &Path,
+    source_id: &str,
+    marker_dir: &Path,
+) -> Result<BindOutcome> {
+    let _lock = ConfigLock::acquire(config_path)?;
+    let mut config = Config::load_from(config_path)?;
+    let wanted = fs::canonicalize(marker_dir)
+        .with_context(|| format!("Could not canonicalize {}", marker_dir.display()))?;
+    if let Some(bound) = config.project_contexts.get(source_id) {
+        if fs::canonicalize(bound).is_ok_and(|b| b == wanted) {
+            return Ok(BindOutcome::AlreadyBoundHere);
+        }
+        if bound.exists() {
+            return Ok(BindOutcome::LiveElsewhere(bound.clone()));
+        }
+    }
+    config.bind_project_context(source_id, marker_dir)?;
+    config.save_to(config_path)?;
+    Ok(BindOutcome::Bound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,5 +777,162 @@ mod tests {
         .unwrap();
         assert_eq!(config.deduplication.similarity_threshold, 0.95);
         assert_eq!(config.deduplication.provider, DedupProviderMode::Auto);
+    }
+
+    #[test]
+    fn bind_if_free_never_overwrites_live_binding() {
+        let root = temp_dir("bind-if-free-live");
+        let first = root.join("first/.NeuroStrata");
+        let second = root.join("second/.NeuroStrata");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let config_path = write_config(&root);
+
+        assert_eq!(
+            bind_project_context_if_free_at(&config_path, "example-project", &first).unwrap(),
+            BindOutcome::Bound
+        );
+        assert_eq!(
+            bind_project_context_if_free_at(&config_path, "example-project", &first).unwrap(),
+            BindOutcome::AlreadyBoundHere
+        );
+        let live = fs::canonicalize(&first).unwrap();
+        assert_eq!(
+            bind_project_context_if_free_at(&config_path, "example-project", &second).unwrap(),
+            BindOutcome::LiveElsewhere(live.clone())
+        );
+        let config = Config::load_from(&config_path).unwrap();
+        assert_eq!(config.project_contexts.get("example-project"), Some(&live));
+        assert!(
+            !config_path.with_file_name("config.json.lock").exists(),
+            "lock released"
+        );
+    }
+
+    #[test]
+    fn bind_if_free_rebinds_missing_folder() {
+        let root = temp_dir("bind-if-free-missing");
+        let gone = root.join("gone/.NeuroStrata");
+        let here = root.join("here/.NeuroStrata");
+        fs::create_dir_all(&gone).unwrap();
+        fs::create_dir_all(&here).unwrap();
+        let config_path = write_config(&root);
+        bind_project_context_if_free_at(&config_path, "example-project", &gone).unwrap();
+        fs::remove_dir_all(root.join("gone")).unwrap();
+
+        assert_eq!(
+            bind_project_context_if_free_at(&config_path, "example-project", &here).unwrap(),
+            BindOutcome::Bound
+        );
+        let config = Config::load_from(&config_path).unwrap();
+        assert_eq!(
+            config.project_contexts.get("example-project"),
+            Some(&fs::canonicalize(&here).unwrap())
+        );
+    }
+
+    #[test]
+    fn concurrent_explicit_bind_survives() {
+        let root = temp_dir("bind-if-free-concurrent");
+        let explicit = root.join("explicit/.NeuroStrata");
+        let other = root.join("other/.NeuroStrata");
+        fs::create_dir_all(&explicit).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let config_path = write_config(&root);
+
+        // A holds the lock across its read-modify-write, as `project-context
+        // bind` does; B starts while A holds it.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let a = {
+            let (config_path, explicit) = (config_path.clone(), explicit.clone());
+            std::thread::spawn(move || {
+                let _lock = ConfigLock::acquire(&config_path).unwrap();
+                locked_tx.send(()).unwrap();
+                let mut config = Config::load_from(&config_path).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                config
+                    .bind_project_context("example-project", &explicit)
+                    .unwrap();
+                config.save_to(&config_path).unwrap();
+            })
+        };
+        locked_rx.recv().unwrap();
+        let outcome =
+            bind_project_context_if_free_at(&config_path, "example-project", &other).unwrap();
+        a.join().unwrap();
+
+        let live = fs::canonicalize(&explicit).unwrap();
+        assert_eq!(outcome, BindOutcome::LiveElsewhere(live.clone()));
+        let config = Config::load_from(&config_path).unwrap();
+        assert_eq!(config.project_contexts.get("example-project"), Some(&live));
+    }
+
+    #[test]
+    fn waiters_on_a_stale_config_lock_hold_it_one_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for round in 0..5 {
+            let root = temp_dir("config-lock-stale-race");
+            let config_path = write_config(&root);
+            let lock = config_path.with_file_name("config.json.lock");
+            fs::write(&lock, "12345").unwrap();
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+            fs::File::options()
+                .write(true)
+                .open(&lock)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+
+            let inside = std::sync::Arc::new(AtomicUsize::new(0));
+            let most = std::sync::Arc::new(AtomicUsize::new(0));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let waiters: Vec<_> = (0..4)
+                .map(|_| {
+                    let (config_path, inside, most, barrier) = (
+                        config_path.clone(),
+                        inside.clone(),
+                        most.clone(),
+                        barrier.clone(),
+                    );
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let _held = ConfigLock::acquire(&config_path).unwrap();
+                        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    })
+                })
+                .collect();
+            for w in waiters {
+                w.join().unwrap();
+            }
+            assert_eq!(most.load(Ordering::SeqCst), 1, "round {round}");
+            let left: Vec<_> = fs::read_dir(&root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".lock"))
+                .collect();
+            assert!(left.is_empty(), "round {round}: {left:?}");
+        }
+    }
+
+    #[test]
+    fn stale_config_lock_is_replaced() {
+        let root = temp_dir("config-lock-stale");
+        let config_path = write_config(&root);
+        let lock = config_path.with_file_name("config.json.lock");
+        fs::write(&lock, "12345").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let held = ConfigLock::acquire(&config_path).unwrap();
+        assert!(lock.exists());
+        drop(held);
+        assert!(!lock.exists());
     }
 }

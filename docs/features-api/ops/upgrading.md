@@ -12,6 +12,10 @@ Schema and config defaults are upgraded automatically. **Upgrading from ≤1.17.
 
 After this one-time reparse, later upgrades return to the automatic path below.
 
+## Set the project root once per clone
+
+After upgrading to a build with the project marker, run `neurostrata-mcp hooks install` once in each git clone (non-git projects: `neurostrata_task_setup`). It writes `.NeuroStrata/config.json`, or asks which root or namespace you mean. See [Project root](project-root.md).
+
 ## How automatic upgrades work
 
 ## How Zero-Touch Upgrades Work

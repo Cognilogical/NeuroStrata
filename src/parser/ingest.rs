@@ -2657,7 +2657,7 @@ pub async fn ingest_directory(
     }
 
     // Cache project_root into the registry row (best-effort) for hook hygiene.
-    crate::registry::cache_project_root(
+    crate::registry::cache_project_root_unless_marked(
         &vector_store,
         Some(&embedder),
         namespace,
