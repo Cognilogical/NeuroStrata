@@ -179,3 +179,31 @@ test("claim scope: the runner passes the session folder as worktree on task_clai
   });
   assert.equal(kept.hookSpecificOutput.updatedInput, undefined);
 });
+
+// Code-scanning polynomial-redos regression (alerts 25-27): quote stripping
+// must be linear and preserve the original match semantics.
+describe('usableNamespace — linear quote stripping (code-scanning 25-27)', () => {
+  async function usable() {
+    const mod = await import('./dist/index.js')
+    assert.equal(typeof mod.usableNamespace, 'function', 'helper exported from dist')
+    return mod.usableNamespace
+  }
+
+  it('strips leading/trailing single and double quotes', async () => {
+    const f = await usable()
+    assert.equal(f('"ns"'), 'ns')
+    assert.equal(f("'ns'"), 'ns')
+    assert.equal(f("\"'ns'"), 'ns')
+    assert.equal(f('  "ns"  '), 'ns')
+    assert.equal(f('project:core'), 'project:core')
+    assert.equal(f('"unterminated'), 'unterminated')
+    assert.equal(f('""""'), undefined)
+  })
+
+  it('handles long quote runs without superlinear backtracking', async () => {
+    const f = await usable()
+    const adversarial = Array.from({ length: 200 }, () => '"'.repeat(50) + 'x').join('') + "'".repeat(50)
+    assert.equal(f(adversarial), undefined)
+    assert.equal(f('"'.repeat(20000) + 'ns' + "'".repeat(20000)), 'ns')
+  })
+})

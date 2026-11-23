@@ -137,7 +137,7 @@ const NAMESPACE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
 export function usableNamespace(raw) {
     if (typeof raw !== 'string')
         return undefined;
-    const ns = raw.trim().replace(/^["']+|["']+$/g, '');
+    const ns = raw.trim().replace(/^["']+/, '').replace(/["']+$/, '');
     return NAMESPACE_PATTERN.test(ns) ? ns : undefined;
 }
 /** Absolute on this host: a drive or UNC path on Windows, `/` elsewhere. */

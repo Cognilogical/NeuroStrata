@@ -1583,7 +1583,7 @@ mod tests {
             // The fixture tag "rename-fault" lives in the path, so a loose
             // `contains("rename")` would also pass a READ-stage failure;
             // only the tmp->rename step's message says "record rename".
-            "the failure must be the tmp->rename step, not an earlier stage: {err}"
+            "the failure must be the tmp->rename step, not an earlier stage"
         );
 
         // Ordering — the WAL compaction must NOT have run: the entry stays
@@ -2200,7 +2200,7 @@ mod tests {
         let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
         assert!(
             err.contains("signing failed"),
-            "a corrupt key must fail the drain as a signing failure: {err}"
+            "a corrupt key must fail the drain as a signing failure"
         );
         assert_eq!(
             outbox.pending().unwrap().len(),
@@ -2231,7 +2231,7 @@ mod tests {
         let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
         assert!(
             err.contains("signing failed"),
-            "a corrupt key must fail even an already-applied drain: {err}"
+            "a corrupt key must fail even an already-applied drain"
         );
         assert_eq!(
             outbox.pending().unwrap().len(),
@@ -2283,7 +2283,7 @@ mod tests {
         let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
         assert!(
             err.contains("signing failed"),
-            "an unsignable key must fail the drain as a signing failure: {err}"
+            "an unsignable key must fail the drain as a signing failure"
         );
         assert_eq!(
             outbox.pending().unwrap().len(),
@@ -2315,7 +2315,7 @@ mod tests {
         let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
         assert!(
             err.contains("signing failed"),
-            "an unsignable key must fail even an already-applied drain: {err}"
+            "an unsignable key must fail even an already-applied drain"
         );
         assert_eq!(
             outbox.pending().unwrap().len(),
@@ -2624,7 +2624,7 @@ mod tests {
         let err = drain_once(&outbox, &mesh, "node-author").unwrap_err();
         assert!(
             err.contains("mesh commit failed"),
-            "the drain must fail at the commit step: {err}"
+            "the drain must fail at the commit step"
         );
         assert!(
             bundle_files_under(mesh.root()).is_empty(),
