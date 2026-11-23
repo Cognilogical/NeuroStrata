@@ -67,6 +67,18 @@ async function main() {
   await writeStdout(JSON.stringify({ continue: true }));
 }
 main().catch((err) => {
-  process.stderr.write(String(err) + "\n");
-  process.exit(2);
+  const reason = String(err);
+  process.stderr.write(reason + "\n");
+  // PowerShell collapses a nonzero exit, so a bare `process.exit(2)` leaves
+  // the hook fail-OPEN on Windows. An explicit deny JSON fails closed on every
+  // shell; no `continue` — Codex rejects it on PreToolUse.
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: `NeuroStrata hook runner failed: ${reason}`,
+      },
+    })
+  );
 });

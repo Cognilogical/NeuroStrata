@@ -575,3 +575,64 @@ test("usableNamespace handles long quote runs without superlinear backtracking",
   assert.equal(f(adversarial), undefined);
   assert.equal(f('"'.repeat(20000) + "ns" + "'".repeat(20000)), "ns");
 });
+
+// Issue #382 batch regressions.
+test("368-F3: PreToolUse allow replies omit continue (Codex contract)", async () => {
+  const mod = await import("./dist/index.js");
+  mod.resetState();
+  const out = await mod.handleHookEvent({
+    hook_event_name: "PreToolUse",
+    tool_name: "read",
+    tool_input: { file_path: "src/example.ts" },
+  });
+  assert.equal(out.continue, undefined);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "allow");
+});
+
+test("378-F2: env namespace uses the CLI's usable-env rule", async () => {
+  const base = markerTempDir("ns-hermes-env-");
+  const saved = process.env.NEUROSTRATA_NAMESPACE;
+  try {
+    process.env.NEUROSTRATA_NAMESPACE = '"alpha"';
+    assert.equal(resolveConfig({}, base).namespace, "alpha");
+    process.env.NEUROSTRATA_NAMESPACE = "'beta'";
+    assert.equal(resolveConfig({}, base).namespace, "beta");
+  } finally {
+    if (saved === undefined) delete process.env.NEUROSTRATA_NAMESPACE;
+    else process.env.NEUROSTRATA_NAMESPACE = saved;
+  }
+});
+
+test("378-F5/F9: checkout config wins; unreadable config fails closed", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join, dirname } = await import("node:path");
+  const { readHarnessConfig } = await import("./dist/index.js");
+  const base = mkdtempSync(join(tmpdir(), "ns-hermes-config-"));
+  const repo = join(base, "repo");
+  const other = join(base, "other");
+  mkdirSync(join(repo, ".git"), { recursive: true });
+  mkdirSync(join(other, ".git"), { recursive: true });
+  const config = join(repo, ".hermes", "plugins", "neurostrata.json");
+  mkdirSync(dirname(config), { recursive: true });
+  writeFileSync(config, JSON.stringify({ namespace: "from-checkout" }));
+  const runnerDir = join(other, ".NeuroStrata", "plugins", "hermes");
+  const otherConfig = join(runnerDir, "neurostrata.json");
+  mkdirSync(runnerDir, { recursive: true });
+  writeFileSync(otherConfig, JSON.stringify({ namespace: "from-runner" }));
+
+  assert.deepEqual(readHarnessConfig("hermes", repo, runnerDir), {
+    namespace: "from-checkout",
+  });
+
+  writeFileSync(config, "{ broken json");
+  const errors = [];
+  const original = console.error;
+  console.error = (line) => errors.push(String(line));
+  try {
+    assert.throws(() => readHarnessConfig("hermes", repo, runnerDir), /could not be read/);
+    assert.ok(errors.some((line) => line.includes(config)), "must report the unreadable config");
+  } finally {
+    console.error = original;
+  }
+});

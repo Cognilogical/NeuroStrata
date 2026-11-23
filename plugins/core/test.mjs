@@ -409,6 +409,21 @@ describe('resolveConfig namespace priority (never hardcodes NeuroStrata)', () =>
     }
   })
 
+  it('env NEUROSTRATA_NAMESPACE is normalized like the CLI (issue #378 F2)', () => {
+    process.env.NEUROSTRATA_NAMESPACE = '"alpha"'
+    try {
+      assert.equal(resolveConfig({}, '/tmp/opencode').namespace, 'alpha')
+      process.env.NEUROSTRATA_NAMESPACE = "'beta'"
+      assert.equal(resolveConfig({}, '/tmp/opencode').namespace, 'beta')
+      // A value that is not a namespace is ignored, not passed to the daemon.
+      process.env.NEUROSTRATA_NAMESPACE = '$NS; rm -rf /'
+      const cfg = resolveConfig({}, '/tmp/opencode')
+      assert.notEqual(cfg.namespace, '$NS; rm -rf /')
+    } finally {
+      delete process.env.NEUROSTRATA_NAMESPACE
+    }
+  })
+
   it('falls back to discoverProjectNamespace(cwd), never hardcoded NeuroStrata', () => {
     const cfg = resolveConfig({}, '/tmp/opencode')
     assert.ok(typeof cfg.namespace === 'string' && cfg.namespace.length > 0)
@@ -596,7 +611,8 @@ describe('project root marker and namespace order', () => {
     })
     assert.deepEqual(readHarnessConfig('codex', repo), {})
     assert.deepEqual(readHarnessConfig('unknown', repo), {})
-    // The runner's own install is read first: <root>/.NeuroStrata/plugins/<harness>.
+    // The session checkout answers first: a shared runner's install root must
+    // not override this project's config (issue #378 F5).
     buildLayout(base, ['other git-dir'])
     const other = under(base, 'other')
     mkdirSync(join(other, '.NeuroStrata', 'plugins', 'claude'), {
@@ -608,6 +624,12 @@ describe('project root marker and namespace order', () => {
     )
     const runnerDir = join(repo, '.NeuroStrata', 'plugins', 'claude')
     assert.deepEqual(readHarnessConfig('claude', other, runnerDir), {
+      namespace: 'from-other'
+    })
+    // With no config of its own, the session checkout falls back to the
+    // runner's install root (the legitimate use of runnerDir).
+    buildLayout(base, ['bare git-dir'])
+    assert.deepEqual(readHarnessConfig('claude', under(base, 'bare'), runnerDir), {
       namespace: 'example-project'
     })
     assert.deepEqual(readHarnessConfig('claude', other), {
@@ -623,6 +645,31 @@ describe('project root marker and namespace order', () => {
       JSON.stringify({ namespace: '$NS' })
     )
     assert.deepEqual(readHarnessConfig('claude', repo), {})
+  })
+
+  it('readHarnessConfig fails closed on an unreadable config (issue #378 F9)', () => {
+    const base = tempDir()
+    buildLayout(base, ['repo git-dir'])
+    const repo = under(base, 'repo')
+    const configDir = join(repo, '.NeuroStrata', 'plugins', 'claude')
+    mkdirSync(configDir, { recursive: true })
+    const config = join(configDir, 'neurostrata.json')
+    writeFileSync(config, '{ broken json')
+    const errors = []
+    const originalError = console.error
+    console.error = (line) => errors.push(String(line))
+    try {
+      assert.throws(() => readHarnessConfig('claude', repo), /could not be read/)
+      assert.ok(
+        errors.some((line) => line.includes(config) && line.includes('valid JSON')),
+        `unreadable config must be reported on stderr; saw ${JSON.stringify(errors)}`
+      )
+      // A missing config stays a normal miss, not a fail-closed error.
+      rmSync(config)
+      assert.deepEqual(readHarnessConfig('claude', repo), {})
+    } finally {
+      console.error = originalError
+    }
   })
 
   it('resolveHookProjectDir: CLAUDE_PROJECT_DIR, then the SessionStart folder, then cwd', () => {
@@ -726,6 +773,53 @@ describe('project root marker and namespace order', () => {
     }
     assert.equal(resolveHookProjectDir('claude', start, {}), repo)
     assert.equal(readFileSync(sessionPath, 'utf8'), '{ half a fi')
+  })
+
+  it('resolveHookProjectDir refuses linked session state (issue #378 F8)', (t) => {
+    const base = tempDir()
+    buildLayout(base, ['repo git-dir', 'repo neurostrata-dir', 'elsewhere'])
+    const repo = under(base, 'repo')
+    const outside = under(base, 'elsewhere')
+    mkdirSync(outside, { recursive: true })
+    const stateDir = join(repo, '.NeuroStrata')
+    const sessionPath = join(stateDir, 'active_session.json')
+    const start = {
+      session_id: 's1',
+      cwd: repo,
+      hook_event_name: 'SessionStart'
+    }
+
+    // A symlinked `.NeuroStrata` can point at another checkout's state.
+    const linkedState = join(outside, 'linked-state')
+    mkdirSync(linkedState, { recursive: true })
+    rmSync(stateDir, { recursive: true, force: true })
+    try {
+      symlinkSync(
+        linkedState,
+        stateDir,
+        process.platform === 'win32' ? 'junction' : 'dir'
+      )
+    } catch (err) {
+      t.skip(`symlink creation not permitted: ${err.message}`)
+      return
+    }
+    assert.equal(resolveHookProjectDir('claude', start, {}), repo)
+    assert.equal(existsSync(join(linkedState, 'active_session.json')), false)
+
+    // A symlinked session file must not be read or replaced either.
+    rmSync(stateDir, { recursive: true, force: true })
+    mkdirSync(stateDir, { recursive: true })
+    const outsideFile = join(outside, 'active_session.json')
+    writeFileSync(
+      outsideFile,
+      JSON.stringify({ claude_session_dirs: { s1: outside } })
+    )
+    symlinkSync(outsideFile, sessionPath, 'file')
+    assert.equal(
+      resolveHookProjectDir('claude', { ...start, hook_event_name: 'PreToolUse' }, {}),
+      repo
+    )
+    assert.equal(readFileSync(outsideFile, 'utf8').includes(outside), true)
   })
 
   it('an unreadable marker is skipped with one warning naming the file', () => {
@@ -972,7 +1066,7 @@ describe('handleHookEvent / handleClaudeHookEvent alias', () => {
         tool_input: target
       })
     })
-    assert.equal(out.continue, true)
+    assert.equal(out.continue, undefined) // #368 F3: no continue on PreToolUse
     assert.equal(out.hookSpecificOutput.permissionDecision, 'allow')
     assert.ok(target.prompt.includes('### NeuroStrata Task & Graph Context'))
   })
@@ -998,7 +1092,7 @@ describe('handleHookEvent / handleClaudeHookEvent alias', () => {
         tool_name: 'read',
         tool_input: { file_path: 'src/foo.ts' }
       })
-      assert.equal(out.continue, true)
+      assert.equal(out.continue, undefined) // #368 F3: no continue on PreToolUse
       assert.equal(out.hookSpecificOutput.permissionDecision, 'allow')
       assert.ok(
         out.systemMessage.includes(
@@ -1024,7 +1118,7 @@ describe('handleHookEvent / handleClaudeHookEvent alias', () => {
         tool_input: { file_path: 'src/foo.ts' }
       })
     })
-    assert.equal(out.continue, true)
+    assert.equal(out.continue, undefined) // #368 F3: no continue on PreToolUse
     assert.equal(out.hookSpecificOutput.permissionDecision, 'allow')
     assert.equal(out.systemMessage, undefined)
   })
@@ -3714,6 +3808,30 @@ describe('round-9: CLI hook runners flush stdout before exiting', () => {
       assert.ok(
         src.includes('const writeStdout = (text) =>'),
         `${rel}: writeStdout helper missing`
+      )
+    }
+  })
+
+  it('runner tails emit deny JSON instead of process.exit(2) (issue #368 F5)', () => {
+    for (const name of ['claude', 'codex', 'github-cli', 'opencode']) {
+      const rel = `../${name}/cli-hook.mjs`
+      const src = readFileSync(new URL(rel, import.meta.url), 'utf8')
+      const code = src
+        .split(/\r?\n/)
+        .filter((line) => !line.trim().startsWith('//'))
+        .join('\n')
+      assert.ok(
+        !/process\.exit\(2\)/.test(code),
+        `${rel}: nonzero exit is collapsed by PowerShell and fails open`
+      )
+      const tail = src.slice(src.indexOf('main().catch'))
+      assert.ok(
+        tail.includes('permissionDecision: "deny"'),
+        `${rel}: the fail-closed tail must emit a deny decision`
+      )
+      assert.ok(
+        tail.includes('process.stdout.write'),
+        `${rel}: the deny JSON must be written to stdout`
       )
     }
   })

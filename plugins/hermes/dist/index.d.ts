@@ -65,8 +65,11 @@ export declare function findRootMarker(startDir: string): FoundRootMarker | null
  * usable namespace.
  *
  * `runnerDir` is the folder of the hook runner the installer wrote,
- * `<root>/.NeuroStrata/plugins/<harness>/`: the config of the project that
- * installed it, `<root>`, is read first.
+ * `<root>/.NeuroStrata/plugins/<harness>/`. The session's checkout is read
+ * FIRST, then the installer's root: a shared runner must not answer for
+ * another project (#378 F5). A config that exists but cannot be read or
+ * parsed is reported and fails closed, never falling through to env/folder
+ * discovery (#378 F9).
  */
 export declare function readHarnessConfig(harness: string, projectDir: string, runnerDir?: string): {
     namespace?: string;

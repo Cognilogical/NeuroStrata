@@ -77,7 +77,7 @@ export function resolveConfig(raw, cwd = process.cwd()) {
     // project marker, harness config, NEUROSTRATA_NAMESPACE, discovery.
     const namespace = findRootMarker(resolve(cwd))?.namespace ??
         asString(input.namespace) ??
-        asString(process.env.NEUROSTRATA_NAMESPACE) ??
+        usableNamespace(process.env.NEUROSTRATA_NAMESPACE) ??
         discoverProjectNamespace(cwd);
     return {
         namespace,
@@ -105,6 +105,14 @@ function warnUnreadableMarker(path, reason) {
         return;
     warnedMarkers.add(path);
     console.error(`[NeuroStrata] warning: the project marker ${path} could not be read (${reason}); it is skipped`);
+}
+/** Harness configs already reported unreadable in this process. */
+const warnedHarnessConfigs = new Set();
+function warnUnreadableHarnessConfig(path, reason) {
+    if (warnedHarnessConfigs.has(path))
+        return;
+    warnedHarnessConfigs.add(path);
+    console.error(`[NeuroStrata] warning: the harness config ${path} could not be read (${reason}); the namespace is unknown and the hook fails closed`);
 }
 /**
  * The raw spelling of every top-level `version` value in a JSON object text
@@ -498,14 +506,22 @@ const HARNESS_CONFIG_FILES = {
  * usable namespace.
  *
  * `runnerDir` is the folder of the hook runner the installer wrote,
- * `<root>/.NeuroStrata/plugins/<harness>/`: the config of the project that
- * installed it, `<root>`, is read first.
+ * `<root>/.NeuroStrata/plugins/<harness>/`. The session's checkout is read
+ * FIRST, then the installer's root: a shared runner must not answer for
+ * another project (#378 F5). A config that exists but cannot be read or
+ * parsed is reported and fails closed, never falling through to env/folder
+ * discovery (#378 F9).
  */
 export function readHarnessConfig(harness, projectDir, runnerDir) {
     const spec = HARNESS_CONFIG_FILES[harness];
     if (!spec)
         return {};
     const roots = [];
+    if (typeof projectDir === 'string' && projectDir !== '') {
+        const start = canonicalThroughExisting(resolve(projectDir));
+        const top = checkoutTop(start);
+        roots.push(...(top === null ? [start] : [top, linkedMainCheckout(top)]));
+    }
     if (typeof runnerDir === 'string' && runnerDir !== '') {
         const plugins = dirname(resolve(runnerDir));
         const stateDir = dirname(plugins);
@@ -515,25 +531,37 @@ export function readHarnessConfig(harness, projectDir, runnerDir) {
             roots.push(dirname(stateDir));
         }
     }
-    if (typeof projectDir === 'string' && projectDir !== '') {
-        const start = canonicalThroughExisting(resolve(projectDir));
-        const top = checkoutTop(start);
-        roots.push(...(top === null ? [start] : [top, linkedMainCheckout(top)]));
-    }
     for (const root of roots) {
         if (root === null)
             continue;
+        const file = join(root, ...spec.file);
+        let text;
         try {
-            let value = JSON.parse(readFileSync(join(root, ...spec.file), 'utf8').replace(/^\uFEFF/, ''));
-            for (const key of spec.key)
-                value = asRecord(value)[key];
-            const namespace = usableNamespace(value);
-            if (namespace)
-                return { namespace };
+            text = readFileSync(file, 'utf8').replace(/^\uFEFF/, '');
         }
-        catch {
-            // missing or malformed: try the next root
+        catch (err) {
+            // Missing is normal; unreadable is not. Guessing from env or the
+            // folder name would bind a different namespace, so fail closed.
+            if (err?.code === 'ENOENT')
+                continue;
+            const reason = String(err?.message ?? err);
+            warnUnreadableHarnessConfig(file, reason);
+            throw new Error(`the project's namespace is unknown because the harness config ${file} could not be read: ${reason}`);
         }
+        let value;
+        try {
+            value = JSON.parse(text);
+        }
+        catch (err) {
+            const reason = `it is not valid JSON (${String(err?.message ?? err)})`;
+            warnUnreadableHarnessConfig(file, reason);
+            throw new Error(`the project's namespace is unknown because the harness config ${file} could not be read: ${reason}`);
+        }
+        for (const key of spec.key)
+            value = asRecord(value)[key];
+        const namespace = usableNamespace(value);
+        if (namespace)
+            return { namespace };
     }
     return {};
 }
@@ -1260,8 +1288,8 @@ const guardToHookResponse = (guard) => {
             }
         };
     }
+    // Codex rejects `continue` on PreToolUse; the allow decision is enough.
     return {
-        continue: true,
         hookSpecificOutput: {
             hookEventName: 'PreToolUse',
             permissionDecision: 'allow'
@@ -1321,8 +1349,8 @@ export async function handleHookEvent(event) {
         return guardToHookResponse(await runActionGuard(toolName, JSON.stringify(toolInput)));
     }
     const scoped = addSessionWorktree(toolName, toolInput, sessionProjectDir ?? asString(event.cwd) ?? process.cwd());
+    // Codex rejects `continue` on PreToolUse; Stop replies above keep it.
     return {
-        continue: true,
         hookSpecificOutput: {
             hookEventName: 'PreToolUse',
             permissionDecision: 'allow',

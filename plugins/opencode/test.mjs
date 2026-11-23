@@ -483,7 +483,7 @@ test("opencode default export handleHookEvent and handleClaudeHookEvent are alia
     tool_name: "subagent",
     tool_input: target,
   });
-  assert.equal(out.continue, true);
+  assert.equal(out.continue, undefined); // #368 F3: no continue on PreToolUse
   assert.equal(out.hookSpecificOutput.permissionDecision, "allow");
   assert.ok(target.prompt.includes("### NeuroStrata Task & Graph Context"));
 
@@ -493,7 +493,7 @@ test("opencode default export handleHookEvent and handleClaudeHookEvent are alia
     tool_name: "subagent",
     tool_input: target2,
   });
-  assert.equal(out2.continue, true);
+  assert.equal(out2.continue, undefined); // #368 F3: no continue on PreToolUse
   assert.equal(out2.hookSpecificOutput.permissionDecision, "allow");
   assert.ok(target2.prompt.includes("### NeuroStrata Task & Graph Context"));
 });
