@@ -2212,8 +2212,47 @@ fn open_daemon_lock(db_path: &std::path::Path) -> std::io::Result<std::fs::File>
 /// has closed.
 static DAEMON_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
 
-/// What a stopping daemon leaves in its lock file for `shutdown` to read.
+/// What a stopping daemon leaves in its exit report for `shutdown` to read.
 const FINAL_CHECKPOINT_OK: &str = "checkpointed";
+
+/// Where a stopping daemon reports how its final checkpoint went. It is not
+/// the lock file: the next daemon rewrites that as soon as it takes the lock,
+/// which could erase the report before `shutdown` has read it.
+fn daemon_exit_report_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(".daemon.exit");
+    std::path::PathBuf::from(path)
+}
+
+/// When the current holder took the daemon lock (see `take_daemon_lock`).
+fn daemon_lock_taken_at(db_path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(daemon_lock_path(db_path))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// The exit report of the daemon that took the lock at `taken_at`, once it
+/// has written one. A report older than that belongs to an earlier daemon;
+/// with no `taken_at` there is no way to tell, so none is trusted.
+fn exit_report_since(
+    db_path: &std::path::Path,
+    taken_at: Option<std::time::SystemTime>,
+) -> Option<String> {
+    let path = daemon_exit_report_path(db_path);
+    let written = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+    if written < taken_at? {
+        return None;
+    }
+    std::fs::read_to_string(&path).ok()
+}
+
+/// The report of a daemon built before the exit report had its own file: it
+/// wrote the report into the lock file. A current daemon's lock file holds
+/// its process id, never a report, so the two cannot be confused.
+fn report_in_lock_file(db_path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(daemon_lock_path(db_path)).ok()?;
+    (text == FINAL_CHECKPOINT_OK || text.starts_with("error: ")).then_some(text)
+}
 
 /// How long a starting daemon keeps retrying a lock that someone else holds.
 /// `daemon_holds_lock` takes the lock for an instant when it finds it free, so
@@ -2228,8 +2267,12 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
     loop {
         match file.try_lock() {
             Ok(()) => {
-                // Whatever the last daemon reported is not about this one.
+                // Rewriting the file stamps when this daemon took the lock:
+                // `shutdown` reads that time to tell this daemon's exit report
+                // from an earlier one's. The process id is for people.
+                use std::io::Write;
                 file.set_len(0)?;
+                (&file).write_all(std::process::id().to_string().as_bytes())?;
                 return Ok(file);
             }
             Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
@@ -3123,22 +3166,22 @@ fn install_pre_commit_hook(root: &std::path::Path) -> anyhow::Result<std::path::
 }
 
 /// Records how the daemon's final checkpoint went, for `shutdown` to report.
-fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
+/// Written while the lock is still held, so the report is in place before
+/// `shutdown` can see the lock go.
+fn record_final_checkpoint(db_path: &std::path::Path, outcome: &anyhow::Result<()>) {
     use std::io::Write;
-    if let Some(file) = DAEMON_LOCK.get() {
-        let report = match outcome {
-            Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
-            Err(e) => format!("error: {}", e),
-        };
-        if let Err(e) = file.set_len(0) {
-            tracing::warn!("final checkpoint report truncate failed: {e}");
-        }
-        if let Err(e) = (&*file).write_all(report.as_bytes()) {
-            tracing::warn!("final checkpoint report write failed: {e}");
-        }
-        if let Err(e) = file.sync_all() {
-            tracing::warn!("final checkpoint report sync failed: {e}");
-        }
+    if DAEMON_LOCK.get().is_none() {
+        return;
+    }
+    let report = match outcome {
+        Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
+        Err(e) => format!("error: {}", e),
+    };
+    let path = daemon_exit_report_path(db_path);
+    let written = std::fs::File::create(&path)
+        .and_then(|mut file| file.write_all(report.as_bytes()).and_then(|()| file.sync_all()));
+    if let Err(e) = written {
+        tracing::warn!("final checkpoint report write to {} failed: {e}", path.display());
     }
 }
 
@@ -3927,6 +3970,54 @@ mod tests {
         release.join().unwrap();
         assert!(daemon.is_ok(), "the daemon gets the lock once the probe lets go");
         drop(daemon);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_new_daemon_does_not_erase_the_exit_report_of_the_one_before() {
+        let root = std::env::temp_dir().join(format!("ns-exit-report-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        let pause = || std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let first = take_daemon_lock(&db).expect("the first daemon takes the lock");
+        let first_taken = daemon_lock_taken_at(&db);
+        assert!(first_taken.is_some(), "taking the lock stamps the file");
+        assert_eq!(exit_report_since(&db, first_taken), None, "no report yet");
+        pause();
+        std::fs::write(daemon_exit_report_path(&db), FINAL_CHECKPOINT_OK).unwrap();
+        drop(first);
+
+        pause();
+        let second = take_daemon_lock(&db).expect("a new daemon takes the lock");
+        let second_taken = daemon_lock_taken_at(&db);
+        assert_ne!(second_taken, first_taken, "the new daemon has its own stamp");
+        assert_eq!(
+            exit_report_since(&db, first_taken).as_deref(),
+            Some(FINAL_CHECKPOINT_OK),
+            "shutdown still reads the stopped daemon's report"
+        );
+        assert_eq!(
+            exit_report_since(&db, second_taken),
+            None,
+            "an older report is not the new daemon's"
+        );
+        assert_eq!(exit_report_since(&db, None), None, "no stamp, no trusted report");
+        drop(second);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shutdown_still_reads_a_report_an_older_daemon_left_in_the_lock_file() {
+        let root = std::env::temp_dir().join(format!("ns-legacy-report-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        std::fs::create_dir_all(&root).unwrap();
+        // What a daemon built before the separate exit report leaves behind.
+        std::fs::write(daemon_lock_path(&db), FINAL_CHECKPOINT_OK).unwrap();
+        assert_eq!(report_in_lock_file(&db).as_deref(), Some(FINAL_CHECKPOINT_OK));
+
+        // A current daemon writes its process id there, which is not a report.
+        drop(take_daemon_lock(&db).expect("take the lock"));
+        assert_eq!(report_in_lock_file(&db), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7717,7 +7808,7 @@ async fn run() -> anyhow::Result<()> {
                     Some(config.deduplication.clone()),
                 )
                 .await;
-                record_final_checkpoint(&outcome);
+                record_final_checkpoint(&config.db_path, &outcome);
                 outcome?;
             }
             Commands::Laya { model, out_dir } => {
@@ -7861,6 +7952,9 @@ async fn run() -> anyhow::Result<()> {
                 let config = Config::from_default_path()?;
                 let db_path = config.db_path.clone();
                 let held = daemon_holds_lock(&db_path);
+                // Read now, while the daemon being stopped still holds the
+                // lock: a daemon that starts after it rewrites the lock file.
+                let mut taken_at = daemon_lock_taken_at(&db_path);
 
                 match probe {
                     DaemonProbe::Absent if !held => {
@@ -7918,20 +8012,24 @@ async fn run() -> anyhow::Result<()> {
                     2400
                 };
                 for _ in 0..attempts {
-                    if daemon_holds_lock(&db_path) {
+                    let held_now = daemon_holds_lock(&db_path);
+                    // A client can start a new daemon the moment the old one
+                    // lets go, before this loop looks again. A lock held under a
+                    // newer stamp than the one seen at the start means the
+                    // daemon being stopped has exited.
+                    let replaced =
+                        saw_lock && held_now && daemon_lock_taken_at(&db_path) != taken_at;
+                    if held_now && !replaced {
+                        if !saw_lock {
+                            // First sight of a holder: its stamp is the one
+                            // its exit report has to be newer than.
+                            taken_at = daemon_lock_taken_at(&db_path);
+                        }
                         saw_lock = true;
-                    } else if saw_lock {
-                        let report = match std::fs::read_to_string(daemon_lock_path(&db_path)) {
-                            Ok(report) => report,
-                            Err(e) => {
-                                tracing::debug!(
-                                    "the daemon's final checkpoint at {} could not be read: {}",
-                                    daemon_lock_path(&db_path).display(),
-                                    e
-                                );
-                                String::new()
-                            }
-                        };
+                    } else if saw_lock || replaced {
+                        let report = exit_report_since(&db_path, taken_at)
+                            .or_else(|| if replaced { None } else { report_in_lock_file(&db_path) })
+                            .unwrap_or_default();
                         if report == FINAL_CHECKPOINT_OK {
                             println!("Daemon stopped and checkpointed.");
                             return Ok(());
