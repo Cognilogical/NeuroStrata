@@ -2,7 +2,7 @@
 //!
 //! Contains the shared MCP + CLI handler plus entry-point export/import logic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -489,6 +489,59 @@ fn write_export_destination(path: &Path, contents: &[u8]) -> Result<(), String> 
         .map_err(|e| format!("Failed to write {}: {}", path.display(), e))
 }
 
+/// Retire stale exports for notes that left the active set.
+///
+/// Only files that parse as a NeuroStrata-exported YAML-LD note AND whose
+/// `@id` is absent from `active_ids` are renamed to `<name>.md.retired`.
+/// The importer collects only `.md` entries, so a tombstone is inert and can
+/// never resurrect a retired note. User-authored Markdown (no YAML-LD
+/// frontmatter), importer history projections, and still-active notes are
+/// left untouched. Returns retired ids in deterministic order.
+fn tombstone_stale_vault_exports(
+    vault_dir: &Path,
+    active_ids: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let mut retired = Vec::new();
+    let entries = std::fs::read_dir(vault_dir)
+        .map_err(|e| format!("Failed to read vault directory: {}", e))?;
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(e) => return Err(format!("Failed to read vault entry: {}", e)),
+        };
+        if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        // A parse failure means this is not a NeuroStrata export; leave it
+        // exactly as the user wrote it.
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(note) = VaultNote::from_markdown(&content) else {
+            continue;
+        };
+        if note.context != YAML_LD_CONTEXT || note.id.contains(".vault-history.") {
+            continue;
+        }
+        if active_ids.contains(&note.id) {
+            continue;
+        }
+        let mut tombstone_name = path.clone().into_os_string();
+        tombstone_name.push(".retired");
+        let tombstone = PathBuf::from(tombstone_name);
+        if tombstone.exists() {
+            std::fs::remove_file(&tombstone).map_err(|e| {
+                format!("Failed to replace tombstone {}: {}", tombstone.display(), e)
+            })?;
+        }
+        std::fs::rename(&path, &tombstone)
+            .map_err(|e| format!("Failed to retire stale export {}: {}", path.display(), e))?;
+        retired.push(note.id);
+    }
+    retired.sort();
+    Ok(retired)
+}
+
 /// Export vault contents to the configured path using the default caps.
 pub async fn export_vault(
     config: VaultSyncConfig,
@@ -537,6 +590,10 @@ pub async fn export_vault_with_limits(
                     .map_or(true, serde_json::Value::is_null)
         })
         .collect();
+
+    // Ids still present in the current-knowledge surface. Any exported note
+    // whose frontmatter id is absent from this set is stale (issue #372).
+    let active_ids: BTreeSet<String> = filtered.iter().map(|m| m.id.clone()).collect();
 
     // Convert to VaultNotes
     let mut notes = Vec::new();
@@ -655,6 +712,13 @@ pub async fn export_vault_with_limits(
         } else {
             exported += 1;
         }
+    }
+
+    // Issue #372: an earlier export may have left a `.md` file behind for a
+    // note that has since retired. Tombstone it so a reimport cannot bring it
+    // back as live knowledge, without touching user-authored files.
+    if let Err(e) = tombstone_stale_vault_exports(&canonical_vault, &active_ids) {
+        errors.push(e);
     }
 
     write_export_destination(&canvas_path, canvas_json.as_bytes())?;
@@ -5986,6 +6050,113 @@ mod tests {
             Some(2),
             "canvas must describe the exported set: {canvas}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #372: a note retired after a prior export must not survive as a
+    /// live `.md`; user-authored files stay untouched; reimport cannot
+    /// resurrect the retired note.
+    #[tokio::test]
+    async fn export_tombstones_stale_files_without_touching_user_notes() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-stale-export-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_stale_export";
+        store.init(ns).await.expect("init");
+        store
+            .upsert(
+                ns,
+                "keep-note",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "keep body".to_string(),
+                    user_id: "default".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed keep");
+
+        let config = vault_config(&root, &vault, ns);
+        let first = export_vault(config.clone(), store.clone())
+            .await
+            .expect("first export");
+        assert!(first.success, "{:?}", first.errors);
+        assert!(vault.join("keep-note.md").exists());
+
+        // Simulate a prior export of a note that has since retired, plus an
+        // unrelated user-authored Markdown file in the same vault.
+        let stale = note("retired-note", &[]);
+        std::fs::write(vault.join("retired-note.md"), stale.to_markdown())
+            .expect("write stale export");
+        std::fs::write(vault.join("my-journal.md"), "# My journal\n\nJust me.\n")
+            .expect("write user file");
+
+        let second = export_vault(config.clone(), store.clone())
+            .await
+            .expect("re-export");
+        assert!(second.success, "{:?}", second.errors);
+        assert!(vault.join("keep-note.md").exists(), "active note must stay");
+        assert!(
+            !vault.join("retired-note.md").exists(),
+            "retired note must be tombstoned"
+        );
+        assert!(
+            vault.join("retired-note.md.retired").exists(),
+            "tombstone file must exist"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vault.join("my-journal.md")).unwrap(),
+            "# My journal\n\nJust me.\n",
+            "user-authored file must be untouched"
+        );
+
+        // Reimport cannot resurrect the retired note: the tombstone's
+        // extension is not `md`, so the importer never collects it.
+        let fresh_root = root.join("fresh");
+        std::fs::create_dir_all(&fresh_root).expect("create fresh root");
+        let fresh_store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(fresh_root.join("db"), 4)
+                .expect("fresh store"),
+        );
+        let fresh_ns = "vault_stale_reimport";
+        fresh_store.init(fresh_ns).await.expect("init fresh");
+        let import_cfg = vault_config(&root, &vault, fresh_ns);
+        let imported = import_vault(
+            import_cfg,
+            fresh_store.clone(),
+            std::sync::Arc::new(TestEmbedder),
+        )
+        .await
+        .expect("import");
+        let ids: Vec<String> = fresh_store
+            .list(fresh_ns, None, None)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(
+            ids.iter().any(|id| id.contains("keep-note")),
+            "active note must reimport: {:?}",
+            ids
+        );
+        assert!(
+            !ids.iter().any(|id| id.contains("retired-note")),
+            "retired note must not be resurrected: {:?} (errors {:?})",
+            ids,
+            imported.errors
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

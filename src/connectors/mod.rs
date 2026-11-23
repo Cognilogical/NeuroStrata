@@ -329,20 +329,28 @@ impl InMemoryPoolConnector {
     }
 
     fn compute_source_sha256(records: &[Value]) -> String {
-        let mut hasher = Sha256::new();
-        for r in records {
-            hasher.update(serde_json::to_vec(r).expect("serialize record"));
-        }
-        hex::encode(hasher.finalize())
+        hash_records_sha256(records)
     }
 
     fn compute_slice_sha256(records: &[Value]) -> String {
-        let mut hasher = Sha256::new();
-        for r in records {
-            hasher.update(serde_json::to_vec(r).expect("serialize record"));
-        }
-        hex::encode(hasher.finalize())
+        hash_records_sha256(records)
     }
+}
+
+/// Hash a record set with an unambiguous per-record length prefix.
+///
+/// Concatenating per-record JSON let `[1,23]` and `[12,3]` feed the hasher
+/// the same `123` byte stream (issue #351). Prefixing each record with its
+/// byte length makes the encoding injective, so a boundary-shifted change
+/// can no longer pass a source-digest compare-and-swap check.
+fn hash_records_sha256(records: &[Value]) -> String {
+    let mut hasher = Sha256::new();
+    for record in records {
+        let bytes = serde_json::to_vec(record).expect("serialize record");
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    hex::encode(hasher.finalize())
 }
 
 impl Default for InMemoryPoolConnector {
@@ -878,11 +886,7 @@ impl DataConnector for JsonFilePoolConnector {
 
 impl JsonFilePoolConnector {
     fn compute_sha(records: &[Value]) -> String {
-        let mut hasher = Sha256::new();
-        for r in records {
-            hasher.update(serde_json::to_vec(r).expect("serialize record"));
-        }
-        hex::encode(hasher.finalize())
+        hash_records_sha256(records)
     }
 }
 
@@ -895,6 +899,47 @@ mod tests {
 
     fn rt() -> Runtime {
         Runtime::new().unwrap()
+    }
+
+    /// Issue #351: boundary-free concatenation made `[1,23]` and `[12,3]`
+    /// hash identically. Every digest helper must separate records.
+    #[test]
+    fn connector_digests_are_boundary_aware() {
+        let a = vec![json!(1), json!(23)];
+        let b = vec![json!(12), json!(3)];
+        let c = vec![json!(1), json!(24)];
+        assert_eq!(
+            InMemoryPoolConnector::compute_source_sha256(&a),
+            InMemoryPoolConnector::compute_slice_sha256(&a),
+            "both in-memory helpers must share one encoding"
+        );
+        assert_ne!(
+            InMemoryPoolConnector::compute_source_sha256(&a),
+            InMemoryPoolConnector::compute_source_sha256(&b),
+            "[1,23] and [12,3] must not collide"
+        );
+        assert_ne!(
+            InMemoryPoolConnector::compute_slice_sha256(&a),
+            InMemoryPoolConnector::compute_slice_sha256(&b),
+            "slice digest must not collide either"
+        );
+        assert_ne!(
+            JsonFilePoolConnector::compute_sha(&a),
+            JsonFilePoolConnector::compute_sha(&b),
+            "file connector digest must not collide"
+        );
+        assert_ne!(
+            InMemoryPoolConnector::compute_source_sha256(&a),
+            InMemoryPoolConnector::compute_source_sha256(&c),
+            "hasher must stay content-sensitive (control)"
+        );
+        let s1 = vec![json!("1"), json!("23")];
+        let s2 = vec![json!("12"), json!("3")];
+        assert_ne!(
+            InMemoryPoolConnector::compute_source_sha256(&s1),
+            InMemoryPoolConnector::compute_source_sha256(&s2),
+            "string records must remain distinct too"
+        );
     }
 
     #[test]
