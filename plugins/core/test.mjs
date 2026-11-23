@@ -810,10 +810,10 @@ describe('project root marker and namespace order', () => {
     rmSync(stateDir, { recursive: true, force: true })
     mkdirSync(stateDir, { recursive: true })
     const outsideFile = join(outside, 'active_session.json')
-    writeFileSync(
-      outsideFile,
-      JSON.stringify({ claude_session_dirs: { s1: outside } })
-    )
+    const originalState = JSON.stringify({
+      claude_session_dirs: { s1: outside }
+    })
+    writeFileSync(outsideFile, originalState)
     try {
       symlinkSync(outsideFile, sessionPath, 'file')
     } catch (err) {
@@ -824,7 +824,9 @@ describe('project root marker and namespace order', () => {
       resolveHookProjectDir('claude', { ...start, hook_event_name: 'PreToolUse' }, {}),
       repo
     )
-    assert.equal(readFileSync(outsideFile, 'utf8').includes(outside), true)
+    // Byte-for-byte: a Windows path's backslashes are JSON-escaped, so a
+    // substring check on the raw path would fail even with no rewrite.
+    assert.equal(readFileSync(outsideFile, 'utf8'), originalState)
   })
 
   it('an unreadable marker is skipped with one warning naming the file', () => {
