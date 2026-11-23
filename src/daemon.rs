@@ -4034,7 +4034,7 @@ mod tests {
         let root = scratch_root("t2r-backup-inside-root");
         std::fs::create_dir_all(&root).unwrap();
         let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
-        let dest = std::fs::canonicalize(&root).unwrap().join("snapshots");
+        let dest = dunce::canonicalize(&root).unwrap().join("snapshots");
         std::fs::create_dir_all(&dest).unwrap();
         // Same destination, but spelled with a redundant `.` component.
         let spelling = root.join(".").join("snapshots");
@@ -4239,7 +4239,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = scratch_root("t2r-export-inside-root");
         std::fs::create_dir_all(&root).unwrap();
-        let target = std::fs::canonicalize(&root).unwrap().join("graph.json");
+        let target = dunce::canonicalize(&root).unwrap().join("graph.json");
         std::fs::write(&target, b"seed").unwrap();
         // Same target, but spelled with a redundant `.` component.
         let spelling = root.join(".").join("graph.json");
