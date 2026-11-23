@@ -1891,10 +1891,12 @@ fn write_staged_atomically(staged: &Path, path: &Path, contents: &str) -> std::i
     // Open first: an entry already at `staged` (someone else's) makes this
     // fail, and it is not ours to clean up.
     let mut file = options.open(staged)?;
-    let opened = file.metadata()?;
     let written = (|| -> std::io::Result<()> {
         std::io::Write::write_all(&mut file, contents.as_bytes())?;
         file.sync_all()?;
+        // Taken after the write: off Unix the check compares sizes, and the
+        // staged file is empty right after the open.
+        let opened = file.metadata()?;
         drop(file);
         // The path can be swapped between the exclusive open and these
         // path-based operations. Never chmod or publish a replacement: it is
@@ -4560,7 +4562,9 @@ mod tests {
         let opened = std::fs::metadata(&staged).unwrap();
         assert!(staged_path_is_open_file(&staged, &opened).unwrap());
 
-        std::fs::remove_file(&staged).unwrap();
+        // Moved aside, not removed: a removed file's inode can be reused by
+        // the next file created, which would then look like the opened one.
+        std::fs::rename(&staged, dir.join(".ours")).unwrap();
         symlink(&victim, &staged).unwrap();
         assert!(
             !staged_path_is_open_file(&staged, &opened).unwrap(),
