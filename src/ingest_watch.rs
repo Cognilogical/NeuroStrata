@@ -1856,8 +1856,11 @@ mod tests {
     #[test]
     fn register_refuses_paths_outside_startup_root() {
         let dir = tempfile::tempdir().unwrap();
-        let service = service_for(&dir, dir.path().to_path_buf());
-        let inside = dir.path().join("src");
+        // The OS may hand out a short (8.3) temp path; the service stores the
+        // canonical spelling, so compare against that.
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        let service = service_for(&dir, base.clone());
+        let inside = base.join("src");
         let registration = service.register("NeuroStrata", &inside).unwrap();
         assert_eq!(registration.canonical_path, inside);
         assert!(service
@@ -1868,8 +1871,11 @@ mod tests {
     #[test]
     fn status_reports_clean_root_after_register() {
         let dir = tempfile::tempdir().unwrap();
-        let service = service_for(&dir, dir.path().to_path_buf());
-        let root = dir.path().join("src");
+        // The OS may hand out a short (8.3) temp path; the service stores the
+        // canonical spelling, so compare against that.
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        let service = service_for(&dir, base.clone());
+        let root = base.join("src");
         service.register("NeuroStrata", &root).unwrap();
         let report = service.status(None);
         assert_eq!(report.roots.len(), 1);
@@ -1896,14 +1902,17 @@ mod tests {
     #[tokio::test]
     async fn start_activates_only_j6_authorized_persisted_registrations() {
         let dir = tempfile::tempdir().unwrap();
+        // The OS may hand out a short (8.3) temp path; the service stores the
+        // canonical spelling, so compare against that.
+        let base = dunce::canonicalize(dir.path()).unwrap();
         let path = dir.path().join("watch_registrations.json");
-        let in_root = dir.path().join("src");
+        let in_root = base.join("src");
         let doc = format!(
             r#"{{"schema_version":1,"registrations":[{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}},{{"namespace":"NeuroStrata","canonical_path":"/tmp","created_at_unix":1763596800,"updated_at_unix":1763596800}}]}}"#,
             json_escape_path(&in_root)
         );
         std::fs::write(&path, doc).unwrap();
-        let service = service_for(&dir, dir.path().to_path_buf());
+        let service = service_for(&dir, base.clone());
         service.start().await.unwrap();
         let report = service.status(None);
         assert_eq!(report.roots.len(), 1);
@@ -2481,9 +2490,12 @@ mod tests {
     #[tokio::test]
     async fn start_continues_when_a_persisted_root_cannot_be_activated() {
         let dir = tempfile::tempdir().unwrap();
+        // The OS may hand out a short (8.3) temp path; the service stores the
+        // canonical spelling, so compare against that.
+        let base = dunce::canonicalize(dir.path()).unwrap();
         let registry = dir.path().join("watch_registrations.json");
-        let good = dir.path().join("good");
-        let stale = dir.path().join("stale");
+        let good = base.join("good");
+        let stale = base.join("stale");
         let doc = format!(
             r#"{{"schema_version":1,"registrations":[{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}},{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}}]}}"#,
             json_escape_path(&good),
@@ -2499,7 +2511,7 @@ mod tests {
             }),
             store,
             Arc::new(NoopTrigger),
-            dir.path().to_path_buf(),
+            base.clone(),
             Vec::new(),
         );
         service

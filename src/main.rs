@@ -2021,9 +2021,20 @@ fn gate_verify_daemon(info: Option<&serde_json::Value>, own: (u64, u64)) -> Resu
     }
 }
 
+/// The identity probe is bounded independently of the 500 ms health probe:
+/// a daemon that answers /health but stalls on /info must not hold `root show`
+/// forever. On expiry this returns None, which the gate reads as stale and
+/// `root show` reports as an unknown cached root.
+const DAEMON_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 async fn fetch_daemon_info() -> Option<serde_json::Value> {
+    fetch_daemon_info_from("http://127.0.0.1:34343/info").await
+}
+
+async fn fetch_daemon_info_from(url: &str) -> Option<serde_json::Value> {
     let res = daemon_http_client()
-        .get("http://127.0.0.1:34343/info")
+        .get(url)
+        .timeout(DAEMON_INFO_TIMEOUT)
         .send()
         .await
         .ok()?;
@@ -5434,6 +5445,28 @@ mod tests {
             std::time::Duration::from_secs(10),
             "the other POSTs in this file use ten seconds; bus-metrics hangs the same way"
         );
+    }
+
+    /// A daemon that answers /health but stalls on /info must not hold
+    /// `root show` forever: the GET is bounded, so identity verification
+    /// falls back to Unknown and the read path can proceed.
+    #[tokio::test]
+    async fn the_daemon_info_get_is_bounded() {
+        // A server that accepts the connection and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/info", listener.local_addr().unwrap());
+        let _hold = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                open.push(socket);
+            }
+        });
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(DAEMON_INFO_TIMEOUT * 3, fetch_daemon_info_from(&url))
+            .await
+            .expect("the /info GET must give up on its own");
+        assert!(answer.is_none());
+        assert!(started.elapsed() >= DAEMON_INFO_TIMEOUT);
     }
 
     /// Round 3: a daemon that cannot answer /info predates build verification,

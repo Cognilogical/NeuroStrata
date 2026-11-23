@@ -30894,7 +30894,10 @@ eurostrata\src\daemon.rs",
         let mut changes = 0;
         let err = copy_file_bracketed_with(&source, &aborted, "test member", |path| {
             changes += 1;
-            std::fs::write(path, format!("generation-{changes}")).unwrap();
+            // Every injected change also changes the length: on Windows the
+            // mtime only moves on a coarse clock tick, so two back-to-back
+            // same-length writes can leave `(len, mtime)` identical.
+            std::fs::write(path, format!("generation-{}", "!".repeat(changes))).unwrap();
         })
         .expect_err("a second observed change aborts the snapshot");
         assert!(

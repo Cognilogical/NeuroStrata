@@ -8,6 +8,8 @@
 # "bad interpreter: /usr/bin/env bash^M".
 *.sh   text eol=lf
 *.bash text eol=lf
+# The git hooks have no extension; bash cannot run them with CRLF either.
+scripts/hooks/* text eol=lf
 
 # PowerShell and batch: keep CRLF, the platform convention these ship with.
 *.ps1  text eol=crlf
