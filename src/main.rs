@@ -2595,8 +2595,35 @@ impl crate::root_marker::RootRegistry for DaemonRootRegistry {
     }
 }
 
+/// A registry that also owns the store lock. The lock is taken before the
+/// daemon probe and held until the registry is dropped, so a daemon that
+/// starts in the probe/open/write window cannot take its own lock and race
+/// the marker writer on the store (#382 ROOT-2).
+struct LockedRootRegistry {
+    inner: Box<dyn crate::root_marker::RootRegistry>,
+    /// Kept until `finish` and drop, then the OS releases it even on a crash.
+    _lock: Option<std::fs::File>,
+}
+
+#[async_trait::async_trait]
+impl crate::root_marker::RootRegistry for LockedRootRegistry {
+    async fn cached_root(&self, namespace: &str) -> Result<Option<String>, String> {
+        self.inner.cached_root(namespace).await
+    }
+    async fn rows(&self, namespace: &str) -> Result<Vec<crate::traits::SearchResult>, String> {
+        self.inner.rows(namespace).await
+    }
+    async fn set_root(&self, namespace: &str, root: &std::path::Path) -> Result<(), String> {
+        self.inner.set_root(namespace, root).await
+    }
+    async fn finish(&self) {
+        self.inner.finish().await;
+    }
+}
+
 /// The registry the marker writers (`root set`, `hooks install`) use: the
-/// answering daemon, else the store opened here. Never starts a daemon.
+/// answering daemon, else the store opened here under a held store lock.
+/// Never starts a daemon.
 async fn open_cli_root_registry(
     probe: DaemonProbe,
 ) -> Result<Box<dyn crate::root_marker::RootRegistry>, String> {
@@ -2608,9 +2635,25 @@ async fn open_cli_root_registry(
         return Ok(Box::new(DaemonRootRegistry));
     }
     let config = Config::load().map_err(|e| format!("the config could not be read: {e}"))?;
-    if daemon_holds_lock(&config.db_path) {
-        return Err("no daemon answered and the store is locked".to_string());
-    }
+    // Take the lock before probing/opening, not after: a daemon starting in
+    // between then fails to take its own lock and cannot write concurrently.
+    let lock = match open_daemon_lock(&config.db_path) {
+        Ok(file) => match file.try_lock() {
+            Ok(()) => Some(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err("no daemon answered and the store is locked".to_string())
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("the store lock could not be taken: {e}"))
+            }
+        },
+        Err(e) => {
+            return Err(format!(
+                "the store lock could not be opened ({}): {e}",
+                daemon_lock_path(&config.db_path).display()
+            ))
+        }
+    };
     if probe == DaemonProbe::Silent {
         return Err(
             "nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy; not opening the store"
@@ -2644,10 +2687,13 @@ async fn open_cli_root_registry(
         .init("global")
         .await
         .map_err(|e| format!("the store could not be initialized: {e}"))?;
-    Ok(Box::new(crate::root_marker::StoreRegistry {
-        store,
-        emb: embedder,
-        checkpoint: true,
+    Ok(Box::new(LockedRootRegistry {
+        inner: Box::new(crate::root_marker::StoreRegistry {
+            store,
+            emb: embedder,
+            checkpoint: true,
+        }),
+        _lock: lock,
     }))
 }
 
@@ -2724,6 +2770,35 @@ where
             return report;
         }
     }
+    // The marker step refuses with OtherNamespace when a marker of a different
+    // namespace already applies here, and that refusal installs nothing (no
+    // hooks, no plugins). Decide that before installing hooks so moving the
+    // hook install earlier does not leave hooks behind on that refusal.
+    if let Ok(ns) = &namespace {
+        if let Ok(Some(found)) = crate::root_marker::find_root_marker(root) {
+            if !found.config.namespace.eq_ignore_ascii_case(ns) {
+                report.err.push(
+                    SetupMarker::OtherNamespace(found.config.namespace.clone())
+                        .message(ns, root)
+                        .unwrap_or_default(),
+                );
+                report.code = 1;
+                return report;
+            }
+        }
+    }
+    // Install the hooks BEFORE publishing a marker. A linked worktree whose
+    // hooks cannot be installed must not be left with a marker and a cache
+    // already moved to it (#381 F2).
+    let target = match install_pre_push_hook(root, force) {
+        Ok(target) => target,
+        Err(e) => {
+            report.err.push(e.to_string());
+            report.code = 1;
+            return report;
+        }
+    };
+    let _ = install_pre_commit_hook(root);
     let chosen: Option<String> = namespace.as_ref().ok().cloned();
     let (message, marker_root, failed) = match namespace {
         Err(candidates) => (
@@ -2755,60 +2830,45 @@ where
             }
         },
     };
-    match install_pre_push_hook(root, force) {
-        Ok(target) => {
-            let _ = install_pre_commit_hook(root);
-            // The harness configs get the namespace the marker step used:
-            // `--namespace` goes into every config; a namespace a marker now
-            // covers the checkout for goes into configs that name none.
-            // Otherwise (the step asked, or wrote no marker) a config gets a
-            // namespace only from an explicit source (a harness config or
-            // NEUROSTRATA_NAMESPACE), never the ledger or the folder name.
-            let refreshed: Option<String>;
-            let config_namespace = match (&chosen, named, marker_root.is_some()) {
-                (Some(ns), true, _) => ConfigNamespace::Set(ns),
-                (Some(ns), false, true) => ConfigNamespace::Keep(Some(ns)),
-                _ => {
-                    refreshed =
-                        match crate::task::harness_plugins::namespace_for_refresh(root, true) {
-                            Ok(ns) => ns,
-                            Err(e) => {
-                                report.err.push(format!(
-                                    "warning: harness configs left as they are: {e}"
-                                ));
-                                None
-                            }
-                        };
-                    ConfigNamespace::Keep(refreshed.as_deref())
+    // The harness configs get the namespace the marker step used:
+    // `--namespace` goes into every config; a namespace a marker now covers
+    // the checkout for goes into configs that name none. Otherwise (the step
+    // asked, or wrote no marker) a config gets a namespace only from an
+    // explicit source, never the ledger or the folder name.
+    let refreshed: Option<String>;
+    let config_namespace = match (&chosen, named, marker_root.is_some()) {
+        (Some(ns), true, _) => ConfigNamespace::Set(ns),
+        (Some(ns), false, true) => ConfigNamespace::Keep(Some(ns)),
+        _ => {
+            refreshed = match crate::task::harness_plugins::namespace_for_refresh(root, true) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    report
+                        .err
+                        .push(format!("warning: harness configs left as they are: {e}"));
+                    None
                 }
             };
-            let _ = crate::task::harness_plugins::auto_install_detected_plugins(
-                root,
-                config_namespace,
-                None,
-            );
-            report.out.push(format!(
-                "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
-                target.display()
-            ));
-            if failed {
-                report.err.extend(message);
-                report.code = 1;
-            } else {
-                report.out.extend(message);
-            }
-            report.out.extend(
-                marker_root
-                    .as_deref()
-                    .and_then(crate::root_marker::commit_advice),
-            );
+            ConfigNamespace::Keep(refreshed.as_deref())
         }
-        Err(e) => {
-            report.err.extend(message);
-            report.err.push(e.to_string());
-            report.code = 1;
-        }
+    };
+    let _ =
+        crate::task::harness_plugins::auto_install_detected_plugins(root, config_namespace, None);
+    report.out.push(format!(
+        "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
+        target.display()
+    ));
+    if failed {
+        report.err.extend(message);
+        report.code = 1;
+    } else {
+        report.out.extend(message);
     }
+    report.out.extend(
+        marker_root
+            .as_deref()
+            .and_then(crate::root_marker::commit_advice),
+    );
     report
 }
 
