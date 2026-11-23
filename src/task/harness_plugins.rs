@@ -4556,21 +4556,20 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = dunce::canonicalize(tmp.path()).unwrap();
         let staged = dir.join(".staged");
-        let victim = dir.join("victim.json");
         std::fs::write(&staged, "ours").unwrap();
-        std::fs::write(&victim, "original").unwrap();
         let opened = std::fs::metadata(&staged).unwrap();
         assert!(staged_path_is_open_file(&staged, &opened).unwrap());
 
         // Moved aside, not removed: a removed file's inode can be reused by
         // the next file created, which would then look like the opened one.
+        // The symlink points at the opened file itself, so a check that
+        // followed it would wrongly say yes.
         std::fs::rename(&staged, dir.join(".ours")).unwrap();
-        symlink(&victim, &staged).unwrap();
+        symlink(dir.join(".ours"), &staged).unwrap();
         assert!(
             !staged_path_is_open_file(&staged, &opened).unwrap(),
             "a symlink planted at the staged path must not be followed"
         );
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
 
         std::fs::remove_file(&staged).unwrap();
         std::fs::write(&staged, "theirs").unwrap();
