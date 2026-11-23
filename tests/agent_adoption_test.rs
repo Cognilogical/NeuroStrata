@@ -625,12 +625,24 @@ fn precommit_no_longer_fabricates_ledger_rows() {
         std::fs::set_permissions(&hook_path, perms).unwrap();
     }
 
-    let out = std::process::Command::new(&bash)
+    let mut hook_cmd = std::process::Command::new(&bash);
+    hook_cmd
         // Git bash reads `C:/...`; a backslash path is mangled.
         .arg(hook_path.to_string_lossy().replace('\\', "/"))
-        .current_dir(&repo)
-        .output()
-        .expect("run pre-commit hook");
+        .current_dir(&repo);
+    // Git's hook runner puts its usr/bin (mkdir, grep, sed, ...) on PATH. A
+    // bare bash.exe launch does not, so mirror `run_pre_commit` in
+    // src/task/mod.rs and add the same utility directory here.
+    if cfg!(windows) {
+        if let Some(bin) = bash.parent() {
+            let mut paths = vec![bin.to_path_buf()];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            hook_cmd.env("PATH", std::env::join_paths(paths).expect("join PATH"));
+        }
+    }
+    let out = hook_cmd.output().expect("run pre-commit hook");
     assert!(
         out.status.success(),
         "hook failed: {}",

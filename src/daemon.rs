@@ -1557,7 +1557,7 @@ async fn handle_backup(
         .export_database(&dir.to_string_lossy())
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(format!("Backed up to {}", req.dir))
+    Ok(format!("Backed up to {}", dir.display()))
 }
 
 /// R22: export-graph CLI proxy — routes through the daemon when it is
@@ -1614,7 +1614,7 @@ async fn handle_export_graph(
             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     )
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(format!("Graph exported to {}", req.target))
+    Ok(format!("Graph exported to {}", target.display()))
 }
 
 #[derive(serde::Deserialize)]
@@ -4026,17 +4026,21 @@ mod tests {
     }
 
     /// Task 2 re-file pin: a backup destination inside the served root
-    /// succeeds exactly as it did before the policy existed.
+    /// succeeds exactly as it did before the policy existed. Review on #389:
+    /// the answer names the resolved destination, not the caller's spelling.
     #[tokio::test(flavor = "multi_thread")]
     async fn backup_inside_root_succeeds() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = scratch_root("t2r-backup-inside-root");
         std::fs::create_dir_all(&root).unwrap();
         let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
-        let dest = root.join("snapshots");
+        let dest = std::fs::canonicalize(&root).unwrap().join("snapshots");
+        std::fs::create_dir_all(&dest).unwrap();
+        // Same destination, but spelled with a redundant `.` component.
+        let spelling = root.join(".").join("snapshots");
         let res = client
             .post(format!("{base}/backup"))
-            .json(&serde_json::json!({ "dir": dest.display().to_string() }))
+            .json(&serde_json::json!({ "dir": spelling.display().to_string() }))
             .send()
             .await
             .unwrap();
@@ -4045,6 +4049,14 @@ mod tests {
         assert!(
             body.contains("Backed up to"),
             "the handler's own answer: {body}"
+        );
+        assert!(
+            body.contains(&dest.display().to_string()),
+            "the answer names the resolved path: {body}"
+        );
+        assert!(
+            !body.contains(&spelling.display().to_string()),
+            "the answer must not echo the caller's spelling: {body}"
         );
         stop_daemon(&client, &base, daemon).await;
     }
@@ -4220,26 +4232,34 @@ mod tests {
     }
 
     /// Task 2 re-file pin: an export target inside the served root is
-    /// written exactly as before the policy existed.
+    /// written exactly as before the policy existed. Review on #389: the
+    /// answer names the resolved target, not the caller's spelling.
     #[tokio::test(flavor = "multi_thread")]
     async fn export_graph_inside_root_succeeds() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = scratch_root("t2r-export-inside-root");
         std::fs::create_dir_all(&root).unwrap();
-        let target = root.join("graph.json");
+        let target = std::fs::canonicalize(&root).unwrap().join("graph.json");
+        std::fs::write(&target, b"seed").unwrap();
+        // Same target, but spelled with a redundant `.` component.
+        let spelling = root.join(".").join("graph.json");
         let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/export-graph"))
-            .json(&serde_json::json!({ "target": target.display().to_string() }))
+            .json(&serde_json::json!({ "target": spelling.display().to_string() }))
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            res.status(),
-            axum::http::StatusCode::OK,
-            "an in-root export proceeds: {}",
-            res.text().await.unwrap()
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let body = res.text().await.unwrap();
+        assert!(
+            body.contains(&target.display().to_string()),
+            "the answer names the resolved target: {body}"
+        );
+        assert!(
+            !body.contains(&spelling.display().to_string()),
+            "the answer must not echo the caller's spelling: {body}"
         );
         assert!(
             target.exists(),
@@ -4334,6 +4354,16 @@ mod tests {
 
         // Both canonical: the long descendant is inside the short root.
         assert!(canonical_contains(canonical_root, &long_descendant));
+
+        // Review on #389: a canonical path OUTSIDE the root must be rejected on
+        // every host. Without this, a Windows-only regression that accepts
+        // every candidate passes the in-root assertion above.
+        let outside_root = std::path::Path::new(r"\\?\C:\somewhere-else");
+        let outside_candidate = outside_root.join("secret.txt");
+        assert!(
+            !canonical_contains(canonical_root, &outside_candidate),
+            "a canonical non-descendant must never be contained"
+        );
 
         // On non-Windows hosts the simplified spelling is a different path
         // component, modeling the mismatch that caused the 403. Windows

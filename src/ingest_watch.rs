@@ -1815,86 +1815,92 @@ mod tests {
     #[tokio::test]
     async fn notify_event_source_real_watcher_reports_events() {
         let dir = tempfile::tempdir().unwrap();
+
+        // Every operation gets a distinct path, and all but the Create target
+        // exist BEFORE the watcher starts. The source coalesces by path while an
+        // event is queued, so a fresh Create for the same path could swallow
+        // the Modify/Remove/Rename that follows it. Pre-creating those paths
+        // leaves their queue keys free for the operation under test. Events for
+        // other paths are discarded by correlation — no quiet-interval "settle"
+        // is treated as proof that a late delivery cannot arrive (review #389).
+        let modified = dir.path().join("modified.txt");
+        let removed = dir.path().join("removed.txt");
+        let old = dir.path().join("old.txt");
+        let new = dir.path().join("new.txt");
+        std::fs::write(&modified, b"first").unwrap();
+        std::fs::write(&removed, b"gone soon").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+
         let source = NotifyEventSource::new().expect("notify watcher available");
         source.watch_root(dir.path()).expect("watch temp dir");
 
-        // Helper to wait for specific event kind
-        async fn recv(source: &NotifyEventSource, want: WatchEventKind) -> WatchEvent {
+        // Wait for an event whose kind AND path match this operation. A late
+        // delivery from an earlier operation has a different path and is
+        // discarded instead of being mistaken for the current step's result.
+        async fn recv_for(
+            source: &NotifyEventSource,
+            kinds: &[WatchEventKind],
+            path: &std::path::Path,
+        ) -> WatchEvent {
+            let mut discarded: Vec<(WatchEventKind, std::path::PathBuf)> = Vec::new();
             loop {
-                let ev = tokio::time::timeout(std::time::Duration::from_secs(2), source.recv())
-                    .await
-                    .unwrap_or_else(|_| panic!("event timeout waiting for {want:?}"))
-                    .expect("event");
-                if ev.kind == want {
+                let ev = match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    source.recv(),
+                )
+                .await
+                {
+                    Ok(Some(ev)) => ev,
+                    Ok(None) => panic!("event channel closed waiting for {kinds:?} on {path:?}"),
+                    Err(_) => panic!(
+                        "event timeout waiting for {kinds:?} on {path:?}; discarded: {discarded:?}"
+                    ),
+                };
+                if kinds.contains(&ev.kind) && ev.path == path {
                     return ev;
                 }
-                // Drain intermediate events (e.g., Modify/Access from same write)
+                discarded.push((ev.kind, ev.path));
             }
         }
 
-        // The source coalesces by path: while an event for a path is queued, a
-        // new event for that path is dropped (`enqueue_coalesced`, by design:
-        // ingest is per-root). So each step first drains what is queued until
-        // the source goes quiet; otherwise a leftover Modify can swallow the
-        // Remove that follows. Bounded: at most 50 events, 300 ms quiet each.
-        async fn settle(source: &NotifyEventSource) {
-            for _ in 0..50 {
-                match tokio::time::timeout(std::time::Duration::from_millis(300), source.recv())
-                    .await
-                {
-                    Ok(Some(_)) => continue,
-                    _ => return,
-                }
-            }
-        }
-
-        // Create a file
-        let file = dir.path().join("test.txt");
-        std::fs::write(&file, b"hello").unwrap();
-
-        // Poll for create event
-        let ev = recv(&source, WatchEventKind::Create).await;
+        // Create.
+        let created = dir.path().join("created.txt");
+        std::fs::write(&created, b"hello").unwrap();
+        let ev = recv_for(&source, &[WatchEventKind::Create], &created).await;
         assert_eq!(ev.kind, WatchEventKind::Create);
-        assert_eq!(ev.path, file);
+        assert_eq!(ev.path, created);
 
-        settle(&source).await;
-        // Modify the file - exact kind may vary by platform/backend; accept any
-        std::fs::write(&file, b"world").unwrap();
-        let ev = recv(&source, WatchEventKind::Modify).await;
-        assert_eq!(ev.path, file);
-        // Accept Modify, Create (truncate+write may look like recreate), or Remove+Create
-        assert!(matches!(
-            ev.kind,
-            WatchEventKind::Modify | WatchEventKind::Create | WatchEventKind::Remove
-        ));
+        // Modify — exact kind may vary by platform/backend; accept any that
+        // indicates a change to this path.
+        std::fs::write(&modified, b"second").unwrap();
+        let ev = recv_for(
+            &source,
+            &[
+                WatchEventKind::Modify,
+                WatchEventKind::Create,
+                WatchEventKind::Remove,
+            ],
+            &modified,
+        )
+        .await;
+        assert_eq!(ev.path, modified);
 
-        settle(&source).await;
-        // Delete the file
-        std::fs::remove_file(&file).unwrap();
-        let ev = recv(&source, WatchEventKind::Remove).await;
-        // Accept any kind that indicates the path is gone; on some platforms a
-        // modify+remove pair may arrive shifted, so we just verify the path matches.
-        assert_eq!(ev.path, file);
+        // Remove.
+        std::fs::remove_file(&removed).unwrap();
+        let ev = recv_for(&source, &[WatchEventKind::Remove], &removed).await;
+        assert_eq!(ev.path, removed);
 
-        settle(&source).await;
-        // Rename test: create old, rename to new
-        let old = dir.path().join("old.txt");
-        let new = dir.path().join("new.txt");
-        std::fs::write(&old, b"old").unwrap();
-        // Wait for create
-        let _ = recv(&source, WatchEventKind::Create).await;
-        settle(&source).await;
-        // Rename
+        // Rename old -> new.
         std::fs::rename(&old, &new).unwrap();
         if cfg!(windows) {
             // The Windows backend reports a rename as From/To events with no
             // tracker cookie, so it arrives as Remove(old) then Create(new).
-            let ev = recv(&source, WatchEventKind::Remove).await;
+            let ev = recv_for(&source, &[WatchEventKind::Remove], &old).await;
             assert_eq!(ev.path, old);
-            let ev = recv(&source, WatchEventKind::Create).await;
+            let ev = recv_for(&source, &[WatchEventKind::Create], &new).await;
             assert_eq!(ev.path, new);
         } else {
-            let ev = recv(&source, WatchEventKind::Rename).await;
+            let ev = recv_for(&source, &[WatchEventKind::Rename], &old).await;
             assert_eq!(ev.kind, WatchEventKind::Rename);
             assert_eq!(ev.path, old);
             assert_eq!(ev.new_path, Some(new.clone()));

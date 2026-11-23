@@ -136,20 +136,25 @@ fn normalize_lexical(path: &Path) -> Option<String> {
 }
 
 fn path_is_in_skipped_dir(path: &Path) -> bool {
-    // Windows paths use `\`; match the skip patterns on the slash form.
-    let path_str = path.to_string_lossy().replace('\\', "/");
-    for skip_dir in SKIPPED_DIRS {
-        let skip_pattern = format!("/{}/", skip_dir);
-        let skip_start = format!("{}/", skip_dir);
-        let skip_exact = format!("./{}", skip_dir);
-        if path_str.contains(&skip_pattern)
-            || path_str.starts_with(&skip_start)
-            || path_str == skip_exact
-        {
-            return true;
-        }
-    }
-    false
+    // Compare whole components with the host's own separators. A Unix filename
+    // may legitimately contain backslashes (`src\vendor\module.rs` is one file,
+    // not a path inside `vendor`), while `Path` on Windows already exposes both
+    // `\` and `/` as components. Components also cover the case where the path
+    // IS the skipped directory (a watched/ingested `.../target` node), which a
+    // `/name/` substring test misses. Windows filesystems are case-insensitive.
+    path.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        let name = name.to_string_lossy();
+        SKIPPED_DIRS.iter().any(|skip_dir| {
+            if cfg!(windows) {
+                name.eq_ignore_ascii_case(skip_dir)
+            } else {
+                &*name == *skip_dir
+            }
+        })
+    })
 }
 
 fn is_store_artifact(path: &Path) -> bool {
@@ -6033,6 +6038,8 @@ use super::x;"#;
         ));
     }
 
+    /// Windows-native spelling: `\` and `/` are both components to `Path`.
+    #[cfg(windows)]
     #[test]
     fn skip_dirs_are_rejected_in_backslash_separated_paths() {
         let root = std::path::Path::new(r"C:\repo");
@@ -6051,6 +6058,50 @@ use super::x;"#;
             std::path::Path::new(r"C:\repo\src\lib.rs"),
             root
         ));
+    }
+
+    /// Review on #389: on Unix a backslash is an ordinary filename character.
+    /// `src\vendor\module.rs` names one file, not a path inside `vendor`.
+    #[cfg(not(windows))]
+    #[test]
+    fn backslashes_in_unix_filenames_do_not_imply_a_skipped_dir() {
+        let root = std::path::Path::new("/tmp/fresh-root");
+        assert!(is_ingest_eligible_path(
+            std::path::Path::new("/tmp/fresh-root/src/vendor\\module.rs"),
+            root
+        ));
+    }
+
+    /// Review on #389: skipped directories are case-insensitive on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn skipped_dirs_match_case_insensitively_on_windows() {
+        let root = std::path::Path::new(r"C:\repo");
+        for rel in [
+            r"TARGET\debug\x.rs",
+            r".GIT\config",
+            r"src\NODE_MODULES\a.js",
+        ] {
+            let path = format!(r"C:\repo\{rel}");
+            assert!(
+                !is_ingest_eligible_path(std::path::Path::new(&path), root),
+                "{path} must be rejected"
+            );
+        }
+    }
+
+    /// Review on #389: the walked/watched path can be the skipped directory
+    /// itself; a `/name/` substring test misses the final component.
+    #[test]
+    fn a_path_ending_at_a_skipped_dir_is_rejected() {
+        let root = std::path::Path::new("/tmp/fresh-root");
+        for skip_dir in SKIPPED_DIRS {
+            let path = format!("/tmp/fresh-root/src/{skip_dir}");
+            assert!(
+                !is_ingest_eligible_path(std::path::Path::new(&path), root),
+                "the skipped directory itself must be rejected: {path}"
+            );
+        }
     }
 
     /// Review on #386: `\server\share\repo\x` (rooted, no drive) is not
