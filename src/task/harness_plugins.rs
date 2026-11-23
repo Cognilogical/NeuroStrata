@@ -1891,10 +1891,12 @@ fn write_staged_atomically(staged: &Path, path: &Path, contents: &str) -> std::i
     // Open first: an entry already at `staged` (someone else's) makes this
     // fail, and it is not ours to clean up.
     let mut file = options.open(staged)?;
-    let opened = file.metadata()?;
     let written = (|| -> std::io::Result<()> {
         std::io::Write::write_all(&mut file, contents.as_bytes())?;
         file.sync_all()?;
+        // Taken after the write: off Unix the check compares sizes, and the
+        // staged file is empty right after the open.
+        let opened = file.metadata()?;
         drop(file);
         // The path can be swapped between the exclusive open and these
         // path-based operations. Never chmod or publish a replacement: it is
@@ -4554,19 +4556,20 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = dunce::canonicalize(tmp.path()).unwrap();
         let staged = dir.join(".staged");
-        let victim = dir.join("victim.json");
         std::fs::write(&staged, "ours").unwrap();
-        std::fs::write(&victim, "original").unwrap();
         let opened = std::fs::metadata(&staged).unwrap();
         assert!(staged_path_is_open_file(&staged, &opened).unwrap());
 
-        std::fs::remove_file(&staged).unwrap();
-        symlink(&victim, &staged).unwrap();
+        // Moved aside, not removed: a removed file's inode can be reused by
+        // the next file created, which would then look like the opened one.
+        // The symlink points at the opened file itself, so a check that
+        // followed it would wrongly say yes.
+        std::fs::rename(&staged, dir.join(".ours")).unwrap();
+        symlink(dir.join(".ours"), &staged).unwrap();
         assert!(
             !staged_path_is_open_file(&staged, &opened).unwrap(),
             "a symlink planted at the staged path must not be followed"
         );
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
 
         std::fs::remove_file(&staged).unwrap();
         std::fs::write(&staged, "theirs").unwrap();
