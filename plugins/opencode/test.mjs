@@ -625,3 +625,39 @@ test("OpenCode V2 execute.after preserves array content[0].text and appends TASK
   assert.match(afterEvent.result.content[0].text, /TASK INTENT DETECTED/, "nudge appended to text");
   assert.match(afterEvent.result.output, /TASK INTENT DETECTED/, "result.output also mutated");
 });
+
+// ── PR #400: event-specific hook failure replies ────────────────────────
+test("hook runner replies in the shape of the failing event (#400)", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdirSync, rmSync } = await import("node:fs");
+  const { dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const runner = fileURLToPath(new URL("./cli-hook.mjs", import.meta.url));
+  const base = mkdtempSync(join(tmpdir(), "ns-400-oc-runner-"));
+  try {
+    const config = join(base, ".opencode", "neurostrata-plugin.json");
+    mkdirSync(dirname(config), { recursive: true });
+    writeFileSync(config, "{ broken json");
+    const env = { ...process.env };
+    delete env.NEUROSTRATA_NAMESPACE;
+    delete env.CLAUDE_PROJECT_DIR;
+    const run = (event) =>
+      spawnSync(process.execPath, [runner], {
+        input: JSON.stringify(event),
+        cwd: base,
+        env,
+        encoding: "utf8",
+        timeout: 30000,
+      });
+    const stop = run({ hook_event_name: "Stop", cwd: base, session_id: "failing" });
+    assert.equal(stop.status, 2, `Stop must exit 2; stderr=${stop.stderr.slice(0, 200)}`);
+    assert.equal(stop.stdout.trim(), "{}");
+    const pre = run({ hook_event_name: "PreToolUse", cwd: base, tool_name: "Write", tool_input: {} });
+    assert.equal(pre.status, 0);
+    const reply = JSON.parse(pre.stdout);
+    assert.equal(reply.hookSpecificOutput.hookEventName, "PreToolUse");
+    assert.equal(reply.hookSpecificOutput.permissionDecision, "deny");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});

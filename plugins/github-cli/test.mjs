@@ -454,3 +454,40 @@ test("buildSubagentContextHeader includes required fields", () => {
   const headerNull = buildSubagentContextHeader("other-ns", null);
   assert.ok(headerNull.includes("Active Task ID: \`unclaimed (claim a task first)\`"));
 });
+
+// ── PR #400: event-specific hook failure replies ────────────────────────
+test("hook runner replies in the shape of the failing event (#400)", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const runner = fileURLToPath(new URL("./cli-hook.mjs", import.meta.url));
+  const base = mkdtempSync(join(tmpdir(), "ns-400-gh-runner-"));
+  try {
+    const config = join(base, ".NeuroStrata", "plugins", "github-cli", "copilot-extension.json");
+    mkdirSync(dirname(config), { recursive: true });
+    writeFileSync(config, "{ broken json");
+    const env = { ...process.env };
+    delete env.NEUROSTRATA_NAMESPACE;
+    delete env.CLAUDE_PROJECT_DIR;
+    const run = (event) =>
+      spawnSync(process.execPath, [runner], {
+        input: JSON.stringify(event),
+        cwd: base,
+        env,
+        encoding: "utf8",
+        timeout: 30000,
+      });
+    const stop = run({ hook_event_name: "Stop", cwd: base, session_id: "failing" });
+    assert.equal(stop.status, 2, `Stop must exit 2; stderr=${stop.stderr.slice(0, 200)}`);
+    assert.equal(stop.stdout.trim(), "{}");
+    const pre = run({ hook_event_name: "PreToolUse", cwd: base, tool_name: "Write", tool_input: {} });
+    assert.equal(pre.status, 0);
+    const reply = JSON.parse(pre.stdout);
+    assert.equal(reply.hookSpecificOutput.hookEventName, "PreToolUse");
+    assert.equal(reply.hookSpecificOutput.permissionDecision, "deny");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});

@@ -5656,3 +5656,45 @@ describe('usableNamespace — linear quote stripping (code-scanning 25-27)', () 
     assert.equal(f('"'.repeat(20000) + 'ns' + "'".repeat(20000)), 'ns')
   })
 })
+
+// ── PR #400 review regressions ──────────────────────────────────────────
+describe('PR #400 namespace resolution regressions', () => {
+  const made = []
+  const tmp = () => {
+    const d = mkdtempSync(join(tmpdir(), 'ns-400-core-'))
+    made.push(d)
+    return d
+  }
+  afterEach(() => {
+    while (made.length) rmSync(made.pop(), { recursive: true, force: true })
+  })
+
+  it('stops at a session config whose namespace is unusable', () => {
+    const session = tmp()
+    const runnerRoot = tmp()
+    const sessionCfg = join(session, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json')
+    mkdirSync(dirname(sessionCfg), { recursive: true })
+    writeFileSync(sessionCfg, JSON.stringify({ namespace: '$INVALID' }))
+    const runnerCfg = join(runnerRoot, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json')
+    mkdirSync(dirname(runnerCfg), { recursive: true })
+    writeFileSync(runnerCfg, JSON.stringify({ namespace: 'runner-project' }))
+    const runnerDir = dirname(runnerCfg)
+    assert.deepEqual(readHarnessConfig('claude', session, runnerDir), {})
+    rmSync(sessionCfg)
+    assert.deepEqual(readHarnessConfig('claude', session, runnerDir), {
+      namespace: 'runner-project'
+    })
+  })
+
+  it('ignores an invalid env namespace copied into config.namespace', () => {
+    const cwd = tmp()
+    const invalid = '$NS; rm -rf /'
+    process.env.NEUROSTRATA_NAMESPACE = invalid
+    try {
+      const cfg = resolveConfig({ namespace: invalid }, cwd)
+      assert.notEqual(cfg.namespace, invalid)
+    } finally {
+      delete process.env.NEUROSTRATA_NAMESPACE
+    }
+  })
+})

@@ -636,3 +636,46 @@ test("378-F5/F9: checkout config wins; unreadable config fails closed", async ()
     console.error = original;
   }
 });
+
+// ── PR #400 review regressions ──────────────────────────────────────────
+test("PR #400: a session config without a usable namespace does not adopt the runner root's", async () => {
+  const { readHarnessConfig } = await import("./dist/index.js");
+  const { mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const base = markerTempDir("ns-400-hermes-");
+  buildMarkerLayout(base, ["session git-dir", "runner git-dir"]);
+  const session = underBase(base, "session");
+  const runnerRoot = underBase(base, "runner");
+  try {
+    const sessionCfg = join(session, ".hermes", "plugins", "neurostrata.json");
+    mkdirSync(dirname(sessionCfg), { recursive: true });
+    writeFileSync(sessionCfg, JSON.stringify({ namespace: "$INVALID" }));
+    const runnerDir = join(runnerRoot, ".NeuroStrata", "plugins", "hermes");
+    const runnerCfg = join(runnerRoot, ".hermes", "plugins", "neurostrata.json");
+    mkdirSync(runnerDir, { recursive: true });
+    mkdirSync(dirname(runnerCfg), { recursive: true });
+    writeFileSync(runnerCfg, JSON.stringify({ namespace: "runner-project" }));
+    assert.deepEqual(readHarnessConfig("hermes", session, runnerDir), {});
+    rmSync(sessionCfg);
+    assert.deepEqual(readHarnessConfig("hermes", session, runnerDir), {
+      namespace: "runner-project",
+    });
+  } finally {
+    removeTree(base, { recursive: true, force: true });
+  }
+});
+
+test("PR #400: invalid env namespace copied into config is ignored", async () => {
+  const { resolveConfig } = await import("./dist/index.js");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const cwd = mkdtempSync(join(tmpdir(), "ns-400-hermes-env-"));
+  const invalid = "$NS; rm -rf /";
+  process.env.NEUROSTRATA_NAMESPACE = invalid;
+  try {
+    assert.notEqual(resolveConfig({ namespace: invalid }, cwd).namespace, invalid);
+  } finally {
+    delete process.env.NEUROSTRATA_NAMESPACE;
+  }
+});
