@@ -193,6 +193,12 @@ fn prepare(dir: &Path, cfg: &RootConfig) -> Result<(PathBuf, PathBuf), MarkerErr
             reason,
         )));
     }
+    // A marker at home, a drive root or a workspace folder above a checkout
+    // would capture projects that never opted in. Callers check this too;
+    // refuse here as well, before `.NeuroStrata` is created.
+    if let Some(reason) = refuse_root_target(dir) {
+        return Err(MarkerError::Unsafe(reason));
+    }
     if !marker_dir_is_safe(dir) {
         return Err(MarkerError::Unsafe(
             ".NeuroStrata is not a real folder inside the target",
@@ -596,6 +602,57 @@ pub enum CachedRoot {
     Unknown(String),
 }
 
+/// Unicode formatting / directional-control characters: renderers can act on
+/// these without treating them as `char::is_control()` (which only covers Cc).
+/// Bidi overrides and isolates reorder the visible text, so a folder name or
+/// source id carrying one could forge the `root show` output.
+fn is_format_or_directional(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Marker-derived text with every control and formatting character spelled
+/// out. A folder name, namespace or source id comes from the checkout: a raw
+/// escape could repaint or forge the `root show` output.
+fn escape_control(value: impl std::fmt::Display) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x1b' => out.push_str("\\x1b"),
+            c if c.is_control() || is_format_or_directional(c) => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// The text of `neurostrata-mcp root show` for the absolute folder `dir`.
 /// `namespace` is the marker's namespace, else the one the project resolves
 /// to without a marker; `bindings` are the configured project contexts, or
@@ -610,21 +667,27 @@ pub fn format_root_show(
     cached: &CachedRoot,
     bindings: &Result<std::collections::HashMap<String, PathBuf>, String>,
 ) -> String {
-    let mut out = vec![format!("folder: {}", dir.display())];
+    let mut out = vec![format!("folder: {}", escape_control(dir.display()))];
     let mut marker_root = None;
     match found {
         Ok(Some(found)) => {
             let marker_dir = found.marker_dir();
-            out.push(format!("marker root: {}", found.root.display()));
+            out.push(format!(
+                "marker root: {}",
+                escape_control(found.root.display())
+            ));
             out.push(format!(
                 "marker file: {}",
-                marker_dir.join(ROOT_CONFIG_REL).display()
+                escape_control(marker_dir.join(ROOT_CONFIG_REL).display())
             ));
             out.push(format!("found via: {}", found.via.as_str()));
-            out.push(format!("namespace: {}", found.config.namespace));
+            out.push(format!(
+                "namespace: {}",
+                escape_control(&found.config.namespace)
+            ));
             out.push(format!(
                 "source_id: {}",
-                found.config.source_id.as_deref().unwrap_or("none")
+                escape_control(found.config.source_id.as_deref().unwrap_or("none"))
             ));
             out.push(format!(
                 "git tracks the marker: {}",
@@ -634,27 +697,36 @@ pub fn format_root_show(
         }
         Ok(None) => {
             out.push("marker root: none (no .NeuroStrata/config.json applies here)".to_string());
-            out.push(format!("namespace without a marker: {namespace}"));
+            out.push(format!(
+                "namespace without a marker: {}",
+                escape_control(namespace)
+            ));
         }
         Err((path, reason)) => {
             out.push(format!(
-                "marker root: unreadable marker {}: {reason}",
-                path.display()
+                "marker root: unreadable marker {}: {}",
+                escape_control(path.display()),
+                escape_control(reason)
             ));
-            out.push(format!("namespace without a marker: {namespace}"));
+            out.push(format!(
+                "namespace without a marker: {}",
+                escape_control(namespace)
+            ));
         }
     }
     for folder in miscased_marker_folders(dir) {
         out.push(format!(
             "note: {} is not spelled .NeuroStrata, so it is not a marker",
-            folder.display()
+            escape_control(folder.display())
         ));
     }
     match cached {
         CachedRoot::Known(Some(root)) => {
             let exists = Path::new(root).is_dir();
             out.push(format!(
-                "cached root for {namespace}: {root} ({})",
+                "cached root for {}: {} ({})",
+                escape_control(namespace),
+                escape_control(root),
                 if exists { "exists" } else { "missing" }
             ));
             // A worktree's root is cached in the main checkout's spelling.
@@ -671,8 +743,13 @@ pub fn format_root_show(
                 );
             }
         }
-        CachedRoot::Known(None) => out.push(format!("cached root for {namespace}: none")),
-        CachedRoot::Unknown(why) => out.push(format!("cached root: unknown ({why})")),
+        CachedRoot::Known(None) => out.push(format!(
+            "cached root for {}: none",
+            escape_control(namespace)
+        )),
+        CachedRoot::Unknown(why) => {
+            out.push(format!("cached root: unknown ({})", escape_control(why)))
+        }
     }
     let walk_root = marker_root.unwrap_or_else(|| dir.to_path_buf());
     let nested = nested_markers(&walk_root);
@@ -695,7 +772,7 @@ pub fn format_root_show(
     let count = nested.len() + main_only.len();
     out.push(format!(
         "nested markers below {} (up to {NESTED_MARKER_MAX_DEPTH} levels, other checkouts not entered): {}",
-        walk_root.display(),
+        escape_control(walk_root.display()),
         if count == 0 { "none".to_string() } else { count.to_string() }
     ));
     let labeled = nested.iter().map(|hit| (hit, "")).chain(
@@ -707,12 +784,13 @@ pub fn format_root_show(
         match read {
             MarkerRead::Valid(cfg) => out.push(format!(
                 "  {} (namespace {}{label})",
-                path.display(),
-                cfg.namespace
+                escape_control(path.display()),
+                escape_control(&cfg.namespace)
             )),
             MarkerRead::Unreadable { reason, .. } => out.push(format!(
-                "  {} (unreadable: {reason}{label})",
-                path.display()
+                "  {} (unreadable: {}{label})",
+                escape_control(path.display()),
+                escape_control(reason)
             )),
             MarkerRead::Absent => {}
         }
@@ -730,11 +808,16 @@ pub fn format_root_show(
                 }
             ));
             for (source_id, path) in missing {
-                out.push(format!("  {source_id} -> {}", path.display()));
+                out.push(format!(
+                    "  {} -> {}",
+                    escape_control(source_id),
+                    escape_control(path.display())
+                ));
             }
         }
         Err(why) => out.push(format!(
-            "project-context bindings to missing folders: unknown (config could not be read: {why})"
+            "project-context bindings to missing folders: unknown (config could not be read: {})",
+            escape_control(why)
         )),
     }
     out.join("\n")
@@ -743,25 +826,42 @@ pub fn format_root_show(
 /// Folders named `.NeuroStrata` in another letter case in `dir` or the
 /// folders above it that a marker walk visits (up to the checkout top, or
 /// every ancestor outside git). Such a folder is not a marker, also where
-/// the filesystem ignores case.
+/// the filesystem ignores case. In a linked worktree the main checkout is
+/// scanned too, since its markers apply to the worktree.
 fn miscased_marker_folders(dir: &Path) -> Vec<PathBuf> {
-    let top = checkout_top(dir);
+    let main = in_main_checkout(dir);
+    let extra = if main == dir { Vec::new() } else { vec![main] };
+    miscased_marker_folders_with(dir, &extra)
+}
+
+/// Scan `dir`, each of `extra_roots` (a linked worktree's main checkout) and
+/// the folders above them for misspelled marker folders.
+fn miscased_marker_folders_with(dir: &Path, extra_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    for folder in dir.ancestors() {
-        if top.as_deref().is_some_and(|top| !folder.starts_with(top)) {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(folder) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name != ".NeuroStrata" && name.eq_ignore_ascii_case(".NeuroStrata") {
-                found.push(entry.path());
+    let mut scan = |start: &Path| {
+        let top = checkout_top(start);
+        for folder in start.ancestors() {
+            if top.as_deref().is_some_and(|top| !folder.starts_with(top)) {
+                break;
+            }
+            let Ok(entries) = std::fs::read_dir(folder) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name != ".NeuroStrata" && name.eq_ignore_ascii_case(".NeuroStrata") {
+                    found.push(entry.path());
+                }
             }
         }
+    };
+    scan(dir);
+    for root in extra_roots {
+        scan(root);
     }
+    found.sort();
+    found.dedup();
     found
 }
 
@@ -1600,6 +1700,34 @@ mod tests {
     fn write_raw(dir: &Path, body: &[u8]) {
         std::fs::create_dir_all(dir.join(".NeuroStrata")).unwrap();
         std::fs::write(dir.join(ROOT_CONFIG_REL), body).unwrap();
+    }
+
+    /// PR #388: a bidi override or isolate in a folder name / source id must
+    /// be spelled out. `char::is_control()` alone lets a renderer reorder the
+    /// forged `root show` output.
+    #[test]
+    fn escape_control_spells_out_unicode_formatting_characters() {
+        let raw = format!(
+            "ok{}\u{202e}bad\u{2066}\u{200f}\u{2028}\u{feff}\u{00ad}end",
+            '\n'
+        );
+        let escaped = escape_control(&raw);
+        for cp in [0x202e, 0x2066, 0x200f, 0x2028, 0xfeff, 0x00ad] {
+            assert!(
+                escaped.contains(&format!("\\u{{{cp:x}}}")),
+                "U+{cp:04X} not escaped in {escaped:?}"
+            );
+        }
+        assert!(!escaped.contains('\u{202e}'), "raw bidi override leaked");
+        assert!(
+            escaped.contains("ok\\n"),
+            "newline not spelled out: {escaped:?}"
+        );
+        assert!(
+            escaped.contains("bad"),
+            "ordinary text was changed: {escaped:?}"
+        );
+        assert!(escape_control("héllo").contains("héllo"));
     }
 
     #[test]
@@ -3493,5 +3621,89 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// #377 review: `prepare` refuses a workspace folder above a checkout
+    /// itself, so no write path can create a marker there.
+    #[test]
+    fn write_paths_refuse_prohibited_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = dunce::canonicalize(tmp.path()).unwrap().join("workspace");
+        std::fs::create_dir_all(workspace.join("child/.git")).unwrap();
+        if crate::paths::git_root_of_dir(&workspace.to_string_lossy()).is_some() {
+            eprintln!("skipped: the temp dir is inside a git checkout");
+            return;
+        }
+        assert!(matches!(
+            replace_marker(&workspace, &RootConfig::new("example-project")),
+            Err(MarkerError::Unsafe(_))
+        ));
+        assert!(matches!(
+            write_new_marker(&workspace, &RootConfig::new("example-project")),
+            Err(MarkerError::Unsafe(_))
+        ));
+        assert!(!workspace.join(".NeuroStrata").exists());
+    }
+
+    /// #377 review: a namespace or source id with control characters cannot
+    /// repaint or forge the `root show` text.
+    #[test]
+    fn format_root_show_escapes_control_characters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = RootConfig::new("example-project");
+        cfg.source_id = Some("evil\x1b[31m\nhost".to_string());
+        let found = Ok(Some(FoundMarker {
+            root: tmp.path().to_path_buf(),
+            config: cfg,
+            via: FoundVia::OwnCheckout,
+        }));
+        let text = format_root_show(
+            tmp.path(),
+            &found,
+            "example-project",
+            &CachedRoot::Unknown("why\x07".to_string()),
+            &Ok(std::collections::HashMap::new()),
+        );
+        assert!(!text.contains('\x1b'), "raw escape in {text:?}");
+        assert!(!text.contains('\x07'), "raw bell in {text:?}");
+        assert!(text.contains("evil\\x1b[31m\\nhost"), "{text:?}");
+    }
+
+    /// #377 review: a misspelled marker folder in a linked worktree's main
+    /// checkout is reported too.
+    #[test]
+    fn miscased_marker_folders_scans_main_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(main.join(".nEuRoStRaTa")).unwrap();
+        let found = miscased_marker_folders_with(&worktree, std::slice::from_ref(&main));
+        assert!(
+            found.iter().any(|p| p == &main.join(".nEuRoStRaTa")),
+            "{found:?}"
+        );
+    }
+
+    /// Review of the #374 restore: the test above calls the `_with` form
+    /// directly. This one goes through `miscased_marker_folders`, so a
+    /// linked worktree must find its main checkout on its own.
+    #[test]
+    fn miscased_marker_folders_finds_the_main_checkout_of_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(
+            &base,
+            r#"["repo git-dir", "repo/.git/worktrees/wt commondir:../..",
+                "wt git-file:../repo/.git/worktrees/wt"]"#,
+        );
+        std::fs::create_dir_all(base.join("repo/.nEuRoStRaTa")).unwrap();
+        let found = miscased_marker_folders(&base.join("wt"));
+        assert!(
+            found
+                .iter()
+                .any(|p| p == &base.join("repo").join(".nEuRoStRaTa")),
+            "{found:?}"
+        );
     }
 }
