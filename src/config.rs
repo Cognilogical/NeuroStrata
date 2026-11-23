@@ -351,13 +351,17 @@ const CONFIG_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(60
 /// How long [`ConfigLock::acquire`] waits for a live lock.
 const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// An exclusive lock on the user config: the file `<config>.lock` beside it,
-/// created with `create_new` and removed on drop; one left older than
-/// [`CONFIG_LOCK_STALE`] by a dead process is broken (see
-/// `break_stale_lock`). A read-check-write of the
-/// config holds it so two writers cannot overwrite each other in between.
+/// An exclusive lock on the user config: the file `<config>.lock` beside it.
+/// The file carries an OS advisory lock held for the guard's whole life, plus
+/// a nonce. Mtime alone cannot tell a paused holder from a dead one, and a
+/// `Drop` that unlinks whatever sits at the path can delete a successor's
+/// lock; both are prevented here. A read-check-write of the config holds the
+/// guard so two writers cannot overwrite each other in between.
 pub struct ConfigLock {
     path: PathBuf,
+    /// Keeps the advisory lock until the guard is dropped.
+    file: Option<std::fs::File>,
+    nonce: String,
 }
 
 impl ConfigLock {
@@ -373,6 +377,7 @@ impl ConfigLock {
                 format!("Could not create config directory {}", parent.display())
             })?;
         }
+        let nonce = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
         let started = std::time::Instant::now();
         loop {
             match fs::OpenOptions::new()
@@ -381,11 +386,23 @@ impl ConfigLock {
                 .open(&path)
             {
                 Ok(mut file) => {
-                    let _ = writeln!(file, "{}", std::process::id());
-                    return Ok(ConfigLock { path });
+                    if let Err(e) = file.try_lock() {
+                        return Err(e)
+                            .with_context(|| format!("Could not lock {}", path.display()));
+                    }
+                    writeln!(file, "{nonce}")
+                        .with_context(|| format!("Could not write {}", path.display()))?;
+                    return Ok(ConfigLock {
+                        path,
+                        file: Some(file),
+                        nonce,
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if is_stale(&path) {
+                    // A live holder owns the advisory lock even when its mtime
+                    // is old (a paused process). Only a lock nobody holds is
+                    // breakable; do not judge liveness by mtime.
+                    if lock_is_free(&path) {
                         break_stale_lock(&path);
                         continue;
                     }
@@ -412,6 +429,15 @@ impl ConfigLock {
                 }
             }
         }
+    }
+}
+
+/// Whether nobody holds the advisory lock on an existing lock file. A file
+/// that cannot be opened cannot be proven free, so it stays untouched.
+fn lock_is_free(path: &Path) -> bool {
+    match fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => matches!(file.try_lock(), Ok(())),
+        Err(_) => false,
     }
 }
 
@@ -456,7 +482,16 @@ fn break_stale_lock(path: &Path) {
 
 impl Drop for ConfigLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Remove only the file we created. If somebody else replaced it, its
+        // nonce differs and it is theirs, not ours, to unlink.
+        let ours = fs::read_to_string(&self.path)
+            .map(|text| text.trim() == self.nonce)
+            .unwrap_or(false);
+        // Release the advisory lock before unlinking (required on Windows).
+        self.file.take();
+        if ours {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -934,5 +969,38 @@ mod tests {
         assert!(lock.exists());
         drop(held);
         assert!(!lock.exists());
+    }
+
+    #[test]
+    fn a_held_config_lock_is_not_broken_by_an_old_mtime() {
+        let root = temp_dir("config-lock-held-not-stale");
+        let config_path = write_config(&root);
+        let lock = config_path.with_file_name("config.json.lock");
+        let held = ConfigLock::acquire(&config_path).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // Age alone must not make a live holder's lock breakable.
+        assert!(!lock_is_free(&lock));
+        drop(held);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn dropping_a_config_lock_does_not_remove_a_successors_file() {
+        let root = temp_dir("config-lock-foreign-successor");
+        let config_path = write_config(&root);
+        let lock = config_path.with_file_name("config.json.lock");
+        let held = ConfigLock::acquire(&config_path).unwrap();
+        // A paused holder's path is overwritten by another writer. Its nonce
+        // differs, so our Drop must leave it alone.
+        fs::write(&lock, "9999:successor").unwrap();
+        drop(held);
+        assert!(lock.exists(), "a foreign lock file must survive our drop");
+        fs::remove_file(&lock).unwrap();
     }
 }

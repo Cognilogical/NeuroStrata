@@ -3839,6 +3839,29 @@ evaporate. The lexical detector surfaces these as `task_intent_signals` in
     )
 }
 
+/// Apply the daemon caller-path policy to a marker-writing MCP call. The
+/// daemon's explicitly configured root is the boundary; without that env var
+/// this is a plain CLI/test run where the caller already owns the root.
+/// Both the requested folder and the main-checkout target are judged: a
+/// linked worktree can otherwise redirect the write outside the allowlist.
+fn checked_marker_root(project_root: &str) -> Result<std::path::PathBuf, String> {
+    let raw = std::path::Path::new(project_root);
+    if std::env::var_os("NEUROSTRATA_PROJECT_ROOT").is_none() {
+        return Ok(dunce::simplified(raw).to_path_buf());
+    }
+    let boundary = crate::daemon::resolve_project_root();
+    let allowlist = crate::config::Config::default_path()
+        .ok()
+        .and_then(|p| crate::config::Config::load_from(&p).ok())
+        .map(|config| config.allowed_external_dirs)
+        .unwrap_or_default();
+    let resolved = crate::daemon::check_caller_path(raw, &boundary, &allowlist)?;
+    let target = crate::paths::main_checkout_root(&resolved.to_string_lossy())
+        .unwrap_or_else(|| resolved.clone());
+    crate::daemon::check_caller_path(&target, &boundary, &allowlist)?;
+    Ok(resolved)
+}
+
 pub async fn handle_bootstrap(
     args: Value,
     emb: Arc<dyn Embedder>,
@@ -3857,7 +3880,11 @@ pub async fn handle_bootstrap(
         return e;
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
-    let root = std::path::Path::new(project_root);
+    let checked = match checked_marker_root(project_root) {
+        Ok(root) => root,
+        Err(e) => return e,
+    };
+    let root = checked.as_path();
     let root_marker =
         crate::root_marker::ensure_marker_for_setup(&store, Some(&emb), root, Some(&namespace))
             .await;
@@ -4528,19 +4555,35 @@ pub(crate) fn git_hooks_dir(root: &std::path::Path) -> std::path::PathBuf {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|v| !v.is_empty());
-    match configured {
+    let from_relative = |v: String| {
+        let p = std::path::Path::new(&v);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        }
+    };
+    if let Some(v) = configured {
         // A relative hooksPath is relative to the repo's top-level working
         // tree, which is `root`; git runs the hook from there.
-        Some(v) => {
-            let p = std::path::Path::new(&v);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                root.join(p)
+        return from_relative(v);
+    }
+    // In a linked worktree `.git` is a FILE pointing at the common git dir,
+    // so `root/.git/hooks` is not a directory and create_dir_all fails with
+    // ENOTDIR. Let git resolve the real hooks path instead.
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .current_dir(root)
+        .output()
+    {
+        if out.status.success() {
+            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !v.is_empty() {
+                return from_relative(v);
             }
         }
-        None => root.join(".git").join("hooks"),
     }
+    root.join(".git").join("hooks")
 }
 
 /// Best-effort hook hygiene for a project root, run by the daemon. Returns
@@ -5310,7 +5353,11 @@ pub async fn handle_task_setup(
     if let Err(e) = check_namespace(&namespace) {
         return e;
     }
-    let root = std::path::Path::new(project_root);
+    let checked = match checked_marker_root(project_root) {
+        Ok(root) => root,
+        Err(e) => return e,
+    };
+    let root = checked.as_path();
     if !root.is_dir() {
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
