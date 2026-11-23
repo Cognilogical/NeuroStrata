@@ -383,7 +383,25 @@ fn installer_hook_parts(
     } else {
         Some(usable_namespace(raw_ns)?)
     };
-    Some((namespace, format!("node \"{abs_runner}\"{suffix}")))
+    Some((
+        namespace,
+        format!("{}{suffix}", claude_hook_command(abs_runner)?),
+    ))
+}
+
+/// OpenCode is set up in the project: its `.opencode` folder or
+/// `opencode.json` exists. The installer wires OpenCode only then.
+fn opencode_in_project(root: &Path) -> bool {
+    root.join(".opencode").exists() || root.join("opencode.json").exists()
+}
+
+/// The Claude hook command `node "<abs_runner>"`, or `None` when the runner
+/// path holds a character that would end or expand inside the double quotes
+/// when the shell runs the hook (`"`, `$`, a backtick; on Unix also `\`).
+/// Writing it anyway would let a folder name run commands.
+fn claude_hook_command(abs_runner: &str) -> Option<String> {
+    let unsafe_char = |c: char| matches!(c, '"' | '$' | '`') || (c == '\\' && !cfg!(windows));
+    (!abs_runner.contains(unsafe_char)).then(|| format!("node \"{abs_runner}\""))
 }
 
 /// Repairs one Claude hook command the installer wrote (see
@@ -687,7 +705,7 @@ fn wire_codex_hooks(project_root: &Path, abs_runner: &str) -> Option<String> {
         .map(|existing| existing != serialized)
         .unwrap_or(true);
     if needs_write {
-        std::fs::write(&hooks_path, serialized).ok()?;
+        write_atomically(&hooks_path, &serialized).ok()?;
     }
     Some(hooks_path.to_string_lossy().to_string())
 }
@@ -830,27 +848,43 @@ fn read_config(path: &Path) -> Result<Option<Value>, UnreadableConfig> {
         path: path.to_path_buf(),
         reason,
     };
-    // `metadata` follows a symlink, so a link to a FIFO/device or to an
-    // enormous file is rejected before `read` can block or exhaust memory.
-    match std::fs::metadata(path) {
-        Ok(meta) => {
-            if !meta.is_file() {
-                return Err(unreadable("it is not a regular file".to_string()));
-            }
-            if meta.len() > MAX_CONFIG_BYTES {
-                return Err(unreadable(format!(
-                    "it is larger than the {MAX_CONFIG_BYTES}-byte config limit"
-                )));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(unreadable(e.to_string())),
+    // One open, checked through its own handle, so the file cannot be
+    // swapped between the check and the read. Non-blocking on Unix, so
+    // opening a FIFO (or a link to one) returns at once; the handle's
+    // metadata then rejects it, and the read never takes more than the limit.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
     }
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match options.open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(unreadable(e.to_string())),
     };
+    let meta = file.metadata().map_err(|e| unreadable(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(unreadable("it is not a regular file".to_string()));
+    }
+    let too_big = || {
+        unreadable(format!(
+            "it is larger than the {MAX_CONFIG_BYTES}-byte config limit"
+        ))
+    };
+    if meta.len() > MAX_CONFIG_BYTES {
+        return Err(too_big());
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, MAX_CONFIG_BYTES + 1),
+        &mut bytes,
+    )
+    .map_err(|e| unreadable(e.to_string()))?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(too_big());
+    }
     if bytes.starts_with(b"\xEF\xBB\xBF") {
         return Err(unreadable(
             "it starts with a UTF-8 byte order mark; save it as UTF-8 without one".to_string(),
@@ -935,7 +969,11 @@ fn harness_config_namespace(
     // metadata the adapter never reads; when the effective config names a
     // namespace it is the authority, so a stale registration cannot make the
     // hooks resolve a different one.
-    if harness == "opencode" {
+    //
+    // Every harness's runner loads that shared config, so it counts as
+    // OpenCode's only where OpenCode is set up in the project, and only the
+    // first file the loader picks counts (it never reads the second).
+    if harness == "opencode" && opencode_in_project(root) {
         for rel in [
             ".NeuroStrata/neurostrata-plugin.json",
             ".NeuroStrata/PluginConfig.json",
@@ -950,6 +988,7 @@ fn harness_config_namespace(
                         return Ok(Some(ns));
                     }
                 }
+                break;
             }
         }
     }
@@ -1665,10 +1704,7 @@ fn sync_skills_and_agent_rules(
     let _ = write_file_if_changed(&proj_task_agent, EMBEDDED_NEUROSTRATA_TASK_AGENT_MD);
 
     // 2. Sync harness-specific skill & agent directories (project-level and machine-level)
-    if active == Some("opencode")
-        || project_root.join(".opencode").exists()
-        || project_root.join("opencode.json").exists()
-    {
+    if active == Some("opencode") || opencode_in_project(project_root) {
         let oc_skill = project_root.join(".opencode/skills/neurostrata/SKILL.md");
         if write_file_if_changed(&oc_skill, EMBEDDED_NEUROSTRATA_SKILL_MD) {
             skills_installed.push(oc_skill.to_string_lossy().to_string());
@@ -1796,8 +1832,10 @@ fn write_staged_atomically(staged: &Path, path: &Path, contents: &str) -> std::i
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
+    // Open first: an entry already at `staged` (someone else's) makes this
+    // fail, and it is not ours to clean up.
+    let mut file = options.open(staged)?;
     let written = (|| -> std::io::Result<()> {
-        let mut file = options.open(staged)?;
         std::io::Write::write_all(&mut file, contents.as_bytes())?;
         file.sync_all()?;
         drop(file);
@@ -1856,10 +1894,7 @@ fn wire_harness_config(
 
     match harness {
         "opencode" => {
-            if is_active
-                || project_root.join(".opencode").exists()
-                || project_root.join("opencode.json").exists()
-            {
+            if is_active || opencode_in_project(project_root) {
                 // 1. Write the thin OpenCode loader at .opencode/plugins/neurostrata.js
                 //    (creating .opencode/plugins/ if needed). The relative import
                 //    resolves from the loader file's location back to the bundled core.
@@ -1947,7 +1982,12 @@ fn wire_harness_config(
                 let cfg_path = project_root.join(".claude/settings.local.json");
                 // The namespace lives in Claude's plugin config, as it does
                 // for the other harnesses; the command carries none.
-                let cmd = format!("node \"{abs_runner}\"");
+                let Some(cmd) = claude_hook_command(abs_runner) else {
+                    warnings.push(format!(
+                        "claude: hooks not written: the runner path {abs_runner:?} holds a character the hook's shell would expand"
+                    ));
+                    return None;
+                };
                 let mut doc: Value = json!({});
                 let mut write_doc = false;
                 if cfg_path.exists() {
@@ -2798,6 +2838,55 @@ mod tests {
                 .as_deref(),
             Some("actual")
         );
+    }
+
+    /// Codex review on #385: every runner loads the shared `.NeuroStrata`
+    /// config, so in a project without OpenCode it is not OpenCode's and
+    /// adds no OpenCode namespace ahead of Codex's own.
+    #[test]
+    fn the_shared_config_is_not_opencodes_without_opencode() {
+        let _env = no_namespace_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        write_file(
+            &root.join(".NeuroStrata/neurostrata-plugin.json"),
+            r#"{"namespace":"fallback"}"#,
+        );
+        assert_eq!(harness_config_namespace(&root, "opencode").unwrap(), None);
+    }
+
+    /// Codex review on #385: OpenCode's loader uses the first config file
+    /// that parses and never reads `PluginConfig.json` after it, so a stale
+    /// namespace there does not count.
+    #[test]
+    fn opencode_stops_at_the_first_config_file_it_loads() {
+        let _env = no_namespace_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".opencode")).unwrap();
+        write_file(&root.join(".NeuroStrata/neurostrata-plugin.json"), "{}");
+        write_file(
+            &root.join(".NeuroStrata/PluginConfig.json"),
+            r#"{"namespace":"stale"}"#,
+        );
+        assert_eq!(harness_config_namespace(&root, "opencode").unwrap(), None);
+    }
+
+    /// Sourcery review on #385: a runner path that would end or expand inside
+    /// the hook's double quotes is never written into a Claude hook command.
+    #[test]
+    fn a_claude_hook_is_not_written_for_an_unsafe_runner_path() {
+        assert_eq!(
+            claude_hook_command("/p/x/cli-hook.mjs").as_deref(),
+            Some("node \"/p/x/cli-hook.mjs\"")
+        );
+        for bad in [
+            "/p/a\"; id; \"/cli-hook.mjs",
+            "/p/$(id)/cli-hook.mjs",
+            "/p/`id`/cli-hook.mjs",
+        ] {
+            assert_eq!(claude_hook_command(bad), None, "{bad}");
+        }
     }
 
     /// #374 (findings p/q/x/Hu), lost in the #380 merge: an atomic config
@@ -4288,6 +4377,20 @@ mod tests {
         write_atomically(&target, "{\"ok\":true}").expect("write with a fresh staged name");
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"ok\":true}");
+    }
+
+    /// Review on #385: a file already at the staged path belongs to someone
+    /// else; a write that cannot create its own staged file leaves it alone.
+    #[test]
+    fn a_failed_write_keeps_an_entry_already_at_the_staged_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap();
+        let staged = dir.join(".config.json.tmp-taken");
+        std::fs::write(&staged, "someone else's").unwrap();
+
+        assert!(write_staged_atomically(&staged, &dir.join("config.json"), "{}").is_err());
+
+        assert_eq!(std::fs::read_to_string(&staged).unwrap(), "someone else's");
     }
 
     /// An atomic replacement must not widen a private config's permissions:

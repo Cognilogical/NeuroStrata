@@ -1542,7 +1542,12 @@ fn walk_to_session_marker_with(
         if is_home(dir) {
             return SessionMarkerWalk::StoppedAtHome;
         }
-        if dir.join(".NeuroStrata").exists() && !is_shared_temp_ancestor(dir, start) {
+        // The temp root's stray `.NeuroStrata` is skipped, but a project
+        // marker (`.NeuroStrata/config.json`) there still makes it a project.
+        if dir.join(".NeuroStrata").exists()
+            && (!is_shared_temp_ancestor(dir, start)
+                || dir.join(".NeuroStrata").join("config.json").exists())
+        {
             return SessionMarkerWalk::Root(dir.to_path_buf());
         }
         cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
@@ -4393,7 +4398,9 @@ done
 rewrite_session_ledger_namespace() {
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
-    printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
+    # Only a path that is truly absent is created: a dangling symlink there
+    # is not followed.
+    [ -L "$LEDGER" ] || printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
@@ -4416,8 +4423,10 @@ elif [ -n "$RESOLVED" ]; then
           let mode;
           try { mode = fs.statSync(ledger).mode; } catch {}
           fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-          if (mode !== undefined) { try { fs.chmodSync(tmp, mode); } catch {} }
-          fs.renameSync(tmp, ledger);
+          try {
+            if (mode !== undefined) { try { fs.chmodSync(tmp, mode); } catch {} }
+            fs.renameSync(tmp, ledger);
+          } catch { try { fs.unlinkSync(tmp); } catch {} }
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
