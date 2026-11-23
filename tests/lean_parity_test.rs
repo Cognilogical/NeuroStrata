@@ -1338,6 +1338,7 @@ fn shell_exemption_json_reader_regressions() {
 /// invokes `rustc -D warnings --crate-type=lib` with zero `--extern` flags).
 /// Kani runs in its own CI step, so skip the duplicate run here.
 #[test]
+#[cfg_attr(windows, ignore = "needs bash and Aeneas; Linux CI runs it")]
 fn formal_kernel_compiles_standalone_for_aeneas_extraction() {
     let root = repo_root();
     let script = root
@@ -1367,6 +1368,7 @@ fn formal_kernel_compiles_standalone_for_aeneas_extraction() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "needs bash and Kani; Linux CI runs it")]
 fn ci_kani_wrapper_dispatches_standalone_file_to_driver() {
     let root = repo_root();
     let workflow =
@@ -1417,6 +1419,7 @@ fn ci_kani_wrapper_dispatches_standalone_file_to_driver() {
 /// Live parity: the Rust kernel's exhaustive truth table must equal the Lean
 /// generated executable's stdout line-for-line.
 #[test]
+#[cfg_attr(windows, ignore = "needs Lean (lake); Linux CI runs it")]
 fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(

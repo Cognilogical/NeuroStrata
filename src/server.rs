@@ -25935,7 +25935,9 @@ mod context_plan_tests {
         }
 
         let proj_root = tmp_dir.join("repo");
-        std::fs::create_dir_all(&proj_root).unwrap();
+        // A marked project: on Windows the temp folder is under the home
+        // folder, where an unmarked folder is never a project root.
+        std::fs::create_dir_all(proj_root.join(".NeuroStrata")).unwrap();
         let text = handle_get_snapshot(
             serde_json::json!({
                 "namespace": "probe",

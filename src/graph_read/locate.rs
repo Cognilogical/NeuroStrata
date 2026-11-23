@@ -1467,6 +1467,9 @@ mod tests {
             .unwrap();
 
         let project_dir = tempfile::tempdir().expect("project_dir");
+        // A marked project: on Windows the temp folder is under the home
+        // folder, where an unmarked folder is never a project root.
+        std::fs::create_dir_all(project_dir.path().join(".NeuroStrata")).unwrap();
         let req = LocateRequest {
             namespace: ns.to_string(),
             query: "check_caller_path".to_string(),

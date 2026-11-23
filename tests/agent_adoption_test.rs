@@ -587,6 +587,10 @@ fn snapshot_readiness_failed_and_replayed_events_excluded() {
 /// ledger entries, then inspect the ledger it leaves behind.
 #[test]
 fn precommit_no_longer_fabricates_ledger_rows() {
+    let Some(bash) = hook_bash() else {
+        eprintln!("skipped: no Git bash to run the hook with");
+        return;
+    };
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();
@@ -621,8 +625,9 @@ fn precommit_no_longer_fabricates_ledger_rows() {
         std::fs::set_permissions(&hook_path, perms).unwrap();
     }
 
-    let out = std::process::Command::new("bash")
-        .arg(&hook_path)
+    let out = std::process::Command::new(&bash)
+        // Git bash reads `C:/...`; a backslash path is mangled.
+        .arg(hook_path.to_string_lossy().replace('\\', "/"))
         .current_dir(&repo)
         .output()
         .expect("run pre-commit hook");
@@ -649,6 +654,27 @@ fn precommit_no_longer_fabricates_ledger_rows() {
         no_fabricated_rows,
         "pre-commit hook fabricated ledger rows: {ledger}"
     );
+}
+
+/// Git's own bash: on Windows `bash` on PATH may be WSL's launcher, which
+/// cannot run a hook against a Windows checkout. Same lookup as the unit
+/// tests' `hook_bash` in src/task/mod.rs.
+fn hook_bash() -> Option<std::path::PathBuf> {
+    if cfg!(windows) {
+        let out = std::process::Command::new("git")
+            .arg("--exec-path")
+            .output()
+            .ok()?;
+        let exec = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        // <git>/mingw64/libexec/git-core -> <git>
+        let git_root = exec.parent()?.parent()?.parent()?.to_path_buf();
+        ["usr/bin/bash.exe", "bin/bash.exe"]
+            .iter()
+            .map(|rel| git_root.join(rel))
+            .find(|p| p.is_file())
+    } else {
+        Some(std::path::PathBuf::from("bash"))
+    }
 }
 
 /// Build a fully-populated receipt from raw query/content text. The raw text
