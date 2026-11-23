@@ -87,9 +87,17 @@ export function resolveConfig(pluginConfig = {}, cwd = process.cwd()) {
         DEFAULT_CONFIG.endpoint;
     // Preserve the exact namespace for MCP routing; sanitization happens only
     // where the value is interpolated into a prompt header (#329 review).
+    const envNamespace = process.env.NEUROSTRATA_NAMESPACE;
+    const rawInputNamespace = asString(input.namespace);
+    // A CLI hook runner copies NEUROSTRATA_NAMESPACE into config.namespace.
+    // Validate that copy with the same rule as the env fallback, so an invalid
+    // environment value cannot win before the fallback is reached (#400 finding).
+    const inputNamespace = envNamespace !== undefined && rawInputNamespace === asString(envNamespace)
+        ? usableNamespace(envNamespace)
+        : rawInputNamespace;
     const namespace = findRootMarker(resolve(cwd))?.namespace ??
-        asString(input.namespace) ??
-        usableNamespace(process.env.NEUROSTRATA_NAMESPACE) ??
+        inputNamespace ??
+        usableNamespace(envNamespace) ??
         discoverProjectNamespace(cwd);
     return {
         namespace,
@@ -580,6 +588,9 @@ export function readHarnessConfig(harness, projectDir, runnerDir) {
         const top = checkoutTop(start);
         roots.push(...(top === null ? [start] : [top, linkedMainCheckout(top)]));
     }
+    // Session-checkout roots come first; the runner's install root is only a
+    // last resort for a checkout with no config of its own (#378 F5).
+    const sessionRootCount = roots.length;
     if (typeof runnerDir === 'string' && runnerDir !== '') {
         const plugins = dirname(resolve(runnerDir));
         const stateDir = dirname(plugins);
@@ -589,9 +600,16 @@ export function readHarnessConfig(harness, projectDir, runnerDir) {
             roots.push(dirname(stateDir));
         }
     }
-    for (const root of roots) {
+    // A config that exists in the session checkout but yields no usable
+    // namespace must not fall through to the runner root: that would bind the
+    // session to the runner's project (#400 finding).
+    let sessionConfigFound = false;
+    for (let i = 0; i < roots.length; i++) {
+        const root = roots[i];
         if (root === null)
             continue;
+        if (i >= sessionRootCount && sessionConfigFound)
+            break;
         const file = join(root, ...spec.file);
         let text;
         try {
@@ -620,6 +638,8 @@ export function readHarnessConfig(harness, projectDir, runnerDir) {
         const namespace = usableNamespace(value);
         if (namespace)
             return { namespace };
+        if (i < sessionRootCount)
+            sessionConfigFound = true;
     }
     return {};
 }

@@ -635,3 +635,63 @@ test("installed claude runner: config over env, and CLAUDE_PROJECT_DIR", () => {
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+// ── PR #400: event-specific hook failure replies ────────────────────────
+function runFailingRunner(event, projectDir) {
+  const env = { ...process.env };
+  delete env.CLAUDE_PROJECT_DIR;
+  delete env.NEUROSTRATA_NAMESPACE;
+  return spawnSync(process.execPath, [RUNNER], {
+    input: JSON.stringify(event),
+    cwd: projectDir,
+    env: { ...env, CLAUDE_PROJECT_DIR: projectDir },
+    encoding: "utf8",
+    timeout: 30000,
+  });
+}
+
+test("hook runner replies in the shape of the failing event (#400)", () => {
+  const base = canonicalTempDir("ns-claude-hookfail-");
+  try {
+    buildLayout(base, ["repo neurostrata-dir"]);
+    const repo = under(base, "repo");
+    const config = join(repo, ".NeuroStrata", "plugins", "claude", "neurostrata.json");
+    mkdirSync(dirname(config), { recursive: true });
+    writeFileSync(config, "{ broken json");
+
+    const stop = runFailingRunner(stopEvent(repo), repo);
+    assert.equal(stop.status, 2, `Stop must exit 2; stderr=${stop.stderr.slice(0, 200)}`);
+    assert.equal(stop.stdout.trim(), "{}");
+
+    const pre = runFailingRunner(
+      { hook_event_name: "PreToolUse", cwd: repo, tool_name: "Write", tool_input: {} },
+      repo
+    );
+    assert.equal(pre.status, 0);
+    const reply = JSON.parse(pre.stdout);
+    assert.equal(reply.hookSpecificOutput.hookEventName, "PreToolUse");
+    assert.equal(reply.hookSpecificOutput.permissionDecision, "deny");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("cli hook ignores an invalid NEUROSTRATA_NAMESPACE (#400)", () => {
+  const base = canonicalTempDir("ns-claude-badenv-");
+  try {
+    buildLayout(base, ["repo neurostrata-dir"]);
+    const repo = under(base, "repo");
+    writeFileSync(
+      join(repo, ".NeuroStrata", "neurostrata-plugin.json"),
+      JSON.stringify({ endpoint: "http://127.0.0.1:1/mcp" })
+    );
+    const env = runnerEnv({
+      CLAUDE_PROJECT_DIR: repo,
+      NEUROSTRATA_NAMESPACE: "$NS; rm -rf /",
+    });
+    const ns = namespaceIn(runClaudeHook(stopEvent(repo), repo, env));
+    assert.notEqual(ns, "$NS; rm -rf /");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
