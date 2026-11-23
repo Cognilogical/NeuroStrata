@@ -665,16 +665,25 @@ fn hook_command_runner(command: &str) -> Option<(String, &str)> {
     None
 }
 
-/// Whether a `[hooks]` section in Codex's other config layer
+/// Whether a `[hooks]` table in Codex's other config layer
 /// (`.codex/config.toml`) already runs this project's canonical runner.
 /// Codex reads both layers; wiring a second entry would run the guard twice.
+/// Only a real hook `command` is evidence: a comment or an unrelated setting
+/// that merely mentions the runner path wires nothing. Malformed TOML names
+/// no hook.
 fn config_toml_wires_runner(
     text: &str,
     project_root: &Path,
     abs_runner: &str,
     event: &str,
 ) -> bool {
-    let event_key = event.to_ascii_lowercase();
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return false;
+    };
+    let Some(hooks) = value.get("hooks") else {
+        return false;
+    };
+    let event_key = event.to_ascii_lowercase().replace(['_', '-'], "");
     let folded_runner = path_key(abs_runner).replace('\\', "/").to_ascii_lowercase();
     let folded_root = format!(
         "{}/.neurostrata/plugins/codex/cli-hook.mjs",
@@ -683,24 +692,52 @@ fn config_toml_wires_runner(
             .trim_end_matches('/')
             .to_ascii_lowercase()
     );
-    let mut in_hooks = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            let section = trimmed
-                .trim_matches(['[', ']'])
-                .replace(['_', '-'], "")
-                .to_ascii_lowercase();
-            in_hooks = section.starts_with("hooks")
-                && (section == "hooks" || section.contains(&event_key.replace('_', "")));
-        } else if in_hooks {
-            let folded = trimmed.replace('\\', "/").to_ascii_lowercase();
-            if folded.contains(&folded_runner) || folded.contains(&folded_root) {
+    let mentions_runner = |part: &str| {
+        let folded = part.replace('\\', "/").to_ascii_lowercase();
+        folded.contains(&folded_runner) || folded.contains(&folded_root)
+    };
+    let covers_event = |key: &str| key.to_ascii_lowercase().replace(['_', '-'], "") == event_key;
+    let command_is_ours = |table: &toml::Table| {
+        table.get("command").is_some_and(|command| match command {
+            toml::Value::String(s) => mentions_runner(s),
+            toml::Value::Array(items) => items
+                .iter()
+                .any(|item| item.as_str().is_some_and(mentions_runner)),
+            _ => false,
+        })
+    };
+    match hooks {
+        // `[hooks.pre_tool_use] command = ...` (or `[hooks] command = ...`).
+        toml::Value::Table(table) => {
+            if command_is_ours(table) {
                 return true;
             }
+            table.iter().any(|(key, value)| {
+                if !covers_event(key) {
+                    return false;
+                }
+                match value {
+                    toml::Value::Table(inner) => command_is_ours(inner),
+                    toml::Value::Array(items) => items
+                        .iter()
+                        .any(|item| item.as_table().is_some_and(command_is_ours)),
+                    _ => false,
+                }
+            })
         }
+        // `[[hooks]] event = "..." command = ...`.
+        toml::Value::Array(items) => items.iter().any(|item| {
+            let Some(table) = item.as_table() else {
+                return false;
+            };
+            let event_matches = table
+                .get("event")
+                .and_then(toml::Value::as_str)
+                .is_some_and(covers_event);
+            event_matches && command_is_ours(table)
+        }),
+        _ => false,
     }
-    false
 }
 
 /// Add the NeuroStrata PreToolUse and Stop hooks to `.codex/hooks.json`,
@@ -771,6 +808,7 @@ fn wire_codex_hooks(
                 continue;
             };
             for hook in entry_hooks {
+                let mut owned = false;
                 for (key, target) in [("command", &cmd), ("commandWindows", &cmd_windows)] {
                     let Some(command) = hook.get(key).and_then(Value::as_str) else {
                         continue;
@@ -781,11 +819,24 @@ fn wire_codex_hooks(
                     if !is_installer_codex_runner(&old_path, project_root, abs_runner) {
                         continue;
                     }
+                    owned = true;
                     if command != target {
                         hook[key] = Value::String(target.clone());
                     }
-                    present = true;
                 }
+                if !owned {
+                    continue;
+                }
+                // An older install may have written only `command`. Once the
+                // hook is recognized as ours, both platform variants must be
+                // present or Windows keeps running a POSIX-quoted command.
+                if hook.get("command").is_none() {
+                    hook["command"] = Value::String(cmd.clone());
+                }
+                if hook.get("commandWindows").is_none() {
+                    hook["commandWindows"] = Value::String(cmd_windows.clone());
+                }
+                present = true;
             }
         }
         if !present && config_toml_wires_runner(&toml, project_root, abs_runner, event) {
@@ -1200,24 +1251,21 @@ impl NamespaceRoots {
             .chain(self.outside_git.iter())
     }
 
-    /// The harness configs of the first place in [`Self::config_order`] that
-    /// has any. A config that could not be read in a place looked at fails
-    /// the lookup: the namespace it names might be the answer.
+    /// Every harness config in every place in [`Self::config_order`], in that
+    /// fixed order. A linked worktree and its main checkout can each name a
+    /// namespace; stopping at the first root with any left the other one out
+    /// of the push gate. A config that could not be read anywhere looked at
+    /// fails the lookup: the namespace it names might be the answer.
     fn harness_namespaces(&self) -> Result<Vec<(String, String)>, Vec<UnreadableConfig>> {
+        let mut found = Vec::new();
         let mut unreadable = Vec::new();
         for root in self.config_order() {
-            let (found, errors) = harness_namespaces_at(root);
+            let (mut here, errors) = harness_namespaces_at(root);
             unreadable.extend(errors);
-            if !found.is_empty() {
-                return if unreadable.is_empty() {
-                    Ok(found)
-                } else {
-                    Err(unreadable)
-                };
-            }
+            found.append(&mut here);
         }
         if unreadable.is_empty() {
-            Ok(Vec::new())
+            Ok(found)
         } else {
             Err(unreadable)
         }
@@ -1442,11 +1490,24 @@ pub fn gate_namespaces(dir: &Path) -> Result<Vec<String>, ResolveError> {
         }
         for root in roots.ledger_order() {
             let ledger = root.join(".NeuroStrata").join("session_queries.json");
-            if let Some(ns) = std::fs::read_to_string(ledger)
-                .ok()
-                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-                .as_ref()
-                .and_then(|v| v.get("namespace"))
+            let text = match std::fs::read_to_string(&ledger) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(ResolveError::UnreadableConfigs(vec![UnreadableConfig {
+                        path: ledger,
+                        reason: e.to_string(),
+                    }]));
+                }
+            };
+            let value: Value = serde_json::from_str(&text).map_err(|e| {
+                ResolveError::UnreadableConfigs(vec![UnreadableConfig {
+                    path: ledger.clone(),
+                    reason: format!("it is not valid JSON ({e})"),
+                }])
+            })?;
+            if let Some(ns) = value
+                .get("namespace")
                 .and_then(Value::as_str)
                 .and_then(usable_namespace)
             {
@@ -4724,6 +4785,84 @@ mod tests {
         let doc = read_codex_hooks(tmp.path());
         assert!(doc["hooks"]["PreToolUse"].as_array().unwrap().is_empty());
         assert_eq!(codex_commands(&doc, "Stop"), vec![ours]);
+    }
+
+    /// An older install (or a checkout shared with POSIX) may carry only
+    /// `command`. Recognizing our hook must repair both platform variants;
+    /// otherwise Windows keeps running the POSIX-quoted command.
+    #[test]
+    fn codex_refresh_adds_the_missing_windows_command_to_an_owned_hook() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let (cmd, cmd_windows) = codex_hook_commands(&runner);
+        std::fs::write(
+            tmp.path().join(".codex/hooks.json"),
+            serde_json::to_string_pretty(&json!({"hooks": {
+                "PreToolUse": [{"hooks": [{"type": "command", "command": cmd.clone()}]}],
+                "Stop": [{"hooks": [{"type": "command", "command": cmd.clone()}]}]
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let doc = read_codex_hooks(tmp.path());
+        for event in ["PreToolUse", "Stop"] {
+            let hook = &doc["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["command"], json!(cmd), "{event}");
+            assert_eq!(hook["commandWindows"], json!(cmd_windows), "{event}");
+            assert_eq!(codex_commands(&doc, event).len(), 1, "{event}");
+        }
+    }
+
+    /// A comment or an unrelated setting mentioning the runner path is not a
+    /// hook command. It must not suppress wiring the real hooks.json entry.
+    #[test]
+    fn a_comment_mentioning_the_runner_does_not_wire_the_codex_hook() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let ours = codex_hook_command(&runner);
+        std::fs::write(
+            tmp.path().join(".codex/hooks.json"),
+            serde_json::to_string(&json!({"hooks": {}})).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".codex/config.toml"),
+            format!(
+                "# the canonical runner is {runner}\n[hooks.pre_tool_use]\nenv = \"{}\"\n",
+                runner.replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let doc = read_codex_hooks(tmp.path());
+        assert_eq!(codex_commands(&doc, "PreToolUse"), vec![ours]);
     }
 
     /// #368 F7: Codex detected only through the user's home install still
