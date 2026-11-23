@@ -1627,6 +1627,12 @@ mod tests {
         ))
     }
 
+    /// A path spelled for a hand-written JSON string: Windows backslashes
+    /// are escapes in JSON.
+    fn json_escape_path(path: &Path) -> String {
+        path.display().to_string().replace('\\', "\\\\")
+    }
+
     fn service_for(dir: &tempfile::TempDir, startup_root: PathBuf) -> IngestWatchService {
         let store: Arc<dyn WatchRegistrationStore> = Arc::new(JsonFileRegistrationStore::new(
             dir.path().join("watch_registrations.json"),
@@ -1763,7 +1769,7 @@ mod tests {
         let in_root = dir.path().join("src");
         let doc = format!(
             r#"{{"schema_version":1,"registrations":[{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}},{{"namespace":"NeuroStrata","canonical_path":"/tmp","created_at_unix":1763596800,"updated_at_unix":1763596800}}]}}"#,
-            in_root.display()
+            json_escape_path(&in_root)
         );
         std::fs::write(&path, doc).unwrap();
         let service = service_for(&dir, dir.path().to_path_buf());
@@ -1790,8 +1796,8 @@ mod tests {
         let path = dir.path().join("watch_registrations.json");
         let in_root = dir.path().join("src");
         std::fs::create_dir_all(&in_root).unwrap();
-        let resolved = in_root.canonicalize().unwrap();
-        let raw = format!("{}/src/../src", dir.path().display());
+        let resolved = dunce::canonicalize(&in_root).unwrap();
+        let raw = format!("{}/src/../src", json_escape_path(dir.path()));
         let doc = format!(
             r#"{{"schema_version":1,"registrations":[{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}}]}}"#,
             raw
@@ -1809,61 +1815,96 @@ mod tests {
     #[tokio::test]
     async fn notify_event_source_real_watcher_reports_events() {
         let dir = tempfile::tempdir().unwrap();
+
+        // Every operation gets a distinct path, and all but the Create target
+        // exist BEFORE the watcher starts. The source coalesces by path while an
+        // event is queued, so a fresh Create for the same path could swallow
+        // the Modify/Remove/Rename that follows it. Pre-creating those paths
+        // leaves their queue keys free for the operation under test. Events for
+        // other paths are discarded by correlation — no quiet-interval "settle"
+        // is treated as proof that a late delivery cannot arrive (review #389).
+        let modified = dir.path().join("modified.txt");
+        let removed = dir.path().join("removed.txt");
+        let old = dir.path().join("old.txt");
+        let new = dir.path().join("new.txt");
+        std::fs::write(&modified, b"first").unwrap();
+        std::fs::write(&removed, b"gone soon").unwrap();
+        std::fs::write(&old, b"old").unwrap();
+
         let source = NotifyEventSource::new().expect("notify watcher available");
         source.watch_root(dir.path()).expect("watch temp dir");
 
-        // Helper to wait for specific event kind
-        async fn recv(source: &NotifyEventSource, want: WatchEventKind) -> WatchEvent {
+        // Wait for an event whose kind AND path match this operation. A late
+        // delivery from an earlier operation has a different path and is
+        // discarded instead of being mistaken for the current step's result.
+        async fn recv_for(
+            source: &NotifyEventSource,
+            kinds: &[WatchEventKind],
+            path: &std::path::Path,
+        ) -> WatchEvent {
+            let mut discarded: Vec<(WatchEventKind, std::path::PathBuf)> = Vec::new();
             loop {
-                let ev = tokio::time::timeout(std::time::Duration::from_secs(2), source.recv())
-                    .await
-                    .unwrap_or_else(|_| panic!("event timeout waiting for {want:?}"))
-                    .expect("event");
-                if ev.kind == want {
+                let ev = match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    source.recv(),
+                )
+                .await
+                {
+                    Ok(Some(ev)) => ev,
+                    Ok(None) => panic!("event channel closed waiting for {kinds:?} on {path:?}"),
+                    Err(_) => panic!(
+                        "event timeout waiting for {kinds:?} on {path:?}; discarded: {discarded:?}"
+                    ),
+                };
+                if kinds.contains(&ev.kind) && ev.path == path {
                     return ev;
                 }
-                // Drain intermediate events (e.g., Modify/Access from same write)
+                discarded.push((ev.kind, ev.path));
             }
         }
 
-        // Create a file
-        let file = dir.path().join("test.txt");
-        std::fs::write(&file, b"hello").unwrap();
-
-        // Poll for create event
-        let ev = recv(&source, WatchEventKind::Create).await;
+        // Create.
+        let created = dir.path().join("created.txt");
+        std::fs::write(&created, b"hello").unwrap();
+        let ev = recv_for(&source, &[WatchEventKind::Create], &created).await;
         assert_eq!(ev.kind, WatchEventKind::Create);
-        assert_eq!(ev.path, file);
+        assert_eq!(ev.path, created);
 
-        // Modify the file - exact kind may vary by platform/backend; accept any
-        std::fs::write(&file, b"world").unwrap();
-        let ev = recv(&source, WatchEventKind::Modify).await;
-        assert_eq!(ev.path, file);
-        // Accept Modify, Create (truncate+write may look like recreate), or Remove+Create
-        assert!(matches!(
-            ev.kind,
-            WatchEventKind::Modify | WatchEventKind::Create | WatchEventKind::Remove
-        ));
+        // Modify — exact kind may vary by platform/backend; accept any that
+        // indicates a change to this path.
+        std::fs::write(&modified, b"second").unwrap();
+        let ev = recv_for(
+            &source,
+            &[
+                WatchEventKind::Modify,
+                WatchEventKind::Create,
+                WatchEventKind::Remove,
+            ],
+            &modified,
+        )
+        .await;
+        assert_eq!(ev.path, modified);
 
-        // Delete the file
-        std::fs::remove_file(&file).unwrap();
-        let ev = recv(&source, WatchEventKind::Remove).await;
-        // Accept any kind that indicates the path is gone; on some platforms a
-        // modify+remove pair may arrive shifted, so we just verify the path matches.
-        assert_eq!(ev.path, file);
+        // Remove.
+        std::fs::remove_file(&removed).unwrap();
+        let ev = recv_for(&source, &[WatchEventKind::Remove], &removed).await;
+        assert_eq!(ev.path, removed);
 
-        // Rename test: create old, rename to new
-        let old = dir.path().join("old.txt");
-        let new = dir.path().join("new.txt");
-        std::fs::write(&old, b"old").unwrap();
-        // Wait for create
-        let _ = recv(&source, WatchEventKind::Create).await;
-        // Rename
+        // Rename old -> new.
         std::fs::rename(&old, &new).unwrap();
-        let ev = recv(&source, WatchEventKind::Rename).await;
-        assert_eq!(ev.kind, WatchEventKind::Rename);
-        assert_eq!(ev.path, old);
-        assert_eq!(ev.new_path, Some(new.clone()));
+        if cfg!(windows) {
+            // The Windows backend reports a rename as From/To events with no
+            // tracker cookie, so it arrives as Remove(old) then Create(new).
+            let ev = recv_for(&source, &[WatchEventKind::Remove], &old).await;
+            assert_eq!(ev.path, old);
+            let ev = recv_for(&source, &[WatchEventKind::Create], &new).await;
+            assert_eq!(ev.path, new);
+        } else {
+            let ev = recv_for(&source, &[WatchEventKind::Rename], &old).await;
+            assert_eq!(ev.kind, WatchEventKind::Rename);
+            assert_eq!(ev.path, old);
+            assert_eq!(ev.new_path, Some(new.clone()));
+        }
 
         // Verify new file exists with content
         let content = std::fs::read_to_string(&new).unwrap();
@@ -1971,7 +2012,7 @@ mod tests {
     ) -> (IngestWatchService, PathBuf) {
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
-        let canonical = root.canonicalize().unwrap();
+        let canonical = dunce::canonicalize(&root).unwrap();
         let store: Arc<dyn WatchRegistrationStore> = Arc::new(JsonFileRegistrationStore::new(
             dir.path().join("watch_registrations.json"),
         ));
@@ -2220,7 +2261,7 @@ mod tests {
         let first = canonical.clone();
         let second = canonical.join("other");
         std::fs::create_dir_all(&second).unwrap();
-        let second = second.canonicalize().unwrap();
+        let second = dunce::canonicalize(&second).unwrap();
         service.register("NsA", &first).unwrap();
         service.register("NsB", &second).unwrap();
         service.reconcile().await.unwrap();
@@ -2314,8 +2355,8 @@ mod tests {
         let stale = dir.path().join("stale");
         let doc = format!(
             r#"{{"schema_version":1,"registrations":[{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}},{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}}]}}"#,
-            good.display(),
-            stale.display()
+            json_escape_path(&good),
+            json_escape_path(&stale)
         );
         std::fs::write(&registry, doc).unwrap();
         let store: Arc<dyn WatchRegistrationStore> =

@@ -5983,6 +5983,7 @@ mod tests {
     }
 
     /// The scaffolded guard must be the canonical script, not an empty stub.
+    #[cfg(unix)]
     #[test]
     fn scaffolded_task_coverage_gate_is_valid_bash() {
         if which_bash().is_none() {
@@ -6182,9 +6183,17 @@ mod tests {
         let store = temp_store().await;
         let ns = "HintRootNs";
         store.init(ns).await.expect("init namespace schema");
-        let scratch =
-            std::env::temp_dir().join(format!("ns-scratch-hint-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&scratch).unwrap();
+        // The scratch hint must be an unmarked folder outside home. On
+        // Windows the temp folder is under home, so use the public folder.
+        let scratch_base = std::env::var_os("PUBLIC")
+            .filter(|_| cfg!(windows))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let scratch_dir = tempfile::Builder::new()
+            .prefix("ns-scratch-hint-")
+            .tempdir_in(&scratch_base)
+            .expect("scratch dir");
+        let scratch = scratch_dir.path().to_path_buf();
         assert!(!scratch.join(".git").exists() && !scratch.join(".NeuroStrata").exists());
         let worktree =
             std::env::temp_dir().join(format!("ns-real-worktree-{}", uuid::Uuid::new_v4()));
@@ -9101,6 +9110,9 @@ exit 0
         let _env_guard = crate::daemon::project_root_env_test_lock();
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
+        // A marked project: on Windows the temp folder is under the home
+        // folder, where an unmarked folder is never a project root.
+        std::fs::create_dir_all(dir_b.path().join(".NeuroStrata")).unwrap();
         let store = store_with_namespace("MyProj").await;
         let rid = crate::registry::registry_row_id("MyProj");
         let reg_vec = StubEmbedder.embed("registry").await.unwrap();

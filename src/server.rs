@@ -13353,7 +13353,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().join("root");
             std::fs::create_dir_all(&root).unwrap();
-            let canonical = root.canonicalize().unwrap();
+            let canonical = dunce::canonicalize(&root).unwrap();
             let watch = watch_service(&root);
             watch.register("ns", &canonical).unwrap();
             let (store, _) = store_with_one_rule("ns").await;
@@ -13413,7 +13413,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().join("root");
             std::fs::create_dir_all(&root).unwrap();
-            let canonical_root = root.canonicalize().unwrap();
+            let canonical_root = dunce::canonicalize(&root).unwrap();
             let watch = watch_service(&root);
             let (store, _) = store_with_one_rule("ns").await;
             let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
@@ -13434,7 +13434,11 @@ mod tests {
             assert_eq!(parsed["removed"], false);
             assert_eq!(
                 parsed["canonical_path"],
-                canonical_root.join("missing/deep").display().to_string(),
+                canonical_root
+                    .join("missing")
+                    .join("deep")
+                    .display()
+                    .to_string(),
                 "echo must use the core resolver, not raw-path canonicalize"
             );
         }
@@ -13444,7 +13448,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().join("root");
             std::fs::create_dir_all(&root).unwrap();
-            let canonical = root.canonicalize().unwrap();
+            let canonical = dunce::canonicalize(&root).unwrap();
             let watch = watch_service(&root);
             watch.register("ns", &canonical).unwrap();
             let before = watch.status(None).roots.len();
@@ -13502,7 +13506,7 @@ mod tests {
             assert_eq!(watch.status(None).roots.len(), 1, "success auto-registered");
             assert_eq!(
                 watch.status(None).roots[0].canonical_path,
-                root.canonicalize().unwrap()
+                dunce::canonicalize(&root).unwrap()
             );
 
             // A failed ingest (missing directory) must not register a root.
@@ -25931,7 +25935,9 @@ mod context_plan_tests {
         }
 
         let proj_root = tmp_dir.join("repo");
-        std::fs::create_dir_all(&proj_root).unwrap();
+        // A marked project: on Windows the temp folder is under the home
+        // folder, where an unmarked folder is never a project root.
+        std::fs::create_dir_all(proj_root.join(".NeuroStrata")).unwrap();
         let text = handle_get_snapshot(
             serde_json::json!({
                 "namespace": "probe",

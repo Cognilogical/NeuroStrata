@@ -1601,6 +1601,15 @@ mod tests {
         p.to_string_lossy().to_string()
     }
 
+    /// Forms are deduplicated by their normalized (`/`) spelling, so on
+    /// Windows a backslash spelling may be stored in its slash form.
+    fn has_form(forms: &[String], want: &str) -> bool {
+        let want = crate::parser::ingest::normalize_node_path(want);
+        forms
+            .iter()
+            .any(|f| crate::parser::ingest::normalize_node_path(f) == want)
+    }
+
     fn resolved(path: &str, source: RootSource) -> (String, RootSource) {
         (path.to_string(), source)
     }
@@ -2111,7 +2120,7 @@ mod tests {
             assert_eq!(by_project.lookup.source, RootSource::ProjectRoot);
             assert_eq!(by_project.lookup.path, ".");
             assert!(by_project.forms.iter().any(|f| f == "."));
-            assert!(by_project.forms.iter().any(|f| f == &root_s));
+            assert!(has_form(&by_project.forms, &root_s));
 
             let by_registry =
                 resolve_in_scope_forms(raw, None, Some(&root_s), PathResolutionScope::Prefix)
@@ -2119,14 +2128,14 @@ mod tests {
             assert_eq!(by_registry.lookup.source, RootSource::RegistryRoot);
             assert_eq!(by_registry.lookup.path, ".");
             assert!(by_registry.forms.iter().any(|f| f == "."));
-            assert!(by_registry.forms.iter().any(|f| f == &root_s));
+            assert!(has_form(&by_registry.forms, &root_s));
 
             let by_marker = resolve_in_scope_forms(raw, None, None, PathResolutionScope::Prefix)
                 .expect("prefix equal to checkout root must resolve via .git marker");
             assert_eq!(by_marker.lookup.source, RootSource::Marker);
             assert_eq!(by_marker.lookup.path, ".");
             assert!(by_marker.forms.iter().any(|f| f == "."));
-            assert!(by_marker.forms.iter().any(|f| f == &root_s));
+            assert!(has_form(&by_marker.forms, &root_s));
         }
 
         // Foreign checkout root stays vetoed when a project_root or registry_root is configured.
@@ -2172,7 +2181,7 @@ mod tests {
         let lookup = to_project_relative(&caller, Some(&root_s), None);
         assert_eq!(lookup.path, "src/lib.rs");
         let forms = lookup_forms(&caller, &lookup, Some(&root_s));
-        assert!(forms.iter().any(|f| f == &caller), "{forms:?}");
+        assert!(has_form(&forms, &caller), "{forms:?}");
         assert!(forms.iter().any(|f| f == "src/lib.rs"), "{forms:?}");
         let abs = s(&root.join("src").join("lib.rs"));
         assert!(forms.iter().any(|f| f == &abs), "{forms:?}");
@@ -2776,7 +2785,9 @@ mod tests {
             common.join("config"),
             format!(
                 "[core]\n\tbare = false # harmless\n\tworktree = {}\\#1 ; trailing\n",
-                s(&base.join("sep"))
+                // `\` is an escape in a Git config value, so spell the
+                // Windows path with `/`.
+                s(&base.join("sep")).replace('\\', "/")
             ),
         )
         .unwrap();

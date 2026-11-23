@@ -613,15 +613,20 @@ pub(crate) fn check_caller_path(
     root: &Path,
     allowlist: &[PathBuf],
 ) -> Result<PathBuf, String> {
+    // Containment compares std's canonical forms, which are uniform (on
+    // Windows always `\\?\`); only the answer is simplified to `C:\...`.
+    // dunce keeps a path past MAX_PATH verbatim, so comparing dunce forms
+    // would put a long descendant outside a short root.
     let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let resolved = resolve_caller_path(raw)?;
-    if resolved.starts_with(&canonical_root) {
-        return Ok(resolved);
+    let answer = || dunce::simplified(&resolved).to_path_buf();
+    if canonical_contains(&canonical_root, &resolved) {
+        return Ok(answer());
     }
     for entry in allowlist {
         let canonical_entry = std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
-        if resolved.starts_with(&canonical_entry) {
-            return Ok(resolved);
+        if canonical_contains(&canonical_entry, &resolved) {
+            return Ok(answer());
         }
     }
     Err(format!(
@@ -632,6 +637,17 @@ pub(crate) fn check_caller_path(
         resolved.display(),
         canonical_root.display()
     ))
+}
+
+/// Containment decision for caller paths, factored out so the prefix form is
+/// explicit and testable. Both arguments must come from
+/// `std::fs::canonicalize`, which on Windows always yields the uniform
+/// `\\?\C:\...` spelling; a path past MAX_PATH and a short root then share
+/// the same prefix form. Passing a `dunce`-simplified root here would put a
+/// long, authorized descendant outside its own root (PR #386 review P2).
+/// Simplification belongs only in `check_caller_path`'s outward `answer`.
+fn canonical_contains(root: &Path, candidate: &Path) -> bool {
+    candidate.starts_with(root)
 }
 
 /// Resolve `raw` to the canonical path it names, per [`check_caller_path`].
@@ -1541,7 +1557,7 @@ async fn handle_backup(
         .export_database(&dir.to_string_lossy())
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(format!("Backed up to {}", req.dir))
+    Ok(format!("Backed up to {}", dir.display()))
 }
 
 /// R22: export-graph CLI proxy — routes through the daemon when it is
@@ -1598,7 +1614,7 @@ async fn handle_export_graph(
             .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     )
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(format!("Graph exported to {}", req.target))
+    Ok(format!("Graph exported to {}", target.display()))
 }
 
 #[derive(serde::Deserialize)]
@@ -4010,17 +4026,21 @@ mod tests {
     }
 
     /// Task 2 re-file pin: a backup destination inside the served root
-    /// succeeds exactly as it did before the policy existed.
+    /// succeeds exactly as it did before the policy existed. Review on #389:
+    /// the answer names the resolved destination, not the caller's spelling.
     #[tokio::test(flavor = "multi_thread")]
     async fn backup_inside_root_succeeds() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = scratch_root("t2r-backup-inside-root");
         std::fs::create_dir_all(&root).unwrap();
         let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
-        let dest = root.join("snapshots");
+        let dest = std::fs::canonicalize(&root).unwrap().join("snapshots");
+        std::fs::create_dir_all(&dest).unwrap();
+        // Same destination, but spelled with a redundant `.` component.
+        let spelling = root.join(".").join("snapshots");
         let res = client
             .post(format!("{base}/backup"))
-            .json(&serde_json::json!({ "dir": dest.display().to_string() }))
+            .json(&serde_json::json!({ "dir": spelling.display().to_string() }))
             .send()
             .await
             .unwrap();
@@ -4029,6 +4049,14 @@ mod tests {
         assert!(
             body.contains("Backed up to"),
             "the handler's own answer: {body}"
+        );
+        assert!(
+            body.contains(&dest.display().to_string()),
+            "the answer names the resolved path: {body}"
+        );
+        assert!(
+            !body.contains(&spelling.display().to_string()),
+            "the answer must not echo the caller's spelling: {body}"
         );
         stop_daemon(&client, &base, daemon).await;
     }
@@ -4204,26 +4232,34 @@ mod tests {
     }
 
     /// Task 2 re-file pin: an export target inside the served root is
-    /// written exactly as before the policy existed.
+    /// written exactly as before the policy existed. Review on #389: the
+    /// answer names the resolved target, not the caller's spelling.
     #[tokio::test(flavor = "multi_thread")]
     async fn export_graph_inside_root_succeeds() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = scratch_root("t2r-export-inside-root");
         std::fs::create_dir_all(&root).unwrap();
-        let target = root.join("graph.json");
+        let target = std::fs::canonicalize(&root).unwrap().join("graph.json");
+        std::fs::write(&target, b"seed").unwrap();
+        // Same target, but spelled with a redundant `.` component.
+        let spelling = root.join(".").join("graph.json");
         let (base, client, daemon, _credential_guard) = spawn_daemon_serving(&root).await;
 
         let res = client
             .post(format!("{base}/export-graph"))
-            .json(&serde_json::json!({ "target": target.display().to_string() }))
+            .json(&serde_json::json!({ "target": spelling.display().to_string() }))
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            res.status(),
-            axum::http::StatusCode::OK,
-            "an in-root export proceeds: {}",
-            res.text().await.unwrap()
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let body = res.text().await.unwrap();
+        assert!(
+            body.contains(&target.display().to_string()),
+            "the answer names the resolved target: {body}"
+        );
+        assert!(
+            !body.contains(&spelling.display().to_string()),
+            "the answer must not echo the caller's spelling: {body}"
         );
         assert!(
             target.exists(),
@@ -4286,6 +4322,60 @@ mod tests {
         );
     }
 
+    /// `std::fs::canonicalize` answers `\\?\C:\...` on Windows, which no
+    /// caller or stored registration spells that way.
+    #[test]
+    fn caller_paths_resolve_without_the_windows_verbatim_prefix() {
+        let root = scratch_root("t2r-unit-verbatim-root");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for raw in [root.join("src"), root.join("src").join("new.rs")] {
+            let resolved = check_caller_path(&raw, &root, &[]).expect("inside the root");
+            assert!(
+                !resolved.to_string_lossy().starts_with(r"\\?\"),
+                "{}",
+                resolved.display()
+            );
+        }
+    }
+
+    /// PR #386 review P2: `dunce` leaves a path past MAX_PATH in verbatim
+    /// `\\?\C:\...` form but simplifies a short root to `C:\...`. Comparing
+    /// those two spellings would refuse an in-root directory with 403 and
+    /// skip its watch registration. Containment must see both in the uniform
+    /// canonical form; only the outward-facing path may be simplified.
+    #[test]
+    fn containment_compares_canonical_prefix_before_outward_simplification() {
+        let canonical_root = std::path::Path::new(r"\\?\C:\root");
+        let long_descendant = canonical_root
+            .join("a")
+            .join("very")
+            .join("long")
+            .join("descendant");
+
+        // Both canonical: the long descendant is inside the short root.
+        assert!(canonical_contains(canonical_root, &long_descendant));
+
+        // Review on #389: a canonical path OUTSIDE the root must be rejected on
+        // every host. Without this, a Windows-only regression that accepts
+        // every candidate passes the in-root assertion above.
+        let outside_root = std::path::Path::new(r"\\?\C:\somewhere-else");
+        let outside_candidate = outside_root.join("secret.txt");
+        assert!(
+            !canonical_contains(canonical_root, &outside_candidate),
+            "a canonical non-descendant must never be contained"
+        );
+
+        // On non-Windows hosts the simplified spelling is a different path
+        // component, modeling the mismatch that caused the 403. Windows
+        // already exercises the real verbatim prefix through the assertion
+        // above; prefix-variant equality there is std's business.
+        #[cfg(not(windows))]
+        {
+            let simplified_root = std::path::Path::new(r"C:\root");
+            assert!(!canonical_contains(simplified_root, &long_descendant));
+        }
+    }
+
     /// Task 2 re-file (J6), unit leg: a not-yet-existing destination with
     /// a plain remainder resolves to the canonical ancestor plus the
     /// remainder — the normal first-backup shape.
@@ -4297,7 +4387,7 @@ mod tests {
         let resolved = check_caller_path(&dest, &root, &[]).expect("a plain remainder resolves");
         assert_eq!(
             resolved,
-            std::fs::canonicalize(&root)
+            dunce::canonicalize(&root)
                 .unwrap()
                 .join("backups")
                 .join("2026-10-25"),
@@ -4320,7 +4410,7 @@ mod tests {
             .expect("an allowlisted directory permits the destination");
         assert_eq!(
             resolved,
-            std::fs::canonicalize(&external).unwrap().join("snapshot")
+            dunce::canonicalize(&external).unwrap().join("snapshot")
         );
     }
 
@@ -4339,7 +4429,7 @@ mod tests {
             "the refusal names the path: {err}"
         );
         assert!(
-            err.contains(&std::fs::canonicalize(&root).unwrap().display().to_string()),
+            err.contains(&dunce::canonicalize(&root).unwrap().display().to_string()),
             "the refusal names the root: {err}"
         );
         assert!(
@@ -4733,7 +4823,7 @@ mod tests {
                 .watch
                 .register("test-ns", &root)
                 .expect("core registration succeeds");
-            let canonical = std::fs::canonicalize(&root).unwrap();
+            let canonical = dunce::canonicalize(&root).unwrap();
 
             let req = serde_json::json!({
                 "namespace": "test-ns",
