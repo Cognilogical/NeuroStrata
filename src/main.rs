@@ -7530,13 +7530,15 @@ async fn run() -> anyhow::Result<()> {
             // Held means the OS lock, not the file: the daemon leaves the file
             // behind on exit, and treating it as a live daemon meant the proxy
             // waited two minutes and never spawned one.
-            let lock_held = proxy_should_wait_for_daemon(config_db_path().as_deref());
+            let db_path = config_db_path();
+            let lock_held = proxy_should_wait_for_daemon(db_path.as_deref());
 
             if lock_held {
                 eprintln!(
                     "NeuroStrata daemon is starting (lock held); waiting for it to answer..."
                 );
                 let client = daemon_http_client();
+                let mut released = false;
                 for _ in 0..1200 {
                     // up to 2 minutes
                     if client
@@ -7550,10 +7552,19 @@ async fn run() -> anyhow::Result<()> {
                         server::start_mcp_proxy(server::DaemonOrigin::AlreadyRunning).await?;
                         return Ok(());
                     }
+                    // A stopping daemon holds the lock through its final
+                    // checkpoint and never answers again: once it lets go,
+                    // start a new one instead of waiting out the two minutes.
+                    if !proxy_should_wait_for_daemon(db_path.as_deref()) {
+                        released = true;
+                        break;
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-                eprintln!("A daemon holds the lock but did not answer within 2 minutes. Refusing to spawn a second instance.");
-                std::process::exit(1);
+                if !released {
+                    eprintln!("A daemon holds the lock but did not answer within 2 minutes. Refusing to spawn a second instance.");
+                    std::process::exit(1);
+                }
             }
 
             eprintln!("NeuroStrata MCP Server initializing...");
