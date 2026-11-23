@@ -6277,12 +6277,12 @@ async fn handle_get_snapshot(
                 .and_then(|v| v.as_str())
                 == Some(root_str.as_str())
         };
-        // A task attributed to this worktree wins over an arbitrary in_progress
-        // task from a different worktree/session.
+        // Only a task attributed to this worktree may become this session's
+        // active task. Falling back to the first in_progress row bound another
+        // worktree's task (and its Breath note) into this session.
         let active_task = all_memories
             .iter()
             .find(|m| is_active(m) && matches_root(m))
-            .or_else(|| all_memories.iter().find(|m| is_active(m)))
             .map(|m| (m.id.as_str(), &m.payload));
         crate::task::persist_active_session_file(
             std::path::Path::new(root_str),
@@ -12837,7 +12837,8 @@ async fn handle_guard_validate(
             // session/worktree preflight before rule validation runs. Resolve
             // the active InProgress task in strict specificity order, so one
             // session's task cannot hijack another worktree's Breath gate:
-            // named id > session+worktree > session > worktree > first row.
+            // named id > session+worktree > session > worktree; no match means
+            // unbound, never another worktree's first in_progress row.
             let caller_session = arguments
                 .get("session_id")
                 .and_then(|v| v.as_str())
@@ -12886,8 +12887,7 @@ async fn handle_guard_validate(
                             .iter()
                             .find(|m| in_progress(m) && task_matches(m, "worktree", w))
                     })
-                })
-                .or_else(|| memories.iter().find(|m| in_progress(m)));
+                });
             let active_task_id = active_task_row.map(|m| m.id.as_str());
             let session_id = arguments
                 .get("session_id")
@@ -13795,6 +13795,43 @@ mod tests {
                 reply
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guard_validate_never_hijacks_an_unrelated_worktree_task() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let vector = StubEmbedder.embed("task").await.unwrap();
+        let mut p = payload("task-A");
+        p.memory_type = "task".to_string();
+        p.metadata = serde_json::json!({
+            "task": {
+                "status": "in_progress",
+                "session_id": "ses_A",
+                "worktree": "/wt/a",
+            }
+        });
+        store.upsert("probe", "task-A", vector, p).await.unwrap();
+
+        // No caller session/worktree matches task-A; cwd names a third one.
+        // The old "first in_progress row" fallback bound task-A anyway.
+        let args = serde_json::json!({
+            "namespace": "probe",
+            "action_type": "write",
+            "payload": "/tmp/scratch.txt",
+            "cwd": "/wt/unrelated",
+            "mutations_since_note": 0
+        });
+        let reply = handle_guard_validate(
+            args,
+            store.clone(),
+            Arc::new(StubEmbedder),
+            recording_bus().0,
+        )
+        .await;
+        assert!(
+            reply.contains("Unpreflighted: claim task") && !reply.contains("task-A"),
+            "an unrelated worktree's task must not satisfy the preflight: {reply}"
+        );
     }
 
     #[test]

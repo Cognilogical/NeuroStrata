@@ -620,6 +620,38 @@ fn depth(rel: &[u8]) -> usize {
     }
 }
 
+/// Namespaces recorded in the graph-lookup ledgers of the checkout and its
+/// main checkout. A migration can move the marker while in-progress tasks
+/// remain under a namespace the ledger still names; gating only the marker
+/// leaves those tasks unguarded.
+fn ledger_namespaces(top: &Path, main_top: Option<&Path>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut add = |root: &Path| {
+        let path = root.join(".NeuroStrata").join("session_queries.json");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
+        let Some(ns) = value
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::task::harness_plugins::usable_namespace)
+        else {
+            return;
+        };
+        if !out.contains(&ns) {
+            out.push(ns);
+        }
+    };
+    if let Some(main) = main_top {
+        add(main);
+    }
+    add(top);
+    out
+}
+
 /// [`namespaces_for_push`] with an injected git.
 pub fn namespaces_for_push_with(
     git: &dyn GitRunner,
@@ -642,12 +674,29 @@ pub fn namespaces_for_push_with(
     if let Some(ns) = gate_ready(folder_namespace.clone()) {
         out.insert(ns);
     }
-    let resolved =
-        crate::task::harness_plugins::resolve_namespace(&top).map_err(|e| e.to_string())?;
-    let fallback =
-        gate_ready(folder_namespace.clone()).unwrap_or_else(|| resolved.namespace.clone());
-    if let Some(ns) = gate_ready(resolved.namespace) {
-        out.insert(ns);
+    // A folder name that is not a usable namespace (say "My Project") is not
+    // a reason to block the push: the hook still gates the raw folder name.
+    // An unreadable marker/config is a reason -- its namespace is unknown.
+    let resolved = match crate::task::harness_plugins::resolve_namespace(&top) {
+        Ok(resolved) => Some(resolved),
+        Err(crate::task::harness_plugins::ResolveError::NoUsableNamespace { .. }) => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let fallback = gate_ready(folder_namespace.clone())
+        .or_else(|| resolved.as_ref().map(|r| r.namespace.clone()))
+        .unwrap_or_else(|| folder_namespace.clone());
+    if let Some(resolved) = resolved {
+        // A marker migration can leave in-progress tasks under a namespace an
+        // old harness config or the ledger still names. Gate every distinct
+        // one, not just the single answer or the namespaces of changed paths.
+        for ns in std::iter::once(resolved.namespace)
+            .chain(resolved.configs.into_iter().map(|(_, ns)| ns))
+            .chain(ledger_namespaces(&own_top, main_top.as_deref()))
+        {
+            if let Some(ns) = gate_ready(ns) {
+                out.insert(ns);
+            }
+        }
     }
 
     let mut resolver = Resolver {
@@ -854,6 +903,57 @@ mod tests {
             namespaces_for_push(&dir, &deletion).unwrap(),
             set(&["marked-proj", "top-ns"])
         );
+    }
+
+    #[test]
+    fn every_distinct_config_and_ledger_namespace_is_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        marker(&dir, "", "marker-ns");
+        write(
+            &dir,
+            ".opencode/neurostrata-plugin.json",
+            "{\"neurostrata\":{\"namespace\":\"opencode-ns\"}}",
+        );
+        write(
+            &dir,
+            ".codex/plugins/neurostrata.json",
+            "{\"namespace\":\"codex-ns\"}",
+        );
+        write(
+            &dir,
+            ".NeuroStrata/session_queries.json",
+            "{\"namespace\":\"ledger-ns\",\"queries\":[]}",
+        );
+        let sha = commit_all(&dir, "namespaces");
+        let got = namespaces_for_push(&dir, &new_branch(&sha, "main")).unwrap();
+        assert_eq!(
+            got,
+            set(&["proj", "marker-ns", "opencode-ns", "codex-ns", "ledger-ns",]),
+            "a marker migration must not drop the namespaces older sources name"
+        );
+    }
+
+    #[test]
+    fn invalid_folder_name_does_not_fail_gate_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "My Project");
+        write(&dir, "src/a.rs", "a");
+        let sha = commit_all(&dir, "a");
+        let got = namespaces_for_push(&dir, &new_branch(&sha, "main")).unwrap();
+        assert!(
+            got.contains("My Project"),
+            "the raw folder name is still gated: {got:?}"
+        );
+    }
+
+    #[test]
+    fn unreadable_harness_config_still_blocks_gate_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        write(&dir, ".codex/plugins/neurostrata.json", "{not json");
+        let sha = commit_all(&dir, "bad config");
+        assert!(namespaces_for_push(&dir, &new_branch(&sha, "main")).is_err());
     }
 
     #[test]
