@@ -653,10 +653,8 @@ fn strip_installer_env_prefix(mut command: &str) -> &str {
 /// user's own and is not claimed.
 fn hook_command_runner(command: &str) -> Option<(String, &str)> {
     let quoted = strip_installer_env_prefix(command).strip_prefix("node ")?;
-    let parsers: [fn(&str) -> Option<(String, &str)>; 2] = [
-        shell_literal_value,
-        powershell_literal_value,
-    ];
+    let parsers: [fn(&str) -> Option<(String, &str)>; 2] =
+        [shell_literal_value, powershell_literal_value];
     for parse in parsers {
         if let Some((path, rest)) = parse(quoted) {
             if rest.trim().is_empty() {
@@ -1417,8 +1415,9 @@ pub fn gate_namespaces(dir: &Path) -> Result<Vec<String>, ResolveError> {
     let Ok(roots) = NamespaceRoots::of(dir) else {
         return Ok(Vec::new());
     };
-    let marker = crate::root_marker::find_root_marker(&roots.dir)
-        .map_err(|(path, reason)| ResolveError::UnreadableMarker(UnreadableConfig { path, reason }))?;
+    let marker = crate::root_marker::find_root_marker(&roots.dir).map_err(|(path, reason)| {
+        ResolveError::UnreadableMarker(UnreadableConfig { path, reason })
+    })?;
     let mut out: Vec<String> = Vec::new();
     {
         let mut add = |ns: String| {
@@ -1956,9 +1955,7 @@ fn sync_skills_and_agent_rules(
 /// installer creates the rest itself. The final component (the file) is
 /// checked too, so a link to a user file is never read back or replaced.
 fn refuse_symlink_components(root: &Path, path: &Path) -> std::io::Result<()> {
-    let denied = |what: String| {
-        std::io::Error::new(std::io::ErrorKind::PermissionDenied, what)
-    };
+    let denied = |what: String| std::io::Error::new(std::io::ErrorKind::PermissionDenied, what);
     let rel = path
         .strip_prefix(root)
         .map_err(|_| denied("path is outside the project root".to_string()))?;
@@ -4360,11 +4357,7 @@ mod tests {
         let doc = read_codex_hooks(tmp.path());
         assert_eq!(
             codex_commands(&doc, "PreToolUse"),
-            vec![
-                "echo user-hook".to_string(),
-                stale,
-                expected.clone()
-            ],
+            vec!["echo user-hook".to_string(), stale, expected.clone()],
             "user hook kept, foreign runner untouched, ours added once"
         );
         assert_eq!(codex_commands(&doc, "Stop"), vec![expected]);
@@ -4596,7 +4589,10 @@ mod tests {
         let doc = read_codex_hooks(tmp.path());
         for event in ["PreToolUse", "Stop"] {
             let hook = &doc["hooks"][event][0]["hooks"][0];
-            assert_eq!(hook["command"], json!(format!("node {}", shell_literal(runner))));
+            assert_eq!(
+                hook["command"],
+                json!(format!("node {}", shell_literal(runner)))
+            );
             assert_eq!(
                 hook["commandWindows"],
                 json!(format!("node {}", powershell_literal(runner)))
@@ -4646,7 +4642,11 @@ mod tests {
             );
         }
         let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
-        assert_eq!(exclude.matches("/.codex/hooks.json").count(), 1, "{exclude}");
+        assert_eq!(
+            exclude.matches("/.codex/hooks.json").count(),
+            1,
+            "{exclude}"
+        );
     }
 
     /// #368 F6/F8: an unreadable hooks.json yields no `config_wired` claim
@@ -4675,10 +4675,15 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("codex"),
         );
-        assert!(report["installed_plugins"][0]["config_wired"].is_null(), "{report}");
-        assert!(report["warnings"].as_array().unwrap().iter().any(|w| w
-            .as_str()
-            .is_some_and(|s| s.contains("byte order mark"))));
+        assert!(
+            report["installed_plugins"][0]["config_wired"].is_null(),
+            "{report}"
+        );
+        assert!(report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().is_some_and(|s| s.contains("byte order mark"))));
 
         // A prefixed form of our own command is repaired, not duplicated.
         let prefixed = format!("env NEUROSTRATA_NAMESPACE=TestProj {ours}");
@@ -4733,7 +4738,8 @@ mod tests {
         std::env::set_var("HOME", &home);
         let project = tmp.path().join("fresh-clone");
         std::fs::create_dir_all(&project).unwrap();
-        let report = auto_install_detected_plugins(&project, ConfigNamespace::Set("TestProj"), None);
+        let report =
+            auto_install_detected_plugins(&project, ConfigNamespace::Set("TestProj"), None);
         match old_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
@@ -4789,13 +4795,11 @@ mod tests {
         let runner = plain_abs_path(&installed_runner(&root, "claude"));
         let parts = |cmd: &str| installer_hook_parts(cmd, &runner, &root);
         assert!(parts(&format!("NEUROSTRATA_NAMESPACE=x node \"{runner}\"")).is_some());
-        assert!(
-            parts(&format!(
-                "NEUROSTRATA_NAMESPACE=x node \"{}\"",
-                root.join("tools/cli-hook.mjs").display()
-            ))
-            .is_none()
-        );
+        assert!(parts(&format!(
+            "NEUROSTRATA_NAMESPACE=x node \"{}\"",
+            root.join("tools/cli-hook.mjs").display()
+        ))
+        .is_none());
         assert!(parts(
             "NEUROSTRATA_NAMESPACE=x node \"C:/gone/.NeuroStrata/plugins/claude/cli-hook.mjs\""
         )
@@ -4819,7 +4823,14 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("claude"),
         );
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not touch", "{report}");
-        assert!(std::fs::symlink_metadata(&skill).unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not touch",
+            "{report}"
+        );
+        assert!(std::fs::symlink_metadata(&skill)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

@@ -1569,8 +1569,14 @@ mod tests {
         );
 
         let marked = dropped.lock().unwrap();
-        assert!(marked.contains(&root_b), "dropped root must be marked dirty");
-        assert!(!marked.contains(&root_a), "enqueued root must not be marked");
+        assert!(
+            marked.contains(&root_b),
+            "dropped root must be marked dirty"
+        );
+        assert!(
+            !marked.contains(&root_a),
+            "enqueued root must not be marked"
+        );
     }
 
     /// Regression for #384: folding a dropped root back into the core marks it
@@ -1591,11 +1597,10 @@ mod tests {
         assert!(report.roots[0].dirty, "dropped root must be marked dirty");
         assert_eq!(report.roots[0].pending_paths_count, 1);
         let key = ("NeuroStrata".to_string(), root.clone());
-        assert!(service
-            .bursts
-            .lock()
-            .unwrap()
-            .contains_key(&key), "dropped root must arm a re-ingest burst");
+        assert!(
+            service.bursts.lock().unwrap().contains_key(&key),
+            "dropped root must arm a re-ingest burst"
+        );
         assert!(service
             .due_keys(tokio::time::Instant::now() + QUIET_PERIOD + Duration::from_millis(1))
             .contains(&key));
@@ -1970,18 +1975,18 @@ mod tests {
         ) -> WatchEvent {
             let mut discarded: Vec<(WatchEventKind, std::path::PathBuf)> = Vec::new();
             loop {
-                let ev = match tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    source.recv(),
-                )
-                .await
-                {
-                    Ok(Some(ev)) => ev,
-                    Ok(None) => panic!("event channel closed waiting for {kinds:?} on {path:?}"),
-                    Err(_) => panic!(
+                let ev =
+                    match tokio::time::timeout(std::time::Duration::from_secs(2), source.recv())
+                        .await
+                    {
+                        Ok(Some(ev)) => ev,
+                        Ok(None) => {
+                            panic!("event channel closed waiting for {kinds:?} on {path:?}")
+                        }
+                        Err(_) => panic!(
                         "event timeout waiting for {kinds:?} on {path:?}; discarded: {discarded:?}"
                     ),
-                };
+                    };
                 if kinds.contains(&ev.kind) && ev.path == path {
                     return ev;
                 }
@@ -2604,7 +2609,12 @@ mod tests {
         enqueue_coalesced(&tx, &queued, &dropped, ev("/tmp/fresh-root/src/a.rs"));
         assert_eq!(rx.len(), 1, "duplicate path coalesced");
         for i in 0..32 {
-            enqueue_coalesced(&tx, &queued, &dropped, ev(&format!("/tmp/fresh-root/src/{i}.rs")));
+            enqueue_coalesced(
+                &tx,
+                &queued,
+                &dropped,
+                ev(&format!("/tmp/fresh-root/src/{i}.rs")),
+            );
         }
         assert!(rx.len() <= 4, "native event queue is bounded");
         assert!(

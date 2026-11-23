@@ -984,7 +984,6 @@ pub(crate) enum RootCommands {
     },
 }
 
-
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub(crate) enum HooksCommands {
     /// Write the pre-push hook into the directory git runs hooks from
@@ -3623,7 +3622,9 @@ mod tests {
     #[test]
     fn fallback_read_only_command_census_is_explicit() {
         assert!(fallback_read_only_command(&Commands::Namespaces));
-        assert!(fallback_read_only_command(&Commands::Doctor { namespace: None }));
+        assert!(fallback_read_only_command(&Commands::Doctor {
+            namespace: None
+        }));
         assert!(fallback_read_only_command(&Commands::List {
             namespace: "NeuroStrata".to_string()
         }));
@@ -3653,12 +3654,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A valid config with no database yet: the CLI's direct root registry
-    /// must initialize the store before reading the registry row, or every
-    /// `root set`/`hooks install` against a pristine store fails on a
-    /// missing Memory table.
+    /// A valid config with no database yet and no usable embedder: the CLI's
+    /// direct root registry must NOT mint a bare store, which would void the
+    /// pending setup-time model choice before it is ever offered (#390).
     #[tokio::test]
-    async fn cli_root_registry_inits_a_pristine_store_before_reading_the_cache() {
+    async fn cli_root_registry_refuses_a_pristine_store_without_an_embedder() {
         let _env = crate::daemon::project_root_env_test_lock();
         let old_home = std::env::var_os("HOME");
         let old_model = std::env::var_os("NEUROSTRATA_MODEL");
@@ -3686,15 +3686,18 @@ mod tests {
         .unwrap();
         std::env::set_var("HOME", &home);
         let outcome = async {
-            let registry = open_cli_root_registry(DaemonProbe::Absent)
-                .await
-                .expect("a pristine store still yields a registry");
-            let cached = registry
-                .cached_root("example-project")
-                .await
-                .expect("the cached root is readable on a fresh store");
-            assert!(cached.is_none(), "{cached:?}");
-            registry.finish().await;
+            let err = match open_cli_root_registry(DaemonProbe::Absent).await {
+                Ok(_) => panic!("#390: a pristine store with no embedder must not be minted"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("complete setup before writing root markers"),
+                "{err}"
+            );
+            assert!(
+                !store_path_present(&db),
+                "#390: the refused open left no bare store file"
+            );
         }
         .await;
         match old_home {
@@ -4880,7 +4883,13 @@ mod tests {
             Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
         match cli.command {
             Some(Commands::Namespace { action }) => {
-                assert_eq!(action, NamespaceCommands::Resolve { dir: None, pushed: false })
+                assert_eq!(
+                    action,
+                    NamespaceCommands::Resolve {
+                        dir: None,
+                        pushed: false
+                    }
+                )
             }
             other => panic!("expected Namespace/Resolve, got {:?}", other),
         }
@@ -4902,7 +4911,13 @@ mod tests {
             .expect("parses --pushed");
         match cli.command {
             Some(Commands::Namespace { action }) => {
-                assert_eq!(action, NamespaceCommands::Resolve { dir: None, pushed: true })
+                assert_eq!(
+                    action,
+                    NamespaceCommands::Resolve {
+                        dir: None,
+                        pushed: true
+                    }
+                )
             }
             other => panic!("expected Namespace/Resolve, got {:?}", other),
         }

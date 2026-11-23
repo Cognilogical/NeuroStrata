@@ -172,7 +172,10 @@ fn contained_marker_path(dir: &Path) -> Result<Option<PathBuf>, String> {
 /// `version` or a bad `namespace` is `Unreadable`) to a marker's bytes read
 /// from anywhere, such as a commit. `path` only names the file in the answer.
 pub fn parse_marker_bytes(path: &Path, bytes: &[u8]) -> MarkerRead {
-    let unreadable = |reason: String| MarkerRead::Unreadable { path: path.to_path_buf(), reason };
+    let unreadable = |reason: String| MarkerRead::Unreadable {
+        path: path.to_path_buf(),
+        reason,
+    };
     let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let cfg: RootConfig = match serde_json::from_slice(body) {
         Ok(cfg) => cfg,

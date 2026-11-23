@@ -26929,7 +26929,10 @@ eurostrata\src\daemon.rs",
         let fx = store_state_fixture("unrecognized-pristine", "UnrecognizedModel");
         crate::model_choice::write_store_state_identity(
             &fx.db,
-            &crate::model_choice::StoreState::new(false, serving_descriptor_for("UnrecognizedModel")),
+            &crate::model_choice::StoreState::new(
+                false,
+                serving_descriptor_for("UnrecognizedModel"),
+            ),
         )
         .expect("write the pristine sidecar under the verbatim name");
         let serving = serving_descriptor_dims(crate::embed::FALLBACK_LOCAL_MODEL_NAME, 4);

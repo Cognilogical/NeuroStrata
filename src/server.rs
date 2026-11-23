@@ -14991,12 +14991,12 @@ mod tests {
             4
         }
         fn embedder_id(&self) -> &str {
-            "ModelA"
+            "NomicEmbedTextV15"
         }
         fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
             crate::traits::EmbeddingDescriptor {
                 provider: "fastembed".to_string(),
-                model: "ModelA".to_string(),
+                model: "NomicEmbedTextV15".to_string(),
                 revision: "onnx".to_string(),
                 dims: 4,
                 normalization: "unknown".to_string(),
@@ -15032,7 +15032,7 @@ mod tests {
             )
             .unwrap();
         };
-        write_config("ModelA");
+        write_config("NomicEmbedTextV15");
         let db_path = root.join("ladybug.db");
 
         let concrete = Arc::new(
@@ -15052,11 +15052,11 @@ mod tests {
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelA")
+            serde_json::json!("NomicEmbedTextV15")
         );
 
         // The pick lands while this process holds the store open.
-        write_config("ModelB");
+        write_config("BGESmallENV15Q");
         let incoming = payload("a memory written after the pick");
         let res = embed_dedup_and_upsert(&store, &emb, "probe", &incoming, None).await;
         assert!(
@@ -15071,7 +15071,7 @@ mod tests {
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelA"),
+            serde_json::json!("NomicEmbedTextV15"),
             "the record stays with the serving model"
         );
 
@@ -15111,7 +15111,7 @@ mod tests {
             )
             .unwrap();
         };
-        write_config("ModelA");
+        write_config("NomicEmbedTextV15");
         let db_path = root.join("ladybug.db");
 
         let store: Arc<dyn VectorStore> = Arc::new(
@@ -15124,7 +15124,7 @@ mod tests {
         store.init("probe").await.expect("init");
 
         // The pick lands while this process holds the store open.
-        write_config("ModelB");
+        write_config("BGESmallENV15Q");
         let incoming = payload("a memory written after the pick");
         let err = embed_dedup_and_upsert(&store, &emb, "probe", &incoming, None)
             .await
@@ -15134,7 +15134,7 @@ mod tests {
             "the caller must see the restart instruction, got: {err}"
         );
         assert!(
-            err.contains("'ModelA'") && err.contains("'ModelB'"),
+            err.contains("'NomicEmbedTextV15'") && err.contains("'BGESmallENV15Q'"),
             "the caller must see the serving and configured models, got: {err}"
         );
         assert!(
@@ -15182,7 +15182,7 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":4}]",
+            "[{\"model_name\":\"NomicEmbedTextV15\",\"dimensions\":4}]",
         )
         .unwrap();
         let db_path = root.join("ladybug.db");
@@ -15235,7 +15235,7 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":4}]",
+            "[{\"model_name\":\"NomicEmbedTextV15\",\"dimensions\":4}]",
         )
         .unwrap();
         let db_path = root.join("ladybug.db");
@@ -15260,7 +15260,7 @@ mod tests {
         // refuses before any embedding happens.
         let model_b = crate::traits::EmbeddingDescriptor {
             provider: "fastembed".to_string(),
-            model: "ModelB".to_string(),
+            model: "BGESmallENV15Q".to_string(),
             revision: "onnx".to_string(),
             dims: 4,
             normalization: "unknown".to_string(),
@@ -15282,7 +15282,7 @@ mod tests {
             "the caller must see the identity refusal, got: {err}"
         );
         assert!(
-            err.contains("'ModelA'") && err.contains("'ModelB'"),
+            err.contains("'NomicEmbedTextV15'") && err.contains("'BGESmallENV15Q'"),
             "the caller must see the recorded and serving models, got: {err}"
         );
         assert!(
