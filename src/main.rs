@@ -2242,7 +2242,8 @@ enum LockHolder {
     /// No id: a daemon between taking the lock and writing its id, a daemon
     /// built before the pid file existed, or a file that could not be read.
     Starting,
-    /// Anything else in the pid file.
+    /// A daemon built before the pid file existed, or anything other than a
+    /// process id in the pid file.
     Legacy,
 }
 
@@ -2281,8 +2282,8 @@ fn exit_report_of(db_path: &std::path::Path, pid: u32) -> Option<String> {
 }
 
 /// The report of a daemon built before the exit report had its own file: it
-/// wrote the report into the lock file. A current daemon's lock file holds
-/// its process id, never a report, so the two cannot be confused.
+/// wrote the report into the lock file. A current daemon empties the lock
+/// file when it takes the lock and never writes a report there.
 fn report_in_lock_file(db_path: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(daemon_lock_path(db_path)).ok()?;
     (text == FINAL_CHECKPOINT_OK || text.starts_with("error: ")).then_some(text)
@@ -3222,6 +3223,10 @@ fn record_final_checkpoint(db_path: &std::path::Path, outcome: &anyhow::Result<(
     if let Err(e) = written {
         tracing::warn!("final checkpoint report write to {} failed: {e}", path.display());
     }
+    // Still holding the lock: no other daemon has written its id yet. With the
+    // id gone, the next daemon reads as starting until it writes its own,
+    // instead of as this one.
+    let _ = std::fs::remove_file(daemon_pid_path(db_path));
 }
 
 /// Read-only queries against the store, transparently proxied to the daemon
@@ -4055,7 +4060,7 @@ mod tests {
         std::fs::write(daemon_lock_path(&db), FINAL_CHECKPOINT_OK).unwrap();
         assert_eq!(report_in_lock_file(&db).as_deref(), Some(FINAL_CHECKPOINT_OK));
 
-        // A current daemon writes its process id there, which is not a report.
+        // A current daemon empties the lock file, which is not a report.
         drop(take_daemon_lock(&db).expect("take the lock"));
         assert_eq!(report_in_lock_file(&db), None);
         let _ = std::fs::remove_dir_all(&root);
@@ -8027,6 +8032,11 @@ async fn run() -> anyhow::Result<()> {
                 // Read now, while the daemon being stopped still holds the
                 // lock: a daemon that starts after it rewrites the lock file.
                 let mut holder = LockHolder::read(&db_path);
+                // A current daemon writes its id before it opens the port, so
+                // one that answers without an id was built before the pid file.
+                if held && holder == LockHolder::Starting && probe == DaemonProbe::Responsive {
+                    holder = LockHolder::Legacy;
+                }
 
                 match probe {
                     DaemonProbe::Absent if !held => {
