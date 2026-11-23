@@ -2224,26 +2224,60 @@ fn daemon_exit_report_path(db_path: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
-/// When the current holder took the daemon lock (see `take_daemon_lock`).
-fn daemon_lock_taken_at(db_path: &std::path::Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(daemon_lock_path(db_path))
-        .and_then(|m| m.modified())
-        .ok()
+/// Where a daemon writes its process id once it holds the lock. Not the lock
+/// file itself: on Windows the lock is mandatory, so no other process can read
+/// the lock file while a daemon holds it.
+fn daemon_pid_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(".daemon.pid");
+    std::path::PathBuf::from(path)
 }
 
-/// The exit report of the daemon that took the lock at `taken_at`, once it
-/// has written one. A report older than that belongs to an earlier daemon;
-/// with no `taken_at` there is no way to tell, so none is trusted.
-fn exit_report_since(
-    db_path: &std::path::Path,
-    taken_at: Option<std::time::SystemTime>,
-) -> Option<String> {
-    let path = daemon_exit_report_path(db_path);
-    let written = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
-    if written < taken_at? {
-        return None;
+/// Who holds the daemon lock, as read from the pid file (see
+/// `take_daemon_lock`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockHolder {
+    /// A current daemon, by process id.
+    Pid(u32),
+    /// No id: a daemon between taking the lock and writing its id, a daemon
+    /// built before the pid file existed, or a file that could not be read.
+    Starting,
+    /// Anything else in the pid file.
+    Legacy,
+}
+
+impl LockHolder {
+    fn read(db_path: &std::path::Path) -> Self {
+        let text = std::fs::read_to_string(daemon_pid_path(db_path)).unwrap_or_default();
+        let text = text.trim();
+        if text.is_empty() {
+            LockHolder::Starting
+        } else if let Ok(pid) = text.parse() {
+            LockHolder::Pid(pid)
+        } else {
+            LockHolder::Legacy
+        }
     }
-    std::fs::read_to_string(&path).ok()
+
+    /// Whether `now` is a different daemon than `self`. Only a different
+    /// process id proves a new holder; a daemon that has not written its id
+    /// yet is not one.
+    fn replaced_by(self, now: LockHolder) -> bool {
+        match (self, now) {
+            (LockHolder::Pid(was), LockHolder::Pid(is)) => was != is,
+            (LockHolder::Legacy, LockHolder::Pid(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The exit report written by the daemon with process id `pid`, once it has
+/// written one. The report file starts with the id of the daemon that wrote
+/// it, so a report left by any other daemon is never taken for this one's.
+fn exit_report_of(db_path: &std::path::Path, pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(daemon_exit_report_path(db_path)).ok()?;
+    let (id, report) = text.split_once('\n')?;
+    (id.parse::<u32>().ok()? == pid).then(|| report.to_string())
 }
 
 /// The report of a daemon built before the exit report had its own file: it
@@ -2267,12 +2301,13 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
     loop {
         match file.try_lock() {
             Ok(()) => {
-                // Rewriting the file stamps when this daemon took the lock:
-                // `shutdown` reads that time to tell this daemon's exit report
-                // from an earlier one's. The process id is for people.
-                use std::io::Write;
+                // Emptying the lock file drops a report that a daemon built
+                // before the exit report file may have left in it. The process
+                // id identifies this daemon: `shutdown` uses it to tell this
+                // daemon from one that replaces it, and to pick out this
+                // daemon's exit report.
                 file.set_len(0)?;
-                (&file).write_all(std::process::id().to_string().as_bytes())?;
+                std::fs::write(daemon_pid_path(db_path), std::process::id().to_string())?;
                 return Ok(file);
             }
             Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
@@ -2353,10 +2388,13 @@ fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     // Read-only status probes must not create the lock file: open_daemon_lock
     // opens with .create(true), so an absent-but-unheld lock would be
     // materialized just by asking about it.
-    if !daemon_lock_path(db_path).exists() {
-        return false;
-    }
-    let outcome = open_daemon_lock(db_path).map(|file| file.try_lock());
+    // Only "no such file" means free: any other failure to look the file up
+    // is a lock that cannot be checked, which counts as held below.
+    let outcome = match std::fs::metadata(daemon_lock_path(db_path)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) => Err(e),
+        Ok(_) => open_daemon_lock(db_path).map(|file| file.try_lock()),
+    };
     match outcome {
         Ok(Ok(())) => false,
         Ok(Err(std::fs::TryLockError::WouldBlock)) => true,
@@ -3177,6 +3215,7 @@ fn record_final_checkpoint(db_path: &std::path::Path, outcome: &anyhow::Result<(
         Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
         Err(e) => format!("error: {}", e),
     };
+    let report = format!("{}\n{}", std::process::id(), report);
     let path = daemon_exit_report_path(db_path);
     let written = std::fs::File::create(&path)
         .and_then(|mut file| file.write_all(report.as_bytes()).and_then(|()| file.sync_all()));
@@ -3974,34 +4013,35 @@ mod tests {
     }
 
     #[test]
-    fn a_new_daemon_does_not_erase_the_exit_report_of_the_one_before() {
+    fn shutdown_reads_only_the_exit_report_of_the_daemon_it_stops() {
         let root = std::env::temp_dir().join(format!("ns-exit-report-{}", uuid::Uuid::new_v4()));
         let db = root.join("ladybug.db");
-        let pause = || std::thread::sleep(std::time::Duration::from_millis(50));
 
         let first = take_daemon_lock(&db).expect("the first daemon takes the lock");
-        let first_taken = daemon_lock_taken_at(&db);
-        assert!(first_taken.is_some(), "taking the lock stamps the file");
-        assert_eq!(exit_report_since(&db, first_taken), None, "no report yet");
-        pause();
-        std::fs::write(daemon_exit_report_path(&db), FINAL_CHECKPOINT_OK).unwrap();
+        let first_pid = match LockHolder::read(&db) {
+            LockHolder::Pid(pid) => pid,
+            other => panic!("taking the lock writes the process id, got {other:?}"),
+        };
+        assert_eq!(exit_report_of(&db, first_pid), None, "no report yet");
+        std::fs::write(
+            daemon_exit_report_path(&db),
+            format!("{first_pid}\n{FINAL_CHECKPOINT_OK}"),
+        )
+        .unwrap();
         drop(first);
 
-        pause();
+        // A new daemon takes the lock: the old report stays, and stays the old one's.
         let second = take_daemon_lock(&db).expect("a new daemon takes the lock");
-        let second_taken = daemon_lock_taken_at(&db);
-        assert_ne!(second_taken, first_taken, "the new daemon has its own stamp");
         assert_eq!(
-            exit_report_since(&db, first_taken).as_deref(),
+            exit_report_of(&db, first_pid).as_deref(),
             Some(FINAL_CHECKPOINT_OK),
             "shutdown still reads the stopped daemon's report"
         );
         assert_eq!(
-            exit_report_since(&db, second_taken),
+            exit_report_of(&db, first_pid.wrapping_add(1)),
             None,
-            "an older report is not the new daemon's"
+            "a report is never taken for another daemon's"
         );
-        assert_eq!(exit_report_since(&db, None), None, "no stamp, no trusted report");
         drop(second);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4018,6 +4058,32 @@ mod tests {
         // A current daemon writes its process id there, which is not a report.
         drop(take_daemon_lock(&db).expect("take the lock"));
         assert_eq!(report_in_lock_file(&db), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_a_different_process_id_is_a_replacement() {
+        let root = std::env::temp_dir().join(format!("ns-lock-holder-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = daemon_pid_path(&db);
+        let holder_after = |text: &str| {
+            std::fs::write(&pid_file, text).unwrap();
+            LockHolder::read(&db)
+        };
+
+        let stopping = holder_after("4242");
+        assert_eq!(stopping, LockHolder::Pid(4242));
+        // Something that is not a process id.
+        assert!(!stopping.replaced_by(holder_after(FINAL_CHECKPOINT_OK)));
+        // A daemon that took the lock but has not written its id yet.
+        assert!(!stopping.replaced_by(holder_after("")));
+        // The same daemon.
+        assert!(!stopping.replaced_by(holder_after("4242")));
+        // A new daemon.
+        assert!(stopping.replaced_by(holder_after("4343")));
+        // Stopping an older daemon: the first process id seen is a new one.
+        assert!(LockHolder::Legacy.replaced_by(holder_after("4343")));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7852,7 +7918,13 @@ async fn run() -> anyhow::Result<()> {
                 } => {
                     if purge_observations {
                         let config = Config::load().unwrap();
-                        if daemon_holds_lock(&config.db_path) {
+                        // Hold the lock for the whole offline purge, as the
+                        // `--no-open` copy does (#241): a probe that lets go
+                        // again would let a daemon start mid-purge.
+                        let offline_lock = open_daemon_lock(&config.db_path)
+                            .ok()
+                            .filter(|file| file.try_lock().is_ok());
+                        if offline_lock.is_none() {
                             print_learn_control(crate::learning::control::LearningControlRequest {
                                 action: crate::learning::control::LearningControlAction::Reset,
                                 purge_observations: true,
@@ -7954,7 +8026,7 @@ async fn run() -> anyhow::Result<()> {
                 let held = daemon_holds_lock(&db_path);
                 // Read now, while the daemon being stopped still holds the
                 // lock: a daemon that starts after it rewrites the lock file.
-                let mut taken_at = daemon_lock_taken_at(&db_path);
+                let mut holder = LockHolder::read(&db_path);
 
                 match probe {
                     DaemonProbe::Absent if !held => {
@@ -8014,20 +8086,23 @@ async fn run() -> anyhow::Result<()> {
                 for _ in 0..attempts {
                     let held_now = daemon_holds_lock(&db_path);
                     // A client can start a new daemon the moment the old one
-                    // lets go, before this loop looks again. A lock held under a
-                    // newer stamp than the one seen at the start means the
-                    // daemon being stopped has exited.
-                    let replaced =
-                        saw_lock && held_now && daemon_lock_taken_at(&db_path) != taken_at;
+                    // lets go, before this loop looks again. A lock held by a
+                    // different process id than the one seen at the start means
+                    // the daemon being stopped has exited.
+                    let current = LockHolder::read(&db_path);
+                    let replaced = saw_lock && held_now && holder.replaced_by(current);
                     if held_now && !replaced {
-                        if !saw_lock {
-                            // First sight of a holder: its stamp is the one
-                            // its exit report has to be newer than.
-                            taken_at = daemon_lock_taken_at(&db_path);
+                        if !saw_lock || holder == LockHolder::Starting {
+                            // First sight of a holder, or of its process id.
+                            holder = current;
                         }
                         saw_lock = true;
                     } else if saw_lock || replaced {
-                        let report = exit_report_since(&db_path, taken_at)
+                        let own_report = match holder {
+                            LockHolder::Pid(pid) => exit_report_of(&db_path, pid),
+                            _ => None,
+                        };
+                        let report = own_report
                             .or_else(|| if replaced { None } else { report_in_lock_file(&db_path) })
                             .unwrap_or_default();
                         if report == FINAL_CHECKPOINT_OK {
