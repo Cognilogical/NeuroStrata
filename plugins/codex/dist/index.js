@@ -175,7 +175,16 @@ const NAMESPACE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
 export function usableNamespace(raw) {
     if (typeof raw !== 'string')
         return undefined;
-    const ns = raw.trim().replace(/^["']+/, '').replace(/["']+$/, '');
+    // Strip quote runs by index: a quantified multi-character class (["']+)
+    // is flagged as polynomial ReDoS by CodeQL even when linear in practice.
+    const trimmed = raw.trim();
+    let start = 0;
+    let end = trimmed.length;
+    while (start < end && (trimmed[start] === '"' || trimmed[start] === "'"))
+        start++;
+    while (end > start && (trimmed[end - 1] === '"' || trimmed[end - 1] === "'"))
+        end--;
+    const ns = trimmed.slice(start, end);
     return NAMESPACE_PATTERN.test(ns) ? ns : undefined;
 }
 /** Absolute on this host: a drive or UNC path on Windows, `/` elsewhere. */
