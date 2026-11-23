@@ -17,6 +17,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Serializes marker writes and the verify-then-unlink of superseded markers
+/// within this process (Codex review 4670091232). Without a shared lock a
+/// concurrent `root set` can replace an old marker between its re-read and
+/// its removal, deleting the successor and leaving the cache unmarked.
+static MARKER_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The marker file, relative to the root it marks.
 pub const ROOT_CONFIG_REL: &str = ".NeuroStrata/config.json";
 
@@ -193,6 +199,9 @@ pub fn parse_marker_bytes(path: &Path, bytes: &[u8]) -> MarkerRead {
 /// There is no fallback to a replacing rename, so a filesystem without hard
 /// links answers `Io`.
 pub fn write_new_marker(dir: &Path, cfg: &RootConfig) -> Result<WriteOutcome, MarkerError> {
+    let _guard = MARKER_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (tmp, target) = prepare(dir, cfg)?;
     let linked = std::fs::hard_link(&tmp, &target);
     let _ = std::fs::remove_file(&tmp);
@@ -208,6 +217,9 @@ pub fn write_new_marker(dir: &Path, cfg: &RootConfig) -> Result<WriteOutcome, Ma
 /// Writes the marker in `dir`, replacing any existing one with temp + rename
 /// so a concurrent reader sees either the old or the new file.
 pub fn replace_marker(dir: &Path, cfg: &RootConfig) -> Result<(), MarkerError> {
+    let _guard = MARKER_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (tmp, target) = prepare(dir, cfg)?;
     if let Err(err) = std::fs::rename(&tmp, &target) {
         let _ = std::fs::remove_file(&tmp);
@@ -1626,9 +1638,24 @@ pub(crate) async fn root_set_with(
     // points at a folder without one.
     for (old_dir, old_source) in &old {
         let old_file = old_dir.join(ROOT_CONFIG_REL);
-        // Re-read before deleting: the scan's snapshot can be stale. A
-        // concurrent `root set` may now own this folder under a different
-        // namespace or source id; deleting that marker would strand its cache.
+        // Async checks stay outside the critical section: a std MutexGuard is
+        // !Send and must not be held across `.await`.
+        if let Ok(Some(now)) = usable_cached_root(registry, ns).await {
+            if same_root(&now, old_dir) {
+                lines.push(format!(
+                    "Kept the old marker {}: the cached root of {ns} is that folder again (another `root set` changed it).",
+                    old_file.display()
+                ));
+                continue;
+            }
+        }
+        // Re-read, then unlink under the same lock marker writers take, so a
+        // concurrent `root set` cannot replace this marker between the check
+        // and the removal and have its successor deleted (Codex review
+        // 4670091232).
+        let _guard = MARKER_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match read_marker(old_dir) {
             MarkerRead::Valid(current)
                 if current.namespace.eq_ignore_ascii_case(ns)
@@ -1637,15 +1664,6 @@ pub(crate) async fn root_set_with(
             other => {
                 lines.push(format!(
                     "Kept the old marker {}: it changed to {other:?} since the scan (another writer used it).",
-                    old_file.display()
-                ));
-                continue;
-            }
-        }
-        if let Ok(Some(now)) = usable_cached_root(registry, ns).await {
-            if same_root(&now, old_dir) {
-                lines.push(format!(
-                    "Kept the old marker {}: the cached root of {ns} is that folder again (another `root set` changed it).",
                     old_file.display()
                 ));
                 continue;
@@ -1754,17 +1772,17 @@ mod tests {
         std::fs::write(&secret, br#"{"version":1,"namespace":"example-project"}"#).unwrap();
         std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
         let marker = tmp.path().join(ROOT_CONFIG_REL);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&secret, &marker).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&secret, &marker).unwrap();
-
-        match read_marker(tmp.path()) {
-            MarkerRead::Unreadable { path, reason } => {
-                assert_eq!(path, marker);
-                assert!(reason.contains("outside"), "{reason}");
+        // Windows without symlink privilege cannot build this fixture; skip
+        // the symlink-specific assertion instead of panicking (Codex review
+        // 4670091413). `link_file` returns false when creation is denied.
+        if link_file(&secret, &marker) {
+            match read_marker(tmp.path()) {
+                MarkerRead::Unreadable { path, reason } => {
+                    assert_eq!(path, marker);
+                    assert!(reason.contains("outside"), "{reason}");
+                }
+                other => panic!("expected an unreadable marker, got {other:?}"),
             }
-            other => panic!("expected an unreadable marker, got {other:?}"),
         }
         // A folder that does not exist still reads as absent.
         assert_eq!(read_marker(&tmp.path().join("missing")), MarkerRead::Absent);
@@ -3369,6 +3387,44 @@ mod tests {
             assert_eq!(
                 cached(&store).await,
                 Some(new.to_string_lossy().into_owned())
+            );
+        }
+    }
+
+    /// Codex review 4670091232: competing replaces must never leave the
+    /// cached root pointing at a folder whose marker was deleted by the other
+    /// writer's stale scan.
+    #[tokio::test]
+    async fn concurrent_replaces_never_leave_the_cached_root_unmarked() {
+        for _ in 0..20 {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = dunce::canonicalize(tmp.path()).unwrap();
+            layout(
+                &base,
+                r#"["repo git-dir", "repo/old marker:example-project", "repo/new", "repo/newer"]"#,
+            );
+            let repo = base.join("repo");
+            let (store, emb) = mock();
+            cache_root(&store, &emb, &repo.join("old")).await;
+            let registry = StoreRegistry {
+                store: store.clone(),
+                emb: Some(emb.clone()),
+                checkpoint: false,
+            };
+            let mut left = set_args(&repo.join("new"));
+            left.replace = true;
+            let mut right = set_args(&repo.join("newer"));
+            right.replace = true;
+            let (a, b) = tokio::join!(
+                root_set_with(&registry, &left, None),
+                root_set_with(&registry, &right, None)
+            );
+            // Either writer may legitimately lose the race.
+            let _ = (a, b);
+            let cached_root = cached(&store).await.expect("cached root");
+            assert!(
+                has_marker(Path::new(&cached_root)),
+                "cached root {cached_root} must still have a marker"
             );
         }
     }

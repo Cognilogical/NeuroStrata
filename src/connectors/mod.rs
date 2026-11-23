@@ -353,6 +353,27 @@ fn hash_records_sha256(records: &[Value]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Digest encoding used before the issue #351 fix: plain concatenation of
+/// each record's serialized JSON. Kept only to recognize expectations that
+/// were persisted before the length-prefixed encoding shipped.
+fn hash_records_sha256_legacy(records: &[Value]) -> String {
+    let mut hasher = Sha256::new();
+    for record in records {
+        hasher.update(serde_json::to_vec(record).expect("serialize record"));
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// True when `expected` matches the current encoding or a digest persisted
+/// before the #351 encoding change (Codex review 4670091380).
+///
+/// Any raw string compare against a persisted source digest must go through
+/// this helper, or write-back CAS rejects every pointer captured with the
+/// legacy encoding until its expectation is recaptured.
+pub fn source_digest_matches(expected: &str, records: &[Value]) -> bool {
+    expected == hash_records_sha256(records) || expected == hash_records_sha256_legacy(records)
+}
+
 impl Default for InMemoryPoolConnector {
     fn default() -> Self {
         InMemoryPoolConnector::new()
@@ -482,7 +503,7 @@ impl DataConnector for InMemoryPoolConnector {
         let prior_records = all_records.clone();
         let current_source_sha = InMemoryPoolConnector::compute_source_sha256(all_records);
         if let Some(expected) = &req.expected_source_sha256 {
-            if *expected != current_source_sha {
+            if !source_digest_matches(expected, all_records.as_slice()) {
                 return Err(anyhow!(
                     "CAS conflict: expected source sha256 {}, got {}",
                     expected,
@@ -837,7 +858,7 @@ impl DataConnector for JsonFilePoolConnector {
         let mut all_records = JsonFilePoolConnector::read_json_file(&path)?;
         let current_source_sha = JsonFilePoolConnector::compute_sha(&all_records);
         if let Some(expected) = &req.expected_source_sha256 {
-            if *expected != current_source_sha {
+            if !source_digest_matches(expected, all_records.as_slice()) {
                 return Err(anyhow!(
                     "CAS conflict: expected source sha256 {}, got {}",
                     expected,
@@ -940,6 +961,25 @@ mod tests {
             InMemoryPoolConnector::compute_source_sha256(&s2),
             "string records must remain distinct too"
         );
+    }
+
+    /// Codex review 4670091380: digests persisted before the v2 encoding
+    /// must still satisfy write-back CAS until they are recaptured.
+    #[test]
+    fn connector_cas_accepts_legacy_and_v2_digests() {
+        let records = vec![json!(1), json!(23)];
+        let v2 = InMemoryPoolConnector::compute_source_sha256(&records);
+        let legacy = hash_records_sha256_legacy(&records);
+        assert_ne!(v2, legacy, "encodings must remain distinct");
+        assert!(source_digest_matches(&v2, &records));
+        assert!(source_digest_matches(&legacy, &records));
+        // The legacy concatenation is exactly the collision #351 fixed:
+        // `[1,23]` and `[12,3]` both serialize to "123". It stays accepted
+        // only for already-persisted expectations, never produced anew.
+        assert!(source_digest_matches(&legacy, &[json!(12), json!(3)]));
+        assert!(!source_digest_matches(&v2, &[json!(12), json!(3)]));
+        assert!(!source_digest_matches(&legacy, &[json!(1), json!(24)]));
+        assert!(!source_digest_matches("deadbeef", &records));
     }
 
     #[test]
