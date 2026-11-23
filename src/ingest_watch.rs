@@ -1832,6 +1832,22 @@ mod tests {
             }
         }
 
+        // The source coalesces by path: while an event for a path is queued, a
+        // new event for that path is dropped (`enqueue_coalesced`, by design:
+        // ingest is per-root). So each step first drains what is queued until
+        // the source goes quiet; otherwise a leftover Modify can swallow the
+        // Remove that follows. Bounded: at most 50 events, 300 ms quiet each.
+        async fn settle(source: &NotifyEventSource) {
+            for _ in 0..50 {
+                match tokio::time::timeout(std::time::Duration::from_millis(300), source.recv())
+                    .await
+                {
+                    Ok(Some(_)) => continue,
+                    _ => return,
+                }
+            }
+        }
+
         // Create a file
         let file = dir.path().join("test.txt");
         std::fs::write(&file, b"hello").unwrap();
@@ -1841,6 +1857,7 @@ mod tests {
         assert_eq!(ev.kind, WatchEventKind::Create);
         assert_eq!(ev.path, file);
 
+        settle(&source).await;
         // Modify the file - exact kind may vary by platform/backend; accept any
         std::fs::write(&file, b"world").unwrap();
         let ev = recv(&source, WatchEventKind::Modify).await;
@@ -1851,6 +1868,7 @@ mod tests {
             WatchEventKind::Modify | WatchEventKind::Create | WatchEventKind::Remove
         ));
 
+        settle(&source).await;
         // Delete the file
         std::fs::remove_file(&file).unwrap();
         let ev = recv(&source, WatchEventKind::Remove).await;
@@ -1858,12 +1876,14 @@ mod tests {
         // modify+remove pair may arrive shifted, so we just verify the path matches.
         assert_eq!(ev.path, file);
 
+        settle(&source).await;
         // Rename test: create old, rename to new
         let old = dir.path().join("old.txt");
         let new = dir.path().join("new.txt");
         std::fs::write(&old, b"old").unwrap();
         // Wait for create
         let _ = recv(&source, WatchEventKind::Create).await;
+        settle(&source).await;
         // Rename
         std::fs::rename(&old, &new).unwrap();
         if cfg!(windows) {
