@@ -195,7 +195,7 @@ const NAMESPACE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/
  */
 export function usableNamespace(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined
-  const ns = raw.trim().replace(/^["']+|["']+$/g, '')
+  const ns = raw.trim().replace(/^["']+/, '').replace(/["']+$/, '')
   return NAMESPACE_PATTERN.test(ns) ? ns : undefined
 }
 
