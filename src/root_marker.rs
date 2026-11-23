@@ -126,17 +126,46 @@ pub fn is_valid_namespace(ns: &str) -> bool {
 /// The marker in `dir`, if any. A UTF-8 BOM is accepted; bad JSON, an
 /// unknown `version` or a bad `namespace` is `Unreadable`, never `Absent`.
 pub fn read_marker(dir: &Path) -> MarkerRead {
-    let path = dir.join(ROOT_CONFIG_REL);
+    let reported = dir.join(ROOT_CONFIG_REL);
     let unreadable = |reason: String| MarkerRead::Unreadable {
-        path: path.clone(),
+        path: reported.clone(),
         reason,
+    };
+    let path = match contained_marker_path(dir) {
+        Ok(Some(path)) => path,
+        Ok(None) => return MarkerRead::Absent,
+        Err(reason) => return unreadable(reason),
     };
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return MarkerRead::Absent,
         Err(err) => return unreadable(err.to_string()),
     };
-    parse_marker_bytes(&path, &bytes)
+    parse_marker_bytes(&reported, &bytes)
+}
+
+/// Resolve the marker through canonical paths and refuse one that leaves
+/// `dir`. A caller may hand `read_marker` a path derived from a request; a
+/// symlinked `.NeuroStrata` or `config.json` must not turn that read into an
+/// arbitrary-file read (CodeQL rust/path-injection). `None` means the folder
+/// itself does not exist, which keeps `read_marker`'s `Absent` answer.
+fn contained_marker_path(dir: &Path) -> Result<Option<PathBuf>, String> {
+    let canonical_dir = match dir.canonicalize() {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    };
+    let candidate = canonical_dir.join(ROOT_CONFIG_REL);
+    let canonical_file = match candidate.canonicalize() {
+        Ok(path) => path,
+        // No marker yet: the non-canonical candidate still reads as Absent.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Some(candidate)),
+        Err(err) => return Err(err.to_string()),
+    };
+    if !canonical_file.starts_with(&canonical_dir) {
+        return Err("root marker resolves outside the target directory".to_string());
+    }
+    Ok(Some(canonical_file))
 }
 
 /// Applies [`read_marker`]'s rules (BOM accepted; bad JSON, an unknown
@@ -1600,6 +1629,45 @@ mod tests {
     fn write_raw(dir: &Path, body: &[u8]) {
         std::fs::create_dir_all(dir.join(".NeuroStrata")).unwrap();
         std::fs::write(dir.join(ROOT_CONFIG_REL), body).unwrap();
+    }
+
+    #[test]
+    fn read_marker_refuses_a_marker_outside_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("config.json");
+        std::fs::write(&secret, br#"{"version":1,"namespace":"example-project"}"#).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let marker = tmp.path().join(ROOT_CONFIG_REL);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret, &marker).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&secret, &marker).unwrap();
+
+        match read_marker(tmp.path()) {
+            MarkerRead::Unreadable { path, reason } => {
+                assert_eq!(path, marker);
+                assert!(reason.contains("outside"), "{reason}");
+            }
+            other => panic!("expected an unreadable marker, got {other:?}"),
+        }
+        // A folder that does not exist still reads as absent.
+        assert_eq!(read_marker(&tmp.path().join("missing")), MarkerRead::Absent);
+    }
+
+    #[test]
+    fn read_marker_accepts_a_canonical_path_with_parent_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(
+            tmp.path(),
+            br#"{"version":1,"namespace":"example-project"}"#,
+        );
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            read_marker(&nested.join("..")),
+            MarkerRead::Valid(RootConfig::new("example-project"))
+        );
     }
 
     #[test]
