@@ -7710,8 +7710,7 @@ async fn run() -> anyhow::Result<()> {
                 } => {
                     if purge_observations {
                         let config = Config::load().unwrap();
-                        let daemon_state = crate::daemon::daemon_status(&config.db_path);
-                        if matches!(daemon_state, crate::daemon::DaemonState::Running { .. }) {
+                        if daemon_holds_lock(&config.db_path) {
                             print_learn_control(crate::learning::control::LearningControlRequest {
                                 action: crate::learning::control::LearningControlAction::Reset,
                                 purge_observations: true,
