@@ -2215,21 +2215,34 @@ static DAEMON_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::ne
 /// What a stopping daemon leaves in its lock file for `shutdown` to read.
 const FINAL_CHECKPOINT_OK: &str = "checkpointed";
 
+/// How long a starting daemon keeps retrying a lock that someone else holds.
+/// `daemon_holds_lock` takes the lock for an instant when it finds it free, so
+/// a daemon starting at that instant would otherwise refuse to run.
+const DAEMON_LOCK_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Takes the daemon lock, or refuses: a second daemon would open the database
 /// while the first one is writing to it.
 fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let file = open_daemon_lock(db_path)?;
-    match file.try_lock() {
-        Ok(()) => {
-            // Whatever the last daemon reported is not about this one.
-            file.set_len(0)?;
-            Ok(file)
+    let deadline = std::time::Instant::now() + DAEMON_LOCK_RETRY;
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                // Whatever the last daemon reported is not about this one.
+                file.set_len(0)?;
+                return Ok(file);
+            }
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(anyhow::anyhow!(
+                    "Another NeuroStrata daemon is already running against {:?}.",
+                    db_path
+                ))
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
-        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::anyhow!(
-            "Another NeuroStrata daemon is already running against {:?}.",
-            db_path
-        )),
-        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
 
@@ -3898,6 +3911,23 @@ mod tests {
             !daemon_holds_lock(&db),
             "the lock is free once its holder is gone"
         );
+    }
+
+    #[test]
+    fn a_starting_daemon_waits_out_a_brief_holder() {
+        let root = std::env::temp_dir().join(format!("ns-brief-lock-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        // Stands in for a status probe that took the free lock for a moment.
+        let probe = take_daemon_lock(&db).expect("the probe takes the lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(probe);
+        });
+        let daemon = take_daemon_lock(&db);
+        release.join().unwrap();
+        assert!(daemon.is_ok(), "the daemon gets the lock once the probe lets go");
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
