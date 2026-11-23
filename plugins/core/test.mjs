@@ -814,7 +814,12 @@ describe('project root marker and namespace order', () => {
       outsideFile,
       JSON.stringify({ claude_session_dirs: { s1: outside } })
     )
-    symlinkSync(outsideFile, sessionPath, 'file')
+    try {
+      symlinkSync(outsideFile, sessionPath, 'file')
+    } catch (err) {
+      t.skip(`file symlink creation not permitted: ${err.message}`)
+      return
+    }
     assert.equal(
       resolveHookProjectDir('claude', { ...start, hook_event_name: 'PreToolUse' }, {}),
       repo
