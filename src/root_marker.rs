@@ -594,9 +594,39 @@ pub enum CachedRoot {
     Unknown(String),
 }
 
-/// Marker-derived text with every control character spelled out. A folder
-/// name, namespace or source id comes from the checkout: a raw escape could
-/// repaint or forge the `root show` output.
+/// Unicode formatting / directional-control characters: renderers can act on
+/// these without treating them as `char::is_control()` (which only covers Cc).
+/// Bidi overrides and isolates reorder the visible text, so a folder name or
+/// source id carrying one could forge the `root show` output.
+fn is_format_or_directional(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Marker-derived text with every control and formatting character spelled
+/// out. A folder name, namespace or source id comes from the checkout: a raw
+/// escape could repaint or forge the `root show` output.
 fn escape_control(value: impl std::fmt::Display) -> String {
     let raw = value.to_string();
     let mut out = String::with_capacity(raw.len());
@@ -606,7 +636,9 @@ fn escape_control(value: impl std::fmt::Display) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             '\x1b' => out.push_str("\\x1b"),
-            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c if c.is_control() || is_format_or_directional(c) => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32))
+            }
             c => out.push(c),
         }
     }
@@ -1660,6 +1692,34 @@ mod tests {
     fn write_raw(dir: &Path, body: &[u8]) {
         std::fs::create_dir_all(dir.join(".NeuroStrata")).unwrap();
         std::fs::write(dir.join(ROOT_CONFIG_REL), body).unwrap();
+    }
+
+    /// PR #388: a bidi override or isolate in a folder name / source id must
+    /// be spelled out. `char::is_control()` alone lets a renderer reorder the
+    /// forged `root show` output.
+    #[test]
+    fn escape_control_spells_out_unicode_formatting_characters() {
+        let raw = format!(
+            "ok{}\u{202e}bad\u{2066}\u{200f}\u{2028}\u{feff}\u{00ad}end",
+            '\n'
+        );
+        let escaped = escape_control(&raw);
+        for cp in [0x202e, 0x2066, 0x200f, 0x2028, 0xfeff, 0x00ad] {
+            assert!(
+                escaped.contains(&format!("\\u{{{cp:x}}}")),
+                "U+{cp:04X} not escaped in {escaped:?}"
+            );
+        }
+        assert!(!escaped.contains('\u{202e}'), "raw bidi override leaked");
+        assert!(
+            escaped.contains("ok\\n"),
+            "newline not spelled out: {escaped:?}"
+        );
+        assert!(
+            escaped.contains("bad"),
+            "ordinary text was changed: {escaped:?}"
+        );
+        assert!(escape_control("héllo").contains("héllo"));
     }
 
     #[test]

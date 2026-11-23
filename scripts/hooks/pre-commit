@@ -255,9 +255,10 @@ done
 rewrite_session_ledger_namespace() {
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
-    # Only a path that is truly absent is created: a dangling symlink there
-    # is not followed.
-    [ -L "$LEDGER" ] || printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
+    # Only a path that is truly absent is created. `set -C` makes the redirect
+    # an exclusive open, so a symlink planted between the check and the open
+    # fails instead of truncating its target.
+    ( set -C; printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER" ) 2>/dev/null || true
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
@@ -270,8 +271,8 @@ elif [ -n "$RESOLVED" ]; then
           const fs = require("fs");
           const ledger = process.env.LEDGER;
           const ns = process.env.NAMESPACE;
-          let parsed;
-          try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
+          let raw, parsed;
+          try { raw = fs.readFileSync(ledger, "utf8"); parsed = JSON.parse(raw); } catch { process.exit(0); }
           const doc = Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed;
           if (!doc || typeof doc !== "object") process.exit(0);
           if (!Array.isArray(parsed) && doc.namespace === ns) process.exit(0);
@@ -281,6 +282,10 @@ elif [ -n "$RESOLVED" ]; then
           try { mode = fs.statSync(ledger).mode; } catch {}
           fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { flag: "wx", mode: 0o600 });
           try {
+            // Where flock is absent the daemon may append a receipt after our
+            // read. Compare the ledger immediately before publishing: a newer
+            // file is left intact rather than overwritten by a stale snapshot.
+            if (fs.readFileSync(ledger, "utf8") !== raw) { fs.unlinkSync(tmp); process.exit(0); }
             if (mode !== undefined) { try { fs.chmodSync(tmp, mode); } catch {} }
             fs.renameSync(tmp, ledger);
           } catch { try { fs.unlinkSync(tmp); } catch {} }
@@ -292,7 +297,8 @@ ledger = os.environ["LEDGER"]
 ns = os.environ["NAMESPACE"]
 try:
     with open(ledger, encoding="utf-8") as f:
-        parsed = json.load(f)
+        text = f.read()
+    parsed = json.loads(text)
 except Exception:
     sys.exit(0)
 doc = {"namespace": ns, "queries": parsed} if isinstance(parsed, list) else parsed
@@ -305,6 +311,9 @@ try:
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
         json.dump(doc, f, indent=2, ensure_ascii=False)
         f.write("\n")
+    with open(ledger, encoding="utf-8") as f:
+        if f.read() != text:
+            raise RuntimeError("ledger changed since the snapshot")
     try:
         os.chmod(tmp, stat.S_IMODE(os.stat(ledger).st_mode))
     except OSError:

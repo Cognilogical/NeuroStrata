@@ -43,7 +43,7 @@ const CORE_PKG_JSON: &str = include_str!("../../plugins/core/package.json");
 
 const CLI_HOOK_RUNNER_MJS: &str = r#"#!/usr/bin/env node
 import { readFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import plugin, * as mod from "./dist/index.js";
 
@@ -92,10 +92,25 @@ async function main() {
       : typeof event.cwd === "string" && event.cwd
         ? event.cwd
         : process.cwd();
+  // OpenCode loads the first parseable .NeuroStrata shared config and only
+  // then falls back to the historical .opencode registration. `namespace
+  // resolve` uses that same precedence; passing the registration as ctx.config
+  // would let `initialize` merge a stale namespace over the effective one.
+  const readOpenCodeConfig = () => {
+    for (const file of ["neurostrata-plugin.json", "PluginConfig.json"]) {
+      try {
+        const parsed = JSON.parse(readFileSync(join(projectDir, ".NeuroStrata", file), "utf8"));
+        if (parsed && typeof parsed === "object") return parsed;
+      } catch {}
+    }
+    return null;
+  };
   const config =
-    typeof mod.readHarnessConfig === "function"
-      ? mod.readHarnessConfig(HARNESS, projectDir, RUNNER_DIR)
-      : {};
+    HARNESS === "opencode" && typeof mod.readHarnessConfig === "function"
+      ? (readOpenCodeConfig() ?? mod.readHarnessConfig(HARNESS, projectDir, RUNNER_DIR))
+      : typeof mod.readHarnessConfig === "function"
+        ? mod.readHarnessConfig(HARNESS, projectDir, RUNNER_DIR)
+        : {};
   const init = mod.initialize ?? plugin?.initialize ?? plugin?.setup;
   if (typeof init === "function") {
     await init({ config, projectDir });
@@ -844,6 +859,17 @@ const PLUGIN_NAMESPACE_CONFIGS: [(&str, &str, &str); 5] = [
 /// file when it exists but cannot be read or parsed (a UTF-8 byte order mark,
 /// as Windows PowerShell 5.1 writes, included).
 fn read_config(path: &Path) -> Result<Option<Value>, UnreadableConfig> {
+    read_config_inner(path, false)
+}
+
+/// The OpenCode loader skips a malformed shared config and tries the next
+/// file. Probing those same files for a namespace must do the same, while an
+/// unreadable (not merely malformed) config remains an error.
+fn read_shared_config(path: &Path) -> Result<Option<Value>, UnreadableConfig> {
+    read_config_inner(path, true)
+}
+
+fn read_config_inner(path: &Path, skip_malformed: bool) -> Result<Option<Value>, UnreadableConfig> {
     let unreadable = |reason: String| UnreadableConfig {
         path: path.to_path_buf(),
         reason,
@@ -886,14 +912,23 @@ fn read_config(path: &Path) -> Result<Option<Value>, UnreadableConfig> {
         return Err(too_big());
     }
     if bytes.starts_with(b"\xEF\xBB\xBF") {
+        if skip_malformed {
+            return Ok(None);
+        }
         return Err(unreadable(
             "it starts with a UTF-8 byte order mark; save it as UTF-8 without one".to_string(),
         ));
     }
-    let text = String::from_utf8(bytes).map_err(|_| unreadable("it is not UTF-8".to_string()))?;
-    serde_json::from_str(&text)
-        .map(Some)
-        .map_err(|e| unreadable(format!("it is not valid JSON ({e})")))
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) if skip_malformed => return Ok(None),
+        Err(_) => return Err(unreadable("it is not UTF-8".to_string())),
+    };
+    match serde_json::from_str(&text) {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if skip_malformed => Ok(None),
+        Err(e) => Err(unreadable(format!("it is not valid JSON ({e})"))),
+    }
 }
 
 /// The runner the installer writes for `harness` under `root`.
@@ -979,15 +1014,19 @@ fn harness_config_namespace(
             ".NeuroStrata/neurostrata-plugin.json",
             ".NeuroStrata/PluginConfig.json",
         ] {
-            if let Some(config) = read_config(&root.join(rel))? {
-                if let Some(ns) = config
-                    .get("namespace")
-                    .and_then(Value::as_str)
-                    .and_then(usable_namespace)
-                {
-                    return Ok(Some(ns));
+            match read_shared_config(&root.join(rel))? {
+                // The first file the loader accepts is the effective one. Its
+                // top-level namespace decides, even when it names none: an
+                // older `.opencode/...` registration must not win by falling
+                // through (#388). A malformed file is skipped just as the
+                // loader skips it and tries the next one.
+                Some(config) => {
+                    return Ok(config
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .and_then(usable_namespace));
                 }
-                break;
+                None => continue,
             }
         }
     }
@@ -1826,6 +1865,24 @@ fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
 /// supplied by the caller so a symlink planted at that exact path can be
 /// exercised deterministically. Production callers get a unique staged name
 /// from [`write_atomically`]; both routes share this single implementation.
+/// True when `staged` still names the very file the caller opened, checked
+/// without following a symlink planted at that path in the meantime.
+fn staged_path_is_open_file(staged: &Path, opened: &std::fs::Metadata) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current = std::fs::symlink_metadata(staged)?;
+        Ok(!current.file_type().is_symlink()
+            && current.dev() == opened.dev()
+            && current.ino() == opened.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let current = std::fs::symlink_metadata(staged)?;
+        Ok(current.is_file() && current.len() == opened.len())
+    }
+}
+
 fn write_staged_atomically(staged: &Path, path: &Path, contents: &str) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1834,10 +1891,20 @@ fn write_staged_atomically(staged: &Path, path: &Path, contents: &str) -> std::i
     // Open first: an entry already at `staged` (someone else's) makes this
     // fail, and it is not ours to clean up.
     let mut file = options.open(staged)?;
+    let opened = file.metadata()?;
     let written = (|| -> std::io::Result<()> {
         std::io::Write::write_all(&mut file, contents.as_bytes())?;
         file.sync_all()?;
         drop(file);
+        // The path can be swapped between the exclusive open and these
+        // path-based operations. Never chmod or publish a replacement: it is
+        // not the file this write created (#388).
+        if !staged_path_is_open_file(staged, &opened)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "staged config was replaced before publish",
+            ));
+        }
         // A refresh must never widen an existing config's access: it carries
         // tokens and namespace metadata other local users must not read.
         #[cfg(unix)]
@@ -1880,8 +1947,14 @@ fn wire_harness_config(
     // namespace-neutral registration that discovers one at invocation time.
     // An explicit but unusable Set value, or an unreadable config, stays
     // unwritten (byte-identical) as before.
-    let wire_without_namespace = matches!(namespace, ConfigNamespace::Keep(_))
-        && namespace.for_harness(project_root, harness).is_none()
+    // A daemon boot refresh (Each) with no namespace listed for a detected
+    // harness is the same case as a Keep refresh with none: register the
+    // runner namespace-neutrally so its hooks are installed (#388). An
+    // unreadable config still leaves the harness byte-identical/unwritten.
+    let wire_without_namespace = matches!(
+        namespace,
+        ConfigNamespace::Keep(_) | ConfigNamespace::Each(_)
+    ) && namespace.for_harness(project_root, harness).is_none()
         && !harness_config_namespace(project_root, harness).is_err();
     let namespace = namespace.for_harness(project_root, harness);
     let with_namespace = |mut doc: Value, ns: Option<&str>| -> Value {
@@ -1953,14 +2026,22 @@ fn wire_harness_config(
                 // 3. Keep writing .opencode/neurostrata-plugin.json (the historical
                 //    plugin registration) unchanged.
                 //    Only with a namespace to write: never an empty or made-up one.
+                let cfg_path = project_root.join(".opencode/neurostrata-plugin.json");
                 if let Some(namespace) = namespace.as_deref() {
-                    let cfg_path = project_root.join(".opencode/neurostrata-plugin.json");
                     let doc = json!({
                         "plugin": [abs_dist],
                         "neurostrata": {
                             "namespace": namespace,
                             "pluginPath": abs_dist
                         }
+                    });
+                    let _ = write_json_if_changed(&cfg_path, &doc);
+                } else if wire_without_namespace {
+                    // A refresh with no namespace still registers the runner;
+                    // it discovers the namespace when the hook runs.
+                    let doc = json!({
+                        "plugin": [abs_dist],
+                        "neurostrata": { "pluginPath": abs_dist }
                     });
                     let _ = write_json_if_changed(&cfg_path, &doc);
                 }
@@ -2431,7 +2512,7 @@ mod tests {
     }
 
     #[test]
-    fn boot_install_without_any_config_writes_no_namespace_config() {
+    fn boot_install_without_any_config_writes_a_namespace_neutral_config() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = dunce::canonicalize(tmp.path())
             .unwrap()
@@ -2440,7 +2521,11 @@ mod tests {
         std::fs::create_dir_all(dir.join(".hermes")).unwrap();
         assert!(boot_namespaces_for(&dir).is_empty());
         boot_install_plugins(&dir);
-        assert!(!dir.join(".hermes/plugins/neurostrata.json").exists());
+        // PR #388: a detected harness with no listed namespace is still
+        // registered — the runner discovers the namespace when it runs.
+        let cfg = dir.join(".hermes/plugins/neurostrata.json");
+        assert!(cfg.exists(), "detected Hermes harness left unwired");
+        assert_eq!(namespace_in(&cfg), Value::Null);
         assert!(dir
             .join(".NeuroStrata/plugins/hermes/dist/index.js")
             .exists());
@@ -2456,7 +2541,7 @@ mod tests {
     }
 
     /// Configs that disagree each keep their own namespace at boot, and a
-    /// harness with no config gets plugin files only, not a config.
+    /// harness with no config gets a namespace-neutral registration.
     #[test]
     fn boot_install_keeps_each_harness_namespace() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2482,7 +2567,9 @@ mod tests {
         // the pre-seeded namespace (PR #375 review).
         assert_ne!(field_in(&codex, "entry"), json!("stale"));
         assert_ne!(field_in(&hermes, "entry"), json!("stale"));
-        assert!(!dir.join(".openclaw/plugins/neurostrata.json").exists());
+        let openclaw = dir.join(".openclaw/plugins/neurostrata.json");
+        assert!(openclaw.exists(), "detected OpenClaw harness left unwired");
+        assert_eq!(namespace_in(&openclaw), Value::Null);
         assert!(dir
             .join(".NeuroStrata/plugins/openclaw/dist/index.js")
             .exists());
@@ -2887,6 +2974,65 @@ mod tests {
         assert_eq!(harness_config_namespace(&root, "opencode").unwrap(), None);
     }
 
+    /// PR #388: once an effective shared config exists its top-level namespace
+    /// decides, even when it names none. The historical registration must not
+    /// be consulted as a fallback and disagree with the loader and the gate.
+    #[test]
+    fn the_first_shared_config_decides_even_without_a_namespace() {
+        let _env = no_namespace_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".opencode")).unwrap();
+        write_file(&root.join(".NeuroStrata/neurostrata-plugin.json"), "{}");
+        write_file(
+            &root.join(".opencode/neurostrata-plugin.json"),
+            r#"{"neurostrata":{"namespace":"stale"}}"#,
+        );
+        assert_eq!(harness_config_namespace(&root, "opencode").unwrap(), None);
+    }
+
+    /// PR #388 (Sourcery + Codex): the loader skips a malformed first config
+    /// and tries `PluginConfig.json`; namespace resolution must report the
+    /// file the plugin actually loads, not stop with a parse error.
+    #[test]
+    fn a_malformed_shared_config_falls_through_to_the_next_file() {
+        let _env = no_namespace_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".opencode")).unwrap();
+        write_file(
+            &root.join(".NeuroStrata/neurostrata-plugin.json"),
+            "{ not json",
+        );
+        write_file(
+            &root.join(".NeuroStrata/PluginConfig.json"),
+            r#"{"namespace":"actual"}"#,
+        );
+        write_file(
+            &root.join(".opencode/neurostrata-plugin.json"),
+            r#"{"neurostrata":{"namespace":"stale"}}"#,
+        );
+        assert_eq!(
+            harness_config_namespace(&root, "opencode")
+                .unwrap()
+                .as_deref(),
+            Some("actual")
+        );
+    }
+
+    /// PR #388: skipping malformed files is not license to swallow every
+    /// unreadable shared config; a directory at the config path stays an
+    /// error, as it is for every other harness.
+    #[test]
+    fn an_unreadable_shared_config_is_still_an_error() {
+        let _env = no_namespace_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".opencode")).unwrap();
+        std::fs::create_dir_all(root.join(".NeuroStrata/neurostrata-plugin.json")).unwrap();
+        assert!(harness_config_namespace(&root, "opencode").is_err());
+    }
+
     /// Sourcery review on #385: a runner path that would end or expand inside
     /// the hook's double quotes is never written into a Claude hook command.
     #[test]
@@ -3110,6 +3256,28 @@ mod tests {
             .expect("detected Codex harness is registered");
         assert!(!codex.contains("namespace"), "no baked namespace: {codex}");
         assert_eq!(harness_namespaces_at(&dir), (Vec::new(), Vec::new()));
+    }
+
+    /// PR #388: a daemon boot refresh (Each) with no namespace listed for a
+    /// detected harness must wire it namespace-neutrally, like Keep.
+    #[test]
+    fn a_boot_refresh_wires_a_detected_harness_without_a_listed_namespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        let listed: Vec<(String, String)> = Vec::new();
+        let report =
+            auto_install_detected_plugins(&root, ConfigNamespace::Each(&listed), Some("hermes"));
+        let installed = report["installed_plugins"].as_array().unwrap();
+        assert!(
+            installed
+                .iter()
+                .any(|v| v["harness"].as_str() == Some("hermes")),
+            "detected Hermes harness left unwired: {installed:?}"
+        );
+        let cfg = root.join(".hermes/plugins/neurostrata.json");
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(doc.get("namespace").is_none(), "baked namespace: {doc}");
+        assert!(doc["cliHookRunner"].is_string(), "no hook runner: {doc}");
     }
 
     /// A refresh keeps each config's own usable namespace and gives the
@@ -4375,6 +4543,65 @@ mod tests {
             !target.exists(),
             "the symlink must not be renamed into place"
         );
+    }
+
+    /// PR #388: between the exclusive open and the path-based chmod/rename a
+    /// replaced staged entry must be rejected without touching its target.
+    #[test]
+    #[cfg(unix)]
+    fn a_replaced_staged_path_is_not_the_open_file() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap();
+        let staged = dir.join(".staged");
+        let victim = dir.join("victim.json");
+        std::fs::write(&staged, "ours").unwrap();
+        std::fs::write(&victim, "original").unwrap();
+        let opened = std::fs::metadata(&staged).unwrap();
+        assert!(staged_path_is_open_file(&staged, &opened).unwrap());
+
+        std::fs::remove_file(&staged).unwrap();
+        symlink(&victim, &staged).unwrap();
+        assert!(
+            !staged_path_is_open_file(&staged, &opened).unwrap(),
+            "a symlink planted at the staged path must not be followed"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
+
+        std::fs::remove_file(&staged).unwrap();
+        std::fs::write(&staged, "theirs").unwrap();
+        assert!(
+            !staged_path_is_open_file(&staged, &opened).unwrap(),
+            "another file at the staged path is not the one we opened"
+        );
+    }
+
+    /// PR #388: the staged identity check must run before either path-based
+    /// operation, never after one has already touched the replacement.
+    #[test]
+    fn a_staged_config_is_verified_before_it_is_published() {
+        let source = include_str!("harness_plugins.rs");
+        let check = source
+            .find("staged_path_is_open_file(staged, &opened)")
+            .expect("identity check");
+        let chmod = source
+            .find("std::fs::set_permissions(staged")
+            .expect("permission update");
+        let rename = source
+            .find("std::fs::rename(staged, path)")
+            .expect("publish rename");
+        assert!(check < chmod && check < rename);
+    }
+
+    /// PR #388: the OpenCode runner must pass the same effective config the
+    /// loader and `namespace resolve` use, not the stale registration alone.
+    #[test]
+    fn installed_runner_reads_opencodes_effective_config_first() {
+        assert!(CLI_HOOK_RUNNER_MJS.contains("HARNESS === \"opencode\""));
+        assert!(CLI_HOOK_RUNNER_MJS.contains("readOpenCodeConfig()"));
+        assert!(CLI_HOOK_RUNNER_MJS.contains("\"neurostrata-plugin.json\", \"PluginConfig.json\""));
+        // Other harnesses keep reading their own registration.
+        assert!(CLI_HOOK_RUNNER_MJS.contains("readHarnessConfig(HARNESS, projectDir, RUNNER_DIR)"));
     }
 
     /// Concurrent config writes to the same path must not share a staged
