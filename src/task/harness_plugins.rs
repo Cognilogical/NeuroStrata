@@ -102,7 +102,7 @@ async function main() {
     // override the one in .NeuroStrata/neurostrata-plugin.json.
     const namespace = process.env.NEUROSTRATA_NAMESPACE;
     const envConfig = namespace ? { namespace } : {};
-    await init({ config: { ...config, ...envConfig }, projectDir });
+    await init({ config: { ...envConfig, ...config }, projectDir });
   }
   const handler =
     mod.handleHookEvent ??

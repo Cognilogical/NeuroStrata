@@ -19,7 +19,12 @@ fi
 # this gate always checked), the namespace configured for this project, and
 # the namespace of every path the pushed commits change (`neurostrata-mcp
 # namespace resolve --pushed`). A failed call blocks the push.
-PUSH_REFS=$(cat)
+# Check cat's status: a read error after a complete prefix (or before any
+# input) must block, not gate on a partial set of refs.
+if ! PUSH_REFS=$(cat); then
+    echo "error: could not read the refs git passed to this hook — gate NOT run for this push" >&2
+    exit 1
+fi
 FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 PUSHED_NAMESPACES=$(printf '%s\n' "$PUSH_REFS" | neurostrata-mcp namespace resolve --pushed) || {
     if neurostrata-mcp namespace resolve --help 2>/dev/null | grep -q -- '--pushed'; then
@@ -38,6 +43,10 @@ if [ -z "$FOLDER_NAMESPACE" ] || [[ "$FOLDER_NAMESPACE" == -* ]]; then
 fi
 while IFS= read -r ns; do
     [ -n "$ns" ] || continue
+    # An option-like name would be parsed as a `task gate` option, blocking
+    # the push; it is never a valid namespace. Drop it here too, so a value
+    # emitted by an older --pushed cannot reach the gate.
+    [[ "$ns" == -* ]] && continue
     seen=0
     for g in "${GATE_NAMESPACES[@]}"; do
         [ "$g" = "$ns" ] && seen=1
@@ -84,4 +93,4 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: d91ec8e46b1854cdb14a0c854bf96989a9887f510e00213c8619cbf7968720c2
+# neurostrata-hook-sha256: e959754763e6e392d7ba87078c4b2bad18f9110daec0b2684c3e194088c65f5c

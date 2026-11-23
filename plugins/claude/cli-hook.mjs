@@ -52,7 +52,7 @@ async function main() {
   const namespace = process.env.NEUROSTRATA_NAMESPACE;
   const envConfig = namespace ? { namespace } : {};
   await initialize({
-    config: { ...readHarnessConfig(HARNESS, projectDir, RUNNER_DIR), ...envConfig },
+    config: { ...envConfig, ...readHarnessConfig(HARNESS, projectDir, RUNNER_DIR) },
     projectDir,
   });
   const handler = plugin.handleHookEvent ?? plugin.handleClaudeHookEvent ?? plugin;

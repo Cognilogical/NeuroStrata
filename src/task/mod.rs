@@ -4045,7 +4045,12 @@ fi
 # this gate always checked), the namespace configured for this project, and
 # the namespace of every path the pushed commits change (`neurostrata-mcp
 # namespace resolve --pushed`). A failed call blocks the push.
-PUSH_REFS=$(cat)
+# Check cat's status: a read error after a complete prefix (or before any
+# input) must block, not gate on a partial set of refs.
+if ! PUSH_REFS=$(cat); then
+    echo "error: could not read the refs git passed to this hook — gate NOT run for this push" >&2
+    exit 1
+fi
 FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
 PUSHED_NAMESPACES=$(printf '%s\n' "$PUSH_REFS" | neurostrata-mcp namespace resolve --pushed) || {
     if neurostrata-mcp namespace resolve --help 2>/dev/null | grep -q -- '--pushed'; then
@@ -4064,6 +4069,10 @@ if [ -z "$FOLDER_NAMESPACE" ] || [[ "$FOLDER_NAMESPACE" == -* ]]; then
 fi
 while IFS= read -r ns; do
     [ -n "$ns" ] || continue
+    # An option-like name would be parsed as a `task gate` option, blocking
+    # the push; it is never a valid namespace. Drop it here too, so a value
+    # emitted by an older --pushed cannot reach the gate.
+    [[ "$ns" == -* ]] && continue
     seen=0
     for g in "${GATE_NAMESPACES[@]}"; do
         [ "$g" = "$ns" ] && seen=1
@@ -4110,7 +4119,7 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: d91ec8e46b1854cdb14a0c854bf96989a9887f510e00213c8619cbf7968720c2
+# neurostrata-hook-sha256: e959754763e6e392d7ba87078c4b2bad18f9110daec0b2684c3e194088c65f5c
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -6407,7 +6416,9 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().expect("tempdir");
-        let repo = dunce::canonicalize(tmp.path()).unwrap().join("example-project");
+        let repo = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
         std::fs::create_dir_all(repo.join(".NeuroStrata")).unwrap();
         git_stdout_in(&repo, &["init", "-q"]);
         let ledger = repo.join(".NeuroStrata").join("session_queries.json");
@@ -6430,7 +6441,9 @@ mod tests {
             if let Some(bin) = bash.parent() {
                 dirs.push(bin.to_path_buf());
             }
-            dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+            dirs.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
             let mut cmd = std::process::Command::new(&bash);
             cmd.arg(&hook)
                 .current_dir(&repo)
@@ -6485,16 +6498,20 @@ mod tests {
         std::fs::create_dir_all(&stub_dir).unwrap();
         write_exec_hook(
             &stub_dir.join("neurostrata-mcp"),
-            "#!/bin/sh\nif [ \"$1\" = namespace ]; then\n    [ -n \"$STUB_RESOLVE_EXIT\" ] && exit \"$STUB_RESOLVE_EXIT\"\n    echo example-project\n    exit 0\nfi\nexit ${STUB_GATE_EXIT:-0}\n",
+            "#!/bin/sh\nif [ \"$1\" = namespace ]; then\n    [ -n \"$STUB_RESOLVE_EXIT\" ] && exit \"$STUB_RESOLVE_EXIT\"\n    if [ -n \"$STUB_PUSHED_NAMESPACES\" ]; then\n        printf '%s\\n' \"$STUB_PUSHED_NAMESPACES\"\n        exit 0\n    fi\n    echo example-project\n    exit 0\nfi\nif [ \"$1\" = task ] && [ \"${3#-}\" != \"$3\" ]; then\n    exit 2\nfi\nexit ${STUB_GATE_EXIT:-0}\n",
         );
         // The inherited PATH minus any installed neurostrata-mcp, so "missing"
         // really is missing on a developer machine.
         let inherited: Vec<std::path::PathBuf> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
                 .filter(|d| {
-                    ["neurostrata-mcp", "neurostrata-mcp.exe", "neurostrata-mcp.cmd"]
-                        .iter()
-                        .all(|name| !d.join(name).is_file())
+                    [
+                        "neurostrata-mcp",
+                        "neurostrata-mcp.exe",
+                        "neurostrata-mcp.cmd",
+                    ]
+                    .iter()
+                    .all(|name| !d.join(name).is_file())
                 })
                 .collect();
         let run = |with_stub: bool, envs: &[(&str, &str)]| -> (Option<i32>, String) {
@@ -6513,18 +6530,29 @@ mod tests {
                 .env("PATH", std::env::join_paths(dirs).expect("join PATH"))
                 .env_remove("NEUROSTRATA_SKIP_GATE")
                 .env_remove("STUB_RESOLVE_EXIT")
+                .env_remove("STUB_PUSHED_NAMESPACES")
                 .env_remove("STUB_GATE_EXIT");
             for (key, value) in envs {
                 cmd.env(key, value);
             }
             let out = cmd.output().expect("the hook runs");
-            (out.status.code(), String::from_utf8_lossy(&out.stderr).to_string())
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            )
         };
         let (code, stderr) = run(false, &[]);
         assert_eq!(code, Some(1), "no neurostrata-mcp on PATH blocks the push");
-        assert!(stderr.contains("error: neurostrata-mcp not found"), "{stderr}");
+        assert!(
+            stderr.contains("error: neurostrata-mcp not found"),
+            "{stderr}"
+        );
         let (code, stderr) = run(true, &[("STUB_RESOLVE_EXIT", "2")]);
-        assert_eq!(code, Some(1), "a namespace resolve that exits 2 blocks the push");
+        assert_eq!(
+            code,
+            Some(1),
+            "a namespace resolve that exits 2 blocks the push"
+        );
         assert!(
             stderr.contains("error: neurostrata-mcp namespace resolve --pushed failed — gate NOT run for this push")
                 && stderr.contains("upgrade it"),
@@ -6532,8 +6560,38 @@ mod tests {
         );
         let (code, stderr) = run(true, &[("STUB_GATE_EXIT", "2")]);
         assert_eq!(code, Some(1), "a gate that exits 2 blocks the push");
-        assert!(stderr.contains("the gate could NOT run for this push"), "{stderr}");
-        assert_eq!(run(true, &[]).0, Some(0), "a passing gate lets the push through");
+        assert!(
+            stderr.contains("the gate could NOT run for this push"),
+            "{stderr}"
+        );
+        assert_eq!(
+            run(true, &[]).0,
+            Some(0),
+            "a passing gate lets the push through"
+        );
+
+        // A failed stdin read must block before resolving any refs. A `cat`
+        // stub that fails reproduces a read error git can surface on a hook.
+        write_exec_hook(&stub_dir.join("cat"), "#!/bin/sh\nexit 1\n");
+        let (code, stderr) = run(true, &[]);
+        assert_eq!(code, Some(1), "a failed refs read blocks the push");
+        assert!(
+            stderr.contains("could not read the refs git passed to this hook"),
+            "{stderr}"
+        );
+        std::fs::remove_file(stub_dir.join("cat")).unwrap();
+
+        // An option-like namespace emitted by --pushed must be dropped before
+        // it reaches `task gate`, which would parse it as an option.
+        let (code, stderr) = run(
+            true,
+            &[("STUB_PUSHED_NAMESPACES", "-worktree\nexample-project")],
+        );
+        assert_eq!(
+            code,
+            Some(0),
+            "an option-like namespace must not block: {stderr}"
+        );
     }
 
     /// `neurostrata-mcp hooks install` and `scripts/install-hooks.sh` must
@@ -6625,8 +6683,9 @@ exit 0
                 dirs.push(bin.to_path_buf());
             }
             dirs.extend(
-                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                    .filter(|d| !d.join("neurostrata-mcp").is_file() && !d.join("neurostrata-mcp.exe").is_file()),
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).filter(|d| {
+                    !d.join("neurostrata-mcp").is_file() && !d.join("neurostrata-mcp.exe").is_file()
+                }),
             );
             let mut cmd = std::process::Command::new(&bash);
             cmd.arg(&hook)
@@ -6647,7 +6706,12 @@ exit 0
             let mut child = cmd.spawn().expect("the hook runs");
             {
                 use std::io::Write as _;
-                child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(stdin.as_bytes())
+                    .unwrap();
             }
             let out = child.wait_with_output().unwrap();
             let log = std::fs::read_to_string(&log).unwrap_or_default();
@@ -6659,7 +6723,10 @@ exit 0
                     .filter_map(|l| l.strip_prefix("task gate "))
                     .map(str::to_string)
                     .collect(),
-                pushed_calls: log.lines().filter(|l| *l == "namespace resolve --pushed").count(),
+                pushed_calls: log
+                    .lines()
+                    .filter(|l| *l == "namespace resolve --pushed")
+                    .count(),
                 stdin_seen: std::fs::read_to_string(&seen).unwrap_or_default(),
                 folder,
             })
@@ -6674,12 +6741,18 @@ exit 0
             };
             assert_eq!(run.code, Some(0), "{}", run.stderr);
             assert_eq!(run.pushed_calls, 1, "one --pushed call per push");
-            assert_eq!(run.stdin_seen, REFS, "the hook's stdin reaches --pushed unchanged");
+            assert_eq!(
+                run.stdin_seen, REFS,
+                "the hook's stdin reaches --pushed unchanged"
+            );
             let want: Vec<String> = [run.folder.as_str(), "alpha", "beta"]
                 .iter()
                 .map(|ns| format!("{ns} --strict"))
                 .collect();
-            assert_eq!(run.gates, want, "the folder name, then each printed namespace once");
+            assert_eq!(
+                run.gates, want,
+                "the folder name, then each printed namespace once"
+            );
         }
 
         #[test]
@@ -6694,7 +6767,10 @@ exit 0
                 "{}",
                 run.stderr
             );
-            assert!(run.gates.is_empty(), "no gate runs on namespaces it could not work out");
+            assert!(
+                run.gates.is_empty(),
+                "no gate runs on namespaces it could not work out"
+            );
         }
 
         #[test]
@@ -6704,7 +6780,8 @@ exit 0
             };
             assert_eq!(run.code, Some(1), "an old CLI blocks the push");
             assert!(
-                run.stderr.contains("neurostrata-mcp is too old for this hook; upgrade it"),
+                run.stderr
+                    .contains("neurostrata-mcp is too old for this hook; upgrade it"),
                 "{}",
                 run.stderr
             );
@@ -6722,7 +6799,10 @@ exit 0
             assert_eq!(run.code, Some(0), "{}", run.stderr);
             assert_eq!(
                 run.gates,
-                vec![format!("{} --strict", run.folder), "example-project --strict".to_string()]
+                vec![
+                    format!("{} --strict", run.folder),
+                    "example-project --strict".to_string()
+                ]
             );
         }
     }

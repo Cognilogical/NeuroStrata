@@ -572,7 +572,12 @@ test("cli hook passes harness config, not env, as config", () => {
     rmSync(base, { recursive: true, force: true });
   }
   const source = readFileSync(RUNNER, "utf8");
-  assert.ok(!source.includes("process.env.NEUROSTRATA_NAMESPACE"), "runner must not pass the env as config");
+  const envIndex = source.indexOf("...envConfig");
+  const configIndex = source.indexOf("...readHarnessConfig(");
+  assert.ok(
+    envIndex >= 0 && configIndex >= 0 && envIndex < configIndex,
+    "the harness config must be spread after the env namespace so it wins"
+  );
 });
 
 // The runner Claude Code actually runs is the one the installer embeds
