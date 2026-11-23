@@ -4481,9 +4481,20 @@ fn configured_embedding_descriptor_in(
             distance_metric: "cosine".into(),
         });
     }
+    // Local entries: synthesize the name the loader actually serves. An
+    // unresolvable configured name falls back inside `FastEmbedder::new`,
+    // so comparing a verbatim name against the serving descriptor left every
+    // pristine comparison false (issue #391): no birth record on a fresh
+    // store, no adoption of a recorded-pristine one, and a first-write
+    // refusal in every process. Resolving the name here keeps #98's strict
+    // full-descriptor equality intact -- C is still compared field-wise to
+    // S, it is just derived by the same resolution the loader performs.
+    // `dims` stays the store's width on purpose: a config width that
+    // disagrees with the loaded model is a real mismatch and must refuse.
+    let loaded_model_name = crate::embed::resolved_local_model_name(&configured.model_name);
     Ok(crate::traits::EmbeddingDescriptor {
         provider: "fastembed".into(),
-        model: configured.model_name,
+        model: loaded_model_name,
         revision: "onnx".into(),
         dims: dimensions,
         normalization: "unknown".into(),
@@ -26862,6 +26873,83 @@ eurostrata\src\daemon.rs",
         );
         drop(store2);
         let _ = std::fs::remove_dir_all(&fx2.root);
+        restore_model_env(previous);
+    }
+
+    #[test]
+    fn configured_descriptor_resolves_unrecognized_name_to_the_serving_name() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("unrecognized-config", "UnrecognizedModel");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir);
+        let configured = store
+            .configured_embedding_descriptor()
+            .expect("the local entry resolves");
+        assert_eq!(
+            configured,
+            serving_descriptor_dims(crate::embed::FALLBACK_LOCAL_MODEL_NAME, 4),
+            "a mistyped configured name synthesizes the name the loader serves"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn unrecognized_configured_name_records_fresh_store_and_accepts_first_write() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("unrecognized-fresh", "UnrecognizedModel");
+        let serving = serving_descriptor_dims(crate::embed::FALLBACK_LOCAL_MODEL_NAME, 4);
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving.clone()));
+        store.init("probe").await.expect("init");
+        let sidecar = read_sidecar(&fx.db);
+        assert_eq!(sidecar["has_data"], json!(false));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            json!(crate::embed::FALLBACK_LOCAL_MODEL_NAME),
+            "a fresh store records the served fallback under strict equality"
+        );
+        store
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await
+            .expect("the first write must not be refused for a mistyped name");
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(true));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
+        restore_model_env(previous);
+    }
+
+    #[tokio::test]
+    async fn pristine_record_under_unrecognized_name_is_adopted_by_fallback_server() {
+        let previous = without_model_env();
+        let fx = store_state_fixture("unrecognized-pristine", "UnrecognizedModel");
+        crate::model_choice::write_store_state_identity(
+            &fx.db,
+            &crate::model_choice::StoreState::new(false, serving_descriptor_for("UnrecognizedModel")),
+        )
+        .expect("write the pristine sidecar under the verbatim name");
+        let serving = serving_descriptor_dims(crate::embed::FALLBACK_LOCAL_MODEL_NAME, 4);
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving.clone()));
+        store.init("probe").await.expect("init");
+        assert_eq!(
+            read_sidecar(&fx.db)["descriptor"]["model"],
+            json!(crate::embed::FALLBACK_LOCAL_MODEL_NAME),
+            "the recorded-pristine store is adopted instead of refused forever"
+        );
+        store
+            .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
+            .await
+            .expect("the adopted store accepts its first write");
+        assert_eq!(read_sidecar(&fx.db)["has_data"], json!(true));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
     }
 

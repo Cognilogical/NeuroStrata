@@ -2288,6 +2288,39 @@ async fn prepare_fallback_write_store(
     vector_store.init(namespace).await
 }
 
+/// Whether a store is already present at `db_path`.
+///
+/// `Path::exists` follows symlinks, so a dangling store symlink would read as
+/// absent and a read route would happily recreate the file behind it. Use
+/// `symlink_metadata`: present-but-unparseable store shapes fail closed, they
+/// are never mistaken for a fresh install (#237, #390).
+fn store_path_present(db_path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(db_path).is_ok()
+}
+
+/// Commands whose daemon-stopped fallback only reads the store.
+///
+/// On a fresh install they have nothing to read. Constructing a store for
+/// them mints a bare `ladybug.db` with no birth record, which the next
+/// interactive command reads as "has data" and voids the pending setup-time
+/// model choice without ever offering it (issue #390).
+fn fallback_read_only_command(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Chat { .. }
+            | Commands::Metrics { .. }
+            | Commands::Graphql { .. }
+            | Commands::ObjectView { .. }
+            | Commands::Locate { .. }
+            | Commands::DiffTour { .. }
+            | Commands::Insights { .. }
+            | Commands::Taxonomy { .. }
+            | Commands::Doctor { .. }
+            | Commands::Namespaces
+            | Commands::List { .. }
+    )
+}
+
 /// Whether some process holds the daemon lock right now.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     // Read-only status probes must not create the lock file: open_daemon_lock
@@ -2584,11 +2617,21 @@ async fn open_cli_root_registry(
                 .to_string(),
         );
     }
+    let embedder = embed::build_embedder().ok();
+    if embedder.is_none() && !store_path_present(&config.db_path) {
+        // #390: with no embedder to bind, init cannot record a birth
+        // identity. Opening here would mint a bare store and void the
+        // pending setup choice before it is ever offered. The normal
+        // fresh-install path builds the embedder and records as designed.
+        return Err(
+            "the embedding model could not be built and no store exists yet; complete setup before writing root markers"
+                .to_string(),
+        );
+    }
     let dimensions = embed::configured_dimensions()
         .map_err(|e| format!("the store could not be opened: {e}"))?;
     let store = LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
         .map_err(|e| format!("the store could not be opened: {e}"))?;
-    let embedder = embed::build_embedder().ok();
     let store: Arc<dyn VectorStore> = Arc::new(store);
     // A pristine database has no schema: `new` opens it but leaves `init` to
     // create the tables. Registry calls query Memory immediately, so prepare
@@ -2963,6 +3006,14 @@ async fn direct_report(
     namespace: &str,
     scope: Option<&crate::task::gate::GateScope>,
 ) -> Result<crate::task::gate::GateReport, String> {
+    // #390: the hook gate/report path is metadata-only and must work on a
+    // fresh install without minting a bare store file. No store means no
+    // tasks to judge, so an empty (passing) report is the truthful answer.
+    // This check precedes even the dimension lookup so nothing on this path
+    // touches the store or loads a model.
+    if !store_path_present(&config.db_path) {
+        return Ok(crate::task::gate::GateReport::default());
+    }
     let dimensions = embed::configured_dimensions().map_err(|e| {
         format!(
             "the configured embedding dimensions could not be read: {}",
@@ -3508,6 +3559,39 @@ async fn run_list(read: &ReadSource, namespace: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_read_only_command_census_is_explicit() {
+        assert!(fallback_read_only_command(&Commands::Namespaces));
+        assert!(fallback_read_only_command(&Commands::Doctor { namespace: None }));
+        assert!(fallback_read_only_command(&Commands::List {
+            namespace: "NeuroStrata".to_string()
+        }));
+        // A command that writes must still be allowed to open (and create)
+        // the store; only read/report arms take the #390 guard.
+        assert!(!fallback_read_only_command(&Commands::Status));
+    }
+
+    #[tokio::test]
+    async fn direct_report_on_absent_store_creates_no_store_file() {
+        let root = std::env::temp_dir().join(format!("ns-gate-absent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let db = root.join("ladybug.db");
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db.to_string_lossy()
+        }))
+        .expect("minimal config with only a db path");
+        assert!(!store_path_present(&db));
+        let report = direct_report(&config, "NeuroStrata", None)
+            .await
+            .expect("a fresh install has no tasks to judge");
+        assert!(report.ok(), "an empty store yields a passing gate report");
+        assert!(
+            !store_path_present(&db),
+            "#390: the metadata-only gate must not mint a bare store file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A valid config with no database yet: the CLI's direct root registry
     /// must initialize the store before reading the registry row, or every
@@ -9258,6 +9342,35 @@ async fn run() -> anyhow::Result<()> {
                 if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
+                }
+                // #390: a read-only fallback command on a fresh path has
+                // nothing to read. Constructing the store here would create
+                // `ladybug.db` with no store-state sidecar; the next
+                // interactive command reads that bare file as "has data"
+                // and voids the pending setup-time model choice. Doctor is
+                // the one read arm with its own no-open diagnostics.
+                if !store_path_present(&config.db_path) && fallback_read_only_command(&other) {
+                    if matches!(&other, Commands::Doctor { .. }) {
+                        let status = crate::storage::compute_storage_status(
+                            &config.db_path,
+                            &config.storage_hygiene,
+                        );
+                        eprintln!(
+                            "Doctor: no store at {:?} yet. Storage diagnostics (no-open): store_bytes={}, wal_bytes={}, wal_age_secs={:?}, wal_recovery_artifact_count={}, wal_recovery_artifact_bytes={}",
+                            config.db_path,
+                            status.store_bytes,
+                            status.wal_bytes,
+                            status.wal_age_secs,
+                            status.wal_recovery_artifact_count,
+                            status.wal_recovery_artifact_bytes,
+                        );
+                    } else {
+                        eprintln!(
+                            "No store at {:?} yet; nothing to read. Run setup before querying.",
+                            config.db_path
+                        );
+                    }
+                    return Ok(());
                 }
                 let concrete_store: Arc<LadybugStore> = match LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),

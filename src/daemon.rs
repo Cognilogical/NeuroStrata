@@ -1959,12 +1959,83 @@ async fn handle_set_metadata(
     }
 }
 
+/// The largest JSON-RPC envelope `/mcp` will deserialize. Axum's `Json`
+/// extractor already caps the body at 2 MiB; restating the cap here makes
+/// the bound explicit at the deserialization boundary so a caller cannot
+/// drive unbounded allocation through `from_value` (CodeQL alert 21).
+const MAX_MCP_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Validate the *shape* of caller-supplied JSON before typed deserialization.
+///
+/// `from_value::<JsonRpcRequest>` trusts the object's fields and allocates a
+/// `String` for `jsonrpc` and `method` and a `Value` for `params`. Checking the
+/// envelope first -- object only, exact version, known keys, bounded method
+/// and id, object/array params within a byte budget -- rejects hostile shapes
+/// before any of those allocations happen. Pure and side-effect free so it is
+/// unit-testable without a running daemon.
+fn valid_mcp_envelope(value: &serde_json::Value) -> bool {
+    let Some(envelope) = value.as_object() else {
+        return false;
+    };
+    if envelope.len() > 4
+        || envelope
+            .keys()
+            .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "method" | "params"))
+    {
+        return false;
+    }
+    if envelope.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+        return false;
+    }
+    let Some(method) = envelope.get("method").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if method.is_empty() || method.len() > 256 {
+        return false;
+    }
+    if let Some(id) = envelope.get("id") {
+        match id {
+            serde_json::Value::Null | serde_json::Value::Number(_) => {}
+            serde_json::Value::String(s) if s.len() <= 256 => {}
+            _ => return false,
+        }
+    }
+    if let Some(params) = envelope.get("params") {
+        if !params.is_object() && !params.is_array() {
+            return false;
+        }
+        let size = serde_json::to_string(params)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX);
+        if size > MAX_MCP_ENVELOPE_BYTES {
+            return false;
+        }
+    }
+    true
+}
+
+/// The JSON-RPC 2.0 "Invalid Request" reply shared by every refused envelope.
+fn invalid_mcp_request_response() -> axum::response::Response {
+    axum::response::IntoResponse::into_response(Json(
+        serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}}),
+    ))
+}
+
 // Handle a single MCP JSON-RPC line
 async fn handle_mcp(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    // Validate before `from_value`: the extractor produced caller-controlled
+    // JSON, and typed deserialization is where the allocations happen.
+    if serde_json::to_string(&request)
+        .map(|encoded| encoded.len() > MAX_MCP_ENVELOPE_BYTES)
+        .unwrap_or(true)
+        || !valid_mcp_envelope(&request)
+    {
+        return invalid_mcp_request_response();
+    }
     if let Ok(rpc_req) = serde_json::from_value::<crate::server::JsonRpcRequest>(request) {
         // JSON-RPC 2.0: a notification (no `id`) is never answered. 202 with an
         // empty body, as MCP's HTTP transport answers one; the stdio proxy
@@ -1985,10 +2056,7 @@ async fn handle_mcp(
         }
         Json(response).into_response()
     } else {
-        Json(
-            serde_json::json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid Request"}}),
-        )
-        .into_response()
+        invalid_mcp_request_response()
     }
 }
 
@@ -2542,6 +2610,44 @@ async fn handle_http_learning_control(
     clippy::cloned_ref_to_slice_refs
 )]
 mod tests {
+    #[test]
+    fn mcp_envelope_validation_accepts_a_well_formed_request() {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/list",
+            "params": { "limit": 10 }
+        });
+        assert!(super::valid_mcp_envelope(&request));
+        // An explicit null id is a JSON-RPC request, not a notification.
+        let with_null_id = serde_json::json!({
+            "jsonrpc": "2.0", "id": null, "method": "tools/list"
+        });
+        assert!(super::valid_mcp_envelope(&with_null_id));
+    }
+
+    #[test]
+    fn mcp_envelope_validation_rejects_hostile_shapes_before_deserialization() {
+        let bad = [
+            serde_json::json!([]),
+            serde_json::json!("tools/list"),
+            serde_json::json!({"jsonrpc": "1.0", "method": "tools/list"}),
+            serde_json::json!({"jsonrpc": "2.0"}),
+            serde_json::json!({"jsonrpc": "2.0", "method": ""}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "tools/list", "surprise": 1}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "tools/list", "params": "bad"}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "tools/list", "id": {"nested": 1}}),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "tools/list",
+                "params": { "blob": "x".repeat(super::MAX_MCP_ENVELOPE_BYTES + 1) }
+            }),
+        ];
+        for value in bad {
+            assert!(!super::valid_mcp_envelope(&value), "accepted {value}");
+        }
+    }
+
     /// `/cli/root` takes a caller path, so it is held to the same policy as
     /// `/ingest`: a root outside the startup root and the allowlist is
     /// refused before the registry is touched.
