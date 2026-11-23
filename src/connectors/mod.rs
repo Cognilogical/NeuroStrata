@@ -77,6 +77,12 @@ pub struct ExternalEffectReceipt {
     pub idempotency_key: String,
     pub applied: bool,
     pub prior_source_sha256: String,
+    /// Legacy-encoded digest of the same prior records. Populated so a
+    /// pointer captured before the #351 encoding change still passes the
+    /// kernel's write-back CAS check (review 4670091380). Old receipts
+    /// deserialize with an empty string via `#[serde(default)]`.
+    #[serde(default)]
+    pub prior_source_sha256_legacy: String,
     pub new_source_sha256: String,
     pub details: String,
 }
@@ -544,6 +550,7 @@ impl DataConnector for InMemoryPoolConnector {
             idempotency_key: req.idempotency_key.clone(),
             applied: true,
             prior_source_sha256: current_source_sha,
+            prior_source_sha256_legacy: hash_records_sha256_legacy(&all_records),
             new_source_sha256: new_source_sha,
             details: format!("{} applied", req.operation),
         };
@@ -897,6 +904,7 @@ impl DataConnector for JsonFilePoolConnector {
             idempotency_key: req.idempotency_key.clone(),
             applied: true,
             prior_source_sha256: current_source_sha,
+            prior_source_sha256_legacy: hash_records_sha256_legacy(&all_records),
             new_source_sha256: new_source_sha,
             details: format!("{} applied to {}", req.operation, path.display()),
         };

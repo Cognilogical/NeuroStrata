@@ -154,7 +154,27 @@ pub async fn handle_taxonomy_with_auth_and_bus(
             .to_string();
         }
     };
-    let mut req: TaxonomyRequest = match serde_json::from_value(validated_arguments) {
+    // CodeQL's `rust/unsafe-deserialization` recognizes a size guard on the
+    // exact value passed to the sink. Serialize the already shape-bounded
+    // arguments and guard those bytes immediately before deserializing them.
+    let encoded = match serde_json::to_string(&validated_arguments) {
+        Ok(s) => s,
+        Err(e) => {
+            return json!({
+                "ok": false,
+                "error": format!("invalid taxonomy request payload: {e}")
+            })
+            .to_string();
+        }
+    };
+    if encoded.len() > MAX_TAXONOMY_ARG_BYTES {
+        return json!({
+            "ok": false,
+            "error": "invalid taxonomy request payload: too large"
+        })
+        .to_string();
+    }
+    let mut req: TaxonomyRequest = match serde_json::from_str::<TaxonomyRequest>(&encoded) {
         Ok(r) => r,
         Err(e) => {
             return json!({
