@@ -44,14 +44,17 @@ fn event_queue_key(event: &WatchEvent) -> PathBuf {
 }
 
 /// Stage one native event for the core. Events whose path is already queued
-/// are coalesced; a full channel drops the event (safe because ingest is
-/// per-root and the next event re-ingests the whole root).
+/// are coalesced. A full channel drops the event, but its root is recorded in
+/// `dropped_roots` so the core can re-ingest it: the "next event re-ingests the
+/// whole root" premise fails when the dropped event was the root's only edit.
 fn enqueue_coalesced(
     tx: &tokio::sync::mpsc::Sender<WatchEvent>,
     queued: &Mutex<HashSet<PathBuf>>,
+    dropped_roots: &Mutex<HashSet<PathBuf>>,
     event: WatchEvent,
 ) {
     let key = event_queue_key(&event);
+    let root = event.root.clone();
     let mut queued = match queued.lock() {
         Ok(queued) => queued,
         Err(_) => return,
@@ -61,6 +64,11 @@ fn enqueue_coalesced(
     }
     if tx.try_send(event).is_err() {
         queued.remove(&key);
+        // Durable overflow marker: the event loop folds these roots back in so
+        // a single dropped edit cannot leave its root stale indefinitely.
+        if let Ok(mut roots) = dropped_roots.lock() {
+            roots.insert(root);
+        }
     }
 }
 
@@ -216,6 +224,12 @@ pub trait WatchEventSource: Send + Sync {
     async fn recv(&self) -> Option<WatchEvent>;
     fn watch_root(&self, root: &Path) -> Result<(), String>;
     fn unwatch_root(&self, root: &Path) -> Result<(), String>;
+    /// Roots whose events were dropped because the staging channel was full.
+    /// Draining the returned set transfers the overflow marker to the core.
+    /// Sources without bounded staging have no overflow to report.
+    fn take_dropped_roots(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 pub trait WatchRegistrationStore: Send + Sync {
@@ -318,6 +332,9 @@ pub struct NotifyEventSource {
     tx: tokio::sync::mpsc::Sender<WatchEvent>,
     rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<WatchEvent>>,
     queued_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    // Roots of events dropped on channel overflow; drained by the core so a
+    // dropped event can still force its root to be re-ingested.
+    dropped_roots: Arc<Mutex<HashSet<PathBuf>>>,
     watched_roots: Mutex<HashSet<PathBuf>>,
     // Shared with the notify callback; the field itself is never re-read here.
     #[allow(dead_code)]
@@ -332,13 +349,20 @@ impl NotifyEventSource {
         let pending_renames: Arc<Mutex<HashMap<usize, (PathBuf, tokio::time::Instant)>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let queued_paths: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+        let dropped_roots: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
         let pending_renames_clone = Arc::clone(&pending_renames);
         let queued_paths_clone = Arc::clone(&queued_paths);
+        let dropped_roots_clone = Arc::clone(&dropped_roots);
         let tx_clone = tx.clone();
         let watcher = notify::recommended_watcher(move |res: Result<Event, Error>| {
             if let Ok(ev) = res {
                 if let Some(watch_event) = translate_native_event(&ev, &pending_renames_clone) {
-                    enqueue_coalesced(&tx_clone, &queued_paths_clone, watch_event);
+                    enqueue_coalesced(
+                        &tx_clone,
+                        &queued_paths_clone,
+                        &dropped_roots_clone,
+                        watch_event,
+                    );
                 }
             }
         })?;
@@ -347,6 +371,7 @@ impl NotifyEventSource {
             tx,
             rx: tokio::sync::Mutex::new(rx),
             queued_paths,
+            dropped_roots,
             watched_roots: Mutex::new(HashSet::new()),
             pending_renames,
         })
@@ -362,6 +387,13 @@ impl WatchEventSource for NotifyEventSource {
             queued.remove(&key);
         }
         Some(event)
+    }
+
+    fn take_dropped_roots(&self) -> Vec<PathBuf> {
+        self.dropped_roots
+            .lock()
+            .map(|mut roots| roots.drain().collect())
+            .unwrap_or_default()
     }
 
     fn watch_root(&self, root: &Path) -> Result<(), String> {
@@ -1355,11 +1387,37 @@ impl IngestWatchService {
         Ok(())
     }
 
+    /// Re-arm roots whose events were dropped on channel overflow. A dropped
+    /// event never reaches `ingest_event`, so without this the root stays stale
+    /// until an unrelated event happens to arrive for it.
+    pub fn fold_dropped_roots(
+        &self,
+        roots: Vec<PathBuf>,
+        now: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        for root in roots {
+            let synthetic = WatchEvent {
+                root: root.clone(),
+                path: root,
+                kind: WatchEventKind::Modify,
+                new_path: None,
+            };
+            self.ingest_event(synthetic, now)?;
+        }
+        Ok(())
+    }
+
     /// Daemon event loop: receive events, fold them into bursts, fire due
     /// roots, honor backoff deadlines, and stop promptly on shutdown.
     pub async fn run(self: Arc<Self>, mut shutdown: oneshot::Receiver<()>) -> anyhow::Result<()> {
         self.reconcile().await?;
         loop {
+            // Overflow drops never reached ingest_event; fold their roots back
+            // in so the root is re-ingested once capacity returns.
+            let dropped = self.events.take_dropped_roots();
+            if !dropped.is_empty() {
+                self.fold_dropped_roots(dropped, tokio::time::Instant::now())?;
+            }
             let due = self.due_keys(tokio::time::Instant::now());
             for key in due {
                 self.fire(&key).await?;
@@ -1473,6 +1531,74 @@ mod tests {
             kind,
             new_path: None,
         }
+    }
+
+    /// Regression for #384: a channel-full drop must leave a durable marker for
+    /// the dropped event's root instead of silently discarding it.
+    #[test]
+    fn overflow_drop_records_the_dropped_root() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let queued = Mutex::new(HashSet::new());
+        let dropped = Mutex::new(HashSet::new());
+        let root_a = PathBuf::from("/tmp/root-a");
+        let root_b = PathBuf::from("/tmp/root-b");
+
+        // Fill the single slot with a distinct event from root A.
+        enqueue_coalesced(
+            &tx,
+            &queued,
+            &dropped,
+            WatchEvent {
+                root: root_a.clone(),
+                path: root_a.join("one.rs"),
+                kind: WatchEventKind::Modify,
+                new_path: None,
+            },
+        );
+        // The next distinct event (root B) is dropped on overflow.
+        enqueue_coalesced(
+            &tx,
+            &queued,
+            &dropped,
+            WatchEvent {
+                root: root_b.clone(),
+                path: root_b.join("two.rs"),
+                kind: WatchEventKind::Modify,
+                new_path: None,
+            },
+        );
+
+        let marked = dropped.lock().unwrap();
+        assert!(marked.contains(&root_b), "dropped root must be marked dirty");
+        assert!(!marked.contains(&root_a), "enqueued root must not be marked");
+    }
+
+    /// Regression for #384: folding a dropped root back into the core marks it
+    /// dirty and arms a burst, so it is re-ingested even with no further events.
+    #[test]
+    fn folded_dropped_root_is_marked_dirty_and_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_for(&dir, dir.path().to_path_buf());
+        let root = dir.path().join("src");
+        service.register("NeuroStrata", &root).unwrap();
+        assert!(!service.status(None).roots[0].dirty);
+
+        service
+            .fold_dropped_roots(vec![root.clone()], tokio::time::Instant::now())
+            .unwrap();
+
+        let report = service.status(None);
+        assert!(report.roots[0].dirty, "dropped root must be marked dirty");
+        assert_eq!(report.roots[0].pending_paths_count, 1);
+        let key = ("NeuroStrata".to_string(), root.clone());
+        assert!(service
+            .bursts
+            .lock()
+            .unwrap()
+            .contains_key(&key), "dropped root must arm a re-ingest burst");
+        assert!(service
+            .due_keys(tokio::time::Instant::now() + QUIET_PERIOD + Duration::from_millis(1))
+            .contains(&key));
     }
 
     #[test]
@@ -2467,18 +2593,23 @@ mod tests {
     async fn native_event_queue_is_bounded_and_coalesces_duplicate_paths() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let queued = Mutex::new(HashSet::new());
+        let dropped = Mutex::new(HashSet::new());
         let ev = |path: &str| WatchEvent {
             root: PathBuf::from("/tmp/fresh-root"),
             path: PathBuf::from(path),
             kind: WatchEventKind::Modify,
             new_path: None,
         };
-        enqueue_coalesced(&tx, &queued, ev("/tmp/fresh-root/src/a.rs"));
-        enqueue_coalesced(&tx, &queued, ev("/tmp/fresh-root/src/a.rs"));
+        enqueue_coalesced(&tx, &queued, &dropped, ev("/tmp/fresh-root/src/a.rs"));
+        enqueue_coalesced(&tx, &queued, &dropped, ev("/tmp/fresh-root/src/a.rs"));
         assert_eq!(rx.len(), 1, "duplicate path coalesced");
         for i in 0..32 {
-            enqueue_coalesced(&tx, &queued, ev(&format!("/tmp/fresh-root/src/{i}.rs")));
+            enqueue_coalesced(&tx, &queued, &dropped, ev(&format!("/tmp/fresh-root/src/{i}.rs")));
         }
         assert!(rx.len() <= 4, "native event queue is bounded");
+        assert!(
+            !dropped.lock().unwrap().is_empty(),
+            "overflow drops must mark their root"
+        );
     }
 }

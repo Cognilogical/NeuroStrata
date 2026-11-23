@@ -3942,6 +3942,10 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         }
     };
     let original_path = path;
+    // The post-dispatch receipt recorder writes `events[]` only (digests, no
+    // path string). The legacy `queries[]` row and task counter belong to this
+    // lookup, so keep the trait object before the downcast shadows `store`.
+    let ledger_store = store.clone();
 
     // The graph-read capability is optional per backend: only LadybugStore
     // implements it (spec §4.6). Anything else answers `unsupported` -- never
@@ -3974,6 +3978,18 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     .await
     {
         Ok(retrieval) => {
+            // §3d Graph-First: every successful lookup records the exact path
+            // in queries[] and increments the active task's graph_queries_count
+            // so the pre-commit recorded-lookup check sees it. The post-dispatch
+            // events[] receipt alone cannot -- it keeps digests, not paths.
+            crate::task::record_graph_query_with_root(
+                &ledger_store,
+                &namespace,
+                "neurostrata_memories_for_file",
+                original_path,
+                project_root,
+            )
+            .await;
             let hits = retrieval.hits;
             // Capability C: attach the shared deprecation/boundary presentation
             // to every governed-memory row before it leaves this surface.
@@ -17247,6 +17263,61 @@ mod tests {
         assert_eq!(parsed["unsupported"], serde_json::json!(true));
         assert_eq!(parsed["memories"], serde_json::json!([]));
         assert_eq!(parsed["path"], serde_json::json!("src/lib.rs"));
+    }
+
+    /// Regression for #383: a successful memories_for_file lookup must write a
+    /// queries[] row (the pre-commit Graph-First check reads only queries[]) and
+    /// increment the active task's graph_queries_count. The post-dispatch
+    /// events[] receipt keeps digests only, so it cannot substitute for either.
+    #[tokio::test]
+    async fn memories_for_file_records_query_row_and_increments_count() {
+        let (store, _rule_id) = store_with_one_rule("probe").await;
+        let vector = StubEmbedder.embed("task").await.unwrap();
+        let mut task_payload = payload("task");
+        task_payload.memory_type = "task".to_string();
+        task_payload.metadata = serde_json::json!({
+            "task": { "status": "in_progress", "title": "active" }
+        });
+        store
+            .upsert("probe", "task-active", vector, task_payload)
+            .await
+            .expect("seed active task");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".NeuroStrata")).unwrap();
+        let ledger = root.join(".NeuroStrata/session_queries.json");
+
+        let arguments = serde_json::json!({
+            "namespace": "probe",
+            "path": "src/lib.rs",
+            "project_root": root.to_string_lossy(),
+        });
+        let text = handle_memories_for_file(arguments, store.clone()).await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(parsed["unsupported"], serde_json::json!(false), "{text}");
+
+        let doc: Value = serde_json::from_str(
+            &std::fs::read_to_string(&ledger).expect("session ledger written"),
+        )
+        .expect("valid ledger JSON");
+        let rows = doc["queries"].as_array().expect("queries[] exists");
+        let row = rows
+            .iter()
+            .find(|q| q["tool"] == "neurostrata_memories_for_file")
+            .unwrap_or_else(|| panic!("memories_for_file query row missing: {doc}"));
+        assert_eq!(row["query"], serde_json::json!("src/lib.rs"));
+        assert_eq!(row["governed_prefixes"], serde_json::json!(["src/lib.rs"]));
+
+        let (_, task) = store
+            .get("probe", "task-active")
+            .await
+            .unwrap()
+            .expect("active task still present");
+        assert_eq!(
+            task.metadata["task"]["graph_queries_count"],
+            serde_json::json!(1)
+        );
     }
 
     /// `include_ast_edges: true` bundles `related_memories` and `ast_summary`
