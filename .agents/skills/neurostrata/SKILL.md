@@ -67,7 +67,7 @@ NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust bi
   3. Task Stratum — Task working memory stored on the task record via `neurostrata_task_update` (`note`) and linked via `EXTRACTED_FROM`.
 - **Pointer-Wiki Engrams & Anchors:** Pass `locations: [{path, lines, symbol}]` and `metadata.governs: ["<Namespace>::<rel_path>"]` on `neurostrata_add_memory` so rules attach directly to file and symbol nodes in the graph.
 - **Negative Exemplars (Failed Attempts):** Record dead-end approaches using `metadata.attempt: { approach, outcome: "failed", failure_mode }` so future sessions never repeat a failed experiment.
-- **Non-Destructive Corrections:** Never use `bd remember` or `MEMORY.md`. Correct outdated memories with `neurostrata_supersede_memory` (`old_id`, `new_content`, `reason`) or retire with `neurostrata_archive_memory`. Deletion is deliberately absent from MCP.
+- **Non-Destructive Corrections:** Never use `bd remember` or `MEMORY.md`. Correct outdated memories with `neurostrata_supersede_memory` (`id` of the memory being replaced, new `content`, `reason`) or retire with `neurostrata_archive_memory`. Deletion is deliberately absent from MCP.
 - **Episodic Buffer:** Maintain a running session log using `neurostrata_append_log` (`namespace`, `project_root`, `content`, `tags`), which writes rolling 500 KB transcripts to `.NeuroStrata/sessions/` and returns `task_intent_signals`.
 
 ---
