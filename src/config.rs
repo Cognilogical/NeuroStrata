@@ -1191,7 +1191,7 @@ mod tests {
         let err = match finish_created_lock(
             created,
             path.clone(),
-            "42:nonce".to_string(),
+            format!("{}:nonce", std::process::id()),
             Instant::now(),
         ) {
             Ok(_) => panic!("expected the contended acquisition to fail"),

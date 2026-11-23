@@ -612,11 +612,10 @@ impl GuardValidator {
         }
         // CodeQL's `rust/unsafe-deserialization` recognizes a size guard on
         // the exact value passed to the sink; keep it immediately adjacent.
-        let bytes = payload.as_bytes();
-        if bytes.len() > MAX_JSON_PAYLOAD_BYTES {
+        if payload.len() > MAX_JSON_PAYLOAD_BYTES {
             return None;
         }
-        match serde_json::from_slice::<serde_json::Value>(bytes) {
+        match serde_json::from_str::<serde_json::Value>(payload) {
             Ok(value @ serde_json::Value::Object(_)) => Some(value),
             _ => None,
         }
