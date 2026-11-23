@@ -26467,14 +26467,14 @@ eurostrata\src\daemon.rs",
         }
     }
 
-    /// A data-bearing fixture: a store recorded under ModelA with one
+    /// A data-bearing fixture: a store recorded under BGESmallENV15 with one
     /// row landed, its instance dropped.
     async fn data_bearing_store_fixture(tag: &str) -> StoreStateFixture {
-        let fx = store_state_fixture(tag, "ModelA");
+        let fx = store_state_fixture(tag, "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
         store
             .upsert(
@@ -26496,11 +26496,11 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn store_state_sidecar_records_pristine_then_flips_on_first_upsert() {
         let previous = without_model_env();
-        let fx = store_state_fixture("flip", "ModelA");
+        let fx = store_state_fixture("flip", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
         assert!(
             !crate::model_choice::store_has_data(&fx.db),
@@ -26508,7 +26508,7 @@ eurostrata\src\daemon.rs",
         );
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], json!(false));
-        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(sidecar["descriptor"]["model"], json!("BGESmallENV15"));
 
         store
             .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
@@ -26535,11 +26535,11 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn store_state_failed_upsert_does_not_flip() {
         let previous = without_model_env();
-        let fx = store_state_fixture("failed-upsert", "ModelA");
+        let fx = store_state_fixture("failed-upsert", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
         assert!(!crate::model_choice::store_has_data(&fx.db));
         // Wrong-width vector: the Memory table's FLOAT[4] column rejects it.
@@ -26579,11 +26579,11 @@ eurostrata\src\daemon.rs",
         // and a write still queued when its deadline fires is dropped
         // with the timed future, never committed.
         let previous = without_model_env();
-        let fx = store_state_fixture("flip-timeout", "ModelA");
+        let fx = store_state_fixture("flip-timeout", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
         assert!(
             !crate::model_choice::store_has_data(&fx.db),
@@ -26642,11 +26642,11 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn store_state_has_data_is_monotonic_across_delete_and_reinit() {
         let previous = without_model_env();
-        let fx = store_state_fixture("monotonic", "ModelA");
+        let fx = store_state_fixture("monotonic", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
         store
             .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
@@ -26683,17 +26683,20 @@ eurostrata\src\daemon.rs",
         // guard; that path is covered by
         // store_state_same_instance_reinit_after_pick_does_not_adopt_and_upsert_refuses.
         let previous = without_model_env();
-        let fx = store_state_fixture("race", "ModelA");
+        let fx = store_state_fixture("race", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
-        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(
+            read_sidecar(&fx.db)["descriptor"]["model"],
+            json!("BGESmallENV15")
+        );
 
         // A pick lands while this process holds the pristine store open:
         // embedders.json now selects a different model.
-        write_embedders_config(&fx.config_dir, "ModelB");
+        write_embedders_config(&fx.config_dir, "GTEBaseENV15");
         let refused = store
             .upsert("probe", "m1", vec![0.0; 4], store_state_payload())
             .await;
@@ -26724,24 +26727,27 @@ eurostrata\src\daemon.rs",
         // for the write that followed. Serving-keyed adoption must
         // leave the record untouched, and the write must refuse.
         let previous = without_model_env();
-        let fx = store_state_fixture("reinit-after-pick", "ModelA");
+        let fx = store_state_fixture("reinit-after-pick", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
-        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(
+            read_sidecar(&fx.db)["descriptor"]["model"],
+            json!("BGESmallENV15")
+        );
         assert_eq!(read_sidecar(&fx.db)["has_data"], json!(false));
 
         // The pick lands while this process holds the store open.
-        write_embedders_config(&fx.config_dir, "ModelB");
+        write_embedders_config(&fx.config_dir, "GTEBaseENV15");
         // The intervening re-init the write half always performs.
         store.init("probe").await.expect("re-init same instance");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], json!(false));
         assert_eq!(
             sidecar["descriptor"]["model"],
-            json!("ModelA"),
+            json!("BGESmallENV15"),
             "a same-instance re-init after a pick must not adopt the new configured model"
         );
 
@@ -26754,7 +26760,7 @@ eurostrata\src\daemon.rs",
             "the refusal must be the restart-to-apply error: {err}"
         );
         assert!(
-            err.to_string().contains("ModelA") && err.to_string().contains("ModelB"),
+            err.to_string().contains("BGESmallENV15") && err.to_string().contains("GTEBaseENV15"),
             "the refusal must name the serving and configured models: {err}"
         );
         // The refusal carries the RestartToApplyError
@@ -26771,7 +26777,7 @@ eurostrata\src\daemon.rs",
         assert!(gone.is_none(), "no data lands under the stale model");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], json!(false));
-        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(sidecar["descriptor"]["model"], json!("BGESmallENV15"));
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
@@ -26796,13 +26802,16 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn store_state_post_pick_instance_adopts_serving_descriptor_and_first_write_passes() {
         let previous = without_model_env();
-        let fx = store_state_fixture("reopen-new-model", "ModelA");
+        let fx = store_state_fixture("reopen-new-model", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
-        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(
+            read_sidecar(&fx.db)["descriptor"]["model"],
+            json!("BGESmallENV15")
+        );
         drop(store);
 
         // The pick is in place before this process starts, and this
@@ -26810,11 +26819,11 @@ eurostrata\src\daemon.rs",
         // the pick): serving == configured at its first init, so it
         // adopts the serving descriptor, and the first write under it
         // proceeds.
-        write_embedders_config(&fx.config_dir, "ModelB");
+        write_embedders_config(&fx.config_dir, "GTEBaseENV15");
         let store2 = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+            .with_serving_descriptor(Some(serving_descriptor_for("GTEBaseENV15")));
         store2
             .init("probe")
             .await
@@ -26823,7 +26832,7 @@ eurostrata\src\daemon.rs",
         assert_eq!(sidecar["has_data"], json!(false));
         assert_eq!(
             sidecar["descriptor"]["model"],
-            json!("ModelB"),
+            json!("GTEBaseENV15"),
             "a pristine store opened under a new model records that model"
         );
         store2
@@ -26831,7 +26840,10 @@ eurostrata\src\daemon.rs",
             .await
             .expect("first upsert under the recorded model succeeds");
         assert!(crate::model_choice::store_has_data(&fx.db));
-        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelB"));
+        assert_eq!(
+            read_sidecar(&fx.db)["descriptor"]["model"],
+            json!("GTEBaseENV15")
+        );
         drop(store2);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
@@ -26840,7 +26852,7 @@ eurostrata\src\daemon.rs",
     #[test]
     fn configured_descriptor_for_remote_entry_matches_remote_serving_shape() {
         let previous = without_model_env();
-        let fx = store_state_fixture("remote-configured", "ModelA");
+        let fx = store_state_fixture("remote-configured", "BGESmallENV15");
         write_remote_embedders_config(&fx.config_dir, Some("RemoteModel"));
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
@@ -26858,7 +26870,7 @@ eurostrata\src\daemon.rs",
 
         // Without api_model, the synthesis resolves the same default
         // model build_embedder constructs the remote embedder with.
-        let fx2 = store_state_fixture("remote-configured-default", "ModelA");
+        let fx2 = store_state_fixture("remote-configured-default", "BGESmallENV15");
         write_remote_embedders_config(&fx2.config_dir, None);
         let store2 = LadybugStore::for_testing(&fx2.db, 4)
             .expect("open temp database")
@@ -26959,13 +26971,16 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn remote_switch_on_pristine_store_adopts_and_first_write_passes() {
         let previous = without_model_env();
-        let fx = store_state_fixture("remote-switch", "ModelA");
+        let fx = store_state_fixture("remote-switch", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
-        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(
+            read_sidecar(&fx.db)["descriptor"]["model"],
+            json!("BGESmallENV15")
+        );
         assert!(!crate::model_choice::store_has_data(&fx.db));
         drop(store);
 
@@ -27019,14 +27034,14 @@ eurostrata\src\daemon.rs",
         // verbatim, never the "local-fastembed" placeholder the
         // in-memory registry records.
         let previous = without_model_env();
-        let fx = store_state_fixture("provenance", "FileModel");
+        let fx = store_state_fixture("provenance", "MultilingualE5Small");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("FileModel")));
+            .with_serving_descriptor(Some(serving_descriptor_for("MultilingualE5Small")));
         store.init("probe").await.expect("init");
         let sidecar = read_sidecar(&fx.db);
-        assert_eq!(sidecar["descriptor"]["model"], json!("FileModel"));
+        assert_eq!(sidecar["descriptor"]["model"], json!("MultilingualE5Small"));
         assert_eq!(sidecar["descriptor"]["provider"], json!("fastembed"));
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
@@ -27036,20 +27051,23 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn store_state_non_serving_open_never_adopts() {
         let previous = without_model_env();
-        let fx = store_state_fixture("non-serving", "ModelA");
+        let fx = store_state_fixture("non-serving", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
-        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(
+            read_sidecar(&fx.db)["descriptor"]["model"],
+            json!("BGESmallENV15")
+        );
         drop(store);
 
         // A non-serving open (the backup / restore-verify / report
         // shape: no embedder is ever built, so no serving descriptor is
         // bound) under a changed configuration must not move the
         // record, however often it inits.
-        write_embedders_config(&fx.config_dir, "ModelB");
+        write_embedders_config(&fx.config_dir, "GTEBaseENV15");
         let opener = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -27059,7 +27077,7 @@ eurostrata\src\daemon.rs",
         assert_eq!(sidecar["has_data"], json!(false));
         assert_eq!(
             sidecar["descriptor"]["model"],
-            json!("ModelA"),
+            json!("BGESmallENV15"),
             "a process with no serving embedder never adopts"
         );
         drop(opener);
@@ -27067,7 +27085,7 @@ eurostrata\src\daemon.rs",
 
         // And a fresh store opened without a serving embedder records
         // nothing at all.
-        let fx2 = store_state_fixture("non-serving-fresh", "ModelA");
+        let fx2 = store_state_fixture("non-serving-fresh", "BGESmallENV15");
         let fresh = LadybugStore::for_testing(&fx2.db, 4)
             .expect("open fresh database")
             .with_embed_config_dir(&fx2.config_dir);
@@ -27084,29 +27102,32 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn store_state_serving_config_mismatch_at_open_does_not_adopt() {
         let previous = without_model_env();
-        let fx = store_state_fixture("mismatch-at-open", "ModelA");
+        let fx = store_state_fixture("mismatch-at-open", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
-        assert_eq!(read_sidecar(&fx.db)["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(
+            read_sidecar(&fx.db)["descriptor"]["model"],
+            json!("BGESmallENV15")
+        );
         drop(store);
 
         // The pick lands before the next process starts, but that
         // process still serves the old model: serving != configured at
         // its first init, so it adopts nothing, and its write refuses.
-        write_embedders_config(&fx.config_dir, "ModelB");
+        write_embedders_config(&fx.config_dir, "GTEBaseENV15");
         let stale = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         stale.init("probe").await.expect("init");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], json!(false));
         assert_eq!(
             sidecar["descriptor"]["model"],
-            json!("ModelA"),
+            json!("BGESmallENV15"),
             "a serving/configured mismatch at open must not adopt"
         );
         let refused = stale
@@ -27119,7 +27140,7 @@ eurostrata\src\daemon.rs",
         );
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], json!(false));
-        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(sidecar["descriptor"]["model"], json!("BGESmallENV15"));
         drop(stale);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
@@ -27134,12 +27155,27 @@ eurostrata\src\daemon.rs",
         let previous = without_model_env();
         let cases: [(&str, &str, &str, &str); 3] = [
             // A process serving the old model after a pick landed.
-            ("triple-pick-landed", "ModelB", "ModelA", "ModelA"),
+            (
+                "triple-pick-landed",
+                "GTEBaseENV15",
+                "BGESmallENV15",
+                "BGESmallENV15",
+            ),
             // The record is never trusted over the serving descriptor.
-            ("triple-record-over-serving", "ModelA", "ModelA", "ModelB"),
+            (
+                "triple-record-over-serving",
+                "BGESmallENV15",
+                "BGESmallENV15",
+                "GTEBaseENV15",
+            ),
             // The post-adoption shape: record and config agree on
             // the new model, the process still serves the old one.
-            ("triple-post-adoption", "ModelA", "ModelB", "ModelB"),
+            (
+                "triple-post-adoption",
+                "BGESmallENV15",
+                "GTEBaseENV15",
+                "GTEBaseENV15",
+            ),
         ];
         for (tag, serving, configured, recorded) in cases {
             let fx = store_state_fixture(tag, recorded);
@@ -27184,13 +27220,13 @@ eurostrata\src\daemon.rs",
 
     #[test]
     fn embedding_identity_refusal_message_matches_only_the_typed_refusal() {
-        let recorded = serving_descriptor_for("ModelA");
-        let serving = serving_descriptor_for("ModelB");
+        let recorded = serving_descriptor_for("BGESmallENV15");
+        let serving = serving_descriptor_for("GTEBaseENV15");
         let wrapped = anyhow::Error::new(EmbeddingIdentityRefusal::between(&recorded, &serving))
             .context("while opening");
         let extracted = embedding_identity_refusal_message(&wrapped)
             .expect("the typed refusal extracts through context layers");
-        assert!(extracted.contains("'ModelA'") && extracted.contains("'ModelB'"));
+        assert!(extracted.contains("'BGESmallENV15'") && extracted.contains("'GTEBaseENV15'"));
         assert!(embedding_identity_refusal_message(&anyhow::anyhow!("store exploded")).is_none());
         // The two refusal types never extract as each other.
         let restart = anyhow::Error::new(RestartToApplyError::new("restart".to_string()));
@@ -27284,7 +27320,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store
             .init("probe")
             .await
@@ -27315,11 +27351,11 @@ eurostrata\src\daemon.rs",
         // engine/FLOAT error.
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-width-switch").await;
-        write_embedders_config(&fx.config_dir, "ModelB");
+        write_embedders_config(&fx.config_dir, "GTEBaseENV15");
         let store = LadybugStore::for_testing(&fx.db, 8)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_dims("ModelB", 8)));
+            .with_serving_descriptor(Some(serving_descriptor_dims("GTEBaseENV15", 8)));
         let err = store
             .init("probe")
             .await
@@ -27343,7 +27379,7 @@ eurostrata\src\daemon.rs",
         // the serving-keyed check accepts the identical remote S, and
         // the unbound (backup-shaped) open.
         let previous = without_model_env();
-        let fx = store_state_fixture("a5-remote-record", "ModelA");
+        let fx = store_state_fixture("a5-remote-record", "BGESmallENV15");
         let blank = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -27395,7 +27431,7 @@ eurostrata\src\daemon.rs",
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-unbound-opens").await;
         let sidecar_before = sidecar_identity(&fx.db);
-        write_embedders_config(&fx.config_dir, "ModelB");
+        write_embedders_config(&fx.config_dir, "GTEBaseENV15");
 
         let backup = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
@@ -27442,7 +27478,7 @@ eurostrata\src\daemon.rs",
         let add = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+            .with_serving_descriptor(Some(serving_descriptor_for("GTEBaseENV15")));
         let err = add
             .upsert(
                 "probe",
@@ -27458,7 +27494,7 @@ eurostrata\src\daemon.rs",
         let chat = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+            .with_serving_descriptor(Some(serving_descriptor_for("GTEBaseENV15")));
         let err = chat
             .search_with_domain(
                 "probe",
@@ -27475,7 +27511,7 @@ eurostrata\src\daemon.rs",
         assert!(embedding_identity_refusal_message(&err).is_some(), "{err}");
         drop(chat);
 
-        write_embedders_config(&fx.config_dir, "ModelB");
+        write_embedders_config(&fx.config_dir, "GTEBaseENV15");
         let normalize = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -27496,20 +27532,20 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn unparseable_sidecar_refuses_init_and_is_not_reclassified() {
         let previous = without_model_env();
-        let fx = store_state_fixture("unparseable-init", "ModelA");
+        let fx = store_state_fixture("unparseable-init", "BGESmallENV15");
         // A valid pristine sidecar exists before the store is built;
         // the cache is lazy, so corrupting it after construction —
         // before the first identity-consulting call — is what init
         // must classify.
         crate::model_choice::write_store_state_identity(
             &fx.db,
-            &crate::model_choice::StoreState::new(false, serving_descriptor_for("ModelA")),
+            &crate::model_choice::StoreState::new(false, serving_descriptor_for("BGESmallENV15")),
         )
         .expect("write the pristine sidecar");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         std::fs::write(crate::model_choice::store_state_path(&fx.db), "{not json")
             .expect("corrupt the sidecar");
         let sidecar_before =
@@ -27561,7 +27597,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         let err = store
             .init("probe")
             .await
@@ -27655,14 +27691,17 @@ eurostrata\src\daemon.rs",
         // A bound init records S in the registry — S verifies,
         // the legacy placeholder does not.
         let previous = without_model_env();
-        let fx = store_state_fixture("a5-registry-serving", "ModelA");
+        let fx = store_state_fixture("a5-registry-serving", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
         store
-            .verify_or_record_embedding_descriptor("probe", &serving_descriptor_for("ModelA"))
+            .verify_or_record_embedding_descriptor(
+                "probe",
+                &serving_descriptor_for("BGESmallENV15"),
+            )
             .expect("the serving descriptor verifies against the registry");
         assert!(
             store
@@ -27682,7 +27721,7 @@ eurostrata\src\daemon.rs",
         // descriptor does not.
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-registry-recorded").await;
-        write_embedders_config(&fx.config_dir, "ModelB");
+        write_embedders_config(&fx.config_dir, "GTEBaseENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -27691,11 +27730,17 @@ eurostrata\src\daemon.rs",
             .await
             .expect("the unbound open succeeds (allow-list)");
         store
-            .verify_or_record_embedding_descriptor("probe", &serving_descriptor_for("ModelA"))
+            .verify_or_record_embedding_descriptor(
+                "probe",
+                &serving_descriptor_for("BGESmallENV15"),
+            )
             .expect("the recorded descriptor verifies against the registry");
         assert!(
             store
-                .verify_or_record_embedding_descriptor("probe", &serving_descriptor_for("ModelB"))
+                .verify_or_record_embedding_descriptor(
+                    "probe",
+                    &serving_descriptor_for("GTEBaseENV15")
+                )
                 .is_err(),
             "the registry holds the recorded descriptor, not the configured one"
         );
@@ -27710,11 +27755,11 @@ eurostrata\src\daemon.rs",
         // init recorded ("local-fastembed") must not verify after a
         // bound init of a feature-created store.
         let previous = without_model_env();
-        let fx = store_state_fixture("a5-registry-no-placeholder", "ModelA");
+        let fx = store_state_fixture("a5-registry-no-placeholder", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
         assert!(
             store
@@ -27734,7 +27779,7 @@ eurostrata\src\daemon.rs",
         // changed config exactly as it did before the feature — and
         // no sidecar is backfilled, at open or at first write.
         let previous = without_model_env();
-        let fx = store_state_fixture("a5-locked-unknown", "ModelA");
+        let fx = store_state_fixture("a5-locked-unknown", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -27745,7 +27790,7 @@ eurostrata\src\daemon.rs",
             "the pre-sidecar fixture carries no sidecar"
         );
 
-        write_embedders_config(&fx.config_dir, "ModelB");
+        write_embedders_config(&fx.config_dir, "GTEBaseENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -27782,7 +27827,7 @@ eurostrata\src\daemon.rs",
         // stores — a different width fails at vector use with the
         // engine's error, never with the identity refusal.
         let previous = without_model_env();
-        let fx = store_state_fixture("a5-locked-unknown-width", "ModelA");
+        let fx = store_state_fixture("a5-locked-unknown-width", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -27865,7 +27910,7 @@ eurostrata\src\daemon.rs",
         assert!(!OpenProvenance::DiscardedUnreadableWal.is_verified());
 
         let previous = without_model_env();
-        let fx = store_state_fixture("open-provenance-normal", "ModelA");
+        let fx = store_state_fixture("open-provenance-normal", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -27887,7 +27932,7 @@ eurostrata\src\daemon.rs",
         // this open. That close left a non-empty WAL in
         // place (#94), so the reopen exercises the
         // NEUROSTRATA_STRICT_WAL=0 opt-in under WAL_ENV_LOCK.
-        let fx = store_state_fixture("open-provenance-mismatch", "ModelA");
+        let fx = store_state_fixture("open-provenance-mismatch", "BGESmallENV15");
         let no_checksums = SystemConfig::default()
             .max_db_size(512 * 1024 * 1024)
             .buffer_pool_size(64 * 1024 * 1024)
@@ -28008,7 +28053,7 @@ eurostrata\src\daemon.rs",
         // now retries the upgrade when serving is bound, matches
         // the configuration, and the open is verified.
         let previous = without_model_env();
-        let fx = store_state_fixture("fastpath-retry-latched", "ModelA");
+        let fx = store_state_fixture("fastpath-retry-latched", "BGESmallENV15");
 
         // Creating process: first init binds the schema latch, no
         // serving descriptor is bound, so nothing is recorded.
@@ -28046,14 +28091,17 @@ eurostrata\src\daemon.rs",
         // instance: the fast path must retry the upgrade, attest
         // the empty table from the engine, and record the pristine
         // sidecar.
-        store.set_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.set_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store
             .init("probe")
             .await
             .expect("fast-path init retries the upgrade");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], serde_json::json!(false));
-        assert_eq!(sidecar["descriptor"]["model"], serde_json::json!("ModelA"));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            serde_json::json!("BGESmallENV15")
+        );
         assert!(
             matches!(store.cached_store_state(), CachedStoreState::Recorded(ref recorded) if !recorded.has_data),
             "the fast path upgraded the store to Recorded pristine"
@@ -28066,7 +28114,7 @@ eurostrata\src\daemon.rs",
         // exists — whose serving matches the configuration and
         // whose physical width equals the serving width records
         // has_data: true.
-        let fx = store_state_fixture("fastpath-migrate-data-bearing", "ModelA");
+        let fx = store_state_fixture("fastpath-migrate-data-bearing", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -28093,7 +28141,7 @@ eurostrata\src\daemon.rs",
         let migrant = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         assert!(matches!(
             migrant.cached_store_state(),
             CachedStoreState::LockedUnknown
@@ -28108,7 +28156,10 @@ eurostrata\src\daemon.rs",
         );
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], serde_json::json!(true));
-        assert_eq!(sidecar["descriptor"]["model"], serde_json::json!("ModelA"));
+        assert_eq!(
+            sidecar["descriptor"]["model"],
+            serde_json::json!("BGESmallENV15")
+        );
         assert!(
             matches!(migrant.cached_store_state(), CachedStoreState::Recorded(ref recorded) if recorded.has_data),
             "the cache records the data-bearing identity"
@@ -28119,7 +28170,7 @@ eurostrata\src\daemon.rs",
         // A width mismatch refuses: the physical FLOAT[4] column
         // does not equal the serving width of 8, so the migration
         // records nothing and the store stays LockedUnknown.
-        let fx = store_state_fixture("fastpath-migrate-mismatch", "ModelA");
+        let fx = store_state_fixture("fastpath-migrate-mismatch", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -28142,7 +28193,7 @@ eurostrata\src\daemon.rs",
         let mismatched = LadybugStore::for_testing(&fx.db, 8)
             .expect("reopen at a different serving width")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         let migrated = mismatched
             .migrate_locked_unknown_data_bearing_store_state()
             .await
@@ -28261,7 +28312,7 @@ eurostrata\src\daemon.rs",
         // now landed in the window — and invoke the stamp step
         // directly, exactly as init does.
         let previous = without_model_env();
-        let fx = store_state_fixture("cond3-stamp-reattest", "ModelA");
+        let fx = store_state_fixture("cond3-stamp-reattest", "BGESmallENV15");
 
         // The pre-sidecar store: a non-serving open creates the DB
         // file and schema but records no sidecar, so every later
@@ -28309,7 +28360,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         assert!(
             matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
             "precondition: the stamping instance classifies LockedUnknown"
@@ -28363,7 +28414,7 @@ eurostrata\src\daemon.rs",
         // Row leg: the state the window produces — LockedUnknown,
         // serving == configured, a row landed (cross-instance, as in
         // the condition-3 test).
-        let fx = store_state_fixture("p1-stamp-turn-row", "ModelA");
+        let fx = store_state_fixture("p1-stamp-turn-row", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -28390,7 +28441,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         assert!(
             matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
             "precondition: the stamping instance classifies LockedUnknown"
@@ -28416,7 +28467,7 @@ eurostrata\src\daemon.rs",
 
         // Empty leg: the unit alone — invoked exactly once, with no
         // post-turn stamp after it — records the pristine identity.
-        let fx = store_state_fixture("p1-stamp-turn-empty", "ModelA");
+        let fx = store_state_fixture("p1-stamp-turn-empty", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -28429,7 +28480,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         assert!(
             matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
             "precondition: the stamping instance classifies LockedUnknown"
@@ -28444,11 +28495,11 @@ eurostrata\src\daemon.rs",
             .expect("the attest-and-stamp unit runs and attests without error");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], json!(false));
-        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(sidecar["descriptor"]["model"], json!("BGESmallENV15"));
         match store.cached_store_state() {
             CachedStoreState::Recorded(recorded) => {
                 assert!(!recorded.has_data);
-                assert_eq!(recorded.descriptor, serving_descriptor_for("ModelA"));
+                assert_eq!(recorded.descriptor, serving_descriptor_for("BGESmallENV15"));
             }
             _ => panic!("the unit moves the cached state to Recorded(pristine)"),
         }
@@ -28475,7 +28526,7 @@ eurostrata\src\daemon.rs",
         // pristine record over a landed row — holds deterministically
         // with the stamp inside the turn.
         let previous = without_model_env();
-        let fx = store_state_fixture("p1-stamp-window", "ModelA");
+        let fx = store_state_fixture("p1-stamp-window", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -28489,7 +28540,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         assert!(
             matches!(store.cached_store_state(), CachedStoreState::LockedUnknown),
             "precondition: the stamping instance classifies LockedUnknown"
@@ -28516,7 +28567,7 @@ eurostrata\src\daemon.rs",
                 json!(true),
                 "a landed row must never sit under a pristine (has_data: false) record"
             );
-            assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+            assert_eq!(sidecar["descriptor"]["model"], json!("BGESmallENV15"));
         }
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
@@ -28731,7 +28782,7 @@ eurostrata\src\daemon.rs",
         // records. The checksum-mismatch and WAL-discard arms set the
         // same recovery flag in `with_system_config`.
         let previous = without_model_env();
-        let fx = store_state_fixture("cond1-recovery-wal-rows", "ModelA");
+        let fx = store_state_fixture("cond1-recovery-wal-rows", "BGESmallENV15");
 
         // The pre-sidecar store: schema at FLOAT[8], created by a
         // non-serving open, so no sidecar exists and the next
@@ -28751,14 +28802,14 @@ eurostrata\src\daemon.rs",
         plant_corrupted_uncheckpointed_wal(&fx.db, 6, false);
 
         // The recovery open: serving bound, serving == configured
-        // (ModelA at the store's width 4), unverified recovery opted
+        // (BGESmallENV15 at the store's width 4), unverified recovery opted
         // in — exactly the shape that used to stamp the sidecar.
         let _wal_env_serial = WAL_ENV_LOCK.lock().await;
         let previous_wal = allow_unverified_wal_recovery();
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("the recovery open succeeds")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store
             .init("probe")
             .await
@@ -28785,11 +28836,11 @@ eurostrata\src\daemon.rs",
         let verified = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         verified.init("probe").await.expect("verified init");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], json!(false));
-        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(sidecar["descriptor"]["model"], json!("BGESmallENV15"));
         drop(verified);
         let _ = std::fs::remove_dir_all(&fx.root);
         restore_model_env(previous);
@@ -28804,7 +28855,7 @@ eurostrata\src\daemon.rs",
         // open cannot distinguish this store from one whose WAL-only
         // rows it failed to recover, so neither may be upgraded.
         let previous = without_model_env();
-        let fx = store_state_fixture("cond1-recovery-empty", "ModelA");
+        let fx = store_state_fixture("cond1-recovery-empty", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 8)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -28822,7 +28873,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("the recovery open succeeds")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store
             .init("probe")
             .await
@@ -28971,12 +29022,12 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn first_data_write_preserves_health_recorded_after_the_cache_loaded() {
         let previous = without_model_env();
-        let fx = store_state_fixture("a5-flip-health", "ModelA");
+        let fx = store_state_fixture("a5-flip-health", "BGESmallENV15");
         // The sidecar a previous process left behind: pristine identity plus
         // checkpoint history.
         crate::model_choice::write_store_state_identity(
             &fx.db,
-            &crate::model_choice::StoreState::new(false, serving_descriptor_for("ModelA")),
+            &crate::model_choice::StoreState::new(false, serving_descriptor_for("BGESmallENV15")),
         )
         .expect("seed the pristine sidecar");
         crate::model_choice::record_store_state_checkpoint(
@@ -28990,7 +29041,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
         // `init` loaded and cached the sidecar, health included.
         assert!(
@@ -29066,14 +29117,14 @@ eurostrata\src\daemon.rs",
         std::fs::create_dir_all(&embed).expect("create the embed config dir");
         std::fs::write(
             embed.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+            "[{\"model_name\":\"BGESmallENV15\",\"dimensions\":8}]",
         )
         .expect("write the fixture embedders.json");
 
         let creator = LadybugStore::for_testing(&db, 8)
             .expect("open temp database")
             .with_embed_config_dir(&embed)
-            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 8)));
+            .with_serving_descriptor(Some(serving_descriptor_dims("BGESmallENV15", 8)));
         creator.init("probe").await.expect("init");
         drop(creator);
         plant_recoverable_wal_with_corrupted_tail(&db, 2);
@@ -29177,7 +29228,7 @@ eurostrata\src\daemon.rs",
         std::fs::create_dir_all(&embed).expect("create the embed config dir");
         std::fs::write(
             embed.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+            "[{\"model_name\":\"BGESmallENV15\",\"dimensions\":8}]",
         )
         .expect("write the fixture embedders.json");
 
@@ -29186,7 +29237,7 @@ eurostrata\src\daemon.rs",
         let creator = LadybugStore::for_testing(&db, 8)
             .expect("open temp database")
             .with_embed_config_dir(&embed)
-            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 8)));
+            .with_serving_descriptor(Some(serving_descriptor_dims("BGESmallENV15", 8)));
         creator.init("probe").await.expect("init");
         drop(creator);
         assert!(
@@ -29299,7 +29350,7 @@ eurostrata\src\daemon.rs",
         std::fs::create_dir_all(&embed).expect("create the embed config dir");
         std::fs::write(
             embed.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+            "[{\"model_name\":\"BGESmallENV15\",\"dimensions\":8}]",
         )
         .expect("write the fixture embedders.json");
         let creator = LadybugStore::for_testing(&db, 8)
@@ -29451,7 +29502,7 @@ eurostrata\src\daemon.rs",
         std::fs::create_dir_all(&embed).expect("create the embed config dir");
         std::fs::write(
             embed.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+            "[{\"model_name\":\"BGESmallENV15\",\"dimensions\":8}]",
         )
         .expect("write the fixture embedders.json");
         let creator = LadybugStore::for_testing(&db, 8)
@@ -31012,23 +31063,23 @@ eurostrata\src\daemon.rs",
         // descriptor to the serving descriptor on the sole basis
         // of the sidecar's has_data=false claim).
         let previous = without_model_env();
-        let fx = store_state_fixture("cond1-recovery-pristine", "ModelA");
+        let fx = store_state_fixture("cond1-recovery-pristine", "BGESmallENV15");
         std::fs::write(
             fx.config_dir.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+            "[{\"model_name\":\"BGESmallENV15\",\"dimensions\":8}]",
         )
         .expect("write 8-wide fixture config");
 
         // The recorded-pristine store: schema at FLOAT[8], sidecar
-        // recording ModelA with has_data=false.
+        // recording BGESmallENV15 with has_data=false.
         let creator = LadybugStore::for_testing(&fx.db, 8)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 8)));
+            .with_serving_descriptor(Some(serving_descriptor_dims("BGESmallENV15", 8)));
         creator.init("probe").await.expect("init");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], json!(false));
-        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(sidecar["descriptor"]["model"], json!("BGESmallENV15"));
         assert_eq!(sidecar["descriptor"]["dims"], json!(8));
         drop(creator);
 
@@ -31036,15 +31087,15 @@ eurostrata\src\daemon.rs",
         // WAL the verified replay refuses.
         plant_corrupted_uncheckpointed_wal(&fx.db, 6, false);
 
-        // The configured model switches to ModelB at dims 4.
+        // The configured model switches to GTEBaseENV15 at dims 4.
         std::fs::write(
             fx.config_dir.join("embedders.json"),
-            "[{\"model_name\":\"ModelB\",\"dimensions\":4}]",
+            "[{\"model_name\":\"GTEBaseENV15\",\"dimensions\":4}]",
         )
         .expect("write 4-wide fixture config");
 
         // The recovery open: serving bound, serving == configured
-        // (ModelB at dims 4), unverified recovery opted in. Init
+        // (GTEBaseENV15 at dims 4), unverified recovery opted in. Init
         // succeeds, but nothing may be reconciled or adopted from
         // the unauthenticated view.
         let _wal_env_serial = WAL_ENV_LOCK.lock().await;
@@ -31052,7 +31103,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("the recovery open succeeds")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_dims("ModelB", 4)));
+            .with_serving_descriptor(Some(serving_descriptor_dims("GTEBaseENV15", 4)));
         store
             .init("probe")
             .await
@@ -31066,14 +31117,17 @@ eurostrata\src\daemon.rs",
         assert_eq!(sidecar["has_data"], json!(false));
         assert_eq!(
             sidecar["descriptor"]["model"],
-            json!("ModelA"),
+            json!("BGESmallENV15"),
             "a recovery open must not adopt the serving descriptor"
         );
         assert_eq!(sidecar["descriptor"]["dims"], json!(8));
         match store.cached_store_state() {
             CachedStoreState::Recorded(recorded) => {
                 assert!(!recorded.has_data);
-                assert_eq!(recorded.descriptor, serving_descriptor_dims("ModelA", 8));
+                assert_eq!(
+                    recorded.descriptor,
+                    serving_descriptor_dims("BGESmallENV15", 8)
+                );
             }
             _ => panic!("the cached state stays Recorded after a recovery open"),
         }
@@ -31081,12 +31135,12 @@ eurostrata\src\daemon.rs",
         restore_wal_env(previous_wal);
 
         // The conservatism is per-open, not a permanent lockout: a
-        // later verified open at dims 4 under ModelB reconciles
+        // later verified open at dims 4 under GTEBaseENV15 reconciles
         // and adopts exactly as today.
         let verified = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_dims("ModelB", 4)));
+            .with_serving_descriptor(Some(serving_descriptor_dims("GTEBaseENV15", 4)));
         verified.init("probe").await.expect("verified init");
         assert_eq!(
             physical_embedding_width(&verified).await,
@@ -31095,7 +31149,7 @@ eurostrata\src\daemon.rs",
         );
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], json!(false));
-        assert_eq!(sidecar["descriptor"]["model"], json!("ModelB"));
+        assert_eq!(sidecar["descriptor"]["model"], json!("GTEBaseENV15"));
         assert_eq!(sidecar["descriptor"]["dims"], json!(4));
         drop(verified);
         let _ = std::fs::remove_dir_all(&fx.root);
@@ -31177,16 +31231,16 @@ eurostrata\src\daemon.rs",
         // leave the store byte-untouched — never alter a table the
         // engine attests is not empty.
         let previous = without_model_env();
-        let fx = store_state_fixture("fwidth-stale-label", "ModelA");
+        let fx = store_state_fixture("fwidth-stale-label", "BGESmallENV15");
         std::fs::write(
             fx.config_dir.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":768}]",
+            "[{\"model_name\":\"BGESmallENV15\",\"dimensions\":768}]",
         )
         .expect("write 768 fixture config");
         let creator = LadybugStore::for_testing(&fx.db, 768)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 768)));
+            .with_serving_descriptor(Some(serving_descriptor_dims("BGESmallENV15", 768)));
         creator.init("probe").await.expect("init");
         creator
             .upsert("probe", "m1", vec![0.1; 768], store_state_payload())
@@ -31198,7 +31252,10 @@ eurostrata\src\daemon.rs",
         // Hand-rewrite the sidecar to the stale pristine label.
         crate::model_choice::write_store_state_identity(
             &fx.db,
-            &crate::model_choice::StoreState::new(false, serving_descriptor_dims("ModelA", 768)),
+            &crate::model_choice::StoreState::new(
+                false,
+                serving_descriptor_dims("BGESmallENV15", 768),
+            ),
         )
         .expect("rewrite the sidecar to the stale pristine label");
         let sidecar_before =
@@ -31206,13 +31263,13 @@ eurostrata\src\daemon.rs",
 
         std::fs::write(
             fx.config_dir.join("embedders.json"),
-            "[{\"model_name\":\"ModelB\",\"dimensions\":384}]",
+            "[{\"model_name\":\"GTEBaseENV15\",\"dimensions\":384}]",
         )
         .expect("write 384 fixture config");
         let store = LadybugStore::for_testing(&fx.db, 384)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_dims("ModelB", 384)));
+            .with_serving_descriptor(Some(serving_descriptor_dims("GTEBaseENV15", 384)));
         let err = store
             .init("probe")
             .await
@@ -31238,13 +31295,13 @@ eurostrata\src\daemon.rs",
         // under its recorded width.
         std::fs::write(
             fx.config_dir.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":768}]",
+            "[{\"model_name\":\"BGESmallENV15\",\"dimensions\":768}]",
         )
         .expect("restore 768 fixture config");
         let store = LadybugStore::for_testing(&fx.db, 768)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_dims("ModelA", 768)));
+            .with_serving_descriptor(Some(serving_descriptor_dims("BGESmallENV15", 768)));
         store
             .init("probe")
             .await
@@ -31269,7 +31326,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir);
-        store.set_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+        store.set_serving_descriptor(Some(serving_descriptor_for("GTEBaseENV15")));
         let err = store
             .upsert(
                 "probe",
@@ -31299,7 +31356,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir);
-        store.set_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.set_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store
             .upsert(
                 "probe",
@@ -31431,7 +31488,7 @@ eurostrata\src\daemon.rs",
         // (the model that produced the vectors) is what the flip
         // records.
         let previous = without_model_env();
-        let fx = store_state_fixture("a5-flip-prefers-serving", "ModelA");
+        let fx = store_state_fixture("a5-flip-prefers-serving", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir);
@@ -31468,7 +31525,7 @@ eurostrata\src\daemon.rs",
 
         // Bound to the configured model instead, the same write lands
         // and the flip records the serving descriptor as data-bearing.
-        store.set_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+        store.set_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store
             .upsert(
                 "probe",
@@ -31482,7 +31539,7 @@ eurostrata\src\daemon.rs",
         assert_eq!(sidecar["has_data"], json!(true));
         assert_eq!(
             sidecar["descriptor"]["model"],
-            json!("ModelA"),
+            json!("BGESmallENV15"),
             "the flip records the serving descriptor, which the guard has verified against the configured one"
         );
         drop(store);
@@ -31507,7 +31564,7 @@ eurostrata\src\daemon.rs",
         // store records the pristine identity, and the store is
         // enforceable afterwards exactly like a Recorded store.
         let previous = without_model_env();
-        let fx = store_state_fixture("t4-direct-report-first", "ModelA");
+        let fx = store_state_fixture("t4-direct-report-first", "BGESmallENV15");
 
         // The metadata-only first touch, constructed the way
         // `direct_report` constructs it: no serving descriptor.
@@ -31529,7 +31586,7 @@ eurostrata\src\daemon.rs",
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(
@@ -31537,7 +31594,7 @@ eurostrata\src\daemon.rs",
             json!(false),
             "the normal start records the pristine identity after a metadata-only first touch"
         );
-        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(sidecar["descriptor"]["model"], json!("BGESmallENV15"));
 
         // Recordable means writable under that identity, and the
         // first write flips the record to data-bearing under it.
@@ -31552,17 +31609,17 @@ eurostrata\src\daemon.rs",
             .expect("the first write under the recorded identity succeeds");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(sidecar["has_data"], json!(true));
-        assert_eq!(sidecar["descriptor"]["model"], json!("ModelA"));
+        assert_eq!(sidecar["descriptor"]["model"], json!("BGESmallENV15"));
         drop(store);
 
         // Enforceable afterwards: reopening the now data-bearing
         // store under a different model is refused by the identity
         // check, the same enforcement a Recorded store gets.
-        write_embedders_config(&fx.config_dir, "ModelB");
+        write_embedders_config(&fx.config_dir, "GTEBaseENV15");
         let refused = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+            .with_serving_descriptor(Some(serving_descriptor_for("GTEBaseENV15")));
         let err = refused
             .init("probe")
             .await
@@ -31589,14 +31646,14 @@ eurostrata\src\daemon.rs",
         // the chosen model, and writes are accepted and recorded
         // under that identity.
         let previous = without_model_env();
-        let fx = store_state_fixture("t4-refused-write-restart", "ModelB");
+        let fx = store_state_fixture("t4-refused-write-restart", "GTEBaseENV15");
 
         // The first-start process serves the stale model while the
         // configuration already names the chosen one.
         let store = LadybugStore::for_testing(&fx.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         store.init("probe").await.expect("init");
         assert!(
             !crate::model_choice::store_state_path(&fx.db).exists(),
@@ -31633,7 +31690,7 @@ eurostrata\src\daemon.rs",
         let restarted = LadybugStore::for_testing(&fx.db, 4)
             .expect("reopen temp database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+            .with_serving_descriptor(Some(serving_descriptor_for("GTEBaseENV15")));
         restarted.init("probe").await.expect("init after restart");
         let sidecar = read_sidecar(&fx.db);
         assert_eq!(
@@ -31641,7 +31698,7 @@ eurostrata\src\daemon.rs",
             json!(false),
             "the restart under the chosen model records the pristine identity"
         );
-        assert_eq!(sidecar["descriptor"]["model"], json!("ModelB"));
+        assert_eq!(sidecar["descriptor"]["model"], json!("GTEBaseENV15"));
         restarted
             .upsert(
                 "probe",
@@ -31655,7 +31712,7 @@ eurostrata\src\daemon.rs",
         assert_eq!(sidecar["has_data"], json!(true));
         assert_eq!(
             sidecar["descriptor"]["model"],
-            json!("ModelB"),
+            json!("GTEBaseENV15"),
             "the flip records has_data under the chosen model's descriptor"
         );
         let found = restarted
@@ -31723,12 +31780,12 @@ eurostrata\src\daemon.rs",
             panic!("the restored store keeps its recorded identity");
         };
         assert!(state.has_data);
-        assert_eq!(state.descriptor, serving_descriptor_for("ModelA"));
+        assert_eq!(state.descriptor, serving_descriptor_for("BGESmallENV15"));
 
         let refused = LadybugStore::for_testing(&restored_db, 4)
             .expect("open restored database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelB")));
+            .with_serving_descriptor(Some(serving_descriptor_for("GTEBaseENV15")));
         let err = refused
             .init("probe")
             .await
@@ -31739,7 +31796,7 @@ eurostrata\src\daemon.rs",
         let ok = LadybugStore::for_testing(&restored_db, 4)
             .expect("open restored database")
             .with_embed_config_dir(&fx.config_dir)
-            .with_serving_descriptor(Some(serving_descriptor_for("ModelA")));
+            .with_serving_descriptor(Some(serving_descriptor_for("BGESmallENV15")));
         ok.init("probe")
             .await
             .expect("the restored store opens under its recorded model");
@@ -31794,7 +31851,7 @@ eurostrata\src\daemon.rs",
         // A pre-sidecar store: the db file exists (created by a
         // non-serving open, exactly as the LockedUnknown fixtures
         // build one) and no sidecar was ever written for it.
-        let fx2 = store_state_fixture("t5-reuse-pre-sidecar", "ModelA");
+        let fx2 = store_state_fixture("t5-reuse-pre-sidecar", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx2.db, 4)
             .expect("open temp database")
             .with_embed_config_dir(&fx2.config_dir);
@@ -33300,7 +33357,7 @@ mod wal_zero_record {
         std::fs::create_dir_all(&embed).expect("create the embed config dir");
         std::fs::write(
             embed.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+            "[{\"model_name\":\"BGESmallENV15\",\"dimensions\":8}]",
         )
         .expect("write the fixture embedders.json");
         let creator = LadybugStore::for_testing(db, 8)
@@ -34808,7 +34865,7 @@ mod wal_semantic_loss {
         std::fs::create_dir_all(&embed).expect("create the embed config dir");
         std::fs::write(
             embed.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+            "[{\"model_name\":\"BGESmallENV15\",\"dimensions\":8}]",
         )
         .expect("write the fixture embedders.json");
         let creator = LadybugStore::for_testing(&db, 8)
@@ -34909,7 +34966,7 @@ mod wal_semantic_loss {
         std::fs::create_dir_all(&embed).expect("create the embed config dir");
         std::fs::write(
             embed.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":8}]",
+            "[{\"model_name\":\"BGESmallENV15\",\"dimensions\":8}]",
         )
         .expect("write the fixture embedders.json");
         let creator = LadybugStore::for_testing(&db, 8)
