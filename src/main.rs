@@ -2168,14 +2168,6 @@ fn dispatch_project_context(
     Ok(output)
 }
 
-/// The daemon creates its lock by appending ".daemon.lock" to the db_path
-/// (see daemon_lock_path in main.rs). with_extension would produce
-/// "db.db.daemon.lock" for a file named "db", which is wrong.
-fn lock_path_for(db_path: &str) -> std::path::PathBuf {
-    let mut os = std::ffi::OsString::from(db_path);
-    os.push(".daemon.lock");
-    std::path::PathBuf::from(os)
-}
 
 async fn probe_daemon() -> DaemonProbe {
     match daemon_http_client()
@@ -2286,6 +2278,13 @@ async fn prepare_fallback_write_store(
 ) -> anyhow::Result<()> {
     bind_fallback_serving_descriptor(vector_store, embedder);
     vector_store.init(namespace).await
+}
+
+/// Whether the stdio proxy should wait for a daemon instead of spawning one.
+/// Only a live holder counts: the lock file outlives the daemon, so its mere
+/// presence says nothing about whether one is running.
+fn proxy_should_wait_for_daemon(db_path: Option<&str>) -> bool {
+    db_path.is_some_and(|p| daemon_holds_lock(std::path::Path::new(p)))
 }
 
 /// Whether some process holds the daemon lock right now.
@@ -3892,6 +3891,28 @@ mod tests {
             !daemon_holds_lock(&db),
             "the lock is free once its holder is gone"
         );
+    }
+
+    #[test]
+    fn a_stale_lock_file_does_not_make_the_proxy_wait() {
+        let db = std::env::temp_dir()
+            .join(format!("ns-stale-lock-{}", uuid::Uuid::new_v4()))
+            .join("ladybug.db");
+        let db_str = db.to_str().expect("temp path is utf-8");
+        assert!(!proxy_should_wait_for_daemon(Some(db_str)), "no file");
+        assert!(!proxy_should_wait_for_daemon(None), "no configured path");
+
+        // A daemon that has exited leaves its lock file behind.
+        drop(take_daemon_lock(&db).expect("take the lock"));
+        assert!(daemon_lock_path(&db).exists(), "the file outlives its holder");
+        assert!(
+            !proxy_should_wait_for_daemon(Some(db_str)),
+            "a stale file must not be mistaken for a live daemon"
+        );
+
+        let held = take_daemon_lock(&db).expect("retake the lock");
+        assert!(proxy_should_wait_for_daemon(Some(db_str)), "a live holder");
+        drop(held);
     }
 
     #[test]
@@ -7506,9 +7527,10 @@ async fn run() -> anyhow::Result<()> {
             // If the lock is held, a daemon exists: wait for it instead of
             // spawning a second one that will fail the lock check and leave
             // the proxy hung for 30s reporting "could not reach".
-            let lock_held = config_db_path()
-                .map(|p| lock_path_for(&p).exists())
-                .unwrap_or(false);
+            // Held means the OS lock, not the file: the daemon leaves the file
+            // behind on exit, and treating it as a live daemon meant the proxy
+            // waited two minutes and never spawned one.
+            let lock_held = proxy_should_wait_for_daemon(config_db_path().as_deref());
 
             if lock_held {
                 eprintln!(
