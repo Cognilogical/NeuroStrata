@@ -972,21 +972,20 @@ fn harness_config_namespace(
     //
     // Every harness's runner loads that shared config, so it counts as
     // OpenCode's only where OpenCode is set up in the project, and only the
-    // first file the loader picks counts (it never reads the second).
+    // first file the loader picks counts (it never reads the second). The
+    // plugin core's `resolveConfig` reads only the top-level `namespace`.
     if harness == "opencode" && opencode_in_project(root) {
         for rel in [
             ".NeuroStrata/neurostrata-plugin.json",
             ".NeuroStrata/PluginConfig.json",
         ] {
             if let Some(config) = read_config(&root.join(rel))? {
-                for pointer in ["/namespace", "/neurostrata/namespace"] {
-                    if let Some(ns) = config
-                        .pointer(pointer)
-                        .and_then(Value::as_str)
-                        .and_then(usable_namespace)
-                    {
-                        return Ok(Some(ns));
-                    }
+                if let Some(ns) = config
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .and_then(usable_namespace)
+                {
+                    return Ok(Some(ns));
                 }
                 break;
             }
@@ -2868,6 +2867,22 @@ mod tests {
         write_file(
             &root.join(".NeuroStrata/PluginConfig.json"),
             r#"{"namespace":"stale"}"#,
+        );
+        assert_eq!(harness_config_namespace(&root, "opencode").unwrap(), None);
+    }
+
+    /// Codex review on #385: the plugin core's `resolveConfig` reads only the
+    /// shared config's top-level `namespace`, so a nested
+    /// `neurostrata.namespace` there is not OpenCode's namespace.
+    #[test]
+    fn opencode_ignores_a_nested_namespace_in_the_shared_config() {
+        let _env = no_namespace_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".opencode")).unwrap();
+        write_file(
+            &root.join(".NeuroStrata/neurostrata-plugin.json"),
+            r#"{"neurostrata":{"namespace":"stale"}}"#,
         );
         assert_eq!(harness_config_namespace(&root, "opencode").unwrap(), None);
     }
