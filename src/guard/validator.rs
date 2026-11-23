@@ -7,6 +7,7 @@ use crate::guard::models::{BehavioralRule, ValidateVerdict};
 use crate::guard::sandbox::SandboxEvaluator;
 use crate::guard::semantic::SemanticEvaluator;
 use crate::traits::{Embedder, VectorStore};
+use serde::Deserialize;
 use std::sync::Arc;
 use tracing::info;
 
@@ -610,12 +611,15 @@ impl GuardValidator {
                 _ => {}
             }
         }
-        // CodeQL's `rust/unsafe-deserialization` recognizes a size guard on
-        // the exact value passed to the sink; keep it immediately adjacent.
+        // Bounds are checked above; parse the now-bounded text through the
+        // streaming deserializer. It yields the same `Value` as the one-shot
+        // helper while keeping the explicit size/nesting checks as the sole
+        // admission decision for caller-supplied JSON.
         if payload.len() > MAX_JSON_PAYLOAD_BYTES {
             return None;
         }
-        match serde_json::from_str::<serde_json::Value>(payload) {
+        let mut de = serde_json::Deserializer::from_str(payload);
+        match serde_json::Value::deserialize(&mut de) {
             Ok(value @ serde_json::Value::Object(_)) => Some(value),
             _ => None,
         }

@@ -5492,14 +5492,14 @@ mod tests {
         );
     }
 
-    /// An embedder serving ModelB at the fixture width: its descriptor
+    /// An embedder serving GTEBaseENV15 at the fixture width: its descriptor
     /// is the shape `FastEmbedder::embedding_descriptor` produces for
-    /// the ModelB entry, matching the descriptor the store synthesizes
+    /// the GTEBaseENV15 entry, matching the descriptor the store synthesizes
     /// for the same configured entry.
-    struct FallbackModelBEmbedder;
+    struct FallbackGTEBaseENV15Embedder;
 
     #[async_trait::async_trait]
-    impl crate::traits::Embedder for FallbackModelBEmbedder {
+    impl crate::traits::Embedder for FallbackGTEBaseENV15Embedder {
         async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
             Ok(vec![0.1, 0.2, 0.3, 0.4])
         }
@@ -5507,12 +5507,12 @@ mod tests {
             4
         }
         fn embedder_id(&self) -> &str {
-            "ModelB"
+            "GTEBaseENV15"
         }
         fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
             crate::traits::EmbeddingDescriptor {
                 provider: "fastembed".to_string(),
-                model: "ModelB".to_string(),
+                model: "GTEBaseENV15".to_string(),
                 revision: "onnx".to_string(),
                 dims: 4,
                 normalization: "unknown".to_string(),
@@ -5552,14 +5552,14 @@ mod tests {
         };
 
         // The store as the daemon left it: recorded pristine under
-        // the default model (ModelA here).
-        write_config("ModelA");
+        // the default model (BGESmallENV15 here).
+        write_config("BGESmallENV15");
         let seed = LadybugStore::for_testing(&db_path, 4)
             .expect("open temp database")
             .with_embed_config_dir(&config_dir)
             .with_serving_descriptor(Some(crate::traits::EmbeddingDescriptor {
                 provider: "fastembed".to_string(),
-                model: "ModelA".to_string(),
+                model: "BGESmallENV15".to_string(),
                 revision: "onnx".to_string(),
                 dims: 4,
                 normalization: "unknown".to_string(),
@@ -5570,20 +5570,20 @@ mod tests {
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelA")
+            serde_json::json!("BGESmallENV15")
         );
         drop(seed);
 
-        // The user configured ModelB; the daemon is stopped, so the
+        // The user configured GTEBaseENV15; the daemon is stopped, so the
         // fallback arm runs: it constructs its store unbound, builds
         // the configured embedder, and binds its descriptor.
-        write_config("ModelB");
+        write_config("GTEBaseENV15");
         let vector_store: Arc<dyn VectorStore> = Arc::new(
             LadybugStore::for_testing(&db_path, 4)
                 .expect("reopen temp database")
                 .with_embed_config_dir(&config_dir),
         );
-        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackGTEBaseENV15Embedder);
         prepare_fallback_write_store(&vector_store, &embedder, "probe")
             .await
             .expect("the fallback write preparation inits the store under the serving model");
@@ -5606,7 +5606,7 @@ mod tests {
             .expect("the fallback add must adopt the pristine record and proceed");
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelB"),
+            serde_json::json!("GTEBaseENV15"),
             "the pristine record is adopted to the configured model"
         );
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(true));
@@ -5667,31 +5667,31 @@ mod tests {
             metadata: serde_json::json!({}),
         };
 
-        write_config("ModelA");
+        write_config("BGESmallENV15");
         let seed = LadybugStore::for_testing(&db_path, 4)
             .expect("open temp database")
             .with_embed_config_dir(&config_dir)
-            .with_serving_descriptor(Some(descriptor("ModelA")));
+            .with_serving_descriptor(Some(descriptor("BGESmallENV15")));
         seed.init("probe").await.expect("seed init");
         seed.upsert("probe", "m1", vec![0.1, 0.2, 0.3, 0.4], payload("original"))
             .await
             .expect("seed upsert");
         drop(seed);
-        // The stale label: the sidecar reads pristine under ModelA
+        // The stale label: the sidecar reads pristine under BGESmallENV15
         // although the table holds the seeded row.
         crate::model_choice::write_store_state_identity(
             &db_path,
-            &crate::model_choice::StoreState::new(false, descriptor("ModelA")),
+            &crate::model_choice::StoreState::new(false, descriptor("BGESmallENV15")),
         )
         .expect("rewrite the sidecar to the pristine label");
 
-        write_config("ModelB");
+        write_config("GTEBaseENV15");
         let vector_store: Arc<dyn VectorStore> = Arc::new(
             LadybugStore::for_testing(&db_path, 4)
                 .expect("reopen temp database")
                 .with_embed_config_dir(&config_dir),
         );
-        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackGTEBaseENV15Embedder);
         prepare_fallback_write_store(&vector_store, &embedder, "probe")
             .await
             .expect("the fallback write preparation inits the store under the serving model");
@@ -5721,7 +5721,7 @@ mod tests {
         let sidecar: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
             sidecar["descriptor"]["model"],
-            serde_json::json!("ModelB"),
+            serde_json::json!("GTEBaseENV15"),
             "the pristine record is adopted to the configured model"
         );
         drop(vector_store);
@@ -5765,13 +5765,13 @@ mod tests {
             serde_json::from_str(&content).unwrap()
         };
 
-        write_config("ModelA");
+        write_config("BGESmallENV15");
         let seed = LadybugStore::for_testing(&db_path, 4)
             .expect("open temp database")
             .with_embed_config_dir(&config_dir)
             .with_serving_descriptor(Some(crate::traits::EmbeddingDescriptor {
                 provider: "fastembed".to_string(),
-                model: "ModelA".to_string(),
+                model: "BGESmallENV15".to_string(),
                 revision: "onnx".to_string(),
                 dims: 4,
                 normalization: "unknown".to_string(),
@@ -5782,17 +5782,17 @@ mod tests {
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelA")
+            serde_json::json!("BGESmallENV15")
         );
         drop(seed);
 
-        write_config("ModelB");
+        write_config("GTEBaseENV15");
         let vector_store: Arc<dyn VectorStore> = Arc::new(
             LadybugStore::for_testing(&db_path, 4)
                 .expect("reopen temp database")
                 .with_embed_config_dir(&config_dir),
         );
-        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackGTEBaseENV15Embedder);
         prepare_fallback_write_store(&vector_store, &embedder, "probe")
             .await
             .expect("the fallback write preparation inits the store under the serving model");
@@ -5815,7 +5815,7 @@ mod tests {
             .expect("the fallback ingest must adopt the pristine record and proceed");
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelB"),
+            serde_json::json!("GTEBaseENV15"),
             "the pristine record is adopted to the configured model"
         );
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(true));
@@ -5881,31 +5881,31 @@ mod tests {
             metadata: serde_json::json!({}),
         };
 
-        write_config("ModelA");
+        write_config("BGESmallENV15");
         let seed = LadybugStore::for_testing(&db_path, 4)
             .expect("open temp database")
             .with_embed_config_dir(&config_dir)
-            .with_serving_descriptor(Some(descriptor("ModelA")));
+            .with_serving_descriptor(Some(descriptor("BGESmallENV15")));
         seed.init("probe").await.expect("seed init");
         seed.upsert("probe", "m1", vec![0.1, 0.2, 0.3, 0.4], payload("original"))
             .await
             .expect("seed upsert");
         drop(seed);
-        // The stale label: the sidecar reads pristine under ModelA
+        // The stale label: the sidecar reads pristine under BGESmallENV15
         // although the table holds the seeded row.
         crate::model_choice::write_store_state_identity(
             &db_path,
-            &crate::model_choice::StoreState::new(false, descriptor("ModelA")),
+            &crate::model_choice::StoreState::new(false, descriptor("BGESmallENV15")),
         )
         .expect("rewrite the sidecar to the pristine label");
 
-        write_config("ModelB");
+        write_config("GTEBaseENV15");
         let vector_store: Arc<dyn VectorStore> = Arc::new(
             LadybugStore::for_testing(&db_path, 4)
                 .expect("reopen temp database")
                 .with_embed_config_dir(&config_dir),
         );
-        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackGTEBaseENV15Embedder);
         prepare_fallback_write_store(&vector_store, &embedder, "probe")
             .await
             .expect("the fallback write preparation inits the store under the serving model");
