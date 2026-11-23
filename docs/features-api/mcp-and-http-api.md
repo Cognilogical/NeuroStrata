@@ -36,10 +36,11 @@ Several tools now append advisory metadata without changing existing result fiel
 
 ## Central Executive Task & Procedure Tools
 
-- `neurostrata_task_create` — create a new task.
+- `neurostrata_task_create` — create a new task. Like `neurostrata_task_claim`, it answers with `auto_retrieved_context` and `subagent_prompt_injection`; see the note under `neurostrata_task_claim`.
 - `neurostrata_task_list` — list tasks.
 - `neurostrata_task_get` — retrieve a single task.
 - `neurostrata_task_claim` — claim exclusivity over a task and stamp caller `worktree`/`branch` scope (from explicit `worktree`/`branch`/`project_root` arguments or the namespace's registered `project_root`). Without those arguments the registered root is used, which for a namespace with a project marker is the main checkout, so a claim from a linked worktree would carry the main checkout's branch; the harness plugins therefore pass the session's project folder as `worktree` on `neurostrata_task_claim` and `neurostrata_get_snapshot` calls that name none.
+  The reply's `auto_retrieved_context` is compact by default: each memory in `golden_rules`, `items`, `normative_memories` and `structural_anchors` is one row with `id`, `memory_type`, `location` and `snippet` (plus `deprecation_banner` or `not_definition` when the memory has one), and the context carries `"compact": true`. The other keys are unchanged. Pass `compact: false` to get each memory's full metadata. `subagent_prompt_injection` is the same either way.
 - `neurostrata_task_update` — update status/notes on a task.
 - `neurostrata_task_complete` — finish a task (requires extracted memory → Lock 2).
 - `neurostrata_task_validate` — advisory gate report for a task.

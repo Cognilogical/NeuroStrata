@@ -1194,6 +1194,58 @@ pub async fn build_task_graph_context(
     (auto_retrieved_context, subagent_prompt)
 }
 
+/// The memory lists in `auto_retrieved_context` whose rows carry each memory's
+/// full metadata. `normative_memories` and `structural_anchors` repeat rows
+/// of `items`.
+const CONTEXT_MEMORY_LISTS: [&str; 4] = [
+    "golden_rules",
+    "items",
+    "normative_memories",
+    "structural_anchors",
+];
+
+/// The context `task_claim` and `task_create` answer with by default: the
+/// same keys, each memory row cut to id, type, location and snippet (plus a
+/// deprecation or not-definition banner when the row has one), and
+/// `"compact": true`. The full rows carry every memory's metadata (calls
+/// lists, edge sources, source identity) and made one claim reply 61,337
+/// characters. `compact: false` returns the full context. The prompt block
+/// returned as `subagent_prompt_injection` is the same either way.
+fn compact_graph_context(context: &Value) -> Value {
+    fn slim(row: &Value) -> Value {
+        let mut out = serde_json::Map::new();
+        for key in [
+            "id",
+            "memory_type",
+            "location",
+            "snippet",
+            "deprecation_banner",
+            "not_definition",
+        ] {
+            if let Some(v) = row.get(key) {
+                out.insert(key.to_string(), v.clone());
+            }
+        }
+        Value::Object(out)
+    }
+    let mut out = context.clone();
+    if let Some(obj) = out.as_object_mut() {
+        for key in CONTEXT_MEMORY_LISTS {
+            if let Some(rows) = obj.get(key).and_then(Value::as_array) {
+                let slimmed = Value::Array(rows.iter().map(slim).collect());
+                obj.insert(key.to_string(), slimmed);
+            }
+        }
+        obj.insert("compact".to_string(), Value::Bool(true));
+    }
+    out
+}
+
+/// Compact unless the caller passes `compact: false`.
+fn wants_compact(args: &Value) -> bool {
+    args.get("compact").and_then(Value::as_bool).unwrap_or(true)
+}
+
 /// Synthesise cross-domain conceptual bridges from retrieved seed memories.
 ///
 /// For each seed item, traverses 2 hops (`seed -> via -> target`) through the
@@ -2108,6 +2160,11 @@ pub async fn handle_task_create(
                     json!(subagent_prompt),
                 );
             }
+            let hits_json = if wants_compact(&args) {
+                compact_graph_context(&hits_json)
+            } else {
+                hits_json
+            };
             encode(&json!({
                 "id": id,
                 "namespace": namespace,
@@ -2472,6 +2529,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
+    let hits_json = if wants_compact(&args) {
+        compact_graph_context(&hits_json)
+    } else {
+        hits_json
+    };
     let mut reply = json!({
         "id": id,
         "namespace": namespace,
@@ -7248,6 +7310,231 @@ exit 0
         let parsed: Value = serde_json::from_str(&reply)
             .unwrap_or_else(|e| panic!("create failed: {} -- {}", reply, e));
         parsed["id"].as_str().expect("id").to_string()
+    }
+
+    /// The compact context keeps every key, cuts each memory row to id,
+    /// type, location and snippet (plus a banner when the row has one), and
+    /// leaves the other keys as they were.
+    #[test]
+    fn compact_context_keeps_the_keys_and_drops_the_per_item_metadata() {
+        let big = json!({ "edge_sources": vec!["x".repeat(500); 20], "mentions": ["a", "b"] });
+        let item = json!({
+            "id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text",
+            "metadata": big, "calls": ["f"], "imports": null, "governs": ["g"],
+            "depends_on": null, "evidence": [{"kind": "direct_match"}],
+        });
+        let mut warned = item.clone();
+        warned["deprecation_banner"] = json!("DEPRECATED");
+        let full = json!({
+            "query": "q",
+            "golden_rules": [item.clone()],
+            "items": [item.clone(), warned],
+            "related_edges": [{"source": "m1", "relation": "calls", "target": "f"}],
+            "next_hop_calls": [{"tool": "neurostrata_related", "trigger_id": "T_SEED_EXPAND"}],
+            "expansion_error": null,
+            "normative_memories": [item.clone()],
+            "structural_anchors": [item.clone()],
+            "conceptual_bridges": [{"id": "b1", "why_connected": "a -> b"}],
+            "project_thesis": {"text": "thesis"},
+            "domain_concepts": [],
+        });
+        let compact = compact_graph_context(&full);
+
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let mut expected = keys(&full);
+        expected.push("compact".to_string());
+        expected.sort();
+        assert_eq!(keys(&compact), expected, "same keys plus the marker");
+        assert_eq!(compact["compact"], json!(true));
+        for key in [
+            "query",
+            "related_edges",
+            "next_hop_calls",
+            "expansion_error",
+            "conceptual_bridges",
+            "project_thesis",
+            "domain_concepts",
+        ] {
+            assert_eq!(compact[key], full[key], "`{key}` passes through");
+        }
+        let slim =
+            json!({"id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text"});
+        for key in CONTEXT_MEMORY_LISTS {
+            assert_eq!(compact[key][0], slim, "`{key}` rows are slim");
+        }
+        assert_eq!(compact["items"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            compact["items"][1]["deprecation_banner"],
+            json!("DEPRECATED")
+        );
+        assert!(
+            serde_json::to_string(&compact).unwrap().len() * 5
+                < serde_json::to_string(&full).unwrap().len(),
+            "the compact form is a fraction of the full one"
+        );
+    }
+
+    /// A namespace whose memories carry the heavy per-row metadata real
+    /// ingested rows have (calls lists, edge sources, source identity).
+    async fn store_with_heavy_memories(namespace: &str) -> Arc<dyn VectorStore> {
+        let store = store_with_namespace(namespace).await;
+        for (i, memory_type) in ["code_ast", "code_ast", "code_ast", "fact", "rule"]
+            .iter()
+            .enumerate()
+        {
+            let content = format!("compact fixture handler {i} parses the claim reply");
+            let vector = StubEmbedder.embed(&content).await.unwrap();
+            let calls: Vec<String> = (0..40).map(|n| format!("module::callee_{i}_{n}")).collect();
+            let edge_sources: Vec<String> = (0..20)
+                .map(|n| format!("ingest:src/fixture_{i}.rs#generation-{n}"))
+                .collect();
+            store
+                .upsert(
+                    namespace,
+                    &uuid::Uuid::new_v4().to_string(),
+                    vector,
+                    MemoryPayload {
+                        content,
+                        user_id: "kenton".to_string(),
+                        memory_type: memory_type.to_string(),
+                        agent_name: None,
+                        location: format!("src/fixture_{i}.rs"),
+                        location_lines: "1-80".to_string(),
+                        metadata: json!({
+                            "calls": calls,
+                            "imports": ["std::sync::Arc", "serde_json::Value"],
+                            "edge_sources": edge_sources,
+                            "source_identity": {
+                                "path": format!("src/fixture_{i}.rs"),
+                                "blob_sha": "0123456789abcdef0123456789abcdef01234567",
+                                "generation": i,
+                            },
+                        }),
+                    },
+                )
+                .await
+                .expect("seed a heavy memory");
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn claim_and_create_answer_compactly_unless_asked_for_the_full_context() {
+        let store = store_with_heavy_memories("MyProj").await;
+        let create_reply = |args: Value| {
+            let store = store.clone();
+            async move {
+                serde_json::from_str::<Value>(&handle_task_create(args, emb(), store).await)
+                    .unwrap()
+            }
+        };
+        let created = create_reply(json!({
+            "namespace": "MyProj", "title": "compact fixture handler work"
+        }))
+        .await;
+        let created_full = create_reply(json!({
+            "namespace": "MyProj", "title": "compact fixture handler work", "compact": false
+        }))
+        .await;
+        assert_eq!(created["auto_retrieved_context"]["compact"], json!(true));
+        assert!(created_full["auto_retrieved_context"]
+            .get("compact")
+            .is_none());
+
+        let id = created["id"].as_str().unwrap().to_string();
+        let claim = |compact: Option<bool>, session: &'static str| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let mut args = json!({
+                    "namespace": "MyProj", "id": id, "assignee": "agent", "session_id": session
+                });
+                if let Some(c) = compact {
+                    args["compact"] = json!(c);
+                }
+                serde_json::from_str::<Value>(&handle_task_claim(args, store).await).unwrap()
+            }
+        };
+        let release = || {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                handle_task_update(
+                    json!({ "namespace": "MyProj", "id": id, "status": "open" }),
+                    emb(),
+                    store,
+                )
+                .await
+            }
+        };
+        let compact = claim(None, "s-compact").await;
+        release().await;
+        let full = claim(Some(false), "s-full").await;
+
+        assert_eq!(compact["claimed"], json!(true));
+        assert_eq!(full["claimed"], json!(true));
+        let ctx = &compact["auto_retrieved_context"];
+        assert_eq!(ctx["compact"], json!(true), "compact is the default");
+        assert!(full["auto_retrieved_context"].get("compact").is_none());
+        let items = ctx["items"].as_array().unwrap();
+        assert!(!items.is_empty(), "the fixture memories are retrieved");
+        for row in items {
+            assert!(
+                row.get("metadata").is_none() && row.get("calls").is_none(),
+                "{row}"
+            );
+        }
+        assert!(
+            full["auto_retrieved_context"]["items"][0]
+                .get("metadata")
+                .is_some(),
+            "compact:false keeps each memory's metadata"
+        );
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v["auto_retrieved_context"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| *k != "compact")
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&compact), keys(&full));
+        assert_eq!(
+            compact["subagent_prompt_injection"], full["subagent_prompt_injection"],
+            "the prompt block does not depend on compact"
+        );
+        assert_eq!(
+            created["subagent_prompt_injection"],
+            created_full["subagent_prompt_injection"]
+                .as_str()
+                .map(|s| s.replace(
+                    created_full["id"].as_str().unwrap(),
+                    created["id"].as_str().unwrap()
+                ))
+                .map(Value::String)
+                .unwrap(),
+            "create returns the same prompt block either way"
+        );
+
+        let size = |v: &Value| serde_json::to_string(v).unwrap().len();
+        eprintln!(
+            "MEASURED claim reply bytes: compact={} full={}; create reply bytes: compact={} full={}",
+            size(&compact),
+            size(&full),
+            size(&created),
+            size(&created_full)
+        );
+        assert!(
+            size(&compact) * 2 < size(&full),
+            "compact is well under half the full reply"
+        );
     }
 
     async fn status_of(store: &Arc<dyn VectorStore>, namespace: &str, id: &str) -> Status {
