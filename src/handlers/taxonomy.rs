@@ -12,6 +12,61 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 
+/// `/taxonomy` hands us caller-controlled JSON. Bound its shape before serde
+/// maps it onto `TaxonomyRequest` so a deep or huge request cannot drive
+/// unbounded allocation in deserialization (CodeQL rust/unsafe-deserialization).
+const MAX_TAXONOMY_ARG_BYTES: usize = 1024 * 1024;
+const MAX_TAXONOMY_FIELDS: usize = 128;
+const MAX_TAXONOMY_ITEMS: usize = 4096;
+const MAX_TAXONOMY_STRING_CHARS: usize = 64 * 1024;
+const MAX_TAXONOMY_NESTING_DEPTH: usize = 16;
+const MAX_TAXONOMY_KEY_CHARS: usize = 256;
+
+fn bounded_taxonomy_value(value: &Value, depth: usize) -> Result<Value, String> {
+    if depth > MAX_TAXONOMY_NESTING_DEPTH {
+        return Err("taxonomy arguments are nested too deeply".to_string());
+    }
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(value.clone()),
+        Value::String(s) if s.chars().count() <= MAX_TAXONOMY_STRING_CHARS => {
+            Ok(Value::String(s.clone()))
+        }
+        Value::String(_) => Err("taxonomy string field exceeds its length limit".to_string()),
+        Value::Array(items) if items.len() <= MAX_TAXONOMY_ITEMS => Ok(Value::Array(
+            items
+                .iter()
+                .map(|item| bounded_taxonomy_value(item, depth + 1))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        Value::Array(_) => Err("taxonomy array field exceeds its length limit".to_string()),
+        Value::Object(map) if map.len() <= MAX_TAXONOMY_FIELDS => {
+            let mut bounded = serde_json::Map::with_capacity(map.len());
+            for (key, val) in map {
+                if key.chars().count() > MAX_TAXONOMY_KEY_CHARS {
+                    return Err("taxonomy field name exceeds its length limit".to_string());
+                }
+                bounded.insert(key.clone(), bounded_taxonomy_value(val, depth + 1)?);
+            }
+            Ok(Value::Object(bounded))
+        }
+        Value::Object(_) => Err("taxonomy object has too many fields".to_string()),
+    }
+}
+
+/// Validate before deserializing. Unknown keys are kept (the handler ignores
+/// them with a debug note) so existing callers keep working.
+fn validated_taxonomy_arguments(arguments: &Value) -> Result<Value, String> {
+    if !arguments.is_object() {
+        return Err("taxonomy arguments must be a JSON object".to_string());
+    }
+    let bounded = bounded_taxonomy_value(arguments, 0)?;
+    let encoded = serde_json::to_string(&bounded).map_err(|e| e.to_string())?;
+    if encoded.len() > MAX_TAXONOMY_ARG_BYTES {
+        return Err("taxonomy arguments exceed the size limit".to_string());
+    }
+    Ok(bounded)
+}
+
 /// Synchronously tee a taxonomy mutation pulse into the project's durable
 /// SynapticMesh outbox when running in CLI fallback mode (`bus == None`).
 pub async fn tee_taxonomy_pulse_to_project_outbox(
@@ -89,7 +144,17 @@ pub async fn handle_taxonomy_with_auth_and_bus(
         .to_string();
     };
 
-    let mut req: TaxonomyRequest = match serde_json::from_value(arguments.clone()) {
+    let validated_arguments = match validated_taxonomy_arguments(arguments) {
+        Ok(v) => v,
+        Err(e) => {
+            return json!({
+                "ok": false,
+                "error": format!("invalid taxonomy request payload: {e}")
+            })
+            .to_string();
+        }
+    };
+    let mut req: TaxonomyRequest = match serde_json::from_value(validated_arguments) {
         Ok(r) => r,
         Err(e) => {
             return json!({
@@ -202,5 +267,54 @@ pub async fn handle_taxonomy_with_auth_and_bus(
             "error": err,
         })
         .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn taxonomy_arguments_are_bounded_before_deserialization() {
+        let mut deep = json!(1);
+        for _ in 0..(MAX_TAXONOMY_NESTING_DEPTH + 1) {
+            deep = json!([deep]);
+        }
+        assert!(validated_taxonomy_arguments(&json!({
+            "operation": "briefing",
+            "query": deep,
+        }))
+        .is_err());
+
+        assert!(validated_taxonomy_arguments(&json!({
+            "operation": "briefing",
+            "query": "x".repeat(MAX_TAXONOMY_STRING_CHARS + 1),
+        }))
+        .is_err());
+
+        let too_many: Vec<String> = (0..MAX_TAXONOMY_ITEMS + 1).map(|i| i.to_string()).collect();
+        assert!(validated_taxonomy_arguments(&json!({
+            "operation": "gaps",
+            "slugs": too_many,
+        }))
+        .is_err());
+
+        assert!(validated_taxonomy_arguments(&json!("not an object")).is_err());
+    }
+
+    #[test]
+    fn valid_taxonomy_arguments_survive_the_gate() {
+        let payload = json!({
+            "operation": "upsert_concept",
+            "namespace": "example",
+            "slug": "concept-a",
+            "definition": "A concept",
+            "aliases": ["alias"],
+            "unrecognised": "ignored as before",
+        });
+        let bounded = validated_taxonomy_arguments(&payload).unwrap();
+        let req: TaxonomyRequest = serde_json::from_value(bounded).unwrap();
+        assert_eq!(req.operation, "upsert_concept");
+        assert_eq!(req.aliases, Some(vec!["alias".to_string()]));
     }
 }
