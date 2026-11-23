@@ -2303,21 +2303,34 @@ fn store_path_present(db_path: &std::path::Path) -> bool {
 /// them mints a bare `ladybug.db` with no birth record, which the next
 /// interactive command reads as "has data" and voids the pending setup-time
 /// model choice without ever offering it (issue #390).
+///
+/// Classification is per variant, never per command family: `insights
+/// define/remove` and `taxonomy set-thesis/upsert-concept` mutate the store,
+/// so treating the whole `Insights`/`Taxonomy` arm as a read silently reports
+/// success without applying them. `export-graph` only writes an output file,
+/// so it belongs in the no-open fallback alongside the other reads.
 fn fallback_read_only_command(cmd: &Commands) -> bool {
-    matches!(
-        cmd,
+    match cmd {
+        Commands::Insights { action, .. } => {
+            let action = action.trim().to_ascii_lowercase();
+            matches!(action.as_str(), "snapshot" | "series")
+        }
+        Commands::Taxonomy { taxonomy } => !matches!(
+            taxonomy,
+            TaxonomyCommands::SetThesis { .. } | TaxonomyCommands::UpsertConcept { .. }
+        ),
         Commands::Chat { .. }
-            | Commands::Metrics { .. }
-            | Commands::Graphql { .. }
-            | Commands::ObjectView { .. }
-            | Commands::Locate { .. }
-            | Commands::DiffTour { .. }
-            | Commands::Insights { .. }
-            | Commands::Taxonomy { .. }
-            | Commands::Doctor { .. }
-            | Commands::Namespaces
-            | Commands::List { .. }
-    )
+        | Commands::Metrics { .. }
+        | Commands::Graphql { .. }
+        | Commands::ObjectView { .. }
+        | Commands::Locate { .. }
+        | Commands::DiffTour { .. }
+        | Commands::ExportGraph { .. }
+        | Commands::Doctor { .. }
+        | Commands::Namespaces
+        | Commands::List { .. } => true,
+        _ => false,
+    }
 }
 
 /// Whether some process holds the daemon lock right now.
@@ -3631,6 +3644,56 @@ mod tests {
         // A command that writes must still be allowed to open (and create)
         // the store; only read/report arms take the #390 guard.
         assert!(!fallback_read_only_command(&Commands::Status));
+    }
+
+    #[test]
+    fn fallback_read_only_command_splits_insights_taxonomy_and_export_variants() {
+        let parsed = |argv: &[&str]| -> Commands {
+            let cli = Cli::try_parse_from(argv).expect("valid CLI surface");
+            cli.command.expect("a command")
+        };
+
+        // Read arms: no store is minted, so a fresh install answers without
+        // creating a bare ladybug.db (#390). export-graph only writes a file.
+        for argv in [
+            &["neurostrata-mcp", "insights", "ns"][..],
+            &["neurostrata-mcp", "insights", "ns", "series"][..],
+            &["neurostrata-mcp", "taxonomy", "tree", "ns"][..],
+            &["neurostrata-mcp", "taxonomy", "briefing", "ns"][..],
+            &[
+                "neurostrata-mcp",
+                "taxonomy",
+                "compare",
+                "ns",
+                "--slugs",
+                "a,b",
+            ][..],
+            &["neurostrata-mcp", "taxonomy", "gaps", "ns"][..],
+            &["neurostrata-mcp", "taxonomy", "advise", "ns"][..],
+            &["neurostrata-mcp", "export-graph"][..],
+        ] {
+            let cmd = parsed(argv);
+            assert!(
+                fallback_read_only_command(&cmd),
+                "expected read-only fallback for {argv:?}"
+            );
+        }
+
+        // Write arms must open (and, on a fresh path, create) the store so the
+        // mutation is applied. A false "read" answer claims success without
+        // doing the work.
+        for argv in [
+            &["neurostrata-mcp", "insights", "ns", "define"][..],
+            &["neurostrata-mcp", "insights", "ns", "remove"][..],
+            &["neurostrata-mcp", "taxonomy", "set-thesis", "ns"][..],
+            &["neurostrata-mcp", "taxonomy", "upsert-concept", "ns"][..],
+        ] {
+            let cmd = parsed(argv);
+            assert!(
+                !fallback_read_only_command(&cmd),
+                "expected write fallback for {argv:?}"
+            );
+        }
     }
 
     #[tokio::test]

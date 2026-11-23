@@ -1969,19 +1969,24 @@ const MAX_MCP_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
 ///
 /// `from_value::<JsonRpcRequest>` trusts the object's fields and allocates a
 /// `String` for `jsonrpc` and `method` and a `Value` for `params`. Checking the
-/// envelope first -- object only, exact version, known keys, bounded method
-/// and id, object/array params within a byte budget -- rejects hostile shapes
-/// before any of those allocations happen. Pure and side-effect free so it is
+/// envelope first -- object only, exact version, bounded method and id,
+/// object/array params within a byte budget -- rejects hostile shapes before
+/// any of those allocations happen. Pure and side-effect free so it is
 /// unit-testable without a running daemon.
+///
+/// JSON-RPC 2.0 permits additional request-object members; the typed request
+/// ignores unknown keys, so they must not turn a valid call into Invalid
+/// Request. Every value still stays under the envelope byte budget, and the
+/// whole body is capped again at the HTTP boundary.
 fn valid_mcp_envelope(value: &serde_json::Value) -> bool {
     let Some(envelope) = value.as_object() else {
         return false;
     };
-    if envelope.len() > 4
-        || envelope
-            .keys()
-            .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "method" | "params"))
-    {
+    if envelope.values().any(|member| {
+        serde_json::to_string(member)
+            .map(|encoded| encoded.len() > MAX_MCP_ENVELOPE_BYTES)
+            .unwrap_or(true)
+    }) {
         return false;
     }
     if envelope.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
@@ -2627,6 +2632,25 @@ mod tests {
     }
 
     #[test]
+    fn mcp_envelope_validation_accepts_json_rpc_extension_members() {
+        // JSON-RPC 2.0 allows additional request-object members; serde ignores
+        // them, so a valid request carrying one must not be refused.
+        let with_extension = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": { "name": "x" },
+            "_meta": { "trace": "abc" },
+            "clientInfo": { "name": "probe", "version": "1" }
+        });
+        assert!(super::valid_mcp_envelope(&with_extension));
+        // Extensions are ignored before deserialization too: the typed request
+        // has no deny_unknown_fields, so extra members must not break it.
+        serde_json::from_value::<crate::server::JsonRpcRequest>(with_extension)
+            .expect("extension members are ignored by the typed request");
+    }
+
+    #[test]
     fn mcp_envelope_validation_rejects_hostile_shapes_before_deserialization() {
         let bad = [
             serde_json::json!([]),
@@ -2634,7 +2658,6 @@ mod tests {
             serde_json::json!({"jsonrpc": "1.0", "method": "tools/list"}),
             serde_json::json!({"jsonrpc": "2.0"}),
             serde_json::json!({"jsonrpc": "2.0", "method": ""}),
-            serde_json::json!({"jsonrpc": "2.0", "method": "tools/list", "surprise": 1}),
             serde_json::json!({"jsonrpc": "2.0", "method": "tools/list", "params": "bad"}),
             serde_json::json!({"jsonrpc": "2.0", "method": "tools/list", "id": {"nested": 1}}),
             serde_json::json!({
