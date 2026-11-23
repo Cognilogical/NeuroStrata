@@ -2207,6 +2207,33 @@ fn open_daemon_lock(db_path: &std::path::Path) -> std::io::Result<std::fs::File>
         .open(path)
 }
 
+/// Takes the daemon lock if nobody holds it. `Ok(None)` means someone does: a
+/// daemon, or a CLI command working on the store. Every lock check and every
+/// holder goes through here.
+fn try_take_store_lock(db_path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = open_daemon_lock(db_path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("could not open {}: {e}", daemon_lock_path(db_path).display()),
+        )
+    })?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// The lock for a CLI command that opens the store itself, held until the
+/// guard drops, so no daemon can start while the command works. `None` when
+/// it cannot be taken; the command must not open the store then.
+fn hold_store_lock(db_path: &std::path::Path) -> Option<std::fs::File> {
+    try_take_store_lock(db_path).unwrap_or_else(|e| {
+        tracing::warn!("the store lock for {} could not be taken: {e}", db_path.display());
+        None
+    })
+}
+
 /// Held for the life of the daemon process and never dropped, so the lock goes
 /// with the process rather than with anything that runs before the database
 /// has closed.
@@ -2297,11 +2324,10 @@ const DAEMON_LOCK_RETRY: std::time::Duration = std::time::Duration::from_secs(2)
 /// Takes the daemon lock, or refuses: a second daemon would open the database
 /// while the first one is writing to it.
 fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    let file = open_daemon_lock(db_path)?;
     let deadline = std::time::Instant::now() + DAEMON_LOCK_RETRY;
     loop {
-        match file.try_lock() {
-            Ok(()) => {
+        match try_take_store_lock(db_path)? {
+            Some(file) => {
                 // Emptying the lock file drops a report that a daemon built
                 // before the exit report file may have left in it. The process
                 // id identifies this daemon: `shutdown` uses it to tell this
@@ -2311,16 +2337,15 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
                 std::fs::write(daemon_pid_path(db_path), std::process::id().to_string())?;
                 return Ok(file);
             }
-            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+            None if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(std::fs::TryLockError::WouldBlock) => {
+            None => {
                 return Err(anyhow::anyhow!(
-                    "Another NeuroStrata daemon is already running against {:?}.",
+                    "Another NeuroStrata daemon, or a CLI command working on the store, holds {:?}.",
                     db_path
                 ))
             }
-            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
     }
 }
@@ -2394,12 +2419,12 @@ fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     let outcome = match std::fs::metadata(daemon_lock_path(db_path)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
         Err(e) => Err(e),
-        Ok(_) => open_daemon_lock(db_path).map(|file| file.try_lock()),
+        Ok(_) => try_take_store_lock(db_path),
     };
     match outcome {
-        Ok(Ok(())) => false,
-        Ok(Err(std::fs::TryLockError::WouldBlock)) => true,
-        Ok(Err(std::fs::TryLockError::Error(e))) | Err(e) => {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
+        Err(e) => {
             tracing::warn!(
                 "daemon_holds_lock probe failed for {}, treating the lock as held: {e}",
                 db_path.display()
@@ -2426,18 +2451,10 @@ fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
 /// A lock that cannot be taken is not evidence that the store is free, so
 /// the failure is closed: the caller refuses instead of copying.
 fn hold_store_lock_for_copy(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    let lock_path = daemon_lock_path(db_path);
-    let file = open_daemon_lock(db_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Refusing the uncoordinated file copy: the store lock could not be taken (could not open {}: {}), so it cannot be shown that no daemon holds the store. Take a coordinated backup with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` first.",
-            lock_path.display(),
-            e
-        )
-    })?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::anyhow!("{}", NO_OPEN_LOCK_HELD_MESSAGE)),
-        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::anyhow!(
+    match try_take_store_lock(db_path) {
+        Ok(Some(file)) => Ok(file),
+        Ok(None) => Err(anyhow::anyhow!("{}", NO_OPEN_LOCK_HELD_MESSAGE)),
+        Err(e) => Err(anyhow::anyhow!(
             "Refusing the uncoordinated file copy: the store lock could not be taken ({}), so it cannot be shown that no daemon holds the store. Take a coordinated backup with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` first.",
             e
         )),
@@ -2499,22 +2516,10 @@ async fn open_cli_read_store(probe: DaemonProbe) -> Result<CliReadStore, String>
     // `hold_store_lock_for_copy` does: a daemon that starts after a mere probe
     // could write a log between the checks below and the open. Taking it
     // creates the empty lock file when it is missing.
-    let lock = match open_daemon_lock(&config.db_path) {
-        Ok(file) => match file.try_lock() {
-            Ok(()) => file,
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err("no daemon, store locked".to_string())
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(format!("the store lock could not be taken: {e}"))
-            }
-        },
-        Err(e) => {
-            return Err(format!(
-                "the store lock could not be opened ({}): {e}",
-                daemon_lock_path(&config.db_path).display()
-            ))
-        }
+    let lock = match try_take_store_lock(&config.db_path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Err("no daemon, store locked".to_string()),
+        Err(e) => return Err(format!("the store lock could not be taken: {e}")),
     };
     if probe == DaemonProbe::Silent {
         return Err(
@@ -4089,6 +4094,20 @@ mod tests {
         assert!(stopping.replaced_by(holder_after("4343")));
         // Stopping an older daemon: the first process id seen is a new one.
         assert!(LockHolder::Legacy.replaced_by(holder_after("4343")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cli_command_holding_the_store_keeps_the_proxy_from_starting_a_daemon() {
+        let root = std::env::temp_dir().join(format!("ns-cli-holds-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        let db_str = db.to_str().unwrap().to_string();
+
+        let command = hold_store_lock(&db).expect("a CLI command takes the lock");
+        assert!(proxy_should_wait_for_daemon(Some(&db_str)), "the proxy waits");
+        assert!(take_daemon_lock(&db).is_err(), "a daemon is refused");
+        drop(command);
+        assert!(!proxy_should_wait_for_daemon(Some(&db_str)), "free again once the command ends");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7926,9 +7945,7 @@ async fn run() -> anyhow::Result<()> {
                         // Hold the lock for the whole offline purge, as the
                         // `--no-open` copy does (#241): a probe that lets go
                         // again would let a daemon start mid-purge.
-                        let offline_lock = open_daemon_lock(&config.db_path)
-                            .ok()
-                            .filter(|file| file.try_lock().is_ok());
+                        let offline_lock = hold_store_lock(&config.db_path);
                         if offline_lock.is_none() {
                             print_learn_control(crate::learning::control::LearningControlRequest {
                                 action: crate::learning::control::LearningControlAction::Reset,
@@ -8535,7 +8552,9 @@ async fn run() -> anyhow::Result<()> {
                         match Config::from_default_path() {
                             Err(e) => Err(format!("the config could not be read: {}", e)),
                             Ok(config) => {
-                                if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                                // Held until the report is read: no daemon starts meanwhile.
+                                let store_lock = hold_store_lock(&config.db_path);
+                                if store_lock.is_none() {
                                     Err(DAEMON_BUSY_MESSAGE.to_string())
                                 } else if probe == DaemonProbe::Silent {
                                     Err("nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy in the database; not opening it".to_string())
@@ -8683,28 +8702,30 @@ async fn run() -> anyhow::Result<()> {
                             Err(e) => {
                                 eprintln!("[neurostrata:gate] the report for '{}' could not be fetched: {}", namespace, e);
                             }
-                            Ok(config)
-                                if daemon_busy(probe, daemon_holds_lock(&config.db_path))
-                                    || probe == DaemonProbe::Silent =>
-                            {
-                                eprintln!(
-                                    "[neurostrata:gate] the report for '{}' could not be fetched: {}",
-                                    namespace, DAEMON_BUSY_MESSAGE
-                                );
-                            }
-                            Ok(config) => match direct_report(&config, &namespace, None).await {
-                                Ok(report) => {
-                                    println!(
-                                        "{}",
-                                        serde_json::to_string_pretty(&report.validate_json())
-                                            .unwrap_or_else(|_| "{}".to_string())
-                                    );
-                                }
-                                Err(e) => {
+                            Ok(config) => {
+                                // Held until the report is read: no daemon starts meanwhile.
+                                let store_lock = hold_store_lock(&config.db_path);
+                                if store_lock.is_none() || probe == DaemonProbe::Silent {
                                     eprintln!(
                                         "[neurostrata:gate] the report for '{}' could not be fetched: {}",
-                                        namespace, e
+                                        namespace, DAEMON_BUSY_MESSAGE
                                     );
+                                } else {
+                                    match direct_report(&config, &namespace, None).await {
+                                        Ok(report) => {
+                                            println!(
+                                                "{}",
+                                                serde_json::to_string_pretty(&report.validate_json())
+                                                    .unwrap_or_else(|_| "{}".to_string())
+                                            );
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[neurostrata:gate] the report for '{}' could not be fetched: {}",
+                                                namespace, e
+                                            );
+                                        }
+                                    }
                                 }
                             },
                         },
@@ -8741,10 +8762,11 @@ async fn run() -> anyhow::Result<()> {
                         })?
                     } else {
                         let config = Config::from_default_path()?;
-                        if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                        // Held for the whole import: no daemon starts meanwhile.
+                        let Some(_store_lock) = hold_store_lock(&config.db_path) else {
                             eprintln!("{}", DAEMON_BUSY_MESSAGE);
                             std::process::exit(1);
-                        }
+                        };
                         let embedder = build_embedder()?;
                         let vector_store: Arc<dyn VectorStore> = Arc::new(
                             LadybugStore::new(
@@ -9521,10 +9543,11 @@ async fn run() -> anyhow::Result<()> {
                 }
 
                 let config = Config::from_default_path()?;
-                if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                // Held for the whole command: no daemon starts meanwhile.
+                let Some(_store_lock) = hold_store_lock(&config.db_path) else {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
-                }
+                };
                 let concrete_store: Arc<LadybugStore> = match LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
                     embed::configured_dimensions()?,
