@@ -1029,10 +1029,11 @@ impl NamespaceRoots {
 /// 1. a harness config (the first in the fixed order), read from the first
 ///    of `dir`'s checkout, its main checkout, or (outside git) `dir` itself
 ///    that has any;
-/// 2. `env_namespace` (`NEUROSTRATA_NAMESPACE`), when usable;
-/// 3. the `namespace` field of the graph-lookup ledger
+/// 2. a project marker (`.NeuroStrata/config.json`), from the same roots;
+/// 3. `env_namespace` (`NEUROSTRATA_NAMESPACE`), when usable;
+/// 4. the `namespace` field of the graph-lookup ledger
 ///    (`.NeuroStrata/session_queries.json`), the main checkout's then `dir`'s;
-/// 4. the main checkout's folder name; outside git, `dir`'s folder name, when
+/// 5. the main checkout's folder name; outside git, `dir`'s folder name, when
 ///    it is a usable namespace.
 ///
 /// A marker or harness config that exists but cannot be read is an error,
@@ -1064,6 +1065,22 @@ fn resolve_namespace_from(
     };
     if let Some((_, ns)) = configs.first() {
         return Ok(resolved(ns.clone(), NamespaceSource::HarnessConfig));
+    }
+    // The project marker is an explicit answer too: a project can name its
+    // namespace in `.NeuroStrata/config.json` without any harness config.
+    for root in roots.config_order() {
+        let marker = root.join(".NeuroStrata").join("config.json");
+        if let Some(ns) = std::fs::read_to_string(marker)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|v| {
+                v.get("namespace")
+                    .and_then(Value::as_str)
+                    .and_then(usable_namespace)
+            })
+        {
+            return Ok(resolved(ns, NamespaceSource::Marker));
+        }
     }
     if let Some(ns) = env_namespace.and_then(usable_env_namespace) {
         return Ok(resolved(ns, NamespaceSource::Env));
@@ -1671,11 +1688,44 @@ fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    // PID alone lets two in-process refreshes derive the same temp path.
+    // A process-wide sequence plus create_new makes a planted symlink and a
+    // racing refresh both fail loudly instead of following/clobbering it.
+    let tmp = path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        ATOMIC_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    write_staged_atomically(&tmp, path, contents)
+}
+
+/// The security-relevant core of [`write_atomically`], with the staged path
+/// supplied by the caller so a symlink planted at that exact path can be
+/// exercised deterministically. Production callers get a unique staged name
+/// from [`write_atomically`]; both routes share this single implementation.
+fn write_staged_atomically(staged: &Path, path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let written = (|| -> std::io::Result<()> {
+        let mut file = options.open(staged)?;
+        std::io::Write::write_all(&mut file, contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        // A refresh must never widen an existing config's access: it carries
+        // tokens and namespace metadata other local users must not read.
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode();
+            std::fs::set_permissions(staged, std::fs::Permissions::from_mode(mode))?;
+        }
+        std::fs::rename(staged, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(staged);
+    }
+    written
 }
 
 fn wire_harness_config(
@@ -1808,10 +1858,11 @@ fn wire_harness_config(
                     write_doc = true;
                 }
                 if write_doc {
+                    let mut may_add = false;
                     if let Some(obj) = doc.as_object_mut() {
                         let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
                         if let Some(h_obj) = hooks.as_object_mut() {
-                            let may_add = repair_claude_hooks(
+                            may_add = repair_claude_hooks(
                                 h_obj,
                                 namespace,
                                 abs_runner,
@@ -1878,6 +1929,24 @@ fn wire_harness_config(
                                         entry["matcher"] = json!(CLAUDE_PRE_TOOL_USE_MATCHER);
                                     }
                                 }
+                            }
+                        }
+                    }
+                    // A caller that already resolved the namespace (get_snapshot,
+                    // hook_hygiene_with_namespace) leaves an explicit answer in the
+                    // settings' env block; hook commands stay plain. Reading back the
+                    // plugin config keeps this consistent with an older install's
+                    // baked namespace and adds nothing when that write failed.
+                    if may_add {
+                        if let (Some(persisted), Some(obj)) =
+                            (claude_config_namespace(project_root), doc.as_object_mut())
+                        {
+                            let env = obj.entry("env".to_string()).or_insert_with(|| json!({}));
+                            if let Some(env_obj) = env.as_object_mut() {
+                                env_obj.insert(
+                                    "NEUROSTRATA_NAMESPACE".to_string(),
+                                    Value::String(persisted),
+                                );
                             }
                         }
                     }
@@ -3792,6 +3861,84 @@ mod tests {
             snippet.contains("memories_for_file"),
             "snippet must still direct to memories_for_file"
         );
+    }
+
+    /// A staged path must never be used as a symlink hop: a write into a
+    /// symlink placed there would overwrite the link's target and then rename
+    /// the link itself into place.
+    #[test]
+    #[cfg(unix)]
+    fn write_atomically_refuses_a_symlink_at_the_temp_path() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap();
+        let target = dir.join("config.json");
+        let victim = dir.join("victim.json");
+        std::fs::write(&victim, "original").unwrap();
+        let staged = dir.join(".config.json.tmp-planted");
+        symlink(&victim, &staged).unwrap();
+
+        let result = write_staged_atomically(&staged, &target, "{\"ok\":true}");
+
+        assert!(
+            result.is_err(),
+            "an existing symlink must refuse exclusive creation"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
+        assert!(
+            !target.exists(),
+            "the symlink must not be renamed into place"
+        );
+    }
+
+    /// Concurrent config writes to the same path must not share a staged
+    /// filename: an occupied predictable path must not break a write.
+    #[test]
+    fn write_atomically_uses_a_unique_staged_name_per_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap();
+        let target = dir.join("config.json");
+        // Occupy the old PID-based staged path with a directory. A unique
+        // staged name is unaffected; a shared one cannot be opened at all.
+        let staged = dir.join(format!(".config.json.tmp-{}", std::process::id()));
+        std::fs::create_dir(&staged).unwrap();
+
+        write_atomically(&target, "{\"ok\":true}").expect("write with a fresh staged name");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"ok\":true}");
+    }
+
+    /// An atomic replacement must not widen a private config's permissions:
+    /// the staged file starts restrictive and inherits the old mode.
+    #[test]
+    #[cfg(unix)]
+    fn write_atomically_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap();
+        let target = dir.join("settings.local.json");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_atomically(&target, "new").expect("write");
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "the original mode must survive the rename");
+    }
+
+    /// A project marker that names a namespace outranks the process
+    /// environment, even when no harness config names one.
+    #[test]
+    fn project_marker_namespace_beats_environment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path())
+            .unwrap()
+            .join("example-project");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        marker_at(&dir, "from-marker");
+        let got = resolve_namespace_from(&dir, Some("from-env")).expect("resolves");
+        assert_eq!(got.namespace, "from-marker");
+        assert_eq!(got.source, NamespaceSource::Marker);
     }
 
     fn read_codex_hooks(root: &Path) -> Value {

@@ -1048,6 +1048,51 @@ mod tests {
         );
     }
 
+    /// A hook rewriting the ledger holds `<ledger>.lock`; the daemon's single
+    /// mutation path must wait for it rather than rename a stale snapshot over
+    /// a receipt the hook has not seen.
+    #[test]
+    fn mutate_session_ledger_respects_an_external_hook_lock() {
+        use fs2::FileExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".NeuroStrata/session_queries.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"namespace":"ns","queries":[],"events":[]}"#).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path.with_file_name("session_queries.json.lock"))
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+
+        let (called_tx, called_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let ledger = path.clone();
+        let writer = std::thread::spawn(move || {
+            mutate_session_ledger(&ledger, "ns", |doc| {
+                called_tx.send(()).unwrap();
+                proceed_rx.recv().unwrap();
+                append_event(doc, json!({"event_id": "from-daemon"}));
+            });
+        });
+
+        assert!(
+            called_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "the mutation must wait while the hook holds the ledger lock"
+        );
+        lock.unlock().unwrap();
+        called_rx
+            .recv()
+            .expect("mutation resumes after the hook releases");
+        proceed_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["events"][0]["event_id"], json!("from-daemon"));
+    }
+
     #[test]
     fn mutate_session_ledger_wraps_bare_array_losslessly() {
         let tmp = tempfile::tempdir().expect("tempdir");

@@ -30,6 +30,12 @@ PUSHED_NAMESPACES=$(printf '%s\n' "$PUSH_REFS" | neurostrata-mcp namespace resol
     exit 1
 }
 GATE_NAMESPACES=("$FOLDER_NAMESPACE")
+# An option-like or empty basename would change how `task gate` parses the
+# call, so it is dropped; hidden directories such as `.worktrees` are valid
+# namespaces. `--pushed` already contributes the resolved project namespace.
+if [ -z "$FOLDER_NAMESPACE" ] || [[ "$FOLDER_NAMESPACE" == -* ]]; then
+    GATE_NAMESPACES=()
+fi
 while IFS= read -r ns; do
     [ -n "$ns" ] || continue
     seen=0
@@ -38,6 +44,10 @@ while IFS= read -r ns; do
     done
     [ $seen -eq 1 ] || GATE_NAMESPACES+=("$ns")
 done <<< "$PUSHED_NAMESPACES"
+if [ ${#GATE_NAMESPACES[@]} -eq 0 ]; then
+    echo "error: no namespace could be resolved for this push — gate NOT run for this push" >&2
+    exit 1
+fi
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
 # --strict maps an unavailable database to a blocking exit too, so a 1
@@ -74,4 +84,4 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 038029282d646345927cf774a0d302a517f8ac9f16a61cd3bcf48b2f69d98d58
+# neurostrata-hook-sha256: d91ec8e46b1854cdb14a0c854bf96989a9887f510e00213c8619cbf7968720c2

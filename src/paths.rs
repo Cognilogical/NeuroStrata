@@ -2427,6 +2427,40 @@ mod tests {
         assert_eq!(main_checkout_root(&s(&wt)), Some(project.clone()));
     }
 
+    /// Unrelated files beside a separate git directory do not make its parent
+    /// a checkout: only Git's own metadata establishes ownership.
+    #[test]
+    fn unrelated_entries_do_not_make_a_parent_the_main_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let data = base.join("data");
+        let common = data.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        touch(&data.join("unrelated.txt"));
+        std::fs::write(common.join("config"), "[core]\n\tbare = false\n").unwrap();
+        let wt = base.join("agent-1");
+        link_worktree(&wt, &common.join("worktrees").join("agent-1"));
+
+        assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
+    }
+
+    /// A main checkout whose working directory holds nothing but `.git` is
+    /// still a checkout when that git directory has Git's own `HEAD` metadata.
+    #[test]
+    fn main_checkout_with_only_dot_git_and_head_is_recognized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let project = base.join("example-project");
+        let common = project.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        touch(&common.join("HEAD"));
+        std::fs::write(common.join("config"), "[core]\n\tbare = false\n").unwrap();
+        let wt = base.join("agent-1");
+        link_worktree(&wt, &common.join("worktrees").join("agent-1"));
+
+        assert_eq!(main_checkout_root(&s(&wt)), Some(project.clone()));
+    }
+
     /// `git init --separate-git-dir data/proj/.git sep` + `git worktree add`:
     /// the common directory is `data/proj/.git`, but `data/proj` is no
     /// checkout. The real main checkout `sep` is named nowhere git keeps
@@ -2751,6 +2785,24 @@ mod tests {
         assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
     }
 
+    /// A commented `bare = true` is true: a bare repo with a `.git` common dir
+    /// must not lend its parent to a linked worktree as a main checkout.
+    #[test]
+    fn commented_core_bare_true_is_still_bare() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let project = base.join("bare-project");
+        let common = project.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        touch(&project.join("unrelated.txt"));
+        std::fs::write(common.join("config"), "[core]\n\tbare = true # comment\n").unwrap();
+        let wt = base.join("wt");
+        link_worktree(&wt, &common.join("worktrees").join("wt"));
+
+        assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
+    }
+
     /// `extensions.worktreeConfig` and config includes supply the main
     /// checkout's `core.worktree` even when the literal config does not.
     #[test]
@@ -2790,6 +2842,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(main_checkout_root(&s(&wt)), Some(sep.clone()));
+    }
+
+    /// An included config's `core.bare = true` is the effective value: a
+    /// top-level `bare = false` must not make the common dir's parent a main
+    /// checkout.
+    #[test]
+    fn included_core_bare_true_overrides_the_top_level_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = canonical(tmp.path()).unwrap();
+        let project = base.join("bare-project");
+        let common = project.join(".git");
+        std::fs::create_dir_all(&common).unwrap();
+        std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        touch(&project.join("unrelated.txt"));
+        let inc = base.join("included-config");
+        std::fs::write(&inc, "[core]\n\tbare = true\n").unwrap();
+        std::fs::write(
+            common.join("config"),
+            format!(
+                "[core]\n\tbare = false\n[include]\n\tpath = {}\n",
+                s(&inc).replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let wt = base.join("wt");
+        link_worktree(&wt, &common.join("worktrees").join("wt"));
+
+        assert_eq!(main_checkout_root(&s(&wt)), Some(wt.clone()));
     }
 
     /// A checkout holding only its `.git` is still the main checkout; a
