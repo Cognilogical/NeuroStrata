@@ -92,7 +92,7 @@ fn is_within(path: &Path, root: &Path) -> bool {
         // it is not absolute, but it is still not relative to the root.
         return !path.has_root() && !path_norm.is_empty();
     }
-    if path.has_root() != root.has_root() {
+    if path.is_absolute() != root.is_absolute() {
         // A relative root does not authorize absolute paths.
         return false;
     }
@@ -6050,6 +6050,18 @@ use super::x;"#;
         assert!(is_ingest_eligible_path(
             std::path::Path::new(r"C:\repo\src\lib.rs"),
             root
+        ));
+    }
+
+    /// Review on #386: `\server\share\repo\x` (rooted, no drive) is not
+    /// under the UNC root `\\server\share\repo`, though both normalize to the
+    /// same components.
+    #[cfg(windows)]
+    #[test]
+    fn a_driveless_rooted_path_is_not_under_a_unc_root() {
+        assert!(!is_ingest_eligible_path(
+            std::path::Path::new(r"\server\share\repo\src\lib.rs"),
+            std::path::Path::new(r"\\server\share\repo"),
         ));
     }
 }

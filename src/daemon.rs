@@ -613,15 +613,20 @@ pub(crate) fn check_caller_path(
     root: &Path,
     allowlist: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    let canonical_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // Containment compares std's canonical forms, which are uniform (on
+    // Windows always `\\?\`); only the answer is simplified to `C:\...`.
+    // dunce keeps a path past MAX_PATH verbatim, so comparing dunce forms
+    // would put a long descendant outside a short root.
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let resolved = resolve_caller_path(raw)?;
+    let answer = || dunce::simplified(&resolved).to_path_buf();
     if resolved.starts_with(&canonical_root) {
-        return Ok(resolved);
+        return Ok(answer());
     }
     for entry in allowlist {
-        let canonical_entry = dunce::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
+        let canonical_entry = std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
         if resolved.starts_with(&canonical_entry) {
-            return Ok(resolved);
+            return Ok(answer());
         }
     }
     Err(format!(
@@ -652,7 +657,7 @@ fn resolve_caller_path(raw: &Path) -> Result<PathBuf, String> {
             .map(|cwd| cwd.join(raw))
             .unwrap_or_else(|_| raw.to_path_buf())
     };
-    if let Ok(canonical) = dunce::canonicalize(&absolute) {
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
         return Ok(canonical);
     }
     // Walk up to the nearest existing ancestor; the components below it
@@ -662,7 +667,7 @@ fn resolve_caller_path(raw: &Path) -> Result<PathBuf, String> {
     let mut cursor = absolute.clone();
     let mut remainder: Vec<std::ffi::OsString> = Vec::new();
     loop {
-        if let Ok(canonical) = dunce::canonicalize(&cursor) {
+        if let Ok(canonical) = std::fs::canonicalize(&cursor) {
             let mut resolved = canonical;
             for name in remainder.iter().rev() {
                 resolved.push(name);

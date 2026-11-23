@@ -179,7 +179,7 @@ impl IngestJobs {
         let canonical_dir = {
             let dir = dir.to_string();
             tokio::task::spawn_blocking(move || {
-                std::fs::canonicalize(&dir)
+                dunce::canonicalize(&dir)
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| dir)
             })

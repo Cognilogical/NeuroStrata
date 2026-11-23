@@ -638,10 +638,12 @@ fn precommit_no_longer_fabricates_ledger_rows() {
     );
 
     let ledger_path = repo.join(".NeuroStrata/session_queries.json");
-    let ledger: Value = std::fs::read_to_string(&ledger_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    // The hook creates the ledger; a hook that exits without doing its work
+    // must not pass as "no fabricated rows".
+    let ledger: Value = serde_json::from_str(
+        &std::fs::read_to_string(&ledger_path).expect("the hook writes the ledger"),
+    )
+    .expect("the ledger is JSON");
     let no_fabricated_rows = ledger
         .get("queries")
         .and_then(Value::as_array)
