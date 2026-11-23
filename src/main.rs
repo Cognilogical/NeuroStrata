@@ -2288,6 +2288,11 @@ fn proxy_should_wait_for_daemon(db_path: Option<&str>) -> bool {
 }
 
 /// Whether some process holds the daemon lock right now.
+///
+/// A lock file that exists but cannot be checked counts as held: like the
+/// `--no-open` gate (#209), "cannot show it is free" is not "free", and every
+/// caller is safer waiting or refusing than starting a second daemon or
+/// opening the store under a live one.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     // Read-only status probes must not create the lock file: open_daemon_lock
     // opens with .create(true), so an absent-but-unheld lock would be
@@ -2295,14 +2300,16 @@ fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     if !daemon_lock_path(db_path).exists() {
         return false;
     }
-    match open_daemon_lock(db_path) {
-        Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
-        Err(e) => {
+    let outcome = open_daemon_lock(db_path).map(|file| file.try_lock());
+    match outcome {
+        Ok(Ok(())) => false,
+        Ok(Err(std::fs::TryLockError::WouldBlock)) => true,
+        Ok(Err(std::fs::TryLockError::Error(e))) | Err(e) => {
             tracing::warn!(
-                "daemon_holds_lock probe failed for {}: {e}",
+                "daemon_holds_lock probe failed for {}, treating the lock as held: {e}",
                 db_path.display()
             );
-            false
+            true
         }
     }
 }
@@ -3894,10 +3901,23 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_that_cannot_be_checked_counts_as_held() {
+        let root = std::env::temp_dir().join(format!("ns-unreadable-lock-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        // A directory where the lock file belongs: it exists but cannot be locked.
+        std::fs::create_dir_all(daemon_lock_path(&db)).unwrap();
+        assert!(daemon_holds_lock(&db), "an unreadable lock is not a free one");
+        assert!(
+            proxy_should_wait_for_daemon(db.to_str()),
+            "the proxy waits instead of starting a second daemon"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_stale_lock_file_does_not_make_the_proxy_wait() {
-        let db = std::env::temp_dir()
-            .join(format!("ns-stale-lock-{}", uuid::Uuid::new_v4()))
-            .join("ladybug.db");
+        let root = std::env::temp_dir().join(format!("ns-stale-lock-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
         let db_str = db.to_str().expect("temp path is utf-8");
         assert!(!proxy_should_wait_for_daemon(Some(db_str)), "no file");
         assert!(!proxy_should_wait_for_daemon(None), "no configured path");
@@ -3913,6 +3933,7 @@ mod tests {
         let held = take_daemon_lock(&db).expect("retake the lock");
         assert!(proxy_should_wait_for_daemon(Some(db_str)), "a live holder");
         drop(held);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
