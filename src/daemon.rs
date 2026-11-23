@@ -620,12 +620,12 @@ pub(crate) fn check_caller_path(
     let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let resolved = resolve_caller_path(raw)?;
     let answer = || dunce::simplified(&resolved).to_path_buf();
-    if resolved.starts_with(&canonical_root) {
+    if canonical_contains(&canonical_root, &resolved) {
         return Ok(answer());
     }
     for entry in allowlist {
         let canonical_entry = std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
-        if resolved.starts_with(&canonical_entry) {
+        if canonical_contains(&canonical_entry, &resolved) {
             return Ok(answer());
         }
     }
@@ -637,6 +637,17 @@ pub(crate) fn check_caller_path(
         resolved.display(),
         canonical_root.display()
     ))
+}
+
+/// Containment decision for caller paths, factored out so the prefix form is
+/// explicit and testable. Both arguments must come from
+/// `std::fs::canonicalize`, which on Windows always yields the uniform
+/// `\\?\C:\...` spelling; a path past MAX_PATH and a short root then share
+/// the same prefix form. Passing a `dunce`-simplified root here would put a
+/// long, authorized descendant outside its own root (PR #386 review P2).
+/// Simplification belongs only in `check_caller_path`'s outward `answer`.
+fn canonical_contains(root: &Path, candidate: &Path) -> bool {
+    candidate.starts_with(root)
 }
 
 /// Resolve `raw` to the canonical path it names, per [`check_caller_path`].
@@ -4304,6 +4315,34 @@ mod tests {
                 "{}",
                 resolved.display()
             );
+        }
+    }
+
+    /// PR #386 review P2: `dunce` leaves a path past MAX_PATH in verbatim
+    /// `\\?\C:\...` form but simplifies a short root to `C:\...`. Comparing
+    /// those two spellings would refuse an in-root directory with 403 and
+    /// skip its watch registration. Containment must see both in the uniform
+    /// canonical form; only the outward-facing path may be simplified.
+    #[test]
+    fn containment_compares_canonical_prefix_before_outward_simplification() {
+        let canonical_root = std::path::Path::new(r"\\?\C:\root");
+        let long_descendant = canonical_root
+            .join("a")
+            .join("very")
+            .join("long")
+            .join("descendant");
+
+        // Both canonical: the long descendant is inside the short root.
+        assert!(canonical_contains(canonical_root, &long_descendant));
+
+        // On non-Windows hosts the simplified spelling is a different path
+        // component, modeling the mismatch that caused the 403. Windows
+        // already exercises the real verbatim prefix through the assertion
+        // above; prefix-variant equality there is std's business.
+        #[cfg(not(windows))]
+        {
+            let simplified_root = std::path::Path::new(r"C:\root");
+            assert!(!canonical_contains(simplified_root, &long_descendant));
         }
     }
 
