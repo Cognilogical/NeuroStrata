@@ -194,7 +194,24 @@ Prints the namespace configured for a project. Order: the `namespace` of the pro
 `hooks install`, `get_snapshot`'s hook refresh and the daemon's startup install refresh the harness plugin files. Apart from `hooks install`'s `--namespace` or marker namespace (above), they write a namespace into a harness config only when it came from a harness config or, for `hooks install` and the CLI, `NEUROSTRATA_NAMESPACE` (the daemon does not read its own environment: one daemon serves every project); a ledger or folder-name answer is never written there. Each config keeps a usable namespace it already names, a config that cannot be read is left as it is, and a config with no namespace to write is not written. Config files are written through a temporary file and a rename. When the project marker cannot be read, `hooks install` and `get_snapshot`'s refresh write no new namespace into any config and say so; the daemon's startup install logs one warning naming the file and keeps each config's own namespace.
 ```bash
 neurostrata-mcp namespace resolve [dir]
+neurostrata-mcp namespace resolve --pushed [dir]
 ```
+With `--pushed` it reads the pre-push hook's stdin (`<local ref> <local sha> <remote ref> <remote sha>` lines) and prints, one per line, every namespace the push must pass the task gate for: the checkout's folder name, the resolved namespace, the namespace of the marker over each path the pushed commits change, read from the pushed commit, and the namespace a marker the push deletes or changes named at the remote tip. It exits 1 on an unreadable marker on a pushed path, on a stdin line it cannot read, or when a committed and an untracked marker disagree.
+
+### `root show`, `root set` & `root audit`
+Read and write the project marker `.NeuroStrata/config.json` (see [Project root](ops/project-root.md)).
+
+```bash
+neurostrata-mcp root show [dir]
+neurostrata-mcp root audit [dir] [--namespace <ns>] [--for-root <path>] [--json]
+neurostrata-mcp root set <dir> --namespace <ns> [--source-id <id>] [--replace] [--force]
+```
+
+- `root show` (read-only): the marker that applies to `dir` (default: the current folder) and how it was found, its namespace and `source_id`, whether git tracks it (`unknown` when git fails), the cached root, other markers below the marker root (in a linked worktree also those only in the main checkout, labeled), and project-context bindings to missing folders (`unknown` when the user config cannot be read). It notes a `.NeuroStrata` folder spelled in another letter case, which is not a marker. It starts no daemon; with no daemon it takes the store lock and holds it while it reads the store.
+- `root audit` (read-only): memories whose stored paths are absolute inside the root, each with the `neurostrata_supersede_memory` call that fixes it, and paths that need a decision. `--for-root <path>` spells the corrections relative to a planned new root (relative keys of the current root included), so `root set <path>` passes after they are applied. Exits 0 when nothing is fixable, else 1. A user config that cannot be read or parsed is an error; a missing one means no project-context bindings.
+- `root set`: writes the marker (in the main checkout for a linked worktree) and sets the cached root; the command writes every file itself, and a running daemon only updates the cached root (with none, the store is opened directly). Refuses a root change that would stop memories matching unless `--force` (for an unrelated new root: keys whose file exists under the old root but not the new one); refuses another namespace's marker in `<dir>` or a second marker for the namespace in the checkout unless `--replace`; binds `--source-id` only when it is unbound or bound to a missing folder.
+
+The marker is strict JSON: `version` 1, `namespace`, and optionally `source_id` (a string, not `null`); `src/schemas/root-config.schema.json` documents it. A new marker is published with a hard link, so the filesystem must support hard links (exFAT and FAT do not). The home folder, a filesystem or drive root, and a folder outside git with a checkout below it may not hold a marker; that last check looks four levels down and skips `node_modules` and `target`.
 
 ### `root show`, `root set` & `root audit`
 Read and write the project marker `.NeuroStrata/config.json` (see [Project root](ops/project-root.md)).

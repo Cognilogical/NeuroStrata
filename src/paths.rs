@@ -609,7 +609,8 @@ pub enum RootSource {
     Marker,
     /// The root of the project marker (`.NeuroStrata/config.json`) for the
     /// call's namespace, when it is also the namespace's cached root
-    /// ([`with_marker_spelling`]).
+    /// ([`with_marker_spelling`]), matched when its namespace matches the
+    /// caller's.
     RootConfig,
     /// Absolute, but under no root this namespace knows: left unchanged.
     Outside,
@@ -621,6 +622,7 @@ impl RootSource {
             RootSource::Relative => "relative",
             RootSource::ProjectRoot => "project_root",
             RootSource::RegistryRoot => "registry_root",
+            RootSource::RootConfig => "root_config",
             RootSource::Marker => "marker",
             RootSource::RootConfig => "root_config",
             RootSource::Outside => "outside",
@@ -974,8 +976,8 @@ pub fn lookup_forms(raw: &str, lookup: &LookupPath, known_root: Option<&str>) ->
         }
         RootSource::ProjectRoot
         | RootSource::RegistryRoot
-        | RootSource::Marker
-        | RootSource::RootConfig => {
+        | RootSource::RootConfig
+        | RootSource::Marker => {
             forms.extend(lookup.alternates.iter().cloned());
         }
     }
@@ -2894,4 +2896,5 @@ mod tests {
         link_worktree(&wt2, &data_common.join("worktrees").join("wt2"));
         assert_eq!(main_checkout_root(&s(&wt2)), Some(wt2.clone()));
     }
+
 }

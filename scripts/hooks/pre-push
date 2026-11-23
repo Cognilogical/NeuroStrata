@@ -14,16 +14,48 @@ if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     exit 0
 fi
 
-# The namespace configured for this project, resolved in one place
-# (`neurostrata-mcp namespace resolve`); a failed lookup blocks the push.
-# The folder name, the namespace this gate checked before, is gated too.
-NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo "error: neurostrata-mcp namespace resolve failed — gate NOT run for this push (an older neurostrata-mcp without the namespace resolve command is a likely cause: upgrade it)" >&2; exit 1; }
+# The namespaces this push must pass the gate for, worked out in one call
+# from the refs git hands this hook on stdin: the folder name (the namespace
+# this gate always checked), the namespace configured for this project, and
+# the namespace of every path the pushed commits change (`neurostrata-mcp
+# namespace resolve --pushed`). A failed call blocks the push.
+# Check cat's status: a read error after a complete prefix (or before any
+# input) must block, not gate on a partial set of refs.
+if ! PUSH_REFS=$(cat); then
+    echo "error: could not read the refs git passed to this hook — gate NOT run for this push" >&2
+    exit 1
+fi
 FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
-GATE_NAMESPACES=("$NAMESPACE")
-# Only a namespace-shaped basename is safe to pass to `task gate`: an
-# option-like or invalid name would change how the CLI parses the call.
-if [[ "$FOLDER_NAMESPACE" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]*$ ]] && [ "$FOLDER_NAMESPACE" != "$NAMESPACE" ]; then
-    GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
+PUSHED_NAMESPACES=$(printf '%s\n' "$PUSH_REFS" | neurostrata-mcp namespace resolve --pushed) || {
+    if neurostrata-mcp namespace resolve --help 2>/dev/null | grep -q -- '--pushed'; then
+        echo "error: neurostrata-mcp namespace resolve --pushed failed — gate NOT run for this push" >&2
+    else
+        echo "error: neurostrata-mcp namespace resolve --pushed failed — gate NOT run for this push (neurostrata-mcp is too old for this hook; upgrade it)" >&2
+    fi
+    exit 1
+}
+GATE_NAMESPACES=("$FOLDER_NAMESPACE")
+# An option-like or empty basename would change how `task gate` parses the
+# call, so it is dropped; hidden directories such as `.worktrees` are valid
+# namespaces. `--pushed` already contributes the resolved project namespace.
+if [ -z "$FOLDER_NAMESPACE" ] || [[ "$FOLDER_NAMESPACE" == -* ]]; then
+    GATE_NAMESPACES=()
+fi
+while IFS= read -r ns; do
+    [ -n "$ns" ] || continue
+    # An option-like name would be parsed as a `task gate` option, blocking
+    # the push; it is never a valid namespace. Drop it here too, so a value
+    # emitted by an older --pushed cannot reach the gate.
+    [[ "$ns" == -* ]] && continue
+    seen=0
+    for g in "${GATE_NAMESPACES[@]}"; do
+        [ "$g" = "$ns" ] && seen=1
+    done
+    [ $seen -eq 1 ] || GATE_NAMESPACES+=("$ns")
+done <<< "$PUSHED_NAMESPACES"
+if [ ${#GATE_NAMESPACES[@]} -eq 0 ]; then
+    echo "error: no namespace could be resolved for this push — gate NOT run for this push" >&2
+    exit 1
 fi
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
@@ -61,4 +93,4 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 64205469189211752148cb6897d3deac0d42e1bc2c9188da06bcc8ef2d2202c4
+# neurostrata-hook-sha256: e959754763e6e392d7ba87078c4b2bad18f9110daec0b2684c3e194088c65f5c

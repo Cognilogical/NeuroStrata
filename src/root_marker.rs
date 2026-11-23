@@ -136,7 +136,15 @@ pub fn read_marker(dir: &Path) -> MarkerRead {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return MarkerRead::Absent,
         Err(err) => return unreadable(err.to_string()),
     };
-    let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+    parse_marker_bytes(&path, &bytes)
+}
+
+/// Applies [`read_marker`]'s rules (BOM accepted; bad JSON, an unknown
+/// `version` or a bad `namespace` is `Unreadable`) to a marker's bytes read
+/// from anywhere, such as a commit. `path` only names the file in the answer.
+pub fn parse_marker_bytes(path: &Path, bytes: &[u8]) -> MarkerRead {
+    let unreadable = |reason: String| MarkerRead::Unreadable { path: path.to_path_buf(), reason };
+    let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let cfg: RootConfig = match serde_json::from_slice(body) {
         Ok(cfg) => cfg,
         Err(err) => return unreadable(format!("not a valid root config: {err}")),

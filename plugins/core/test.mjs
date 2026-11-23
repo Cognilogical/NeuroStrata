@@ -8,7 +8,8 @@ import {
   rmSync,
   mkdtempSync,
   existsSync,
-  copyFileSync
+  copyFileSync,
+  symlinkSync
 } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join, isAbsolute, resolve, dirname } from 'node:path'

@@ -273,7 +273,19 @@ pub fn node_id_for(root: &Path, path: &Path) -> String {
     // the same shape a rule names when it says "src/lib.rs" -- rather than the
     // lib.rs that stripping the ingest root would leave.
     let relative = if path.is_relative() {
-        path.to_path_buf()
+        if root.is_absolute() {
+            // A relative walk under a marker-pinned root: the root is the
+            // marker's absolute folder, the path the walk's relative spelling.
+            // Resolve the path through the working directory so the key is
+            // relative to the marker root, which is where lookups start.
+            let absolute = std::env::current_dir().unwrap_or_default().join(path);
+            absolute
+                .strip_prefix(root)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|_| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        }
     } else {
         // Absolute: relative to the root being ingested. This used to try the
         // process's working directory first, which made an id depend on where
@@ -1378,6 +1390,52 @@ fn replay_processed_entry(
     Ok(())
 }
 
+/// Folder the stored node keys are relative to. A marker pinning an ancestor
+/// of the walk root can supply that root, but only when it is the namespace's
+/// cached root: `server::marker_use` applies marker spelling to lookups only
+/// in that case, so a marker root that differs from the cached one would make
+/// every key unreachable. Marker discovery needs an absolute path (relative
+/// paths find no marker), while the returned root stays in the walk's own
+/// spelling so a relative walk keeps producing relative keys.
+fn key_root_for_ingest(
+    dir_path: &Path,
+    namespace: &str,
+    cached_root: Option<&str>,
+) -> std::path::PathBuf {
+    let absolute = if dir_path.is_absolute() {
+        dir_path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(dir_path)
+    };
+    match crate::root_marker::find_root_marker(&absolute) {
+        Ok(Some(found))
+            if found.config.namespace.eq_ignore_ascii_case(namespace)
+                && crate::paths::marker_root_is_cached_root(&found, cached_root) =>
+        {
+            // `marker_dir()` maps a linked worktree back to the main checkout,
+            // but the walker yields paths in the worktree's own spelling. Keep
+            // that spelling: a relative walk must strip a relative root, and
+            // an absolute one an absolute root, or the key becomes absolute.
+            let root = found.root;
+            if !absolute.starts_with(&root) {
+                return dir_path.to_path_buf();
+            }
+            if dir_path.is_absolute() {
+                root
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => match root.strip_prefix(&cwd) {
+                        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_path_buf(),
+                        _ => root,
+                    },
+                    Err(_) => root,
+                }
+            }
+        }
+        _ => dir_path.to_path_buf(),
+    }
+}
+
 /// Blocking producer: walks the directory tree, reads files, parses ASTs,
 /// and streams owned results through `tx`. Runs on the blocking thread pool
 /// so filesystem I/O never stalls the async runtime.
@@ -1391,6 +1449,7 @@ fn run_producer(
     prev_file_map: std::collections::HashMap<String, String>,
     force_reparse: bool,
     observer: Option<std::sync::Arc<dyn IngestObserver>>,
+    cached_root: Option<String>,
 ) -> anyhow::Result<(
     std::collections::HashSet<String>,
     std::collections::HashMap<String, String>,
@@ -1408,6 +1467,7 @@ fn run_producer(
         std::collections::HashMap::new();
     let mut raw_imports: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    let key_root = key_root_for_ingest(&dir_path, &namespace, cached_root.as_deref());
 
     let walker = WalkBuilder::new(&dir_path).build();
 
@@ -1450,13 +1510,13 @@ fn run_producer(
                 .to_string()
         };
 
-        let node_path = node_id_for(&dir_path, path);
+        let node_path = node_id_for(&key_root, path);
 
         let parent_id = if path == dir_path {
             None
         } else if let Some(p) = path.parent() {
-            if p == dir_path || p.strip_prefix(&dir_path).is_ok() {
-                let p_str = node_id_for(&dir_path, p);
+            if p == key_root || p.strip_prefix(&key_root).is_ok() {
+                let p_str = node_id_for(&key_root, p);
                 if p_str != "." && p_str != "" && p_str != node_path {
                     Some(p_str)
                 } else {
@@ -2128,6 +2188,9 @@ pub async fn ingest_directory(
     // blocking thread, streaming owned results through the channel.
     let prev_file_map_clone = prev_file_map.clone();
     let observer_clone = observer.clone();
+    let cached_root = crate::registry::cached_project_root(&vector_store, namespace)
+        .await
+        .unwrap_or(None);
     let producer = tokio::task::spawn_blocking(move || {
         run_producer(
             dir_path_owned,
@@ -2139,6 +2202,7 @@ pub async fn ingest_directory(
             prev_file_map_clone,
             force_reparse,
             observer_clone,
+            cached_root,
         )
     });
 
@@ -2285,6 +2349,15 @@ pub async fn ingest_directory(
                 None => continue,
             };
             if gen != prev_gen {
+                continue;
+            }
+            // A row whose path key is not one the current walk produces
+            // belongs to an older key scheme (the same file ingested from a
+            // subdirectory before a marker pinned keys to its root). The
+            // producer re-stages that file under the current key, so carrying
+            // the old id too would leave a duplicate, stale path here.
+            let key_path = tail.split('#').next().unwrap_or(&tail);
+            if !current_paths.contains(key_path) {
                 continue;
             }
             // The row's `location` is the file it came from (stamped at
@@ -3091,6 +3164,222 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&db);
+    }
+
+    /// In a linked worktree the marker folder is spelled in the worktree,
+    /// while `marker_dir()` maps it back to the main checkout. Keys must be
+    /// stripped against the walk's own spelling or they become absolute.
+    #[test]
+    fn key_root_for_linked_worktree_uses_the_worktree_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        let src_main = repo.join("src");
+        std::fs::create_dir_all(repo.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(repo.join(".git/worktrees/wt/commondir"), "../..\n").unwrap();
+        // A linked worktree's common dir counts as a checkout only with HEAD
+        // (paths::main_checkout_of_common); without it no marker is found.
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(src_main.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            src_main.join(".NeuroStrata/config.json"),
+            r#"{"version":1,"namespace":"test-ns"}"#,
+        )
+        .unwrap();
+        let wt = base.join("wt");
+        let src_wt = wt.join("src");
+        let nested_wt = src_wt.join("lib");
+        std::fs::create_dir_all(&nested_wt).unwrap();
+        std::fs::create_dir_all(src_main.join("lib")).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ../repo/.git/worktrees/wt\n").unwrap();
+
+        let pinned_wt = dunce::canonicalize(&src_wt).unwrap();
+        assert_eq!(
+            key_root_for_ingest(&nested_wt, "test-ns", Some(&pinned_wt.to_string_lossy())),
+            src_wt,
+            "a nested ingest must key from the marker folder in the worktree's own spelling"
+        );
+        // A cached root that disagrees with the marker must not move the keys
+        // onto a root path lookups do not use.
+        assert_eq!(
+            key_root_for_ingest(&nested_wt, "test-ns", Some(&repo.to_string_lossy())),
+            nested_wt,
+            "a marker that is not the cached root must not key from the marker"
+        );
+    }
+
+    /// A marker pins the repo root; ingesting only its `src/` subfolder must
+    /// still key nodes from the pinned root, or absolute lookups that start
+    /// from the cached root can never reach them.
+    #[tokio::test]
+    async fn subdirectory_ingest_keys_nodes_from_the_marked_root() {
+        let tmp = std::env::temp_dir().join(format!("ns-subdir-key-{}", uuid::Uuid::new_v4()));
+        let repo = tmp.join("repo");
+        let src = repo.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            repo.join(".NeuroStrata").join("config.json"),
+            r#"{"version":1,"namespace":"test-ns"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn x() {}\n").unwrap();
+
+        let db = tmp.join("db");
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.unwrap();
+        let pinned = dunce::canonicalize(&repo).unwrap();
+        crate::registry::cache_project_root(
+            &store,
+            Some(&(Arc::new(ZeroEmbedder) as Arc<dyn Embedder>)),
+            "test-ns",
+            &pinned.to_string_lossy(),
+        )
+        .await;
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        ingest_directory(
+            &dunce::canonicalize(&src).unwrap(),
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "test-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("ingest succeeds");
+
+        let locations: Vec<String> = store
+            .list("test-ns", None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.payload.location)
+            .collect();
+        assert!(
+            locations.iter().any(|p| p == "src/lib.rs"),
+            "expected a root-relative key, got {locations:?}"
+        );
+        assert!(
+            !locations.iter().any(|p| p == "lib.rs"),
+            "an ingest-folder-relative key is unreachable from the pinned root: {locations:?}"
+        );
+    }
+
+    /// A relative walk under an absolute marker root must key from that root,
+    /// or lookups started at the marker cannot reach the stored node.
+    #[test]
+    fn a_relative_walk_under_an_absolute_marker_root_keys_from_the_marker() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            node_id_for(&cwd, std::path::Path::new("./src/lib.rs")),
+            "src/lib.rs",
+            "the walk's relative spelling must resolve through cwd to the marker root"
+        );
+    }
+
+    /// A marker above a cached subfolder is not used for key spelling: path
+    /// lookups still start at the cached root, so keys must agree with it.
+    /// Re-ingesting after the cache moves to the marker root must not leave
+    /// the obsolete subfolder-relative keys behind (carry-forward skip).
+    #[tokio::test]
+    async fn ingest_follows_the_cached_root_and_drops_obsolete_keys_on_reingest() {
+        let tmp = std::env::temp_dir().join(format!("ns-key-scheme-{}", uuid::Uuid::new_v4()));
+        let repo = tmp.join("repo");
+        let src = repo.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".NeuroStrata")).unwrap();
+        std::fs::write(
+            repo.join(".NeuroStrata").join("config.json"),
+            r#"{"version":1,"namespace":"test-ns"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn x() {}\n").unwrap();
+
+        let db = tmp.join("db");
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        store.init("test-ns").await.unwrap();
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let embedder: Arc<dyn Embedder> = Arc::new(ZeroEmbedder);
+        let pinned_repo = dunce::canonicalize(&repo).unwrap();
+        let pinned_src = dunce::canonicalize(&src).unwrap();
+
+        // Cached root disagrees with the marker: keys must be relative to the
+        // cached subfolder, not to the marker root.
+        crate::registry::cache_project_root(
+            &store,
+            Some(&embedder),
+            "test-ns",
+            &pinned_src.to_string_lossy(),
+        )
+        .await;
+        ingest_directory(
+            &pinned_src,
+            &schema,
+            embedder.clone(),
+            store.clone(),
+            "test-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("first ingest succeeds");
+
+        let locations = || async {
+            store
+                .list("test-ns", None, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.payload.location)
+                .collect::<Vec<_>>()
+        };
+        let first = locations().await;
+        assert!(
+            first.iter().any(|p| p == "lib.rs"),
+            "mismatched cached root must key from it: {first:?}"
+        );
+        assert!(
+            !first.iter().any(|p| p == "src/lib.rs"),
+            "the marker root is not the cached root, so its spelling is not used: {first:?}"
+        );
+
+        // Move the cached root to the marker root and re-ingest unchanged
+        // files: keys become root-relative and the old keys must not linger.
+        crate::registry::cache_project_root(
+            &store,
+            Some(&embedder),
+            "test-ns",
+            &pinned_repo.to_string_lossy(),
+        )
+        .await;
+        ingest_directory(
+            &pinned_src,
+            &schema,
+            embedder.clone(),
+            store.clone(),
+            "test-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("second ingest succeeds");
+
+        let second = locations().await;
+        assert!(
+            second.iter().any(|p| p == "src/lib.rs"),
+            "now the marker root is cached: {second:?}"
+        );
+        assert!(
+            !second.iter().any(|p| p == "lib.rs"),
+            "carry-forward must not keep the obsolete subfolder key: {second:?}"
+        );
     }
 
     #[tokio::test]

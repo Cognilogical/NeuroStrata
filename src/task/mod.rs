@@ -13,6 +13,7 @@ pub mod intake;
 pub mod intent;
 pub mod machine;
 pub mod precheck;
+pub mod push_namespaces;
 pub mod receipt;
 pub mod routing;
 pub mod snapshot_readiness;
@@ -4039,16 +4040,48 @@ if [ "$NEUROSTRATA_SKIP_GATE" = "1" ]; then
     exit 0
 fi
 
-# The namespace configured for this project, resolved in one place
-# (`neurostrata-mcp namespace resolve`); a failed lookup blocks the push.
-# The folder name, the namespace this gate checked before, is gated too.
-NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo "error: neurostrata-mcp namespace resolve failed — gate NOT run for this push (an older neurostrata-mcp without the namespace resolve command is a likely cause: upgrade it)" >&2; exit 1; }
+# The namespaces this push must pass the gate for, worked out in one call
+# from the refs git hands this hook on stdin: the folder name (the namespace
+# this gate always checked), the namespace configured for this project, and
+# the namespace of every path the pushed commits change (`neurostrata-mcp
+# namespace resolve --pushed`). A failed call blocks the push.
+# Check cat's status: a read error after a complete prefix (or before any
+# input) must block, not gate on a partial set of refs.
+if ! PUSH_REFS=$(cat); then
+    echo "error: could not read the refs git passed to this hook — gate NOT run for this push" >&2
+    exit 1
+fi
 FOLDER_NAMESPACE=$(basename "$(git rev-parse --show-toplevel)")
-GATE_NAMESPACES=("$NAMESPACE")
-# Only a namespace-shaped basename is safe to pass to `task gate`: an
-# option-like or invalid name would change how the CLI parses the call.
-if [[ "$FOLDER_NAMESPACE" =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]*$ ]] && [ "$FOLDER_NAMESPACE" != "$NAMESPACE" ]; then
-    GATE_NAMESPACES+=("$FOLDER_NAMESPACE")
+PUSHED_NAMESPACES=$(printf '%s\n' "$PUSH_REFS" | neurostrata-mcp namespace resolve --pushed) || {
+    if neurostrata-mcp namespace resolve --help 2>/dev/null | grep -q -- '--pushed'; then
+        echo "error: neurostrata-mcp namespace resolve --pushed failed — gate NOT run for this push" >&2
+    else
+        echo "error: neurostrata-mcp namespace resolve --pushed failed — gate NOT run for this push (neurostrata-mcp is too old for this hook; upgrade it)" >&2
+    fi
+    exit 1
+}
+GATE_NAMESPACES=("$FOLDER_NAMESPACE")
+# An option-like or empty basename would change how `task gate` parses the
+# call, so it is dropped; hidden directories such as `.worktrees` are valid
+# namespaces. `--pushed` already contributes the resolved project namespace.
+if [ -z "$FOLDER_NAMESPACE" ] || [[ "$FOLDER_NAMESPACE" == -* ]]; then
+    GATE_NAMESPACES=()
+fi
+while IFS= read -r ns; do
+    [ -n "$ns" ] || continue
+    # An option-like name would be parsed as a `task gate` option, blocking
+    # the push; it is never a valid namespace. Drop it here too, so a value
+    # emitted by an older --pushed cannot reach the gate.
+    [[ "$ns" == -* ]] && continue
+    seen=0
+    for g in "${GATE_NAMESPACES[@]}"; do
+        [ "$g" = "$ns" ] && seen=1
+    done
+    [ $seen -eq 1 ] || GATE_NAMESPACES+=("$ns")
+done <<< "$PUSHED_NAMESPACES"
+if [ ${#GATE_NAMESPACES[@]} -eq 0 ]; then
+    echo "error: no namespace could be resolved for this push — gate NOT run for this push" >&2
+    exit 1
 fi
 
 # ── NeuroStrata gate (required) ────────────────────────────────────────────
@@ -4086,7 +4119,7 @@ if [ ${#PROJECT_GATES[@]} -gt 0 ]; then
 fi
 
 exit 0   # the gate passed and all project guards passed
-# neurostrata-hook-sha256: 64205469189211752148cb6897d3deac0d42e1bc2c9188da06bcc8ef2d2202c4
+# neurostrata-hook-sha256: e959754763e6e392d7ba87078c4b2bad18f9110daec0b2684c3e194088c65f5c
 "#;
 
 /// SHA-256 of the scaffolded pre-push hook body (excluding the trailing
@@ -6465,7 +6498,7 @@ mod tests {
         std::fs::create_dir_all(&stub_dir).unwrap();
         write_exec_hook(
             &stub_dir.join("neurostrata-mcp"),
-            "#!/bin/sh\nif [ \"$1\" = namespace ]; then\n    [ -n \"$STUB_RESOLVE_EXIT\" ] && exit \"$STUB_RESOLVE_EXIT\"\n    echo example-project\n    exit 0\nfi\nexit ${STUB_GATE_EXIT:-0}\n",
+            "#!/bin/sh\nif [ \"$1\" = namespace ]; then\n    [ -n \"$STUB_RESOLVE_EXIT\" ] && exit \"$STUB_RESOLVE_EXIT\"\n    if [ -n \"$STUB_PUSHED_NAMESPACES\" ]; then\n        printf '%s\\n' \"$STUB_PUSHED_NAMESPACES\"\n        exit 0\n    fi\n    echo example-project\n    exit 0\nfi\nif [ \"$1\" = task ] && [ \"${3#-}\" != \"$3\" ]; then\n    exit 2\nfi\nexit ${STUB_GATE_EXIT:-0}\n",
         );
         // The inherited PATH minus any installed neurostrata-mcp, so "missing"
         // really is missing on a developer machine.
@@ -6497,6 +6530,7 @@ mod tests {
                 .env("PATH", std::env::join_paths(dirs).expect("join PATH"))
                 .env_remove("NEUROSTRATA_SKIP_GATE")
                 .env_remove("STUB_RESOLVE_EXIT")
+                .env_remove("STUB_PUSHED_NAMESPACES")
                 .env_remove("STUB_GATE_EXIT");
             for (key, value) in envs {
                 cmd.env(key, value);
@@ -6520,9 +6554,8 @@ mod tests {
             "a namespace resolve that exits 2 blocks the push"
         );
         assert!(
-            stderr.contains(
-                "error: neurostrata-mcp namespace resolve failed — gate NOT run for this push"
-            ) && stderr.contains("upgrade it"),
+            stderr.contains("error: neurostrata-mcp namespace resolve --pushed failed — gate NOT run for this push")
+                && stderr.contains("upgrade it"),
             "a failed resolve is announced, never silent: {stderr}"
         );
         let (code, stderr) = run(true, &[("STUB_GATE_EXIT", "2")]);
@@ -6535,6 +6568,29 @@ mod tests {
             run(true, &[]).0,
             Some(0),
             "a passing gate lets the push through"
+        );
+
+        // A failed stdin read must block before resolving any refs. A `cat`
+        // stub that fails reproduces a read error git can surface on a hook.
+        write_exec_hook(&stub_dir.join("cat"), "#!/bin/sh\nexit 1\n");
+        let (code, stderr) = run(true, &[]);
+        assert_eq!(code, Some(1), "a failed refs read blocks the push");
+        assert!(
+            stderr.contains("could not read the refs git passed to this hook"),
+            "{stderr}"
+        );
+        std::fs::remove_file(stub_dir.join("cat")).unwrap();
+
+        // An option-like namespace emitted by --pushed must be dropped before
+        // it reaches `task gate`, which would parse it as an option.
+        let (code, stderr) = run(
+            true,
+            &[("STUB_PUSHED_NAMESPACES", "-worktree\nexample-project")],
+        );
+        assert_eq!(
+            code,
+            Some(0),
+            "an option-like namespace must not block: {stderr}"
         );
     }
 
@@ -6563,6 +6619,192 @@ mod tests {
             checked_in.contains("if [ $code -ne 0 ]"),
             "a non-zero gate exit must block the push"
         );
+    }
+
+    /// The pre-push hook's `--pushed` leg, run through Git's bash against a
+    /// stub `neurostrata-mcp` that logs every call.
+    mod pre_push_hook_pushed {
+        use super::{git_stdout_in, hook_bash, write_exec_hook, SCAFFOLDED_PRE_PUSH_HOOK};
+
+        const STUB: &str = r#"#!/bin/sh
+echo "$*" >> "$STUB_LOG"
+if [ "$1 $2" = "namespace resolve" ]; then
+    case "$3" in
+        --pushed)
+            if [ -n "$STUB_OLD" ]; then
+                echo "error: unexpected argument '--pushed' found" >&2
+                exit 2
+            fi
+            cat > "$STUB_STDIN"
+            [ -n "$STUB_PUSHED_EXIT" ] && exit "$STUB_PUSHED_EXIT"
+            printf '%s\n' $STUB_PRINT
+            exit 0
+            ;;
+        --help)
+            [ -n "$STUB_OLD" ] || echo "      --pushed  Read the pre-push hook's stdin"
+            exit 0
+            ;;
+    esac
+    echo example-project
+    exit 0
+fi
+exit 0
+"#;
+
+        struct Run {
+            code: Option<i32>,
+            stderr: String,
+            /// `task gate` arguments, in call order.
+            gates: Vec<String>,
+            pushed_calls: usize,
+            stdin_seen: String,
+            folder: String,
+        }
+
+        fn run_hook(stdin: &str, envs: &[(&str, &str)]) -> Option<Run> {
+            let Some(bash) = hook_bash() else {
+                eprintln!("skipped: no bash to run the hook with");
+                return None;
+            };
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = dunce::canonicalize(tmp.path()).unwrap();
+            git_stdout_in(&root, &["init", "-q"]);
+            let folder = root.file_name().unwrap().to_string_lossy().into_owned();
+            let hook = root.join("pre-push");
+            std::fs::write(&hook, SCAFFOLDED_PRE_PUSH_HOOK).unwrap();
+            let stub_dir = root.join("stub-bin");
+            std::fs::create_dir_all(&stub_dir).unwrap();
+            write_exec_hook(&stub_dir.join("neurostrata-mcp"), STUB);
+            let slash = |p: std::path::PathBuf| p.to_string_lossy().replace('\\', "/");
+            let log = root.join("stub.log");
+            let seen = root.join("stub.stdin");
+            let mut dirs = vec![stub_dir.clone()];
+            if let Some(bin) = bash.parent() {
+                dirs.push(bin.to_path_buf());
+            }
+            dirs.extend(
+                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).filter(|d| {
+                    !d.join("neurostrata-mcp").is_file() && !d.join("neurostrata-mcp.exe").is_file()
+                }),
+            );
+            let mut cmd = std::process::Command::new(&bash);
+            cmd.arg(&hook)
+                .current_dir(&root)
+                .env("PATH", std::env::join_paths(dirs).expect("join PATH"))
+                .env("STUB_LOG", slash(log.clone()))
+                .env("STUB_STDIN", slash(seen.clone()))
+                .env_remove("NEUROSTRATA_SKIP_GATE")
+                .env_remove("STUB_OLD")
+                .env_remove("STUB_PUSHED_EXIT")
+                .env_remove("STUB_PRINT")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            for (key, value) in envs {
+                cmd.env(key, value);
+            }
+            let mut child = cmd.spawn().expect("the hook runs");
+            {
+                use std::io::Write as _;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(stdin.as_bytes())
+                    .unwrap();
+            }
+            let out = child.wait_with_output().unwrap();
+            let log = std::fs::read_to_string(&log).unwrap_or_default();
+            Some(Run {
+                code: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                gates: log
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("task gate "))
+                    .map(str::to_string)
+                    .collect(),
+                pushed_calls: log
+                    .lines()
+                    .filter(|l| *l == "namespace resolve --pushed")
+                    .count(),
+                stdin_seen: std::fs::read_to_string(&seen).unwrap_or_default(),
+                folder,
+            })
+        }
+
+        const REFS: &str = "refs/heads/main 1111111111111111111111111111111111111111 refs/heads/main 0000000000000000000000000000000000000000\n";
+
+        #[test]
+        fn hook_gates_each_printed_namespace_strict() {
+            let Some(run) = run_hook(REFS, &[("STUB_PRINT", "alpha beta alpha")]) else {
+                return;
+            };
+            assert_eq!(run.code, Some(0), "{}", run.stderr);
+            assert_eq!(run.pushed_calls, 1, "one --pushed call per push");
+            assert_eq!(
+                run.stdin_seen, REFS,
+                "the hook's stdin reaches --pushed unchanged"
+            );
+            let want: Vec<String> = [run.folder.as_str(), "alpha", "beta"]
+                .iter()
+                .map(|ns| format!("{ns} --strict"))
+                .collect();
+            assert_eq!(
+                run.gates, want,
+                "the folder name, then each printed namespace once"
+            );
+        }
+
+        #[test]
+        fn hook_blocks_on_pushed_failure() {
+            let Some(run) = run_hook(REFS, &[("STUB_PUSHED_EXIT", "1")]) else {
+                return;
+            };
+            assert_eq!(run.code, Some(1), "a failed --pushed blocks the push");
+            assert!(
+                run.stderr.contains("error: neurostrata-mcp namespace resolve --pushed failed — gate NOT run for this push")
+                    && !run.stderr.contains("too old"),
+                "{}",
+                run.stderr
+            );
+            assert!(
+                run.gates.is_empty(),
+                "no gate runs on namespaces it could not work out"
+            );
+        }
+
+        #[test]
+        fn old_cli_without_pushed_blocks_with_upgrade_message() {
+            let Some(run) = run_hook(REFS, &[("STUB_OLD", "1")]) else {
+                return;
+            };
+            assert_eq!(run.code, Some(1), "an old CLI blocks the push");
+            assert!(
+                run.stderr
+                    .contains("neurostrata-mcp is too old for this hook; upgrade it"),
+                "{}",
+                run.stderr
+            );
+            assert!(run.gates.is_empty());
+        }
+
+        #[test]
+        fn no_marker_gates_exactly_folder_name_and_resolved_namespace() {
+            // With no marker, --pushed prints the folder name and the
+            // resolved namespace and nothing else.
+            let folder_probe = run_hook(REFS, &[("STUB_PRINT", "example-project")]);
+            let Some(run) = folder_probe else {
+                return;
+            };
+            assert_eq!(run.code, Some(0), "{}", run.stderr);
+            assert_eq!(
+                run.gates,
+                vec![
+                    format!("{} --strict", run.folder),
+                    "example-project --strict".to_string()
+                ]
+            );
+        }
     }
 
     /// A store whose `namespace` already holds one rule, so the namespace

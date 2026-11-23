@@ -917,6 +917,16 @@ pub(crate) enum NamespaceCommands {
     Resolve {
         /// Directory inside the project (default: the current directory)
         dir: Option<std::path::PathBuf>,
+        /// Read the pre-push hook's stdin (`<local ref> <local sha> <remote
+        /// ref> <remote sha>` lines) and print, one per line, every namespace
+        /// the push must pass the task gate for: the checkout's folder name,
+        /// the resolved namespace, and the namespace of each path the pushed
+        /// commits change, and the namespace a marker the push deletes or
+        /// changes named at the remote tip. Exits 1 on an unreadable marker
+        /// on a pushed path, on a stdin line it cannot read, or when a
+        /// committed and an untracked marker disagree.
+        #[arg(long)]
+        pushed: bool,
     },
 }
 
@@ -973,6 +983,7 @@ pub(crate) enum RootCommands {
         force: bool,
     },
 }
+
 
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub(crate) enum HooksCommands {
@@ -4428,8 +4439,13 @@ mod tests {
         );
         for behavior in [
             "command -v neurostrata-mcp",
-            "NAMESPACE=$(neurostrata-mcp namespace resolve) || { echo \"error: neurostrata-mcp namespace resolve failed — gate NOT run for this push",
+            "PUSH_REFS=$(cat)",
             "FOLDER_NAMESPACE=$(basename \"$(git rev-parse --show-toplevel)\")",
+            "PUSHED_NAMESPACES=$(printf '%s\\n' \"$PUSH_REFS\" | neurostrata-mcp namespace resolve --pushed) || {",
+            "echo \"error: neurostrata-mcp namespace resolve --pushed failed — gate NOT run for this push\" >&2",
+            "(neurostrata-mcp is too old for this hook; upgrade it)",
+            "GATE_NAMESPACES=(\"$FOLDER_NAMESPACE\")",
+            "done <<< \"$PUSHED_NAMESPACES\"",
             "neurostrata-mcp task gate \"$GATE_NAMESPACE\" --strict",
             "code=$?",
             "if [ $code -eq 1 ]; then",
@@ -4720,7 +4736,7 @@ mod tests {
             Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
         match cli.command {
             Some(Commands::Namespace { action }) => {
-                assert_eq!(action, NamespaceCommands::Resolve { dir: None })
+                assert_eq!(action, NamespaceCommands::Resolve { dir: None, pushed: false })
             }
             other => panic!("expected Namespace/Resolve, got {:?}", other),
         }
@@ -4731,9 +4747,18 @@ mod tests {
                 assert_eq!(
                     action,
                     NamespaceCommands::Resolve {
-                        dir: Some("some/dir".into())
+                        dir: Some("some/dir".into()),
+                        pushed: false
                     }
                 )
+            }
+            other => panic!("expected Namespace/Resolve, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve", "--pushed"])
+            .expect("parses --pushed");
+        match cli.command {
+            Some(Commands::Namespace { action }) => {
+                assert_eq!(action, NamespaceCommands::Resolve { dir: None, pushed: true })
             }
             other => panic!("expected Namespace/Resolve, got {:?}", other),
         }
@@ -7302,11 +7327,34 @@ async fn run() -> anyhow::Result<()> {
     // daemon and without opening the database.
     if let Some(Commands::Namespace { action }) = cli.command.as_ref() {
         match action {
-            NamespaceCommands::Resolve { dir } => {
+            NamespaceCommands::Resolve { dir, pushed } => {
                 let dir = match dir {
                     Some(d) => d.clone(),
                     None => std::env::current_dir()?,
                 };
+                if *pushed {
+                    use std::io::Read as _;
+                    let mut stdin = String::new();
+                    std::io::stdin().read_to_string(&mut stdin)?;
+                    // An unparseable stdin line exits 1 like an unreadable
+                    // marker: the hook blocks rather than gate without a ref.
+                    let namespaces = crate::task::push_namespaces::parse_pre_push_stdin(&stdin)
+                        .and_then(|refs| {
+                            crate::task::push_namespaces::namespaces_for_push(&dir, &refs)
+                        });
+                    match namespaces {
+                        Ok(namespaces) => {
+                            for namespace in namespaces {
+                                println!("{namespace}");
+                            }
+                        }
+                        Err(msg) => {
+                            eprintln!("error: {msg}");
+                            std::process::exit(1);
+                        }
+                    }
+                    return Ok(());
+                }
                 // Fail closed: a missing directory, a project marker or a
                 // harness config that cannot be read, or no usable namespace
                 // exits non-zero, and the pre-push hook blocks the push.

@@ -98,7 +98,11 @@ async function main() {
       : {};
   const init = mod.initialize ?? plugin?.initialize ?? plugin?.setup;
   if (typeof init === "function") {
-    await init({ config, projectDir });
+    // Pass the namespace only when it is set: an explicit undefined would
+    // override the one in .NeuroStrata/neurostrata-plugin.json.
+    const namespace = process.env.NEUROSTRATA_NAMESPACE;
+    const envConfig = namespace ? { namespace } : {};
+    await init({ config: { ...envConfig, ...config }, projectDir });
   }
   const handler =
     mod.handleHookEvent ??
@@ -2921,7 +2925,9 @@ mod tests {
         let fresh = file_hooks(tmp.path());
         assert_eq!(fresh.len(), 1);
         assert!(
-            fresh[0].0.split('|').any(|t| t == "NotebookEdit"),
+            fresh
+                .iter()
+                .any(|(m, _)| m.split('|').any(|t| t == "NotebookEdit")),
             "fresh install must guard NotebookEdit: {:?}",
             fresh
         );
@@ -2951,7 +2957,7 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("claude"),
         );
-        let after = file_hooks(tmp.path());
+        let after = claude_pre_tool_use_matchers(tmp.path());
         assert_eq!(
             after,
             vec![
@@ -2960,8 +2966,9 @@ mod tests {
                     LEGACY_CLAUDE_PRE_TOOL_USE_MATCHER.to_string(),
                     "echo user-hook".to_string()
                 ),
+                (CLAUDE_SESSION_SCOPE_MATCHER.to_string(), ours.clone()),
             ],
-            "only the installer's own entry is widened"
+            "only the installer's own entry is widened; session-scope stays"
         );
     }
 
@@ -4074,7 +4081,7 @@ mod tests {
         for other in ["TestProj", "", "folder-name"] {
             let _ = auto_install_detected_plugins(
                 tmp.path(),
-                ConfigNamespace::Keep(Some(other)),
+                ConfigNamespace::Set(other),
                 Some("codex"),
             );
             assert_eq!(
