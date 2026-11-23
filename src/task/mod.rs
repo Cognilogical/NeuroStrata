@@ -1204,14 +1204,19 @@ const CONTEXT_MEMORY_LISTS: [&str; 4] = [
     "structural_anchors",
 ];
 
+/// What the trimmed context says in its `note` field: how to get more.
+const TRIMMED_CONTEXT_NOTE: &str = "rows show a snippet; neurostrata_get_memory(id) returns one memory in full; include_metadata: true returns every row's details";
+
 /// The context `task_claim` and `task_create` answer with by default: the
 /// same keys, each memory row cut to id, type, location and snippet (plus a
-/// deprecation or not-definition banner when the row has one), and
-/// `"compact": true`. The full rows carry every memory's metadata (calls
+/// deprecation or not-definition banner when the row has one, and `symbol`
+/// when its metadata names one: a code row's symbol, or the `refs[].symbol`
+/// names of a rule or fact), and a `note` saying how to get
+/// more. The full rows carry every memory's metadata (calls
 /// lists, edge sources, source identity) and made one claim reply 61,337
-/// characters. `compact: false` returns the full context. The prompt block
+/// characters. `include_metadata: true` returns the full context. The prompt block
 /// returned as `subagent_prompt_injection` is the same either way.
-fn compact_graph_context(context: &Value) -> Value {
+fn trimmed_graph_context(context: &Value) -> Value {
     fn slim(row: &Value) -> Value {
         let mut out = serde_json::Map::new();
         for key in [
@@ -1226,7 +1231,23 @@ fn compact_graph_context(context: &Value) -> Value {
                 out.insert(key.to_string(), v.clone());
             }
         }
+        if let Some(symbol) = row.get("metadata").and_then(metadata_symbol) {
+            out.insert("symbol".to_string(), symbol);
+        }
         Value::Object(out)
+    }
+    // The one name agents were seen taking from the metadata.
+    fn metadata_symbol(metadata: &Value) -> Option<Value> {
+        if let Some(symbol) = metadata.get("symbol").and_then(Value::as_str) {
+            return Some(json!(symbol));
+        }
+        let names: Vec<&str> = metadata
+            .get("refs")?
+            .as_array()?
+            .iter()
+            .filter_map(|r| r.get("symbol").and_then(Value::as_str))
+            .collect();
+        (!names.is_empty()).then(|| json!(names))
     }
     let mut out = context.clone();
     if let Some(obj) = out.as_object_mut() {
@@ -1236,14 +1257,14 @@ fn compact_graph_context(context: &Value) -> Value {
                 obj.insert(key.to_string(), slimmed);
             }
         }
-        obj.insert("compact".to_string(), Value::Bool(true));
+        obj.insert("note".to_string(), json!(TRIMMED_CONTEXT_NOTE));
     }
     out
 }
 
-/// Compact unless the caller passes `compact: false`.
-fn wants_compact(args: &Value) -> bool {
-    args.get("compact").and_then(Value::as_bool).unwrap_or(true)
+/// Full rows only when the caller passes `include_metadata: true`.
+fn wants_metadata(args: &Value) -> bool {
+    args.get("include_metadata").and_then(Value::as_bool).unwrap_or(false)
 }
 
 /// Synthesise cross-domain conceptual bridges from retrieved seed memories.
@@ -2160,10 +2181,10 @@ pub async fn handle_task_create(
                     json!(subagent_prompt),
                 );
             }
-            let hits_json = if wants_compact(&args) {
-                compact_graph_context(&hits_json)
-            } else {
+            let hits_json = if wants_metadata(&args) {
                 hits_json
+            } else {
+                trimmed_graph_context(&hits_json)
             };
             encode(&json!({
                 "id": id,
@@ -2529,10 +2550,10 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
-    let hits_json = if wants_compact(&args) {
-        compact_graph_context(&hits_json)
-    } else {
+    let hits_json = if wants_metadata(&args) {
         hits_json
+    } else {
+        trimmed_graph_context(&hits_json)
     };
     let mut reply = json!({
         "id": id,
@@ -7312,11 +7333,11 @@ exit 0
         parsed["id"].as_str().expect("id").to_string()
     }
 
-    /// The compact context keeps every key, cuts each memory row to id,
-    /// type, location and snippet (plus a banner when the row has one), and
-    /// leaves the other keys as they were.
+    /// The trimmed context keeps every key, cuts each memory row to id,
+    /// type, location and snippet (plus a banner and a symbol when the row
+    /// has one), leaves the other keys as they were, and says how to get more.
     #[test]
-    fn compact_context_keeps_the_keys_and_drops_the_per_item_metadata() {
+    fn trimmed_context_keeps_the_keys_and_drops_the_per_item_metadata() {
         let big = json!({ "edge_sources": vec!["x".repeat(500); 20], "mentions": ["a", "b"] });
         let item = json!({
             "id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text",
@@ -7325,10 +7346,16 @@ exit 0
         });
         let mut warned = item.clone();
         warned["deprecation_banner"] = json!("DEPRECATED");
+        let mut code = item.clone();
+        code["memory_type"] = json!("code_ast");
+        code["metadata"]["symbol"] = json!("parse_claim");
+        let mut rule = item.clone();
+        rule["memory_type"] = json!("rule");
+        rule["metadata"]["refs"] = json!([{ "file": "src/a.rs", "symbol": "a" }, { "file": "src/b.rs" }]);
         let full = json!({
             "query": "q",
             "golden_rules": [item.clone()],
-            "items": [item.clone(), warned],
+            "items": [item.clone(), warned, code, rule],
             "related_edges": [{"source": "m1", "relation": "calls", "target": "f"}],
             "next_hop_calls": [{"tool": "neurostrata_related", "trigger_id": "T_SEED_EXPAND"}],
             "expansion_error": null,
@@ -7338,7 +7365,7 @@ exit 0
             "project_thesis": {"text": "thesis"},
             "domain_concepts": [],
         });
-        let compact = compact_graph_context(&full);
+        let trimmed = trimmed_graph_context(&full);
 
         let keys = |v: &Value| -> Vec<String> {
             let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
@@ -7346,10 +7373,15 @@ exit 0
             k
         };
         let mut expected = keys(&full);
-        expected.push("compact".to_string());
+        expected.push("note".to_string());
         expected.sort();
-        assert_eq!(keys(&compact), expected, "same keys plus the marker");
-        assert_eq!(compact["compact"], json!(true));
+        assert_eq!(keys(&trimmed), expected, "same keys plus the note");
+        assert!(trimmed.get("compact").is_none(), "no compact key");
+        let note = trimmed["note"].as_str().expect("a note says how to get more");
+        assert!(
+            note.contains("neurostrata_get_memory(id)") && note.contains("include_metadata: true"),
+            "{note}"
+        );
         for key in [
             "query",
             "related_edges",
@@ -7359,22 +7391,25 @@ exit 0
             "project_thesis",
             "domain_concepts",
         ] {
-            assert_eq!(compact[key], full[key], "`{key}` passes through");
+            assert_eq!(trimmed[key], full[key], "`{key}` passes through");
         }
         let slim =
             json!({"id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text"});
         for key in CONTEXT_MEMORY_LISTS {
-            assert_eq!(compact[key][0], slim, "`{key}` rows are slim");
+            assert_eq!(trimmed[key][0], slim, "`{key}` rows are slim");
         }
-        assert_eq!(compact["items"].as_array().unwrap().len(), 2);
+        assert_eq!(trimmed["items"].as_array().unwrap().len(), 4);
         assert_eq!(
-            compact["items"][1]["deprecation_banner"],
+            trimmed["items"][1]["deprecation_banner"],
             json!("DEPRECATED")
         );
+        assert_eq!(trimmed["items"][2]["symbol"], json!("parse_claim"), "a code row's symbol");
+        assert_eq!(trimmed["items"][3]["symbol"], json!(["a"]), "a rule's refs[].symbol");
+        assert!(trimmed["items"][3].get("metadata").is_none());
         assert!(
-            serde_json::to_string(&compact).unwrap().len() * 5
+            serde_json::to_string(&trimmed).unwrap().len() * 5
                 < serde_json::to_string(&full).unwrap().len(),
-            "the compact form is a fraction of the full one"
+            "the trimmed form is a fraction of the full one"
         );
     }
 
@@ -7423,7 +7458,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn claim_and_create_answer_compactly_unless_asked_for_the_full_context() {
+    async fn claim_and_create_trim_rows_unless_asked_to_include_metadata() {
         let store = store_with_heavy_memories("MyProj").await;
         let create_reply = |args: Value| {
             let store = store.clone();
@@ -7437,24 +7472,35 @@ exit 0
         }))
         .await;
         let created_full = create_reply(json!({
+            "namespace": "MyProj", "title": "compact fixture handler work", "include_metadata": true
+        }))
+        .await;
+        assert_eq!(
+            created["auto_retrieved_context"]["note"],
+            json!(TRIMMED_CONTEXT_NOTE)
+        );
+        assert!(created_full["auto_retrieved_context"].get("note").is_none());
+        assert!(created["auto_retrieved_context"].get("compact").is_none());
+        // `compact` is not an alias: `compact: false` still gets trimmed rows.
+        let created_old_arg = create_reply(json!({
             "namespace": "MyProj", "title": "compact fixture handler work", "compact": false
         }))
         .await;
-        assert_eq!(created["auto_retrieved_context"]["compact"], json!(true));
-        assert!(created_full["auto_retrieved_context"]
-            .get("compact")
-            .is_none());
+        assert_eq!(
+            created_old_arg["auto_retrieved_context"]["note"],
+            json!(TRIMMED_CONTEXT_NOTE)
+        );
 
         let id = created["id"].as_str().unwrap().to_string();
-        let claim = |compact: Option<bool>, session: &'static str| {
+        let claim = |include_metadata: Option<bool>, session: &'static str| {
             let store = store.clone();
             let id = id.clone();
             async move {
                 let mut args = json!({
                     "namespace": "MyProj", "id": id, "assignee": "agent", "session_id": session
                 });
-                if let Some(c) = compact {
-                    args["compact"] = json!(c);
+                if let Some(m) = include_metadata {
+                    args["include_metadata"] = json!(m);
                 }
                 serde_json::from_str::<Value>(&handle_task_claim(args, store).await).unwrap()
             }
@@ -7471,15 +7517,20 @@ exit 0
                 .await
             }
         };
-        let compact = claim(None, "s-compact").await;
+        let trimmed = claim(None, "s-compact").await;
         release().await;
-        let full = claim(Some(false), "s-full").await;
+        let full = claim(Some(true), "s-full").await;
 
-        assert_eq!(compact["claimed"], json!(true));
+        assert_eq!(trimmed["claimed"], json!(true));
         assert_eq!(full["claimed"], json!(true));
-        let ctx = &compact["auto_retrieved_context"];
-        assert_eq!(ctx["compact"], json!(true), "compact is the default");
-        assert!(full["auto_retrieved_context"].get("compact").is_none());
+        let ctx = &trimmed["auto_retrieved_context"];
+        assert_eq!(
+            ctx["note"],
+            json!(TRIMMED_CONTEXT_NOTE),
+            "trimmed rows are the default"
+        );
+        assert!(ctx.get("compact").is_none());
+        assert!(full["auto_retrieved_context"].get("note").is_none());
         let items = ctx["items"].as_array().unwrap();
         assert!(!items.is_empty(), "the fixture memories are retrieved");
         for row in items {
@@ -7492,23 +7543,23 @@ exit 0
             full["auto_retrieved_context"]["items"][0]
                 .get("metadata")
                 .is_some(),
-            "compact:false keeps each memory's metadata"
+            "include_metadata: true keeps each memory's metadata"
         );
         let keys = |v: &Value| -> Vec<String> {
             let mut k: Vec<String> = v["auto_retrieved_context"]
                 .as_object()
                 .unwrap()
                 .keys()
-                .filter(|k| *k != "compact")
+                .filter(|k| *k != "note")
                 .cloned()
                 .collect();
             k.sort();
             k
         };
-        assert_eq!(keys(&compact), keys(&full));
+        assert_eq!(keys(&trimmed), keys(&full));
         assert_eq!(
-            compact["subagent_prompt_injection"], full["subagent_prompt_injection"],
-            "the prompt block does not depend on compact"
+            trimmed["subagent_prompt_injection"], full["subagent_prompt_injection"],
+            "the prompt block does not depend on include_metadata"
         );
         assert_eq!(
             created["subagent_prompt_injection"],
@@ -7525,15 +7576,15 @@ exit 0
 
         let size = |v: &Value| serde_json::to_string(v).unwrap().len();
         eprintln!(
-            "MEASURED claim reply bytes: compact={} full={}; create reply bytes: compact={} full={}",
-            size(&compact),
+            "MEASURED claim reply bytes: trimmed={} include_metadata={}; create reply bytes: trimmed={} include_metadata={}",
+            size(&trimmed),
             size(&full),
             size(&created),
             size(&created_full)
         );
         assert!(
-            size(&compact) * 2 < size(&full),
-            "compact is well under half the full reply"
+            size(&trimmed) * 2 < size(&full),
+            "the trimmed reply is well under half the full one"
         );
     }
 

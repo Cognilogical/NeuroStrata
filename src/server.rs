@@ -545,7 +545,7 @@ async fn _with_watch(
                                 "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Ids of tasks this one waits on; a ready task has none unfinished." },
                                 "user_id": { "type": "string", "description": "Optional user identifier for audit receipts." },
                                 "agent_name": { "type": "string", "description": "Optional agent identifier for audit receipts." },
-                                "compact": { "type": "boolean", "description": "Defaults to true: each memory in auto_retrieved_context is one short row (id, memory_type, location, snippet). Pass false to get every memory's full metadata. subagent_prompt_injection is the same either way." },
+                                "include_metadata": { "type": "boolean", "description": "Defaults to false: each memory in auto_retrieved_context is one short row (id, memory_type, location, snippet, banners, and symbol when it has one). Pass true to get every memory's full row with its metadata. subagent_prompt_injection is the same either way." },
                             },
                             "required": ["namespace", "title"]
                         }
@@ -564,7 +564,7 @@ async fn _with_watch(
                                 "branch": { "type": "string", "description": "Optional caller git branch for strict push-gate scoping." },
                                 "project_root": { "type": "string", "description": "Optional caller project root path used to capture worktree and branch scope." },
                                 "event_id": { "type": "string", "description": "Optional idempotency event ID for the claim receipt." },
-                                "compact": { "type": "boolean", "description": "Defaults to true: each memory in auto_retrieved_context is one short row (id, memory_type, location, snippet). Pass false to get every memory's full metadata. subagent_prompt_injection is the same either way." },
+                                "include_metadata": { "type": "boolean", "description": "Defaults to false: each memory in auto_retrieved_context is one short row (id, memory_type, location, snippet, banners, and symbol when it has one). Pass true to get every memory's full row with its metadata. subagent_prompt_injection is the same either way." },
                             },
                             "required": ["id", "namespace", "assignee", "session_id"]
                         }
