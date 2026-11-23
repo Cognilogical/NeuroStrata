@@ -575,10 +575,28 @@ pub async fn export_vault_with_limits(
         .await
         .map_err(|e| format!("Failed to list memories: {}", e))?;
 
-    // Filter by ReBAC can_read_memory, then drop retired rows: an export is
-    // the current-knowledge surface, and `list` is generation-scoped only.
     let principal = config.principal.as_deref().unwrap_or("default");
     let now = chrono::Utc::now().timestamp();
+
+    // Staleness must be judged against the UNFILTERED store view (Codex
+    // review 4670091162). A note can be live yet unreadable to this export
+    // principal (ReBAC), or written by a newer overlapping export from a
+    // different snapshot. Deriving `active_ids` from `filtered` renamed both
+    // kinds of still-active Markdown exports to `.retired`.
+    let active_ids: BTreeSet<String> = memories
+        .iter()
+        .filter(|m| {
+            let metadata = &m.payload.metadata;
+            !crate::store::ladybug::is_retired_at(metadata, now)
+                && metadata
+                    .get("superseded_by")
+                    .map_or(true, serde_json::Value::is_null)
+        })
+        .map(|m| m.id.clone())
+        .collect();
+
+    // Filter by ReBAC can_read_memory, then drop retired rows: an export is
+    // the current-knowledge surface, and `list` is generation-scoped only.
     let filtered: Vec<SearchResult> = memories
         .into_iter()
         .filter(|m| rebac::can_read_memory(principal, &m.payload.user_id, &m.payload.metadata))
@@ -590,10 +608,6 @@ pub async fn export_vault_with_limits(
                     .map_or(true, serde_json::Value::is_null)
         })
         .collect();
-
-    // Ids still present in the current-knowledge surface. Any exported note
-    // whose frontmatter id is absent from this set is stale (issue #372).
-    let active_ids: BTreeSet<String> = filtered.iter().map(|m| m.id.clone()).collect();
 
     // Convert to VaultNotes
     let mut notes = Vec::new();
@@ -6156,6 +6170,71 @@ mod tests {
             ids,
             imported.errors
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Codex review 4670091162: an active export unreadable to the current
+    /// principal must not be renamed to `.retired` by a re-export.
+    #[tokio::test]
+    async fn reexport_preserves_active_exports_unreadable_to_principal() {
+        let root =
+            std::env::temp_dir().join(format!("ns-vault-rebac-export-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("vault");
+        std::fs::create_dir_all(&vault).expect("create vault");
+        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                .expect("temp store"),
+        );
+        let ns = "vault_rebac_export";
+        store.init(ns).await.expect("init");
+        // Owned by alice and restricted to her: admin can export it, bob
+        // cannot read it.
+        store
+            .upsert(
+                ns,
+                "restricted-note",
+                vec![0.0; 4],
+                crate::traits::MemoryPayload {
+                    content: "restricted body".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({"visible_to": ["alice"]}),
+                },
+            )
+            .await
+            .expect("seed restricted");
+
+        let config = vault_config(&root, &vault, ns);
+        let admin_cfg = VaultSyncConfig {
+            principal: Some("admin".to_string()),
+            ..config.clone()
+        };
+        let first = export_vault(admin_cfg, store.clone())
+            .await
+            .expect("admin export");
+        assert!(first.success, "{:?}", first.errors);
+        assert!(vault.join("restricted-note.md").exists());
+
+        // Bob cannot read the note, so it is not rewritten; the file from the
+        // admin export is still active and must survive the re-export.
+        let bob_cfg = VaultSyncConfig {
+            principal: Some("bob".to_string()),
+            ..config
+        };
+        let second = export_vault(bob_cfg, store.clone())
+            .await
+            .expect("bob re-export");
+        assert!(second.success, "{:?}", second.errors);
+        assert!(
+            vault.join("restricted-note.md").exists(),
+            "active-but-unreadable export must not be retired: {:?}",
+            second.errors
+        );
+        assert!(!vault.join("restricted-note.md.retired").exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
