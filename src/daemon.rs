@@ -613,13 +613,13 @@ pub(crate) fn check_caller_path(
     root: &Path,
     allowlist: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canonical_root = dunce::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let resolved = resolve_caller_path(raw)?;
     if resolved.starts_with(&canonical_root) {
         return Ok(resolved);
     }
     for entry in allowlist {
-        let canonical_entry = std::fs::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
+        let canonical_entry = dunce::canonicalize(entry).unwrap_or_else(|_| entry.to_path_buf());
         if resolved.starts_with(&canonical_entry) {
             return Ok(resolved);
         }
@@ -652,7 +652,7 @@ fn resolve_caller_path(raw: &Path) -> Result<PathBuf, String> {
             .map(|cwd| cwd.join(raw))
             .unwrap_or_else(|_| raw.to_path_buf())
     };
-    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+    if let Ok(canonical) = dunce::canonicalize(&absolute) {
         return Ok(canonical);
     }
     // Walk up to the nearest existing ancestor; the components below it
@@ -662,7 +662,7 @@ fn resolve_caller_path(raw: &Path) -> Result<PathBuf, String> {
     let mut cursor = absolute.clone();
     let mut remainder: Vec<std::ffi::OsString> = Vec::new();
     loop {
-        if let Ok(canonical) = std::fs::canonicalize(&cursor) {
+        if let Ok(canonical) = dunce::canonicalize(&cursor) {
             let mut resolved = canonical;
             for name in remainder.iter().rev() {
                 resolved.push(name);
@@ -4286,6 +4286,22 @@ mod tests {
         );
     }
 
+    /// `std::fs::canonicalize` answers `\\?\C:\...` on Windows, which no
+    /// caller or stored registration spells that way.
+    #[test]
+    fn caller_paths_resolve_without_the_windows_verbatim_prefix() {
+        let root = scratch_root("t2r-unit-verbatim-root");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        for raw in [root.join("src"), root.join("src").join("new.rs")] {
+            let resolved = check_caller_path(&raw, &root, &[]).expect("inside the root");
+            assert!(
+                !resolved.to_string_lossy().starts_with(r"\\?\"),
+                "{}",
+                resolved.display()
+            );
+        }
+    }
+
     /// Task 2 re-file (J6), unit leg: a not-yet-existing destination with
     /// a plain remainder resolves to the canonical ancestor plus the
     /// remainder — the normal first-backup shape.
@@ -4297,7 +4313,7 @@ mod tests {
         let resolved = check_caller_path(&dest, &root, &[]).expect("a plain remainder resolves");
         assert_eq!(
             resolved,
-            std::fs::canonicalize(&root)
+            dunce::canonicalize(&root)
                 .unwrap()
                 .join("backups")
                 .join("2026-10-25"),
@@ -4320,7 +4336,7 @@ mod tests {
             .expect("an allowlisted directory permits the destination");
         assert_eq!(
             resolved,
-            std::fs::canonicalize(&external).unwrap().join("snapshot")
+            dunce::canonicalize(&external).unwrap().join("snapshot")
         );
     }
 
@@ -4339,7 +4355,7 @@ mod tests {
             "the refusal names the path: {err}"
         );
         assert!(
-            err.contains(&std::fs::canonicalize(&root).unwrap().display().to_string()),
+            err.contains(&dunce::canonicalize(&root).unwrap().display().to_string()),
             "the refusal names the root: {err}"
         );
         assert!(
@@ -4733,7 +4749,7 @@ mod tests {
                 .watch
                 .register("test-ns", &root)
                 .expect("core registration succeeds");
-            let canonical = std::fs::canonicalize(&root).unwrap();
+            let canonical = dunce::canonicalize(&root).unwrap();
 
             let req = serde_json::json!({
                 "namespace": "test-ns",
