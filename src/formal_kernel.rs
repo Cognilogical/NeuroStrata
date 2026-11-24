@@ -2669,6 +2669,79 @@ pub const fn wal_commit_evidence_tag(evidence: KernelWalCommitEvidence) -> &'sta
     }
 }
 
+/// Hard upper bound for a working-set frame's charged bytes.
+pub const WORKING_SET_MAX_FRAME_BYTES: u32 = 4096;
+
+/// Maximum charged bytes permitted for a deterministic working-set stub.
+pub const WORKING_SET_STUB_MAX_BYTES: u32 = 192;
+
+/// Generational tier of a working-set node.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingSetTier {
+    Immortal,
+    PinnedRoot,
+    YoungGen,
+    EvictedStub,
+}
+
+/// Pure working-set garbage-collection decision.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcAction {
+    RetainFull,
+    PromoteToYoungGen,
+    DemoteToStub,
+    RetainStub,
+}
+
+/// Inputs for one deterministic working-set eviction decision.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkingSetEvictionInput {
+    pub tier: WorkingSetTier,
+    pub turn_age: u32,
+    pub max_idle_turns: u32,
+    pub node_bytes: u32,
+    pub projected_frame_bytes: u32,
+    pub max_frame_bytes: u32,
+    pub is_re_referenced: bool,
+}
+
+/// Applies the spec's first-match eviction precedence to one node.
+/// Stub construction and byte accounting belong to the state layer.
+pub const fn evaluate_working_set_eviction(input: WorkingSetEvictionInput) -> GcAction {
+    match input.tier {
+        WorkingSetTier::Immortal => GcAction::RetainFull,
+        WorkingSetTier::EvictedStub => {
+            if input.is_re_referenced && input.projected_frame_bytes <= input.max_frame_bytes {
+                GcAction::PromoteToYoungGen
+            } else {
+                GcAction::RetainStub
+            }
+        }
+        WorkingSetTier::YoungGen => {
+            if (!input.is_re_referenced && input.turn_age > input.max_idle_turns)
+                || input.projected_frame_bytes > input.max_frame_bytes
+            {
+                GcAction::DemoteToStub
+            } else {
+                GcAction::RetainFull
+            }
+        }
+        WorkingSetTier::PinnedRoot => {
+            if !input.is_re_referenced
+                && input.turn_age > 0
+                && input.projected_frame_bytes > input.max_frame_bytes
+            {
+                GcAction::DemoteToStub
+            } else {
+                GcAction::RetainFull
+            }
+        }
+    }
+}
+
 // Unit tests for formal_kernel.rs – covering classify_epistemic_status, validate_taxonomy_dag, validate_skos_disjointness, compute_epistemic_coverage_bps, realization_status_gap_bps, compute_frontier_leverage_bps
 #[cfg(test)]
 mod tests {
@@ -3064,6 +3137,203 @@ mod tests {
         assert_eq!(
             evaluate_workflow_stage_transition(Completed, LoadContext),
             Err("IllegalWorkflowStageTransition")
+        );
+    }
+
+    fn working_set_input(
+        tier: WorkingSetTier,
+        turn_age: u32,
+        max_idle_turns: u32,
+        node_bytes: u32,
+        projected_frame_bytes: u32,
+        max_frame_bytes: u32,
+        is_re_referenced: bool,
+    ) -> WorkingSetEvictionInput {
+        WorkingSetEvictionInput {
+            tier,
+            turn_age,
+            max_idle_turns,
+            node_bytes,
+            projected_frame_bytes,
+            max_frame_bytes,
+            is_re_referenced,
+        }
+    }
+
+    #[test]
+    fn working_set_immortal_overflow_retains_full() {
+        let input = working_set_input(
+            WorkingSetTier::Immortal,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            0,
+            false,
+        );
+        assert_eq!(evaluate_working_set_eviction(input), GcAction::RetainFull);
+    }
+
+    #[test]
+    fn working_set_page_fault_promotes_only_when_fits() {
+        for (projected, expected) in [
+            (0u32, GcAction::PromoteToYoungGen),
+            (WORKING_SET_MAX_FRAME_BYTES, GcAction::PromoteToYoungGen),
+            (WORKING_SET_MAX_FRAME_BYTES + 1, GcAction::RetainStub),
+            (u32::MAX, GcAction::RetainStub),
+        ] {
+            assert_eq!(
+                evaluate_working_set_eviction(working_set_input(
+                    WorkingSetTier::EvictedStub,
+                    4,
+                    3,
+                    256,
+                    projected,
+                    WORKING_SET_MAX_FRAME_BYTES,
+                    true,
+                )),
+                expected
+            );
+        }
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::EvictedStub,
+                4,
+                3,
+                256,
+                0,
+                WORKING_SET_MAX_FRAME_BYTES,
+                false,
+            )),
+            GcAction::RetainStub
+        );
+    }
+
+    #[test]
+    fn working_set_ttl_equality_retains_and_expiry_demotes() {
+        for (turn_age, expected) in [
+            (3u32, GcAction::RetainFull),
+            (4, GcAction::DemoteToStub),
+            (u32::MAX, GcAction::DemoteToStub),
+        ] {
+            assert_eq!(
+                evaluate_working_set_eviction(working_set_input(
+                    WorkingSetTier::YoungGen,
+                    turn_age,
+                    3,
+                    256,
+                    0,
+                    WORKING_SET_MAX_FRAME_BYTES,
+                    false,
+                )),
+                expected
+            );
+        }
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::YoungGen,
+                u32::MAX,
+                u32::MAX,
+                256,
+                0,
+                WORKING_SET_MAX_FRAME_BYTES,
+                false,
+            )),
+            GcAction::RetainFull
+        );
+    }
+
+    #[test]
+    fn working_set_pinned_root_pressure_respects_current_turn() {
+        for (turn_age, is_re_referenced, expected) in [
+            (0u32, false, GcAction::RetainFull),
+            (1, true, GcAction::RetainFull),
+            (1, false, GcAction::DemoteToStub),
+            (u32::MAX, false, GcAction::DemoteToStub),
+        ] {
+            assert_eq!(
+                evaluate_working_set_eviction(working_set_input(
+                    WorkingSetTier::PinnedRoot,
+                    turn_age,
+                    0,
+                    256,
+                    WORKING_SET_MAX_FRAME_BYTES + 1,
+                    WORKING_SET_MAX_FRAME_BYTES,
+                    is_re_referenced,
+                )),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn working_set_zero_budget_is_total() {
+        for tier in [
+            WorkingSetTier::Immortal,
+            WorkingSetTier::PinnedRoot,
+            WorkingSetTier::YoungGen,
+            WorkingSetTier::EvictedStub,
+        ] {
+            let action =
+                evaluate_working_set_eviction(working_set_input(tier, 0, 0, 0, 0, 0, false));
+            let expected = match tier {
+                WorkingSetTier::Immortal | WorkingSetTier::PinnedRoot => GcAction::RetainFull,
+                WorkingSetTier::YoungGen => GcAction::RetainFull,
+                WorkingSetTier::EvictedStub => GcAction::RetainStub,
+            };
+            assert_eq!(action, expected);
+        }
+    }
+
+    #[test]
+    fn working_set_maximum_integer_inputs() {
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::YoungGen,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                false,
+            )),
+            GcAction::RetainFull
+        );
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::YoungGen,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX - 1,
+                false,
+            )),
+            GcAction::DemoteToStub
+        );
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::PinnedRoot,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                0,
+                false,
+            )),
+            GcAction::DemoteToStub
+        );
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::EvictedStub,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                true,
+            )),
+            GcAction::PromoteToYoungGen
         );
     }
 
@@ -3500,6 +3770,33 @@ mod tests {
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
+
+    #[kani::proof]
+    fn proof_evaluate_working_set_eviction_total() {
+        let input = kani::any::<WorkingSetEvictionInput>();
+        let action = evaluate_working_set_eviction(input);
+        if matches!(input.tier, WorkingSetTier::Immortal) {
+            assert_eq!(action, GcAction::RetainFull);
+        }
+        if matches!(input.tier, WorkingSetTier::EvictedStub) {
+            let expected =
+                if input.is_re_referenced && input.projected_frame_bytes <= input.max_frame_bytes {
+                    GcAction::PromoteToYoungGen
+                } else {
+                    GcAction::RetainStub
+                };
+            assert_eq!(action, expected);
+        }
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_working_set_eviction_deterministic() {
+        let input = kani::any::<WorkingSetEvictionInput>();
+        assert_eq!(
+            evaluate_working_set_eviction(input),
+            evaluate_working_set_eviction(input)
+        );
+    }
 
     #[kani::proof]
     fn proof_task_step_no_panic() {

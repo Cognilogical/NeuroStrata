@@ -7,7 +7,7 @@
 //! Three contracts:
 //! 1. the kernel compiles standalone with zero `--extern` flags (Aeneas/Charon
 //!    extractability precondition);
-//! 2. the exhaustive 1,273-row truth table produced by the Rust kernel equals the
+//! 2. the exhaustive 3,833-row truth table produced by the Rust kernel equals the
 //!    one emitted by `lake --dir proofs exe neurostrata-proofs`;
 //! 3. no Lean proof source carries a `sorry` placeholder or an `axiom`.
 
@@ -74,6 +74,24 @@ fn connector_post_verdict_tag(v: KernelConnectorPostVerdict) -> &'static str {
     }
 }
 
+fn working_set_tier_tag(tier: formal_kernel::WorkingSetTier) -> &'static str {
+    match tier {
+        formal_kernel::WorkingSetTier::Immortal => "Immortal",
+        formal_kernel::WorkingSetTier::PinnedRoot => "PinnedRoot",
+        formal_kernel::WorkingSetTier::YoungGen => "YoungGen",
+        formal_kernel::WorkingSetTier::EvictedStub => "EvictedStub",
+    }
+}
+
+fn working_set_action_tag(action: formal_kernel::GcAction) -> &'static str {
+    match action {
+        formal_kernel::GcAction::RetainFull => "retain_full",
+        formal_kernel::GcAction::PromoteToYoungGen => "promote_to_young_gen",
+        formal_kernel::GcAction::DemoteToStub => "demote_to_stub",
+        formal_kernel::GcAction::RetainStub => "retain_stub",
+    }
+}
+
 /// Fixed-size 64-element bool array with the given prefix set, rest `false`.
 fn bool_array_64(prefix: &[bool]) -> [bool; 64] {
     let mut arr = [false; 64];
@@ -134,10 +152,10 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Generates the canonical 1011-line truth table in `proofs/Main.lean` order:
-/// 891 base/action/code-intel/ontology rows + 120 taxonomy rows.
+/// Generates the canonical truth table in `proofs/Main.lean` order:
+/// 1,273 existing rows followed by 2,560 working-set GC rows.
 fn generate_rust_truth_table() -> Vec<String> {
-    let mut lines: Vec<String> = Vec::with_capacity(1273);
+    let mut lines: Vec<String> = Vec::with_capacity(3833);
 
     for &from in TASK_STATUSES.iter() {
         for &to in TASK_STATUSES.iter() {
@@ -1253,6 +1271,51 @@ fn generate_rust_truth_table() -> Vec<String> {
         ));
     }
 
+    // WORKING_SET_GC: 2,560 rows (4 tiers × 5 ages × 2 idle TTLs × 4 node
+    // costs × 4 projections × 2 frame caps × 2 reference states).
+    let working_set_tiers = [
+        formal_kernel::WorkingSetTier::Immortal,
+        formal_kernel::WorkingSetTier::PinnedRoot,
+        formal_kernel::WorkingSetTier::YoungGen,
+        formal_kernel::WorkingSetTier::EvictedStub,
+    ];
+    for &tier in working_set_tiers.iter() {
+        for &turn_age in [0u32, 1, 3, 4, u32::MAX].iter() {
+            for &max_idle_turns in [0u32, 3].iter() {
+                for &node_bytes in [0u32, 1, 256, u32::MAX].iter() {
+                    for &projected_frame_bytes in [0u32, 4096, 4097, u32::MAX].iter() {
+                        for &max_frame_bytes in [0u32, 4096].iter() {
+                            for &is_re_referenced in [false, true].iter() {
+                                let action = formal_kernel::evaluate_working_set_eviction(
+                                    formal_kernel::WorkingSetEvictionInput {
+                                        tier,
+                                        turn_age,
+                                        max_idle_turns,
+                                        node_bytes,
+                                        projected_frame_bytes,
+                                        max_frame_bytes,
+                                        is_re_referenced,
+                                    },
+                                );
+                                lines.push(format!(
+                                    "WORKING_SET_GC|{}|{}|{}|{}|{}|{}|{}|{}",
+                                    working_set_tier_tag(tier),
+                                    turn_age,
+                                    max_idle_turns,
+                                    node_bytes,
+                                    projected_frame_bytes,
+                                    max_frame_bytes,
+                                    bool_str(is_re_referenced),
+                                    working_set_action_tag(action)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     lines
 }
 
@@ -1424,8 +1487,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        1273,
-        "expected 1273 canonical lines (891 base/action/code-intel/ontology + 120 taxonomy + 144 workflow + 17 Kani parity + 32 WAL verdict + 69 derivation-cert)"
+        3833,
+        "expected 3833 canonical lines (1273 existing + 2560 WORKING_SET_GC)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -1592,6 +1655,11 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         *section_counts.get("CERT_FULL").unwrap_or(&0),
         8,
         "expected 8 CERT_FULL rows"
+    );
+    assert_eq!(
+        *section_counts.get("WORKING_SET_GC").unwrap_or(&0),
+        2560,
+        "expected 2560 WORKING_SET_GC rows"
     );
 
     let lake = find_lake().expect(

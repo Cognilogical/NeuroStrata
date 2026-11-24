@@ -1,5 +1,6 @@
 import NeuroStrata
 import NeuroStrata.DerivationCertificate
+import NeuroStrata.WorkingSetGc
 
 open NeuroStrata.TaskMachine
 open NeuroStrata.SynapticMesh
@@ -16,6 +17,7 @@ open NeuroStrata
 open NeuroStrata.Taxonomy
 open NeuroStrata.WorkflowStage
 open NeuroStrata.DerivationCertificate
+open NeuroStrata.WorkingSetGc
 
 def boolToStr (b : Bool) : String := if b then "true" else "false"
 
@@ -380,3 +382,23 @@ def main : IO Unit := do
   IO.println s!"CERT_FULL|2|true|[8:2:true]|true|{fProfile}"
   IO.println s!"CERT_FULL|1|true|[8:2:true]|false|{fProof}"
   IO.println s!"CERT_FULL|1|true|70x[8:2:true]|true|{fBig}"
+  -- Generational working-set GC: 2,560 rows appended in canonical order.
+  let workingSetTiers : List WorkingSetTier :=
+    [.immortal, .pinnedRoot, .youngGen, .evictedStub]
+  let workingSetAges : List Nat := [0, 1, 3, 4, 4294967295]
+  let workingSetIdleLimits : List Nat := [0, 3]
+  let workingSetNodeBytes : List Nat := [0, 1, 256, 4294967295]
+  let workingSetProjections : List Nat := [0, 4096, 4097, 4294967295]
+  let workingSetFrameLimits : List Nat := [0, 4096]
+  for tier in workingSetTiers do
+    for turnAge in workingSetAges do
+      for maxIdleTurns in workingSetIdleLimits do
+        for nodeBytes in workingSetNodeBytes do
+          for projectedFrameBytes in workingSetProjections do
+            for maxFrameBytes in workingSetFrameLimits do
+              for isReReferenced in [false, true] do
+                let input : WorkingSetEvictionInput :=
+                  { tier, turnAge, maxIdleTurns, nodeBytes, projectedFrameBytes
+                    maxFrameBytes, isReReferenced }
+                let action := evaluateWorkingSetEviction input
+                IO.println s!"WORKING_SET_GC|{tier.asStr}|{turnAge}|{maxIdleTurns}|{nodeBytes}|{projectedFrameBytes}|{maxFrameBytes}|{boolToStr isReReferenced}|{action.asTag}"
