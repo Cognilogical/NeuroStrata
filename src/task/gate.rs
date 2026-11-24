@@ -355,6 +355,24 @@ pub fn task_status(result: &SearchResult) -> Status {
         .unwrap_or(Status::Open)
 }
 
+/// The worktree the task's claim stamped, if any.
+pub fn task_worktree(result: &SearchResult) -> Option<&str> {
+    non_empty(
+        result
+            .payload
+            .metadata
+            .get("task")
+            .and_then(|t| t.get("worktree")),
+    )
+}
+
+/// Whether the task's claim was stamped in the worktree at `root`. The claim
+/// stores a canonicalized path (`\\?\C:\...` on Windows) while callers send
+/// their plain root, so the two are compared as locations, not as strings.
+pub fn task_in_worktree(result: &SearchResult, root: &str) -> bool {
+    task_worktree(result).is_some_and(|w| crate::paths::same_location(w, root))
+}
+
 /// The age of `metadata.task.<first parseable key>`, in seconds. Crate-visible
 /// because the claim handler needs the same liveness window the gate's
 /// staleness advisory uses.
@@ -401,7 +419,10 @@ fn claim_blocks_scope(meta: Option<&Value>, scope: Option<&GateScope>) -> bool {
     let claim_attributed = claim_branch.is_some() || claim_worktree.is_some();
 
     let branch_matches = claim_branch.is_some() && claim_branch == caller_branch;
-    let worktree_matches = claim_worktree.is_some() && claim_worktree == caller_worktree;
+    let worktree_matches = matches!(
+        (claim_worktree, caller_worktree),
+        (Some(claim), Some(caller)) if crate::paths::same_location(claim, caller)
+    );
 
     crate::formal_kernel::evaluate_claim_scope_gate(
         scoped,
@@ -1722,6 +1743,59 @@ mod tests {
         )];
         let report = evaluate_scoped(&memories, NOW, Some(&GateScope::default()));
         assert!(report.violations.iter().any(|v| v.kind == "in_progress"));
+    }
+
+    #[test]
+    fn task_in_worktree_compares_locations_not_spellings() {
+        let stamped = |w: &str| task("t", json!({ "status": "in_progress", "worktree": w }));
+        // A claim stores the verbatim form std::fs::canonicalize gives on
+        // Windows; callers send the plain root. Parsed the same on any host.
+        let verbatim = stamped(r"\\?\C:\dev\projects\x");
+        assert!(task_in_worktree(&verbatim, r"C:\dev\projects\x"));
+        assert!(task_in_worktree(&verbatim, "c:/dev/projects/x/"));
+        assert!(!task_in_worktree(&verbatim, r"C:\dev\projects\y"));
+        let posix = stamped("/repo/a");
+        assert!(task_in_worktree(&posix, "/repo/a/"));
+        assert!(task_in_worktree(&posix, "/repo/a/./b/.."));
+        assert!(!task_in_worktree(&posix, "/repo/b"));
+        let unstamped = task("u", json!({ "status": "in_progress" }));
+        assert!(!task_in_worktree(&unstamped, "/repo/a"));
+        assert_eq!(task_worktree(&stamped("")), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn task_in_worktree_matches_a_std_canonicalized_claim_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = std::fs::canonicalize(dir.path()).unwrap();
+        let stored = stored.to_string_lossy();
+        assert!(stored.starts_with(r"\\?\"), "std form: {stored}");
+        let plain = dunce::canonicalize(dir.path()).unwrap();
+        let row = task("t", json!({ "status": "in_progress", "worktree": stored }));
+        assert!(task_in_worktree(&row, &plain.to_string_lossy()));
+    }
+
+    #[test]
+    fn strict_scope_matches_a_verbatim_claim_worktree() {
+        let current = GateScope {
+            branch: Some("feature/mine".to_string()),
+            worktree: Some(r"C:\repo\release".to_string()),
+        };
+        let memories = vec![task(
+            "verbatim-claim",
+            json!({
+                "status": "in_progress",
+                "updated_at": iso(60),
+                "branch": "feature/other",
+                "worktree": r"\\?\C:\repo\release",
+            }),
+        )];
+        let report = evaluate_scoped(&memories, NOW, Some(&current));
+        assert!(
+            report.violations.iter().any(|v| v.kind == "in_progress"),
+            "a claim in this worktree must block whatever its spelling: {:?}",
+            report.violations
+        );
     }
 
     #[test]

@@ -645,6 +645,23 @@ pub fn format_golden_rules_section(golden_rules: &[SearchResult]) -> String {
     out
 }
 
+/// The in_progress task the session rooted at `root` works on: one claimed in
+/// this worktree, else one claimed with no worktree stamped (outside git). A
+/// task claimed in another worktree is never named, or its Breath note would
+/// land in this session.
+pub fn active_task_for_root<'a>(
+    rows: &'a [SearchResult],
+    root: &str,
+    is_active: impl Fn(&SearchResult) -> bool,
+) -> Option<&'a SearchResult> {
+    rows.iter()
+        .find(|r| is_active(r) && gate::task_in_worktree(r, root))
+        .or_else(|| {
+            rows.iter()
+                .find(|r| is_active(r) && gate::task_worktree(r).is_none())
+        })
+}
+
 /// Best-effort persistence of `.NeuroStrata/active_session.json` so harness
 /// plugins can inject Golden Rules and active task context on session startup
 /// (`sessionContextHandler`) even before the first tool call.
@@ -1924,13 +1941,13 @@ pub async fn record_tool_receipt(
             let session = (!session.is_empty()).then_some(session);
             let worktree = caller_root.map(str::trim).filter(|w| !w.is_empty());
             let attributed = match (session, worktree) {
-                (Some(s), Some(w)) => pick(&|r| {
-                    task_meta(r, "session_id") == Some(s) && task_meta(r, "worktree") == Some(w)
-                })
-                .or_else(|| pick(&|r| task_meta(r, "session_id") == Some(s)))
-                .or_else(|| pick(&|r| task_meta(r, "worktree") == Some(w))),
+                (Some(s), Some(w)) => {
+                    pick(&|r| task_meta(r, "session_id") == Some(s) && gate::task_in_worktree(r, w))
+                        .or_else(|| pick(&|r| task_meta(r, "session_id") == Some(s)))
+                        .or_else(|| pick(&|r| gate::task_in_worktree(r, w)))
+                }
                 (Some(s), None) => pick(&|r| task_meta(r, "session_id") == Some(s)),
-                (None, Some(w)) => pick(&|r| task_meta(r, "worktree") == Some(w)),
+                (None, Some(w)) => pick(&|r| gate::task_in_worktree(r, w)),
                 (None, None) => None,
             }
             .or_else(|| pick(&|_| true));
@@ -11730,6 +11747,43 @@ exit 0
             },
             evidence: None,
         }
+    }
+
+    #[test]
+    fn active_task_for_root_names_this_worktree_or_an_unstamped_claim_only() {
+        let in_progress = |r: &SearchResult| gate::task_status(r) == Status::InProgress;
+        let other = task_row(
+            "t-other",
+            json!({ "status": "in_progress", "worktree": r"\\?\C:\repo\other" }),
+        );
+        let mine = task_row(
+            "t-mine",
+            json!({ "status": "in_progress", "worktree": r"\\?\C:\repo\mine" }),
+        );
+        let unstamped = task_row("t-unstamped", json!({ "status": "in_progress" }));
+        let open_mine = task_row(
+            "t-open",
+            json!({ "status": "open", "worktree": r"C:\repo\mine" }),
+        );
+        let pick = |rows: &[SearchResult], root: &str| {
+            active_task_for_root(rows, root, in_progress).map(|r| r.id.clone())
+        };
+
+        // The verbatim spelling a claim stores matches the caller's plain root,
+        // and beats an unstamped claim listed earlier.
+        let rows = [
+            open_mine.clone(),
+            other.clone(),
+            unstamped.clone(),
+            mine.clone(),
+        ];
+        assert_eq!(pick(&rows, r"C:\repo\mine").as_deref(), Some("t-mine"));
+        // A task claimed in another worktree is never named; an unstamped
+        // claim (made outside git) still is.
+        let rows = [other.clone(), unstamped.clone()];
+        assert_eq!(pick(&rows, r"C:\repo\mine").as_deref(), Some("t-unstamped"));
+        let rows = [other, open_mine];
+        assert_eq!(pick(&rows, r"C:\repo\mine"), None);
     }
 
     #[test]

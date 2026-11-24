@@ -3898,15 +3898,15 @@ async fn record_graph_query_for_caller_root(
             session.as_deref().and_then(|s| {
                 rows.iter().find(|r| {
                     is_active(r)
-                        && task_meta(r, "worktree") == Some(w)
                         && task_meta(r, "session_id") == Some(s)
+                        && crate::task::gate::task_in_worktree(r, w)
                 })
             })
         })
         .or_else(|| {
             root.and_then(|w| {
                 rows.iter()
-                    .find(|r| is_active(r) && task_meta(r, "worktree") == Some(w))
+                    .find(|r| is_active(r) && crate::task::gate::task_in_worktree(r, w))
             })
         })
         .or_else(|| {
@@ -6399,20 +6399,7 @@ async fn handle_get_snapshot(
                     .and_then(|v| v.as_str())
                     == Some("in_progress")
         };
-        let matches_root = |m: &SearchResult| {
-            m.payload
-                .metadata
-                .get("task")
-                .and_then(|t| t.get("worktree"))
-                .and_then(|v| v.as_str())
-                == Some(root_str.as_str())
-        };
-        // Only a task attributed to this worktree may become this session's
-        // active task. Falling back to the first in_progress row bound another
-        // worktree's task (and its Breath note) into this session.
-        let active_task = all_memories
-            .iter()
-            .find(|m| is_active(m) && matches_root(m))
+        let active_task = crate::task::active_task_for_root(&all_memories, root_str, is_active)
             .map(|m| (m.id.as_str(), &m.payload));
         crate::task::persist_active_session_file(
             std::path::Path::new(root_str),
@@ -13000,7 +12987,7 @@ async fn handle_guard_validate(
                     (Some(s), Some(w)) => memories.iter().find(|m| {
                         in_progress(m)
                             && task_matches(m, "session_id", s)
-                            && task_matches(m, "worktree", w)
+                            && crate::task::gate::task_in_worktree(m, w)
                     }),
                     _ => None,
                 })
@@ -13015,7 +13002,7 @@ async fn handle_guard_validate(
                     caller_worktree.and_then(|w| {
                         memories
                             .iter()
-                            .find(|m| in_progress(m) && task_matches(m, "worktree", w))
+                            .find(|m| in_progress(m) && crate::task::gate::task_in_worktree(m, w))
                     })
                 });
             let active_task_id = active_task_row.map(|m| m.id.as_str());

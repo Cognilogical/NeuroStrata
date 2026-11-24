@@ -289,7 +289,7 @@ fn joined(base: &Path, rel: &str) -> String {
 
 /// Whether `a` and `b` name the same location: by spelling, else by their
 /// canonical forms on this host.
-fn same_location(a: &str, b: &str) -> bool {
+pub(crate) fn same_location(a: &str, b: &str) -> bool {
     let lexical = |a: &str, b: &str| matches!((parse_absolute(a), parse_absolute(b)), (Some(a), Some(b)) if a == b);
     if lexical(a, b) {
         return true;
