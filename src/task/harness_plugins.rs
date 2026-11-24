@@ -631,27 +631,6 @@ fn posix_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Read back a single-quoted word whose embedded quote is written as `'`
-/// followed by `escaped`; `None` when `text` does not start with one. Returns
-/// the value and the text after it.
-fn quoted_literal_value<'a>(text: &'a str, escaped: &str) -> Option<(String, &'a str)> {
-    let mut rest = text.strip_prefix('\'')?;
-    let mut value = String::new();
-    loop {
-        let close = rest.find('\'')?;
-        value.push_str(&rest[..close]);
-        rest = &rest[close + 1..];
-        // After a closing quote, this continues the same word with a quote.
-        match rest.strip_prefix(escaped) {
-            Some(after) => {
-                value.push('\'');
-                rest = after;
-            }
-            None => return Some((value, rest)),
-        }
-    }
-}
-
 /// Read back a word written by `shell_literal`.
 #[cfg(test)]
 fn shell_literal_value(text: &str) -> Option<(String, &str)> {
@@ -662,9 +641,24 @@ fn shell_literal_value(text: &str) -> Option<(String, &str)> {
     }
 }
 
-/// Read a word written by [`posix_literal`].
+/// Read a word written by [`posix_literal`]; `None` when `text` does not
+/// start with one. Returns the value and the text after it.
 fn posix_literal_value(text: &str) -> Option<(String, &str)> {
-    quoted_literal_value(text, r"\''")
+    let mut rest = text.strip_prefix('\'')?;
+    let mut value = String::new();
+    loop {
+        let close = rest.find('\'')?;
+        value.push_str(&rest[..close]);
+        rest = &rest[close + 1..];
+        // After a closing quote, this continues the same word with a quote.
+        match rest.strip_prefix(r"\''") {
+            Some(after) => {
+                value.push('\'');
+                rest = after;
+            }
+            None => return Some((value, rest)),
+        }
+    }
 }
 
 /// Whether a runner path is the installer's canonical runner for THIS
@@ -677,17 +671,55 @@ fn is_installer_runner(path: &str, project_root: &Path, abs_runner: &str) -> boo
         || same_path_on_disk(&project_root.join(path).to_string_lossy(), abs_runner)
 }
 
+/// The characters PowerShell treats as a single quote: the ASCII one and
+/// the typographic ones (U+2018 to U+201B). Any of them ends a single-quoted
+/// string, and one followed by another is one literal quote.
+const POWERSHELL_SINGLE_QUOTES: [char; 5] = ['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'];
+
 /// PowerShell's single-quote rules, independent of the platform the
-/// installer runs on: only `''` is an escape inside single quotes. Codex
-/// uses `commandWindows` on Windows even when the installer was produced on
-/// another OS, so this cannot use `cfg!(windows)` in [`shell_literal`].
+/// installer runs on: inside single quotes the only escape is a doubled
+/// quote, and every character in [`POWERSHELL_SINGLE_QUOTES`] needs it (a
+/// path may hold a typographic one). Codex uses `commandWindows` on Windows
+/// even when the installer was produced on another OS, so this cannot use
+/// `cfg!(windows)` in [`shell_literal`].
 fn powershell_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    let mut word = String::with_capacity(value.len() + 2);
+    word.push('\'');
+    for c in value.chars() {
+        if POWERSHELL_SINGLE_QUOTES.contains(&c) {
+            word.push(c);
+        }
+        word.push(c);
+    }
+    word.push('\'');
+    word
 }
 
-/// Read a word written by [`powershell_literal`].
+/// Read a word written by [`powershell_literal`]; `None` when `text` does
+/// not start with one. Returns the value and the text after it. As in
+/// PowerShell, a quote followed by another quote is one literal quote (the
+/// second), and a lone quote ends the word.
 fn powershell_literal_value(text: &str) -> Option<(String, &str)> {
-    quoted_literal_value(text, "'")
+    let mut chars = text.char_indices().peekable();
+    let (_, open) = chars.next()?;
+    if !POWERSHELL_SINGLE_QUOTES.contains(&open) {
+        return None;
+    }
+    let mut value = String::new();
+    while let Some((i, c)) = chars.next() {
+        if !POWERSHELL_SINGLE_QUOTES.contains(&c) {
+            value.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some(&(_, next)) if POWERSHELL_SINGLE_QUOTES.contains(&next) => {
+                value.push(next);
+                chars.next();
+            }
+            _ => return Some((value, &text[i + c.len_utf8()..])),
+        }
+    }
+    None
 }
 
 /// The two command forms the installer writes into a Codex hook entry:
@@ -732,21 +764,27 @@ fn strip_installer_env_prefix(mut command: &str) -> &str {
     }
 }
 
-/// The runner path in a hook command after any environment prefix, in either
-/// platform's quoting. A command that runs anything after the runner is a
-/// user's own and is not claimed.
-fn hook_command_runner(command: &str) -> Option<(String, &str)> {
-    let quoted = strip_installer_env_prefix(command).strip_prefix("node ")?;
+/// The runner path a hook command runs after any environment prefix, read in
+/// each platform's quoting; empty when it is not `node <one quoted word>`. A
+/// word can read differently in the two (`'a’’b'` holds two typographic
+/// quotes in `sh`, one in PowerShell), so every full reading is returned and
+/// the caller checks each. A command that runs anything after the runner is
+/// a user's own and is not claimed.
+fn hook_command_runners(command: &str) -> Vec<String> {
+    let Some(quoted) = strip_installer_env_prefix(command).strip_prefix("node ") else {
+        return Vec::new();
+    };
     let parsers: [fn(&str) -> Option<(String, &str)>; 2] =
         [posix_literal_value, powershell_literal_value];
+    let mut paths: Vec<String> = Vec::new();
     for parse in parsers {
         if let Some((path, rest)) = parse(quoted) {
-            if rest.trim().is_empty() {
-                return Some((path, rest));
+            if rest.trim().is_empty() && !paths.contains(&path) {
+                paths.push(path);
             }
         }
     }
-    None
+    paths
 }
 
 /// Whether a `[hooks]` table in Codex's other config layer
@@ -886,13 +924,16 @@ fn wire_codex_hooks(
         ));
         return None;
     };
+    if let Some(event) = non_array_hook_list(h_obj) {
+        warnings.push(format!(
+            "{} has a non-array {event} hook list, which disables the whole file; no Codex hook was wired",
+            hooks_path.display()
+        ));
+        return None;
+    }
     for (event, matcher) in CODEX_HOOK_EVENTS {
         let entries = h_obj.entry(event).or_insert_with(|| json!([]));
         let Some(arr) = entries.as_array_mut() else {
-            warnings.push(format!(
-                "{} has a non-array {event} hook list; that event was left untouched",
-                hooks_path.display()
-            ));
             continue;
         };
         let mut present = false;
@@ -906,10 +947,10 @@ fn wire_codex_hooks(
                     let Some(command) = hook.get(key).and_then(Value::as_str) else {
                         continue;
                     };
-                    let Some((old_path, _)) = hook_command_runner(command) else {
-                        continue;
-                    };
-                    if !is_installer_runner(&old_path, project_root, abs_runner) {
+                    if !hook_command_runners(command)
+                        .iter()
+                        .any(|old_path| is_installer_runner(old_path, project_root, abs_runner))
+                    {
                         continue;
                     }
                     owned = true;
@@ -957,21 +998,55 @@ fn wire_codex_hooks(
     }
     // hooks.json is untracked and carries an absolute runner path. Keep it
     // out of a commit by listing it in the checkout's local exclude file
-    // (#368 F10). Best effort: a bare directory has no git, and a linked
-    // worktree's `.git` is a file pointing elsewhere.
+    // (#368 F10). Best effort: a bare directory has no git.
     exclude_local_file(project_root, ".codex/hooks.json");
     Some(hooks_path.to_string_lossy().to_string())
 }
 
-/// Add `/<rel>` to this checkout's `.git/info/exclude` once (`rel` is a path
-/// relative to the checkout, with `/` separators).
-fn exclude_local_file(project_root: &Path, rel: &str) {
-    let git_dir = project_root.join(".git");
-    if git_dir.is_file() {
-        return;
+/// The first event in a hooks object whose list is not an array. Codex and
+/// Copilot CLI each parse the hooks file as a whole, so one such list
+/// disables every hook in the file (Copilot's hooks reference: "a non-array
+/// event list" rejects "the entire file"). The installer then leaves the
+/// file as it is rather than add hooks that would never run.
+fn non_array_hook_list(hooks: &serde_json::Map<String, Value>) -> Option<&str> {
+    hooks
+        .iter()
+        .find(|(_, list)| !list.is_array())
+        .map(|(event, _)| event.as_str())
+}
+
+/// Warn when a harness config beside a hooks file was not written: the hooks
+/// still run, and the runner takes the namespace from the project marker or
+/// discovers it.
+fn warn_unwritten_config(written: Option<String>, cfg_path: &Path, warnings: &mut Vec<String>) {
+    if written.is_none() {
+        warnings.push(format!(
+            "{} could not be written; the hook runner takes the namespace from the project marker or discovers it",
+            cfg_path.display()
+        ));
     }
-    let exclude = git_dir.join("info").join("exclude");
-    if refuse_symlink_components(project_root, &exclude).is_err() {
+}
+
+/// Add `/<rel>` to this checkout's `.git/info/exclude` once (`rel` is a path
+/// relative to the checkout, with `/` separators). A linked worktree's
+/// `.git` is a file; git reads `info/exclude` from the common git directory
+/// every worktree shares ([`crate::paths::common_git_dir`]), so the entry
+/// goes there and covers each worktree's own copy of the file.
+fn exclude_local_file(project_root: &Path, rel: &str) {
+    let dot_git = project_root.join(".git");
+    let (exclude, symlink_root) = if dot_git.is_file() {
+        let Some(common) = crate::paths::common_git_dir(&project_root.to_string_lossy()) else {
+            return;
+        };
+        let common = PathBuf::from(common);
+        (common.join("info").join("exclude"), common)
+    } else {
+        (
+            dot_git.join("info").join("exclude"),
+            project_root.to_path_buf(),
+        )
+    };
+    if refuse_symlink_components(&symlink_root, &exclude).is_err() {
         return;
     }
     if let Some(parent) = exclude.parent() {
@@ -1071,16 +1146,19 @@ fn wire_copilot_hooks(
         ));
         return None;
     };
+    if let Some(event) = non_array_hook_list(h_obj) {
+        warnings.push(format!(
+            "{} has a non-array {event} hook list, which disables the whole file; no Copilot hook was wired",
+            hooks_path.display()
+        ));
+        return None;
+    }
     for event in COPILOT_HOOK_EVENTS {
         let Some(entries) = h_obj
             .entry(event)
             .or_insert_with(|| json!([]))
             .as_array_mut()
         else {
-            warnings.push(format!(
-                "{} has a non-array {event} hook list; that event was left untouched",
-                hooks_path.display()
-            ));
             continue;
         };
         let mut present = false;
@@ -1089,8 +1167,11 @@ fn wire_copilot_hooks(
                 entry
                     .get(*key)
                     .and_then(Value::as_str)
-                    .and_then(hook_command_runner)
-                    .is_some_and(|(path, _)| is_installer_runner(&path, project_root, abs_runner))
+                    .is_some_and(|command| {
+                        hook_command_runners(command)
+                            .iter()
+                            .any(|path| is_installer_runner(path, project_root, abs_runner))
+                    })
             });
             if !ours || !entry.is_object() {
                 continue;
@@ -2739,17 +2820,17 @@ fn wire_harness_config(
                     }),
                     namespace.as_deref(),
                 );
-                let cfg_written = write_json_if_changed(&cfg_path, &doc);
+                warn_unwritten_config(write_json_if_changed(&cfg_path, &doc), &cfg_path, warnings);
                 // Codex CLI never reads the metadata file: it runs hooks from
                 // `.codex/hooks.json` (or `[hooks]` in config.toml). Report
                 // only a hook that was actually wired, never the metadata as
                 // a fallback; say so loudly when wiring failed (#368 F6).
                 let hooks_wired = wire_codex_hooks(project_root, abs_runner, warnings);
                 if hooks_wired.is_none() {
-                    warnings.push(format!(
-                        "Codex metadata {} was written but no Codex hook was wired; check .codex/hooks.json and .codex/config.toml",
-                        cfg_path.display()
-                    ));
+                    warnings.push(
+                        "no Codex hook was wired; check .codex/hooks.json and .codex/config.toml"
+                            .to_string(),
+                    );
                 }
                 return hooks_wired;
             }
@@ -2789,15 +2870,14 @@ fn wire_harness_config(
                     }),
                     namespace.as_deref(),
                 );
-                let _ = write_json_if_changed(&cfg_path, &doc);
+                warn_unwritten_config(write_json_if_changed(&cfg_path, &doc), &cfg_path, warnings);
                 // Copilot CLI never reads the extension file: it runs hooks
                 // from `.github/hooks/*.json`. Report only a hook that was
                 // actually wired, as for Codex.
                 let hooks_wired = wire_copilot_hooks(project_root, abs_runner, warnings);
                 if hooks_wired.is_none() {
                     warnings.push(format!(
-                        "Copilot config {} was written but no Copilot hook was wired; check {}",
-                        cfg_path.display(),
+                        "no Copilot hook was wired; check {}",
                         project_root.join(COPILOT_HOOKS_REL).display()
                     ));
                 }
@@ -5955,15 +6035,147 @@ mod tests {
         );
         assert_eq!(posix_literal_value(&word), Some((path.to_string(), "")));
         let command = format!("node {word}");
-        assert_eq!(
-            hook_command_runner(&command).map(|(p, _)| p),
-            Some(path.to_string())
-        );
+        assert_eq!(hook_command_runners(&command), vec![path.to_string()]);
         let ps = format!("node {}", powershell_literal(path));
+        assert_eq!(hook_command_runners(&ps), vec![path.to_string()]);
+    }
+
+    /// PowerShell ends a single-quoted string at a typographic quote too
+    /// (U+2018 to U+201B), so each one in a path is doubled like `'`. The
+    /// PowerShell parser reads `'C:\o’’brien\x‘‘y\a''b\cli-hook.mjs'` as
+    /// `C:\o’brien\x‘y\a'b\cli-hook.mjs` (checked with
+    /// `[System.Management.Automation.Language.Parser]::ParseInput`).
+    #[test]
+    fn powershell_literal_doubles_typographic_quotes() {
+        let path = "C:\\o\u{2019}brien\\x\u{2018}y\\a'b\\cli-hook.mjs";
+        let word = powershell_literal(path);
         assert_eq!(
-            hook_command_runner(&ps).map(|(p, _)| p),
-            Some(path.to_string())
+            word,
+            "'C:\\o\u{2019}\u{2019}brien\\x\u{2018}\u{2018}y\\a''b\\cli-hook.mjs'"
         );
+        assert_eq!(
+            powershell_literal_value(&word),
+            Some((path.to_string(), ""))
+        );
+        for quote in POWERSHELL_SINGLE_QUOTES {
+            let path = format!("C:\\a{quote}b\\cli-hook.mjs");
+            let word = powershell_literal(&path);
+            assert_eq!(powershell_literal_value(&word), Some((path.clone(), "")));
+            // `sh` reads the typographic quotes literally, so the command has
+            // two readings; the PowerShell one is among them.
+            assert!(hook_command_runners(&format!("node {word}")).contains(&path));
+        }
+        // A lone typographic quote ends the word, as in PowerShell.
+        assert_eq!(
+            powershell_literal_value("'a\u{2019} rest"),
+            Some(("a".to_string(), " rest"))
+        );
+    }
+
+    /// The installer recognizes its own PowerShell command for a runner path
+    /// with a typographic quote (on Windows both Codex commands use it), so a
+    /// second run repairs it in place instead of adding a second entry.
+    #[test]
+    fn hooks_for_a_path_with_a_typographic_quote_are_written_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("o\u{2019}brien");
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        for harness in ["github-cli", "codex"] {
+            for _ in 0..2 {
+                let _ = auto_install_detected_plugins(
+                    &root,
+                    ConfigNamespace::Set("TestProj"),
+                    Some(harness),
+                );
+            }
+        }
+        let copilot = read_copilot_hooks(&root);
+        for event in COPILOT_HOOK_EVENTS {
+            assert_eq!(
+                copilot["hooks"][event].as_array().unwrap().len(),
+                1,
+                "{copilot}"
+            );
+        }
+        let codex = read_codex_hooks(&root);
+        for (event, _) in CODEX_HOOK_EVENTS {
+            assert_eq!(
+                codex["hooks"][event].as_array().unwrap().len(),
+                1,
+                "{codex}"
+            );
+        }
+    }
+
+    /// Copilot rejects the whole hooks file when any event list is not an
+    /// array, and Codex parses its file as a whole: the installer leaves such
+    /// a file as it is and reports no hook wired.
+    #[test]
+    fn hooks_file_with_a_non_array_event_list_is_left_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".github/hooks")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        let copilot = r#"{"version": 1, "hooks": {"postToolUse": {"type": "command"}}}"#;
+        let codex = r#"{"hooks": {"PostToolUse": "echo user"}}"#;
+        std::fs::write(tmp.path().join(COPILOT_HOOKS_REL), copilot).unwrap();
+        std::fs::write(tmp.path().join(".codex/hooks.json"), codex).unwrap();
+        for (harness, rel, text, event) in [
+            ("github-cli", COPILOT_HOOKS_REL, copilot, "postToolUse"),
+            ("codex", ".codex/hooks.json", codex, "PostToolUse"),
+        ] {
+            let report = auto_install_detected_plugins(
+                tmp.path(),
+                ConfigNamespace::Set("TestProj"),
+                Some(harness),
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join(rel)).unwrap(),
+                text,
+                "{harness}"
+            );
+            assert!(
+                report["installed_plugins"][0]["config_wired"].is_null(),
+                "{harness}: {report}"
+            );
+            let warned = report["warnings"].as_array().unwrap().iter().any(|w| {
+                w.as_str()
+                    .is_some_and(|s| s.contains(&format!("non-array {event} hook list")))
+            });
+            assert!(warned, "{harness}: {report}");
+        }
+    }
+
+    /// A linked worktree's `.git` is a file: the exclude entry goes into the
+    /// common git directory's `info/exclude`, which git reads for every
+    /// worktree.
+    #[test]
+    fn linked_worktree_hooks_file_is_excluded_in_the_common_git_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main = tmp.path().join("main");
+        let gitdir = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(wt.join(".github")).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+        let _ = auto_install_detected_plugins(
+            &wt,
+            ConfigNamespace::Set("TestProj"),
+            Some("github-cli"),
+        );
+        assert!(wt.join(COPILOT_HOOKS_REL).exists());
+        let exclude = std::fs::read_to_string(main.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            exclude.matches("/.github/hooks/neurostrata.json").count(),
+            1,
+            "{exclude}"
+        );
+        assert!(!gitdir.join("info/exclude").exists());
     }
 
     /// #368 F7: Codex detected only through the user's home install still
