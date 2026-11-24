@@ -2178,15 +2178,6 @@ fn dispatch_project_context(
     Ok(output)
 }
 
-/// The daemon creates its lock by appending ".daemon.lock" to the db_path
-/// (see daemon_lock_path in main.rs). with_extension would produce
-/// "db.db.daemon.lock" for a file named "db", which is wrong.
-fn lock_path_for(db_path: &str) -> std::path::PathBuf {
-    let mut os = std::ffi::OsString::from(db_path);
-    os.push(".daemon.lock");
-    std::path::PathBuf::from(os)
-}
-
 async fn probe_daemon() -> DaemonProbe {
     match daemon_http_client()
         .get("http://127.0.0.1:34343/health")
@@ -2225,29 +2216,186 @@ fn open_daemon_lock(db_path: &std::path::Path) -> std::io::Result<std::fs::File>
         .open(path)
 }
 
+/// Takes the daemon lock if nobody holds it. `Ok(None)` means someone does: a
+/// daemon, or a CLI command working on the store. Every lock check and every
+/// holder goes through here.
+fn try_take_store_lock(db_path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = open_daemon_lock(db_path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "could not open {}: {e}",
+                daemon_lock_path(db_path).display()
+            ),
+        )
+    })?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// The lock for a CLI command that opens the store itself, held until the
+/// guard drops, so no daemon can start while the command works. `None` when
+/// it cannot be taken; the command must not open the store then.
+fn hold_store_lock(db_path: &std::path::Path) -> Option<std::fs::File> {
+    try_take_store_lock(db_path).unwrap_or_else(|e| {
+        tracing::warn!(
+            "the store lock for {} could not be taken: {e}",
+            db_path.display()
+        );
+        None
+    })
+}
+
 /// Held for the life of the daemon process and never dropped, so the lock goes
 /// with the process rather than with anything that runs before the database
 /// has closed.
 static DAEMON_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
 
-/// What a stopping daemon leaves in its lock file for `shutdown` to read.
+/// What a stopping daemon leaves in its exit report for `shutdown` to read.
 const FINAL_CHECKPOINT_OK: &str = "checkpointed";
+
+/// Where a stopping daemon reports how its final checkpoint went. It is not
+/// the lock file: the next daemon rewrites that as soon as it takes the lock,
+/// which could erase the report before `shutdown` has read it.
+fn daemon_exit_report_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(".daemon.exit");
+    std::path::PathBuf::from(path)
+}
+
+/// Where a starting daemon parks a checkpoint report left in the lock file by
+/// a daemon built before the exit report had its own file. The lock file is
+/// emptied on takeover; without this stash `shutdown` loses the report when a
+/// replacement takes the lock before the old daemon's shutdown reads it.
+fn daemon_legacy_report_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(".daemon.legacy-report");
+    std::path::PathBuf::from(path)
+}
+
+/// Where a daemon writes its process id once it holds the lock. Not the lock
+/// file itself: on Windows the lock is mandatory, so no other process can read
+/// the lock file while a daemon holds it.
+fn daemon_pid_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(".daemon.pid");
+    std::path::PathBuf::from(path)
+}
+
+/// Who holds the daemon lock, as read from the pid file (see
+/// `take_daemon_lock`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockHolder {
+    /// A current daemon, by process id.
+    Pid(u32),
+    /// No id: a daemon between taking the lock and writing its id, a daemon
+    /// built before the pid file existed, or a file that could not be read.
+    Starting,
+    /// A daemon built before the pid file existed, or anything other than a
+    /// process id in the pid file.
+    Legacy,
+}
+
+impl LockHolder {
+    fn read(db_path: &std::path::Path) -> Self {
+        let text = std::fs::read_to_string(daemon_pid_path(db_path)).unwrap_or_default();
+        let text = text.trim();
+        if text.is_empty() {
+            LockHolder::Starting
+        } else if let Ok(pid) = text.parse() {
+            LockHolder::Pid(pid)
+        } else {
+            LockHolder::Legacy
+        }
+    }
+
+    /// Whether `now` is a different daemon than `self`. Only a different
+    /// process id proves a new holder; a daemon that has not written its id
+    /// yet is not one.
+    fn replaced_by(self, now: LockHolder) -> bool {
+        match (self, now) {
+            (LockHolder::Pid(was), LockHolder::Pid(is)) => was != is,
+            (LockHolder::Legacy, LockHolder::Pid(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The exit report written by the daemon with process id `pid`, once it has
+/// written one. The report file starts with the id of the daemon that wrote
+/// it, so a report left by any other daemon is never taken for this one's.
+fn exit_report_of(db_path: &std::path::Path, pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(daemon_exit_report_path(db_path)).ok()?;
+    let (id, report) = text.split_once('\n')?;
+    (id.parse::<u32>().ok()? == pid).then(|| report.to_string())
+}
+
+/// The report of a daemon built before the exit report had its own file: it
+/// wrote the report into the lock file. A current daemon empties the lock
+/// file when it takes the lock and never writes a report there.
+fn report_in_lock_file(db_path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(daemon_lock_path(db_path)).ok()?;
+    (text == FINAL_CHECKPOINT_OK || text.starts_with("error: ")).then_some(text)
+}
+
+/// Consume a parked legacy report, but only for the daemon that parked it.
+/// The stash is one-shot so a later shutdown cannot mistake an old daemon's
+/// report for the one it is stopping.
+fn parked_legacy_report(db_path: &std::path::Path, current: LockHolder) -> Option<String> {
+    let path = daemon_legacy_report_path(db_path);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let (pid, report) = text.split_once('\n')?;
+    let matches = match current {
+        LockHolder::Pid(holder) => pid.parse::<u32>().ok() == Some(holder),
+        LockHolder::Starting | LockHolder::Legacy => false,
+    };
+    if matches {
+        let _ = std::fs::remove_file(&path);
+        Some(report.to_string())
+    } else {
+        None
+    }
+}
+
+/// How long a starting daemon keeps retrying a lock that someone else holds.
+/// `daemon_holds_lock` takes the lock for an instant when it finds it free, so
+/// a daemon starting at that instant would otherwise refuse to run.
+const DAEMON_LOCK_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Takes the daemon lock, or refuses: a second daemon would open the database
 /// while the first one is writing to it.
 fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    let file = open_daemon_lock(db_path)?;
-    match file.try_lock() {
-        Ok(()) => {
-            // Whatever the last daemon reported is not about this one.
-            file.set_len(0)?;
-            Ok(file)
+    let deadline = std::time::Instant::now() + DAEMON_LOCK_RETRY;
+    loop {
+        match try_take_store_lock(db_path)? {
+            Some(file) => {
+                // A daemon built before the exit report file may have left
+                // its checkpoint in the lock file. Park it before emptying
+                // the file so `shutdown` can still report it after this
+                // daemon takes over. Tagged with this daemon's id so only the
+                // replacement this stash belongs to consumes it.
+                if let Some(report) = report_in_lock_file(db_path) {
+                    let parked = format!("{}\n{}", std::process::id(), report);
+                    let _ = std::fs::write(daemon_legacy_report_path(db_path), parked);
+                }
+                // The process id identifies this daemon: `shutdown` uses it
+                // to tell this daemon from one that replaces it, and to pick
+                // out this daemon's exit report.
+                file.set_len(0)?;
+                std::fs::write(daemon_pid_path(db_path), std::process::id().to_string())?;
+                return Ok(file);
+            }
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            None => return Err(anyhow::anyhow!(
+                "Another NeuroStrata daemon, or a CLI command working on the store, holds {:?}.",
+                db_path
+            )),
         }
-        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::anyhow!(
-            "Another NeuroStrata daemon is already running against {:?}.",
-            db_path
-        )),
-        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
 
@@ -2298,6 +2446,13 @@ async fn prepare_fallback_write_store(
     vector_store.init(namespace).await
 }
 
+/// Whether the stdio proxy should wait for a daemon instead of spawning one.
+/// Only a live holder counts: the lock file outlives the daemon, so its mere
+/// presence says nothing about whether one is running.
+fn proxy_should_wait_for_daemon(db_path: Option<&str>) -> bool {
+    db_path.is_some_and(|p| daemon_holds_lock(std::path::Path::new(p)))
+}
+
 /// Whether a store is already present at `db_path`.
 ///
 /// `Path::exists` follows symlinks, so a dangling store symlink would read as
@@ -2345,21 +2500,31 @@ fn fallback_read_only_command(cmd: &Commands) -> bool {
 }
 
 /// Whether some process holds the daemon lock right now.
+///
+/// A lock file that exists but cannot be checked counts as held: like the
+/// `--no-open` gate (#209), "cannot show it is free" is not "free", and every
+/// caller is safer waiting or refusing than starting a second daemon or
+/// opening the store under a live one.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     // Read-only status probes must not create the lock file: open_daemon_lock
     // opens with .create(true), so an absent-but-unheld lock would be
     // materialized just by asking about it.
-    if !daemon_lock_path(db_path).exists() {
-        return false;
-    }
-    match open_daemon_lock(db_path) {
-        Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+    // Only "no such file" means free: any other failure to look the file up
+    // is a lock that cannot be checked, which counts as held below.
+    let outcome = match std::fs::metadata(daemon_lock_path(db_path)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) => Err(e),
+        Ok(_) => try_take_store_lock(db_path),
+    };
+    match outcome {
+        Ok(Some(_)) => false,
+        Ok(None) => true,
         Err(e) => {
             tracing::warn!(
-                "daemon_holds_lock probe failed for {}: {e}",
+                "daemon_holds_lock probe failed for {}, treating the lock as held: {e}",
                 db_path.display()
             );
-            false
+            true
         }
     }
 }
@@ -2381,18 +2546,10 @@ fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
 /// A lock that cannot be taken is not evidence that the store is free, so
 /// the failure is closed: the caller refuses instead of copying.
 fn hold_store_lock_for_copy(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    let lock_path = daemon_lock_path(db_path);
-    let file = open_daemon_lock(db_path).map_err(|e| {
-        anyhow::anyhow!(
-            "Refusing the uncoordinated file copy: the store lock could not be taken (could not open {}: {}), so it cannot be shown that no daemon holds the store. Take a coordinated backup with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` first.",
-            lock_path.display(),
-            e
-        )
-    })?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(anyhow::anyhow!("{}", NO_OPEN_LOCK_HELD_MESSAGE)),
-        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::anyhow!(
+    match try_take_store_lock(db_path) {
+        Ok(Some(file)) => Ok(file),
+        Ok(None) => Err(anyhow::anyhow!("{}", NO_OPEN_LOCK_HELD_MESSAGE)),
+        Err(e) => Err(anyhow::anyhow!(
             "Refusing the uncoordinated file copy: the store lock could not be taken ({}), so it cannot be shown that no daemon holds the store. Take a coordinated backup with `neurostrata-mcp backup <dir>` (without --no-open), or run `neurostrata-mcp shutdown` first.",
             e
         )),
@@ -2454,22 +2611,10 @@ async fn open_cli_read_store(probe: DaemonProbe) -> Result<CliReadStore, String>
     // `hold_store_lock_for_copy` does: a daemon that starts after a mere probe
     // could write a log between the checks below and the open. Taking it
     // creates the empty lock file when it is missing.
-    let lock = match open_daemon_lock(&config.db_path) {
-        Ok(file) => match file.try_lock() {
-            Ok(()) => file,
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err("no daemon, store locked".to_string())
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(format!("the store lock could not be taken: {e}"))
-            }
-        },
-        Err(e) => {
-            return Err(format!(
-                "the store lock could not be opened ({}): {e}",
-                daemon_lock_path(&config.db_path).display()
-            ))
-        }
+    let lock = match try_take_store_lock(&config.db_path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Err("no daemon, store locked".to_string()),
+        Err(e) => return Err(format!("the store lock could not be taken: {e}")),
     };
     if probe == DaemonProbe::Silent {
         return Err(
@@ -3238,23 +3383,37 @@ fn install_pre_commit_hook(root: &std::path::Path) -> anyhow::Result<std::path::
 }
 
 /// Records how the daemon's final checkpoint went, for `shutdown` to report.
-fn record_final_checkpoint(outcome: &anyhow::Result<()>) {
+/// Written while the lock is still held, so the report is in place before
+/// `shutdown` can see the lock go.
+fn record_final_checkpoint(db_path: &std::path::Path, outcome: &anyhow::Result<()>) {
     use std::io::Write;
-    if let Some(file) = DAEMON_LOCK.get() {
-        let report = match outcome {
-            Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
-            Err(e) => format!("error: {}", e),
-        };
-        if let Err(e) = file.set_len(0) {
-            tracing::warn!("final checkpoint report truncate failed: {e}");
-        }
-        if let Err(e) = (&*file).write_all(report.as_bytes()) {
-            tracing::warn!("final checkpoint report write failed: {e}");
-        }
-        if let Err(e) = file.sync_all() {
-            tracing::warn!("final checkpoint report sync failed: {e}");
-        }
+    if DAEMON_LOCK.get().is_none() {
+        return;
     }
+    let report = match outcome {
+        Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
+        Err(e) => format!("error: {}", e),
+    };
+    let report = format!("{}\n{}", std::process::id(), report);
+    // A current daemon's own report supersedes any legacy report parked by
+    // an earlier takeover; leaving it would let a later shutdown read a
+    // checkpoint from a daemon that is long gone.
+    let _ = std::fs::remove_file(daemon_legacy_report_path(db_path));
+    let path = daemon_exit_report_path(db_path);
+    let written = std::fs::File::create(&path).and_then(|mut file| {
+        file.write_all(report.as_bytes())
+            .and_then(|()| file.sync_all())
+    });
+    if let Err(e) = written {
+        tracing::warn!(
+            "final checkpoint report write to {} failed: {e}",
+            path.display()
+        );
+    }
+    // Still holding the lock: no other daemon has written its id yet. With the
+    // id gone, the next daemon reads as starting until it writes its own,
+    // instead of as this one.
+    let _ = std::fs::remove_file(daemon_pid_path(db_path));
 }
 
 /// Read-only queries against the store, transparently proxied to the daemon
@@ -4113,6 +4272,179 @@ mod tests {
             !daemon_holds_lock(&db),
             "the lock is free once its holder is gone"
         );
+    }
+
+    #[test]
+    fn a_starting_daemon_waits_out_a_brief_holder() {
+        let root = std::env::temp_dir().join(format!("ns-brief-lock-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        // Stands in for a status probe that took the free lock for a moment.
+        let probe = take_daemon_lock(&db).expect("the probe takes the lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(probe);
+        });
+        let daemon = take_daemon_lock(&db);
+        release.join().unwrap();
+        assert!(
+            daemon.is_ok(),
+            "the daemon gets the lock once the probe lets go"
+        );
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shutdown_reads_only_the_exit_report_of_the_daemon_it_stops() {
+        let root = std::env::temp_dir().join(format!("ns-exit-report-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+
+        let first = take_daemon_lock(&db).expect("the first daemon takes the lock");
+        let first_pid = match LockHolder::read(&db) {
+            LockHolder::Pid(pid) => pid,
+            other => panic!("taking the lock writes the process id, got {other:?}"),
+        };
+        assert_eq!(exit_report_of(&db, first_pid), None, "no report yet");
+        std::fs::write(
+            daemon_exit_report_path(&db),
+            format!("{first_pid}\n{FINAL_CHECKPOINT_OK}"),
+        )
+        .unwrap();
+        drop(first);
+
+        // A new daemon takes the lock: the old report stays, and stays the old one's.
+        let second = take_daemon_lock(&db).expect("a new daemon takes the lock");
+        assert_eq!(
+            exit_report_of(&db, first_pid).as_deref(),
+            Some(FINAL_CHECKPOINT_OK),
+            "shutdown still reads the stopped daemon's report"
+        );
+        assert_eq!(
+            exit_report_of(&db, first_pid.wrapping_add(1)),
+            None,
+            "a report is never taken for another daemon's"
+        );
+        drop(second);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shutdown_still_reads_a_report_an_older_daemon_left_in_the_lock_file() {
+        let root = std::env::temp_dir().join(format!("ns-legacy-report-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        std::fs::create_dir_all(&root).unwrap();
+        // What a daemon built before the separate exit report leaves behind.
+        std::fs::write(daemon_lock_path(&db), FINAL_CHECKPOINT_OK).unwrap();
+        assert_eq!(
+            report_in_lock_file(&db).as_deref(),
+            Some(FINAL_CHECKPOINT_OK)
+        );
+
+        // A current daemon empties the lock file, but parks the legacy
+        // report so `shutdown` can read it even though it sees a replacement.
+        let lock = take_daemon_lock(&db).expect("take the lock");
+        assert_eq!(report_in_lock_file(&db), None);
+        let current = LockHolder::Pid(std::process::id());
+        assert_eq!(
+            parked_legacy_report(&db, current).as_deref(),
+            Some(FINAL_CHECKPOINT_OK)
+        );
+        assert_eq!(
+            parked_legacy_report(&db, current),
+            None,
+            "stash is one-shot"
+        );
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_a_different_process_id_is_a_replacement() {
+        let root = std::env::temp_dir().join(format!("ns-lock-holder-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = daemon_pid_path(&db);
+        let holder_after = |text: &str| {
+            std::fs::write(&pid_file, text).unwrap();
+            LockHolder::read(&db)
+        };
+
+        let stopping = holder_after("4242");
+        assert_eq!(stopping, LockHolder::Pid(4242));
+        // Something that is not a process id.
+        assert!(!stopping.replaced_by(holder_after(FINAL_CHECKPOINT_OK)));
+        // A daemon that took the lock but has not written its id yet.
+        assert!(!stopping.replaced_by(holder_after("")));
+        // The same daemon.
+        assert!(!stopping.replaced_by(holder_after("4242")));
+        // A new daemon.
+        assert!(stopping.replaced_by(holder_after("4343")));
+        // Stopping an older daemon: the first process id seen is a new one.
+        assert!(LockHolder::Legacy.replaced_by(holder_after("4343")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cli_command_holding_the_store_keeps_the_proxy_from_starting_a_daemon() {
+        let root = std::env::temp_dir().join(format!("ns-cli-holds-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        let db_str = db.to_str().unwrap().to_string();
+
+        let command = hold_store_lock(&db).expect("a CLI command takes the lock");
+        assert!(
+            proxy_should_wait_for_daemon(Some(&db_str)),
+            "the proxy waits"
+        );
+        assert!(take_daemon_lock(&db).is_err(), "a daemon is refused");
+        drop(command);
+        assert!(
+            !proxy_should_wait_for_daemon(Some(&db_str)),
+            "free again once the command ends"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_checked_counts_as_held() {
+        let root =
+            std::env::temp_dir().join(format!("ns-unreadable-lock-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        // A directory where the lock file belongs: it exists but cannot be locked.
+        std::fs::create_dir_all(daemon_lock_path(&db)).unwrap();
+        assert!(
+            daemon_holds_lock(&db),
+            "an unreadable lock is not a free one"
+        );
+        assert!(
+            proxy_should_wait_for_daemon(db.to_str()),
+            "the proxy waits instead of starting a second daemon"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stale_lock_file_does_not_make_the_proxy_wait() {
+        let root = std::env::temp_dir().join(format!("ns-stale-lock-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        let db_str = db.to_str().expect("temp path is utf-8");
+        assert!(!proxy_should_wait_for_daemon(Some(db_str)), "no file");
+        assert!(!proxy_should_wait_for_daemon(None), "no configured path");
+
+        // A daemon that has exited leaves its lock file behind.
+        drop(take_daemon_lock(&db).expect("take the lock"));
+        assert!(
+            daemon_lock_path(&db).exists(),
+            "the file outlives its holder"
+        );
+        assert!(
+            !proxy_should_wait_for_daemon(Some(db_str)),
+            "a stale file must not be mistaken for a live daemon"
+        );
+
+        let held = take_daemon_lock(&db).expect("retake the lock");
+        assert!(proxy_should_wait_for_daemon(Some(db_str)), "a live holder");
+        drop(held);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -7761,15 +8093,18 @@ async fn run() -> anyhow::Result<()> {
             // If the lock is held, a daemon exists: wait for it instead of
             // spawning a second one that will fail the lock check and leave
             // the proxy hung for 30s reporting "could not reach".
-            let lock_held = config_db_path()
-                .map(|p| lock_path_for(&p).exists())
-                .unwrap_or(false);
+            // Held means the OS lock, not the file: the daemon leaves the file
+            // behind on exit, and treating it as a live daemon meant the proxy
+            // waited two minutes and never spawned one.
+            let db_path = config_db_path();
+            let lock_held = proxy_should_wait_for_daemon(db_path.as_deref());
 
             if lock_held {
                 eprintln!(
                     "NeuroStrata daemon is starting (lock held); waiting for it to answer..."
                 );
                 let client = daemon_http_client();
+                let mut released = false;
                 for _ in 0..1200 {
                     // up to 2 minutes
                     if client
@@ -7783,10 +8118,19 @@ async fn run() -> anyhow::Result<()> {
                         server::start_mcp_proxy(server::DaemonOrigin::AlreadyRunning).await?;
                         return Ok(());
                     }
+                    // A stopping daemon holds the lock through its final
+                    // checkpoint and never answers again: once it lets go,
+                    // start a new one instead of waiting out the two minutes.
+                    if !proxy_should_wait_for_daemon(db_path.as_deref()) {
+                        released = true;
+                        break;
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-                eprintln!("A daemon holds the lock but did not answer within 2 minutes. Refusing to spawn a second instance.");
-                std::process::exit(1);
+                if !released {
+                    eprintln!("A daemon holds the lock but did not answer within 2 minutes. Refusing to spawn a second instance.");
+                    std::process::exit(1);
+                }
             }
 
             eprintln!("NeuroStrata MCP Server initializing...");
@@ -7888,7 +8232,7 @@ async fn run() -> anyhow::Result<()> {
                     Some(config.deduplication.clone()),
                 )
                 .await;
-                record_final_checkpoint(&outcome);
+                record_final_checkpoint(&config.db_path, &outcome);
                 outcome?;
             }
             Commands::Laya { model, out_dir } => {
@@ -7932,8 +8276,11 @@ async fn run() -> anyhow::Result<()> {
                 } => {
                     if purge_observations {
                         let config = Config::load().unwrap();
-                        let daemon_state = crate::daemon::daemon_status(&config.db_path);
-                        if matches!(daemon_state, crate::daemon::DaemonState::Running { .. }) {
+                        // Hold the lock for the whole offline purge, as the
+                        // `--no-open` copy does (#241): a probe that lets go
+                        // again would let a daemon start mid-purge.
+                        let offline_lock = hold_store_lock(&config.db_path);
+                        if offline_lock.is_none() {
                             print_learn_control(crate::learning::control::LearningControlRequest {
                                 action: crate::learning::control::LearningControlAction::Reset,
                                 purge_observations: true,
@@ -8033,6 +8380,14 @@ async fn run() -> anyhow::Result<()> {
                 let config = Config::from_default_path()?;
                 let db_path = config.db_path.clone();
                 let held = daemon_holds_lock(&db_path);
+                // Read now, while the daemon being stopped still holds the
+                // lock: a daemon that starts after it rewrites the lock file.
+                let mut holder = LockHolder::read(&db_path);
+                // A current daemon writes its id before it opens the port, so
+                // one that answers without an id was built before the pid file.
+                if held && holder == LockHolder::Starting && probe == DaemonProbe::Responsive {
+                    holder = LockHolder::Legacy;
+                }
 
                 match probe {
                     DaemonProbe::Absent if !held => {
@@ -8090,20 +8445,34 @@ async fn run() -> anyhow::Result<()> {
                     2400
                 };
                 for _ in 0..attempts {
-                    if daemon_holds_lock(&db_path) {
+                    let held_now = daemon_holds_lock(&db_path);
+                    // A client can start a new daemon the moment the old one
+                    // lets go, before this loop looks again. A lock held by a
+                    // different process id than the one seen at the start means
+                    // the daemon being stopped has exited.
+                    let current = LockHolder::read(&db_path);
+                    let replaced = saw_lock && held_now && holder.replaced_by(current);
+                    if held_now && !replaced {
+                        if !saw_lock || holder == LockHolder::Starting {
+                            // First sight of a holder, or of its process id.
+                            holder = current;
+                        }
                         saw_lock = true;
-                    } else if saw_lock {
-                        let report = match std::fs::read_to_string(daemon_lock_path(&db_path)) {
-                            Ok(report) => report,
-                            Err(e) => {
-                                tracing::debug!(
-                                    "the daemon's final checkpoint at {} could not be read: {}",
-                                    daemon_lock_path(&db_path).display(),
-                                    e
-                                );
-                                String::new()
-                            }
+                    } else if saw_lock || replaced {
+                        let own_report = match holder {
+                            LockHolder::Pid(pid) => exit_report_of(&db_path, pid),
+                            _ => None,
                         };
+                        let report = own_report
+                            .or_else(|| {
+                                if replaced {
+                                    None
+                                } else {
+                                    report_in_lock_file(&db_path)
+                                }
+                            })
+                            .or_else(|| parked_legacy_report(&db_path, current))
+                            .unwrap_or_default();
                         if report == FINAL_CHECKPOINT_OK {
                             println!("Daemon stopped and checkpointed.");
                             return Ok(());
@@ -8524,7 +8893,9 @@ async fn run() -> anyhow::Result<()> {
                         match Config::from_default_path() {
                             Err(e) => Err(format!("the config could not be read: {}", e)),
                             Ok(config) => {
-                                if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                                // Held until the report is read: no daemon starts meanwhile.
+                                let store_lock = hold_store_lock(&config.db_path);
+                                if store_lock.is_none() {
                                     Err(DAEMON_BUSY_MESSAGE.to_string())
                                 } else if probe == DaemonProbe::Silent {
                                     Err("nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy in the database; not opening it".to_string())
@@ -8672,30 +9043,34 @@ async fn run() -> anyhow::Result<()> {
                             Err(e) => {
                                 eprintln!("[neurostrata:gate] the report for '{}' could not be fetched: {}", namespace, e);
                             }
-                            Ok(config)
-                                if daemon_busy(probe, daemon_holds_lock(&config.db_path))
-                                    || probe == DaemonProbe::Silent =>
-                            {
-                                eprintln!(
-                                    "[neurostrata:gate] the report for '{}' could not be fetched: {}",
-                                    namespace, DAEMON_BUSY_MESSAGE
-                                );
-                            }
-                            Ok(config) => match direct_report(&config, &namespace, None).await {
-                                Ok(report) => {
-                                    println!(
-                                        "{}",
-                                        serde_json::to_string_pretty(&report.validate_json())
-                                            .unwrap_or_else(|_| "{}".to_string())
-                                    );
-                                }
-                                Err(e) => {
+                            Ok(config) => {
+                                // Held until the report is read: no daemon starts meanwhile.
+                                let store_lock = hold_store_lock(&config.db_path);
+                                if store_lock.is_none() || probe == DaemonProbe::Silent {
                                     eprintln!(
                                         "[neurostrata:gate] the report for '{}' could not be fetched: {}",
-                                        namespace, e
+                                        namespace, DAEMON_BUSY_MESSAGE
                                     );
+                                } else {
+                                    match direct_report(&config, &namespace, None).await {
+                                        Ok(report) => {
+                                            println!(
+                                                "{}",
+                                                serde_json::to_string_pretty(
+                                                    &report.validate_json()
+                                                )
+                                                .unwrap_or_else(|_| "{}".to_string())
+                                            );
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[neurostrata:gate] the report for '{}' could not be fetched: {}",
+                                                namespace, e
+                                            );
+                                        }
+                                    }
                                 }
-                            },
+                            }
                         },
                     }
                     // Always exit 0: the report informs, it never blocks.
@@ -8730,10 +9105,11 @@ async fn run() -> anyhow::Result<()> {
                         })?
                     } else {
                         let config = Config::from_default_path()?;
-                        if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                        // Held for the whole import: no daemon starts meanwhile.
+                        let Some(_store_lock) = hold_store_lock(&config.db_path) else {
                             eprintln!("{}", DAEMON_BUSY_MESSAGE);
                             std::process::exit(1);
-                        }
+                        };
                         let embedder = build_embedder()?;
                         let vector_store: Arc<dyn VectorStore> = Arc::new(
                             LadybugStore::new(
@@ -9510,10 +9886,11 @@ async fn run() -> anyhow::Result<()> {
                 }
 
                 let config = Config::from_default_path()?;
-                if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
+                // Held for the whole command: no daemon starts meanwhile.
+                let Some(_store_lock) = hold_store_lock(&config.db_path) else {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
-                }
+                };
                 // #390: a read-only fallback command on a fresh path has
                 // nothing to read. Constructing the store here would create
                 // `ladybug.db` with no store-state sidecar; the next
