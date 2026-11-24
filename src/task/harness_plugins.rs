@@ -2646,6 +2646,12 @@ fn wire_harness_config(
                                     &runs,
                                 );
                                 ensure_claude_hook(h_obj, "Stop", None, |_| true, &cmd, &runs);
+                                // SessionEnd and PreCompact let the runner write the
+                                // handoff note before the session ends or its
+                                // context is compacted.
+                                for event in ["SessionEnd", "PreCompact"] {
+                                    ensure_claude_hook(h_obj, event, None, |_| true, &cmd, &runs);
+                                }
                             }
                             // An older installer wrote a matcher without
                             // NotebookEdit, so notebook edits skipped the
@@ -4323,7 +4329,7 @@ mod tests {
             .expect("cli_hook_runner");
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 6, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "missing runner not repaired: {commands:?}"
@@ -4355,7 +4361,7 @@ mod tests {
             json!({"id": "neurostrata-claude", "namespace": "example-project"})
         );
         let commands = hook_commands(&tmp.path().join(".claude/settings.local.json"));
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 6, "{commands:?}");
         let want = format!("node \"{abs_runner}\"");
         assert!(commands.iter().all(|c| *c == want), "{commands:?}");
         assert_eq!(
@@ -4404,7 +4410,7 @@ mod tests {
         assert_eq!(claude_config(&dir)["namespace"], "example-project");
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 6, "{commands:?}");
         assert!(commands.iter().all(|c| *c == want), "{commands:?}");
     }
 
@@ -4456,7 +4462,7 @@ mod tests {
             .as_str()
             .unwrap();
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 6, "{commands:?}");
         assert!(
             commands
                 .iter()
@@ -4492,7 +4498,7 @@ mod tests {
             .as_str()
             .unwrap();
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 6, "{commands:?}");
         assert!(
             commands
                 .iter()
@@ -4644,6 +4650,14 @@ mod tests {
             vec![CLAUDE_PRE_TOOL_USE_MATCHER, CLAUDE_SESSION_SCOPE_MATCHER]
         );
         assert!(entries("Stop").iter().any(runs_ours));
+        for event in ["SessionEnd", "PreCompact"] {
+            let list = entries(event);
+            assert_eq!(list.len(), 1, "{event}: {list:?}");
+            assert!(
+                runs_ours(&list[0]) && list[0].get("matcher").is_none(),
+                "{event}"
+            );
+        }
         // A second install adds nothing.
         let before = std::fs::read_to_string(&cfg).unwrap();
         auto_install_detected_plugins(
@@ -4713,7 +4727,7 @@ mod tests {
         );
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 6, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "own verbatim runner not repaired: {commands:?}"
@@ -4760,7 +4774,7 @@ mod tests {
         );
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 6, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "own runner in other case not repaired: {commands:?}"
