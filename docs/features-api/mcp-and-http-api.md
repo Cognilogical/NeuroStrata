@@ -37,11 +37,11 @@ Several tools now append advisory metadata without changing existing result fiel
 ## Central Executive Task & Procedure Tools
 
 - `neurostrata_task_create` — create a new task.
-- `neurostrata_task_list` — list tasks.
+- `neurostrata_task_list` — list tasks. Each row carries `history_count` (the number of notes in its history); `include_history: true` returns the notes themselves.
 - `neurostrata_task_get` — retrieve a single task.
-- `neurostrata_task_claim` — claim exclusivity over a task and stamp caller `worktree`/`branch` scope (from explicit `worktree`/`branch`/`project_root` arguments or the namespace's registered `project_root`). Without those arguments the registered root is used, which for a namespace with a project marker is the main checkout, so a claim from a linked worktree would carry the main checkout's branch; the harness plugins therefore pass the session's project folder as `worktree` on `neurostrata_task_claim` and `neurostrata_get_snapshot` calls that name none.
-- `neurostrata_task_update` — update status/notes on a task.
-- `neurostrata_task_complete` — finish a task (requires extracted memory → Lock 2).
+- `neurostrata_task_claim` — claim exclusivity over a task and stamp caller `worktree`/`branch` scope (from explicit `worktree`/`branch`/`project_root` arguments or the namespace's registered `project_root`). Without those arguments the registered root is used, which for a namespace with a project marker is the main checkout, so a claim from a linked worktree would carry the main checkout's branch; the harness plugins therefore pass the session's project folder as `worktree` on `neurostrata_task_claim` and `neurostrata_get_snapshot` calls that name none. A claim that takes the task (from open, or from a stale holder) returns its whole note history, so a new session sees where the work stopped; a repeat claim by the session that already holds it returns `history_count` instead.
+- `neurostrata_task_update` — update status/notes on a task. The reply carries the history entry this call added as `appended` (null when it added none) and `history_count` instead of the whole history.
+- `neurostrata_task_complete` — finish a task (requires extracted memory → Lock 2). Like `neurostrata_task_create`, its reply carries `history_count` instead of the note history.
 - `neurostrata_task_validate` — advisory gate report for a task.
 - `neurostrata_procedure_perform` — fire a recurring procedure.
 - `neurostrata_guard_validate` — validate PreToolUse actions against behavioral rules and Zero-Action Start (`git push`/`pull`/`fetch`/`status`/`log`/`diff`/`show`/`rev-parse` without file-output or exec-override flags like `--output`/`-c`, plus `neurostrata-mcp task` commands, are exempt from requiring an `in_progress` task so post-completion pushes pass without skipping the gate). `neurostrata-1e14`: force-push flags and destructive remote operations (`-f` in any short bundle such as `-vf`/`-uf`, `--force`, `--force-with-lease[=<ref>]`, `+<refspec>`, `--mirror`, `--delete`, `--prune`) are never exempt — both the plugin and daemon classifiers reject them so remote-history rewrites still require an active task.
