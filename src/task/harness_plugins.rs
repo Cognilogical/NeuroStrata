@@ -1163,22 +1163,37 @@ fn wire_copilot_hooks(
         };
         let mut present = false;
         for entry in entries.iter_mut() {
-            let ours = ["bash", "powershell"].iter().any(|key| {
-                entry
-                    .get(*key)
-                    .and_then(Value::as_str)
-                    .is_some_and(|command| {
-                        hook_command_runners(command)
-                            .iter()
-                            .any(|path| is_installer_runner(path, project_root, abs_runner))
-                    })
-            });
-            if !ours || !entry.is_object() {
+            if !entry.is_object() {
                 continue;
             }
+            // As for Codex: only a command that runs this project's runner
+            // is rewritten; a user's own command in the other shell's key
+            // stays, and a missing key is filled once the entry is ours.
+            let mut owned = false;
+            for (key, target) in [("bash", &bash), ("powershell", &powershell)] {
+                let Some(command) = entry.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                if !hook_command_runners(command)
+                    .iter()
+                    .any(|path| is_installer_runner(path, project_root, abs_runner))
+                {
+                    continue;
+                }
+                owned = true;
+                if command != target.as_str() {
+                    entry[key] = json!(target);
+                }
+            }
+            if !owned {
+                continue;
+            }
+            for (key, target) in [("bash", &bash), ("powershell", &powershell)] {
+                if entry.get(key).is_none() {
+                    entry[key] = json!(target);
+                }
+            }
             entry["type"] = json!("command");
-            entry["bash"] = json!(bash);
-            entry["powershell"] = json!(powershell);
             if !entry.get("env").is_some_and(Value::is_object) {
                 entry["env"] = json!({});
             }
@@ -5962,6 +5977,11 @@ mod tests {
                         "env": { "KEEP": "1" },
                         "timeoutSec": 10
                     }],
+                    "sessionEnd": [{
+                        "type": "command",
+                        "bash": bash,
+                        "powershell": "echo custom"
+                    }],
                     "postToolUse": [user_entry.clone()]
                 },
                 "other": true
@@ -5995,6 +6015,16 @@ mod tests {
                 "powershell": powershell,
                 "env": { "KEEP": "1", "NEUROSTRATA_HOOK_EVENT": "preToolUse" },
                 "timeoutSec": 10
+            }])
+        );
+        // A user's own command in the other shell's key is kept.
+        assert_eq!(
+            doc["hooks"]["sessionEnd"],
+            json!([{
+                "type": "command",
+                "bash": bash,
+                "powershell": "echo custom",
+                "env": { "NEUROSTRATA_HOOK_EVENT": "sessionEnd" }
             }])
         );
         assert_eq!(doc["hooks"]["postToolUse"], json!([user_entry]));
