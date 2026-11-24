@@ -4,6 +4,23 @@ All notable changes to the NeuroStrata project will be documented in this file.
 
 ---
 
+## [1.19.1] - 2026-11-24
+
+### Added
+
+- **Daemon-native incremental AST freshness watcher (`src/ingest_watch.rs`, `src/main.rs`, `src/daemon.rs`, #359).** Registers watched roots with strict v1 JSON persistence, J6 caller-path re-check on load and at fire time, debounced coalesced ingest, bounded exponential backoff, and fail-closed activation retry. A root swapped for an out-of-bound path while events are pending is refused before ingestion; failed triggers schedule retries from completion; stored-but-inactive roots retry activation (#396, #397, #398).
+- **Namespace-scoped CLI and hook routing (`src/main.rs`, `src/task/harness_plugins.rs`, `src/task/push_namespaces.rs`, #374, #388).** Adds namespace resolution for hooks, makes the push gate cover every pushed path's namespace, and restores the hardening lost in the earlier merge.
+
+### Fixed
+
+- **Connector idempotency and kernel receipt alignment (`src/connectors/mod.rs`, `src/kernel/mod.rs`, #362, #399).** Persisted connector keys now include the action receipt, matching the kernel's effect dedup triple in both connector implementations and hydration, so a retry under a different receipt names a distinct effect instead of silently returning an earlier result.
+- **Code-scanning remediation (`src/root_marker.rs`, `src/daemon.rs`, `src/guard/validator.rs`, `src/handlers/taxonomy.rs`, `src/synaptic_mesh/worker.rs`, #400, #402).** Canonical containment is re-verified at the marker read site; MCP envelopes are bounded and nesting-checked before typed deserialization; guard and taxonomy parsing use validated objects. Main's open code-scanning alerts are **0**, confirmed after re-analysis of the merge commit.
+- **Daemon lock and MCP proxy startup (`src/main.rs`, `src/daemon.rs`, #401).** A proxy no longer spawns a second daemon after one exits; the lock checks agree, and a legacy lock-file checkpoint report is parked before takeover truncation so shutdown still reports it after a replacement takes the lock.
+- **Vault export scoping and taxonomy bounds (`src/vault_ld/vault_sync.rs`, `src/rdf/taxonomy.rs`, #341, #353, #363).** Exported notes carry their namespace and stale-note retirement is scoped to the same namespace; taxonomy compare and tree honor bounded controls and surface unknown fields.
+- **Windows test parity and release hygiene (`.github/workflows/ci.yml`, `Cargo.toml`, #389, #393).** Restores Windows test failures and pins the audit dependency fixes; version and release narrative are corrected together.
+
+---
+
 ## [1.19.0] - 2026-11-17
 
 ### Added
