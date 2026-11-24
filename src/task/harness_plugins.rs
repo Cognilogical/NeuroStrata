@@ -815,7 +815,19 @@ fn config_toml_wires_runner(
     }
 }
 
-/// Add the NeuroStrata PreToolUse and Stop hooks to `.codex/hooks.json`,
+/// The Codex hook events the installer wires, with the PreToolUse matcher.
+/// SessionStart lets the runner inject the session file at startup, resume,
+/// clear, compact and fork; SessionEnd and PreCompact let it write the handoff
+/// note. Codex 0.170 knows all five event names (its hook config schema).
+const CODEX_HOOK_EVENTS: [(&str, Option<&str>); 5] = [
+    ("SessionStart", None),
+    ("PreToolUse", Some(CODEX_PRE_TOOL_USE_MATCHER)),
+    ("Stop", None),
+    ("SessionEnd", None),
+    ("PreCompact", None),
+];
+
+/// Add the NeuroStrata hooks ([`CODEX_HOOK_EVENTS`]) to `.codex/hooks.json`,
 /// keeping every other entry. A command running this project's canonical
 /// runner is rewritten to the current form (both command variants), so a
 /// stale spelling is repaired and nothing is added twice; a foreign runner
@@ -865,10 +877,7 @@ fn wire_codex_hooks(
         ));
         return None;
     };
-    for (event, matcher) in [
-        ("PreToolUse", Some(CODEX_PRE_TOOL_USE_MATCHER)),
-        ("Stop", None),
-    ] {
+    for (event, matcher) in CODEX_HOOK_EVENTS {
         let entries = h_obj.entry(event).or_insert_with(|| json!([]));
         let Some(arr) = entries.as_array_mut() else {
             warnings.push(format!(
@@ -5088,6 +5097,12 @@ mod tests {
         assert_eq!(pre[0]["hooks"][0]["type"], json!("command"));
         assert_eq!(codex_commands(&doc, "PreToolUse"), vec![expected.clone()]);
         assert_eq!(codex_commands(&doc, "Stop"), vec![expected.clone()]);
+        // The session-start injection and the handoff write (session file
+        // contract) run on these, with no matcher.
+        for event in ["SessionStart", "SessionEnd", "PreCompact"] {
+            assert_eq!(codex_commands(&doc, event), vec![expected.clone()], "{event}");
+            assert!(doc["hooks"][event][0].get("matcher").is_none(), "{event}");
+        }
         // No namespace in the command: the callers that refresh it only have
         // a folder-name guess, and PowerShell cannot run a NAME=value prefix.
         assert!(!expected.contains("TestProj") && !expected.contains("NEUROSTRATA_NAMESPACE="));
@@ -5148,10 +5163,11 @@ mod tests {
             vec!["echo user-hook".to_string(), stale, expected.clone()],
             "user hook kept, foreign runner untouched, ours added once"
         );
-        assert_eq!(codex_commands(&doc, "Stop"), vec![expected]);
+        assert_eq!(codex_commands(&doc, "Stop"), vec![expected.clone()]);
         assert_eq!(
             codex_commands(&doc, "SessionStart"),
-            vec!["echo start".to_string()]
+            vec!["echo start".to_string(), expected],
+            "the user's SessionStart hook kept, ours added beside it"
         );
         assert_eq!(doc["other"], json!(true));
 
@@ -5375,7 +5391,7 @@ mod tests {
             .as_str()
             .expect("runner");
         let doc = read_codex_hooks(tmp.path());
-        for event in ["PreToolUse", "Stop"] {
+        for (event, _) in CODEX_HOOK_EVENTS {
             let hook = &doc["hooks"][event][0]["hooks"][0];
             assert_eq!(
                 hook["command"],
