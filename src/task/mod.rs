@@ -2859,7 +2859,16 @@ pub async fn handle_task_update(
             }
         },
     };
-    let note = arg_str(&args, "note").map(|s| s.to_string());
+    // A note is never refused (a handoff must not be lost): add_memory's
+    // secret scanner finds each secret and the note is stored with it
+    // replaced by `[REDACTED:<category>]`. The reply names the categories.
+    let (note, note_redactions) = match arg_str(&args, "note") {
+        Some(raw) => {
+            let (scrubbed, found) = crate::secrets::redact(raw);
+            (Some(scrubbed), found)
+        }
+        None => (None, Vec::new()),
+    };
     // The title is the task's content (section 1.1), so renaming it means
     // rewriting content AND re-embedding: a title is what search_memory reads.
     let new_title = match args.get("title") {
@@ -3112,6 +3121,12 @@ pub async fn handle_task_update(
         "task": task_summary(&id, &task.payload),
         "graph_queries_count": graph_queries_count,
         "graph_lookup_nudge": Value::Null,
+        // One entry per secret replaced in the note, by the scanner's finding
+        // type; empty when none. Never the secret itself.
+        "redactions": note_redactions
+            .iter()
+            .map(|category| json!({ "category": category }))
+            .collect::<Vec<_>>(),
     }))
 }
 
@@ -10372,6 +10387,49 @@ exit 0
             !nested_session.exists(),
             "active_session.json must not be stranded in a nested subdirectory"
         );
+    }
+
+    /// A note is never refused: a secret in it is stored as
+    /// `[REDACTED:<category>]` and the reply says how many and which kinds,
+    /// never the secret. A clean note is stored as written.
+    #[tokio::test]
+    async fn a_note_is_stored_with_its_secrets_redacted() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "keep secrets out", 1).await;
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let history = || {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let (_, p) = store.get("MyProj", &id).await.unwrap().unwrap();
+                p.metadata["task"]["history"].to_string()
+            }
+        };
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "note": format!("Handoff: push with {key}") }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.contains(key), "{reply}");
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["redactions"], json!([{ "category": "github_pat" }]));
+        let stored = history().await;
+        assert!(!stored.contains(key), "{stored}");
+        assert!(
+            stored.contains("Handoff: push with [REDACTED:github_pat]"),
+            "{stored}"
+        );
+
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "note": "Handoff: run the suite" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["redactions"], json!([]));
+        assert!(history().await.contains("Handoff: run the suite"));
     }
 
     #[test]

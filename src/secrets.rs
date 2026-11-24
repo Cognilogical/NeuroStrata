@@ -422,13 +422,19 @@ impl SecretScanner {
                 category: "oversized_input",
             });
         }
+        self.find_first(text).map(|(category, _)| Rejection {
+            location: location.to_string(),
+            category,
+        })
+    }
 
+    /// The first secret in `text` (at most `MAX_SCAN_BYTES`) as its category
+    /// and byte span. Rejection and redaction share this one detector order,
+    /// so they always agree on what is a secret.
+    fn find_first(&self, text: &str) -> Option<(&'static str, std::ops::Range<usize>)> {
         // --- JWT detection ---
-        if let Some(cat) = self.detect_jwt(text) {
-            return Some(Rejection {
-                location: location.to_string(),
-                category: cat,
-            });
+        if let Some(found) = self.detect_jwt_span(text) {
+            return Some(found);
         }
 
         // --- Provider token form detection ---
@@ -438,10 +444,7 @@ impl SecretScanner {
             let candidate = mat.as_str();
             if let Some(cat) = self.validate_provider_form(candidate) {
                 if !is_placeholder(&candidate.to_ascii_lowercase()) {
-                    return Some(Rejection {
-                        location: location.to_string(),
-                        category: cat,
-                    });
+                    return Some((cat, mat.range()));
                 }
             }
         }
@@ -457,10 +460,10 @@ impl SecretScanner {
                 continue;
             }
             if meets_high_entropy(token) {
-                return Some(Rejection {
-                    location: location.to_string(),
-                    category: "high_entropy_secret",
-                });
+                return Some((
+                    "high_entropy_secret",
+                    cap.get(1).map_or(0..0, |m| m.range()),
+                ));
             }
         }
 
@@ -514,10 +517,7 @@ impl SecretScanner {
                     .chars()
                     .all(|c| c == value.chars().next().unwrap_or('x'))
             {
-                return Some(Rejection {
-                    location: location.to_string(),
-                    category: "password",
-                });
+                return Some(("password", cap.get(2).map_or(0..0, |m| m.range())));
             }
         }
 
@@ -586,7 +586,13 @@ impl SecretScanner {
     /// Detect a JWT-shaped token: three base64url segments where segment 1
     /// decodes to a JSON object containing `alg` and `typ` (case-sensitive
     /// bytes).
+    #[cfg(test)]
     fn detect_jwt(&self, text: &str) -> Option<&'static str> {
+        self.detect_jwt_span(text).map(|(category, _)| category)
+    }
+
+    /// `detect_jwt` with the token's byte span.
+    fn detect_jwt_span(&self, text: &str) -> Option<(&'static str, std::ops::Range<usize>)> {
         // Find all dot-separated triplets that look base64url.
         // We look for the pattern: non-dot+ . non-dot+ . non-dot+
         for mat in self.jwt_re.find_iter(text) {
@@ -594,7 +600,7 @@ impl SecretScanner {
             // Validate it's actually a JWT by decoding segment 1.
             if let Some(dots) = find_jwt_segments(jwt_str) {
                 if is_valid_jwt_header(dots.0) {
-                    return Some("jwt");
+                    return Some(("jwt", mat.range()));
                 }
             }
         }
@@ -700,6 +706,14 @@ fn is_placeholder(lower: &str) -> bool {
     // Empty or near-empty.
     if trimmed.is_empty() {
         return true;
+    }
+    // A redaction marker this module wrote (`[REDACTED:<category>]`): a
+    // scrubbed text scrubs to itself. Only the scanner's own categories count.
+    if let Some(category) = trimmed.strip_prefix("[redacted:") {
+        let category = category.strip_suffix(']').unwrap_or(category);
+        if REDACTION_CATEGORIES.contains(&category) {
+            return true;
+        }
     }
     // Variable references and angle-bracket placeholders. Only single,
     // short, one-line placeholder tokens are excluded: a document that
@@ -821,6 +835,61 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     }
 
     Some(output)
+}
+
+/// The categories `find_first` reports, which a redaction marker may name.
+const REDACTION_CATEGORIES: &[&str] = &[
+    "jwt",
+    "github_pat",
+    "anthropic_token",
+    "openai_project_key",
+    "openai_key",
+    "slack_token",
+    "aws_access_key",
+    "provider_token",
+    "high_entropy_secret",
+    "password",
+];
+
+/// Upper bound on secrets replaced in one text, so a pathological input
+/// cannot loop for long.
+const MAX_REDACTIONS: usize = 256;
+
+/// Replaces every secret the scanner finds in `text` with
+/// `[REDACTED:<category>]` and returns the scrubbed text and the categories
+/// replaced, in order. The same detectors as `scan_entry_point`, for text
+/// that must be kept rather than refused (a task note). Text longer than the
+/// scanner's limit is scrubbed line block by line block.
+pub fn redact(text: &str) -> (String, Vec<&'static str>) {
+    let scanner = SecretScanner::instance();
+    let mut found = Vec::new();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut end = rest.len().min(MAX_SCAN_BYTES);
+        while end < rest.len() && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end < rest.len() {
+            if let Some(nl) = rest[..end].rfind('\n') {
+                end = nl + 1;
+            }
+        }
+        let mut block = rest[..end].to_string();
+        while found.len() < MAX_REDACTIONS {
+            let Some((category, span)) = scanner.find_first(&block) else {
+                break;
+            };
+            if span.is_empty() {
+                break;
+            }
+            block.replace_range(span, &format!("[REDACTED:{category}]"));
+            found.push(category);
+        }
+        out.push_str(&block);
+        rest = &rest[end..];
+    }
+    (out, found)
 }
 
 /// Scan user-controlled content + metadata at an entry point.
@@ -1212,6 +1281,27 @@ mod tests {
             let r = scan_entry_point(dirty_content, &clean_meta, entry);
             assert!(r.is_some(), "{} should reject secret", entry);
         }
+    }
+
+    /// `redact` replaces every finding with a marker naming its category,
+    /// keeps the rest, passes clean text through, and is idempotent: the
+    /// scrubbed text scans clean and scrubs to itself.
+    #[test]
+    fn redact_replaces_each_secret_with_its_category() {
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let text = format!("Handoff: push with {key}, then password=hunter22 and go.");
+        let (scrubbed, found) = redact(&text);
+        assert_eq!(found, vec!["github_pat", "password"]);
+        assert_eq!(
+            scrubbed,
+            "Handoff: push with [REDACTED:github_pat], then password=[REDACTED:password] and go."
+        );
+        assert!(scan_entry_point(&scrubbed, &json!({}), "note").is_none());
+        assert_eq!(redact(&scrubbed), (scrubbed.clone(), vec![]));
+        assert_eq!(
+            redact("run the suite, then push"),
+            ("run the suite, then push".to_string(), vec![])
+        );
     }
 
     #[test]
