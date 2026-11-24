@@ -138,8 +138,19 @@ async function main() {
   await writeStdout(JSON.stringify({ continue: true }));
 }
 main().catch((err) => {
-  process.stderr.write(String(err) + "\n");
-  process.exit(2);
+  const reason = String(err);
+  process.stderr.write(reason + "\n");
+  // PowerShell swallows `process.exit(2)`: the host sees a zero exit code
+  // and runs the tool anyway. Emit a deny decision so a failed hook still
+  // fails closed on Windows. No `continue` field: Codex rejects it on
+  // PreToolUse (the plugin's deny replies omit it too).
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: reason
+    }
+  }));
 });
 "#;
 
@@ -367,12 +378,9 @@ fn installer_hook_parts(
     abs_runner: &str,
     project_root: &Path,
 ) -> Option<(Option<String>, String)> {
-    let (raw_ns, rest, plain) = match command.strip_prefix("NEUROSTRATA_NAMESPACE=") {
-        Some(assigned) => {
-            let (ns, rest) = assigned.split_once(' ')?;
-            (ns, rest, false)
-        }
-        None => ("", command, true),
+    let (raw_ns, rest) = match command.strip_prefix("NEUROSTRATA_NAMESPACE=") {
+        Some(assigned) => assigned.split_once(' ')?,
+        None => ("", command),
     };
     let rest = rest.strip_prefix("node \"")?;
     let close = rest.find('"')?;
@@ -383,11 +391,12 @@ fn installer_hook_parts(
     if path_basename(old_path) != path_basename(abs_runner) {
         return None;
     }
-    // A plain `node "<...>/cli-hook.mjs"` is anyone's command; only one that
-    // runs the installer's runner, or a missing runner at the installer's
-    // place (`.NeuroStrata/plugins/claude/cli-hook.mjs` of a moved project),
-    // is ours to repair.
-    if plain && !at_installer_runner_place(old_path, project_root, abs_runner) {
+    // Both the plain and the `NEUROSTRATA_NAMESPACE=<ns>` forms must name
+    // the installer's runner, or a missing runner at the installer's place
+    // (`.NeuroStrata/plugins/claude/cli-hook.mjs` of a moved project). An
+    // arbitrary `cli-hook.mjs` with a namespace prefix is someone else's
+    // hook: claiming it would overwrite this project's config (#378 F6).
+    if !at_installer_runner_place(old_path, project_root, abs_runner) {
         return None;
     }
     // The strict check: a missing runner counts only at the installer's plugin
@@ -636,50 +645,236 @@ fn shell_literal_value(text: &str) -> Option<(String, &str)> {
     }
 }
 
-/// Whether a single-quoted runner path is one the installer wrote: it sits at
-/// the installer's layout, `<root>/.NeuroStrata/plugins/codex/cli-hook.mjs`,
-/// in any checkout (a moved or copied project). The path is literal text,
-/// so `$` or `%` in it are ordinary characters, and a user's own
-/// `cli-hook.mjs` elsewhere is never claimed, present or not.
-fn is_installer_codex_runner(path: &str) -> bool {
-    path.replace('\\', "/")
-        .to_ascii_lowercase()
-        .ends_with("/.neurostrata/plugins/codex/cli-hook.mjs")
+/// Whether a runner path is the installer's canonical runner for THIS
+/// project: equal to `abs_runner` in any spelling, or resolving to it when
+/// taken relative to this project root. A monorepo root must not claim a
+/// nested project's `cli-hook.mjs` just because its path ends with the
+/// installer layout (#368 F9).
+fn is_installer_codex_runner(path: &str, project_root: &Path, abs_runner: &str) -> bool {
+    path_key(path) == path_key(abs_runner)
+        || same_path_on_disk(&project_root.join(path).to_string_lossy(), abs_runner)
 }
 
-/// The installer's Codex hook command. It carries no namespace: the callers
-/// that refresh it (`hook_hygiene` from `get_snapshot`, `hooks install`,
-/// daemon boot) only have a folder-name guess or nothing, so the runner
-/// discovers the namespace itself, as it does with no configured value.
+/// PowerShell's single-quote rules, independent of the platform the
+/// installer runs on: only `''` is an escape inside single quotes. Codex
+/// uses `commandWindows` on Windows even when the installer was produced on
+/// another OS, so this cannot use `cfg!(windows)` in [`shell_literal`].
+fn powershell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Read a word written by [`powershell_literal`].
+fn powershell_literal_value(text: &str) -> Option<(String, &str)> {
+    let mut rest = text.strip_prefix('\'')?;
+    let mut value = String::new();
+    loop {
+        let close = rest.find('\'')?;
+        value.push_str(&rest[..close]);
+        rest = &rest[close + 1..];
+        match rest.strip_prefix('\'') {
+            Some(after) => {
+                value.push('\'');
+                rest = after;
+            }
+            None => return Some((value, rest)),
+        }
+    }
+}
+
+/// The two command forms the installer writes into a Codex hook entry:
+/// `command` in this platform's shell quoting and `commandWindows` in
+/// PowerShell quoting. Neither carries a namespace: the runner discovers it
+/// from the harness config.
+fn codex_hook_commands(abs_runner: &str) -> (String, String) {
+    (
+        format!("node {}", shell_literal(abs_runner)),
+        format!("node {}", powershell_literal(abs_runner)),
+    )
+}
+
+/// The installer's Codex `command` value (kept separate so tests can parse
+/// the quoting without going through the hook writer).
 fn codex_hook_command(abs_runner: &str) -> String {
-    format!("node {}", shell_literal(abs_runner))
+    codex_hook_commands(abs_runner).0
+}
+
+/// Strip environment prefixes an older installer or a user may put in front
+/// of a hook command: `env NAME=x node ...`, `NAME=x node ...`, or the cmd
+/// form `set NAME=x&& node ...`. Without this a second hook is appended
+/// beside an existing one (#368 F8).
+fn strip_installer_env_prefix(mut command: &str) -> &str {
+    loop {
+        let trimmed = command.trim_start();
+        let rest = if let Some(rest) = trimmed.strip_prefix("env ") {
+            Some(rest.trim_start())
+        } else if let Some(rest) = trimmed.strip_prefix("set NEUROSTRATA_NAMESPACE=") {
+            rest.split_once("&&").map(|(_, tail)| tail.trim_start())
+        } else if let Some(rest) = trimmed.strip_prefix("NEUROSTRATA_NAMESPACE=") {
+            rest.split_once(' ')
+                .map(|(_, tail)| tail.trim_start())
+                .or_else(|| rest.split_once("&&").map(|(_, tail)| tail.trim_start()))
+        } else {
+            None
+        };
+        match rest {
+            Some(next) if next.len() < trimmed.len() => command = next,
+            _ => return trimmed,
+        }
+    }
+}
+
+/// The runner path in a hook command after any environment prefix, in either
+/// platform's quoting. A command that runs anything after the runner is a
+/// user's own and is not claimed.
+fn hook_command_runner(command: &str) -> Option<(String, &str)> {
+    let quoted = strip_installer_env_prefix(command).strip_prefix("node ")?;
+    let parsers: [fn(&str) -> Option<(String, &str)>; 2] =
+        [shell_literal_value, powershell_literal_value];
+    for parse in parsers {
+        if let Some((path, rest)) = parse(quoted) {
+            if rest.trim().is_empty() {
+                return Some((path, rest));
+            }
+        }
+    }
+    None
+}
+
+/// Whether a `[hooks]` table in Codex's other config layer
+/// (`.codex/config.toml`) already runs this project's canonical runner.
+/// Codex reads both layers; wiring a second entry would run the guard twice.
+/// Only a real hook `command` is evidence: a comment or an unrelated setting
+/// that merely mentions the runner path wires nothing. Malformed TOML names
+/// no hook.
+fn config_toml_wires_runner(
+    text: &str,
+    project_root: &Path,
+    abs_runner: &str,
+    event: &str,
+) -> bool {
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return false;
+    };
+    let Some(hooks) = value.get("hooks") else {
+        return false;
+    };
+    let event_key = event.to_ascii_lowercase().replace(['_', '-'], "");
+    let folded_runner = path_key(abs_runner).replace('\\', "/").to_ascii_lowercase();
+    let folded_root = format!(
+        "{}/.neurostrata/plugins/codex/cli-hook.mjs",
+        path_key(&project_root.to_string_lossy())
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    );
+    let mentions_runner = |part: &str| {
+        let folded = part.replace('\\', "/").to_ascii_lowercase();
+        folded.contains(&folded_runner) || folded.contains(&folded_root)
+    };
+    let covers_event = |key: &str| key.to_ascii_lowercase().replace(['_', '-'], "") == event_key;
+    let command_is_ours = |table: &toml::Table| {
+        table.get("command").is_some_and(|command| match command {
+            toml::Value::String(s) => mentions_runner(s),
+            toml::Value::Array(items) => items
+                .iter()
+                .any(|item| item.as_str().is_some_and(mentions_runner)),
+            _ => false,
+        })
+    };
+    match hooks {
+        // `[hooks.pre_tool_use] command = ...` (or `[hooks] command = ...`).
+        toml::Value::Table(table) => {
+            if command_is_ours(table) {
+                return true;
+            }
+            table.iter().any(|(key, value)| {
+                if !covers_event(key) {
+                    return false;
+                }
+                match value {
+                    toml::Value::Table(inner) => command_is_ours(inner),
+                    toml::Value::Array(items) => items
+                        .iter()
+                        .any(|item| item.as_table().is_some_and(command_is_ours)),
+                    _ => false,
+                }
+            })
+        }
+        // `[[hooks]] event = "..." command = ...`.
+        toml::Value::Array(items) => items.iter().any(|item| {
+            let Some(table) = item.as_table() else {
+                return false;
+            };
+            let event_matches = table
+                .get("event")
+                .and_then(toml::Value::as_str)
+                .is_some_and(covers_event);
+            event_matches && command_is_ours(table)
+        }),
+        _ => false,
+    }
 }
 
 /// Add the NeuroStrata PreToolUse and Stop hooks to `.codex/hooks.json`,
-/// keeping every other entry. An installer-written command is recognized by
-/// its runner and rewritten to the current form, so a moved runner is
-/// repointed and nothing is added twice. A hooks.json that cannot be read or
-/// is not a JSON object is left untouched.
-fn wire_codex_hooks(project_root: &Path, abs_runner: &str) -> Option<String> {
+/// keeping every other entry. A command running this project's canonical
+/// runner is rewritten to the current form (both command variants), so a
+/// stale spelling is repaired and nothing is added twice; a foreign runner
+/// is left as-is. Codex's other
+/// hook layer (`.codex/config.toml` `[hooks]`) is checked so a hook already
+/// there is not duplicated. Anything unreadable or not shaped as expected
+/// is left untouched with a warning. `Some(path)` means a hook was actually
+/// wired; metadata written elsewhere does not count (#368 F6).
+fn wire_codex_hooks(
+    project_root: &Path,
+    abs_runner: &str,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
     let hooks_path = project_root.join(".codex/hooks.json");
-    let mut doc: Value = match std::fs::read_to_string(&hooks_path) {
-        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
-            Ok(d) if d.is_object() => d,
-            _ => return None,
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
-        Err(_) => return None,
+    // A repo-controlled symlink at any component would redirect the write
+    // into the user's home config (e.g. a tracked `.codex -> ../.codex`).
+    if let Err(e) = refuse_symlink_components(project_root, &hooks_path) {
+        warnings.push(format!(
+            "{} refused: {e}; no Codex hook was wired",
+            hooks_path.display()
+        ));
+        return None;
+    }
+    let mut doc: Value = match read_config(&hooks_path) {
+        Ok(Some(d)) if d.is_object() => d,
+        Ok(Some(_)) => {
+            warnings.push(format!(
+                "{} is not a JSON object; no Codex hook was wired",
+                hooks_path.display()
+            ));
+            return None;
+        }
+        Ok(None) => json!({}),
+        Err(e) => {
+            warnings.push(format!("{e}; no Codex hook was wired"));
+            return None;
+        }
     };
-    let cmd = codex_hook_command(abs_runner);
+    let toml = std::fs::read_to_string(project_root.join(".codex/config.toml")).unwrap_or_default();
+    let (cmd, cmd_windows) = codex_hook_commands(abs_runner);
     let obj = doc.as_object_mut()?;
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
-    let h_obj = hooks.as_object_mut()?;
+    let Some(h_obj) = hooks.as_object_mut() else {
+        warnings.push(format!(
+            "{} has a non-object hooks value; no Codex hook was wired",
+            hooks_path.display()
+        ));
+        return None;
+    };
     for (event, matcher) in [
         ("PreToolUse", Some(CODEX_PRE_TOOL_USE_MATCHER)),
         ("Stop", None),
     ] {
         let entries = h_obj.entry(event).or_insert_with(|| json!([]));
         let Some(arr) = entries.as_array_mut() else {
+            warnings.push(format!(
+                "{} has a non-array {event} hook list; that event was left untouched",
+                hooks_path.display()
+            ));
             continue;
         };
         let mut present = false;
@@ -688,36 +883,52 @@ fn wire_codex_hooks(project_root: &Path, abs_runner: &str) -> Option<String> {
                 continue;
             };
             for hook in entry_hooks {
-                let Some(command) = hook.get("command").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                // Only a complete installer command is ours: a user command
-                // that runs the runner and then more (`&& policy-check`) is
-                // left as written.
-                let Some((old_path, "")) =
-                    command.strip_prefix("node ").and_then(shell_literal_value)
-                else {
-                    continue;
-                };
-                if is_installer_codex_runner(&old_path) {
-                    if command != cmd {
-                        hook["command"] = Value::String(cmd.clone());
+                let mut owned = false;
+                for (key, target) in [("command", &cmd), ("commandWindows", &cmd_windows)] {
+                    let Some(command) = hook.get(key).and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some((old_path, _)) = hook_command_runner(command) else {
+                        continue;
+                    };
+                    if !is_installer_codex_runner(&old_path, project_root, abs_runner) {
+                        continue;
                     }
-                    present = true;
+                    owned = true;
+                    if command != target {
+                        hook[key] = Value::String(target.clone());
+                    }
                 }
+                if !owned {
+                    continue;
+                }
+                // An older install may have written only `command`. Once the
+                // hook is recognized as ours, both platform variants must be
+                // present or Windows keeps running a POSIX-quoted command.
+                if hook.get("command").is_none() {
+                    hook["command"] = Value::String(cmd.clone());
+                }
+                if hook.get("commandWindows").is_none() {
+                    hook["commandWindows"] = Value::String(cmd_windows.clone());
+                }
+                present = true;
             }
         }
+        if !present && config_toml_wires_runner(&toml, project_root, abs_runner, event) {
+            present = true;
+        }
         if !present {
-            let mut entry = json!({ "hooks": [{ "type": "command", "command": cmd }] });
+            let hook_entry = json!({
+                "type": "command",
+                "command": cmd,
+                "commandWindows": cmd_windows
+            });
+            let mut entry = json!({ "hooks": [hook_entry] });
             if let Some(m) = matcher {
                 entry["matcher"] = json!(m);
             }
             arr.push(entry);
         }
-    }
-
-    if let Some(parent) = hooks_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
     }
     let serialized = serde_json::to_string_pretty(&doc).ok()?;
     let needs_write = std::fs::read_to_string(&hooks_path)
@@ -726,7 +937,42 @@ fn wire_codex_hooks(project_root: &Path, abs_runner: &str) -> Option<String> {
     if needs_write {
         write_atomically(&hooks_path, &serialized).ok()?;
     }
+    // hooks.json is untracked and carries an absolute runner path. Keep it
+    // out of a commit by listing it in the checkout's local exclude file
+    // (#368 F10). Best effort: a bare directory has no git, and a linked
+    // worktree's `.git` is a file pointing elsewhere.
+    exclude_codex_hooks(project_root);
     Some(hooks_path.to_string_lossy().to_string())
+}
+
+/// Add `/.codex/hooks.json` to this checkout's `.git/info/exclude` once.
+fn exclude_codex_hooks(project_root: &Path) {
+    let git_dir = project_root.join(".git");
+    if git_dir.is_file() {
+        return;
+    }
+    let exclude = git_dir.join("info").join("exclude");
+    if refuse_symlink_components(project_root, &exclude).is_err() {
+        return;
+    }
+    if let Some(parent) = exclude.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing
+        .lines()
+        .any(|line| matches!(line.trim(), "/.codex/hooks.json" | ".codex/hooks.json"))
+    {
+        return;
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str("/.codex/hooks.json\n");
+    let _ = write_atomically(&exclude, &updated);
 }
 
 fn has_any_env(keys: &[&str]) -> bool {
@@ -956,6 +1202,9 @@ fn installer_hook_namespace(command: &str, root: &Path, abs_runner: &str) -> Opt
     if runner.contains('"') || path_basename(runner) != path_basename(abs_runner) {
         return None;
     }
+    // A missing runner counts as ours only at the installer's plugin
+    // location: any other `cli-hook.mjs` is someone else's hook and must not
+    // supply this project's namespace (#378 F6, #388).
     runner_is_installers_hook(runner, root, abs_runner).then_some(ns)
 }
 
@@ -1161,24 +1410,21 @@ impl NamespaceRoots {
             .chain(self.outside_git.iter())
     }
 
-    /// The harness configs of the first place in [`Self::config_order`] that
-    /// has any. A config that could not be read in a place looked at fails
-    /// the lookup: the namespace it names might be the answer.
+    /// Every harness config in every place in [`Self::config_order`], in that
+    /// fixed order. A linked worktree and its main checkout can each name a
+    /// namespace; stopping at the first root with any left the other one out
+    /// of the push gate. A config that could not be read anywhere looked at
+    /// fails the lookup: the namespace it names might be the answer.
     fn harness_namespaces(&self) -> Result<Vec<(String, String)>, Vec<UnreadableConfig>> {
+        let mut found = Vec::new();
         let mut unreadable = Vec::new();
         for root in self.config_order() {
-            let (found, errors) = harness_namespaces_at(root);
+            let (mut here, errors) = harness_namespaces_at(root);
             unreadable.extend(errors);
-            if !found.is_empty() {
-                return if unreadable.is_empty() {
-                    Ok(found)
-                } else {
-                    Err(unreadable)
-                };
-            }
+            found.append(&mut here);
         }
         if unreadable.is_empty() {
-            Ok(Vec::new())
+            Ok(found)
         } else {
             Err(unreadable)
         }
@@ -1363,6 +1609,72 @@ fn explicit_namespace_from(dir: &Path, env_namespace: Option<&str>) -> Result<St
             .collect()),
         _ => Err(candidates),
     }
+}
+
+/// Every distinct namespace the pre-push gate must check for `dir`: the
+/// root marker's first (marker-first resolution), then every harness config,
+/// `NEUROSTRATA_NAMESPACE`, and the ledger. A migration can leave an old
+/// namespace's in-progress tasks in a config or the ledger even after a
+/// marker names a new one; gating only the resolved namespace lets them
+/// escape (#378 F1). Case-only spellings are one namespace. An unreadable
+/// marker or config fails closed: the namespace it names is unknown.
+pub fn gate_namespaces(dir: &Path) -> Result<Vec<String>, ResolveError> {
+    let Ok(roots) = NamespaceRoots::of(dir) else {
+        return Ok(Vec::new());
+    };
+    let marker = crate::root_marker::find_root_marker(&roots.dir).map_err(|(path, reason)| {
+        ResolveError::UnreadableMarker(UnreadableConfig { path, reason })
+    })?;
+    let mut out: Vec<String> = Vec::new();
+    {
+        let mut add = |ns: String| {
+            if !out.iter().any(|n| n.eq_ignore_ascii_case(&ns)) {
+                out.push(ns);
+            }
+        };
+        if let Some(found) = marker {
+            add(found.config.namespace);
+        }
+        let configs = roots
+            .harness_namespaces()
+            .map_err(ResolveError::UnreadableConfigs)?;
+        for (_, ns) in configs {
+            add(ns);
+        }
+        if let Some(ns) = std::env::var("NEUROSTRATA_NAMESPACE")
+            .ok()
+            .and_then(|v| usable_env_namespace(&v))
+        {
+            add(ns);
+        }
+        for root in roots.ledger_order() {
+            let ledger = root.join(".NeuroStrata").join("session_queries.json");
+            let text = match std::fs::read_to_string(&ledger) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(ResolveError::UnreadableConfigs(vec![UnreadableConfig {
+                        path: ledger,
+                        reason: e.to_string(),
+                    }]));
+                }
+            };
+            let value: Value = serde_json::from_str(&text).map_err(|e| {
+                ResolveError::UnreadableConfigs(vec![UnreadableConfig {
+                    path: ledger.clone(),
+                    reason: format!("it is not valid JSON ({e})"),
+                }])
+            })?;
+            if let Some(ns) = value
+                .get("namespace")
+                .and_then(Value::as_str)
+                .and_then(usable_namespace)
+            {
+                add(ns);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The one warning line, naming the file, for a project marker at `path`
@@ -1688,6 +2000,7 @@ pub fn auto_install_detected_plugins(
             namespace,
             harness,
             active == Some(harness),
+            &detected,
             &abs_dist,
             &abs_runner,
             &mut warnings,
@@ -1723,6 +2036,17 @@ fn sync_skills_and_agent_rules(
     let mut patched_agents = Vec::new();
 
     let write_file_if_changed = |path: &Path, content: &str| -> bool {
+        // Home-level skills are outside the checkout; anchor the symlink
+        // check at their nearest parent so a repo-controlled link is still
+        // refused while the user's own install can be refreshed (#381 F3).
+        let base = if path.starts_with(project_root) {
+            project_root
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        if refuse_symlink_components(base, path).is_err() {
+            return false;
+        }
         if let Some(parent) = path.parent() {
             if std::fs::create_dir_all(parent).is_err() {
                 return false;
@@ -1731,7 +2055,7 @@ fn sync_skills_and_agent_rules(
         let needs_write = std::fs::read_to_string(path)
             .map(|existing| existing != content)
             .unwrap_or(true);
-        if needs_write && std::fs::write(path, content).is_err() {
+        if needs_write && write_atomically(path, content).is_err() {
             return false;
         }
         true
@@ -1833,7 +2157,9 @@ fn sync_skills_and_agent_rules(
                 None
             };
             if let Some(updated) = updated {
-                if std::fs::write(&path, updated).is_ok() {
+                if refuse_symlink_components(&dir, &path).is_ok()
+                    && write_atomically(&path, &updated).is_ok()
+                {
                     patched_agents.push(path.to_string_lossy().to_string());
                 }
             }
@@ -1841,6 +2167,32 @@ fn sync_skills_and_agent_rules(
     }
 
     (skills_installed, patched_agents)
+}
+
+/// Refuse a write whose path has a symlink component beneath `root`. A repo
+/// can ship a tracked `.codex -> ../.codex` or a symlinked
+/// `.NeuroStrata/plugins/...`; `create_dir_all` and `rename` would otherwise
+/// follow it out of the checkout. Stops at the first missing component: the
+/// installer creates the rest itself. The final component (the file) is
+/// checked too, so a link to a user file is never read back or replaced.
+fn refuse_symlink_components(root: &Path, path: &Path) -> std::io::Result<()> {
+    let denied = |what: String| std::io::Error::new(std::io::ErrorKind::PermissionDenied, what);
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|_| denied("path is outside the project root".to_string()))?;
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(denied(format!("{} is a symlink", current.display())));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Write `contents` to `path` through a temporary file in the same folder and
@@ -1931,11 +2283,15 @@ fn wire_harness_config(
     namespace: ConfigNamespace<'_>,
     harness: &str,
     is_active: bool,
+    detected: &[&str],
     abs_dist: &str,
     abs_runner: &str,
     warnings: &mut Vec<String>,
 ) -> Option<String> {
     let write_json_if_changed = |path: &Path, val: &Value| -> Option<String> {
+        if refuse_symlink_components(project_root, path).is_err() {
+            return None;
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -2206,11 +2562,16 @@ fn wire_harness_config(
             None
         }
         "codex" => {
-            if is_active || project_root.join(".codex").exists() {
+            // A Codex install in the user's home is detected even on a fresh
+            // clone with no `.codex` folder; wire the hooks then too and let
+            // the writer create the folder (#368 F7).
+            if is_active || detected.contains(&"codex") || project_root.join(".codex").exists() {
                 if namespace.is_none() && !wire_without_namespace {
                     return None;
                 }
                 let cfg_path = project_root.join(".codex/plugins/neurostrata.json");
+                // A namespace-neutral refresh writes no baked namespace; an
+                // explicit one is still persisted for older readers (#388).
                 let doc = with_namespace(
                     json!({
                         "id": "neurostrata-codex",
@@ -2220,10 +2581,18 @@ fn wire_harness_config(
                     namespace.as_deref(),
                 );
                 let cfg_written = write_json_if_changed(&cfg_path, &doc);
-                // Codex CLI never reads the file above: it runs hooks from
-                // `.codex/hooks.json` (or `[hooks]` in config.toml). Without
-                // this entry no NeuroStrata hook ran in Codex at all (#333).
-                return wire_codex_hooks(project_root, abs_runner).or(cfg_written);
+                // Codex CLI never reads the metadata file: it runs hooks from
+                // `.codex/hooks.json` (or `[hooks]` in config.toml). Report
+                // only a hook that was actually wired, never the metadata as
+                // a fallback; say so loudly when wiring failed (#368 F6).
+                let hooks_wired = wire_codex_hooks(project_root, abs_runner, warnings);
+                if hooks_wired.is_none() {
+                    warnings.push(format!(
+                        "Codex metadata {} was written but no Codex hook was wired; check .codex/hooks.json and .codex/config.toml",
+                        cfg_path.display()
+                    ));
+                }
+                return hooks_wired;
             }
             None
         }
@@ -3767,7 +4136,8 @@ mod tests {
     fn repairs_a_runner_path_that_no_longer_exists() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".claude")).expect("create .claude");
-        // A moved project: the old runner sat at the installer's plugin location.
+        // A moved project keeps the installer layout; the old runner sat at
+        // the installer's plugin location (#378 F6, #388).
         let gone = tmp
             .path()
             .join("moved-away/.NeuroStrata/plugins/claude/cli-hook.mjs");
@@ -4405,6 +4775,7 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             "opencode",
             true,
+            &["opencode"],
             "./.NeuroStrata/plugins/opencode/dist/index.js",
             "./.NeuroStrata/plugins/opencode/cli-hook.mjs",
             &mut Vec::new(),
@@ -4731,8 +5102,11 @@ mod tests {
         assert_eq!(read_codex_hooks(tmp.path()), doc);
     }
 
+    /// Ownership is this project's runner only: a foreign `cli-hook.mjs`
+    /// (even at the installer layout under another folder) is kept as-is and
+    /// our hook is added beside it, not repointed (#368 F9).
     #[test]
-    fn codex_hooks_json_keeps_user_hooks_and_repoints_a_moved_runner() {
+    fn codex_hooks_json_keeps_a_foreign_runner_and_adds_ours() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".codex")).expect("create .codex");
         let report = auto_install_detected_plugins(
@@ -4754,7 +5128,7 @@ mod tests {
             "hooks": {
                 "PreToolUse": [
                     { "matcher": "*", "hooks": [{ "type": "command", "command": "echo user-hook" }] },
-                    { "matcher": "apply_patch|Bash", "hooks": [{ "type": "command", "command": stale }] }
+                    { "matcher": "apply_patch|Bash", "hooks": [{ "type": "command", "command": stale.clone() }] }
                 ],
                 "SessionStart": [{ "hooks": [{ "type": "command", "command": "echo start" }] }]
             },
@@ -4771,8 +5145,8 @@ mod tests {
         let doc = read_codex_hooks(tmp.path());
         assert_eq!(
             codex_commands(&doc, "PreToolUse"),
-            vec!["echo user-hook".to_string(), expected.clone()],
-            "user hook kept, moved runner repointed, nothing duplicated"
+            vec!["echo user-hook".to_string(), stale, expected.clone()],
+            "user hook kept, foreign runner untouched, ours added once"
         );
         assert_eq!(codex_commands(&doc, "Stop"), vec![expected]);
         assert_eq!(
@@ -4915,12 +5289,12 @@ mod tests {
         assert!(CLI_HOOK_RUNNER_MJS.contains(", projectDir });"));
     }
 
-    /// Ownership is the installer's layout, read as literal text: a user's
-    /// own (missing) `cli-hook.mjs` is never claimed, and a moved checkout
-    /// whose old path holds `$` or `%` is repointed, not duplicated (Codex
-    /// review on #368).
+    /// Ownership is this project's canonical runner, not any path ending in
+    /// the installer layout: a nested/moved checkout's `cli-hook.mjs` (even
+    /// one holding `$` or `%`) is left untouched and ours is added beside it
+    /// (#368 F9).
     #[test]
-    fn codex_refresh_owns_only_the_installer_layout_literally() {
+    fn codex_refresh_owns_only_this_projects_runner() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join(".codex")).expect("create .codex");
         let report = auto_install_detected_plugins(
@@ -4952,10 +5326,10 @@ mod tests {
         let user = json!({
             "hooks": {
                 "PreToolUse": [
-                    { "matcher": "*", "hooks": [{ "type": "command", "command": user_policy }] },
-                    { "matcher": "apply_patch|Bash", "hooks": [{ "type": "command", "command": moved }] }
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": user_policy.clone() }] },
+                    { "matcher": "apply_patch|Bash", "hooks": [{ "type": "command", "command": moved.clone() }] }
                 ],
-                "Stop": [{ "hooks": [{ "type": "command", "command": moved }] }]
+                "Stop": [{ "hooks": [{ "type": "command", "command": moved.clone() }] }]
             }
         });
         std::fs::write(
@@ -4972,9 +5346,357 @@ mod tests {
         let doc = read_codex_hooks(tmp.path());
         assert_eq!(
             codex_commands(&doc, "PreToolUse"),
-            vec![user_policy, ours.clone()],
-            "user hook kept as written; moved installer hook repointed in place"
+            vec![user_policy, moved.clone(), ours.clone()],
+            "user hook kept as written; foreign runner kept; ours added once"
         );
+        assert_eq!(
+            codex_commands(&doc, "Stop"),
+            vec![moved, ours],
+            "foreign Stop hook kept as written; ours added beside it"
+        );
+    }
+
+    // ---- issue #382 regressions ----
+
+    /// #368 F5/F10: both command forms are written, and the embedded runner
+    /// answers a failed hook with a PreToolUse deny instead of `exit 2`
+    /// (PowerShell swallows a nonzero exit code and the tool runs anyway).
+    #[test]
+    fn codex_hooks_carry_windows_variant_and_runner_denies_on_error() {
+        assert!(CLI_HOOK_RUNNER_MJS.contains("permissionDecision: \"deny\""));
+        assert!(!CLI_HOOK_RUNNER_MJS.contains("\n  process.exit(2);"));
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner");
+        let doc = read_codex_hooks(tmp.path());
+        for event in ["PreToolUse", "Stop"] {
+            let hook = &doc["hooks"][event][0]["hooks"][0];
+            assert_eq!(
+                hook["command"],
+                json!(format!("node {}", shell_literal(runner)))
+            );
+            assert_eq!(
+                hook["commandWindows"],
+                json!(format!("node {}", powershell_literal(runner)))
+            );
+        }
+    }
+
+    /// #368 F4/F10: a tracked `.codex` symlink must not redirect the hook or
+    /// metadata write into a user file; the absolute runner path in the
+    /// untracked hooks.json is added once to the local git exclude.
+    #[cfg(unix)]
+    #[test]
+    fn codex_writes_refuse_symlinks_and_exclude_hooks_once() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("hooks.json");
+        std::fs::write(&target, "{}").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git/info")).unwrap();
+        std::fs::write(tmp.path().join(".git/info/exclude"), "# local\n").unwrap();
+        symlink(&outside, tmp.path().join(".codex")).unwrap();
+
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        assert!(
+            report["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("symlink"))),
+            "{report}"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}");
+        assert!(!outside.join("plugins/neurostrata.json").exists());
+
+        std::fs::remove_file(tmp.path().join(".codex")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        for _ in 0..2 {
+            let _ = auto_install_detected_plugins(
+                tmp.path(),
+                ConfigNamespace::Set("TestProj"),
+                Some("codex"),
+            );
+        }
+        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            exclude.matches("/.codex/hooks.json").count(),
+            1,
+            "{exclude}"
+        );
+    }
+
+    /// #368 F6/F8: an unreadable hooks.json yields no `config_wired` claim
+    /// plus a warning; env/argument-prefixed commands and `[hooks]` in the
+    /// other Codex config layer are recognized so no second hook is added.
+    #[test]
+    fn codex_wiring_reports_hook_state_and_recognizes_other_layers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let ours = format!("node {}", shell_literal(&runner));
+        let path = tmp.path().join(".codex/hooks.json");
+
+        // A BOM'd hooks.json is left alone and is not reported as wired.
+        std::fs::write(&path, "\u{feff}{\"hooks\":{}}").unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        assert!(
+            report["installed_plugins"][0]["config_wired"].is_null(),
+            "{report}"
+        );
+        assert!(report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().is_some_and(|s| s.contains("byte order mark"))));
+
+        // A prefixed form of our own command is repaired, not duplicated.
+        let prefixed = format!("env NEUROSTRATA_NAMESPACE=TestProj {ours}");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({"hooks": {
+                "PreToolUse": [{"hooks": [{"type": "command", "command": prefixed}]}]
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        assert_eq!(
+            codex_commands(&read_codex_hooks(tmp.path()), "PreToolUse"),
+            vec![ours.clone()]
+        );
+
+        // A `[hooks.pre_tool_use]` entry in config.toml covers PreToolUse;
+        // Stop is still wired because that section does not cover it.
+        std::fs::write(&path, serde_json::to_string(&json!({"hooks": {}})).unwrap()).unwrap();
+        std::fs::write(
+            tmp.path().join(".codex/config.toml"),
+            format!(
+                "[hooks.pre_tool_use]\ncommand = \"{}\"\n",
+                runner.replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let doc = read_codex_hooks(tmp.path());
+        assert!(doc["hooks"]["PreToolUse"].as_array().unwrap().is_empty());
         assert_eq!(codex_commands(&doc, "Stop"), vec![ours]);
+    }
+
+    /// An older install (or a checkout shared with POSIX) may carry only
+    /// `command`. Recognizing our hook must repair both platform variants;
+    /// otherwise Windows keeps running the POSIX-quoted command.
+    #[test]
+    fn codex_refresh_adds_the_missing_windows_command_to_an_owned_hook() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let (cmd, cmd_windows) = codex_hook_commands(&runner);
+        std::fs::write(
+            tmp.path().join(".codex/hooks.json"),
+            serde_json::to_string_pretty(&json!({"hooks": {
+                "PreToolUse": [{"hooks": [{"type": "command", "command": cmd.clone()}]}],
+                "Stop": [{"hooks": [{"type": "command", "command": cmd.clone()}]}]
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let doc = read_codex_hooks(tmp.path());
+        for event in ["PreToolUse", "Stop"] {
+            let hook = &doc["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["command"], json!(cmd), "{event}");
+            assert_eq!(hook["commandWindows"], json!(cmd_windows), "{event}");
+            assert_eq!(codex_commands(&doc, event).len(), 1, "{event}");
+        }
+    }
+
+    /// A comment or an unrelated setting mentioning the runner path is not a
+    /// hook command. It must not suppress wiring the real hooks.json entry.
+    #[test]
+    fn a_comment_mentioning_the_runner_does_not_wire_the_codex_hook() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let ours = codex_hook_command(&runner);
+        std::fs::write(
+            tmp.path().join(".codex/hooks.json"),
+            serde_json::to_string(&json!({"hooks": {}})).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".codex/config.toml"),
+            format!(
+                "# the canonical runner is {runner}\n[hooks.pre_tool_use]\nenv = \"{}\"\n",
+                runner.replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let doc = read_codex_hooks(tmp.path());
+        assert_eq!(codex_commands(&doc, "PreToolUse"), vec![ours]);
+    }
+
+    /// #368 F7: Codex detected only through the user's home install still
+    /// gets hooks wired on a fresh clone without a project `.codex` folder.
+    #[test]
+    fn codex_detected_in_home_wires_a_fresh_clone() {
+        let _env = no_namespace_env();
+        let old_home = std::env::var_os("HOME");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::env::set_var("HOME", &home);
+        let project = tmp.path().join("fresh-clone");
+        std::fs::create_dir_all(&project).unwrap();
+        let report =
+            auto_install_detected_plugins(&project, ConfigNamespace::Set("TestProj"), None);
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(project.join(".codex/hooks.json").exists(), "{report}");
+        let codex = report["installed_plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["harness"] == "codex")
+            .expect("codex installed");
+        assert!(!codex["config_wired"].is_null());
+    }
+
+    /// #378 F1: the gate's namespace list keeps marker-first resolution but
+    /// also covers every harness config and the ledger; case-only spellings
+    /// are one namespace.
+    #[test]
+    fn gate_namespaces_unions_marker_configs_and_ledger() {
+        let _env = no_namespace_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = dunce::canonicalize(tmp.path()).unwrap().join("migrated");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        marker_at(&dir, "New");
+        write_file(
+            &dir.join(".codex/plugins/neurostrata.json"),
+            r#"{"namespace":"Legacy"}"#,
+        );
+        write_file(
+            &dir.join(".NeuroStrata/session_queries.json"),
+            r#"{"namespace":"Ledger"}"#,
+        );
+        assert_eq!(
+            gate_namespaces(&dir).expect("namespaces"),
+            vec!["New", "Legacy", "Ledger"]
+        );
+        write_file(
+            &dir.join(".hermes/plugins/neurostrata.json"),
+            r#"{"namespace":"legacy"}"#,
+        );
+        assert_eq!(
+            gate_namespaces(&dir).expect("namespaces"),
+            vec!["New", "Legacy", "Ledger"]
+        );
+    }
+
+    /// #378 F6: only the installer's own place may carry a baked namespace;
+    /// an arbitrary `cli-hook.mjs` beside it is someone else's hook.
+    #[test]
+    fn an_assigned_hook_only_claims_the_installers_place() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = dunce::canonicalize(tmp.path()).unwrap();
+        let runner = plain_abs_path(&installed_runner(&root, "claude"));
+        let parts = |cmd: &str| installer_hook_parts(cmd, &runner, &root);
+        assert!(parts(&format!("NEUROSTRATA_NAMESPACE=x node \"{runner}\"")).is_some());
+        assert!(parts(&format!(
+            "NEUROSTRATA_NAMESPACE=x node \"{}\"",
+            root.join("tools/cli-hook.mjs").display()
+        ))
+        .is_none());
+        assert!(parts(
+            "NEUROSTRATA_NAMESPACE=x node \"C:/gone/.NeuroStrata/plugins/claude/cli-hook.mjs\""
+        )
+        .is_some());
+    }
+
+    /// #381 F3: skill scaffolding never writes through a symlinked target.
+    #[cfg(unix)]
+    #[test]
+    fn skill_writes_refuse_a_symlinked_target() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = dunce::canonicalize(tmp.path()).unwrap().join("project");
+        std::fs::create_dir_all(project.join(".agents/skills/neurostrata")).unwrap();
+        let victim = tmp.path().join("victim.md");
+        std::fs::write(&victim, "do not touch").unwrap();
+        let skill = project.join(".agents/skills/neurostrata/SKILL.md");
+        symlink(&victim, &skill).unwrap();
+        let report = auto_install_detected_plugins(
+            &project,
+            ConfigNamespace::Set("TestProj"),
+            Some("claude"),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not touch",
+            "{report}"
+        );
+        assert!(std::fs::symlink_metadata(&skill)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

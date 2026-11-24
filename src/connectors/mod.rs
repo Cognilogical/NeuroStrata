@@ -77,6 +77,12 @@ pub struct ExternalEffectReceipt {
     pub idempotency_key: String,
     pub applied: bool,
     pub prior_source_sha256: String,
+    /// Legacy-encoded digest of the same prior records. Populated so a
+    /// pointer captured before the #351 encoding change still passes the
+    /// kernel's write-back CAS check (review 4670091380). Old receipts
+    /// deserialize with an empty string via `#[serde(default)]`.
+    #[serde(default)]
+    pub prior_source_sha256_legacy: String,
     pub new_source_sha256: String,
     pub details: String,
 }
@@ -329,20 +335,49 @@ impl InMemoryPoolConnector {
     }
 
     fn compute_source_sha256(records: &[Value]) -> String {
-        let mut hasher = Sha256::new();
-        for r in records {
-            hasher.update(serde_json::to_vec(r).expect("serialize record"));
-        }
-        hex::encode(hasher.finalize())
+        hash_records_sha256(records)
     }
 
     fn compute_slice_sha256(records: &[Value]) -> String {
-        let mut hasher = Sha256::new();
-        for r in records {
-            hasher.update(serde_json::to_vec(r).expect("serialize record"));
-        }
-        hex::encode(hasher.finalize())
+        hash_records_sha256(records)
     }
+}
+
+/// Hash a record set with an unambiguous per-record length prefix.
+///
+/// Concatenating per-record JSON let `[1,23]` and `[12,3]` feed the hasher
+/// the same `123` byte stream (issue #351). Prefixing each record with its
+/// byte length makes the encoding injective, so a boundary-shifted change
+/// can no longer pass a source-digest compare-and-swap check.
+fn hash_records_sha256(records: &[Value]) -> String {
+    let mut hasher = Sha256::new();
+    for record in records {
+        let bytes = serde_json::to_vec(record).expect("serialize record");
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Digest encoding used before the issue #351 fix: plain concatenation of
+/// each record's serialized JSON. Kept only to recognize expectations that
+/// were persisted before the length-prefixed encoding shipped.
+fn hash_records_sha256_legacy(records: &[Value]) -> String {
+    let mut hasher = Sha256::new();
+    for record in records {
+        hasher.update(serde_json::to_vec(record).expect("serialize record"));
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// True when `expected` matches the current encoding or a digest persisted
+/// before the #351 encoding change (Codex review 4670091380).
+///
+/// Any raw string compare against a persisted source digest must go through
+/// this helper, or write-back CAS rejects every pointer captured with the
+/// legacy encoding until its expectation is recaptured.
+pub fn source_digest_matches(expected: &str, records: &[Value]) -> bool {
+    expected == hash_records_sha256(records) || expected == hash_records_sha256_legacy(records)
 }
 
 impl Default for InMemoryPoolConnector {
@@ -474,7 +509,7 @@ impl DataConnector for InMemoryPoolConnector {
         let prior_records = all_records.clone();
         let current_source_sha = InMemoryPoolConnector::compute_source_sha256(all_records);
         if let Some(expected) = &req.expected_source_sha256 {
-            if *expected != current_source_sha {
+            if !source_digest_matches(expected, all_records.as_slice()) {
                 return Err(anyhow!(
                     "CAS conflict: expected source sha256 {}, got {}",
                     expected,
@@ -515,6 +550,7 @@ impl DataConnector for InMemoryPoolConnector {
             idempotency_key: req.idempotency_key.clone(),
             applied: true,
             prior_source_sha256: current_source_sha,
+            prior_source_sha256_legacy: hash_records_sha256_legacy(&all_records),
             new_source_sha256: new_source_sha,
             details: format!("{} applied", req.operation),
         };
@@ -829,7 +865,7 @@ impl DataConnector for JsonFilePoolConnector {
         let mut all_records = JsonFilePoolConnector::read_json_file(&path)?;
         let current_source_sha = JsonFilePoolConnector::compute_sha(&all_records);
         if let Some(expected) = &req.expected_source_sha256 {
-            if *expected != current_source_sha {
+            if !source_digest_matches(expected, all_records.as_slice()) {
                 return Err(anyhow!(
                     "CAS conflict: expected source sha256 {}, got {}",
                     expected,
@@ -868,6 +904,7 @@ impl DataConnector for JsonFilePoolConnector {
             idempotency_key: req.idempotency_key.clone(),
             applied: true,
             prior_source_sha256: current_source_sha,
+            prior_source_sha256_legacy: hash_records_sha256_legacy(&all_records),
             new_source_sha256: new_source_sha,
             details: format!("{} applied to {}", req.operation, path.display()),
         };
@@ -878,11 +915,7 @@ impl DataConnector for JsonFilePoolConnector {
 
 impl JsonFilePoolConnector {
     fn compute_sha(records: &[Value]) -> String {
-        let mut hasher = Sha256::new();
-        for r in records {
-            hasher.update(serde_json::to_vec(r).expect("serialize record"));
-        }
-        hex::encode(hasher.finalize())
+        hash_records_sha256(records)
     }
 }
 
@@ -895,6 +928,66 @@ mod tests {
 
     fn rt() -> Runtime {
         Runtime::new().unwrap()
+    }
+
+    /// Issue #351: boundary-free concatenation made `[1,23]` and `[12,3]`
+    /// hash identically. Every digest helper must separate records.
+    #[test]
+    fn connector_digests_are_boundary_aware() {
+        let a = vec![json!(1), json!(23)];
+        let b = vec![json!(12), json!(3)];
+        let c = vec![json!(1), json!(24)];
+        assert_eq!(
+            InMemoryPoolConnector::compute_source_sha256(&a),
+            InMemoryPoolConnector::compute_slice_sha256(&a),
+            "both in-memory helpers must share one encoding"
+        );
+        assert_ne!(
+            InMemoryPoolConnector::compute_source_sha256(&a),
+            InMemoryPoolConnector::compute_source_sha256(&b),
+            "[1,23] and [12,3] must not collide"
+        );
+        assert_ne!(
+            InMemoryPoolConnector::compute_slice_sha256(&a),
+            InMemoryPoolConnector::compute_slice_sha256(&b),
+            "slice digest must not collide either"
+        );
+        assert_ne!(
+            JsonFilePoolConnector::compute_sha(&a),
+            JsonFilePoolConnector::compute_sha(&b),
+            "file connector digest must not collide"
+        );
+        assert_ne!(
+            InMemoryPoolConnector::compute_source_sha256(&a),
+            InMemoryPoolConnector::compute_source_sha256(&c),
+            "hasher must stay content-sensitive (control)"
+        );
+        let s1 = vec![json!("1"), json!("23")];
+        let s2 = vec![json!("12"), json!("3")];
+        assert_ne!(
+            InMemoryPoolConnector::compute_source_sha256(&s1),
+            InMemoryPoolConnector::compute_source_sha256(&s2),
+            "string records must remain distinct too"
+        );
+    }
+
+    /// Codex review 4670091380: digests persisted before the v2 encoding
+    /// must still satisfy write-back CAS until they are recaptured.
+    #[test]
+    fn connector_cas_accepts_legacy_and_v2_digests() {
+        let records = vec![json!(1), json!(23)];
+        let v2 = InMemoryPoolConnector::compute_source_sha256(&records);
+        let legacy = hash_records_sha256_legacy(&records);
+        assert_ne!(v2, legacy, "encodings must remain distinct");
+        assert!(source_digest_matches(&v2, &records));
+        assert!(source_digest_matches(&legacy, &records));
+        // The legacy concatenation is exactly the collision #351 fixed:
+        // `[1,23]` and `[12,3]` both serialize to "123". It stays accepted
+        // only for already-persisted expectations, never produced anew.
+        assert!(source_digest_matches(&legacy, &[json!(12), json!(3)]));
+        assert!(!source_digest_matches(&v2, &[json!(12), json!(3)]));
+        assert!(!source_digest_matches(&legacy, &[json!(1), json!(24)]));
+        assert!(!source_digest_matches("deadbeef", &records));
     }
 
     #[test]

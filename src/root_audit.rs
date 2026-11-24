@@ -194,6 +194,32 @@ fn ends_with_separator(raw: &str) -> bool {
     raw.ends_with('/') || raw.ends_with('\\')
 }
 
+/// Split a qualified key into the prefix to preserve and the logical path the
+/// audit judges. Only the audited namespace is stripped, plus one numeric
+/// generation: a namespace may itself contain `::`, so splitting on any `::`
+/// would mistake part of the namespace for a separator and the key would be
+/// neither counted nor rewritten.
+fn split_qualified<'a>(entry: &'a str, namespace: &str) -> (&'a str, &'a str) {
+    let sep = crate::parser::ingest::NAMESPACE_SEPARATOR;
+    let mut prefix = "";
+    let mut rest = entry;
+    if let Some(stripped) = entry
+        .strip_prefix(namespace)
+        .and_then(|r| r.strip_prefix(sep))
+        .filter(|r| !r.is_empty())
+    {
+        prefix = &entry[..entry.len() - stripped.len()];
+        rest = stripped;
+    }
+    if let Some((head, tail)) = rest.split_once(sep) {
+        if head.parse::<u64>().is_ok() {
+            prefix = &entry[..entry.len() - tail.len()];
+            rest = tail;
+        }
+    }
+    (prefix, rest)
+}
+
 /// The roots an audit judges paths against: the current root, whose files
 /// the stored relative keys name today, and the root the corrections are
 /// spelled relative to (the same one unless `--for-root` names a planned
@@ -452,16 +478,18 @@ pub fn audit_rows_for(
                     out.push(entry.clone());
                     continue;
                 };
-                if !governs_is_path(raw, &roots.both())
-                    || other_root_paths.contains(&crate::parser::ingest::normalize_node_path(raw))
+                let (qualifier, logical) = split_qualified(raw, namespace);
+                if !governs_is_path(logical, &roots.both())
+                    || other_root_paths
+                        .contains(&crate::parser::ingest::normalize_node_path(logical))
                 {
                     out.push(entry.clone());
                     continue;
                 }
-                match judge(raw, &roots) {
+                match judge(logical, &roots) {
                     Verdict::Rewrite(rel) => {
                         rewrote = true;
-                        out.push(Value::String(rel));
+                        out.push(Value::String(format!("{qualifier}{rel}")));
                     }
                     Verdict::Missing => {
                         note(raw, UndecidedWhy::NoSuchFile, &mut undecided);

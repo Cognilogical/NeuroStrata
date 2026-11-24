@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Provider selection mode for deduplication.
 #[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -328,7 +329,7 @@ impl Config {
         if canonical_path.file_name().and_then(|name| name.to_str()) != Some(".NeuroStrata") {
             anyhow::bail!(
                 "Canonical project context path must end in .NeuroStrata: {}",
-                canonical_path.display()
+                marker_path.display()
             );
         }
         self.project_contexts
@@ -346,18 +347,28 @@ impl Config {
 
 /// How long a `config.json.lock` may sit before it is taken as left behind by
 /// a process that died holding it.
-const CONFIG_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(60);
+const CONFIG_LOCK_STALE: Duration = Duration::from_secs(60);
 
 /// How long [`ConfigLock::acquire`] waits for a live lock.
-const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const CONFIG_LOCK_WAIT: Duration = Duration::from_secs(30);
 
-/// An exclusive lock on the user config: the file `<config>.lock` beside it,
-/// created with `create_new` and removed on drop; one left older than
-/// [`CONFIG_LOCK_STALE`] by a dead process is broken (see
-/// `break_stale_lock`). A read-check-write of the
-/// config holds it so two writers cannot overwrite each other in between.
+/// Poll interval while waiting for a contended lock.
+const CONFIG_LOCK_POLL: Duration = Duration::from_millis(25);
+
+/// Poll interval while retrying a transient lock on a freshly created file.
+const LOCK_RETRY_POLL: Duration = Duration::from_millis(5);
+
+/// An exclusive lock on the user config: the file `<config>.lock` beside it.
+/// The file carries an OS advisory lock held for the guard's whole life, plus
+/// a nonce. Mtime alone cannot tell a paused holder from a dead one, and a
+/// `Drop` that unlinks whatever sits at the path can delete a successor's
+/// lock; both are prevented here. A read-check-write of the config holds the
+/// guard so two writers cannot overwrite each other in between.
 pub struct ConfigLock {
     path: PathBuf,
+    /// Keeps the advisory lock until the guard is dropped.
+    file: Option<std::fs::File>,
+    nonce: String,
 }
 
 impl ConfigLock {
@@ -373,45 +384,120 @@ impl ConfigLock {
                 format!("Could not create config directory {}", parent.display())
             })?;
         }
-        let started = std::time::Instant::now();
+        let nonce = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
+        let deadline = Instant::now() + CONFIG_LOCK_WAIT;
         loop {
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(mut file) => {
-                    let _ = writeln!(file, "{}", std::process::id());
-                    return Ok(ConfigLock { path });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if is_stale(&path) {
-                        break_stale_lock(&path);
+                Ok(file) => return finish_created_lock(file, path, nonce, deadline),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    // A live holder owns the advisory lock even when its mtime
+                    // is old (a paused process). Only a stale, unheld lock is
+                    // breakable, and the break re-validates atomically so a
+                    // writer cannot be unlinked out from under it.
+                    if try_break_stale_lock(&path) {
                         continue;
                     }
-                    if started.elapsed() > CONFIG_LOCK_WAIT {
+                    if Instant::now() >= deadline {
                         anyhow::bail!(
                             "the user config is locked by {} (another NeuroStrata command is writing it)",
                             path.display()
                         );
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    std::thread::sleep(CONFIG_LOCK_POLL);
                 }
                 // Windows answers "access denied" while another process's
                 // delete or rename of the lock file is still pending: the
                 // lock is changing hands, so wait like for a held lock.
                 Err(e)
                     if cfg!(windows)
-                        && e.kind() == std::io::ErrorKind::PermissionDenied
-                        && started.elapsed() <= CONFIG_LOCK_WAIT =>
+                        && e.kind() == ErrorKind::PermissionDenied
+                        && Instant::now() < deadline =>
                 {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    std::thread::sleep(CONFIG_LOCK_POLL);
                 }
                 Err(e) => {
                     return Err(e).with_context(|| format!("Could not create {}", path.display()))
                 }
             }
         }
+    }
+}
+
+/// Finish claiming a lock file we created with `create_new`: write our nonce,
+/// acquire the advisory lock (retrying a transient free-probe), and reclaim the
+/// path on every error so a failed acquisition never strands a lock file.
+fn finish_created_lock(
+    mut file: std::fs::File,
+    path: PathBuf,
+    nonce: String,
+    deadline: Instant,
+) -> Result<ConfigLock> {
+    if let Err(e) = writeln!(file, "{nonce}") {
+        // We created this path exclusively; no successor can own it yet.
+        let _ = fs::remove_file(&path);
+        return Err(e).with_context(|| format!("Could not write {}", path.display()));
+    }
+    if let Err(e) = lock_created_file(&mut file, deadline) {
+        // Reclaim only if the path still carries our nonce.
+        if lock_nonce_is(&path, &nonce) {
+            let _ = fs::remove_file(&path);
+        }
+        return Err(e).with_context(|| format!("Could not lock {}", path.display()));
+    }
+    Ok(ConfigLock {
+        path,
+        file: Some(file),
+        nonce,
+    })
+}
+
+/// Acquire the advisory lock on a file we just created. A concurrent waiter's
+/// free-probe can briefly hold that lock; retry the transient contention
+/// instead of failing a valid config write.
+fn lock_created_file(file: &mut std::fs::File, deadline: Instant) -> std::io::Result<()> {
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let retryable = match &e {
+                    std::fs::TryLockError::WouldBlock => true,
+                    std::fs::TryLockError::Error(io) => {
+                        io.kind() == ErrorKind::WouldBlock
+                            || (cfg!(windows) && io.kind() == ErrorKind::PermissionDenied)
+                    }
+                };
+                if retryable && Instant::now() < deadline {
+                    std::thread::sleep(LOCK_RETRY_POLL);
+                    continue;
+                }
+                return Err(match e {
+                    std::fs::TryLockError::WouldBlock => {
+                        std::io::Error::new(ErrorKind::WouldBlock, "lock is held")
+                    }
+                    std::fs::TryLockError::Error(io) => io,
+                });
+            }
+        }
+    }
+}
+
+/// Whether the lock file at `path` still carries `nonce` (our identity).
+fn lock_nonce_is(path: &Path, nonce: &str) -> bool {
+    fs::read_to_string(path)
+        .map(|text| text.trim() == nonce)
+        .unwrap_or(false)
+}
+
+/// Whether nobody holds the advisory lock on an existing lock file. A file
+/// that cannot be opened cannot be proven free, so it stays untouched.
+fn lock_is_free(path: &Path) -> bool {
+    match fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => matches!(file.try_lock(), Ok(())),
+        Err(_) => false,
     }
 }
 
@@ -423,40 +509,108 @@ fn is_stale(path: &Path) -> bool {
         .is_some_and(|age| age > CONFIG_LOCK_STALE)
 }
 
-/// Remove the stale lock at `path`, serialized by a short-lived second lock
-/// (`<lock>.break`) and re-checked under it: two waiters that both saw the
-/// same stale file cannot both remove "it", because the second one would
-/// find the first one's successor fresh and leave it alone. A `.break` file
-/// itself older than the stale limit was left by a process that died while
-/// breaking, and is removed.
-fn break_stale_lock(path: &Path) {
+/// True when `path` still names the same inode as the open `file` handle.
+#[cfg(unix)]
+fn same_file_at_path(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), fs::metadata(path)) {
+        (Ok(open), Ok(named)) => open.dev() == named.dev() && open.ino() == named.ino(),
+        _ => false,
+    }
+}
+
+/// Break the stale lock at `path`, if any.
+///
+/// Serialized by a short-lived sibling `.break` lock. Under that guard the
+/// lock file is re-checked for staleness and acquired with the OS advisory
+/// lock; on Unix the path is unlinked *while that advisory lock is held*, so a
+/// writer cannot acquire the file between the check and the unlink. The inode
+/// is re-validated against `path` before removal. A `.break` file older than
+/// the stale limit was left by a process that died mid-break and is removed.
+fn try_break_stale_lock(path: &Path) -> bool {
     let mut breaker = path.as_os_str().to_owned();
     breaker.push(".break");
     let breaker = PathBuf::from(breaker);
-    match fs::OpenOptions::new()
+    let breaker_guard = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&breaker)
     {
-        Ok(file) => {
-            drop(file);
-            if is_stale(path) {
-                let _ = fs::remove_file(path);
-            }
-            let _ = fs::remove_file(&breaker);
-        }
+        Ok(file) => file,
         Err(_) => {
             if is_stale(&breaker) {
                 let _ = fs::remove_file(&breaker);
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            return false;
         }
-    }
+    };
+
+    let broke = (|| -> bool {
+        if !is_stale(path) {
+            return false;
+        }
+        let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        // Proves the stale file is unheld; keep the lock through the unlink.
+        if file.try_lock().is_err() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            if !same_file_at_path(&file, path) {
+                return false;
+            }
+            let removed = fs::remove_file(path).is_ok();
+            drop(file); // release the advisory lock on the now-unlinked inode
+            removed
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows refuses to unlink an open file; close first, then
+            // re-validate before the final removal. The `.break` guard still
+            // serializes competing breakers.
+            drop(file);
+            if is_stale(path) && lock_is_free(path) {
+                fs::remove_file(path).is_ok()
+            } else {
+                false
+            }
+        }
+    })();
+
+    drop(breaker_guard);
+    let _ = fs::remove_file(&breaker);
+    broke
 }
 
 impl Drop for ConfigLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Re-validate identity and unlink while the advisory lock is still
+        // held, so a successor cannot acquire the file (or replace it) between
+        // the check and the removal and get its own lock file unlinked.
+        let Some(file) = self.file.take() else {
+            return;
+        };
+        if !lock_nonce_is(&self.path, &self.nonce) {
+            // Somebody replaced the path; it is theirs, not ours to unlink.
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(&self.path);
+            drop(file); // release the advisory lock on the now-unlinked inode
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows refuses to unlink an open file: release, re-check, then
+            // remove only if the path still carries our nonce.
+            drop(file);
+            if lock_nonce_is(&self.path, &self.nonce) {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
     }
 }
 
@@ -934,5 +1088,172 @@ mod tests {
         assert!(lock.exists());
         drop(held);
         assert!(!lock.exists());
+    }
+
+    #[test]
+    fn a_held_config_lock_is_not_broken_by_an_old_mtime() {
+        let root = temp_dir("config-lock-held-not-stale");
+        let config_path = write_config(&root);
+        let lock = config_path.with_file_name("config.json.lock");
+        let held = ConfigLock::acquire(&config_path).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // Age alone must not make a live holder's lock breakable.
+        assert!(!lock_is_free(&lock));
+        drop(held);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn dropping_a_config_lock_does_not_remove_a_successors_file() {
+        let root = temp_dir("config-lock-foreign-successor");
+        let config_path = write_config(&root);
+        let lock = config_path.with_file_name("config.json.lock");
+        let held = ConfigLock::acquire(&config_path).unwrap();
+        // A paused holder's path is overwritten by another writer. Its nonce
+        // differs, so our Drop must leave it alone.
+        fs::write(&lock, "9999:successor").unwrap();
+        drop(held);
+        assert!(lock.exists(), "a foreign lock file must survive our drop");
+        fs::remove_file(&lock).unwrap();
+    }
+
+    // PR #400 bot findings. Concurrency regressions: no sleeps, channels and
+    // barriers only, so the races are exercised deterministically.
+
+    /// [Codex P2 / 4670088580] A concurrent free-probe can briefly hold the
+    /// advisory lock on a file we just created; `lock_created_file` must retry
+    /// that transient `WouldBlock` instead of failing the acquisition.
+    #[test]
+    fn transient_holder_on_created_file_is_retried() {
+        use std::sync::mpsc;
+
+        let root = temp_dir("config-lock-retry");
+        let path = root.join("created.lock");
+        fs::write(&path, b"seed").unwrap();
+
+        // Establish real contention: a separate fd holds the advisory lock.
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder_path = path.clone();
+        let holder = std::thread::spawn(move || {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&holder_path)
+                .unwrap();
+            file.try_lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            // `file` drops here -> advisory lock released
+        });
+        locked_rx.recv().unwrap();
+
+        let mut created = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(
+            created.try_lock().is_err(),
+            "contention must be established before the retry is exercised"
+        );
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let acquirer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            lock_created_file(&mut created, Instant::now() + Duration::from_secs(5)).unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+        holder.join().unwrap();
+        acquirer.join().unwrap();
+    }
+
+    /// [Sourcery Medium / 4670091305] A failed post-create acquisition must
+    /// reclaim the lock path it created, so later callers do not wait on a
+    /// lock nobody holds.
+    #[test]
+    fn failed_lock_acquisition_reclaims_created_lock_path() {
+        let root = temp_dir("config-lock-cleanup");
+        let path = root.join("created.lock");
+        fs::write(&path, b"").unwrap();
+
+        // A different fd holds the advisory lock, so our handle cannot lock.
+        let holder = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        holder.try_lock().unwrap();
+        let created = fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+        let err = match finish_created_lock(
+            created,
+            path.clone(),
+            format!("{}:nonce", std::process::id()),
+            Instant::now(),
+        ) {
+            Ok(_) => panic!("expected the contended acquisition to fail"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:#}").contains("Could not lock"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !path.exists(),
+            "a failed acquisition must reclaim the lock path it created"
+        );
+        drop(holder);
+    }
+
+    /// [Sourcery High / 4670091186 + 4670091174] Under heavy contention the
+    /// break path and `Drop` must never double-hold or leave a lock file (or a
+    /// `.break` sibling) behind.
+    #[test]
+    fn contended_acquire_and_drop_never_double_holds_or_leaves_locks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..8 {
+            let root = temp_dir("config-lock-contention");
+            let config_path = write_config(&root);
+            let inside = Arc::new(AtomicUsize::new(0));
+            let most = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let (config_path, inside, most, barrier) = (
+                        config_path.clone(),
+                        inside.clone(),
+                        most.clone(),
+                        barrier.clone(),
+                    );
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let _guard = ConfigLock::acquire(&config_path).unwrap();
+                        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        std::thread::yield_now();
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert_eq!(
+                most.load(Ordering::SeqCst),
+                1,
+                "round {round}: mutual exclusion"
+            );
+            let leftovers: Vec<_> = fs::read_dir(&root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".lock"))
+                .collect();
+            assert!(leftovers.is_empty(), "round {round}: {leftovers:?}");
+        }
     }
 }

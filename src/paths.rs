@@ -2907,5 +2907,4 @@ mod tests {
         link_worktree(&wt2, &data_common.join("worktrees").join("wt2"));
         assert_eq!(main_checkout_root(&s(&wt2)), Some(wt2.clone()));
     }
-
 }

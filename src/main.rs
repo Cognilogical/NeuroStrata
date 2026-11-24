@@ -984,7 +984,6 @@ pub(crate) enum RootCommands {
     },
 }
 
-
 #[derive(Subcommand, Debug, Clone, PartialEq)]
 pub(crate) enum HooksCommands {
     /// Write the pre-push hook into the directory git runs hooks from
@@ -2299,6 +2298,52 @@ async fn prepare_fallback_write_store(
     vector_store.init(namespace).await
 }
 
+/// Whether a store is already present at `db_path`.
+///
+/// `Path::exists` follows symlinks, so a dangling store symlink would read as
+/// absent and a read route would happily recreate the file behind it. Use
+/// `symlink_metadata`: present-but-unparseable store shapes fail closed, they
+/// are never mistaken for a fresh install (#237, #390).
+fn store_path_present(db_path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(db_path).is_ok()
+}
+
+/// Commands whose daemon-stopped fallback only reads the store.
+///
+/// On a fresh install they have nothing to read. Constructing a store for
+/// them mints a bare `ladybug.db` with no birth record, which the next
+/// interactive command reads as "has data" and voids the pending setup-time
+/// model choice without ever offering it (issue #390).
+///
+/// Classification is per variant, never per command family: `insights
+/// define/remove` and `taxonomy set-thesis/upsert-concept` mutate the store,
+/// so treating the whole `Insights`/`Taxonomy` arm as a read silently reports
+/// success without applying them. `export-graph` only writes an output file,
+/// so it belongs in the no-open fallback alongside the other reads.
+fn fallback_read_only_command(cmd: &Commands) -> bool {
+    match cmd {
+        Commands::Insights { action, .. } => {
+            let action = action.trim().to_ascii_lowercase();
+            matches!(action.as_str(), "snapshot" | "series")
+        }
+        Commands::Taxonomy { taxonomy } => !matches!(
+            taxonomy,
+            TaxonomyCommands::SetThesis { .. } | TaxonomyCommands::UpsertConcept { .. }
+        ),
+        Commands::Chat { .. }
+        | Commands::Metrics { .. }
+        | Commands::Graphql { .. }
+        | Commands::ObjectView { .. }
+        | Commands::Locate { .. }
+        | Commands::DiffTour { .. }
+        | Commands::ExportGraph { .. }
+        | Commands::Doctor { .. }
+        | Commands::Namespaces
+        | Commands::List { .. } => true,
+        _ => false,
+    }
+}
+
 /// Whether some process holds the daemon lock right now.
 fn daemon_holds_lock(db_path: &std::path::Path) -> bool {
     // Read-only status probes must not create the lock file: open_daemon_lock
@@ -2573,8 +2618,35 @@ impl crate::root_marker::RootRegistry for DaemonRootRegistry {
     }
 }
 
+/// A registry that also owns the store lock. The lock is taken before the
+/// daemon probe and held until the registry is dropped, so a daemon that
+/// starts in the probe/open/write window cannot take its own lock and race
+/// the marker writer on the store (#382 ROOT-2).
+struct LockedRootRegistry {
+    inner: Box<dyn crate::root_marker::RootRegistry>,
+    /// Kept until `finish` and drop, then the OS releases it even on a crash.
+    _lock: Option<std::fs::File>,
+}
+
+#[async_trait::async_trait]
+impl crate::root_marker::RootRegistry for LockedRootRegistry {
+    async fn cached_root(&self, namespace: &str) -> Result<Option<String>, String> {
+        self.inner.cached_root(namespace).await
+    }
+    async fn rows(&self, namespace: &str) -> Result<Vec<crate::traits::SearchResult>, String> {
+        self.inner.rows(namespace).await
+    }
+    async fn set_root(&self, namespace: &str, root: &std::path::Path) -> Result<(), String> {
+        self.inner.set_root(namespace, root).await
+    }
+    async fn finish(&self) {
+        self.inner.finish().await;
+    }
+}
+
 /// The registry the marker writers (`root set`, `hooks install`) use: the
-/// answering daemon, else the store opened here. Never starts a daemon.
+/// answering daemon, else the store opened here under a held store lock.
+/// Never starts a daemon.
 async fn open_cli_root_registry(
     probe: DaemonProbe,
 ) -> Result<Box<dyn crate::root_marker::RootRegistry>, String> {
@@ -2586,12 +2658,39 @@ async fn open_cli_root_registry(
         return Ok(Box::new(DaemonRootRegistry));
     }
     let config = Config::load().map_err(|e| format!("the config could not be read: {e}"))?;
-    if daemon_holds_lock(&config.db_path) {
-        return Err("no daemon answered and the store is locked".to_string());
-    }
+    // Take the lock before probing/opening, not after: a daemon starting in
+    // between then fails to take its own lock and cannot write concurrently.
+    let lock = match open_daemon_lock(&config.db_path) {
+        Ok(file) => match file.try_lock() {
+            Ok(()) => Some(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err("no daemon answered and the store is locked".to_string())
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("the store lock could not be taken: {e}"))
+            }
+        },
+        Err(e) => {
+            return Err(format!(
+                "the store lock could not be opened ({}): {e}",
+                daemon_lock_path(&config.db_path).display()
+            ))
+        }
+    };
     if probe == DaemonProbe::Silent {
         return Err(
             "nothing answered on 127.0.0.1:34343 within 500ms, so a daemon may be busy; not opening the store"
+                .to_string(),
+        );
+    }
+    let embedder = embed::build_embedder().ok();
+    if embedder.is_none() && !store_path_present(&config.db_path) {
+        // #390: with no embedder to bind, init cannot record a birth
+        // identity. Opening here would mint a bare store and void the
+        // pending setup choice before it is ever offered. The normal
+        // fresh-install path builds the embedder and records as designed.
+        return Err(
+            "the embedding model could not be built and no store exists yet; complete setup before writing root markers"
                 .to_string(),
         );
     }
@@ -2599,7 +2698,6 @@ async fn open_cli_root_registry(
         .map_err(|e| format!("the store could not be opened: {e}"))?;
     let store = LadybugStore::new(config.db_path.to_string_lossy().to_string(), dimensions)
         .map_err(|e| format!("the store could not be opened: {e}"))?;
-    let embedder = embed::build_embedder().ok();
     let store: Arc<dyn VectorStore> = Arc::new(store);
     // A pristine database has no schema: `new` opens it but leaves `init` to
     // create the tables. Registry calls query Memory immediately, so prepare
@@ -2612,10 +2710,13 @@ async fn open_cli_root_registry(
         .init("global")
         .await
         .map_err(|e| format!("the store could not be initialized: {e}"))?;
-    Ok(Box::new(crate::root_marker::StoreRegistry {
-        store,
-        emb: embedder,
-        checkpoint: true,
+    Ok(Box::new(LockedRootRegistry {
+        inner: Box::new(crate::root_marker::StoreRegistry {
+            store,
+            emb: embedder,
+            checkpoint: true,
+        }),
+        _lock: lock,
     }))
 }
 
@@ -2692,6 +2793,35 @@ where
             return report;
         }
     }
+    // The marker step refuses with OtherNamespace when a marker of a different
+    // namespace already applies here, and that refusal installs nothing (no
+    // hooks, no plugins). Decide that before installing hooks so moving the
+    // hook install earlier does not leave hooks behind on that refusal.
+    if let Ok(ns) = &namespace {
+        if let Ok(Some(found)) = crate::root_marker::find_root_marker(root) {
+            if !found.config.namespace.eq_ignore_ascii_case(ns) {
+                report.err.push(
+                    SetupMarker::OtherNamespace(found.config.namespace.clone())
+                        .message(ns, root)
+                        .unwrap_or_default(),
+                );
+                report.code = 1;
+                return report;
+            }
+        }
+    }
+    // Install the hooks BEFORE publishing a marker. A linked worktree whose
+    // hooks cannot be installed must not be left with a marker and a cache
+    // already moved to it (#381 F2).
+    let target = match install_pre_push_hook(root, force) {
+        Ok(target) => target,
+        Err(e) => {
+            report.err.push(e.to_string());
+            report.code = 1;
+            return report;
+        }
+    };
+    let _ = install_pre_commit_hook(root);
     let chosen: Option<String> = namespace.as_ref().ok().cloned();
     let (message, marker_root, failed) = match namespace {
         Err(candidates) => (
@@ -2723,60 +2853,45 @@ where
             }
         },
     };
-    match install_pre_push_hook(root, force) {
-        Ok(target) => {
-            let _ = install_pre_commit_hook(root);
-            // The harness configs get the namespace the marker step used:
-            // `--namespace` goes into every config; a namespace a marker now
-            // covers the checkout for goes into configs that name none.
-            // Otherwise (the step asked, or wrote no marker) a config gets a
-            // namespace only from an explicit source (a harness config or
-            // NEUROSTRATA_NAMESPACE), never the ledger or the folder name.
-            let refreshed: Option<String>;
-            let config_namespace = match (&chosen, named, marker_root.is_some()) {
-                (Some(ns), true, _) => ConfigNamespace::Set(ns),
-                (Some(ns), false, true) => ConfigNamespace::Keep(Some(ns)),
-                _ => {
-                    refreshed =
-                        match crate::task::harness_plugins::namespace_for_refresh(root, true) {
-                            Ok(ns) => ns,
-                            Err(e) => {
-                                report.err.push(format!(
-                                    "warning: harness configs left as they are: {e}"
-                                ));
-                                None
-                            }
-                        };
-                    ConfigNamespace::Keep(refreshed.as_deref())
+    // The harness configs get the namespace the marker step used:
+    // `--namespace` goes into every config; a namespace a marker now covers
+    // the checkout for goes into configs that name none. Otherwise (the step
+    // asked, or wrote no marker) a config gets a namespace only from an
+    // explicit source, never the ledger or the folder name.
+    let refreshed: Option<String>;
+    let config_namespace = match (&chosen, named, marker_root.is_some()) {
+        (Some(ns), true, _) => ConfigNamespace::Set(ns),
+        (Some(ns), false, true) => ConfigNamespace::Keep(Some(ns)),
+        _ => {
+            refreshed = match crate::task::harness_plugins::namespace_for_refresh(root, true) {
+                Ok(ns) => ns,
+                Err(e) => {
+                    report
+                        .err
+                        .push(format!("warning: harness configs left as they are: {e}"));
+                    None
                 }
             };
-            let _ = crate::task::harness_plugins::auto_install_detected_plugins(
-                root,
-                config_namespace,
-                None,
-            );
-            report.out.push(format!(
-                "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
-                target.display()
-            ));
-            if failed {
-                report.err.extend(message);
-                report.code = 1;
-            } else {
-                report.out.extend(message);
-            }
-            report.out.extend(
-                marker_root
-                    .as_deref()
-                    .and_then(crate::root_marker::commit_advice),
-            );
+            ConfigNamespace::Keep(refreshed.as_deref())
         }
-        Err(e) => {
-            report.err.extend(message);
-            report.err.push(e.to_string());
-            report.code = 1;
-        }
+    };
+    let _ =
+        crate::task::harness_plugins::auto_install_detected_plugins(root, config_namespace, None);
+    report.out.push(format!(
+        "Installed the NeuroStrata task gate at {} (plus pre-commit ledger and detected harness plugins).",
+        target.display()
+    ));
+    if failed {
+        report.err.extend(message);
+        report.code = 1;
+    } else {
+        report.out.extend(message);
     }
+    report.out.extend(
+        marker_root
+            .as_deref()
+            .and_then(crate::root_marker::commit_advice),
+    );
     report
 }
 
@@ -2974,6 +3089,14 @@ async fn direct_report(
     namespace: &str,
     scope: Option<&crate::task::gate::GateScope>,
 ) -> Result<crate::task::gate::GateReport, String> {
+    // #390: the hook gate/report path is metadata-only and must work on a
+    // fresh install without minting a bare store file. No store means no
+    // tasks to judge, so an empty (passing) report is the truthful answer.
+    // This check precedes even the dimension lookup so nothing on this path
+    // touches the store or loads a model.
+    if !store_path_present(&config.db_path) {
+        return Ok(crate::task::gate::GateReport::default());
+    }
     let dimensions = embed::configured_dimensions().map_err(|e| {
         format!(
             "the configured embedding dimensions could not be read: {}",
@@ -3520,12 +3643,96 @@ async fn run_list(read: &ReadSource, namespace: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// A valid config with no database yet: the CLI's direct root registry
-    /// must initialize the store before reading the registry row, or every
-    /// `root set`/`hooks install` against a pristine store fails on a
-    /// missing Memory table.
+    #[test]
+    fn fallback_read_only_command_census_is_explicit() {
+        assert!(fallback_read_only_command(&Commands::Namespaces));
+        assert!(fallback_read_only_command(&Commands::Doctor {
+            namespace: None
+        }));
+        assert!(fallback_read_only_command(&Commands::List {
+            namespace: "NeuroStrata".to_string()
+        }));
+        // A command that writes must still be allowed to open (and create)
+        // the store; only read/report arms take the #390 guard.
+        assert!(!fallback_read_only_command(&Commands::Status));
+    }
+
+    #[test]
+    fn fallback_read_only_command_splits_insights_taxonomy_and_export_variants() {
+        let parsed = |argv: &[&str]| -> Commands {
+            let cli = Cli::try_parse_from(argv).expect("valid CLI surface");
+            cli.command.expect("a command")
+        };
+
+        // Read arms: no store is minted, so a fresh install answers without
+        // creating a bare ladybug.db (#390). export-graph only writes a file.
+        for argv in [
+            &["neurostrata-mcp", "insights", "ns"][..],
+            &["neurostrata-mcp", "insights", "ns", "series"][..],
+            &["neurostrata-mcp", "taxonomy", "tree", "ns"][..],
+            &["neurostrata-mcp", "taxonomy", "briefing", "ns"][..],
+            &[
+                "neurostrata-mcp",
+                "taxonomy",
+                "compare",
+                "ns",
+                "--slugs",
+                "a,b",
+            ][..],
+            &["neurostrata-mcp", "taxonomy", "gaps", "ns"][..],
+            &["neurostrata-mcp", "taxonomy", "advise", "ns"][..],
+            &["neurostrata-mcp", "export-graph"][..],
+        ] {
+            let cmd = parsed(argv);
+            assert!(
+                fallback_read_only_command(&cmd),
+                "expected read-only fallback for {argv:?}"
+            );
+        }
+
+        // Write arms must open (and, on a fresh path, create) the store so the
+        // mutation is applied. A false "read" answer claims success without
+        // doing the work.
+        for argv in [
+            &["neurostrata-mcp", "insights", "ns", "define"][..],
+            &["neurostrata-mcp", "insights", "ns", "remove"][..],
+            &["neurostrata-mcp", "taxonomy", "set-thesis", "ns"][..],
+            &["neurostrata-mcp", "taxonomy", "upsert-concept", "ns"][..],
+        ] {
+            let cmd = parsed(argv);
+            assert!(
+                !fallback_read_only_command(&cmd),
+                "expected write fallback for {argv:?}"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn cli_root_registry_inits_a_pristine_store_before_reading_the_cache() {
+    async fn direct_report_on_absent_store_creates_no_store_file() {
+        let root = std::env::temp_dir().join(format!("ns-gate-absent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let db = root.join("ladybug.db");
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db.to_string_lossy()
+        }))
+        .expect("minimal config with only a db path");
+        assert!(!store_path_present(&db));
+        let report = direct_report(&config, "NeuroStrata", None)
+            .await
+            .expect("a fresh install has no tasks to judge");
+        assert!(report.ok(), "an empty store yields a passing gate report");
+        assert!(
+            !store_path_present(&db),
+            "#390: the metadata-only gate must not mint a bare store file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A valid config with no database yet and no usable embedder: the CLI's
+    /// direct root registry must NOT mint a bare store, which would void the
+    /// pending setup-time model choice before it is ever offered (#390).
+    #[tokio::test]
+    async fn cli_root_registry_refuses_a_pristine_store_without_an_embedder() {
         let _env = crate::daemon::project_root_env_test_lock();
         let old_home = std::env::var_os("HOME");
         let old_model = std::env::var_os("NEUROSTRATA_MODEL");
@@ -3553,15 +3760,18 @@ mod tests {
         .unwrap();
         std::env::set_var("HOME", &home);
         let outcome = async {
-            let registry = open_cli_root_registry(DaemonProbe::Absent)
-                .await
-                .expect("a pristine store still yields a registry");
-            let cached = registry
-                .cached_root("example-project")
-                .await
-                .expect("the cached root is readable on a fresh store");
-            assert!(cached.is_none(), "{cached:?}");
-            registry.finish().await;
+            let err = match open_cli_root_registry(DaemonProbe::Absent).await {
+                Ok(_) => panic!("#390: a pristine store with no embedder must not be minted"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("complete setup before writing root markers"),
+                "{err}"
+            );
+            assert!(
+                !store_path_present(&db),
+                "#390: the refused open left no bare store file"
+            );
         }
         .await;
         match old_home {
@@ -4747,7 +4957,13 @@ mod tests {
             Cli::try_parse_from(["neurostrata-mcp", "namespace", "resolve"]).expect("parses bare");
         match cli.command {
             Some(Commands::Namespace { action }) => {
-                assert_eq!(action, NamespaceCommands::Resolve { dir: None, pushed: false })
+                assert_eq!(
+                    action,
+                    NamespaceCommands::Resolve {
+                        dir: None,
+                        pushed: false
+                    }
+                )
             }
             other => panic!("expected Namespace/Resolve, got {:?}", other),
         }
@@ -4769,7 +4985,13 @@ mod tests {
             .expect("parses --pushed");
         match cli.command {
             Some(Commands::Namespace { action }) => {
-                assert_eq!(action, NamespaceCommands::Resolve { dir: None, pushed: true })
+                assert_eq!(
+                    action,
+                    NamespaceCommands::Resolve {
+                        dir: None,
+                        pushed: true
+                    }
+                )
             }
             other => panic!("expected Namespace/Resolve, got {:?}", other),
         }
@@ -5303,14 +5525,14 @@ mod tests {
         );
     }
 
-    /// An embedder serving ModelB at the fixture width: its descriptor
+    /// An embedder serving GTEBaseENV15 at the fixture width: its descriptor
     /// is the shape `FastEmbedder::embedding_descriptor` produces for
-    /// the ModelB entry, matching the descriptor the store synthesizes
+    /// the GTEBaseENV15 entry, matching the descriptor the store synthesizes
     /// for the same configured entry.
-    struct FallbackModelBEmbedder;
+    struct FallbackGTEBaseENV15Embedder;
 
     #[async_trait::async_trait]
-    impl crate::traits::Embedder for FallbackModelBEmbedder {
+    impl crate::traits::Embedder for FallbackGTEBaseENV15Embedder {
         async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
             Ok(vec![0.1, 0.2, 0.3, 0.4])
         }
@@ -5318,12 +5540,12 @@ mod tests {
             4
         }
         fn embedder_id(&self) -> &str {
-            "ModelB"
+            "GTEBaseENV15"
         }
         fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
             crate::traits::EmbeddingDescriptor {
                 provider: "fastembed".to_string(),
-                model: "ModelB".to_string(),
+                model: "GTEBaseENV15".to_string(),
                 revision: "onnx".to_string(),
                 dims: 4,
                 normalization: "unknown".to_string(),
@@ -5363,14 +5585,14 @@ mod tests {
         };
 
         // The store as the daemon left it: recorded pristine under
-        // the default model (ModelA here).
-        write_config("ModelA");
+        // the default model (BGESmallENV15 here).
+        write_config("BGESmallENV15");
         let seed = LadybugStore::for_testing(&db_path, 4)
             .expect("open temp database")
             .with_embed_config_dir(&config_dir)
             .with_serving_descriptor(Some(crate::traits::EmbeddingDescriptor {
                 provider: "fastembed".to_string(),
-                model: "ModelA".to_string(),
+                model: "BGESmallENV15".to_string(),
                 revision: "onnx".to_string(),
                 dims: 4,
                 normalization: "unknown".to_string(),
@@ -5381,20 +5603,20 @@ mod tests {
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelA")
+            serde_json::json!("BGESmallENV15")
         );
         drop(seed);
 
-        // The user configured ModelB; the daemon is stopped, so the
+        // The user configured GTEBaseENV15; the daemon is stopped, so the
         // fallback arm runs: it constructs its store unbound, builds
         // the configured embedder, and binds its descriptor.
-        write_config("ModelB");
+        write_config("GTEBaseENV15");
         let vector_store: Arc<dyn VectorStore> = Arc::new(
             LadybugStore::for_testing(&db_path, 4)
                 .expect("reopen temp database")
                 .with_embed_config_dir(&config_dir),
         );
-        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackGTEBaseENV15Embedder);
         prepare_fallback_write_store(&vector_store, &embedder, "probe")
             .await
             .expect("the fallback write preparation inits the store under the serving model");
@@ -5417,7 +5639,7 @@ mod tests {
             .expect("the fallback add must adopt the pristine record and proceed");
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelB"),
+            serde_json::json!("GTEBaseENV15"),
             "the pristine record is adopted to the configured model"
         );
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(true));
@@ -5478,31 +5700,31 @@ mod tests {
             metadata: serde_json::json!({}),
         };
 
-        write_config("ModelA");
+        write_config("BGESmallENV15");
         let seed = LadybugStore::for_testing(&db_path, 4)
             .expect("open temp database")
             .with_embed_config_dir(&config_dir)
-            .with_serving_descriptor(Some(descriptor("ModelA")));
+            .with_serving_descriptor(Some(descriptor("BGESmallENV15")));
         seed.init("probe").await.expect("seed init");
         seed.upsert("probe", "m1", vec![0.1, 0.2, 0.3, 0.4], payload("original"))
             .await
             .expect("seed upsert");
         drop(seed);
-        // The stale label: the sidecar reads pristine under ModelA
+        // The stale label: the sidecar reads pristine under BGESmallENV15
         // although the table holds the seeded row.
         crate::model_choice::write_store_state_identity(
             &db_path,
-            &crate::model_choice::StoreState::new(false, descriptor("ModelA")),
+            &crate::model_choice::StoreState::new(false, descriptor("BGESmallENV15")),
         )
         .expect("rewrite the sidecar to the pristine label");
 
-        write_config("ModelB");
+        write_config("GTEBaseENV15");
         let vector_store: Arc<dyn VectorStore> = Arc::new(
             LadybugStore::for_testing(&db_path, 4)
                 .expect("reopen temp database")
                 .with_embed_config_dir(&config_dir),
         );
-        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackGTEBaseENV15Embedder);
         prepare_fallback_write_store(&vector_store, &embedder, "probe")
             .await
             .expect("the fallback write preparation inits the store under the serving model");
@@ -5532,7 +5754,7 @@ mod tests {
         let sidecar: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
             sidecar["descriptor"]["model"],
-            serde_json::json!("ModelB"),
+            serde_json::json!("GTEBaseENV15"),
             "the pristine record is adopted to the configured model"
         );
         drop(vector_store);
@@ -5576,13 +5798,13 @@ mod tests {
             serde_json::from_str(&content).unwrap()
         };
 
-        write_config("ModelA");
+        write_config("BGESmallENV15");
         let seed = LadybugStore::for_testing(&db_path, 4)
             .expect("open temp database")
             .with_embed_config_dir(&config_dir)
             .with_serving_descriptor(Some(crate::traits::EmbeddingDescriptor {
                 provider: "fastembed".to_string(),
-                model: "ModelA".to_string(),
+                model: "BGESmallENV15".to_string(),
                 revision: "onnx".to_string(),
                 dims: 4,
                 normalization: "unknown".to_string(),
@@ -5593,17 +5815,17 @@ mod tests {
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelA")
+            serde_json::json!("BGESmallENV15")
         );
         drop(seed);
 
-        write_config("ModelB");
+        write_config("GTEBaseENV15");
         let vector_store: Arc<dyn VectorStore> = Arc::new(
             LadybugStore::for_testing(&db_path, 4)
                 .expect("reopen temp database")
                 .with_embed_config_dir(&config_dir),
         );
-        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackGTEBaseENV15Embedder);
         prepare_fallback_write_store(&vector_store, &embedder, "probe")
             .await
             .expect("the fallback write preparation inits the store under the serving model");
@@ -5626,7 +5848,7 @@ mod tests {
             .expect("the fallback ingest must adopt the pristine record and proceed");
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelB"),
+            serde_json::json!("GTEBaseENV15"),
             "the pristine record is adopted to the configured model"
         );
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(true));
@@ -5692,31 +5914,31 @@ mod tests {
             metadata: serde_json::json!({}),
         };
 
-        write_config("ModelA");
+        write_config("BGESmallENV15");
         let seed = LadybugStore::for_testing(&db_path, 4)
             .expect("open temp database")
             .with_embed_config_dir(&config_dir)
-            .with_serving_descriptor(Some(descriptor("ModelA")));
+            .with_serving_descriptor(Some(descriptor("BGESmallENV15")));
         seed.init("probe").await.expect("seed init");
         seed.upsert("probe", "m1", vec![0.1, 0.2, 0.3, 0.4], payload("original"))
             .await
             .expect("seed upsert");
         drop(seed);
-        // The stale label: the sidecar reads pristine under ModelA
+        // The stale label: the sidecar reads pristine under BGESmallENV15
         // although the table holds the seeded row.
         crate::model_choice::write_store_state_identity(
             &db_path,
-            &crate::model_choice::StoreState::new(false, descriptor("ModelA")),
+            &crate::model_choice::StoreState::new(false, descriptor("BGESmallENV15")),
         )
         .expect("rewrite the sidecar to the pristine label");
 
-        write_config("ModelB");
+        write_config("GTEBaseENV15");
         let vector_store: Arc<dyn VectorStore> = Arc::new(
             LadybugStore::for_testing(&db_path, 4)
                 .expect("reopen temp database")
                 .with_embed_config_dir(&config_dir),
         );
-        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackModelBEmbedder);
+        let embedder: Arc<dyn crate::traits::Embedder> = Arc::new(FallbackGTEBaseENV15Embedder);
         prepare_fallback_write_store(&vector_store, &embedder, "probe")
             .await
             .expect("the fallback write preparation inits the store under the serving model");
@@ -9291,6 +9513,35 @@ async fn run() -> anyhow::Result<()> {
                 if daemon_busy(probe, daemon_holds_lock(&config.db_path)) {
                     eprintln!("{}", DAEMON_BUSY_MESSAGE);
                     std::process::exit(1);
+                }
+                // #390: a read-only fallback command on a fresh path has
+                // nothing to read. Constructing the store here would create
+                // `ladybug.db` with no store-state sidecar; the next
+                // interactive command reads that bare file as "has data"
+                // and voids the pending setup-time model choice. Doctor is
+                // the one read arm with its own no-open diagnostics.
+                if !store_path_present(&config.db_path) && fallback_read_only_command(&other) {
+                    if matches!(&other, Commands::Doctor { .. }) {
+                        let status = crate::storage::compute_storage_status(
+                            &config.db_path,
+                            &config.storage_hygiene,
+                        );
+                        eprintln!(
+                            "Doctor: no store at {:?} yet. Storage diagnostics (no-open): store_bytes={}, wal_bytes={}, wal_age_secs={:?}, wal_recovery_artifact_count={}, wal_recovery_artifact_bytes={}",
+                            config.db_path,
+                            status.store_bytes,
+                            status.wal_bytes,
+                            status.wal_age_secs,
+                            status.wal_recovery_artifact_count,
+                            status.wal_recovery_artifact_bytes,
+                        );
+                    } else {
+                        eprintln!(
+                            "No store at {:?} yet; nothing to read. Run setup before querying.",
+                            config.db_path
+                        );
+                    }
+                    return Ok(());
                 }
                 let concrete_store: Arc<LadybugStore> = match LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),

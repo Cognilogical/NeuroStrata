@@ -3850,6 +3850,134 @@ async fn ast_neighborhood_for_forms(
     merge_ast_neighborhood_results(results)
 }
 
+/// Stamp one graph-first lookup on the caller's own in-progress task.
+///
+/// The shared recorder attributes a lookup to the lowest-id in-progress row in
+/// the namespace. With two worktrees active that credits the wrong task, so
+/// resolve the row pinned to `caller_root` (and the caller's session) first and
+/// update only that row. The `queries[]` ledger row still goes through the
+/// shared recorder, which preserves #383's pre-commit ledger contract.
+async fn record_graph_query_for_caller_root(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    tool_name: &str,
+    query_hint: &str,
+    caller_root: Option<&str>,
+) {
+    // Legacy queries[] row (+ test ledger entry) without a counter bump.
+    crate::task::record_legacy_query_path(store, namespace, tool_name, query_hint, caller_root)
+        .await;
+
+    let ns = resolve_namespace(store, namespace).await;
+    let Ok(rows) = store.list(&ns, None, Some("task")).await else {
+        return;
+    };
+    let now = chrono::Utc::now().timestamp();
+    let is_active = |r: &SearchResult| {
+        crate::task::gate::is_task(r)
+            && !crate::task::gate::is_retired(&r.payload.metadata, now)
+            && crate::task::gate::task_status(r) == crate::task::machine::Status::InProgress
+    };
+    fn task_meta<'a>(r: &'a SearchResult, key: &str) -> Option<&'a str> {
+        r.payload
+            .metadata
+            .get("task")
+            .and_then(|t| t.get(key))
+            .and_then(|v| v.as_str())
+    }
+    let root = caller_root.map(str::trim).filter(|s| !s.is_empty());
+    let session = std::env::var("OPENCODE_SESSION_ID")
+        .ok()
+        .or_else(|| std::env::var("NEUROSTRATA_SESSION_ID").ok())
+        .filter(|s| !s.trim().is_empty() && s != "unknown");
+
+    // Specificity: root+session > root > session > lowest-id fallback. The last
+    // tier keeps the one-task (no worktree stamped) case working.
+    let chosen = root
+        .and_then(|w| {
+            session.as_deref().and_then(|s| {
+                rows.iter().find(|r| {
+                    is_active(r)
+                        && task_meta(r, "worktree") == Some(w)
+                        && task_meta(r, "session_id") == Some(s)
+                })
+            })
+        })
+        .or_else(|| {
+            root.and_then(|w| {
+                rows.iter()
+                    .find(|r| is_active(r) && task_meta(r, "worktree") == Some(w))
+            })
+        })
+        .or_else(|| {
+            session.as_deref().and_then(|s| {
+                rows.iter()
+                    .find(|r| is_active(r) && task_meta(r, "session_id") == Some(s))
+            })
+        })
+        .or_else(|| {
+            rows.iter()
+                .filter(|r| is_active(r))
+                .min_by(|a, b| a.id.cmp(&b.id))
+        });
+    let Some(chosen) = chosen else {
+        return;
+    };
+    let task_id = chosen.id.clone();
+
+    static STAMP_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = STAMP_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    // Re-read under the lock and re-check the state; the task may have left
+    // in_progress while the lookup ran.
+    if let Ok(Some((vec, mut payload))) = store.get(&ns, &task_id).await {
+        {
+            let Some(task_obj) = payload
+                .metadata
+                .get_mut("task")
+                .and_then(|v| v.as_object_mut())
+            else {
+                return;
+            };
+            if task_obj.get("status").and_then(|v| v.as_str())
+                != Some(crate::task::machine::Status::InProgress.as_str())
+            {
+                return;
+            }
+            let count = task_obj
+                .get("graph_queries_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                + 1;
+            task_obj.insert("graph_queries_count".to_string(), json!(count));
+            task_obj.insert("graph_queried".to_string(), json!(true));
+            let mut recent: Vec<String> = task_obj
+                .get("recent_queries")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            recent.push(format!(
+                "{}:{}",
+                tool_name,
+                query_hint.chars().take(80).collect::<String>()
+            ));
+            if recent.len() > 10 {
+                let drop_n = recent.len() - 10;
+                recent.drain(0..drop_n);
+            }
+            task_obj.insert("recent_queries".to_string(), json!(recent));
+        }
+        let _ = store.upsert(&ns, &task_id, vec, payload).await;
+    }
+}
+
 /// The `neurostrata_memories_for_file` handler. Returns a JSON object carrying
 /// `memories` (possibly empty) and `unsupported` -- an explicit flag, because a
 /// backend without graph-read must never be mistaken for "no rules apply".
@@ -3942,6 +4070,10 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         }
     };
     let original_path = path;
+    // The post-dispatch receipt recorder writes `events[]` only (digests, no
+    // path string). The legacy `queries[]` row and task counter belong to this
+    // lookup, so keep the trait object before the downcast shadows `store`.
+    let ledger_store = store.clone();
 
     // The graph-read capability is optional per backend: only LadybugStore
     // implements it (spec §4.6). Anything else answers `unsupported` -- never
@@ -3974,6 +4106,20 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
     .await
     {
         Ok(retrieval) => {
+            // §3d Graph-First: every successful lookup records the exact path
+            // in queries[] and increments the *caller's* active task's
+            // graph_queries_count so the pre-commit recorded-lookup check sees
+            // it. The post-dispatch events[] receipt alone cannot -- it keeps
+            // digests, not paths. Attribute by caller_root/session so another
+            // worktree's in-progress task is never credited with this lookup.
+            record_graph_query_for_caller_root(
+                &ledger_store,
+                &namespace,
+                "neurostrata_memories_for_file",
+                original_path,
+                project_root,
+            )
+            .await;
             let hits = retrieval.hits;
             // Capability C: attach the shared deprecation/boundary presentation
             // to every governed-memory row before it leaves this surface.
@@ -6261,12 +6407,12 @@ async fn handle_get_snapshot(
                 .and_then(|v| v.as_str())
                 == Some(root_str.as_str())
         };
-        // A task attributed to this worktree wins over an arbitrary in_progress
-        // task from a different worktree/session.
+        // Only a task attributed to this worktree may become this session's
+        // active task. Falling back to the first in_progress row bound another
+        // worktree's task (and its Breath note) into this session.
         let active_task = all_memories
             .iter()
             .find(|m| is_active(m) && matches_root(m))
-            .or_else(|| all_memories.iter().find(|m| is_active(m)))
             .map(|m| (m.id.as_str(), &m.payload));
         crate::task::persist_active_session_file(
             std::path::Path::new(root_str),
@@ -12821,7 +12967,8 @@ async fn handle_guard_validate(
             // session/worktree preflight before rule validation runs. Resolve
             // the active InProgress task in strict specificity order, so one
             // session's task cannot hijack another worktree's Breath gate:
-            // named id > session+worktree > session > worktree > first row.
+            // named id > session+worktree > session > worktree; no match means
+            // unbound, never another worktree's first in_progress row.
             let caller_session = arguments
                 .get("session_id")
                 .and_then(|v| v.as_str())
@@ -12870,8 +13017,7 @@ async fn handle_guard_validate(
                             .iter()
                             .find(|m| in_progress(m) && task_matches(m, "worktree", w))
                     })
-                })
-                .or_else(|| memories.iter().find(|m| in_progress(m)));
+                });
             let active_task_id = active_task_row.map(|m| m.id.as_str());
             let session_id = arguments
                 .get("session_id")
@@ -13779,6 +13925,43 @@ mod tests {
                 reply
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guard_validate_never_hijacks_an_unrelated_worktree_task() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let vector = StubEmbedder.embed("task").await.unwrap();
+        let mut p = payload("task-A");
+        p.memory_type = "task".to_string();
+        p.metadata = serde_json::json!({
+            "task": {
+                "status": "in_progress",
+                "session_id": "ses_A",
+                "worktree": "/wt/a",
+            }
+        });
+        store.upsert("probe", "task-A", vector, p).await.unwrap();
+
+        // No caller session/worktree matches task-A; cwd names a third one.
+        // The old "first in_progress row" fallback bound task-A anyway.
+        let args = serde_json::json!({
+            "namespace": "probe",
+            "action_type": "write",
+            "payload": "/tmp/scratch.txt",
+            "cwd": "/wt/unrelated",
+            "mutations_since_note": 0
+        });
+        let reply = handle_guard_validate(
+            args,
+            store.clone(),
+            Arc::new(StubEmbedder),
+            recording_bus().0,
+        )
+        .await;
+        assert!(
+            reply.contains("Unpreflighted: claim task") && !reply.contains("task-A"),
+            "an unrelated worktree's task must not satisfy the preflight: {reply}"
+        );
     }
 
     #[test]
@@ -14938,12 +15121,12 @@ mod tests {
             4
         }
         fn embedder_id(&self) -> &str {
-            "ModelA"
+            "NomicEmbedTextV15"
         }
         fn embedding_descriptor(&self) -> crate::traits::EmbeddingDescriptor {
             crate::traits::EmbeddingDescriptor {
                 provider: "fastembed".to_string(),
-                model: "ModelA".to_string(),
+                model: "NomicEmbedTextV15".to_string(),
                 revision: "onnx".to_string(),
                 dims: 4,
                 normalization: "unknown".to_string(),
@@ -14979,7 +15162,7 @@ mod tests {
             )
             .unwrap();
         };
-        write_config("ModelA");
+        write_config("NomicEmbedTextV15");
         let db_path = root.join("ladybug.db");
 
         let concrete = Arc::new(
@@ -14999,11 +15182,11 @@ mod tests {
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelA")
+            serde_json::json!("NomicEmbedTextV15")
         );
 
         // The pick lands while this process holds the store open.
-        write_config("ModelB");
+        write_config("BGESmallENV15Q");
         let incoming = payload("a memory written after the pick");
         let res = embed_dedup_and_upsert(&store, &emb, "probe", &incoming, None).await;
         assert!(
@@ -15018,7 +15201,7 @@ mod tests {
         assert_eq!(sidecar(&db_path)["has_data"], serde_json::json!(false));
         assert_eq!(
             sidecar(&db_path)["descriptor"]["model"],
-            serde_json::json!("ModelA"),
+            serde_json::json!("NomicEmbedTextV15"),
             "the record stays with the serving model"
         );
 
@@ -15058,7 +15241,7 @@ mod tests {
             )
             .unwrap();
         };
-        write_config("ModelA");
+        write_config("NomicEmbedTextV15");
         let db_path = root.join("ladybug.db");
 
         let store: Arc<dyn VectorStore> = Arc::new(
@@ -15071,7 +15254,7 @@ mod tests {
         store.init("probe").await.expect("init");
 
         // The pick lands while this process holds the store open.
-        write_config("ModelB");
+        write_config("BGESmallENV15Q");
         let incoming = payload("a memory written after the pick");
         let err = embed_dedup_and_upsert(&store, &emb, "probe", &incoming, None)
             .await
@@ -15081,7 +15264,7 @@ mod tests {
             "the caller must see the restart instruction, got: {err}"
         );
         assert!(
-            err.contains("'ModelA'") && err.contains("'ModelB'"),
+            err.contains("'NomicEmbedTextV15'") && err.contains("'BGESmallENV15Q'"),
             "the caller must see the serving and configured models, got: {err}"
         );
         assert!(
@@ -15129,7 +15312,7 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":4}]",
+            "[{\"model_name\":\"NomicEmbedTextV15\",\"dimensions\":4}]",
         )
         .unwrap();
         let db_path = root.join("ladybug.db");
@@ -15182,7 +15365,7 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("embedders.json"),
-            "[{\"model_name\":\"ModelA\",\"dimensions\":4}]",
+            "[{\"model_name\":\"NomicEmbedTextV15\",\"dimensions\":4}]",
         )
         .unwrap();
         let db_path = root.join("ladybug.db");
@@ -15207,7 +15390,7 @@ mod tests {
         // refuses before any embedding happens.
         let model_b = crate::traits::EmbeddingDescriptor {
             provider: "fastembed".to_string(),
-            model: "ModelB".to_string(),
+            model: "BGESmallENV15Q".to_string(),
             revision: "onnx".to_string(),
             dims: 4,
             normalization: "unknown".to_string(),
@@ -15229,7 +15412,7 @@ mod tests {
             "the caller must see the identity refusal, got: {err}"
         );
         assert!(
-            err.contains("'ModelA'") && err.contains("'ModelB'"),
+            err.contains("'NomicEmbedTextV15'") && err.contains("'BGESmallENV15Q'"),
             "the caller must see the recorded and serving models, got: {err}"
         );
         assert!(
@@ -17247,6 +17430,134 @@ mod tests {
         assert_eq!(parsed["unsupported"], serde_json::json!(true));
         assert_eq!(parsed["memories"], serde_json::json!([]));
         assert_eq!(parsed["path"], serde_json::json!("src/lib.rs"));
+    }
+
+    /// Regression for #383: a successful memories_for_file lookup must write a
+    /// queries[] row (the pre-commit Graph-First check reads only queries[]) and
+    /// increment the active task's graph_queries_count. The post-dispatch
+    /// events[] receipt keeps digests only, so it cannot substitute for either.
+    #[tokio::test]
+    async fn memories_for_file_records_query_row_and_increments_count() {
+        let (store, _rule_id) = store_with_one_rule("probe").await;
+        let vector = StubEmbedder.embed("task").await.unwrap();
+        let mut task_payload = payload("task");
+        task_payload.memory_type = "task".to_string();
+        task_payload.metadata = serde_json::json!({
+            "task": { "status": "in_progress", "title": "active" }
+        });
+        store
+            .upsert("probe", "task-active", vector, task_payload)
+            .await
+            .expect("seed active task");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".NeuroStrata")).unwrap();
+        let ledger = root.join(".NeuroStrata/session_queries.json");
+
+        let arguments = serde_json::json!({
+            "namespace": "probe",
+            "path": "src/lib.rs",
+            "project_root": root.to_string_lossy(),
+        });
+        let text = handle_memories_for_file(arguments, store.clone()).await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(parsed["unsupported"], serde_json::json!(false), "{text}");
+
+        let doc: Value = serde_json::from_str(
+            &std::fs::read_to_string(&ledger).expect("session ledger written"),
+        )
+        .expect("valid ledger JSON");
+        let rows = doc["queries"].as_array().expect("queries[] exists");
+        let row = rows
+            .iter()
+            .find(|q| q["tool"] == "neurostrata_memories_for_file")
+            .unwrap_or_else(|| panic!("memories_for_file query row missing: {doc}"));
+        assert_eq!(row["query"], serde_json::json!("src/lib.rs"));
+        assert_eq!(row["governed_prefixes"], serde_json::json!(["src/lib.rs"]));
+
+        let (_, task) = store
+            .get("probe", "task-active")
+            .await
+            .unwrap()
+            .expect("active task still present");
+        assert_eq!(
+            task.metadata["task"]["graph_queries_count"],
+            serde_json::json!(1)
+        );
+    }
+
+    /// Two in-progress tasks in one namespace must not cross-attribute a
+    /// graph-first lookup: the caller root selects the task, even when the
+    /// other row has a lower id.
+    #[tokio::test]
+    async fn memories_for_file_stamps_caller_worktree_task_not_lowest_id() {
+        let (store, _rule_id) = store_with_one_rule("probe").await;
+        let vector = StubEmbedder.embed("task").await.unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root_a = tmp.path().join("wt-a");
+        let root_b = tmp.path().join("wt-b");
+        std::fs::create_dir_all(root_b.join(".NeuroStrata")).unwrap();
+        let ledger = root_b.join(".NeuroStrata/session_queries.json");
+
+        let task_payload = |wt: &std::path::Path| {
+            let mut p = payload("task");
+            p.memory_type = "task".to_string();
+            let wt = wt.to_string_lossy();
+            p.metadata = serde_json::json!({
+                "task": {
+                    "status": "in_progress",
+                    "worktree": wt,
+                    "session_id": wt,
+                }
+            });
+            p
+        };
+        // "task-A" sorts before "task-B": the old lowest-id fallback credited A.
+        store
+            .upsert("probe", "task-A", vector.clone(), task_payload(&root_a))
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "task-B", vector, task_payload(&root_b))
+            .await
+            .unwrap();
+
+        let arguments = serde_json::json!({
+            "namespace": "probe",
+            "path": "src/lib.rs",
+            "project_root": root_b.to_string_lossy(),
+        });
+        let text = handle_memories_for_file(arguments, store.clone()).await;
+        let parsed: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(parsed["unsupported"], serde_json::json!(false), "{text}");
+
+        // #383 ledger row is still written for the queried path.
+        let doc: Value = serde_json::from_str(
+            &std::fs::read_to_string(&ledger).expect("session ledger written"),
+        )
+        .expect("valid ledger JSON");
+        assert!(
+            doc["queries"].as_array().unwrap().iter().any(|q| {
+                q["tool"] == "neurostrata_memories_for_file" && q["query"] == "src/lib.rs"
+            }),
+            "queries[] row missing: {doc}"
+        );
+
+        // The matched task is stamped; the unrelated lower-id task is not.
+        let (_, a) = store.get("probe", "task-A").await.unwrap().unwrap();
+        let (_, b) = store.get("probe", "task-B").await.unwrap().unwrap();
+        assert_eq!(
+            a.metadata["task"]["graph_queries_count"]
+                .as_i64()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            b.metadata["task"]["graph_queries_count"],
+            serde_json::json!(1)
+        );
+        assert_eq!(b.metadata["task"]["graph_queried"], serde_json::json!(true));
     }
 
     /// `include_ast_edges: true` bundles `related_memories` and `ast_summary`
