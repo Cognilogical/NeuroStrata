@@ -1964,6 +1964,11 @@ async fn handle_set_metadata(
 /// the bound explicit at the deserialization boundary so a caller cannot
 /// drive unbounded allocation through `from_value` (CodeQL alert 21).
 const MAX_MCP_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum `{`/`[` nesting accepted before typed deserialization; the bound is
+/// restated here because serde_json's own recursion limit is an internal
+/// default the standard parse entry points do not expose to callers (mirrors
+/// the guard's `MAX_JSON_NESTING_DEPTH`).
+const MAX_MCP_JSON_NESTING_DEPTH: usize = 32;
 
 /// Validate the *shape* of caller-supplied JSON before typed deserialization.
 ///
@@ -2026,22 +2031,51 @@ fn invalid_mcp_request_response() -> axum::response::Response {
     ))
 }
 
+/// The JSON nesting depth of a value: a container counts one level over its
+/// deepest child, a primitive zero. The bound the typed deserializer may walk.
+fn json_nesting_depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.values().map(json_nesting_depth).max().unwrap_or(0) + 1
+        }
+        serde_json::Value::Array(items) => {
+            items.iter().map(json_nesting_depth).max().unwrap_or(0) + 1
+        }
+        _ => 0,
+    }
+}
+
+/// The typed JSON-RPC request behind a caller envelope that passed admission,
+/// or `None` to answer "Invalid Request". Admission mirrors the guard's
+/// `validated_json_object` discipline -- bounded size, bounded nesting, typed
+/// shape checks -- and only then parses through the streaming deserializer, so
+/// the typed request is never built from an unbounded or unverified envelope
+/// (CodeQL alert 21).
+fn validated_mcp_request(value: &serde_json::Value) -> Option<crate::server::JsonRpcRequest> {
+    let encoded = serde_json::to_string(value).ok()?;
+    if encoded.len() > MAX_MCP_ENVELOPE_BYTES {
+        return None;
+    }
+    if json_nesting_depth(value) > MAX_MCP_JSON_NESTING_DEPTH {
+        return None;
+    }
+    let mut de = serde_json::Deserializer::from_str(&encoded);
+    let parsed = serde_json::Value::deserialize(&mut de).ok()?;
+    if !valid_mcp_envelope(&parsed) {
+        return None;
+    }
+    serde_json::from_value::<crate::server::JsonRpcRequest>(parsed).ok()
+}
+
 // Handle a single MCP JSON-RPC line
 async fn handle_mcp(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    // Validate before `from_value`: the extractor produced caller-controlled
+    // Validate before the typed parse: the extractor produced caller-controlled
     // JSON, and typed deserialization is where the allocations happen.
-    if serde_json::to_string(&request)
-        .map(|encoded| encoded.len() > MAX_MCP_ENVELOPE_BYTES)
-        .unwrap_or(true)
-        || !valid_mcp_envelope(&request)
-    {
-        return invalid_mcp_request_response();
-    }
-    if let Ok(rpc_req) = serde_json::from_value::<crate::server::JsonRpcRequest>(request) {
+    if let Some(rpc_req) = validated_mcp_request(&request) {
         // JSON-RPC 2.0: a notification (no `id`) is never answered. 202 with an
         // empty body, as MCP's HTTP transport answers one; the stdio proxy
         // writes nothing for an empty body.
@@ -2669,6 +2703,40 @@ mod tests {
         for value in bad {
             assert!(!super::valid_mcp_envelope(&value), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn mcp_envelope_admission_bounds_size_and_depth_before_typed_parse() {
+        // Oversized envelope: over the byte budget the admission refuses before
+        // any typed deserialization runs.
+        let oversized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": { "blob": "x".repeat(super::MAX_MCP_ENVELOPE_BYTES) }
+        });
+        assert!(super::validated_mcp_request(&oversized).is_none());
+        // Deeply nested envelope: over the depth bound the admission refuses
+        // before the typed parse walks it.
+        let mut deep = serde_json::json!("x");
+        for _ in 0..(super::MAX_MCP_JSON_NESTING_DEPTH + 4) {
+            deep = serde_json::json!({ "nested": deep });
+        }
+        let deep_envelope = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": deep
+        });
+        assert!(super::validated_mcp_request(&deep_envelope).is_none());
+        // A well-formed envelope still parses to the typed request.
+        let good = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/list",
+            "params": { "limit": 10 }
+        });
+        assert!(super::validated_mcp_request(&good).is_some());
     }
 
     /// `/cli/root` takes a caller path, so it is held to the same policy as

@@ -894,11 +894,21 @@ impl IngestWatchService {
 
     fn ensure_runtime(&self, namespace: &str, canonical: &Path) -> anyhow::Result<Registration> {
         let key = (namespace.to_string(), canonical.to_path_buf());
-        {
+        let existing = {
             let state = self.lock_state()?;
-            if let Some(runtime) = state.roots.get(&key) {
-                return Ok(runtime.registration.clone());
+            state
+                .roots
+                .get(&key)
+                .map(|runtime| (runtime.registration.clone(), !runtime.watch_active))
+        };
+        if let Some((registration, retry_activation)) = existing {
+            if retry_activation {
+                // A stored-but-inactive row is a previously failed activation;
+                // retry before handing the runtime back.
+                self.activate(canonical)?;
+                self.mark_watch_active(&key, true)?;
             }
+            return Ok(registration);
         }
         let registration = Registration {
             namespace: namespace.to_string(),
@@ -1298,9 +1308,20 @@ impl IngestWatchService {
             retries.remove(key);
         }
         let (namespace, canonical) = (key.0.clone(), key.1.clone());
-        let path_str = canonical.to_string_lossy().to_string();
-        let outcome = match self.trigger.trigger(&namespace, &path_str).await {
-            Ok(outcome) => outcome,
+        // Re-validate the stored registration-time root at fire time: a root
+        // swapped for an out-of-bound path while events were pending must not
+        // reach ingestion.
+        let outcome = match self.canonical_or_err(&canonical) {
+            Ok(path) => {
+                let path_str = path.to_string_lossy().to_string();
+                match self.trigger.trigger(&namespace, &path_str).await {
+                    Ok(outcome) => outcome,
+                    Err(err) => TriggerOutcome {
+                        state: TriggerState::Failed,
+                        error: Some(err.to_string()),
+                    },
+                }
+            }
             Err(err) => TriggerOutcome {
                 state: TriggerState::Failed,
                 error: Some(err.to_string()),
@@ -1327,7 +1348,7 @@ impl IngestWatchService {
                     let delay = next_backoff(runtime.backoff_attempt);
                     runtime.backoff_attempt += 1;
                     runtime.next_retry_unix = Some(unix_now_secs() + delay.as_secs());
-                    retry_at = Some(started + delay);
+                    retry_at = Some(finished + delay);
                 }
             }
             root_exists
@@ -2633,5 +2654,166 @@ mod tests {
             !dropped.lock().unwrap().is_empty(),
             "overflow drops must mark their root"
         );
+    }
+
+    /// Regression for #396: the J6 caller-path check is applied at
+    /// registration/registry load, but must also be re-applied when a pending
+    /// root fires, so a root swapped for an out-of-bound path is never ingested.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fire_reresolves_j6_caller_path_before_ingesting() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path().join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical = dunce::canonicalize(&root).unwrap();
+        let store: Arc<dyn WatchRegistrationStore> = Arc::new(JsonFileRegistrationStore::new(
+            dir.path().join("watch_registrations.json"),
+        ));
+        let trigger = Arc::new(RecordingTrigger::default());
+        let service = IngestWatchService::new(
+            Box::new(TestEventSource::channel()),
+            store,
+            trigger.clone(),
+            dunce::canonicalize(dir.path()).unwrap(),
+            Vec::new(),
+        );
+        service.register("NeuroStrata", &canonical).unwrap();
+        let key = root_key(&canonical);
+        let t0 = tokio::time::Instant::now();
+        service
+            .ingest_event(
+                source_event(&canonical, canonical.join("a.rs"), WatchEventKind::Create),
+                t0,
+            )
+            .unwrap();
+        assert!(service.status(None).roots[0].dirty);
+
+        // Swap the registered root for an out-of-bound symlink while pending.
+        std::fs::remove_dir_all(&canonical).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &canonical).unwrap();
+
+        service.fire(&key).await.unwrap();
+        assert_eq!(
+            trigger.call_count(),
+            0,
+            "out-of-bound root must not reach the trigger"
+        );
+        let status = service.status(None).roots[0].clone();
+        assert!(
+            status.dirty,
+            "refused fire must leave the root dirty for retry"
+        );
+        assert!(
+            service
+                .retry_at
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .is_some(),
+            "refused fire must arm a backoff retry"
+        );
+    }
+
+    // Trigger that fails after a delay longer than the first backoff step, so a
+    // retry armed from the pre-trigger start instant is already elapsed once the
+    // failure is known.
+    struct SlowFailTrigger;
+
+    #[async_trait]
+    impl IngestTrigger for SlowFailTrigger {
+        async fn trigger(
+            &self,
+            _namespace: &str,
+            _canonical_path: &str,
+        ) -> anyhow::Result<TriggerOutcome> {
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            Err(anyhow::anyhow!("injected failure"))
+        }
+    }
+
+    /// Regression for #397: a failed fire must arm the retry from completion
+    /// time, not from the pre-trigger start time.
+    #[tokio::test]
+    async fn fire_failed_retry_schedules_from_completion_not_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, canonical) = service_with(&dir, Arc::new(SlowFailTrigger));
+        service.register("NeuroStrata", &canonical).unwrap();
+        let key = root_key(&canonical);
+        service
+            .ingest_event(
+                source_event(&canonical, canonical.join("a.rs"), WatchEventKind::Create),
+                tokio::time::Instant::now(),
+            )
+            .unwrap();
+
+        service.fire(&key).await.unwrap();
+        let retry_at = service.retry_at.lock().unwrap().get(&key).cloned();
+        assert!(retry_at.is_some(), "failed fire must arm a retry");
+        let retry_at = retry_at.expect("failed fire must arm a retry");
+        assert!(
+            retry_at > tokio::time::Instant::now(),
+            "retry must be scheduled from completion time, got {retry_at:?}"
+        );
+    }
+
+    struct RecoveringWatchSource {
+        inner: TestEventSource,
+        remaining_refusals: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl WatchEventSource for RecoveringWatchSource {
+        async fn recv(&self) -> Option<WatchEvent> {
+            self.inner.recv().await
+        }
+        fn watch_root(&self, root: &Path) -> Result<(), String> {
+            if self
+                .remaining_refusals
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
+                return Err("stale root unavailable".to_string());
+            }
+            self.inner.watch_root(root)
+        }
+        fn unwatch_root(&self, root: &Path) -> Result<(), String> {
+            self.inner.unwatch_root(root)
+        }
+    }
+
+    /// Regression for #398: ensure_runtime must retry activation of a
+    /// stored-but-inactive root instead of returning it as-is.
+    #[tokio::test]
+    async fn ensure_runtime_retries_inactive_stored_root_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(dir.path()).unwrap();
+        let root = base.join("src");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = dir.path().join("watch_registrations.json");
+        let doc = format!(
+            r#"{{"schema_version":1,"registrations":[{{"namespace":"NeuroStrata","canonical_path":"{}","created_at_unix":1763596800,"updated_at_unix":1763596800}}]}}"#,
+            json_escape_path(&root)
+        );
+        std::fs::write(&registry, doc).unwrap();
+        let store: Arc<dyn WatchRegistrationStore> =
+            Arc::new(JsonFileRegistrationStore::new(registry));
+        let source = RecoveringWatchSource {
+            inner: TestEventSource::channel(),
+            remaining_refusals: std::sync::atomic::AtomicUsize::new(1),
+        };
+        let service = IngestWatchService::new(
+            Box::new(source),
+            store,
+            Arc::new(NoopTrigger),
+            base.clone(),
+            Vec::new(),
+        );
+        service.start().await.unwrap();
+        assert!(!service.status(None).roots[0].watch_active);
+
+        service.ensure_runtime("NeuroStrata", &root).unwrap();
+        assert!(service.status(None).roots[0].watch_active);
     }
 }

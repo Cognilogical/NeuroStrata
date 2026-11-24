@@ -380,6 +380,15 @@ pub fn source_digest_matches(expected: &str, records: &[Value]) -> bool {
     expected == hash_records_sha256(records) || expected == hash_records_sha256_legacy(records)
 }
 
+/// Durable retry key for one logical effect, mirroring the kernel's
+/// `AgentKernel::effect_dedup_key` (#350): the action receipt, pointer URI, and
+/// idempotency key together name one effect, so the receipt is part of the key.
+/// A retry under a new receipt names a new effect, not a replay of the first
+/// effect's receipt (#399).
+fn effect_dedup_key(req: &ExternalEffectRequest, pointer_uri: &str) -> String {
+    serde_json::json!([req.action_receipt_id, pointer_uri, req.idempotency_key]).to_string()
+}
+
 impl Default for InMemoryPoolConnector {
     fn default() -> Self {
         InMemoryPoolConnector::new()
@@ -486,7 +495,7 @@ impl DataConnector for InMemoryPoolConnector {
         let pool = pools
             .get_mut(pool_id)
             .ok_or_else(|| anyhow!("pool '{}' not found", pool_id))?;
-        let idempotency_key = format!("{}:{}:{}", pool_id, pointer_uri, req.idempotency_key);
+        let idempotency_key = effect_dedup_key(&req, pointer_uri);
         if pool.schema.access_mode == DataPoolAccessMode::ReadOnly {
             return Err(anyhow!("pool '{}' is read-only", pool_id));
         }
@@ -846,7 +855,7 @@ impl DataConnector for JsonFilePoolConnector {
         pointer_uri: &str,
         req: &ExternalEffectRequest,
     ) -> Result<ExternalEffectReceipt> {
-        let idempotency_key = format!("{}:{}:{}", pool_id, pointer_uri, req.idempotency_key);
+        let idempotency_key = format!("{}::{}", pool_id, effect_dedup_key(&req, pointer_uri));
         let mut idem = self.idempotency.write().unwrap();
         let schema = {
             let pools = self.pools.read().unwrap();
@@ -910,6 +919,21 @@ impl DataConnector for JsonFilePoolConnector {
         };
         idem.insert(idempotency_key, receipt.clone());
         Ok(receipt)
+    }
+
+    async fn hydrate_idempotency(
+        &self,
+        pool_id: &str,
+        receipts: &HashMap<String, ExternalEffectReceipt>,
+    ) -> Result<()> {
+        let mut idem = self.idempotency.write().unwrap();
+        for (key, receipt) in receipts {
+            // Receipts arrive keyed by the kernel's durable dedup key; re-key
+            // through the same pool-scoped derivation the apply path uses so a
+            // hydrated retry resolves identically (#399).
+            idem.insert(format!("{}::{}", pool_id, key), receipt.clone());
+        }
+        Ok(())
     }
 }
 
@@ -1094,6 +1118,101 @@ mod tests {
             .block_on(c.apply_external_effect("p", "uri", &bad_req))
             .unwrap_err();
         assert!(err.to_string().contains("CAS conflict"));
+    }
+
+    /// #399: the durable retry key must include the action receipt, so a retry
+    /// under a new receipt applies a new effect instead of replaying the first
+    /// effect's receipt.
+    #[test]
+    fn test_inmemory_apply_effect_retry_key_includes_action_receipt_id() {
+        let c = InMemoryPoolConnector::new();
+        c.upsert_pool(DataPoolSchema {
+            connector_id: "memory_pool".into(),
+            pool_id: "p".into(),
+            access_mode: DataPoolAccessMode::ReadWrite,
+            entity_types: vec![],
+            max_slice_rows: 10,
+            max_slice_bytes: 1024,
+            description: "test".into(),
+        });
+        c.seed_records("p", "uri", vec![json!(1)]);
+        let rt = rt();
+
+        let first_req = ExternalEffectRequest {
+            pointer_id: "uri".into(),
+            operation: "append".into(),
+            payload: json!({"v": 2}),
+            action_receipt_id: "rcpt_a".into(),
+            expected_source_sha256: None,
+            idempotency_key: "key1".into(),
+        };
+        let first = rt
+            .block_on(c.apply_external_effect("p", "uri", &first_req))
+            .unwrap();
+        assert!(first.applied);
+
+        // Same pointer + idempotency key under a different action receipt is a
+        // new effect, not a replay of the first effect's receipt.
+        let second_req = ExternalEffectRequest {
+            pointer_id: "uri".into(),
+            operation: "append".into(),
+            payload: json!({"v": 3}),
+            action_receipt_id: "rcpt_b".into(),
+            expected_source_sha256: None,
+            idempotency_key: "key1".into(),
+        };
+        let second = rt
+            .block_on(c.apply_external_effect("p", "uri", &second_req))
+            .unwrap();
+        assert!(
+            second.applied,
+            "a new action receipt must not replay the first effect"
+        );
+        let resolved = rt
+            .block_on(c.resolve_slice("p", "uri", 0, 10, 1024))
+            .unwrap();
+        assert_eq!(resolved.records.len(), 3);
+
+        // Replaying the same receipt + idempotency key stays idempotent.
+        let replay = rt
+            .block_on(c.apply_external_effect("p", "uri", &second_req))
+            .unwrap();
+        assert_eq!(replay.new_source_sha256, second.new_source_sha256);
+        let resolved = rt
+            .block_on(c.resolve_slice("p", "uri", 0, 10, 1024))
+            .unwrap();
+        assert_eq!(resolved.records.len(), 3);
+
+        // Hydration under the durable dedup key replays the persisted receipt.
+        let mut hydrated = HashMap::new();
+        hydrated.insert(effect_dedup_key(&second_req, "uri"), second.clone());
+        let c2 = InMemoryPoolConnector::new();
+        c2.upsert_pool(DataPoolSchema {
+            connector_id: "memory_pool".into(),
+            pool_id: "p".into(),
+            access_mode: DataPoolAccessMode::ReadWrite,
+            entity_types: vec![],
+            max_slice_rows: 10,
+            max_slice_bytes: 1024,
+            description: "test".into(),
+        });
+        c2.seed_records("p", "uri", vec![json!(1)]);
+        rt.block_on(c2.hydrate_idempotency("p", &hydrated)).unwrap();
+        let replay_hydrated = rt
+            .block_on(c2.apply_external_effect("p", "uri", &second_req))
+            .unwrap();
+        assert_eq!(
+            replay_hydrated.new_source_sha256, second.new_source_sha256,
+            "hydrated receipt must replay without re-applying"
+        );
+        let resolved = rt
+            .block_on(c2.resolve_slice("p", "uri", 0, 10, 1024))
+            .unwrap();
+        assert_eq!(
+            resolved.records.len(),
+            1,
+            "hydrated receipt must replay without re-applying"
+        );
     }
 
     #[test]
