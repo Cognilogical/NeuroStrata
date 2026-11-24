@@ -51,11 +51,17 @@ import plugin, * as mod from "./dist/index.js";
 // the harness config of <root> is read first.
 const RUNNER_DIR = dirname(fileURLToPath(import.meta.url));
 const HARNESS = basename(RUNNER_DIR);
-// Session events, by the lowercase name every harness spelling folds to
+// Events whose reply carries no permission decision (the session events and
+// PostToolUse), by the lowercase name every harness spelling folds to
 // (Copilot names its event only in NEUROSTRATA_HOOK_EVENT, camelCase).
-const SESSION_EVENTS = { sessionstart: "SessionStart", sessionend: "SessionEnd", precompact: "PreCompact" };
-// The session event being handled, so the catch replies in its shape.
-let sessionEvent;
+const NO_DECISION_EVENTS = {
+  sessionstart: "SessionStart",
+  sessionend: "SessionEnd",
+  precompact: "PreCompact",
+  posttooluse: "PostToolUse"
+};
+// The no-decision event being handled, so the catch replies in its shape.
+let noDecisionEvent;
 
 async function main() {
   // Redirect all diagnostic logging to stderr so stdout carries only the
@@ -103,16 +109,19 @@ async function main() {
     event.eventName,
     process.env.NEUROSTRATA_HOOK_EVENT
   ].find((name) => typeof name === "string" && name);
-  sessionEvent = eventName ? SESSION_EVENTS[eventName.toLowerCase()] : undefined;
-  // A plugin build without a handler for this session event would answer
-  // with its PreToolUse-shaped default, which Codex rejects on SessionStart
-  // and PreCompact. Answer `{}` (valid for every harness) instead. Claude's
+  noDecisionEvent = eventName ? NO_DECISION_EVENTS[eventName.toLowerCase()] : undefined;
+  // A plugin build without a handler for this event would answer with its
+  // PreToolUse-shaped default, which Codex rejects on SessionStart and
+  // PreCompact, and would run the PreToolUse work a second time on
+  // PostToolUse. Answer `{}` (valid for every harness) instead. Claude's
   // SessionStart keeps going to the plugin, as it always has.
-  const handled =
-    sessionEvent === "SessionStart"
-      ? HARNESS === "claude" || typeof mod.handleSessionStartEvent === "function"
-      : typeof mod.writeSessionHandoff === "function";
-  if (sessionEvent && !handled) {
+  const handled = {
+    SessionStart: HARNESS === "claude" || typeof mod.handleSessionStartEvent === "function",
+    SessionEnd: typeof mod.writeSessionHandoff === "function",
+    PreCompact: typeof mod.writeSessionHandoff === "function",
+    PostToolUse: typeof mod.handlePostToolUseEvent === "function"
+  }[noDecisionEvent];
+  if (noDecisionEvent && !handled) {
     await writeStdout("{}");
     return;
   }
@@ -164,15 +173,18 @@ async function main() {
 main().catch((err) => {
   const reason = String(err);
   process.stderr.write(reason + "\n");
-  // A session event takes no permission decision; `{}` lets the session go
-  // on. The reason stays on stderr.
-  if (sessionEvent) {
+  // Only PreToolUse takes a permission decision. Any other event answers
+  // `{}`, so the session and the tool result go on; for Copilot that is
+  // every event but preToolUse, even one that failed before it was read.
+  // The reason stays on stderr.
+  const copilotEvent = process.env.NEUROSTRATA_HOOK_EVENT;
+  if (noDecisionEvent || (copilotEvent && copilotEvent.toLowerCase() !== "pretooluse")) {
     process.stdout.write("{}");
     return;
   }
   // Copilot CLI (its hooks file sets NEUROSTRATA_HOOK_EVENT) reads a
   // top-level decision on preToolUse and ignores hookSpecificOutput.
-  if (process.env.NEUROSTRATA_HOOK_EVENT) {
+  if (copilotEvent) {
     process.stdout.write(JSON.stringify({ permissionDecision: "deny", permissionDecisionReason: reason }));
     return;
   }
@@ -5749,11 +5761,118 @@ mod tests {
             "typeof mod.handleSessionStartEvent === \"function\"",
             "typeof mod.writeSessionHandoff === \"function\"",
             "process.env.NEUROSTRATA_HOOK_EVENT",
-            "if (sessionEvent && !handled) {\n    await writeStdout(\"{}\");",
-            "if (sessionEvent) {\n    process.stdout.write(\"{}\");",
+            "if (noDecisionEvent && !handled) {\n    await writeStdout(\"{}\");",
             "JSON.stringify({ permissionDecision: \"deny\", permissionDecisionReason: reason })",
         ] {
             assert!(CLI_HOOK_RUNNER_MJS.contains(needle), "{needle}");
+        }
+    }
+
+    /// Runs the installed runner under node with a stand-in plugin bundle and
+    /// one Copilot hook input on stdin (Copilot names the event only in
+    /// `NEUROSTRATA_HOOK_EVENT`). `flags` become env variables the bundle
+    /// reads. `None` when node is not installed.
+    fn run_copilot_runner(event: &str, flags: &[&str]) -> Option<Value> {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("github-cli");
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join("cli-hook.mjs"), CLI_HOOK_RUNNER_MJS).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"type": "module"}"#).unwrap();
+        // HANDLERS exports every handler a newer bundle has; THROW fails the
+        // handler; THROW_EARLY fails before the runner reads the event name.
+        std::fs::write(
+            dir.join("dist/index.js"),
+            r#"const on = (name) => Boolean(process.env[name]);
+const marker = on("HANDLERS") ? async () => ({}) : undefined;
+export const handleSessionStartEvent = marker;
+export const writeSessionHandoff = marker;
+export const handlePostToolUseEvent = marker;
+export const resolveHookProjectDir = on("THROW_EARLY")
+  ? () => { throw new Error("early"); }
+  : undefined;
+export async function handleHookEvent() {
+  if (on("THROW")) throw new Error("boom");
+  return { ran: "handleHookEvent" };
+}
+export default {};
+"#,
+        )
+        .unwrap();
+        let mut command = std::process::Command::new("node");
+        command
+            .arg(dir.join("cli-hook.mjs"))
+            .current_dir(tmp.path())
+            .env("NEUROSTRATA_HOOK_EVENT", event)
+            .env_remove("NEUROSTRATA_NAMESPACE")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for name in ["HANDLERS", "THROW", "THROW_EARLY"] {
+            command.env_remove(name);
+        }
+        for flag in flags {
+            command.env(flag, "1");
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                eprintln!("skipped: node is not installed");
+                return None;
+            }
+        };
+        let input = json!({
+            "sessionId": "s1",
+            "timestamp": 1,
+            "cwd": tmp.path().to_string_lossy(),
+            "toolName": "bash",
+            "toolArgs": "{}",
+            "toolResult": { "resultType": "success", "textResultForLlm": "ok" }
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        Some(serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!(
+                "{event} {flags:?}: stdout {stdout:?} is not JSON ({e}); stderr {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        }))
+    }
+
+    /// Merged before the plugin handles postToolUse, the runner answers `{}`
+    /// to it instead of running the bundle's PreToolUse work a second time;
+    /// a bundle that exports `handlePostToolUseEvent` gets it through
+    /// `handleHookEvent`. A failed Copilot event answers `{}`, even one that
+    /// failed before its name was read; only preToolUse answers with a deny.
+    #[test]
+    fn copilot_runner_answers_events_without_a_decision_with_an_empty_reply() {
+        let ran = json!({ "ran": "handleHookEvent" });
+        let cases: [(&str, &[&str], Value); 6] = [
+            ("postToolUse", &[], json!({})),
+            ("postToolUse", &["HANDLERS"], ran.clone()),
+            ("postToolUse", &["HANDLERS", "THROW"], json!({})),
+            ("postToolUse", &["HANDLERS", "THROW_EARLY"], json!({})),
+            ("preToolUse", &[], ran.clone()),
+            ("sessionEnd", &["HANDLERS", "THROW_EARLY"], json!({})),
+        ];
+        for (event, flags, expected) in cases {
+            let Some(reply) = run_copilot_runner(event, flags) else {
+                return;
+            };
+            assert_eq!(reply, expected, "{event} {flags:?}");
+        }
+        for flags in [&["THROW"][..], &["THROW_EARLY"][..]] {
+            let Some(reply) = run_copilot_runner("preToolUse", flags) else {
+                return;
+            };
+            assert_eq!(reply["permissionDecision"], json!("deny"), "{flags:?}");
+            assert!(reply.get("hookSpecificOutput").is_none(), "{reply}");
         }
     }
 
