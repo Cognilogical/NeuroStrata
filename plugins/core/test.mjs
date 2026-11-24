@@ -3842,6 +3842,131 @@ describe('round-9: CLI hook runners flush stdout before exiting', () => {
       )
     }
   })
+
+  // The installer's CLI_HOOK_RUNNER_MJS and each package's cli-hook.mjs keep
+  // their own structure but must behave the same; both run here against one
+  // stand-in bundle. HANDLERS exports every handler a newer bundle has, THROW
+  // fails the handler, THROW_EARLY fails the project folder lookup.
+  it('both runners gate unhandled events and reply to a failure by event', async () => {
+    const embedded = readFileSync(
+      new URL('../../src/task/harness_plugins.rs', import.meta.url),
+      'utf8'
+    ).match(/const CLI_HOOK_RUNNER_MJS: &str = r#"([\s\S]*?)"#;/)
+    assert.ok(embedded, 'CLI_HOOK_RUNNER_MJS must be extractable')
+    const bundle = `const on = (name) => Boolean(process.env[name]);
+const marker = on("HANDLERS") ? async () => ({}) : undefined;
+export const handleSessionStartEvent = marker;
+export const writeSessionHandoff = marker;
+export const handlePostToolUseEvent = marker;
+export function resolveHookProjectDir(harness, event) {
+  if (on("THROW_EARLY")) throw new Error("early");
+  return event.cwd;
+}
+export const readHarnessConfig = () => ({});
+export const usableNamespace = () => undefined;
+export async function initialize() {}
+export async function onTurnEnd() {}
+export async function handleHookEvent() {
+  if (on("THROW")) throw new Error("boom");
+  return { ran: "handleHookEvent" };
+}
+export default { handleHookEvent };
+`
+    const base = mkdtempSync(join(tmpdir(), 'ns-runner-sync-'))
+    const runners = []
+    for (const harness of ['claude', 'codex', 'github-cli', 'opencode']) {
+      const copy = readFileSync(
+        new URL(`../${harness}/cli-hook.mjs`, import.meta.url),
+        'utf8'
+      )
+      runners.push({ label: `plugins/${harness}/cli-hook.mjs`, harness, source: copy })
+    }
+    for (const harness of ['claude', 'github-cli']) {
+      runners.push({ label: `installer runner as ${harness}`, harness, source: embedded[1] })
+    }
+    const run = (dir, { named, copilot, flags = [] }) =>
+      new Promise((resolveRun, rejectRun) => {
+        const env = { ...process.env }
+        for (const name of [
+          'NEUROSTRATA_HOOK_EVENT',
+          'NEUROSTRATA_NAMESPACE',
+          'CLAUDE_PROJECT_DIR',
+          'HANDLERS',
+          'THROW',
+          'THROW_EARLY'
+        ]) {
+          delete env[name]
+        }
+        // Copilot names its event only in NEUROSTRATA_HOOK_EVENT.
+        if (copilot) env.NEUROSTRATA_HOOK_EVENT = copilot
+        for (const flag of flags) env[flag] = '1'
+        const input = { cwd: dir, toolName: 'bash', toolArgs: '{}' }
+        if (named) input.hook_event_name = named
+        const child = spawn(process.execPath, [join(dir, 'cli-hook.mjs')], {
+          cwd: dir,
+          env,
+          stdio: ['pipe', 'pipe', 'ignore']
+        })
+        let stdout = ''
+        child.stdout.on('data', (chunk) => {
+          stdout += chunk
+        })
+        child.on('error', rejectRun)
+        child.on('close', (code) => resolveRun({ stdout, code }))
+        child.stdin.end(JSON.stringify(input))
+      })
+    const ran = { ran: 'handleHookEvent' }
+    // Claude's SessionStart always goes to the plugin.
+    const sessionStart = (harness) => (harness === 'claude' ? ran : {})
+    // [input, expected reply (or the deny shape), exit code]
+    const cases = [
+      [{ copilot: 'postToolUse' }, {}, 0],
+      [{ copilot: 'postToolUse', flags: ['HANDLERS'] }, ran, 0],
+      [{ copilot: 'postToolUse', flags: ['HANDLERS', 'THROW'] }, {}, 0],
+      [{ copilot: 'postToolUse', flags: ['HANDLERS', 'THROW_EARLY'] }, {}, 0],
+      [{ copilot: 'preToolUse' }, ran, 0],
+      [{ copilot: 'sessionStart' }, sessionStart, 0],
+      [{ copilot: 'sessionEnd', flags: ['HANDLERS', 'THROW_EARLY'] }, {}, 0],
+      [{ named: 'SessionStart' }, sessionStart, 0],
+      [{ named: 'SessionStart', flags: ['THROW'] }, {}, 0],
+      [{ named: 'PreCompact' }, {}, 0],
+      [{ named: 'PreCompact', flags: ['HANDLERS', 'THROW'] }, {}, 0],
+      [{ named: 'PostToolUse' }, {}, 0],
+      [{ named: 'SubagentStop', flags: ['THROW'] }, {}, 0],
+      [{ named: 'Stop' }, ran, 0],
+      [{ named: 'Stop', flags: ['THROW'] }, {}, 2],
+      [{ copilot: 'preToolUse', flags: ['THROW'] }, 'top-level deny', 0],
+      [{ named: 'PreToolUse', flags: ['THROW'] }, 'deny', 0],
+      [{ flags: ['THROW'] }, 'deny', 0]
+    ]
+    try {
+      for (const [index, runner] of runners.entries()) {
+        const dir = join(base, String(index), runner.harness)
+        mkdirSync(join(dir, 'dist'), { recursive: true })
+        writeFileSync(join(dir, 'cli-hook.mjs'), runner.source)
+        writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module' }))
+        writeFileSync(join(dir, 'dist', 'index.js'), bundle)
+        const results = await Promise.all(cases.map(([input]) => run(dir, input)))
+        for (const [i, [input, expected, code]] of cases.entries()) {
+          const what = `${runner.label} ${JSON.stringify(input)}`
+          const { stdout, code: status } = results[i]
+          assert.equal(status, code, `${what}: exit code`)
+          const reply = JSON.parse(stdout)
+          if (expected === 'top-level deny') {
+            assert.equal(reply.permissionDecision, 'deny', what)
+            assert.equal(reply.hookSpecificOutput, undefined, what)
+          } else if (expected === 'deny') {
+            assert.equal(reply.hookSpecificOutput?.permissionDecision, 'deny', what)
+          } else {
+            const want = typeof expected === 'function' ? expected(runner.harness) : expected
+            assert.deepEqual(reply, want, what)
+          }
+        }
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
 })
 
 // ──────────────────────────────────────────────────────────────────────

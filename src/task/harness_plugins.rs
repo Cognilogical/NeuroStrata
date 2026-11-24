@@ -60,8 +60,9 @@ const NO_DECISION_EVENTS = {
   precompact: "PreCompact",
   posttooluse: "PostToolUse"
 };
-// The no-decision event being handled, so the catch replies in its shape.
-let noDecisionEvent;
+// The name of the event being handled (Copilot names it only in
+// NEUROSTRATA_HOOK_EVENT), so the catch can reply in its shape.
+let eventName;
 
 async function main() {
   // Redirect all diagnostic logging to stderr so stdout carries only the
@@ -94,22 +95,13 @@ async function main() {
   } catch {
     return;
   }
-  // The namespace comes from the harness config the installer wrote; the
-  // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
-  // this config (the order of `neurostrata-mcp namespace resolve`).
-  const projectDir =
-    typeof mod.resolveHookProjectDir === "function"
-      ? mod.resolveHookProjectDir(HARNESS, event)
-      : typeof event.cwd === "string" && event.cwd
-        ? event.cwd
-        : process.cwd();
-  const eventName = [
+  eventName = [
     event.hook_event_name,
     event.hookEventName,
     event.eventName,
     process.env.NEUROSTRATA_HOOK_EVENT
   ].find((name) => typeof name === "string" && name);
-  noDecisionEvent = eventName ? NO_DECISION_EVENTS[eventName.toLowerCase()] : undefined;
+  const noDecisionEvent = eventName ? NO_DECISION_EVENTS[eventName.toLowerCase()] : undefined;
   // A plugin build without a handler for this event would answer with its
   // PreToolUse-shaped default, which Codex rejects on SessionStart and
   // PreCompact, and would run the PreToolUse work a second time on
@@ -125,6 +117,15 @@ async function main() {
     await writeStdout("{}");
     return;
   }
+  // The namespace comes from the harness config the installer wrote; the
+  // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
+  // this config (the order of `neurostrata-mcp namespace resolve`).
+  const projectDir =
+    typeof mod.resolveHookProjectDir === "function"
+      ? mod.resolveHookProjectDir(HARNESS, event)
+      : typeof event.cwd === "string" && event.cwd
+        ? event.cwd
+        : process.cwd();
   // OpenCode loads the first parseable .NeuroStrata shared config and only
   // then falls back to the historical .opencode registration. `namespace
   // resolve` uses that same precedence; passing the registration as ctx.config
@@ -173,18 +174,27 @@ async function main() {
 main().catch((err) => {
   const reason = String(err);
   process.stderr.write(reason + "\n");
-  // Only PreToolUse takes a permission decision. Any other event answers
-  // `{}`, so the session and the tool result go on; for Copilot that is
-  // every event but preToolUse, even one that failed before it was read.
-  // The reason stays on stderr.
-  const copilotEvent = process.env.NEUROSTRATA_HOOK_EVENT;
-  if (noDecisionEvent || (copilotEvent && copilotEvent.toLowerCase() !== "pretooluse")) {
+  // Reply in the shape of the event that failed; an event without a name is
+  // a PreToolUse, as for the plugin. A PreToolUse deny means nothing at Stop,
+  // where Claude Code treats exit code 2 as a block; stdout still has to be
+  // valid JSON. PowerShell can collapse nonzero exits, so the reason stays on
+  // stderr as well.
+  const failed = (eventName ?? "PreToolUse").toLowerCase();
+  if (failed === "stop") {
+    process.stdout.write("{}");
+    process.exitCode = 2;
+    return;
+  }
+  // Only PreToolUse takes a permission decision. Every other event (the
+  // session events, PostToolUse, each Copilot event but preToolUse) answers
+  // `{}`, so the session and the tool result go on.
+  if (failed !== "pretooluse") {
     process.stdout.write("{}");
     return;
   }
   // Copilot CLI (its hooks file sets NEUROSTRATA_HOOK_EVENT) reads a
   // top-level decision on preToolUse and ignores hookSpecificOutput.
-  if (copilotEvent) {
+  if (process.env.NEUROSTRATA_HOOK_EVENT) {
     process.stdout.write(JSON.stringify({ permissionDecision: "deny", permissionDecisionReason: reason }));
     return;
   }
@@ -5768,11 +5778,16 @@ mod tests {
         }
     }
 
-    /// Runs the installed runner under node with a stand-in plugin bundle and
-    /// one Copilot hook input on stdin (Copilot names the event only in
-    /// `NEUROSTRATA_HOOK_EVENT`). `flags` become env variables the bundle
-    /// reads. `None` when node is not installed.
-    fn run_copilot_runner(event: &str, flags: &[&str]) -> Option<Value> {
+    /// Runs the installed runner under node with a stand-in plugin bundle.
+    /// The hook input names `named` in `hook_event_name` (Claude, Codex);
+    /// `copilot` goes into `NEUROSTRATA_HOOK_EVENT` (Copilot names its event
+    /// only there). `flags` become env variables the bundle reads. Returns
+    /// the reply and the exit code; `None` when node is not installed.
+    fn run_installed_runner(
+        named: Option<&str>,
+        copilot: Option<&str>,
+        flags: &[&str],
+    ) -> Option<(Value, i32)> {
         use std::io::Write as _;
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("github-cli");
@@ -5780,7 +5795,8 @@ mod tests {
         std::fs::write(dir.join("cli-hook.mjs"), CLI_HOOK_RUNNER_MJS).unwrap();
         std::fs::write(dir.join("package.json"), r#"{"type": "module"}"#).unwrap();
         // HANDLERS exports every handler a newer bundle has; THROW fails the
-        // handler; THROW_EARLY fails before the runner reads the event name.
+        // handler; THROW_EARLY fails the project folder lookup, before the
+        // plugin is initialized.
         std::fs::write(
             dir.join("dist/index.js"),
             r#"const on = (name) => Boolean(process.env[name]);
@@ -5803,11 +5819,14 @@ export default {};
         command
             .arg(dir.join("cli-hook.mjs"))
             .current_dir(tmp.path())
-            .env("NEUROSTRATA_HOOK_EVENT", event)
+            .env_remove("NEUROSTRATA_HOOK_EVENT")
             .env_remove("NEUROSTRATA_NAMESPACE")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        if let Some(event) = copilot {
+            command.env("NEUROSTRATA_HOOK_EVENT", event);
+        }
         for name in ["HANDLERS", "THROW", "THROW_EARLY"] {
             command.env_remove(name);
         }
@@ -5821,14 +5840,16 @@ export default {};
                 return None;
             }
         };
-        let input = json!({
+        let mut input = json!({
             "sessionId": "s1",
             "timestamp": 1,
             "cwd": tmp.path().to_string_lossy(),
             "toolName": "bash",
-            "toolArgs": "{}",
-            "toolResult": { "resultType": "success", "textResultForLlm": "ok" }
+            "toolArgs": "{}"
         });
+        if let Some(event) = named {
+            input["hook_event_name"] = json!(event);
+        }
         child
             .stdin
             .take()
@@ -5837,42 +5858,88 @@ export default {};
             .unwrap();
         let out = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
-        Some(serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        let reply = serde_json::from_str(&stdout).unwrap_or_else(|e| {
             panic!(
-                "{event} {flags:?}: stdout {stdout:?} is not JSON ({e}); stderr {}",
+                "{named:?} {copilot:?} {flags:?}: stdout {stdout:?} is not JSON ({e}); stderr {}",
                 String::from_utf8_lossy(&out.stderr)
             )
-        }))
+        });
+        Some((reply, out.status.code().unwrap_or(-1)))
     }
 
     /// Merged before the plugin handles postToolUse, the runner answers `{}`
     /// to it instead of running the bundle's PreToolUse work a second time;
     /// a bundle that exports `handlePostToolUseEvent` gets it through
-    /// `handleHookEvent`. A failed Copilot event answers `{}`, even one that
-    /// failed before its name was read; only preToolUse answers with a deny.
+    /// `handleHookEvent`. A failed event replies in its own shape: Stop gets
+    /// `{}` with exit code 2 (a block for Claude Code), PreToolUse a deny (an
+    /// unnamed event counts as one), and every other event `{}`.
     #[test]
-    fn copilot_runner_answers_events_without_a_decision_with_an_empty_reply() {
+    fn installed_runner_replies_in_the_shape_of_the_event() {
         let ran = json!({ "ran": "handleHookEvent" });
-        let cases: [(&str, &[&str], Value); 6] = [
-            ("postToolUse", &[], json!({})),
-            ("postToolUse", &["HANDLERS"], ran.clone()),
-            ("postToolUse", &["HANDLERS", "THROW"], json!({})),
-            ("postToolUse", &["HANDLERS", "THROW_EARLY"], json!({})),
-            ("preToolUse", &[], ran.clone()),
-            ("sessionEnd", &["HANDLERS", "THROW_EARLY"], json!({})),
+        let empty = json!({});
+        let cases: [(Option<&str>, Option<&str>, &[&str], &Value, i32); 13] = [
+            (None, Some("postToolUse"), &[], &empty, 0),
+            (None, Some("postToolUse"), &["HANDLERS"], &ran, 0),
+            (None, Some("postToolUse"), &["HANDLERS", "THROW"], &empty, 0),
+            (
+                None,
+                Some("postToolUse"),
+                &["HANDLERS", "THROW_EARLY"],
+                &empty,
+                0,
+            ),
+            (None, Some("preToolUse"), &[], &ran, 0),
+            (
+                None,
+                Some("sessionEnd"),
+                &["HANDLERS", "THROW_EARLY"],
+                &empty,
+                0,
+            ),
+            (
+                None,
+                Some("sessionStart"),
+                &["HANDLERS", "THROW"],
+                &empty,
+                0,
+            ),
+            (Some("PreCompact"), None, &[], &empty, 0),
+            (Some("PreCompact"), None, &["HANDLERS", "THROW"], &empty, 0),
+            (Some("PostToolUse"), None, &[], &empty, 0),
+            (Some("SubagentStop"), None, &["THROW"], &empty, 0),
+            (Some("Stop"), None, &["THROW"], &empty, 2),
+            (Some("Stop"), None, &[], &ran, 0),
         ];
-        for (event, flags, expected) in cases {
-            let Some(reply) = run_copilot_runner(event, flags) else {
+        for (named, copilot, flags, expected, code) in cases {
+            let Some((reply, status)) = run_installed_runner(named, copilot, flags) else {
                 return;
             };
-            assert_eq!(reply, expected, "{event} {flags:?}");
+            assert_eq!(
+                (&reply, status),
+                (expected, code),
+                "{named:?} {copilot:?} {flags:?}"
+            );
         }
-        for flags in [&["THROW"][..], &["THROW_EARLY"][..]] {
-            let Some(reply) = run_copilot_runner("preToolUse", flags) else {
+        // Copilot reads a top-level decision on preToolUse; the others read
+        // hookSpecificOutput.
+        let denies: [(Option<&str>, Option<&str>, &[&str], bool); 4] = [
+            (None, Some("preToolUse"), &["THROW"], true),
+            (None, Some("preToolUse"), &["THROW_EARLY"], true),
+            (Some("PreToolUse"), None, &["THROW"], false),
+            (None, None, &["THROW"], false),
+        ];
+        for (named, copilot, flags, top_level) in denies {
+            let Some((reply, status)) = run_installed_runner(named, copilot, flags) else {
                 return;
             };
-            assert_eq!(reply["permissionDecision"], json!("deny"), "{flags:?}");
-            assert!(reply.get("hookSpecificOutput").is_none(), "{reply}");
+            assert_eq!(status, 0, "{reply}");
+            let decision = if top_level {
+                assert!(reply.get("hookSpecificOutput").is_none(), "{reply}");
+                &reply["permissionDecision"]
+            } else {
+                &reply["hookSpecificOutput"]["permissionDecision"]
+            };
+            assert_eq!(decision, &json!("deny"), "{named:?} {copilot:?} {flags:?}");
         }
     }
 
