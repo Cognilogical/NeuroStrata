@@ -137,11 +137,20 @@ pub fn read_marker(dir: &Path) -> MarkerRead {
         path: reported.clone(),
         reason,
     };
-    let path = match contained_marker_path(dir) {
-        Ok(Some(path)) => path,
-        Ok(None) => return MarkerRead::Absent,
+    let (canonical_dir, path) = match contained_marker_path(dir) {
+        Ok((canonical_dir, path)) => (canonical_dir, path),
         Err(reason) => return unreadable(reason),
     };
+    let Some(path) = path else {
+        // No marker yet: the folder itself is not a root.
+        return MarkerRead::Absent;
+    };
+    // The read site re-verifies containment against the canonicalized target
+    // folder, so the file read stays inside the folder the caller pointed at
+    // (CodeQL rust/path-injection).
+    if !path.starts_with(&canonical_dir) {
+        return unreadable("root marker resolves outside the target directory".to_string());
+    }
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return MarkerRead::Absent,
@@ -153,25 +162,30 @@ pub fn read_marker(dir: &Path) -> MarkerRead {
 /// Resolve the marker through canonical paths and refuse one that leaves
 /// `dir`. A caller may hand `read_marker` a path derived from a request; a
 /// symlinked `.NeuroStrata` or `config.json` must not turn that read into an
-/// arbitrary-file read (CodeQL rust/path-injection). `None` means the folder
-/// itself does not exist, which keeps `read_marker`'s `Absent` answer.
-fn contained_marker_path(dir: &Path) -> Result<Option<PathBuf>, String> {
+/// arbitrary-file read (CodeQL rust/path-injection). The answer carries the
+/// canonical target folder plus the canonical marker path when one exists;
+/// the path half is `None` when the folder holds no marker.
+fn contained_marker_path(dir: &Path) -> Result<(PathBuf, Option<PathBuf>), String> {
     let canonical_dir = match dir.canonicalize() {
         Ok(path) => path,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((dir.to_path_buf(), None));
+        }
         Err(err) => return Err(err.to_string()),
     };
     let candidate = canonical_dir.join(ROOT_CONFIG_REL);
     let canonical_file = match candidate.canonicalize() {
         Ok(path) => path,
-        // No marker yet: the non-canonical candidate still reads as Absent.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Some(candidate)),
+        // No marker yet: the folder is not a root.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((canonical_dir, None));
+        }
         Err(err) => return Err(err.to_string()),
     };
     if !canonical_file.starts_with(&canonical_dir) {
         return Err("root marker resolves outside the target directory".to_string());
     }
-    Ok(Some(canonical_file))
+    Ok((canonical_dir, Some(canonical_file)))
 }
 
 /// Applies [`read_marker`]'s rules (BOM accepted; bad JSON, an unknown
@@ -1914,6 +1928,30 @@ mod tests {
         }
         // A folder that does not exist still reads as absent.
         assert_eq!(read_marker(&tmp.path().join("missing")), MarkerRead::Absent);
+    }
+
+    #[test]
+    fn read_marker_refuses_a_symlinked_marker_directory_escaping_the_target() {
+        // A `.NeuroStrata` that is a link to another folder must not turn the
+        // read into an arbitrary-file read: containment is re-checked at the
+        // read site, so an escaping link answers Unreadable, not a file read.
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        write_raw(
+            elsewhere.path(),
+            br#"{"version":1,"namespace":"example-project"}"#,
+        );
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        link_dir(
+            &elsewhere.path().join(".NeuroStrata"),
+            &linked.join(".NeuroStrata"),
+        );
+        let got = read_marker(&linked);
+        assert!(
+            matches!(got, MarkerRead::Unreadable { .. }),
+            "expected an unreadable marker, got {got:?}"
+        );
     }
 
     #[test]
