@@ -680,7 +680,7 @@ pub trait VectorStore: Send + Sync + AsAny {
 
     /// The payloads of the rows in `namespaces` whose id is in `ids`, without
     /// their vectors; ids with no row are left out. The default reads them one
-    /// by one; a store that can answers in one query.
+    /// by one; a store that can answer in one query should override it.
     async fn get_many(
         &self,
         namespaces: &[&str],

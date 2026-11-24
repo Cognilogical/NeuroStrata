@@ -522,12 +522,19 @@ pub fn is_rule_prefixed_content(content: &str) -> bool {
 }
 
 fn is_active_golden_candidate(r: &SearchResult) -> bool {
-    if r.payload.memory_type == "task"
-        || r.payload.memory_type == "community_summary"
-        || crate::registry::is_registry_row(&r.payload.metadata)
-        || crate::handlers::archive_memory::is_archived(&r.payload)
-        || r.payload.metadata.get("superseded_by").is_some()
-        || r.payload
+    is_active_golden_payload(&r.payload)
+}
+
+/// Whether a row may still be quoted as a Golden Rule: the test
+/// `collect_golden_rules` applies, also used to drop golden entries from a
+/// task block cached at claim time.
+fn is_active_golden_payload(payload: &MemoryPayload) -> bool {
+    if payload.memory_type == "task"
+        || payload.memory_type == "community_summary"
+        || crate::registry::is_registry_row(&payload.metadata)
+        || crate::handlers::archive_memory::is_archived(payload)
+        || payload.metadata.get("superseded_by").is_some()
+        || payload
             .metadata
             .get("valid_to")
             .and_then(|v| v.as_i64())
@@ -536,9 +543,8 @@ fn is_active_golden_candidate(r: &SearchResult) -> bool {
     {
         return false;
     }
-    if r.payload.memory_type == "guard_rule" {
-        return r
-            .payload
+    if payload.memory_type == "guard_rule" {
+        return payload
             .metadata
             .get("status")
             .and_then(|v| v.as_str())
@@ -645,10 +651,16 @@ pub fn format_golden_rules_section(golden_rules: &[SearchResult]) -> String {
     out
 }
 
+/// The line that opens the memory entries in a rendered task block.
+const TASK_BLOCK_ENTRIES_HEADER: &str = "- Auto-Retrieved Governing Rules & Graph Nodes:";
+/// The line that opens the conceptual bridges in a rendered task block.
+const TASK_BLOCK_BRIDGES_HEADER: &str = "### Cross-Domain Bridges";
+
 /// The active task's payload with the entries of its cached
-/// `subagent_prompt_injection` left out whose memory was retired since the
-/// claim (superseded, expired or archived). The block is written once at claim
-/// time; `get_snapshot` hands it to every session start through
+/// `subagent_prompt_injection` left out that quote a memory retired since the
+/// claim (superseded, expired or archived): memory entries naming it and
+/// Cross-Domain Bridges whose path runs through it. The block is written once at
+/// claim time; `get_snapshot` hands it to every session start through
 /// `active_session.json`, so it must not quote a retired rule there. Only one
 /// keyed read by id: rebuilding the block with `build_task_graph_context` runs
 /// a hybrid search and lists the namespace, which took seconds on a large
@@ -668,10 +680,10 @@ pub(crate) async fn task_payload_without_retired_entries(
     else {
         return payload.clone();
     };
-    let mut ids: Vec<String> = block
-        .lines()
-        .filter_map(task_block_entry_id)
-        .map(String::from)
+    let parts = task_block_parts(block);
+    let mut ids: Vec<String> = parts
+        .iter()
+        .flat_map(|p| p.ids.iter().map(|id| id.to_string()))
         .collect();
     ids.sort();
     ids.dedup();
@@ -693,31 +705,150 @@ pub(crate) async fn task_payload_without_retired_entries(
             && !crate::store::ladybug::is_retired_at(&row.metadata, now)
             && !crate::handlers::archive_memory::is_archived(row)
     };
-    // An id is dropped only when every row found for it is retired; the same
-    // id can exist once in the task's namespace and once in `global`.
-    let live: HashSet<&str> = rows
+    // An id is dropped only when no row found for it passes; the same id can
+    // exist once in the task's namespace and once in `global`. Golden entries
+    // are held to the test that picked them (`collect_golden_rules`), the
+    // others to the retirement checks search applies.
+    fn retired_by<'a>(
+        rows: &'a [(String, MemoryPayload)],
+        passes: impl Fn(&MemoryPayload) -> bool,
+    ) -> HashSet<&'a str> {
+        let passing: HashSet<&str> = rows
+            .iter()
+            .filter(|(_, row)| passes(row))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        rows.iter()
+            .map(|(id, _)| id.as_str())
+            .filter(|id| !passing.contains(id))
+            .collect()
+    }
+    let retired = retired_by(&rows, is_live);
+    let retired_golden = retired_by(&rows, is_active_golden_payload);
+    let kept: Vec<&TaskBlockPart> = parts
         .iter()
-        .filter(|(_, row)| is_live(row))
-        .map(|(id, _)| id.as_str())
+        .filter(|p| {
+            let gone = if p.is_golden {
+                &retired_golden
+            } else {
+                &retired
+            };
+            !p.ids.iter().any(|id| gone.contains(id))
+        })
         .collect();
-    let retired: HashSet<&str> = rows
-        .iter()
-        .map(|(id, _)| id.as_str())
-        .filter(|id| !live.contains(id))
-        .collect();
-    if retired.is_empty() {
+    if kept.len() == parts.len() {
         return payload.clone();
     }
-    let kept: Vec<&str> = block
-        .lines()
-        .filter(|line| task_block_entry_id(line).is_none_or(|id| !retired.contains(id)))
-        .collect();
+    let mut lines: Vec<&str> = Vec::new();
+    for (i, part) in kept.iter().enumerate() {
+        // The renderer writes the bridges header only above bridges, so a
+        // header whose bridges were all dropped goes too.
+        let bridges_left = kept
+            .get(i + 1)
+            .is_some_and(|next| next.section == TaskBlockSection::Bridges && next.is_entry);
+        if part.is_header && part.section == TaskBlockSection::Bridges && !bridges_left {
+            continue;
+        }
+        lines.extend(part.lines.iter().copied());
+    }
     let mut current = payload.clone();
     task_obj_mut(&mut current).insert(
         "subagent_prompt_injection".to_string(),
-        json!(kept.join("\n")),
+        json!(lines.join("\n")),
     );
     current
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskBlockSection {
+    /// Header, goal, taxonomy and instruction text: never pruned.
+    Other,
+    /// Golden rules and retrieved memories, one entry per memory.
+    Entries,
+    /// Cross-Domain Bridges, one `seed -> via -> target` entry per bridge.
+    Bridges,
+}
+
+/// One piece of a rendered task block: a section header, one entry with any
+/// lines that continue it, or a line of other text.
+struct TaskBlockPart<'a> {
+    section: TaskBlockSection,
+    is_header: bool,
+    is_entry: bool,
+    /// A Golden Rule entry (`  - [GOLDEN <type>] ...`).
+    is_golden: bool,
+    /// The memory ids an entry names; empty for headers and other text.
+    ids: Vec<&'a str>,
+    lines: Vec<&'a str>,
+}
+
+/// Split a task block, as [`render_subagent_prompt`] writes it, into parts.
+/// Entries are read only inside the memory-entries and bridges sections, so a
+/// goal or taxonomy line that looks like an entry is never taken for one. An
+/// entry starts at a `  - ` line and runs until the next entry or section
+/// line (`###...` or a `- ` line at column 0).
+fn task_block_parts(block: &str) -> Vec<TaskBlockPart<'_>> {
+    let mut parts: Vec<TaskBlockPart> = Vec::new();
+    let mut section = TaskBlockSection::Other;
+    for line in block.lines() {
+        let header = if line == TASK_BLOCK_ENTRIES_HEADER {
+            Some(TaskBlockSection::Entries)
+        } else if line == TASK_BLOCK_BRIDGES_HEADER {
+            Some(TaskBlockSection::Bridges)
+        } else if line.starts_with("###") || line.starts_with("- ") {
+            Some(TaskBlockSection::Other)
+        } else {
+            None
+        };
+        if let Some(next) = header {
+            section = next;
+            parts.push(TaskBlockPart {
+                section,
+                is_header: true,
+                is_entry: false,
+                is_golden: false,
+                ids: Vec::new(),
+                lines: vec![line],
+            });
+            continue;
+        }
+        if section != TaskBlockSection::Other {
+            if let Some(entry) = line.strip_prefix("  - ") {
+                let ids = if section == TaskBlockSection::Entries {
+                    task_block_entry_id(line).into_iter().collect()
+                } else {
+                    entry
+                        .split(" -> ")
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .collect()
+                };
+                parts.push(TaskBlockPart {
+                    section,
+                    is_header: false,
+                    is_entry: true,
+                    is_golden: section == TaskBlockSection::Entries
+                        && entry.starts_with("[GOLDEN "),
+                    ids,
+                    lines: vec![line],
+                });
+                continue;
+            }
+            if let Some(entry) = parts.last_mut().filter(|p| p.is_entry) {
+                entry.lines.push(line);
+                continue;
+            }
+        }
+        parts.push(TaskBlockPart {
+            section,
+            is_header: false,
+            is_entry: false,
+            is_golden: false,
+            ids: Vec::new(),
+            lines: vec![line],
+        });
+    }
+    parts
 }
 
 /// The memory id of one entry line of a task block, as
@@ -835,10 +966,16 @@ fn render_subagent_prompt(
     format!(
         "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
          - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
-         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}{}\n\
+         {}\n{}{}{}\n\
          - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `mode`: `hybrid` (default) + `include_references`: true / `neurostrata_sparql_query`).\n\
          - Formal Verification Reflex: When adding or modifying a state machine, gate, sovereignty/ACL check, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to extract the pure decision into `src/formal_kernel.rs`, prove its theorems in `proofs/NeuroStrata/*.lean` (zero `sorry`/`axiom`), and extend `tests/lean_parity_test.rs`.",
-        namespace, task_id, goal, hits_block, bridges_prompt, taxonomy_prompt
+        namespace,
+        task_id,
+        goal,
+        TASK_BLOCK_ENTRIES_HEADER,
+        hits_block,
+        bridges_prompt,
+        taxonomy_prompt
     )
 }
 
@@ -1223,7 +1360,7 @@ pub async fn build_task_graph_context(
                             .map(|s| format!("  - {s}"))
                     })
                     .collect();
-                format!("\n### Cross-Domain Bridges\n{}", lines.join("\n"))
+                format!("\n{TASK_BLOCK_BRIDGES_HEADER}\n{}", lines.join("\n"))
             }
         })
         .unwrap_or_default();
@@ -6036,9 +6173,11 @@ mod tests {
         }
     }
 
-    /// The session-start task block drops entries whose rule was retired after
-    /// the claim, keeps live and unknown entries, and stays whole when the rows
-    /// cannot be read.
+    /// The session-start task block drops whole entries whose rule was retired
+    /// after the claim (with the lines that continue them) and bridges whose
+    /// path runs through one; it keeps live and unknown entries and leaves the
+    /// goal and taxonomy text alone even when a line there looks like an entry.
+    /// It stays whole when the rows cannot be read.
     #[tokio::test]
     async fn task_block_drops_retired_entries_and_keeps_it_whole_on_a_read_error() {
         use crate::guard::testkit::MockStore;
@@ -6054,24 +6193,49 @@ mod tests {
             location_lines: String::new(),
             metadata,
         };
-        store
-            .upsert("probe", "rule-live", vec![0.1; 4], rule(json!({})))
-            .await
-            .unwrap();
-        store
-            .upsert(
-                "probe",
+        for (id, metadata) in [
+            ("rule-live", json!({})),
+            ("fact-live", json!({})),
+            (
                 "rule-gone",
-                vec![0.1; 4],
-                rule(json!({ "superseded_by": "rule-live", "valid_to": 1 })),
-            )
+                json!({ "superseded_by": "rule-live", "valid_to": 1 }),
+            ),
+            ("fact-gone", json!({ "valid_to": 1 })),
+            ("fact-ending", json!({ "valid_to": 4_000_000_000i64 })),
+        ] {
+            store
+                .upsert("probe", id, vec![0.1; 4], rule(metadata))
+                .await
+                .unwrap();
+        }
+        // A guard rule deprecated after the claim no longer qualifies as a
+        // Golden Rule, though nothing retired it.
+        let mut deprecated = rule(json!({ "status": "deprecated" }));
+        deprecated.memory_type = "guard_rule".to_string();
+        store
+            .upsert("global", "guard-deprecated", vec![0.1; 4], deprecated)
             .await
             .unwrap();
         let block = [
-            "Task: probe-t1",
+            "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)",
+            "- Namespace: `probe` | Task ID: `probe-t1` | Goal: Fix the deploy",
+            "  - [rule] `rule-gone`: a goal line that looks like an entry",
+            TASK_BLOCK_ENTRIES_HEADER,
             "  - [GOLDEN rule] `rule-live`: Run the tests.",
             "  - [GOLDEN rule] `rule-gone`: Use the old script.",
+            "    and this line continues the retired rule.",
+            "  - [GOLDEN guard_rule] `guard-deprecated`: A deprecated guard.",
             "  - [fact] `fact-elsewhere` (src/a.rs): Lives in another namespace.",
+            "  - [fact] `fact-gone` (memory): Expired fact.",
+            "continued expired fact",
+            "  - [fact] `fact-ending` (memory): Expires later, still live.",
+            TASK_BLOCK_BRIDGES_HEADER,
+            "  - fact-live -> src/a.rs -> rule-live",
+            "  - fact-live -> src/a.rs -> rule-gone",
+            "  - fact-gone -> src/b.rs -> rule-live",
+            "### Project Thesis & Domain Expertise",
+            "  - [concept:a | b] `rule-gone` (Label): a concept line",
+            "- Mandatory Graph-First Lookup Rule: ...",
         ]
         .join("\n");
         let mut task = rule(json!({ "task": { "status": "in_progress" } }));
@@ -6079,16 +6243,48 @@ mod tests {
         task.metadata["task"]["subagent_prompt_injection"] = json!(block);
 
         let current = task_payload_without_retired_entries(&store, "probe", &task).await;
-        let kept = current.metadata["task"]["subagent_prompt_injection"]
-            .as_str()
-            .unwrap();
-        assert!(!kept.contains("rule-gone"), "{kept}");
-        assert!(
-            kept.contains("rule-live") && kept.contains("fact-elsewhere"),
-            "{kept}"
+        let expected = [
+            "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)",
+            "- Namespace: `probe` | Task ID: `probe-t1` | Goal: Fix the deploy",
+            "  - [rule] `rule-gone`: a goal line that looks like an entry",
+            TASK_BLOCK_ENTRIES_HEADER,
+            "  - [GOLDEN rule] `rule-live`: Run the tests.",
+            "  - [fact] `fact-elsewhere` (src/a.rs): Lives in another namespace.",
+            "  - [fact] `fact-ending` (memory): Expires later, still live.",
+            TASK_BLOCK_BRIDGES_HEADER,
+            "  - fact-live -> src/a.rs -> rule-live",
+            "### Project Thesis & Domain Expertise",
+            "  - [concept:a | b] `rule-gone` (Label): a concept line",
+            "- Mandatory Graph-First Lookup Rule: ...",
+        ]
+        .join("\n");
+        assert_eq!(
+            current.metadata["task"]["subagent_prompt_injection"],
+            json!(expected)
         );
-        assert!(kept.contains("Task: probe-t1"), "{kept}");
 
+        // When every bridge is dropped, the bridges header goes with them.
+        let only_retired_bridges = [
+            TASK_BLOCK_ENTRIES_HEADER,
+            "  - [GOLDEN rule] `rule-live`: Run the tests.",
+            TASK_BLOCK_BRIDGES_HEADER,
+            "  - fact-live -> src/a.rs -> rule-gone",
+            "- Mandatory Graph-First Lookup Rule: ...",
+        ]
+        .join("\n");
+        task.metadata["task"]["subagent_prompt_injection"] = json!(only_retired_bridges);
+        let current = task_payload_without_retired_entries(&store, "probe", &task).await;
+        assert_eq!(
+            current.metadata["task"]["subagent_prompt_injection"],
+            json!([
+                TASK_BLOCK_ENTRIES_HEADER,
+                "  - [GOLDEN rule] `rule-live`: Run the tests.",
+                "- Mandatory Graph-First Lookup Rule: ...",
+            ]
+            .join("\n"))
+        );
+
+        task.metadata["task"]["subagent_prompt_injection"] = json!(block);
         mock.set_get_fails(true);
         let unread = task_payload_without_retired_entries(&store, "probe", &task).await;
         assert_eq!(

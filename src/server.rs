@@ -26416,10 +26416,19 @@ mod context_plan_tests {
 
         // An in-progress task whose cached block was built while the rule was live,
         // the way task_claim stamps it.
+        let proj_root = tmp_dir.join("repo");
+        // A .git marker: a markerless folder under the home folder gets no session file.
+        std::fs::create_dir_all(proj_root.join(".git")).unwrap();
+        let proj_root_str = proj_root.to_string_lossy().to_string();
+        // get_snapshot binds only a task claimed from this worktree.
         let mut task = payload(
             "Fix the deploy",
             "task",
-            serde_json::json!({ "task": { "status": "in_progress", "session_id": "ses_snap" } }),
+            serde_json::json!({ "task": {
+                "status": "in_progress",
+                "session_id": "ses_snap",
+                "worktree": proj_root_str,
+            } }),
         );
         let (_hits, cached) =
             crate::task::build_task_graph_context(&store, "probe", "probe-t1", &[0.1f32; 4], &task)
@@ -26488,13 +26497,10 @@ mod context_plan_tests {
             .await
             .unwrap();
 
-        let proj_root = tmp_dir.join("repo");
-        // A .git marker: a markerless folder under the home folder gets no session file.
-        std::fs::create_dir_all(proj_root.join(".git")).unwrap();
         handle_get_snapshot(
             serde_json::json!({
                 "namespace": "probe",
-                "project_root": proj_root.to_string_lossy(),
+                "project_root": proj_root_str,
             }),
             store,
         )
