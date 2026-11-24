@@ -645,6 +645,92 @@ pub fn format_golden_rules_section(golden_rules: &[SearchResult]) -> String {
     out
 }
 
+/// The active task's payload with the entries of its cached
+/// `subagent_prompt_injection` left out whose memory was retired since the
+/// claim (superseded, expired or archived). The block is written once at claim
+/// time; `get_snapshot` hands it to every session start through
+/// `active_session.json`, so it must not quote a retired rule there. Only one
+/// keyed read by id: rebuilding the block with `build_task_graph_context` runs
+/// a hybrid search and lists the namespace, which took seconds on a large
+/// store, longer than session start waits. An entry whose row is not found is
+/// kept (it may live in a namespace this read does not ask), and if the rows
+/// cannot be read the cached block is kept whole.
+pub(crate) async fn task_payload_without_retired_entries(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    payload: &MemoryPayload,
+) -> MemoryPayload {
+    let Some(block) = payload
+        .metadata
+        .get("task")
+        .and_then(|t| t.get("subagent_prompt_injection"))
+        .and_then(Value::as_str)
+    else {
+        return payload.clone();
+    };
+    let mut ids: Vec<String> = block
+        .lines()
+        .filter_map(task_block_entry_id)
+        .map(String::from)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        return payload.clone();
+    }
+    // Golden rules come from `global` as well as the task's namespace.
+    let namespaces: Vec<&str> = if namespace == "global" {
+        vec![namespace]
+    } else {
+        vec![namespace, "global"]
+    };
+    let Ok(rows) = store.get_many(&namespaces, &ids).await else {
+        return payload.clone();
+    };
+    let now = chrono::Utc::now().timestamp();
+    let is_live = |row: &MemoryPayload| {
+        row.metadata.get("superseded_by").is_none_or(Value::is_null)
+            && !crate::store::ladybug::is_retired_at(&row.metadata, now)
+            && !crate::handlers::archive_memory::is_archived(row)
+    };
+    // An id is dropped only when every row found for it is retired; the same
+    // id can exist once in the task's namespace and once in `global`.
+    let live: HashSet<&str> = rows
+        .iter()
+        .filter(|(_, row)| is_live(row))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let retired: HashSet<&str> = rows
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .filter(|id| !live.contains(id))
+        .collect();
+    if retired.is_empty() {
+        return payload.clone();
+    }
+    let kept: Vec<&str> = block
+        .lines()
+        .filter(|line| task_block_entry_id(line).is_none_or(|id| !retired.contains(id)))
+        .collect();
+    let mut current = payload.clone();
+    task_obj_mut(&mut current).insert(
+        "subagent_prompt_injection".to_string(),
+        json!(kept.join("\n")),
+    );
+    current
+}
+
+/// The memory id of one entry line of a task block, as
+/// [`build_task_graph_context`] renders golden rules (`  - [GOLDEN rule] `id`: ...`)
+/// and retrieved memories (`  - [fact] `id` (location): ...`); `None` for any
+/// other line.
+fn task_block_entry_id(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("  - [")?;
+    let (_, rest) = rest.split_once("] `")?;
+    let (id, _) = rest.split_once('`')?;
+    (!id.is_empty()).then_some(id)
+}
+
 /// Best-effort persistence of `.NeuroStrata/active_session.json` so harness
 /// plugins can inject Golden Rules and active task context on session startup
 /// (`sessionContextHandler`) even before the first tool call.
@@ -5948,6 +6034,68 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).unwrap();
         }
+    }
+
+    /// The session-start task block drops entries whose rule was retired after
+    /// the claim, keeps live and unknown entries, and stays whole when the rows
+    /// cannot be read.
+    #[tokio::test]
+    async fn task_block_drops_retired_entries_and_keeps_it_whole_on_a_read_error() {
+        use crate::guard::testkit::MockStore;
+
+        let mock = Arc::new(MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let rule = |metadata: Value| MemoryPayload {
+            content: "rule".to_string(),
+            user_id: "kenton".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        };
+        store
+            .upsert("probe", "rule-live", vec![0.1; 4], rule(json!({})))
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                "rule-gone",
+                vec![0.1; 4],
+                rule(json!({ "superseded_by": "rule-live", "valid_to": 1 })),
+            )
+            .await
+            .unwrap();
+        let block = [
+            "Task: probe-t1",
+            "  - [GOLDEN rule] `rule-live`: Run the tests.",
+            "  - [GOLDEN rule] `rule-gone`: Use the old script.",
+            "  - [fact] `fact-elsewhere` (src/a.rs): Lives in another namespace.",
+        ]
+        .join("\n");
+        let mut task = rule(json!({ "task": { "status": "in_progress" } }));
+        task.memory_type = "task".to_string();
+        task.metadata["task"]["subagent_prompt_injection"] = json!(block);
+
+        let current = task_payload_without_retired_entries(&store, "probe", &task).await;
+        let kept = current.metadata["task"]["subagent_prompt_injection"]
+            .as_str()
+            .unwrap();
+        assert!(!kept.contains("rule-gone"), "{kept}");
+        assert!(
+            kept.contains("rule-live") && kept.contains("fact-elsewhere"),
+            "{kept}"
+        );
+        assert!(kept.contains("Task: probe-t1"), "{kept}");
+
+        mock.set_get_fails(true);
+        let unread = task_payload_without_retired_entries(&store, "probe", &task).await;
+        assert_eq!(
+            unread.metadata["task"]["subagent_prompt_injection"],
+            json!(block),
+            "a read error keeps the cached block whole"
+        );
     }
 
     // hook hash marker tests (Task 1)
