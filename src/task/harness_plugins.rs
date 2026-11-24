@@ -1156,8 +1156,17 @@ const COPILOT_HOOKS_REL: &str = ".github/hooks/neurostrata.json";
 
 /// The Copilot CLI hook events the installer wires (camelCase, hooks file
 /// version 1). sessionStart lets the runner inject the session file;
-/// sessionEnd and preCompact let it write the handoff note.
-const COPILOT_HOOK_EVENTS: [&str; 4] = ["sessionStart", "preToolUse", "sessionEnd", "preCompact"];
+/// sessionEnd and preCompact let it write the handoff note. postToolUse lets
+/// it deliver the session-start text a slow start missed and left-out rules:
+/// its `additionalContext` is appended to the tool result, while a preToolUse
+/// reply carries no text on an allowed call.
+const COPILOT_HOOK_EVENTS: [&str; 5] = [
+    "sessionStart",
+    "preToolUse",
+    "postToolUse",
+    "sessionEnd",
+    "preCompact",
+];
 
 /// The environment variable that tells the runner which Copilot event it
 /// handles: Copilot's hook input does not name the event.
@@ -6139,7 +6148,10 @@ mod tests {
                 "env": { "NEUROSTRATA_HOOK_EVENT": "sessionEnd" }
             }])
         );
-        assert_eq!(doc["hooks"]["postToolUse"], json!([user_entry]));
+        assert_eq!(
+            doc["hooks"]["postToolUse"],
+            json!([user_entry.clone(), ours("postToolUse")])
+        );
         assert_eq!(doc["other"], json!(true));
 
         for left_alone in ["not json", r#"{"version": 2, "hooks": {}}"#] {
