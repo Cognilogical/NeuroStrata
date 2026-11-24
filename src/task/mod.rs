@@ -646,9 +646,10 @@ pub fn format_golden_rules_section(golden_rules: &[SearchResult]) -> String {
 }
 
 /// The in_progress task the session rooted at `root` works on: one claimed in
-/// this worktree, else one claimed with no worktree stamped (outside git). A
-/// task claimed in another worktree is never named, or its Breath note would
-/// land in this session.
+/// this worktree, else, when `root` is outside git too, one claimed with no
+/// worktree stamped (a claim stamps none outside git). A task claimed in
+/// another worktree is never named, or its Breath note would land in this
+/// session.
 pub fn active_task_for_root<'a>(
     rows: &'a [SearchResult],
     root: &str,
@@ -657,8 +658,14 @@ pub fn active_task_for_root<'a>(
     rows.iter()
         .find(|r| is_active(r) && gate::task_in_worktree(r, root))
         .or_else(|| {
-            rows.iter()
-                .find(|r| is_active(r) && gate::task_worktree(r).is_none())
+            let unstamped = rows
+                .iter()
+                .find(|r| is_active(r) && gate::task_worktree(r).is_none())?;
+            // The capture the claim stamps with, so both sides agree.
+            let caller_outside_git = gate::GateScope::capture(std::path::Path::new(root))
+                .worktree
+                .is_none();
+            caller_outside_git.then_some(unstamped)
         })
 }
 
@@ -11779,11 +11786,25 @@ exit 0
         ];
         assert_eq!(pick(&rows, r"C:\repo\mine").as_deref(), Some("t-mine"));
         // A task claimed in another worktree is never named; an unstamped
-        // claim (made outside git) still is.
+        // claim (made outside git) is, for a caller outside git too.
+        let outside_git = tempfile::tempdir().unwrap();
+        let outside_git = outside_git.path().to_string_lossy().into_owned();
         let rows = [other.clone(), unstamped.clone()];
-        assert_eq!(pick(&rows, r"C:\repo\mine").as_deref(), Some("t-unstamped"));
+        assert_eq!(pick(&rows, &outside_git).as_deref(), Some("t-unstamped"));
         let rows = [other, open_mine];
-        assert_eq!(pick(&rows, r"C:\repo\mine"), None);
+        assert_eq!(pick(&rows, &outside_git), None);
+        // A caller inside a git worktree never gets an unstamped claim: it
+        // may come from any folder of the namespace.
+        let repo = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(repo.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let rows = [unstamped];
+        assert_eq!(pick(&rows, &repo.path().to_string_lossy()), None);
     }
 
     #[test]
