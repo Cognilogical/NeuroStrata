@@ -1204,18 +1204,24 @@ const CONTEXT_MEMORY_LISTS: [&str; 4] = [
     "structural_anchors",
 ];
 
-/// What the trimmed context says in its `note` field: how to get more.
-const TRIMMED_CONTEXT_NOTE: &str = "rows show a snippet; neurostrata_get_memory(id) returns one memory in full; include_metadata: true returns every row's details";
+/// What the trimmed context says in its `note` field: how to get more, and
+/// only routes that work. `neurostrata_get_memory` needs the namespace, and a
+/// golden rule can live in `global`. A repeat claim by the session that holds
+/// the task returns no context at all, so `include_metadata` only helps on
+/// create or on the claim that takes the task.
+const TRIMMED_CONTEXT_NOTE: &str = "rows are trimmed to a snippet. One memory's whole text: neurostrata_get_memory with id and namespace (this task's namespace; a golden rule not found there is in global). Every row's details: pass include_metadata: true to neurostrata_task_create, or to the neurostrata_task_claim call that takes the task (a repeat claim by the same session returns no context)";
 
 /// The context `task_claim` and `task_create` answer with by default: the
 /// same keys, each memory row cut to id, type, location and snippet (plus a
-/// deprecation or not-definition banner when the row has one, and `symbol`
-/// when its metadata names one: a code row's symbol, or the `refs[].symbol`
-/// names of a rule or fact), and a `note` saying how to get
-/// more. The full rows carry every memory's metadata (calls
-/// lists, edge sources, source identity) and made one claim reply 61,337
-/// characters. `include_metadata: true` returns the full context. The prompt block
-/// returned as `subagent_prompt_injection` is the same either way.
+/// deprecation or not-definition banner when the row has one), and a `note`
+/// saying how to get more. The symbol names agents were seen using keep the
+/// field names and shapes the memory's metadata stores them under: a code
+/// row's `symbol` (a string) and a rule or fact's `refs` entries that name a
+/// symbol (`{file, symbol}` objects). The full rows carry every memory's
+/// metadata (calls lists, edge sources, source identity) and made one claim
+/// reply 61,337 characters. `include_metadata: true` returns the full
+/// context. The prompt block returned as `subagent_prompt_injection` is the
+/// same either way.
 fn trimmed_graph_context(context: &Value) -> Value {
     fn slim(row: &Value) -> Value {
         let mut out = serde_json::Map::new();
@@ -1231,23 +1237,27 @@ fn trimmed_graph_context(context: &Value) -> Value {
                 out.insert(key.to_string(), v.clone());
             }
         }
-        if let Some(symbol) = row.get("metadata").and_then(metadata_symbol) {
-            out.insert("symbol".to_string(), symbol);
+        let metadata = row.get("metadata");
+        if let Some(symbol) = metadata
+            .and_then(|m| m.get("symbol"))
+            .filter(|v| v.is_string())
+        {
+            out.insert("symbol".to_string(), symbol.clone());
+        }
+        let refs: Vec<Value> = metadata
+            .and_then(|m| m.get("refs"))
+            .and_then(Value::as_array)
+            .map(|refs| {
+                refs.iter()
+                    .filter(|r| r.get("symbol").is_some_and(Value::is_string))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !refs.is_empty() {
+            out.insert("refs".to_string(), Value::Array(refs));
         }
         Value::Object(out)
-    }
-    // The one name agents were seen taking from the metadata.
-    fn metadata_symbol(metadata: &Value) -> Option<Value> {
-        if let Some(symbol) = metadata.get("symbol").and_then(Value::as_str) {
-            return Some(json!(symbol));
-        }
-        let names: Vec<&str> = metadata
-            .get("refs")?
-            .as_array()?
-            .iter()
-            .filter_map(|r| r.get("symbol").and_then(Value::as_str))
-            .collect();
-        (!names.is_empty()).then(|| json!(names))
     }
     let mut out = context.clone();
     if let Some(obj) = out.as_object_mut() {
@@ -1264,7 +1274,9 @@ fn trimmed_graph_context(context: &Value) -> Value {
 
 /// Full rows only when the caller passes `include_metadata: true`.
 fn wants_metadata(args: &Value) -> bool {
-    args.get("include_metadata").and_then(Value::as_bool).unwrap_or(false)
+    args.get("include_metadata")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Synthesise cross-domain conceptual bridges from retrieved seed memories.
@@ -7351,7 +7363,11 @@ exit 0
         code["metadata"]["symbol"] = json!("parse_claim");
         let mut rule = item.clone();
         rule["memory_type"] = json!("rule");
-        rule["metadata"]["refs"] = json!([{ "file": "src/a.rs", "symbol": "a" }, { "file": "src/b.rs" }]);
+        rule["metadata"]["refs"] = json!([
+            { "file": "src/a.rs", "symbol": "a" },
+            { "file": "src/b.rs" },
+            { "file": "src/c.rs", "symbol": "a" }
+        ]);
         let full = json!({
             "query": "q",
             "golden_rules": [item.clone()],
@@ -7377,9 +7393,14 @@ exit 0
         expected.sort();
         assert_eq!(keys(&trimmed), expected, "same keys plus the note");
         assert!(trimmed.get("compact").is_none(), "no compact key");
-        let note = trimmed["note"].as_str().expect("a note says how to get more");
+        let note = trimmed["note"]
+            .as_str()
+            .expect("a note says how to get more");
         assert!(
-            note.contains("neurostrata_get_memory(id)") && note.contains("include_metadata: true"),
+            note.contains("neurostrata_get_memory with id and namespace")
+                && note.contains("global")
+                && note.contains("include_metadata: true")
+                && note.contains("repeat claim"),
             "{note}"
         );
         for key in [
@@ -7403,8 +7424,18 @@ exit 0
             trimmed["items"][1]["deprecation_banner"],
             json!("DEPRECATED")
         );
-        assert_eq!(trimmed["items"][2]["symbol"], json!("parse_claim"), "a code row's symbol");
-        assert_eq!(trimmed["items"][3]["symbol"], json!(["a"]), "a rule's refs[].symbol");
+        // The metadata's own names and shapes: a code row's `symbol` string,
+        // a rule's `refs` entries that name a symbol.
+        assert_eq!(trimmed["items"][2]["symbol"], json!("parse_claim"));
+        assert!(trimmed["items"][2].get("refs").is_none());
+        assert_eq!(
+            trimmed["items"][3]["refs"],
+            json!([
+                { "file": "src/a.rs", "symbol": "a" },
+                { "file": "src/c.rs", "symbol": "a" }
+            ])
+        );
+        assert!(trimmed["items"][3].get("symbol").is_none());
         assert!(trimmed["items"][3].get("metadata").is_none());
         assert!(
             serde_json::to_string(&trimmed).unwrap().len() * 5
@@ -7518,6 +7549,11 @@ exit 0
             }
         };
         let trimmed = claim(None, "s-compact").await;
+        // What the note says: a repeat claim by the holding session returns
+        // no context, include_metadata or not, so the note does not offer it.
+        let repeat = claim(Some(true), "s-compact").await;
+        assert_eq!(repeat["note"], json!("already claimed by this session"));
+        assert!(repeat.get("auto_retrieved_context").is_none(), "{repeat}");
         release().await;
         let full = claim(Some(true), "s-full").await;
 
@@ -7575,13 +7611,6 @@ exit 0
         );
 
         let size = |v: &Value| serde_json::to_string(v).unwrap().len();
-        eprintln!(
-            "MEASURED claim reply bytes: trimmed={} include_metadata={}; create reply bytes: trimmed={} include_metadata={}",
-            size(&trimmed),
-            size(&full),
-            size(&created),
-            size(&created_full)
-        );
         assert!(
             size(&trimmed) * 2 < size(&full),
             "the trimmed reply is well under half the full one"
