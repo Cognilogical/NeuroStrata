@@ -198,6 +198,9 @@ struct Changes {
 /// - When that lists no commit (everything pushed is already on some remote,
 ///   say a branch pushed under a second name), fall back to the full history
 ///   of `<local>`: an earlier split must be gated even if the tip is unrelated.
+///
+/// Every `git log` passes `--no-show-signature`: with the user's
+/// `log.showSignature` on, git prints signature checks into the path list.
 fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Changes, String> {
     let local = r.local_sha.as_str();
     let remote_known = !is_zero_sha(&r.remote_sha)
@@ -212,6 +215,7 @@ fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Chan
             repo,
             &[
                 "log",
+                "--no-show-signature",
                 "-m",
                 "--format=",
                 "--name-only",
@@ -229,6 +233,7 @@ fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Chan
     let args: &[&str] = if commits.trim().is_empty() {
         &[
             "log",
+            "--no-show-signature",
             "-m",
             "--format=",
             "--name-only",
@@ -239,6 +244,7 @@ fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Chan
     } else {
         &[
             "log",
+            "--no-show-signature",
             "-m",
             "--format=",
             "--name-only",
@@ -854,6 +860,45 @@ mod tests {
             namespaces_for_push(&dir, &deletion).unwrap(),
             set(&["marked-proj", "top-ns"])
         );
+    }
+
+    /// With `log.showSignature` on, git prints signature checks into `git log`
+    /// output, where they would read as changed paths. Every `git log` the
+    /// gate runs turns that off, on all three routes of `changed_paths`.
+    #[test]
+    fn every_path_listing_turns_off_signature_output() {
+        struct LogArgsGit(std::cell::RefCell<Vec<Vec<String>>>);
+        impl GitRunner for LogArgsGit {
+            fn git(&self, dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+                if args.first() == Some(&"log") {
+                    self.0
+                        .borrow_mut()
+                        .push(args.iter().map(|a| a.to_string()).collect());
+                }
+                SystemGit.git(dir, args)
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        let base = git(&dir, &["rev-parse", "HEAD"]);
+        write(&dir, "sub/a.rs", "a");
+        let tip = commit_all(&dir, "change");
+        let runner = LogArgsGit(Default::default());
+        // A new branch with commits on no remote.
+        namespaces_for_push_with(&runner, &dir, &new_branch(&tip, "feature")).unwrap();
+        // An update of a remote tip known locally.
+        let update = format!("refs/heads/main {tip} refs/heads/main {base}
+");
+        namespaces_for_push_with(&runner, &dir, &parse_pre_push_stdin(&update).unwrap())
+            .unwrap();
+        // A new branch whose commits are all on a remote-tracking ref.
+        git(&dir, &["update-ref", "refs/remotes/origin/main", &tip]);
+        namespaces_for_push_with(&runner, &dir, &new_branch(&tip, "other")).unwrap();
+        let logs = runner.0.into_inner();
+        assert_eq!(logs.len(), 3, "{logs:?}");
+        for args in logs {
+            assert!(args.iter().any(|a| a == "--no-show-signature"), "{args:?}");
+        }
     }
 
     #[test]
