@@ -51,6 +51,11 @@ import plugin, * as mod from "./dist/index.js";
 // the harness config of <root> is read first.
 const RUNNER_DIR = dirname(fileURLToPath(import.meta.url));
 const HARNESS = basename(RUNNER_DIR);
+// Session events, by the lowercase name every harness spelling folds to
+// (Copilot names its event only in NEUROSTRATA_HOOK_EVENT, camelCase).
+const SESSION_EVENTS = { sessionstart: "SessionStart", sessionend: "SessionEnd", precompact: "PreCompact" };
+// The session event being handled, so the catch replies in its shape.
+let sessionEvent;
 
 async function main() {
   // Redirect all diagnostic logging to stderr so stdout carries only the
@@ -92,6 +97,25 @@ async function main() {
       : typeof event.cwd === "string" && event.cwd
         ? event.cwd
         : process.cwd();
+  const eventName = [
+    event.hook_event_name,
+    event.hookEventName,
+    event.eventName,
+    process.env.NEUROSTRATA_HOOK_EVENT
+  ].find((name) => typeof name === "string" && name);
+  sessionEvent = eventName ? SESSION_EVENTS[eventName.toLowerCase()] : undefined;
+  // A plugin build without a handler for this session event would answer
+  // with its PreToolUse-shaped default, which Codex rejects on SessionStart
+  // and PreCompact. Answer `{}` (valid for every harness) instead. Claude's
+  // SessionStart keeps going to the plugin, as it always has.
+  const handled =
+    sessionEvent === "SessionStart"
+      ? HARNESS === "claude" || typeof mod.handleSessionStartEvent === "function"
+      : typeof mod.writeSessionHandoff === "function";
+  if (sessionEvent && !handled) {
+    await writeStdout("{}");
+    return;
+  }
   // OpenCode loads the first parseable .NeuroStrata shared config and only
   // then falls back to the historical .opencode registration. `namespace
   // resolve` uses that same precedence; passing the registration as ctx.config
@@ -140,6 +164,18 @@ async function main() {
 main().catch((err) => {
   const reason = String(err);
   process.stderr.write(reason + "\n");
+  // A session event takes no permission decision; `{}` lets the session go
+  // on. The reason stays on stderr.
+  if (sessionEvent) {
+    process.stdout.write("{}");
+    return;
+  }
+  // Copilot CLI (its hooks file sets NEUROSTRATA_HOOK_EVENT) reads a
+  // top-level decision on preToolUse and ignores hookSpecificOutput.
+  if (process.env.NEUROSTRATA_HOOK_EVENT) {
+    process.stdout.write(JSON.stringify({ permissionDecision: "deny", permissionDecisionReason: reason }));
+    return;
+  }
   // PowerShell swallows `process.exit(2)`: the host sees a zero exit code
   // and runs the tool anyway. Emit a deny decision so a failed hook still
   // fails closed on Windows. No `continue` field: Codex rejects it on
@@ -5639,6 +5675,26 @@ mod tests {
             vec![moved, ours],
             "foreign Stop hook kept as written; ours added beside it"
         );
+    }
+
+    /// The installed runner works with a plugin build that has no session
+    /// handlers (merged in either order): it answers `{}` on a session event
+    /// the bundle cannot handle, since that bundle's default reply carries a
+    /// permission decision Codex's SessionStart and PreCompact output schemas
+    /// reject (`additionalProperties: false`, Codex 0.170). A failed session
+    /// event also answers `{}`, and Copilot gets its top-level deny shape.
+    #[test]
+    fn runner_answers_session_events_an_older_plugin_cannot_handle() {
+        for needle in [
+            "typeof mod.handleSessionStartEvent === \"function\"",
+            "typeof mod.writeSessionHandoff === \"function\"",
+            "process.env.NEUROSTRATA_HOOK_EVENT",
+            "if (sessionEvent && !handled) {\n    await writeStdout(\"{}\");",
+            "if (sessionEvent) {\n    process.stdout.write(\"{}\");",
+            "JSON.stringify({ permissionDecision: \"deny\", permissionDecisionReason: reason })",
+        ] {
+            assert!(CLI_HOOK_RUNNER_MJS.contains(needle), "{needle}");
+        }
     }
 
     // ---- issue #382 regressions ----
