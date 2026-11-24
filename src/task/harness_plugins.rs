@@ -494,8 +494,12 @@ fn repair_installer_hook_command(
 const CLAUDE_FILE_TOOLS_MATCHER: &str = "Read|Write|Edit|MultiEdit|Bash|Task";
 
 /// The NeuroStrata MCP tools whose PreToolUse runs the runner so it can pass
-/// the session's project folder as `worktree`.
-const CLAUDE_SESSION_SCOPE_MATCHER: &str = "mcp__.*__neurostrata_(task_claim|get_snapshot)";
+/// the session's project folder as `worktree` (and, with a plugin that does,
+/// record the harness's session id on a claim). Claude Code and Codex both
+/// name an MCP tool `mcp__<server>__<tool>` in hook payloads and matchers
+/// (Codex 0.170: `McpHandler::hook_tool_name_for`, which also accepts an
+/// `updatedInput` rewrite of MCP arguments).
+const SESSION_SCOPE_MATCHER: &str = "mcp__.*__neurostrata_(task_claim|get_snapshot)";
 
 /// Adds an entry running `cmd` (with `matcher`, when given) to Claude's
 /// `event` hooks unless an entry whose matcher passes `matcher_counts`
@@ -898,17 +902,36 @@ fn config_toml_wires_runner(
     }
 }
 
-/// The Codex hook events the installer wires, with the PreToolUse matcher.
+/// The Codex hook entries the installer wires: event and matcher.
 /// SessionStart lets the runner inject the session file at startup, resume,
 /// clear, compact and fork; SessionEnd and PreCompact let it write the handoff
-/// note. Codex 0.170 knows all five event names (its hook config schema).
-const CODEX_HOOK_EVENTS: [(&str, Option<&str>); 5] = [
+/// note. PreToolUse has two entries, as for Claude: file tools, and the
+/// NeuroStrata MCP calls a session scopes (task_claim, get_snapshot). Codex
+/// 0.170 knows all five event names (its hook config schema).
+const CODEX_HOOK_EVENTS: [(&str, Option<&str>); 6] = [
     ("SessionStart", None),
     ("PreToolUse", Some(CODEX_PRE_TOOL_USE_MATCHER)),
+    ("PreToolUse", Some(SESSION_SCOPE_MATCHER)),
     ("Stop", None),
     ("SessionEnd", None),
     ("PreCompact", None),
 ];
+
+/// Which of the installer's Codex entries for `event` an entry with
+/// `entry_matcher` stands for: the one with the same matcher, else (a matcher
+/// the user changed) the event's first one, so it is not added again.
+fn codex_entry_slot<'a>(event: &str, entry_matcher: Option<&'a str>) -> Option<&'a str> {
+    let ours: Vec<Option<&str>> = CODEX_HOOK_EVENTS
+        .iter()
+        .filter(|(e, _)| *e == event)
+        .map(|(_, m)| *m)
+        .collect();
+    if ours.contains(&entry_matcher) {
+        entry_matcher
+    } else {
+        ours.first().copied().flatten()
+    }
+}
 
 /// Add the NeuroStrata hooks ([`CODEX_HOOK_EVENTS`]) to `.codex/hooks.json`,
 /// keeping every other entry. A command running this project's canonical
@@ -974,6 +997,13 @@ fn wire_codex_hooks(
         };
         let mut present = false;
         for entry in arr.iter_mut() {
+            // An owned hook counts only for the entry it stands for (see
+            // codex_entry_slot), so each of an event's entries is checked.
+            let entry_matcher = entry
+                .get("matcher")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let this_slot = codex_entry_slot(event, entry_matcher.as_deref()) == matcher;
             let Some(entry_hooks) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
                 continue;
             };
@@ -1006,10 +1036,21 @@ fn wire_codex_hooks(
                 if hook.get("commandWindows").is_none() {
                     hook["commandWindows"] = Value::String(cmd_windows.clone());
                 }
-                present = true;
+                if this_slot {
+                    present = true;
+                }
             }
         }
-        if !present && config_toml_wires_runner(&toml, project_root, abs_runner, event) {
+        // `[hooks]` in config.toml names no matcher this check reads: it
+        // stands for the event's first entry only.
+        let first_slot = CODEX_HOOK_EVENTS
+            .iter()
+            .find(|(e, _)| *e == event)
+            .is_some_and(|(_, m)| *m == matcher);
+        if !present
+            && first_slot
+            && config_toml_wires_runner(&toml, project_root, abs_runner, event)
+        {
             present = true;
         }
         if !present {
@@ -2752,7 +2793,7 @@ fn wire_harness_config(
                                     h_obj,
                                     "PreToolUse",
                                     Some(CLAUDE_FILE_TOOLS_MATCHER),
-                                    |m| m != Some(CLAUDE_SESSION_SCOPE_MATCHER),
+                                    |m| m != Some(SESSION_SCOPE_MATCHER),
                                     &cmd,
                                     &runs,
                                 );
@@ -2762,8 +2803,8 @@ fn wire_harness_config(
                                 ensure_claude_hook(
                                     h_obj,
                                     "PreToolUse",
-                                    Some(CLAUDE_SESSION_SCOPE_MATCHER),
-                                    |m| m == Some(CLAUDE_SESSION_SCOPE_MATCHER),
+                                    Some(SESSION_SCOPE_MATCHER),
+                                    |m| m == Some(SESSION_SCOPE_MATCHER),
                                     &cmd,
                                     &runs,
                                 );
@@ -4195,7 +4236,7 @@ mod tests {
                     LEGACY_CLAUDE_PRE_TOOL_USE_MATCHER.to_string(),
                     "echo user-hook".to_string()
                 ),
-                (CLAUDE_SESSION_SCOPE_MATCHER.to_string(), ours.clone()),
+                (SESSION_SCOPE_MATCHER.to_string(), ours.clone()),
             ],
             "only the installer's own entry is widened; session-scope stays"
         );
@@ -4778,7 +4819,7 @@ mod tests {
             .collect();
         assert_eq!(
             matchers,
-            vec![CLAUDE_PRE_TOOL_USE_MATCHER, CLAUDE_SESSION_SCOPE_MATCHER]
+            vec![CLAUDE_PRE_TOOL_USE_MATCHER, SESSION_SCOPE_MATCHER]
         );
         assert!(entries("Stop").iter().any(runs_ours));
         for event in ["SessionEnd", "PreCompact"] {
@@ -5393,10 +5434,15 @@ mod tests {
 
         let doc = read_codex_hooks(tmp.path());
         let pre = doc["hooks"]["PreToolUse"].as_array().expect("PreToolUse");
-        assert_eq!(pre.len(), 1);
+        assert_eq!(pre.len(), 2);
         assert_eq!(pre[0]["matcher"], json!("apply_patch|Bash"));
+        // NeuroStrata's own MCP calls (Codex names them mcp__<server>__<tool>).
+        assert_eq!(pre[1]["matcher"], json!(SESSION_SCOPE_MATCHER));
         assert_eq!(pre[0]["hooks"][0]["type"], json!("command"));
-        assert_eq!(codex_commands(&doc, "PreToolUse"), vec![expected.clone()]);
+        assert_eq!(
+            codex_commands(&doc, "PreToolUse"),
+            vec![expected.clone(), expected.clone()]
+        );
         assert_eq!(codex_commands(&doc, "Stop"), vec![expected.clone()]);
         // The session-start injection and the handoff write (session file
         // contract) run on these, with no matcher.
@@ -5465,8 +5511,13 @@ mod tests {
         let doc = read_codex_hooks(tmp.path());
         assert_eq!(
             codex_commands(&doc, "PreToolUse"),
-            vec!["echo user-hook".to_string(), stale, expected.clone()],
-            "user hook kept, foreign runner untouched, ours added once"
+            vec![
+                "echo user-hook".to_string(),
+                stale,
+                expected.clone(),
+                expected.clone()
+            ],
+            "user hook kept, foreign runner untouched, ours added once per entry"
         );
         assert_eq!(codex_commands(&doc, "Stop"), vec![expected.clone()]);
         assert_eq!(
@@ -5590,7 +5641,7 @@ mod tests {
         let doc = read_codex_hooks(tmp.path());
         assert_eq!(
             codex_commands(&doc, "PreToolUse"),
-            vec![custom, ours.clone()],
+            vec![custom, ours.clone(), ours.clone()],
             "the user command keeps its suffix"
         );
         assert_eq!(codex_commands(&doc, "Stop"), vec![ours]);
@@ -5667,8 +5718,8 @@ mod tests {
         let doc = read_codex_hooks(tmp.path());
         assert_eq!(
             codex_commands(&doc, "PreToolUse"),
-            vec![user_policy, moved.clone(), ours.clone()],
-            "user hook kept as written; foreign runner kept; ours added once"
+            vec![user_policy, moved.clone(), ours.clone(), ours.clone()],
+            "user hook kept as written; foreign runner kept; ours added once per entry"
         );
         assert_eq!(
             codex_commands(&doc, "Stop"),
@@ -5829,9 +5880,11 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("codex"),
         );
+        // The repaired entry has no matcher, so it stands for the file-tool
+        // entry; the session-scope entry is added beside it.
         assert_eq!(
             codex_commands(&read_codex_hooks(tmp.path()), "PreToolUse"),
-            vec![ours.clone()]
+            vec![ours.clone(), ours.clone()]
         );
 
         // A `[hooks.pre_tool_use]` entry in config.toml covers PreToolUse;
@@ -5851,7 +5904,10 @@ mod tests {
             Some("codex"),
         );
         let doc = read_codex_hooks(tmp.path());
-        assert!(doc["hooks"]["PreToolUse"].as_array().unwrap().is_empty());
+        // The TOML entry stands for the file-tool entry only.
+        let pre = doc["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1, "{doc}");
+        assert_eq!(pre[0]["matcher"], json!(SESSION_SCOPE_MATCHER));
         assert_eq!(codex_commands(&doc, "Stop"), vec![ours]);
     }
 
@@ -5887,11 +5943,11 @@ mod tests {
             Some("codex"),
         );
         let doc = read_codex_hooks(tmp.path());
-        for event in ["PreToolUse", "Stop"] {
+        for (event, entries) in [("PreToolUse", 2), ("Stop", 1)] {
             let hook = &doc["hooks"][event][0]["hooks"][0];
             assert_eq!(hook["command"], json!(cmd), "{event}");
             assert_eq!(hook["commandWindows"], json!(cmd_windows), "{event}");
-            assert_eq!(codex_commands(&doc, event).len(), 1, "{event}");
+            assert_eq!(codex_commands(&doc, event).len(), entries, "{event}");
         }
     }
 
@@ -5930,7 +5986,7 @@ mod tests {
             Some("codex"),
         );
         let doc = read_codex_hooks(tmp.path());
-        assert_eq!(codex_commands(&doc, "PreToolUse"), vec![ours]);
+        assert_eq!(codex_commands(&doc, "PreToolUse"), vec![ours.clone(), ours]);
     }
 
     fn read_copilot_hooks(root: &Path) -> Value {
@@ -6186,11 +6242,69 @@ mod tests {
         }
         let codex = read_codex_hooks(&root);
         for (event, _) in CODEX_HOOK_EVENTS {
+            let ours = CODEX_HOOK_EVENTS
+                .iter()
+                .filter(|(e, _)| *e == event)
+                .count();
             assert_eq!(
                 codex["hooks"][event].as_array().unwrap().len(),
-                1,
+                ours,
                 "{codex}"
             );
+        }
+    }
+
+    /// Codex fires PreToolUse for MCP tools as `mcp__<server>__<tool>` (0.170
+    /// `McpHandler::hook_tool_name_for`), so a second PreToolUse entry runs the
+    /// runner on NeuroStrata's task_claim and get_snapshot. An older install
+    /// (file tools only) gets it added once; a matcher the user changed still
+    /// stands for the file-tool entry; a second run writes nothing.
+    #[test]
+    fn codex_pre_tool_use_covers_neurostrata_mcp_calls() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let (cmd, cmd_windows) = codex_hook_commands(&runner);
+        let ours = json!({"type": "command", "command": cmd, "commandWindows": cmd_windows});
+        let matcher = regex::Regex::new(SESSION_SCOPE_MATCHER).unwrap();
+        for name in [
+            "mcp__neurostrata__neurostrata_task_claim",
+            "mcp__neurostrata__neurostrata_get_snapshot",
+        ] {
+            assert!(matcher.is_match(name), "{name}");
+        }
+        assert!(!matcher.is_match("mcp__neurostrata__neurostrata_search_memory"));
+        for user_matcher in ["apply_patch|Bash", "apply_patch|Bash|Read"] {
+            let path = tmp.path().join(".codex/hooks.json");
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&json!({"hooks": {
+                    "PreToolUse": [{"matcher": user_matcher, "hooks": [ours.clone()]}]
+                }}))
+                .unwrap(),
+            )
+            .unwrap();
+            for _ in 0..2 {
+                let _ = auto_install_detected_plugins(
+                    tmp.path(),
+                    ConfigNamespace::Set("TestProj"),
+                    Some("codex"),
+                );
+            }
+            let doc = read_codex_hooks(tmp.path());
+            let pre = doc["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(pre.len(), 2, "{user_matcher}: {doc}");
+            assert_eq!(pre[0]["matcher"], json!(user_matcher));
+            assert_eq!(pre[1]["matcher"], json!(SESSION_SCOPE_MATCHER));
+            assert_eq!(pre[1]["hooks"], json!([ours.clone()]));
         }
     }
 
