@@ -1248,9 +1248,11 @@ fn trimmed_graph_context(context: &Value) -> Value {
             .and_then(|m| m.get("refs"))
             .and_then(Value::as_array)
             .map(|refs| {
+                // Only file and symbol: a ref can also carry lines and a
+                // source_context, which are details, not the name.
                 refs.iter()
                     .filter(|r| r.get("symbol").is_some_and(Value::is_string))
-                    .cloned()
+                    .map(|r| json!({ "file": r.get("file"), "symbol": r.get("symbol") }))
                     .collect()
             })
             .unwrap_or_default();
@@ -7366,7 +7368,7 @@ exit 0
         rule["metadata"]["refs"] = json!([
             { "file": "src/a.rs", "symbol": "a" },
             { "file": "src/b.rs" },
-            { "file": "src/c.rs", "symbol": "a" }
+            { "file": "src/c.rs", "symbol": "a", "lines": "3-9", "source_context": { "provider": "git" } }
         ]);
         let full = json!({
             "query": "q",
