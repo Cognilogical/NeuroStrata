@@ -111,7 +111,8 @@ export function sanitizeSubagentHeaderToken(value: string): string {
  * `neurostrata-mcp namespace resolve`:
  *  1. the project root marker (`.NeuroStrata/config.json`, findRootMarker(cwd))
  *  2. pluginConfig.namespace (the harness config; non-empty trimmed string)
- *  3. process.env.NEUROSTRATA_NAMESPACE (non-empty trimmed string)
+ *  3. process.env.NEUROSTRATA_NAMESPACE (trimmed, one quote pair stripped and
+ *     validated by `usableNamespace`, the CLI's `usable_env_namespace` rule)
  *  4. discoverProjectNamespace(cwd)
  * Never falls back to a hardcoded "NeuroStrata".
  */
@@ -127,10 +128,19 @@ export function resolveConfig(
     DEFAULT_CONFIG.endpoint
   // Preserve the exact namespace for MCP routing; sanitization happens only
   // where the value is interpolated into a prompt header (#329 review).
+  const envNamespace = process.env.NEUROSTRATA_NAMESPACE
+  const rawInputNamespace = asString(input.namespace)
+  // A CLI hook runner copies NEUROSTRATA_NAMESPACE into config.namespace.
+  // Validate that copy with the same rule as the env fallback, so an invalid
+  // environment value cannot win before the fallback is reached (#400 finding).
+  const inputNamespace =
+    envNamespace !== undefined && rawInputNamespace === asString(envNamespace)
+      ? usableNamespace(envNamespace)
+      : rawInputNamespace
   const namespace =
     findRootMarker(resolve(cwd))?.namespace ??
-    asString(input.namespace) ??
-    asString(process.env.NEUROSTRATA_NAMESPACE) ??
+    inputNamespace ??
+    usableNamespace(envNamespace) ??
     discoverProjectNamespace(cwd)
   return {
     namespace,
@@ -189,6 +199,17 @@ function warnUnreadableMarker(path: string, reason: string): void {
   )
 }
 
+/** Harness configs already reported unreadable in this process. */
+const warnedHarnessConfigs = new Set<string>()
+
+function warnUnreadableHarnessConfig(path: string, reason: string): void {
+  if (warnedHarnessConfigs.has(path)) return
+  warnedHarnessConfigs.add(path)
+  console.error(
+    `[NeuroStrata] warning: the harness config ${path} could not be read (${reason}); the namespace is unknown and the hook fails closed`
+  )
+}
+
 /**
  * The raw spelling of every top-level `version` value in a JSON object text
  * that already parsed. JSON.parse reads `1.0` as 1, but the daemon's reader
@@ -232,7 +253,14 @@ const NAMESPACE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/
  */
 export function usableNamespace(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined
-  const ns = raw.trim().replace(/^["']+|["']+$/g, '')
+  // Strip quote runs by index: a quantified multi-character class (["']+)
+  // is flagged as polynomial ReDoS by CodeQL even when linear in practice.
+  const trimmed = raw.trim()
+  let start = 0
+  let end = trimmed.length
+  while (start < end && (trimmed[start] === '"' || trimmed[start] === "'")) start++
+  while (end > start && (trimmed[end - 1] === '"' || trimmed[end - 1] === "'")) end--
+  const ns = trimmed.slice(start, end)
   return NAMESPACE_PATTERN.test(ns) ? ns : undefined
 }
 
@@ -620,8 +648,11 @@ const HARNESS_CONFIG_FILES: Record<string, { file: string[]; key: string[] }> =
  * usable namespace.
  *
  * `runnerDir` is the folder of the hook runner the installer wrote,
- * `<root>/.NeuroStrata/plugins/<harness>/`: the config of the project that
- * installed it, `<root>`, is read first.
+ * `<root>/.NeuroStrata/plugins/<harness>/`. The session's checkout is read
+ * FIRST, then the installer's root: a shared runner must not answer for
+ * another project (#378 F5). A config that exists but cannot be read or
+ * parsed is reported and fails closed, never falling through to env/folder
+ * discovery (#378 F9).
  */
 export function readHarnessConfig(
   harness: string,
@@ -631,6 +662,14 @@ export function readHarnessConfig(
   const spec = HARNESS_CONFIG_FILES[harness]
   if (!spec) return {}
   const roots: Array<string | null> = []
+  if (typeof projectDir === 'string' && projectDir !== '') {
+    const start = canonicalThroughExisting(resolve(projectDir))
+    const top = checkoutTop(start)
+    roots.push(...(top === null ? [start] : [top, linkedMainCheckout(top)]))
+  }
+  // Session-checkout roots come first; the runner's install root is only a
+  // last resort for a checkout with no config of its own (#378 F5).
+  const sessionRootCount = roots.length
   if (typeof runnerDir === 'string' && runnerDir !== '') {
     const plugins = dirname(resolve(runnerDir))
     const stateDir = dirname(plugins)
@@ -642,29 +681,83 @@ export function readHarnessConfig(
       roots.push(dirname(stateDir))
     }
   }
-  if (typeof projectDir === 'string' && projectDir !== '') {
-    const start = canonicalThroughExisting(resolve(projectDir))
-    const top = checkoutTop(start)
-    roots.push(...(top === null ? [start] : [top, linkedMainCheckout(top)]))
-  }
-  for (const root of roots) {
+  // A config that exists in the session checkout but yields no usable
+  // namespace must not fall through to the runner root: that would bind the
+  // session to the runner's project (#400 finding).
+  let sessionConfigFound = false
+  for (let i = 0; i < roots.length; i++) {
+    const root = roots[i]
     if (root === null) continue
+    if (i >= sessionRootCount && sessionConfigFound) break
+    const file = join(root, ...spec.file)
+    let text: string
     try {
-      let value: unknown = JSON.parse(
-        readFileSync(join(root, ...spec.file), 'utf8').replace(/^\uFEFF/, '')
+      text = readFileSync(file, 'utf8').replace(/^\uFEFF/, '')
+    } catch (err) {
+      // A missing config is normal; an existing one we cannot read is not:
+      // guessing from env or the folder name would bind the wrong namespace.
+      if ((err as { code?: string })?.code === 'ENOENT') continue
+      const reason = String((err as Error)?.message ?? err)
+      warnUnreadableHarnessConfig(file, reason)
+      throw new Error(
+        `the project's namespace is unknown because the harness config ${file} could not be read: ${reason}`
       )
-      for (const key of spec.key) value = asRecord(value)[key]
-      const namespace = usableNamespace(value)
-      if (namespace) return { namespace }
-    } catch {
-      // missing or malformed: try the next root
     }
+    let value: unknown
+    try {
+      value = JSON.parse(text)
+    } catch (err) {
+      const reason = `it is not valid JSON (${String((err as Error)?.message ?? err)})`
+      warnUnreadableHarnessConfig(file, reason)
+      throw new Error(
+        `the project's namespace is unknown because the harness config ${file} could not be read: ${reason}`
+      )
+    }
+    for (const key of spec.key) value = asRecord(value)[key]
+    const namespace = usableNamespace(value)
+    if (namespace) return { namespace }
+    if (i < sessionRootCount) sessionConfigFound = true
   }
   return {}
 }
 
 /** How many SessionStart folders the Claude runner remembers. */
 const CLAUDE_SESSION_DIRS_KEEP = 20
+
+/**
+ * True only when `stateDir` is a real `.NeuroStrata` directly under `root`,
+ * every step a real directory (no link/junction), and `sessionPath` is absent
+ * or a real file. A repo-controlled link can point into another project, so
+ * SessionStart must not read or write session state through one (#378 F8).
+ */
+function safeProjectStateDir(
+  root: string,
+  stateDir: string,
+  sessionPath: string
+): boolean {
+  try {
+    if (lstatSync(root).isSymbolicLink()) return false
+    let cursor = root
+    for (const part of pathParts(relative(root, stateDir))) {
+      cursor = join(cursor, part)
+      const st = lstatSync(cursor)
+      if (st.isSymbolicLink() || !st.isDirectory()) return false
+    }
+    const realRoot = canonicalPath(root)
+    const realState = canonicalPath(stateDir)
+    if (realRoot === null || realState === null) return false
+    if (realState !== join(realRoot, '.NeuroStrata')) return false
+    try {
+      const st = lstatSync(sessionPath)
+      if (st.isSymbolicLink() || !st.isFile()) return false
+    } catch (err) {
+      if ((err as { code?: string })?.code !== 'ENOENT') return false
+    }
+    return true
+  } catch {
+    return false
+  }
+}
 
 /**
  * The project folder a CLI hook runner resolves its namespace from. Claude
@@ -699,6 +792,9 @@ export function resolveHookProjectDir(
   if (home && sameFolder(root, home)) return cwd
   const stateDir = join(root, '.NeuroStrata')
   const sessionPath = join(stateDir, 'active_session.json')
+  // Refuse a linked/non-project state directory before touching the file at
+  // all: reading it can seed a session from another checkout (#378 F8).
+  if (!safeProjectStateDir(root, stateDir, sessionPath)) return cwd
   let state: Record<string, unknown> = {}
   let unparsable = false
   try {
@@ -3878,8 +3974,9 @@ export async function handleHookEvent(
         config.namespace,
         activeTaskId
       )
+      // Codex rejects `continue` on PreToolUse replies; the allow decision
+      // alone is the contract. `continue` stays on Stop replies below.
       return {
-        continue: true,
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
           permissionDecision: 'allow',
@@ -3995,7 +4092,6 @@ export async function handleHookEvent(
     if (recalledFilePath)
       confirmPrefetchDelivery(config.namespace, recalledFilePath)
     return {
-      continue: true,
       ...(recallBlock ? { systemMessage: recallBlock } : {}),
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',

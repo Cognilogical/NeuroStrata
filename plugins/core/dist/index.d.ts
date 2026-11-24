@@ -41,7 +41,8 @@ export declare function sanitizeSubagentHeaderToken(value: string): string;
  * `neurostrata-mcp namespace resolve`:
  *  1. the project root marker (`.NeuroStrata/config.json`, findRootMarker(cwd))
  *  2. pluginConfig.namespace (the harness config; non-empty trimmed string)
- *  3. process.env.NEUROSTRATA_NAMESPACE (non-empty trimmed string)
+ *  3. process.env.NEUROSTRATA_NAMESPACE (trimmed, one quote pair stripped and
+ *     validated by `usableNamespace`, the CLI's `usable_env_namespace` rule)
  *  4. discoverProjectNamespace(cwd)
  * Never falls back to a hardcoded "NeuroStrata".
  */
@@ -91,8 +92,11 @@ export declare function findProjectRoot(startDir?: string, home?: string): strin
  * usable namespace.
  *
  * `runnerDir` is the folder of the hook runner the installer wrote,
- * `<root>/.NeuroStrata/plugins/<harness>/`: the config of the project that
- * installed it, `<root>`, is read first.
+ * `<root>/.NeuroStrata/plugins/<harness>/`. The session's checkout is read
+ * FIRST, then the installer's root: a shared runner must not answer for
+ * another project (#378 F5). A config that exists but cannot be read or
+ * parsed is reported and fails closed, never falling through to env/folder
+ * discovery (#378 F9).
  */
 export declare function readHarnessConfig(harness: string, projectDir: string, runnerDir?: string): {
     namespace?: string;

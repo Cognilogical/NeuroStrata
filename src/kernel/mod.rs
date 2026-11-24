@@ -7,8 +7,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crate::connectors::{
-    DataConnector, DataConnectorRegistry, DataPointerRecord, DataPoolAccessMode, DataPoolSchema,
-    DataSlicePayload, DataSliceRequest, ExternalEffectReceipt, ExternalEffectRequest,
+    source_digest_matches, DataConnector, DataConnectorRegistry, DataPointerRecord,
+    DataPoolAccessMode, DataPoolSchema, DataSlicePayload, DataSliceRequest, ExternalEffectReceipt,
+    ExternalEffectRequest,
 };
 use crate::events::ThalamicBus;
 use crate::formal_kernel::{
@@ -422,7 +423,10 @@ impl AgentKernel {
         slice.pointer_id = pointer.pointer_id.clone();
         slice.pool_id = pointer.pool_id.clone();
         let source_digest_matches = match &pointer.expected_source_sha256 {
-            Some(expected) => expected == &slice.source_sha256,
+            // #351 changed the digest encoding to per-record length prefixes;
+            // a pointer captured before that change still carries the legacy
+            // digest, so validate against both encodings of the same records.
+            Some(expected) => source_digest_matches(expected, &slice.records),
             None => true,
         };
         let post_verdict = evaluate_connector_post_gate(build_resolve_post_gate_input(
@@ -540,11 +544,17 @@ impl AgentKernel {
             .apply_external_effect(&connector_pool_id, &pointer.pointer_uri, &guarded_req)
             .await?;
         let pointer_source_digest_matches = match &pointer.expected_source_sha256 {
-            Some(expected) => expected == &receipt.prior_source_sha256,
+            Some(expected) => {
+                expected == &receipt.prior_source_sha256
+                    || expected == &receipt.prior_source_sha256_legacy
+            }
             None => true,
         };
         let request_cas_expected_matches = match &req.expected_source_sha256 {
-            Some(expected) => expected == &receipt.prior_source_sha256,
+            Some(expected) => {
+                expected == &receipt.prior_source_sha256
+                    || expected == &receipt.prior_source_sha256_legacy
+            }
             None => true,
         };
         let post_verdict = evaluate_connector_post_gate(build_writeback_post_gate_input(
@@ -815,6 +825,7 @@ mod tests {
         max_slice_bytes: u32,
         records: Vec<serde_json::Value>,
         bad_source_digest: bool,
+        prior_source_sha256_legacy: String,
         inflate_rows: bool,
         inflate_bytes: bool,
         resolve_calls: AtomicUsize,
@@ -831,6 +842,7 @@ mod tests {
                 max_slice_bytes: max_bytes,
                 records: vec![json!({"v": 1})],
                 bad_source_digest: false,
+                prior_source_sha256_legacy: String::new(),
                 inflate_rows: false,
                 inflate_bytes: false,
                 resolve_calls: AtomicUsize::new(0),
@@ -923,6 +935,7 @@ mod tests {
                 idempotency_key: req.idempotency_key.clone(),
                 applied: true,
                 prior_source_sha256: "prior".to_string(),
+                prior_source_sha256_legacy: self.prior_source_sha256_legacy.clone(),
                 new_source_sha256: "new-source-digest".to_string(),
                 details: "applied".to_string(),
             })
@@ -1517,6 +1530,75 @@ mod tests {
         assert_eq!(spy.resolve_calls.load(Ordering::SeqCst), 1); // no additional call
     }
 
+    #[tokio::test]
+    async fn legacy_source_digest_remains_valid_for_resolve_and_writeback() {
+        use sha2::{Digest, Sha256};
+
+        // Digest encoding used before #351: plain concatenation of serialized
+        // records, with no per-record length prefix.
+        let records = vec![json!({"v": 1})];
+        let mut hasher = Sha256::new();
+        for record in &records {
+            hasher.update(serde_json::to_vec(record).expect("serialize record"));
+        }
+        let legacy_digest = hex::encode(hasher.finalize());
+        let ns = "ns1";
+
+        // Resolve: a pointer pinned to the legacy digest still gets its slice.
+        let spy = Arc::new(SpyConnector::new(
+            "spy",
+            DataPoolAccessMode::ReadWrite,
+            10,
+            1024,
+        ));
+        let (kernel, store, _dir) = build_kernel(spy.clone());
+        store.init(ns).await.expect("init");
+        let mut ptr = pointer_record("ptr_legacy", "spy", 1000, 100);
+        ptr.expected_source_sha256 = Some(legacy_digest.clone());
+        kernel
+            .register_pointer(ns, &ptr, Some(ns))
+            .await
+            .expect("register");
+        let slice = kernel
+            .resolve_pointer(ns, &slice_request("ptr_legacy", 1, 64), 1000, Some(ns))
+            .await
+            .expect("legacy-digest pointer must still resolve");
+        assert_eq!(slice.records, records);
+
+        // Write-back: the legacy expectation matches the receipt's legacy
+        // prior digest even though the receipt's current digest uses the new
+        // length-prefixed encoding.
+        let mut spy_wb = SpyConnector::new("spy", DataPoolAccessMode::ReadWrite, 10, 1024);
+        spy_wb.prior_source_sha256_legacy = legacy_digest.clone();
+        let spy_wb = Arc::new(spy_wb);
+        let (kernel_wb, store_wb, _dir) = build_kernel(spy_wb.clone());
+        store_wb.init(ns).await.expect("init");
+        kernel_wb
+            .register_pointer(
+                ns,
+                &pointer_record("ptr_legacy_wb", "spy", 1000, 100),
+                Some(ns),
+            )
+            .await
+            .expect("register");
+        seed_receipt(
+            &store_wb,
+            ns,
+            "rcpt_legacy",
+            "ptr_legacy_wb",
+            "pool1",
+            false,
+        )
+        .await;
+        let mut req = writeback_request("ptr_legacy_wb", "rcpt_legacy");
+        req.expected_source_sha256 = Some(legacy_digest);
+        let receipt = kernel_wb
+            .apply_external_effect(ns, &req, 1000, Some(ns))
+            .await
+            .expect("legacy CAS expectation must pass the post-gate");
+        assert!(receipt.applied);
+    }
+
     fn now_epoch() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1869,6 +1951,7 @@ mod tests {
                     idempotency_key: req.idempotency_key.clone(),
                     applied: true,
                     prior_source_sha256: "prior".to_string(),
+                    prior_source_sha256_legacy: String::new(),
                     new_source_sha256: "new".to_string(),
                     details: "ok".to_string(),
                 })

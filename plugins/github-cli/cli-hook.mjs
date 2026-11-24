@@ -6,11 +6,14 @@ import plugin, {
   initialize,
   onTurnEnd,
   readHarnessConfig,
-  resolveHookProjectDir
+  resolveHookProjectDir,
+  usableNamespace
 } from "./dist/index.js";
 
 const HARNESS = "github-cli";
 const RUNNER_DIR = dirname(fileURLToPath(import.meta.url));
+// The event being handled, so the catch can reply in the right hook shape.
+let currentEvent = null;
 
 async function main() {
   // Redirect all diagnostic logging to stderr so stdout carries only the
@@ -43,13 +46,14 @@ async function main() {
   } catch {
     return;
   }
+  currentEvent = event;
   // The namespace comes from the harness config the installer wrote; the
   // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
   // this config (the order of `neurostrata-mcp namespace resolve`).
   const projectDir = resolveHookProjectDir(HARNESS, event);
   // Pass the namespace only when it is set: an explicit undefined would
   // override the one in .NeuroStrata/neurostrata-plugin.json.
-  const namespace = process.env.NEUROSTRATA_NAMESPACE;
+  const namespace = usableNamespace(process.env.NEUROSTRATA_NAMESPACE);
   const envConfig = namespace ? { namespace } : {};
   await initialize({
     config: { ...envConfig, ...readHarnessConfig(HARNESS, projectDir, RUNNER_DIR) },
@@ -67,6 +71,27 @@ async function main() {
   await writeStdout(JSON.stringify({ continue: true }));
 }
 main().catch((err) => {
-  process.stderr.write(String(err) + "\n");
-  process.exit(2);
+  const reason = String(err);
+  process.stderr.write(reason + "\n");
+  // Reply in the shape of the event that failed. A PreToolUse-only deny is
+  // meaningless at Stop: the host cannot apply it, so the turn could end
+  // without retry. At Stop, Claude Code treats exit code 2 as a block; stdout
+  // still has to be valid JSON. PowerShell can collapse nonzero exits, so the
+  // reason remains on stderr as well.
+  if (currentEvent?.hook_event_name === "Stop") {
+    process.stdout.write("{}");
+    process.exitCode = 2;
+    return;
+  }
+  // PreToolUse (and other tool events): an explicit deny fails closed on
+  // every shell; no `continue` — Codex rejects it on PreToolUse.
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: `NeuroStrata hook runner failed: ${reason}`,
+      },
+    })
+  );
 });

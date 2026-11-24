@@ -552,3 +552,130 @@ test("claim scope: the runner passes the session folder as worktree on task_clai
   });
   assert.equal(kept.hookSpecificOutput.updatedInput, undefined);
 });
+
+
+// Code-scanning polynomial-redos regression (alerts 25-27): quote stripping
+// must be linear and preserve the original match semantics.
+test("usableNamespace linear quote stripping (code-scanning 25-27)", async () => {
+  const mod = await import("./dist/index.js");
+  assert.equal(typeof mod.usableNamespace, "function", "helper exported from dist");
+  const f = mod.usableNamespace;
+  assert.equal(f('"ns"'), "ns");
+  assert.equal(f("'ns'"), "ns");
+  assert.equal(f("\"'ns'"), "ns");
+  assert.equal(f('  "ns"  '), "ns");
+  assert.equal(f("project:core"), "project:core");
+  assert.equal(f('"unterminated'), "unterminated");
+  assert.equal(f('""""'), undefined);
+});
+
+test("usableNamespace handles long quote runs without superlinear backtracking", async () => {
+  const { usableNamespace: f } = await import("./dist/index.js");
+  const adversarial = Array.from({ length: 200 }, () => '"'.repeat(50) + "x").join("") + "'".repeat(50);
+  assert.equal(f(adversarial), undefined);
+  assert.equal(f('"'.repeat(20000) + "ns" + "'".repeat(20000)), "ns");
+});
+
+// Issue #382 batch regressions.
+test("368-F3: PreToolUse allow replies omit continue (Codex contract)", async () => {
+  const mod = await import("./dist/index.js");
+  mod.resetState();
+  const out = await mod.handleHookEvent({
+    hook_event_name: "PreToolUse",
+    tool_name: "read",
+    tool_input: { file_path: "src/example.ts" },
+  });
+  assert.equal(out.continue, undefined);
+  assert.equal(out.hookSpecificOutput.permissionDecision, "allow");
+});
+
+test("378-F2: env namespace uses the CLI's usable-env rule", async () => {
+  const base = markerTempDir("ns-hermes-env-");
+  const saved = process.env.NEUROSTRATA_NAMESPACE;
+  try {
+    process.env.NEUROSTRATA_NAMESPACE = '"alpha"';
+    assert.equal(resolveConfig({}, base).namespace, "alpha");
+    process.env.NEUROSTRATA_NAMESPACE = "'beta'";
+    assert.equal(resolveConfig({}, base).namespace, "beta");
+  } finally {
+    if (saved === undefined) delete process.env.NEUROSTRATA_NAMESPACE;
+    else process.env.NEUROSTRATA_NAMESPACE = saved;
+  }
+});
+
+test("378-F5/F9: checkout config wins; unreadable config fails closed", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join, dirname } = await import("node:path");
+  const { readHarnessConfig } = await import("./dist/index.js");
+  const base = mkdtempSync(join(tmpdir(), "ns-hermes-config-"));
+  const repo = join(base, "repo");
+  const other = join(base, "other");
+  mkdirSync(join(repo, ".git"), { recursive: true });
+  mkdirSync(join(other, ".git"), { recursive: true });
+  const config = join(repo, ".hermes", "plugins", "neurostrata.json");
+  mkdirSync(dirname(config), { recursive: true });
+  writeFileSync(config, JSON.stringify({ namespace: "from-checkout" }));
+  const runnerDir = join(other, ".NeuroStrata", "plugins", "hermes");
+  const otherConfig = join(runnerDir, "neurostrata.json");
+  mkdirSync(runnerDir, { recursive: true });
+  writeFileSync(otherConfig, JSON.stringify({ namespace: "from-runner" }));
+
+  assert.deepEqual(readHarnessConfig("hermes", repo, runnerDir), {
+    namespace: "from-checkout",
+  });
+
+  writeFileSync(config, "{ broken json");
+  const errors = [];
+  const original = console.error;
+  console.error = (line) => errors.push(String(line));
+  try {
+    assert.throws(() => readHarnessConfig("hermes", repo, runnerDir), /could not be read/);
+    assert.ok(errors.some((line) => line.includes(config)), "must report the unreadable config");
+  } finally {
+    console.error = original;
+  }
+});
+
+// ── PR #400 review regressions ──────────────────────────────────────────
+test("PR #400: a session config without a usable namespace does not adopt the runner root's", async () => {
+  const { readHarnessConfig } = await import("./dist/index.js");
+  const { mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const base = markerTempDir("ns-400-hermes-");
+  buildMarkerLayout(base, ["session git-dir", "runner git-dir"]);
+  const session = underBase(base, "session");
+  const runnerRoot = underBase(base, "runner");
+  try {
+    const sessionCfg = join(session, ".hermes", "plugins", "neurostrata.json");
+    mkdirSync(dirname(sessionCfg), { recursive: true });
+    writeFileSync(sessionCfg, JSON.stringify({ namespace: "$INVALID" }));
+    const runnerDir = join(runnerRoot, ".NeuroStrata", "plugins", "hermes");
+    const runnerCfg = join(runnerRoot, ".hermes", "plugins", "neurostrata.json");
+    mkdirSync(runnerDir, { recursive: true });
+    mkdirSync(dirname(runnerCfg), { recursive: true });
+    writeFileSync(runnerCfg, JSON.stringify({ namespace: "runner-project" }));
+    assert.deepEqual(readHarnessConfig("hermes", session, runnerDir), {});
+    rmSync(sessionCfg);
+    assert.deepEqual(readHarnessConfig("hermes", session, runnerDir), {
+      namespace: "runner-project",
+    });
+  } finally {
+    removeTree(base, { recursive: true, force: true });
+  }
+});
+
+test("PR #400: invalid env namespace copied into config is ignored", async () => {
+  const { resolveConfig } = await import("./dist/index.js");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const cwd = mkdtempSync(join(tmpdir(), "ns-400-hermes-env-"));
+  const invalid = "$NS; rm -rf /";
+  process.env.NEUROSTRATA_NAMESPACE = invalid;
+  try {
+    assert.notEqual(resolveConfig({ namespace: invalid }, cwd).namespace, invalid);
+  } finally {
+    delete process.env.NEUROSTRATA_NAMESPACE;
+  }
+});

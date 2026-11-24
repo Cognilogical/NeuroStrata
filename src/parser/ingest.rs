@@ -60,6 +60,11 @@ pub const SKIPPED_DIRS: &[&str] = &[
     ".idea",
     ".vscode",
     "coverage",
+    // Daemon-owned session/plugin state (session_queries.json,
+    // active_session.json, harness plugins). The daemon writes these after
+    // every MCP call; ingesting them makes the freshness watcher mark its own
+    // root dirty and re-ingest on each debounce (issue #355).
+    ".NeuroStrata",
 ];
 
 /// Shared eligibility predicate: would a normal ingest walk consider this
@@ -6270,6 +6275,36 @@ use super::x;"#;
                 "skip dir {skip_dir} must be rejected: {skipped_path}"
             );
         }
+    }
+
+    /// Issue #355: daemon session/plugin state under `.NeuroStrata` is a
+    /// self-write — the watcher must not treat it as an ingest trigger.
+    #[test]
+    fn eligibility_rejects_neurostrata_session_state() {
+        let root = std::path::Path::new("/tmp/fresh-root");
+        for rel in [
+            ".NeuroStrata/session_queries.json",
+            ".NeuroStrata/active_session.json",
+            ".NeuroStrata/plugins/opencode/index.js",
+            ".NeuroStrata/docs/a-rule.md",
+        ] {
+            let path = format!("/tmp/fresh-root/{rel}");
+            assert!(
+                !is_ingest_eligible_path(std::path::Path::new(&path), root),
+                "daemon state {rel} must not be an ingest trigger"
+            );
+        }
+        // Store-artifact behavior is unchanged: still rejected.
+        let db_path = "/tmp/fresh-root/.NeuroStrata/store.db";
+        assert!(!is_ingest_eligible_path(
+            std::path::Path::new(db_path),
+            root
+        ));
+        // Normal source outside the daemon state is still eligible.
+        assert!(is_ingest_eligible_path(
+            std::path::Path::new("/tmp/fresh-root/src/lib.rs"),
+            root
+        ));
     }
 
     #[test]

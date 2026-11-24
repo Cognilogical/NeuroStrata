@@ -1468,6 +1468,29 @@ fn is_any_home_folder(dir: &std::path::Path, homes: &[std::path::PathBuf]) -> bo
     homes.iter().any(|h| is_home_folder(dir, Some(h)))
 }
 
+/// The OS temp root is shared scratch space, not a project: a `.NeuroStrata`
+/// left there by an earlier fallback write must not capture every scratch
+/// folder beneath it (issue #322). Ignore that marker only when it is an
+/// *ancestor* of the walk's start; a caller naming the temp root itself keeps
+/// its own marker.
+fn is_shared_temp_ancestor(dir: &std::path::Path, start: &std::path::Path) -> bool {
+    is_shared_temp_ancestor_with(dir, start, &std::env::temp_dir())
+}
+
+fn is_shared_temp_ancestor_with(
+    dir: &std::path::Path,
+    start: &std::path::Path,
+    temp: &std::path::Path,
+) -> bool {
+    if dir == start {
+        return false;
+    }
+    match (dunce::canonicalize(dir), dunce::canonicalize(temp)) {
+        (Ok(d), Ok(t)) => d == t,
+        _ => dir == temp,
+    }
+}
+
 /// True when `dir` is the user's home folder and holds no `.git`. Such a
 /// folder is never a project, so no session file (`active_session.json`,
 /// `session_queries.json`) is written there: `~/.NeuroStrata` belongs to
@@ -1510,6 +1533,14 @@ fn walk_to_session_marker_with(
     start: &std::path::Path,
     homes: &[std::path::PathBuf],
 ) -> SessionMarkerWalk {
+    walk_to_session_marker_with_temp(start, homes, &std::env::temp_dir())
+}
+
+fn walk_to_session_marker_with_temp(
+    start: &std::path::Path,
+    homes: &[std::path::PathBuf],
+    temp: &std::path::Path,
+) -> SessionMarkerWalk {
     let start = if start.is_dir() {
         start
     } else {
@@ -1527,7 +1558,12 @@ fn walk_to_session_marker_with(
         if is_home(dir) {
             return SessionMarkerWalk::StoppedAtHome;
         }
-        if dir.join(".NeuroStrata").exists() {
+        // The temp root's stray `.NeuroStrata` is skipped, but a project
+        // marker (`.NeuroStrata/config.json`) there still makes it a project.
+        if dir.join(".NeuroStrata").exists()
+            && (!is_shared_temp_ancestor_with(dir, start, temp)
+                || dir.join(".NeuroStrata").join("config.json").exists())
+        {
             return SessionMarkerWalk::Root(dir.to_path_buf());
         }
         cur = dir.parent().filter(|p| !p.as_os_str().is_empty());
@@ -3839,6 +3875,29 @@ evaporate. The lexical detector surfaces these as `task_intent_signals` in
     )
 }
 
+/// Apply the daemon caller-path policy to a marker-writing MCP call. The
+/// daemon's explicitly configured root is the boundary; without that env var
+/// this is a plain CLI/test run where the caller already owns the root.
+/// Both the requested folder and the main-checkout target are judged: a
+/// linked worktree can otherwise redirect the write outside the allowlist.
+fn checked_marker_root(project_root: &str) -> Result<std::path::PathBuf, String> {
+    let raw = std::path::Path::new(project_root);
+    if std::env::var_os("NEUROSTRATA_PROJECT_ROOT").is_none() {
+        return Ok(dunce::simplified(raw).to_path_buf());
+    }
+    let boundary = crate::daemon::resolve_project_root();
+    let allowlist = crate::config::Config::default_path()
+        .ok()
+        .and_then(|p| crate::config::Config::load_from(&p).ok())
+        .map(|config| config.allowed_external_dirs)
+        .unwrap_or_default();
+    let resolved = crate::daemon::check_caller_path(raw, &boundary, &allowlist)?;
+    let target = crate::paths::main_checkout_root(&resolved.to_string_lossy())
+        .unwrap_or_else(|| resolved.clone());
+    crate::daemon::check_caller_path(&target, &boundary, &allowlist)?;
+    Ok(resolved)
+}
+
 pub async fn handle_bootstrap(
     args: Value,
     emb: Arc<dyn Embedder>,
@@ -3857,7 +3916,11 @@ pub async fn handle_bootstrap(
         return e;
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
-    let root = std::path::Path::new(project_root);
+    let checked = match checked_marker_root(project_root) {
+        Ok(root) => root,
+        Err(e) => return e,
+    };
+    let root = checked.as_path();
     let root_marker =
         crate::root_marker::ensure_marker_for_setup(&store, Some(&emb), root, Some(&namespace))
             .await;
@@ -4405,49 +4468,80 @@ done
 
 # ── Write the query ledger (non-blocking, always writes) ─────────────────────
 # The daemon mutates this ledger under the same lock; without it a hook could
-# rename a stale snapshot over a receipt written in between.
+# rename a stale snapshot over a receipt written in between. Only where `flock`
+# exists (Linux; not Git Bash or stock macOS).
 rewrite_session_ledger_namespace() {
 mkdir -p "$(dirname "$LEDGER")"
 if [ ! -f "$LEDGER" ]; then
-    printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER"
+    # Only a path that is truly absent is created. `set -C` makes the redirect
+    # an exclusive open, so a symlink planted between the check and the open
+    # fails instead of truncating its target.
+    ( set -C; printf '{\n  "namespace": "%s",\n  "queries": [\n  ]\n}\n' "$NAMESPACE" > "$LEDGER" ) 2>/dev/null || true
 elif [ -n "$RESOLVED" ]; then
     # The ledger's namespace follows the resolved one, so lookups recorded from
     # now on are filed under the namespace the hooks and the gate use. The
-    # rewrite goes through a temporary file and a rename; an unparseable
-    # ledger or a missing node/python3 leaves the file as it is.
+    # rewrite uses a unique EXCLUSIVE temp file (a planted symlink cannot be
+    # followed), keeps the original mode, and wraps legacy bare-array ledgers.
+    # An unparseable ledger or a missing node/python3 leaves the file as it is.
     export LEDGER NAMESPACE
     if command -v node >/dev/null 2>&1; then
         node -e '
           const fs = require("fs");
           const ledger = process.env.LEDGER;
           const ns = process.env.NAMESPACE;
-          let parsed;
-          try { parsed = JSON.parse(fs.readFileSync(ledger, "utf8")); } catch { process.exit(0); }
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) process.exit(0);
-          if (parsed.namespace === ns) process.exit(0);
-          parsed.namespace = ns;
-          const tmp = ledger + ".tmp-" + process.pid;
-          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2) + "\n");
-          fs.renameSync(tmp, ledger);
+          let raw, parsed;
+          try { raw = fs.readFileSync(ledger, "utf8"); parsed = JSON.parse(raw); } catch { process.exit(0); }
+          const doc = Array.isArray(parsed) ? { namespace: ns, queries: parsed } : parsed;
+          if (!doc || typeof doc !== "object") process.exit(0);
+          if (!Array.isArray(parsed) && doc.namespace === ns) process.exit(0);
+          doc.namespace = ns;
+          const tmp = ledger + ".tmp-" + process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+          let mode;
+          try { mode = fs.statSync(ledger).mode; } catch {}
+          fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+          try {
+            // Where flock is absent the daemon may append a receipt after our
+            // read. Compare the ledger immediately before publishing: a newer
+            // file is left intact rather than overwritten by a stale snapshot.
+            if (fs.readFileSync(ledger, "utf8") !== raw) { fs.unlinkSync(tmp); process.exit(0); }
+            if (mode !== undefined) { try { fs.chmodSync(tmp, mode); } catch {} }
+            fs.renameSync(tmp, ledger);
+          } catch { try { fs.unlinkSync(tmp); } catch {} }
         ' 2>/dev/null || true
     elif command -v python3 >/dev/null 2>&1; then
         python3 -c '
-import json, os, sys
+import json, os, sys, stat
 ledger = os.environ["LEDGER"]
 ns = os.environ["NAMESPACE"]
 try:
     with open(ledger, encoding="utf-8") as f:
-        parsed = json.load(f)
+        text = f.read()
+    parsed = json.loads(text)
 except Exception:
     sys.exit(0)
-if not isinstance(parsed, dict) or parsed.get("namespace") == ns:
+doc = {"namespace": ns, "queries": parsed} if isinstance(parsed, list) else parsed
+if not isinstance(doc, dict) or (not isinstance(parsed, list) and doc.get("namespace") == ns):
     sys.exit(0)
-parsed["namespace"] = ns
-tmp = ledger + ".tmp-" + str(os.getpid())
-with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-    json.dump(parsed, f, indent=2, ensure_ascii=False)
-    f.write("\n")
-os.replace(tmp, ledger)
+doc["namespace"] = ns
+tmp = f"{ledger}.tmp-{os.getpid()}-{os.urandom(6).hex()}"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    with open(ledger, encoding="utf-8") as f:
+        if f.read() != text:
+            raise RuntimeError("ledger changed since the snapshot")
+    try:
+        os.chmod(tmp, stat.S_IMODE(os.stat(ledger).st_mode))
+    except OSError:
+        pass
+    os.replace(tmp, ledger)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
 ' 2>/dev/null || true
     fi
 fi
@@ -4528,19 +4622,35 @@ pub(crate) fn git_hooks_dir(root: &std::path::Path) -> std::path::PathBuf {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|v| !v.is_empty());
-    match configured {
+    let from_relative = |v: String| {
+        let p = std::path::Path::new(&v);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        }
+    };
+    if let Some(v) = configured {
         // A relative hooksPath is relative to the repo's top-level working
         // tree, which is `root`; git runs the hook from there.
-        Some(v) => {
-            let p = std::path::Path::new(&v);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                root.join(p)
+        return from_relative(v);
+    }
+    // In a linked worktree `.git` is a FILE pointing at the common git dir,
+    // so `root/.git/hooks` is not a directory and create_dir_all fails with
+    // ENOTDIR. Let git resolve the real hooks path instead.
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .current_dir(root)
+        .output()
+    {
+        if out.status.success() {
+            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !v.is_empty() {
+                return from_relative(v);
             }
         }
-        None => root.join(".git").join("hooks"),
     }
+    root.join(".git").join("hooks")
 }
 
 /// Best-effort hook hygiene for a project root, run by the daemon. Returns
@@ -5310,7 +5420,11 @@ pub async fn handle_task_setup(
     if let Err(e) = check_namespace(&namespace) {
         return e;
     }
-    let root = std::path::Path::new(project_root);
+    let checked = match checked_marker_root(project_root) {
+        Ok(root) => root,
+        Err(e) => return e,
+    };
+    let root = checked.as_path();
     if !root.is_dir() {
         return format!("ERROR: project_root '{}' is not a directory.", project_root);
     }
@@ -6375,6 +6489,286 @@ mod tests {
             checked_in.contains("scripts/check-staged-quality.sh"),
             "the pre-commit hook must delegate to the project's staged-quality runner"
         );
+    }
+
+    /// #374, lost in the #380 merge: the hook's ledger rewrite writes an
+    /// exclusive unique temp file (a planted symlink is not followed) and
+    /// keeps the file mode. The lock is checked by
+    /// `pre_commit_hook_serializes_its_ledger_rewrite`. The python branch imports
+    /// `stat`, which it uses for the mode copy.
+    #[test]
+    fn pre_commit_ledger_rewrite_writes_an_exclusive_temp() {
+        let hook = SCAFFOLDED_PRE_COMMIT_HOOK;
+        for needle in [
+            "flag: \"wx\", mode: 0o600",
+            "import json, os, sys, stat",
+            "os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600",
+            "stat.S_IMODE(os.stat(ledger).st_mode)",
+        ] {
+            assert!(hook.contains(needle), "pre-commit hook lost {needle:?}");
+        }
+        assert!(
+            !hook.contains("ledger + \".tmp-\" + process.pid;"),
+            "a pid-only temp name lets a planted symlink be followed"
+        );
+    }
+
+    /// PR #388: both hook copies create the initial ledger through an
+    /// exclusive open, not a check followed by a following redirect.
+    #[test]
+    fn pre_commit_ledger_creation_is_exclusive_in_both_copies() {
+        for source in [
+            SCAFFOLDED_PRE_COMMIT_HOOK,
+            include_str!("../../scripts/hooks/pre-commit"),
+        ] {
+            assert!(
+                source.contains("( set -C; printf '{\\n"),
+                "ledger creation is not an exclusive open"
+            );
+        }
+    }
+
+    /// PR #388: both interpreters compare the ledger immediately before
+    /// publishing, so neither can rename a snapshot over a newer receipt.
+    #[test]
+    fn pre_commit_ledger_rewrite_compares_before_publishing() {
+        let hook = SCAFFOLDED_PRE_COMMIT_HOOK;
+        assert!(hook.contains("fs.readFileSync(ledger, \"utf8\") !== raw"));
+        assert!(hook.contains("if f.read() != text:"));
+    }
+
+    /// PR #388: a symlink planted after the `-f` check must not redirect the
+    /// first ledger write onto an unrelated file.
+    #[test]
+    #[cfg(unix)]
+    fn pre_commit_ledger_creation_does_not_follow_a_raced_symlink() {
+        use std::os::unix::fs::symlink;
+        let Some(bash) = hook_bash() else {
+            eprintln!("skipped: no bash to run the hook with");
+            return;
+        };
+        let source = SCAFFOLDED_PRE_COMMIT_HOOK;
+        let from = source
+            .find("rewrite_session_ledger_namespace() {")
+            .expect("function");
+        let to = from
+            + source[from..]
+                .find("\n}\n\nmkdir -p")
+                .expect("function end")
+            + 2;
+        let function = &source[from..to];
+
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim.json");
+        let ledger = tmp.path().join("session_queries.json");
+        std::fs::write(&victim, "original").unwrap();
+        symlink(&victim, &ledger).unwrap();
+
+        let status = std::process::Command::new(bash)
+            .arg("-c")
+            .arg(format!("{function}\nrewrite_session_ledger_namespace"))
+            .env("LEDGER", &ledger)
+            .env("NAMESPACE", "proj")
+            .status()
+            .expect("run ledger function");
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
+        assert!(
+            std::fs::symlink_metadata(&ledger)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be untouched"
+        );
+    }
+
+    /// PR #388: without flock a daemon receipt appended after the hook's read
+    /// must survive. The second ledger read is made to observe a newer file,
+    /// so the rewrite must abandon its stale snapshot instead of renaming it.
+    #[test]
+    fn pre_commit_ledger_rewrite_keeps_a_concurrent_receipt() {
+        let source = SCAFFOLDED_PRE_COMMIT_HOOK;
+        let anchor = "export LEDGER NAMESPACE";
+        let hook = &source[source.find(anchor).expect("anchor")..];
+        let from = hook.find("node -e '").expect("node snippet") + "node -e '".len();
+        let len = hook[from..]
+            .find("' 2>/dev/null")
+            .expect("node snippet end");
+        let node = &hook[from..from + len];
+        let newer = "{\"namespace\":\"daemon\",\"queries\":[{\"query\":\"receipt\"}]}\n";
+        let patch = format!(
+            "const fsPatch = require(\"fs\");\n\
+             const realRead = fsPatch.readFileSync;\n\
+             let reads = 0;\n\
+             fsPatch.readFileSync = function (p, o) {{\n\
+             \x20 if (p === process.env.LEDGER) {{ reads += 1; if (reads === 2) {{ fsPatch.writeFileSync(p, {newer:?}); return {newer:?}; }} }}\n\
+             \x20 return realRead(p, o);\n\
+             }};\n"
+        );
+        let script = format!("{patch}\n{node}");
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join("session_queries.json");
+        std::fs::write(&ledger, "{\"namespace\":\"old\",\"queries\":[]}\n").unwrap();
+
+        let status = match std::process::Command::new("node")
+            .arg("-e")
+            .arg(&script)
+            .env("LEDGER", &ledger)
+            .env("NAMESPACE", "proj")
+            .status()
+        {
+            Ok(status) => status,
+            Err(_) => {
+                eprintln!("skipped: node is not installed");
+                return;
+            }
+        };
+        assert!(status.success());
+        let text = std::fs::read_to_string(&ledger).unwrap();
+        assert!(text.contains("receipt"), "concurrent receipt lost: {text}");
+        assert!(
+            !text.contains("\"proj\""),
+            "stale snapshot was published: {text}"
+        );
+    }
+
+    /// Review of the #374 restore: the hook wrapped a bare-array ledger and
+    /// then saw `namespace === ns` and exited, so the file was never
+    /// rewritten. Runs the hook's own node and python3 snippets on a bare
+    /// array and checks the file is wrapped; skips an interpreter that is
+    /// not installed.
+    #[test]
+    fn pre_commit_ledger_rewrite_wraps_a_bare_array_ledger() {
+        fn snippet<'a>(hook: &'a str, start: &str, end: &str) -> &'a str {
+            let from = hook.find(start).expect("snippet start") + start.len();
+            let len = hook[from..].find(end).expect("snippet end");
+            &hook[from..from + len]
+        }
+        // The ledger rewrite's snippets, not the earlier namespace lookup's.
+        let anchor = "export LEDGER NAMESPACE";
+        let hook = &SCAFFOLDED_PRE_COMMIT_HOOK[SCAFFOLDED_PRE_COMMIT_HOOK
+            .find(anchor)
+            .expect("ledger rewrite")..];
+        let node = snippet(hook, "node -e '", "' 2>/dev/null");
+        let python = snippet(hook, "python3 -c '", "' 2>/dev/null");
+        let mut ran = 0;
+        for (program, flag, code) in [("node", "-e", node), ("python3", "-c", python)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = tmp.path().join("session_queries.json");
+            std::fs::write(&ledger, "[{\"query\":\"q\"}]").unwrap();
+            let status = match std::process::Command::new(program)
+                .args([flag, code])
+                .env("LEDGER", &ledger)
+                .env("NAMESPACE", "proj")
+                .status()
+            {
+                Ok(status) => status,
+                Err(_) => {
+                    eprintln!("skipped {program}: not installed");
+                    continue;
+                }
+            };
+            assert!(status.success(), "{program} snippet failed");
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+            assert_eq!(doc["namespace"], "proj", "{program} left {doc}");
+            assert_eq!(doc["queries"][0]["query"], "q", "{program} lost the rows");
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("skipped: neither node nor python3 is installed");
+        }
+    }
+
+    /// Review of the #374 restore (carried fix "the test that thought /tmp
+    /// was a worktree"): the OS temp root's marker is ignored only when the
+    /// temp root is above the walk's start, never when it is the start, and
+    /// no other folder is treated as the temp root.
+    #[test]
+    fn only_the_temp_root_above_the_start_is_skipped() {
+        let temp = std::env::temp_dir();
+        let below = tempfile::tempdir().unwrap();
+        assert!(is_shared_temp_ancestor(&temp, below.path()));
+        assert!(!is_shared_temp_ancestor(&temp, &temp));
+        assert!(!is_shared_temp_ancestor(
+            below.path(),
+            &below.path().join("x")
+        ));
+    }
+
+    /// PR #388: the walk itself, not just the helper, must ignore a stray
+    /// marker at the temp root above the start. The temp root is injected so
+    /// no test writes into the machine's real shared scratch folder.
+    #[test]
+    fn the_temp_root_walk_ignores_a_stray_marker_above_the_start() {
+        let outer = tempfile::tempdir().unwrap();
+        let outer = dunce::canonicalize(outer.path()).unwrap();
+        let temp = outer.join("fake-temp");
+        let start = temp.join("scratch").join("inner");
+        std::fs::create_dir_all(&start).unwrap();
+        // A real project above the fake temp root stops the walk, so the
+        // assertion below cannot be satisfied by a marker in the real /tmp.
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        let homes: Vec<std::path::PathBuf> = Vec::new();
+
+        std::fs::create_dir_all(temp.join(".NeuroStrata")).unwrap();
+        assert_eq!(
+            walk_to_session_marker_with_temp(&start, &homes, &temp),
+            SessionMarkerWalk::Root(outer.clone()),
+            "a stray temp-root marker captured the scratch folder"
+        );
+
+        // Naming the temp root itself keeps its own marker.
+        assert_eq!(
+            walk_to_session_marker_with_temp(&temp, &homes, &temp),
+            SessionMarkerWalk::Root(temp.clone())
+        );
+
+        // A real project marker at the temp root is still a project.
+        std::fs::write(temp.join(".NeuroStrata/config.json"), "{}").unwrap();
+        assert_eq!(
+            walk_to_session_marker_with_temp(&start, &homes, &temp),
+            SessionMarkerWalk::Root(temp.clone())
+        );
+    }
+
+    /// #380 dropped the exec bit on `scripts/hooks/pre-commit`; the
+    /// installer copies these files, and a checkout without the bit cannot
+    /// run them from `core.hooksPath`.
+    #[test]
+    fn checked_in_hooks_keep_the_exec_bit() {
+        let out = match std::process::Command::new("git")
+            .args([
+                "ls-files",
+                "-s",
+                "scripts/hooks/pre-commit",
+                "scripts/hooks/pre-push",
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+        {
+            Ok(out) if out.status.success() => out,
+            _ => {
+                eprintln!("skipped: git is unavailable or this is not a checkout");
+                return;
+            }
+        };
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = listing.lines().filter(|l| !l.trim().is_empty()).collect();
+        // A missing or untracked hook must fail, not leave the other one to
+        // carry the check (#388).
+        for expected in ["scripts/hooks/pre-commit", "scripts/hooks/pre-push"] {
+            assert!(
+                lines.iter().any(|l| l.ends_with(expected)),
+                "hook {expected} is not tracked in the index: {listing}"
+            );
+        }
+        for line in lines {
+            assert!(
+                line.starts_with("100755 "),
+                "hook lost its exec bit: {line}"
+            );
+        }
     }
 
     /// Both pre-commit hook copies take the same ledger lock the daemon uses

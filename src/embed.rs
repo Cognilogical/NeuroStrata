@@ -184,6 +184,29 @@ pub fn configured_dimensions() -> Result<usize> {
 /// Token ceiling for one embedding. Roughly covers MAX_SYMBOL_CHARS of source
 const MAX_EMBED_TOKENS: usize = 2048;
 
+/// The local model served when a configured fastembed name cannot be resolved.
+pub const FALLBACK_LOCAL_MODEL_NAME: &str = "NomicEmbedTextV15";
+
+/// The fixed width of the fallback local model.
+pub const FALLBACK_LOCAL_MODEL_DIMS: usize = 768;
+
+/// Resolve a configured local model name the way model loading does.
+///
+/// An unrecognized name serves the Nomic fallback. Pristine store-identity
+/// comparisons synthesize their configured descriptor from this same rule, so
+/// a mistyped name yields C == S under the existing strict full-descriptor
+/// equality instead of a permanent first-write refusal (issue #391). This is
+/// name resolution only: the store's own width stays the authoritative `dims`,
+/// because a config width that disagrees with the loader's real width is a
+/// genuine mismatch and must still fail closed.
+pub fn resolved_local_model_name(configured_name: &str) -> String {
+    if EmbeddingModel::from_str(configured_name).is_ok() {
+        configured_name.to_string()
+    } else {
+        FALLBACK_LOCAL_MODEL_NAME.to_string()
+    }
+}
+
 /// Forward-pass micro-batch size for local ONNX inference (`FastEmbedder::embed_batch`).
 /// `fastembed` defaults `None` to `batch_size = 256` and pads every item in a batch
 /// up to the longest item's token length (up to `MAX_EMBED_TOKENS = 2048`), which
@@ -369,21 +392,24 @@ impl FastEmbedder {
 
         // The descriptor must describe the model actually loaded: an unknown
         // configured name silently falls back to NomicEmbedTextV15 (768 dims).
-        let (model_enum, loaded_model_name, loaded_dims) =
-            match EmbeddingModel::from_str(&target_model.model_name) {
-                Ok(m) => (m, target_model.model_name.clone(), target_model.dimensions),
-                Err(_) => {
-                    tracing::warn!(
-                    "Unknown embedding model '{}', falling back to NomicEmbedTextV15 (768 dims)",
-                    target_model.model_name
-                );
-                    (
-                        EmbeddingModel::NomicEmbedTextV15,
-                        "NomicEmbedTextV15".to_string(),
-                        768,
-                    )
-                }
-            };
+        // The name comes from the shared resolver so the store's pristine-identity
+        // synthesis cannot drift away from the model this embedder serves (#391).
+        let loaded_model_name = resolved_local_model_name(&target_model.model_name);
+        let (model_enum, loaded_dims) = if loaded_model_name == target_model.model_name {
+            (
+                EmbeddingModel::from_str(&loaded_model_name)
+                    .expect("a resolved configured name must parse"),
+                target_model.dimensions,
+            )
+        } else {
+            tracing::warn!(
+                "Unknown embedding model '{}', falling back to {} ({} dims)",
+                target_model.model_name,
+                FALLBACK_LOCAL_MODEL_NAME,
+                FALLBACK_LOCAL_MODEL_DIMS
+            );
+            (EmbeddingModel::NomicEmbedTextV15, FALLBACK_LOCAL_MODEL_DIMS)
+        };
 
         let cache_dir = find_existing_cache_dir()?;
 
@@ -1041,6 +1067,20 @@ pub fn build_embedder() -> Result<Arc<dyn Embedder>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_model_name_resolution_matches_the_loader_fallback() {
+        assert_eq!(
+            super::resolved_local_model_name("UnrecognizedModel"),
+            super::FALLBACK_LOCAL_MODEL_NAME,
+            "a mistyped name resolves to the name the loader actually serves"
+        );
+        assert_eq!(
+            super::resolved_local_model_name(super::FALLBACK_LOCAL_MODEL_NAME),
+            super::FALLBACK_LOCAL_MODEL_NAME,
+            "the resolvable fallback name is stable under re-resolution"
+        );
+    }
+
     #[test]
     fn arena_default_is_disabled_with_an_explicit_opt_in() {
         for off in [None, Some("0"), Some(""), Some("no"), Some("false")] {

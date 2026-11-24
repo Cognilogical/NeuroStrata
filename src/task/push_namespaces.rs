@@ -198,6 +198,9 @@ struct Changes {
 /// - When that lists no commit (everything pushed is already on some remote,
 ///   say a branch pushed under a second name), fall back to the full history
 ///   of `<local>`: an earlier split must be gated even if the tip is unrelated.
+///
+/// Every `git log` passes `--no-show-signature`: with the user's
+/// `log.showSignature` on, git prints signature checks into the path list.
 fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Changes, String> {
     let local = r.local_sha.as_str();
     let remote_known = !is_zero_sha(&r.remote_sha)
@@ -212,6 +215,7 @@ fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Chan
             repo,
             &[
                 "log",
+                "--no-show-signature",
                 "-m",
                 "--format=",
                 "--name-only",
@@ -229,6 +233,7 @@ fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Chan
     let args: &[&str] = if commits.trim().is_empty() {
         &[
             "log",
+            "--no-show-signature",
             "-m",
             "--format=",
             "--name-only",
@@ -239,6 +244,7 @@ fn changed_paths(git: &dyn GitRunner, repo: &Path, r: &PushedRef) -> Result<Chan
     } else {
         &[
             "log",
+            "--no-show-signature",
             "-m",
             "--format=",
             "--name-only",
@@ -367,13 +373,13 @@ fn working_tree_marker(dir: &Path) -> Option<MarkerRead> {
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
-            return None
+            return None;
         }
         Err(err) => {
             return Some(MarkerRead::Unreadable {
                 path: folder,
                 reason: err.to_string(),
-            })
+            });
         }
     }
     if !crate::source_context::is_valid_marker_directory(&folder) {
@@ -554,7 +560,7 @@ impl Resolver<'_> {
                         return Err(format!(
                             "cannot read the project marker {}: {reason}",
                             path.display()
-                        ))
+                        ));
                     }
                     MarkerRead::Absent => {}
                 }
@@ -577,7 +583,7 @@ impl Resolver<'_> {
                     return Err(format!(
                         "cannot read the project marker {} in pushed commit {sha}: {reason}",
                         show_path(&marker_rel(&marker_folder))
-                    ))
+                    ));
                 }
                 None => {}
             }
@@ -620,6 +626,40 @@ fn depth(rel: &[u8]) -> usize {
     }
 }
 
+/// Namespaces recorded in the graph-lookup ledgers of the checkout and its
+/// main checkout. A migration can move the marker while in-progress tasks
+/// remain under a namespace the ledger still names; gating only the marker
+/// leaves those tasks unguarded. An absent ledger is fine; one that exists but
+/// cannot be read or parsed fails closed, because its namespace is unknown.
+fn ledger_namespaces(top: &Path, main_top: Option<&Path>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut add = |root: &Path| -> Result<(), String> {
+        let path = root.join(".NeuroStrata").join("session_queries.json");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        };
+        let value = serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+        if let Some(ns) = value
+            .get("namespace")
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::task::harness_plugins::usable_namespace)
+        {
+            if !out.contains(&ns) {
+                out.push(ns);
+            }
+        }
+        Ok(())
+    };
+    if let Some(main) = main_top {
+        add(main)?;
+    }
+    add(top)?;
+    Ok(out)
+}
+
 /// [`namespaces_for_push`] with an injected git.
 pub fn namespaces_for_push_with(
     git: &dyn GitRunner,
@@ -642,12 +682,37 @@ pub fn namespaces_for_push_with(
     if let Some(ns) = gate_ready(folder_namespace.clone()) {
         out.insert(ns);
     }
-    let resolved =
-        crate::task::harness_plugins::resolve_namespace(&top).map_err(|e| e.to_string())?;
-    let fallback =
-        gate_ready(folder_namespace.clone()).unwrap_or_else(|| resolved.namespace.clone());
-    if let Some(ns) = gate_ready(resolved.namespace) {
-        out.insert(ns);
+    // A folder name that is not a usable namespace (say "My Project") is not
+    // a reason to block the push: the hook still gates the raw folder name.
+    // An unreadable marker/config is a reason -- its namespace is unknown.
+    let resolved = match crate::task::harness_plugins::resolve_namespace(&top) {
+        Ok(resolved) => Some(resolved),
+        Err(crate::task::harness_plugins::ResolveError::NoUsableNamespace { .. }) => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let fallback = gate_ready(folder_namespace.clone())
+        .or_else(|| resolved.as_ref().map(|r| r.namespace.clone()))
+        .unwrap_or_else(|| folder_namespace.clone());
+    if let Some(resolved) = resolved {
+        // A marker migration can leave in-progress tasks under a namespace an
+        // old harness config or the ledger still names. Gate every distinct
+        // one, not just the single answer or the namespaces of changed paths.
+        for ns in std::iter::once(resolved.namespace)
+            .chain(resolved.configs.into_iter().map(|(_, ns)| ns))
+            .chain(ledger_namespaces(&own_top, main_top.as_deref())?)
+        {
+            if let Some(ns) = gate_ready(ns) {
+                out.insert(ns);
+            }
+        }
+    }
+    // Resolution lets a marker suppress unreadable configs and never includes
+    // NEUROSTRATA_NAMESPACE. The shared gate list does both, so union it here
+    // instead of letting either namespace escape the push gate.
+    for ns in crate::task::harness_plugins::gate_namespaces(&top).map_err(|e| e.to_string())? {
+        if let Some(ns) = gate_ready(ns) {
+            out.insert(ns);
+        }
     }
 
     let mut resolver = Resolver {
@@ -792,6 +857,35 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Set `NEUROSTRATA_NAMESPACE` for one test under the crate's env lock,
+    /// restoring the previous value on drop.
+    struct NamespaceEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for NamespaceEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("NEUROSTRATA_NAMESPACE", value),
+                None => std::env::remove_var("NEUROSTRATA_NAMESPACE"),
+            }
+        }
+    }
+
+    fn namespace_env(value: Option<&str>) -> NamespaceEnvGuard {
+        let lock = crate::daemon::project_root_env_test_lock();
+        let previous = std::env::var_os("NEUROSTRATA_NAMESPACE");
+        match value {
+            Some(value) => std::env::set_var("NEUROSTRATA_NAMESPACE", value),
+            None => std::env::remove_var("NEUROSTRATA_NAMESPACE"),
+        }
+        NamespaceEnvGuard {
+            _lock: lock,
+            previous,
+        }
+    }
+
     const SHA: &str = "1234567890abcdef1234567890abcdef12345678";
 
     #[test]
@@ -854,6 +948,168 @@ mod tests {
             namespaces_for_push(&dir, &deletion).unwrap(),
             set(&["marked-proj", "top-ns"])
         );
+    }
+
+    /// With `log.showSignature` on, git prints signature checks into `git log`
+    /// output, where they would read as changed paths. Every `git log` the
+    /// gate runs turns that off, on all three routes of `changed_paths`.
+    #[test]
+    fn every_path_listing_turns_off_signature_output() {
+        struct LogArgsGit(std::cell::RefCell<Vec<Vec<String>>>);
+        impl GitRunner for LogArgsGit {
+            fn git(&self, dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+                if args.first() == Some(&"log") {
+                    self.0
+                        .borrow_mut()
+                        .push(args.iter().map(|a| a.to_string()).collect());
+                }
+                SystemGit.git(dir, args)
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        let base = git(&dir, &["rev-parse", "HEAD"]);
+        write(&dir, "sub/a.rs", "a");
+        let tip = commit_all(&dir, "change");
+        let runner = LogArgsGit(Default::default());
+        // A new branch with commits on no remote.
+        namespaces_for_push_with(&runner, &dir, &new_branch(&tip, "feature")).unwrap();
+        // An update of a remote tip known locally.
+        let update = format!("refs/heads/main {tip} refs/heads/main {base}
+");
+        namespaces_for_push_with(&runner, &dir, &parse_pre_push_stdin(&update).unwrap())
+            .unwrap();
+        // A new branch whose commits are all on a remote-tracking ref.
+        git(&dir, &["update-ref", "refs/remotes/origin/main", &tip]);
+        namespaces_for_push_with(&runner, &dir, &new_branch(&tip, "other")).unwrap();
+        let logs = runner.0.into_inner();
+        assert_eq!(logs.len(), 3, "{logs:?}");
+        for args in logs {
+            assert!(args.iter().any(|a| a == "--no-show-signature"), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn every_distinct_config_and_ledger_namespace_is_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        marker(&dir, "", "marker-ns");
+        write(
+            &dir,
+            ".opencode/neurostrata-plugin.json",
+            "{\"neurostrata\":{\"namespace\":\"opencode-ns\"}}",
+        );
+        write(
+            &dir,
+            ".codex/plugins/neurostrata.json",
+            "{\"namespace\":\"codex-ns\"}",
+        );
+        write(
+            &dir,
+            ".NeuroStrata/session_queries.json",
+            "{\"namespace\":\"ledger-ns\",\"queries\":[]}",
+        );
+        let sha = commit_all(&dir, "namespaces");
+        let got = namespaces_for_push(&dir, &new_branch(&sha, "main")).unwrap();
+        assert_eq!(
+            got,
+            set(&["proj", "marker-ns", "opencode-ns", "codex-ns", "ledger-ns",]),
+            "a marker migration must not drop the namespaces older sources name"
+        );
+    }
+
+    #[test]
+    fn invalid_folder_name_does_not_fail_gate_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "My Project");
+        write(&dir, "src/a.rs", "a");
+        let sha = commit_all(&dir, "a");
+        let got = namespaces_for_push(&dir, &new_branch(&sha, "main")).unwrap();
+        assert!(
+            got.contains("My Project"),
+            "the raw folder name is still gated: {got:?}"
+        );
+    }
+
+    #[test]
+    fn unreadable_harness_config_still_blocks_gate_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        write(&dir, ".codex/plugins/neurostrata.json", "{not json");
+        let sha = commit_all(&dir, "bad config");
+        assert!(namespaces_for_push(&dir, &new_branch(&sha, "main")).is_err());
+    }
+
+    #[test]
+    fn a_marker_does_not_hide_an_unreadable_config_from_the_gate() {
+        let _env = namespace_env(None);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        marker(&dir, "", "marker-ns");
+        write(&dir, ".codex/plugins/neurostrata.json", "{not json");
+        let sha = commit_all(&dir, "marker plus broken config");
+        assert!(namespaces_for_push(&dir, &new_branch(&sha, "main")).is_err());
+    }
+
+    #[test]
+    fn linked_worktree_gates_configs_from_both_roots() {
+        let _env = namespace_env(None);
+        let tmp = tempfile::tempdir().unwrap();
+        let main = repo(tmp.path(), "proj");
+        let wt = tmp.path().join("proj-wt");
+        git(
+            &main,
+            &["worktree", "add", "-q", "-b", "wtb", wt.to_str().unwrap()],
+        );
+        write(
+            &main,
+            ".codex/plugins/neurostrata.json",
+            "{\"namespace\":\"main-ns\"}",
+        );
+        write(
+            &wt,
+            ".hermes/plugins/neurostrata.json",
+            "{\"namespace\":\"wt-ns\"}",
+        );
+        let sha = commit_all(&wt, "configs in both checkouts");
+        let got = namespaces_for_push(&wt, &new_branch(&sha, "wtb")).unwrap();
+        assert!(
+            got.contains("main-ns") && got.contains("wt-ns"),
+            "both roots must be gated: {got:?}"
+        );
+    }
+
+    #[test]
+    fn environment_namespace_is_gated_beside_the_marker() {
+        let _env = namespace_env(Some("env-ns"));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        marker(&dir, "", "marker-ns");
+        let sha = commit_all(&dir, "marker");
+        let got = namespaces_for_push(&dir, &new_branch(&sha, "main")).unwrap();
+        assert!(
+            got.contains("env-ns") && got.contains("marker-ns"),
+            "NEUROSTRATA_NAMESPACE must not escape the gate: {got:?}"
+        );
+    }
+
+    #[test]
+    fn unreadable_or_malformed_ledger_fails_the_gate() {
+        let _env = namespace_env(None);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(tmp.path(), "proj");
+        for bad in ["{not json", "\u{feff}{\"namespace\":\"ledger-ns\"}"] {
+            write(&dir, ".NeuroStrata/session_queries.json", bad);
+            let sha = commit_all(&dir, "bad ledger");
+            assert!(
+                namespaces_for_push(&dir, &new_branch(&sha, "main")).is_err(),
+                "an existing but unreadable ledger must fail closed: {bad:?}"
+            );
+        }
+        // An absent ledger stays fine.
+        std::fs::remove_file(dir.join(".NeuroStrata/session_queries.json")).unwrap();
+        let sha = commit_all(&dir, "no ledger");
+        assert!(namespaces_for_push(&dir, &new_branch(&sha, "main")).is_ok());
     }
 
     #[test]

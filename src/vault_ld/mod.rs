@@ -137,10 +137,20 @@ impl VaultNote {
 
     /// Render to YAML-LD 1.0 Markdown with frontmatter
     pub fn to_markdown(&self) -> String {
+        self.render_markdown(None)
+    }
+
+    /// Render an export stamped with its owning namespace. The stamp lets a
+    /// later export retire only its own stale notes in a shared vault.
+    pub fn to_markdown_with_namespace(&self, namespace: &str) -> String {
+        self.render_markdown(Some(namespace))
+    }
+
+    fn render_markdown(&self, namespace: Option<&str>) -> String {
         let mut out = String::new();
         out.push_str("---\n");
 
-        let frontmatter = serde_json::json!({
+        let mut frontmatter = serde_json::json!({
             "@context": self.context,
             "@id": self.id,
             "@type": self.rdf_type,
@@ -148,6 +158,9 @@ impl VaultNote {
             "canonical_sha256": self.canonical_sha256,
             "related": self.related,
         });
+        if let Some(namespace) = namespace {
+            frontmatter["namespace"] = serde_json::Value::String(namespace.to_string());
+        }
 
         let yaml = serde_yaml::to_string(&frontmatter)
             .unwrap_or_else(|_| "epistemic_tier: unknown\n".to_string());

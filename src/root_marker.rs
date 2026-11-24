@@ -17,6 +17,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Serializes marker writes and the verify-then-unlink of superseded markers
+/// within this process (Codex review 4670091232). Without a shared lock a
+/// concurrent `root set` can replace an old marker between its re-read and
+/// its removal, deleting the successor and leaving the cache unmarked.
+static MARKER_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The marker file, relative to the root it marks.
 pub const ROOT_CONFIG_REL: &str = ".NeuroStrata/config.json";
 
@@ -126,24 +132,56 @@ pub fn is_valid_namespace(ns: &str) -> bool {
 /// The marker in `dir`, if any. A UTF-8 BOM is accepted; bad JSON, an
 /// unknown `version` or a bad `namespace` is `Unreadable`, never `Absent`.
 pub fn read_marker(dir: &Path) -> MarkerRead {
-    let path = dir.join(ROOT_CONFIG_REL);
+    let reported = dir.join(ROOT_CONFIG_REL);
     let unreadable = |reason: String| MarkerRead::Unreadable {
-        path: path.clone(),
+        path: reported.clone(),
         reason,
+    };
+    let path = match contained_marker_path(dir) {
+        Ok(Some(path)) => path,
+        Ok(None) => return MarkerRead::Absent,
+        Err(reason) => return unreadable(reason),
     };
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return MarkerRead::Absent,
         Err(err) => return unreadable(err.to_string()),
     };
-    parse_marker_bytes(&path, &bytes)
+    parse_marker_bytes(&reported, &bytes)
+}
+
+/// Resolve the marker through canonical paths and refuse one that leaves
+/// `dir`. A caller may hand `read_marker` a path derived from a request; a
+/// symlinked `.NeuroStrata` or `config.json` must not turn that read into an
+/// arbitrary-file read (CodeQL rust/path-injection). `None` means the folder
+/// itself does not exist, which keeps `read_marker`'s `Absent` answer.
+fn contained_marker_path(dir: &Path) -> Result<Option<PathBuf>, String> {
+    let canonical_dir = match dir.canonicalize() {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.to_string()),
+    };
+    let candidate = canonical_dir.join(ROOT_CONFIG_REL);
+    let canonical_file = match candidate.canonicalize() {
+        Ok(path) => path,
+        // No marker yet: the non-canonical candidate still reads as Absent.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Some(candidate)),
+        Err(err) => return Err(err.to_string()),
+    };
+    if !canonical_file.starts_with(&canonical_dir) {
+        return Err("root marker resolves outside the target directory".to_string());
+    }
+    Ok(Some(canonical_file))
 }
 
 /// Applies [`read_marker`]'s rules (BOM accepted; bad JSON, an unknown
 /// `version` or a bad `namespace` is `Unreadable`) to a marker's bytes read
 /// from anywhere, such as a commit. `path` only names the file in the answer.
 pub fn parse_marker_bytes(path: &Path, bytes: &[u8]) -> MarkerRead {
-    let unreadable = |reason: String| MarkerRead::Unreadable { path: path.to_path_buf(), reason };
+    let unreadable = |reason: String| MarkerRead::Unreadable {
+        path: path.to_path_buf(),
+        reason,
+    };
     let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let cfg: RootConfig = match serde_json::from_slice(body) {
         Ok(cfg) => cfg,
@@ -161,6 +199,9 @@ pub fn parse_marker_bytes(path: &Path, bytes: &[u8]) -> MarkerRead {
 /// There is no fallback to a replacing rename, so a filesystem without hard
 /// links answers `Io`.
 pub fn write_new_marker(dir: &Path, cfg: &RootConfig) -> Result<WriteOutcome, MarkerError> {
+    let _guard = MARKER_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (tmp, target) = prepare(dir, cfg)?;
     let linked = std::fs::hard_link(&tmp, &target);
     let _ = std::fs::remove_file(&tmp);
@@ -176,6 +217,9 @@ pub fn write_new_marker(dir: &Path, cfg: &RootConfig) -> Result<WriteOutcome, Ma
 /// Writes the marker in `dir`, replacing any existing one with temp + rename
 /// so a concurrent reader sees either the old or the new file.
 pub fn replace_marker(dir: &Path, cfg: &RootConfig) -> Result<(), MarkerError> {
+    let _guard = MARKER_MUTATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (tmp, target) = prepare(dir, cfg)?;
     if let Err(err) = std::fs::rename(&tmp, &target) {
         let _ = std::fs::remove_file(&tmp);
@@ -192,6 +236,12 @@ fn prepare(dir: &Path, cfg: &RootConfig) -> Result<(PathBuf, PathBuf), MarkerErr
             std::io::ErrorKind::InvalidInput,
             reason,
         )));
+    }
+    // A marker at home, a drive root or a workspace folder above a checkout
+    // would capture projects that never opted in. Callers check this too;
+    // refuse here as well, before `.NeuroStrata` is created.
+    if let Some(reason) = refuse_root_target(dir) {
+        return Err(MarkerError::Unsafe(reason));
     }
     if !marker_dir_is_safe(dir) {
         return Err(MarkerError::Unsafe(
@@ -545,22 +595,67 @@ fn depth_below(dir: &Path, top: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// How deep `root show` looks below its folder for other markers.
-const NESTED_MARKER_MAX_DEPTH: usize = 8;
+/// How deep `root show` looks below its folder for other markers. Gate and
+/// duplicate checks call [`nested_markers_up_to`] with no cap instead.
+pub const NESTED_MARKER_MAX_DEPTH: usize = 8;
 
 /// Folders below `dir` (not `dir` itself) holding a marker, valid or not,
 /// down to [`NESTED_MARKER_MAX_DEPTH`] levels. Links are not followed, and
 /// `node_modules`, `target`, `.git` and folders holding their own `.git`
 /// (another checkout) are not entered.
 pub fn nested_markers(dir: &Path) -> Vec<(PathBuf, MarkerRead)> {
+    let mut truncated = false;
+    let found = nested_markers_up_to_report(dir, NESTED_MARKER_MAX_DEPTH, &mut truncated);
+    if truncated {
+        tracing::warn!(
+            "the marker walk below {} stopped at depth {}; use `root show` from a shallower folder to see deeper markers",
+            dir.display(),
+            NESTED_MARKER_MAX_DEPTH
+        );
+    }
+    found
+}
+
+/// Every marker below `dir`, without the display cap. Used where a missed
+/// marker would cause a duplicate write or an ungated push.
+pub fn nested_markers_uncapped(dir: &Path) -> Vec<(PathBuf, MarkerRead)> {
+    let mut truncated = false;
+    nested_markers_up_to_report(dir, usize::MAX, &mut truncated)
+}
+
+/// The gate's walk: every marker below `dir`, including unreadable ones. An
+/// unreadable marker is returned as `MarkerRead::Unreadable` so callers can
+/// fail closed instead of treating the folder as unmarked.
+pub fn nested_markers_for_gate(dir: &Path) -> Vec<(PathBuf, MarkerRead)> {
+    nested_markers_uncapped(dir)
+}
+
+/// Folders below `dir` holding a marker, down to `max_depth` levels.
+pub fn nested_markers_up_to(dir: &Path, max_depth: usize) -> Vec<(PathBuf, MarkerRead)> {
+    let mut truncated = false;
+    nested_markers_up_to_report(dir, max_depth, &mut truncated)
+}
+
+fn nested_markers_up_to_report(
+    dir: &Path,
+    max_depth: usize,
+    truncated: &mut bool,
+) -> Vec<(PathBuf, MarkerRead)> {
     let mut found = Vec::new();
-    collect_nested(dir, 1, &mut found);
+    collect_nested(dir, 1, max_depth, &mut found, truncated);
     found.sort_by(|a, b| a.0.cmp(&b.0));
     found
 }
 
-fn collect_nested(dir: &Path, depth: usize, found: &mut Vec<(PathBuf, MarkerRead)>) {
-    if depth > NESTED_MARKER_MAX_DEPTH {
+fn collect_nested(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    found: &mut Vec<(PathBuf, MarkerRead)>,
+    truncated: &mut bool,
+) {
+    if depth > max_depth {
+        *truncated = true;
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -584,7 +679,7 @@ fn collect_nested(dir: &Path, depth: usize, found: &mut Vec<(PathBuf, MarkerRead
         if let Some(hit) = marker_at(&path) {
             found.push(hit);
         }
-        collect_nested(&path, depth + 1, found);
+        collect_nested(&path, depth + 1, max_depth, found, truncated);
     }
 }
 
@@ -594,6 +689,57 @@ fn collect_nested(dir: &Path, depth: usize, found: &mut Vec<(PathBuf, MarkerRead
 pub enum CachedRoot {
     Known(Option<String>),
     Unknown(String),
+}
+
+/// Unicode formatting / directional-control characters: renderers can act on
+/// these without treating them as `char::is_control()` (which only covers Cc).
+/// Bidi overrides and isolates reorder the visible text, so a folder name or
+/// source id carrying one could forge the `root show` output.
+fn is_format_or_directional(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Marker-derived text with every control and formatting character spelled
+/// out. A folder name, namespace or source id comes from the checkout: a raw
+/// escape could repaint or forge the `root show` output.
+fn escape_control(value: impl std::fmt::Display) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x1b' => out.push_str("\\x1b"),
+            c if c.is_control() || is_format_or_directional(c) => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The text of `neurostrata-mcp root show` for the absolute folder `dir`.
@@ -610,21 +756,27 @@ pub fn format_root_show(
     cached: &CachedRoot,
     bindings: &Result<std::collections::HashMap<String, PathBuf>, String>,
 ) -> String {
-    let mut out = vec![format!("folder: {}", dir.display())];
+    let mut out = vec![format!("folder: {}", escape_control(dir.display()))];
     let mut marker_root = None;
     match found {
         Ok(Some(found)) => {
             let marker_dir = found.marker_dir();
-            out.push(format!("marker root: {}", found.root.display()));
+            out.push(format!(
+                "marker root: {}",
+                escape_control(found.root.display())
+            ));
             out.push(format!(
                 "marker file: {}",
-                marker_dir.join(ROOT_CONFIG_REL).display()
+                escape_control(marker_dir.join(ROOT_CONFIG_REL).display())
             ));
             out.push(format!("found via: {}", found.via.as_str()));
-            out.push(format!("namespace: {}", found.config.namespace));
+            out.push(format!(
+                "namespace: {}",
+                escape_control(&found.config.namespace)
+            ));
             out.push(format!(
                 "source_id: {}",
-                found.config.source_id.as_deref().unwrap_or("none")
+                escape_control(found.config.source_id.as_deref().unwrap_or("none"))
             ));
             out.push(format!(
                 "git tracks the marker: {}",
@@ -634,27 +786,36 @@ pub fn format_root_show(
         }
         Ok(None) => {
             out.push("marker root: none (no .NeuroStrata/config.json applies here)".to_string());
-            out.push(format!("namespace without a marker: {namespace}"));
+            out.push(format!(
+                "namespace without a marker: {}",
+                escape_control(namespace)
+            ));
         }
         Err((path, reason)) => {
             out.push(format!(
-                "marker root: unreadable marker {}: {reason}",
-                path.display()
+                "marker root: unreadable marker {}: {}",
+                escape_control(path.display()),
+                escape_control(reason)
             ));
-            out.push(format!("namespace without a marker: {namespace}"));
+            out.push(format!(
+                "namespace without a marker: {}",
+                escape_control(namespace)
+            ));
         }
     }
     for folder in miscased_marker_folders(dir) {
         out.push(format!(
             "note: {} is not spelled .NeuroStrata, so it is not a marker",
-            folder.display()
+            escape_control(folder.display())
         ));
     }
     match cached {
         CachedRoot::Known(Some(root)) => {
             let exists = Path::new(root).is_dir();
             out.push(format!(
-                "cached root for {namespace}: {root} ({})",
+                "cached root for {}: {} ({})",
+                escape_control(namespace),
+                escape_control(root),
                 if exists { "exists" } else { "missing" }
             ));
             // A worktree's root is cached in the main checkout's spelling.
@@ -671,8 +832,13 @@ pub fn format_root_show(
                 );
             }
         }
-        CachedRoot::Known(None) => out.push(format!("cached root for {namespace}: none")),
-        CachedRoot::Unknown(why) => out.push(format!("cached root: unknown ({why})")),
+        CachedRoot::Known(None) => out.push(format!(
+            "cached root for {}: none",
+            escape_control(namespace)
+        )),
+        CachedRoot::Unknown(why) => {
+            out.push(format!("cached root: unknown ({})", escape_control(why)))
+        }
     }
     let walk_root = marker_root.unwrap_or_else(|| dir.to_path_buf());
     let nested = nested_markers(&walk_root);
@@ -695,7 +861,7 @@ pub fn format_root_show(
     let count = nested.len() + main_only.len();
     out.push(format!(
         "nested markers below {} (up to {NESTED_MARKER_MAX_DEPTH} levels, other checkouts not entered): {}",
-        walk_root.display(),
+        escape_control(walk_root.display()),
         if count == 0 { "none".to_string() } else { count.to_string() }
     ));
     let labeled = nested.iter().map(|hit| (hit, "")).chain(
@@ -707,12 +873,13 @@ pub fn format_root_show(
         match read {
             MarkerRead::Valid(cfg) => out.push(format!(
                 "  {} (namespace {}{label})",
-                path.display(),
-                cfg.namespace
+                escape_control(path.display()),
+                escape_control(&cfg.namespace)
             )),
             MarkerRead::Unreadable { reason, .. } => out.push(format!(
-                "  {} (unreadable: {reason}{label})",
-                path.display()
+                "  {} (unreadable: {}{label})",
+                escape_control(path.display()),
+                escape_control(reason)
             )),
             MarkerRead::Absent => {}
         }
@@ -730,11 +897,16 @@ pub fn format_root_show(
                 }
             ));
             for (source_id, path) in missing {
-                out.push(format!("  {source_id} -> {}", path.display()));
+                out.push(format!(
+                    "  {} -> {}",
+                    escape_control(source_id),
+                    escape_control(path.display())
+                ));
             }
         }
         Err(why) => out.push(format!(
-            "project-context bindings to missing folders: unknown (config could not be read: {why})"
+            "project-context bindings to missing folders: unknown (config could not be read: {})",
+            escape_control(why)
         )),
     }
     out.join("\n")
@@ -743,25 +915,42 @@ pub fn format_root_show(
 /// Folders named `.NeuroStrata` in another letter case in `dir` or the
 /// folders above it that a marker walk visits (up to the checkout top, or
 /// every ancestor outside git). Such a folder is not a marker, also where
-/// the filesystem ignores case.
+/// the filesystem ignores case. In a linked worktree the main checkout is
+/// scanned too, since its markers apply to the worktree.
 fn miscased_marker_folders(dir: &Path) -> Vec<PathBuf> {
-    let top = checkout_top(dir);
+    let main = in_main_checkout(dir);
+    let extra = if main == dir { Vec::new() } else { vec![main] };
+    miscased_marker_folders_with(dir, &extra)
+}
+
+/// Scan `dir`, each of `extra_roots` (a linked worktree's main checkout) and
+/// the folders above them for misspelled marker folders.
+fn miscased_marker_folders_with(dir: &Path, extra_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    for folder in dir.ancestors() {
-        if top.as_deref().is_some_and(|top| !folder.starts_with(top)) {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(folder) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name != ".NeuroStrata" && name.eq_ignore_ascii_case(".NeuroStrata") {
-                found.push(entry.path());
+    let mut scan = |start: &Path| {
+        let top = checkout_top(start);
+        for folder in start.ancestors() {
+            if top.as_deref().is_some_and(|top| !folder.starts_with(top)) {
+                break;
+            }
+            let Ok(entries) = std::fs::read_dir(folder) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name != ".NeuroStrata" && name.eq_ignore_ascii_case(".NeuroStrata") {
+                    found.push(entry.path());
+                }
             }
         }
+    };
+    scan(dir);
+    for root in extra_roots {
+        scan(root);
     }
+    found.sort();
+    found.dedup();
     found
 }
 
@@ -1254,6 +1443,15 @@ pub async fn ensure_marker_with(
     if let Some(reason) = refuse_root_target(&target) {
         return SetupMarker::Refused(reason);
     }
+    // A marker for this namespace in a subfolder is still a marker for this
+    // namespace. Writing the checkout top's marker would split the namespace
+    // across two roots; send the caller to `root set --replace` instead.
+    let elsewhere = other_markers_for(&target, &namespace);
+    if elsewhere.first().is_some() {
+        return SetupMarker::Refused(
+            "another marker for this namespace exists in a subfolder; run `neurostrata-mcp root set <dir> --namespace <ns> --replace` to move it here",
+        );
+    }
     match setup_loss_check(registry, &namespace, cached.as_deref(), &target).await {
         Ok(ids) if !ids.is_empty() => return SetupMarker::RootChangeBlocked(ids),
         Ok(_) => {}
@@ -1322,26 +1520,34 @@ pub async fn root_set(
 }
 
 /// Same-namespace markers in `target`'s checkout (or, outside git, the first
-/// marker above it and those below it), other than `target`'s own.
-fn other_markers_for(target: &Path, namespace: &str) -> Vec<PathBuf> {
+/// marker above it and those below it), other than `target`'s own. Returns
+/// each folder with the source id its marker carried, so a caller that moves
+/// the root can re-read and refuse to delete a marker another writer changed.
+///
+/// The walk is uncapped here: a duplicate at depth 9 is still a duplicate,
+/// and missing one would write a second marker for the same namespace.
+fn other_markers_for(target: &Path, namespace: &str) -> Vec<(PathBuf, Option<String>)> {
     let mut found: Vec<(PathBuf, MarkerRead)> = Vec::new();
     match crate::paths::main_checkout_root(&target.to_string_lossy()) {
         Some(top) => {
             found.extend(marker_at(&top));
-            found.extend(nested_markers(&top));
+            found.extend(nested_markers_uncapped(&top));
         }
         None => {
             found.extend(target.ancestors().skip(1).find_map(marker_at));
-            found.extend(nested_markers(target));
+            found.extend(nested_markers_uncapped(target));
         }
     }
     found
         .into_iter()
-        .filter(|(dir, read)| {
-            matches!(read, MarkerRead::Valid(cfg) if cfg.namespace.eq_ignore_ascii_case(namespace))
-                && !same_folder(dir, target)
+        .filter_map(|(dir, read)| match read {
+            MarkerRead::Valid(cfg)
+                if cfg.namespace.eq_ignore_ascii_case(namespace) && !same_folder(&dir, target) =>
+            {
+                Some((dir, cfg.source_id))
+            }
+            _ => None,
         })
-        .map(|(dir, _)| dir)
         .collect()
 }
 
@@ -1400,7 +1606,7 @@ pub(crate) async fn root_set_with(
     }
     let old = other_markers_for(&target, ns);
     if !old.is_empty() && !args.replace {
-        let listed: Vec<String> = old.iter().map(|p| p.display().to_string()).collect();
+        let listed: Vec<String> = old.iter().map(|(p, _)| p.display().to_string()).collect();
         return Err(format!(
             "another marker for {ns} exists at {}; pass --replace to move it to {}",
             listed.join(", "),
@@ -1409,7 +1615,9 @@ pub(crate) async fn root_set_with(
     }
 
     let cached = usable_cached_root(registry, ns).await?;
-    let current = cached.clone().or_else(|| old.first().cloned());
+    let current = cached
+        .clone()
+        .or_else(|| old.first().map(|(p, _)| p.clone()));
     let lost = lost_by_change(registry, ns, current.as_deref(), &target).await?;
     let mut lines = Vec::new();
     if !lost.is_empty() {
@@ -1439,6 +1647,38 @@ pub(crate) async fn root_set_with(
         MarkerRead::Valid(cfg) if cfg.namespace.eq_ignore_ascii_case(ns) => Some(cfg),
         _ => None,
     };
+    // ROOT-6: `existing` was read before the registry/loss checks and may be
+    // stale. Re-read before rewriting a source id: a competing writer's
+    // marker must never be overwritten without an explicit --replace.
+    if cfg.is_some() {
+        match read_marker(&target) {
+            MarkerRead::Valid(current) if current.namespace.eq_ignore_ascii_case(ns) => {
+                if current.source_id != cfg.as_ref().and_then(|c| c.source_id.clone())
+                    && !args.replace
+                {
+                    return Err(format!(
+                        "{} changed while root set was running (source id now {:?}); re-run with --replace to overwrite it",
+                        target.join(ROOT_CONFIG_REL).display(),
+                        current.source_id
+                    ));
+                }
+                cfg = Some(current);
+            }
+            MarkerRead::Valid(current) if args.replace => {
+                // A different namespace now owns the file: fall through to a
+                // fresh marker rather than mutating the old config.
+                let _ = current;
+                cfg = None;
+            }
+            MarkerRead::Absent => cfg = None,
+            other => {
+                return Err(format!(
+                    "{} could not be re-read while root set was running ({other:?}); run `root show` and retry",
+                    target.join(ROOT_CONFIG_REL).display()
+                ));
+            }
+        }
+    }
     let wrote = match cfg.as_mut() {
         Some(cfg) => {
             let changed = args.source_id.is_some() && cfg.source_id != args.source_id;
@@ -1496,12 +1736,34 @@ pub(crate) async fn root_set_with(
     // 3. Remove the old markers. A concurrent `root set` may have made one
     // of them the cached root since: that marker stays, so the cache never
     // points at a folder without one.
-    for old_dir in &old {
+    for (old_dir, old_source) in &old {
         let old_file = old_dir.join(ROOT_CONFIG_REL);
+        // Async checks stay outside the critical section: a std MutexGuard is
+        // !Send and must not be held across `.await`.
         if let Ok(Some(now)) = usable_cached_root(registry, ns).await {
             if same_root(&now, old_dir) {
                 lines.push(format!(
                     "Kept the old marker {}: the cached root of {ns} is that folder again (another `root set` changed it).",
+                    old_file.display()
+                ));
+                continue;
+            }
+        }
+        // Re-read, then unlink under the same lock marker writers take, so a
+        // concurrent `root set` cannot replace this marker between the check
+        // and the removal and have its successor deleted (Codex review
+        // 4670091232).
+        let _guard = MARKER_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match read_marker(old_dir) {
+            MarkerRead::Valid(current)
+                if current.namespace.eq_ignore_ascii_case(ns)
+                    && current.source_id.as_deref() == old_source.as_deref() => {}
+            MarkerRead::Absent => continue,
+            other => {
+                lines.push(format!(
+                    "Kept the old marker {}: it changed to {other:?} since the scan (another writer used it).",
                     old_file.display()
                 ));
                 continue;
@@ -1600,6 +1862,73 @@ mod tests {
     fn write_raw(dir: &Path, body: &[u8]) {
         std::fs::create_dir_all(dir.join(".NeuroStrata")).unwrap();
         std::fs::write(dir.join(ROOT_CONFIG_REL), body).unwrap();
+    }
+
+    /// PR #388: a bidi override or isolate in a folder name / source id must
+    /// be spelled out. `char::is_control()` alone lets a renderer reorder the
+    /// forged `root show` output.
+    #[test]
+    fn escape_control_spells_out_unicode_formatting_characters() {
+        let raw = format!(
+            "ok{}\u{202e}bad\u{2066}\u{200f}\u{2028}\u{feff}\u{00ad}end",
+            '\n'
+        );
+        let escaped = escape_control(&raw);
+        for cp in [0x202e, 0x2066, 0x200f, 0x2028, 0xfeff, 0x00ad] {
+            assert!(
+                escaped.contains(&format!("\\u{{{cp:x}}}")),
+                "U+{cp:04X} not escaped in {escaped:?}"
+            );
+        }
+        assert!(!escaped.contains('\u{202e}'), "raw bidi override leaked");
+        assert!(
+            escaped.contains("ok\\n"),
+            "newline not spelled out: {escaped:?}"
+        );
+        assert!(
+            escaped.contains("bad"),
+            "ordinary text was changed: {escaped:?}"
+        );
+        assert!(escape_control("héllo").contains("héllo"));
+    }
+
+    #[test]
+    fn read_marker_refuses_a_marker_outside_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("config.json");
+        std::fs::write(&secret, br#"{"version":1,"namespace":"example-project"}"#).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let marker = tmp.path().join(ROOT_CONFIG_REL);
+        // Windows without symlink privilege cannot build this fixture; skip
+        // the symlink-specific assertion instead of panicking (Codex review
+        // 4670091413). `link_file` returns false when creation is denied.
+        if link_file(&secret, &marker) {
+            match read_marker(tmp.path()) {
+                MarkerRead::Unreadable { path, reason } => {
+                    assert_eq!(path, marker);
+                    assert!(reason.contains("outside"), "{reason}");
+                }
+                other => panic!("expected an unreadable marker, got {other:?}"),
+            }
+        }
+        // A folder that does not exist still reads as absent.
+        assert_eq!(read_marker(&tmp.path().join("missing")), MarkerRead::Absent);
+    }
+
+    #[test]
+    fn read_marker_accepts_a_canonical_path_with_parent_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(
+            tmp.path(),
+            br#"{"version":1,"namespace":"example-project"}"#,
+        );
+        let nested = tmp.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            read_marker(&nested.join("..")),
+            MarkerRead::Valid(RootConfig::new("example-project"))
+        );
     }
 
     #[test]
@@ -3190,6 +3519,44 @@ mod tests {
         }
     }
 
+    /// Codex review 4670091232: competing replaces must never leave the
+    /// cached root pointing at a folder whose marker was deleted by the other
+    /// writer's stale scan.
+    #[tokio::test]
+    async fn concurrent_replaces_never_leave_the_cached_root_unmarked() {
+        for _ in 0..20 {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = dunce::canonicalize(tmp.path()).unwrap();
+            layout(
+                &base,
+                r#"["repo git-dir", "repo/old marker:example-project", "repo/new", "repo/newer"]"#,
+            );
+            let repo = base.join("repo");
+            let (store, emb) = mock();
+            cache_root(&store, &emb, &repo.join("old")).await;
+            let registry = StoreRegistry {
+                store: store.clone(),
+                emb: Some(emb.clone()),
+                checkpoint: false,
+            };
+            let mut left = set_args(&repo.join("new"));
+            left.replace = true;
+            let mut right = set_args(&repo.join("newer"));
+            right.replace = true;
+            let (a, b) = tokio::join!(
+                root_set_with(&registry, &left, None),
+                root_set_with(&registry, &right, None)
+            );
+            // Either writer may legitimately lose the race.
+            let _ = (a, b);
+            let cached_root = cached(&store).await.expect("cached root");
+            assert!(
+                has_marker(Path::new(&cached_root)),
+                "cached root {cached_root} must still have a marker"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn root_set_reports_a_cache_it_could_not_set() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3493,5 +3860,89 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// #377 review: `prepare` refuses a workspace folder above a checkout
+    /// itself, so no write path can create a marker there.
+    #[test]
+    fn write_paths_refuse_prohibited_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = dunce::canonicalize(tmp.path()).unwrap().join("workspace");
+        std::fs::create_dir_all(workspace.join("child/.git")).unwrap();
+        if crate::paths::git_root_of_dir(&workspace.to_string_lossy()).is_some() {
+            eprintln!("skipped: the temp dir is inside a git checkout");
+            return;
+        }
+        assert!(matches!(
+            replace_marker(&workspace, &RootConfig::new("example-project")),
+            Err(MarkerError::Unsafe(_))
+        ));
+        assert!(matches!(
+            write_new_marker(&workspace, &RootConfig::new("example-project")),
+            Err(MarkerError::Unsafe(_))
+        ));
+        assert!(!workspace.join(".NeuroStrata").exists());
+    }
+
+    /// #377 review: a namespace or source id with control characters cannot
+    /// repaint or forge the `root show` text.
+    #[test]
+    fn format_root_show_escapes_control_characters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = RootConfig::new("example-project");
+        cfg.source_id = Some("evil\x1b[31m\nhost".to_string());
+        let found = Ok(Some(FoundMarker {
+            root: tmp.path().to_path_buf(),
+            config: cfg,
+            via: FoundVia::OwnCheckout,
+        }));
+        let text = format_root_show(
+            tmp.path(),
+            &found,
+            "example-project",
+            &CachedRoot::Unknown("why\x07".to_string()),
+            &Ok(std::collections::HashMap::new()),
+        );
+        assert!(!text.contains('\x1b'), "raw escape in {text:?}");
+        assert!(!text.contains('\x07'), "raw bell in {text:?}");
+        assert!(text.contains("evil\\x1b[31m\\nhost"), "{text:?}");
+    }
+
+    /// #377 review: a misspelled marker folder in a linked worktree's main
+    /// checkout is reported too.
+    #[test]
+    fn miscased_marker_folders_scans_main_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("worktree");
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(main.join(".nEuRoStRaTa")).unwrap();
+        let found = miscased_marker_folders_with(&worktree, std::slice::from_ref(&main));
+        assert!(
+            found.iter().any(|p| p == &main.join(".nEuRoStRaTa")),
+            "{found:?}"
+        );
+    }
+
+    /// Review of the #374 restore: the test above calls the `_with` form
+    /// directly. This one goes through `miscased_marker_folders`, so a
+    /// linked worktree must find its main checkout on its own.
+    #[test]
+    fn miscased_marker_folders_finds_the_main_checkout_of_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(tmp.path()).unwrap();
+        layout(
+            &base,
+            r#"["repo git-dir", "repo/.git/worktrees/wt commondir:../..",
+                "wt git-file:../repo/.git/worktrees/wt"]"#,
+        );
+        std::fs::create_dir_all(base.join("repo/.nEuRoStRaTa")).unwrap();
+        let found = miscased_marker_folders(&base.join("wt"));
+        assert!(
+            found
+                .iter()
+                .any(|p| p == &base.join("repo").join(".nEuRoStRaTa")),
+            "{found:?}"
+        );
     }
 }
