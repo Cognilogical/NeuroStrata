@@ -587,8 +587,13 @@ fn try_break_stale_lock(path: &Path) -> bool {
         {
             // As on Unix, unlink while the lock is held so no writer can take
             // the path in between. Windows allows it: the file was opened with
-            // delete sharing. Holding the lock, under the `.break` guard, the
-            // path still names the file we opened.
+            // delete sharing. Windows has no stable same-file check, so
+            // re-check staleness: if the holder unlinked the file between our
+            // open and our lock, a successor's fresh file now names the path.
+            if !is_stale(path) {
+                drop(file);
+                return false;
+            }
             let removed = fs::remove_file(path).is_ok();
             drop(file);
             removed
