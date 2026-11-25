@@ -2865,7 +2865,9 @@ function wsStripFrames(text) {
         const nextOpen = replaced.text.indexOf(legacyOpen, openIdx + 1);
         const nextEnd = replaced.text.indexOf('\n', openIdx);
         const endIdx = nextOpen === -1
-            ? (nextEnd === -1 ? replaced.text.length : nextEnd)
+            ? nextEnd === -1
+                ? replaced.text.length
+                : nextEnd
             : Math.min(nextOpen, nextEnd);
         legacyLines.push('');
         i = endIdx;
@@ -3080,7 +3082,8 @@ export async function runWorkingSetTurnBoundary(scopeInput, eventId, turnId) {
     const changed = final.fingerprint !== before.frame_fingerprint ||
         final.state.turn_seq !== before.turn_seq;
     if (before.last_injected_fingerprint !== wsEmptyFingerprint() &&
-        renderWorkingSetFrame({ ...final.state, turn_seq: before.turn_seq }, parent).fingerprint === before.last_injected_fingerprint) {
+        renderWorkingSetFrame({ ...final.state, turn_seq: before.turn_seq }, parent)
+            .fingerprint === before.last_injected_fingerprint) {
         final.state.last_injected_fingerprint = final.fingerprint;
         rememberWorkingSetInjection(scope, final.fingerprint);
     }
