@@ -23958,6 +23958,10 @@ mod tests {
             assert!(ended.get(key).is_none(), "'{key}' cleared when the task ended: {ended}");
         }
 
+        // A cleanup that never ran (the process stopped first) leaves the
+        // claim's fields behind; the snapshot must drop them on its own.
+        std::fs::write(&session_file, serde_json::to_string_pretty(&during).unwrap())
+            .expect("restore the stale session file");
         handle_get_snapshot(snapshot_args, store.clone())
             .await
             .expect("snapshot");
