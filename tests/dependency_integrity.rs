@@ -67,7 +67,9 @@ impl PartialOrd for Version {
 ///
 /// Fails closed: a missing or non-numeric component panics instead of silently
 /// defaulting to zero, so a malformed lockfile version can never satisfy a
-/// floor by accident.
+/// floor by accident. A dangling separator such as `11.0.1-` is an empty
+/// pre-release, which semver forbids; treating it as a plain release would let
+/// it clear a security floor, so it panics too.
 fn parse_version(raw: &str) -> Version {
     let cleaned = raw.trim().trim_start_matches(['v', 'V']);
     // Build metadata is everything after `+`; strip it before looking for the
@@ -92,11 +94,22 @@ fn parse_version(raw: &str) -> Version {
         panic!("version {raw:?} has more than three numeric components");
     }
 
+    let is_prerelease = match prerelease {
+        Some(pre) => {
+            assert!(
+                !pre.is_empty(),
+                "version {raw:?} has an empty pre-release suffix; semver requires at least one identifier"
+            );
+            true
+        }
+        None => false,
+    };
+
     Version {
         major: numbers[0],
         minor: numbers[1],
         patch: numbers[2],
-        is_prerelease: prerelease.is_some_and(|value| !value.is_empty()),
+        is_prerelease,
     }
 }
 
@@ -172,6 +185,20 @@ fn format_webui_entries(entries: &[(String, String)]) -> String {
         .join(", ")
 }
 
+/// Slice a top-level `## ` section out of a Markdown document.
+///
+/// The section starts at `heading` and runs to the next `## ` heading. Asserting
+/// against the returned slice keeps a marker that appears elsewhere in the
+/// document from satisfying a section-scoped contract.
+fn markdown_section<'a>(document: &'a str, heading: &str) -> Option<&'a str> {
+    let start = document.find(heading)?;
+    let body = &document[start..];
+    let end = body[heading.len()..]
+        .find("\n## ")
+        .map_or(body.len(), |offset| heading.len() + offset);
+    Some(&body[..end])
+}
+
 #[test]
 fn srctauri_cookie_is_patched() {
     const FLOOR: Version = Version::release(0, 18, 3);
@@ -232,6 +259,7 @@ fn srctauri_glib_decision_recorded() {
         return;
     }
 
+    const C2_HEADING: &str = "## 4. Contract C2";
     let spec = manifest_path(
         "docs/superpowers/specs/2026-11-24-issues-426-429-dependency-remediation-spec.md",
     );
@@ -243,22 +271,32 @@ fn srctauri_glib_decision_recorded() {
         )
     });
 
-    assert!(
-        record.contains("RUSTSEC-2024-0429"),
-        "C2 decision record {} does not name RUSTSEC-2024-0429",
-        spec.display()
-    );
-    assert!(
-        record.contains("gtk >= 0.19"),
-        "C2 decision record {} does not carry the upstream review trigger `gtk >= 0.19`",
-        spec.display()
-    );
+    let section = markdown_section(&record, C2_HEADING).unwrap_or_else(|| {
+        panic!(
+            "glib {} is below 0.20.0 and the C2 decision record {} has no {C2_HEADING:?} section",
+            versions.join(", "),
+            spec.display()
+        )
+    });
+
+    // Scope every marker to the C2 section itself; a stray mention elsewhere in
+    // the spec must not satisfy a decision-record contract.
+    for marker in ["RUSTSEC-2024-0429", "0.18.5", "2026-11-24", "gtk >= 0.19"] {
+        assert!(
+            section.contains(marker),
+            "C2 decision record {} section {C2_HEADING:?} does not contain {marker:?}",
+            spec.display()
+        );
+    }
 }
 
 #[test]
 fn webui_has_no_vulnerable_minimatch() {
-    // C3.2.1: any minimatch strictly below 11.0.1 is vulnerable, regardless of
-    // where it sits in the tree; a pre-release of 11.0.1 does not clear it.
+    // C3.2.1 / Spec §5.2.1: the affected band is [7.0.0, 11.0.1). No entry may
+    // sit inside it, and at least one must reach 11.0.1; a pre-release of
+    // 11.0.1 sorts below the release, so it does not clear the floor either.
+    // Entries below 7.0.0 are outside the advisory range by definition.
+    const MIN_AFFECTED: Version = Version::release(7, 0, 0);
     const FIXED_FLOOR: Version = Version::release(11, 0, 1);
 
     let entries = webui_versions("minimatch");
@@ -269,12 +307,15 @@ fn webui_has_no_vulnerable_minimatch() {
 
     let vulnerable: Vec<String> = entries
         .iter()
-        .filter(|(_, version)| parse_version(version) < FIXED_FLOOR)
+        .filter(|(_, version)| {
+            let parsed = parse_version(version);
+            parsed >= MIN_AFFECTED && parsed < FIXED_FLOOR
+        })
         .map(|(path, version)| format!("{path}@{version}"))
         .collect();
     assert!(
         vulnerable.is_empty(),
-        "vulnerable minimatch entries (< 11.0.1): {}",
+        "vulnerable minimatch entries in [7.0.0, 11.0.1): {}",
         vulnerable.join(", ")
     );
 
