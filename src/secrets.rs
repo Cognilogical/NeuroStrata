@@ -920,12 +920,12 @@ pub fn redact(text: &str) -> (String, Vec<&'static str>) {
             if span.is_empty() || found.len() >= MAX_REDACTIONS {
                 // Findings come in detector order, not text order, so any
                 // part of this block may still hold a secret: drop it all.
-                // Earlier blocks were scanned to the end.
+                // Later blocks are still scrubbed: one with no secret is
+                // kept, and one with a secret is dropped the same way.
                 block.clear();
                 block.push_str("[REDACTED:truncated]");
                 found.push("truncated");
-                out.push_str(&block);
-                return (out, found);
+                break;
             }
             block.replace_range(span, &format!("[REDACTED:{category}]"));
             found.push(category);

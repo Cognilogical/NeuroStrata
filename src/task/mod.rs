@@ -2310,8 +2310,8 @@ pub async fn handle_task_create(
     };
     let mut redactions = Vec::new();
     let title = match arg_str(&args, "title") {
-        Some(t) => match check_title(t) {
-            Ok(v) => redact_into(&v, &mut redactions),
+        Some(t) => match check_title(&redact_into(t, &mut redactions)) {
+            Ok(v) => v,
             Err(e) => return e,
         },
         None => {
@@ -2890,8 +2890,11 @@ pub async fn handle_task_update(
     // rewriting content AND re-embedding: a title is what search_memory reads.
     let new_title = match args.get("title") {
         None => None,
-        Some(_) => match check_title(arg_str(&args, "title").unwrap_or_default()) {
-            Ok(t) => Some(redact_into(&t, &mut redactions)),
+        Some(_) => match check_title(&redact_into(
+            arg_str(&args, "title").unwrap_or_default(),
+            &mut redactions,
+        )) {
+            Ok(t) => Some(t),
             Err(e) => return e,
         },
     };
@@ -3401,8 +3404,8 @@ pub async fn handle_task_complete(
                     return Err(format!("ERROR: follow_up_tasks[{}] must be an object.", i));
                 }
                 let title = match item.get("title").and_then(|t| t.as_str()) {
-                    Some(t) => match check_title(t) {
-                        Ok(v) => redact_into(&v, &mut redactions),
+                    Some(t) => match check_title(&redact_into(t, &mut redactions)) {
+                        Ok(v) => v,
                         Err(e) => {
                             return Err(format!("ERROR: follow_up_tasks[{}].title: {}", i, e))
                         }
@@ -10485,6 +10488,19 @@ exit 0
         let row = stored(id.clone()).await;
         assert!(!row.contains(key) && !row.contains("hunter22"), "{row}");
         assert!(row.contains("rotate [REDACTED:github_pat]"), "{row}");
+
+        // A title over the limit only because of its secret is not refused:
+        // the length is checked on the redacted title.
+        let long_title = format!("{} {key}", "x".repeat(170));
+        assert!(long_title.chars().count() > MAX_TITLE);
+        let reply = handle_task_create(
+            json!({ "namespace": "MyProj", "title": long_title }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
+        assert_eq!(parsed["redactions"], json!([{ "category": "github_pat" }]));
 
         let reply = handle_task_update(
             json!({ "namespace": "MyProj", "id": id, "title": format!("rotate {key} now") }),
