@@ -2396,12 +2396,14 @@ fn stopped_daemon_report(
                 report_in_lock_file(db_path)
             }
         })
-        // A parked report belongs to the older daemon the replacement found,
-        // never to the replacement itself: only a stopped daemon that was
-        // replaced can be that older daemon. Without `replaced`, a parking
-        // daemon that crashed would be credited with the old one's checkpoint.
+        // A parked report belongs to the older daemon that `current` (the
+        // parker) found, never to the parker itself. So skip it when the
+        // stopped daemon is `current`: a parking daemon that crashed would be
+        // credited with the old one's checkpoint. Comparing holders instead
+        // of `replaced` also covers a replacement that took the lock just
+        // after the wait loop saw it free.
         .or_else(|| {
-            if replaced {
+            if current != holder {
                 parked_legacy_report(db_path, current)
             } else {
                 None
@@ -4433,9 +4435,10 @@ mod tests {
         drop(lock); // exits without writing an exit report
         let me = LockHolder::Pid(std::process::id());
         assert_eq!(stopped_daemon_report(&db, me, me, false), "");
-        // The replaced older daemon still gets its parked report.
+        // The older daemon still gets its parked report, also when the wait
+        // loop saw the lock free before the replacement took it.
         assert_eq!(
-            stopped_daemon_report(&db, LockHolder::Legacy, me, true),
+            stopped_daemon_report(&db, LockHolder::Legacy, me, false),
             FINAL_CHECKPOINT_OK
         );
         let _ = std::fs::remove_dir_all(&root);
