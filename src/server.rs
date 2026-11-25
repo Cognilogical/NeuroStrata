@@ -23954,7 +23954,9 @@ mod tests {
         // Ending the task already clears it, before any snapshot runs: a
         // session that ends right after would otherwise leave it for the next.
         let ended = read_session();
-        assert!(ended.get("task_id").is_none(), "cleared when the task ended: {ended}");
+        for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+            assert!(ended.get(key).is_none(), "'{key}' cleared when the task ended: {ended}");
+        }
 
         handle_get_snapshot(snapshot_args, store.clone())
             .await
@@ -24095,10 +24097,12 @@ mod tests {
                 .expect("the task completes");
             }
             let after = read();
-            assert!(
-                after.get("task_id").is_none(),
-                "release={release}: the worktree's session file still names the task: {after}"
-            );
+            for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+                assert!(
+                    after.get(key).is_none(),
+                    "release={release}: the worktree's session file still has '{key}': {after}"
+                );
+            }
         }
     }
 
