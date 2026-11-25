@@ -2787,6 +2787,21 @@ pub async fn handle_task_update(
 
 // ── tool: neurostrata_task_list ────────────────────────────────────────────
 
+/// Labels a task row that is history, so nobody reads it as live work:
+/// `retired: true` once its `valid_to` has passed (superseded or expired),
+/// `archived: true` when it carries the archive tombstone. The labels stay
+/// apart because archiving leaves `valid_to` as it was.
+fn label_history_row(summary: &mut Value, payload: &MemoryPayload, retired: bool) {
+    if let Some(obj) = summary.as_object_mut() {
+        if retired {
+            obj.insert("retired".to_string(), json!(true));
+        }
+        if crate::handlers::archive_memory::is_archived(payload) {
+            obj.insert("archived".to_string(), json!(true));
+        }
+    }
+}
+
 /// Notes a `neurostrata_task_get` reply carries without `include_history`:
 /// the latest ones, where a handoff note lands.
 const TASK_GET_RECENT_NOTES: usize = 5;
@@ -2796,8 +2811,8 @@ const TASK_GET_RECENT_NOTES: usize = 5;
 /// live session holds or a finished one, takes over a stale holder, and marks
 /// the task in progress, so it cannot stand in for a read. The reply carries
 /// the latest notes and `history_count`; `include_history: true` returns every
-/// note. A retired row (superseded or expired) is still returned, labelled
-/// `retired: true`.
+/// note. A retired or archived row is still returned, labelled as
+/// [`label_history_row`] says.
 pub async fn handle_task_get(args: Value, store: Arc<dyn VectorStore>) -> String {
     let id = match required_str(&args, "id") {
         Ok(v) => v.to_string(),
@@ -2833,10 +2848,9 @@ pub async fn handle_task_get(args: Value, store: Arc<dyn VectorStore>) -> String
             );
         }
         obj.insert("history_count".to_string(), json!(notes.len()));
-        if gate::is_retired(&task.payload.metadata, chrono::Utc::now().timestamp()) {
-            obj.insert("retired".to_string(), json!(true));
-        }
     }
+    let retired = gate::is_retired(&task.payload.metadata, chrono::Utc::now().timestamp());
+    label_history_row(&mut summary, &task.payload, retired);
     encode(&json!({ "id": id, "namespace": namespace, "task": summary }))
 }
 
@@ -2936,12 +2950,8 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
             let mut summary = task_summary(&m.id, &m.payload);
             if let Some(obj) = summary.as_object_mut() {
                 obj.insert("ready".to_string(), json!(ready));
-                if retired {
-                    // A row shown as history must say so, so nobody reads it as
-                    // live claimed work.
-                    obj.insert("retired".to_string(), json!(true));
-                }
             }
+            label_history_row(&mut summary, &m.payload, retired);
             summary
         })
         .collect();
@@ -10151,18 +10161,47 @@ exit 0
     }
 
     #[tokio::test]
-    async fn task_get_labels_a_retired_task() {
+    async fn task_get_labels_a_retired_or_archived_task() {
         let store = store_with_namespace("MyProj").await;
-        let id = create_task(&store, "MyProj", "the old work", 2).await;
-        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        payload.metadata["valid_to"] = json!(chrono::Utc::now().timestamp() - 60);
-        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+        let expired = json!({ "valid_to": chrono::Utc::now().timestamp() - 60 });
+        let archived = json!({ "archived": true });
+        let mut read = Vec::new();
+        for (title, fields) in [("the old work", expired), ("the shelved work", archived)] {
+            let id = create_task(&store, "MyProj", title, 2).await;
+            let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            for (k, v) in fields.as_object().unwrap() {
+                payload.metadata[k] = v.clone();
+            }
+            store.upsert("MyProj", &id, vector, payload).await.unwrap();
+            let reply: Value = serde_json::from_str(
+                &handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store.clone()).await,
+            )
+            .expect("task_get replies with json");
+            read.push(reply);
+        }
+        assert_eq!(read[0]["task"]["retired"], json!(true), "{}", read[0]);
+        assert!(read[0]["task"].get("archived").is_none(), "{}", read[0]);
+        // Archiving leaves valid_to alone, so an archived task is labelled
+        // archived, not retired.
+        assert_eq!(read[1]["task"]["archived"], json!(true), "{}", read[1]);
+        assert!(read[1]["task"].get("retired").is_none(), "{}", read[1]);
 
-        let reply: Value = serde_json::from_str(
-            &handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store).await,
+        // task_list labels its rows with the same helper.
+        let list: Value = serde_json::from_str(
+            &handle_task_list(json!({ "namespace": "MyProj", "include_retired": true }), store).await,
         )
-        .expect("task_get replies with json");
-        assert_eq!(reply["task"]["retired"], json!(true), "{reply}");
+        .unwrap();
+        let row = |title: &str| {
+            list["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["title"] == json!(title))
+                .cloned()
+                .unwrap_or_else(|| panic!("{title} missing from {list}"))
+        };
+        assert_eq!(row("the old work")["retired"], json!(true), "{list}");
+        assert_eq!(row("the shelved work")["archived"], json!(true), "{list}");
     }
 
     #[tokio::test]
