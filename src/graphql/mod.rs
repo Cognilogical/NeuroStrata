@@ -87,6 +87,142 @@ pub fn decode_cursor(cursor: &str) -> Result<(String, String), String> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
+/// Shared typed resolver for GraphQL argument values.
+///
+/// Takes an argument's `graphql_parser` value plus the variables map and
+/// yields the typed value: a literal yields itself; a
+/// `Value::Variable(name)` yields the entry under that exact name in the
+/// variables map. Extraction is strict-and-silent, through the same
+/// `as_i64() -> as i32` / `as_str()` / `as_bool()` funnels the literal arms
+/// always used: no coercion (`"1"` and `1.5` yield `None`), no errors on
+/// mismatch, no `Value::Float` arm. An absent variable, or a provided JSON
+/// null (extraction fails on null), yields `None`, which callers treat as
+/// "argument not provided" so the current default stands. Only the
+/// variables map is read — variable-definition defaults are never read.
+pub(crate) fn resolve_arg_i32<'a>(
+    value: &graphql_parser::query::Value<'a, &'a str>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Option<i32> {
+    match value {
+        graphql_parser::query::Value::Int(num) => num.as_i64().map(|i| i as i32),
+        graphql_parser::query::Value::Variable(name) => variables
+            .get(*name)
+            .and_then(|v| v.as_i64())
+            .map(|i| i as i32),
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_arg_string<'a>(
+    value: &graphql_parser::query::Value<'a, &'a str>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    match value {
+        graphql_parser::query::Value::String(s) => Some(s.clone()),
+        graphql_parser::query::Value::Variable(name) => variables
+            .get(*name)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_arg_bool<'a>(
+    value: &graphql_parser::query::Value<'a, &'a str>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Option<bool> {
+    match value {
+        graphql_parser::query::Value::Boolean(b) => Some(*b),
+        graphql_parser::query::Value::Variable(name) => {
+            variables.get(*name).and_then(|v| v.as_bool())
+        }
+        _ => None,
+    }
+}
+
+/// ID resolver (C2): the `ID` type has two literal forms, so accept string
+/// and integer forms alike — `Value::Int` literals via `as_i64()` to a
+/// decimal string, and variables holding either a JSON string or a JSON
+/// integer.
+pub(crate) fn resolve_arg_id<'a>(
+    value: &graphql_parser::query::Value<'a, &'a str>,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    match value {
+        graphql_parser::query::Value::String(s) => Some(s.clone()),
+        graphql_parser::query::Value::Int(num) => num.as_i64().map(|i| i.to_string()),
+        graphql_parser::query::Value::Variable(name) => variables.get(*name).and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| v.as_i64().map(|i| i.to_string()))
+        }),
+        _ => None,
+    }
+}
+
+/// Path-aware extraction of a node's nested `edges` field arguments (F3).
+///
+/// A node's edge pagination state comes from that node's own nested
+/// `edges` selection, resolved through the shared T3 resolver (literal +
+/// variable forms) — never from the root field's pagination state. The
+/// walk follows the actual path per root field kind: for `memory` the
+/// nested field is a direct child of the root field's selection set; for
+/// `memories`/`search` the path is `edges { node { edges(…) } }`, where
+/// the connection-level `edges` takes no arguments in the schema and its
+/// arguments (if a query puts any there) are a decoy that must not be
+/// read. Fragment-nested `edges` fields are not read (the executor is
+/// fragment-blind everywhere; unchanged). Within one node's selection
+/// set, repeated or aliased `edges` fields collapse to a single page —
+/// the first one wins, because build_memory_node emits one fixed
+/// "edges" key and the executor merges no aliased subfields.
+///
+/// Returns `(first, after)`: each is `None` when the nested field or the
+/// argument is absent, so build_memory_node applies its own defaults
+/// (first 20; no resume) — the root's `first`/`after` are never a
+/// fallback.
+fn nested_edges_args<'a>(
+    root_field: &graphql_parser::query::Field<'a, &'a str>,
+    root_name: &str,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> (Option<i32>, Option<String>) {
+    fn first_field<'a, 'b>(
+        items: &'b [graphql_parser::query::Selection<'a, &'a str>],
+        name: &str,
+    ) -> Option<&'b graphql_parser::query::Field<'a, &'a str>> {
+        items.iter().find_map(|sel| match sel {
+            graphql_parser::query::Selection::Field(f) if f.name == name => Some(f),
+            _ => None,
+        })
+    }
+    let nested = if root_name == "memory" {
+        first_field(&root_field.selection_set.items, "edges")
+    } else {
+        first_field(&root_field.selection_set.items, "edges")
+            .and_then(|conn| first_field(&conn.selection_set.items, "node"))
+            .and_then(|node| first_field(&node.selection_set.items, "edges"))
+    };
+    let mut first = None;
+    let mut after = None;
+    if let Some(field) = nested {
+        for (k, v) in &field.arguments {
+            match *k {
+                "first" => {
+                    if let Some(n) = resolve_arg_i32(v, variables) {
+                        first = Some(n);
+                    }
+                }
+                "after" => {
+                    if let Some(s) = resolve_arg_string(v, variables) {
+                        after = Some(s);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (first, after)
+}
+
 fn sanitize_metadata(metadata: &Value, principal: &str, user_id: &str) -> Value {
     let mut cleaned = metadata.clone();
     if let Some(obj) = cleaned.as_object_mut() {
