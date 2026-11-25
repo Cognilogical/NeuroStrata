@@ -24165,6 +24165,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&proj_root);
     }
 
+    /// A task another session has taken over no longer belongs in the old
+    /// worktree's session file: neither the cleanup nor a snapshot there
+    /// keeps it, though the row is still in progress.
+    #[tokio::test]
+    async fn a_task_taken_over_by_another_session_leaves_the_old_session_file() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let created = crate::task::handle_task_create(
+            serde_json::json!({ "namespace": "probe", "title": "the work" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let created: Value = serde_json::from_str(&created).expect("create replies with json");
+        let id = created["id"].as_str().expect("id").to_string();
+        let claimed = crate::task::handle_task_claim(
+            serde_json::json!({
+                "namespace": "probe", "id": id, "assignee": "ses_b", "session_id": "ses_b"
+            }),
+            store.clone(),
+        )
+        .await;
+        assert!(claimed.contains("in_progress"), "claim failed: {claimed}");
+
+        // The old worktree's file still names the task under its old session.
+        let old_root = std::env::temp_dir().join(format!("ns-session-takeover-{}", uuid::Uuid::new_v4()));
+        let session_file = old_root.join(".NeuroStrata").join("active_session.json");
+        std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        let stale = serde_json::json!({
+            "namespace": "probe", "task_id": id, "status": "in_progress", "session_id": "ses_a"
+        });
+        let read_session = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(&session_file).expect("session file"))
+                .expect("session file is json")
+        };
+
+        std::fs::write(&session_file, stale.to_string()).unwrap();
+        crate::task::clear_finished_task_from_session_file(&store, "probe", &id, &[old_root.clone()]).await;
+        assert!(read_session().get("task_id").is_none(), "cleanup: {}", read_session());
+
+        std::fs::write(&session_file, stale.to_string()).unwrap();
+        crate::task::refresh_active_session_file(&store, &old_root, "probe", &[], None, None).await;
+        assert!(read_session().get("task_id").is_none(), "snapshot: {}", read_session());
+        let _ = std::fs::remove_dir_all(&old_root);
+    }
+
     /// The printed path carries the graph's own direction. The store's
     /// orientation fix (task neurostrata-ttmr) changes the one-hop line only
     /// for a directed relation -- RELATES_TO is drawn undirected there

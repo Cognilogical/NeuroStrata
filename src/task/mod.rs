@@ -855,11 +855,20 @@ fn seed_expand_next_hops(namespace: &str, seeds: &[String], edges: &[Value]) -> 
 static SESSION_FILE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-/// The task id the session file at `project_root` currently names, if any.
-fn session_file_task_id(project_root: &std::path::Path) -> Option<String> {
+/// The task id the session file at `project_root` currently names, if any,
+/// and the session id written with it.
+fn session_file_task_id(project_root: &std::path::Path) -> Option<(String, Option<String>)> {
     let text = std::fs::read_to_string(project_root.join(".NeuroStrata").join("active_session.json")).ok()?;
     let value = serde_json::from_str::<Value>(&text).ok()?;
-    value.get("task_id").and_then(|v| v.as_str()).map(String::from)
+    let task_id = value.get("task_id").and_then(|v| v.as_str())?.to_string();
+    Some((task_id, value.get("session_id").and_then(|v| v.as_str()).map(String::from)))
+}
+
+/// Whether a session file's claim is still the task row's claim: the same
+/// session holds it. A task another session has taken over (from another
+/// worktree) no longer belongs in this file.
+fn file_names_current_claim(file_session: Option<&str>, task: &Task) -> bool {
+    file_session == task.task_field("session_id").and_then(|v| v.as_str())
 }
 
 /// The row of task `id` read fresh: `Ok(Some)` when it is in progress and a
@@ -910,14 +919,24 @@ pub(crate) async fn refresh_active_session_file(
         return;
     }
     let mut active: Option<Task> = None;
+    // The task the file names counts only while the session that wrote it
+    // still holds the claim.
     let named = session_file_task_id(project_root);
-    for id in candidate.map(String::from).into_iter().chain(named) {
+    let candidates = candidate
+        .map(|id| (id.to_string(), None))
+        .into_iter()
+        .chain(named.map(|(id, session)| (id, Some(session))));
+    for (id, file_session) in candidates {
         match in_progress_task(store, namespace, &id).await {
-            Ok(Some(task)) => {
+            Ok(Some(task))
+                if file_session
+                    .as_ref()
+                    .is_none_or(|session| file_names_current_claim(session.as_deref(), &task)) =>
+            {
                 active = Some(task);
                 break;
             }
-            Ok(None) => {}
+            Ok(_) => {}
             Err(()) => return,
         }
     }
@@ -935,7 +954,7 @@ pub(crate) async fn refresh_active_session_file(
 /// [`caller_session_root`]), and the namespace's registered project root. So
 /// the next session start does not announce a finished task. Only a file that still names this task is
 /// touched: another task claimed since keeps its fields, and so does this
-/// task when another session has claimed it again meanwhile (its row is
+/// task when the same session has claimed it again meanwhile (its row is
 /// read again under the session file lock). Best effort.
 pub(crate) async fn clear_finished_task_from_session_file(
     store: &Arc<dyn VectorStore>,
@@ -960,7 +979,7 @@ pub(crate) async fn clear_finished_task_from_session_file(
         .filter(|root| seen.insert(root.join(".NeuroStrata")))
         .collect();
     let _session_guard = SESSION_FILE_LOCK.lock().await;
-    let mut still_in_progress: Option<bool> = None;
+    let mut row: Option<Result<Option<Task>, ()>> = None;
     for root in roots {
         let session_path = root.join(".NeuroStrata").join("active_session.json");
         let Some(mut active) = std::fs::read_to_string(&session_path)
@@ -973,16 +992,17 @@ pub(crate) async fn clear_finished_task_from_session_file(
         if active.get("task_id").and_then(|v| v.as_str()) != Some(task_id) {
             continue;
         }
-        // Read the row once, under the lock: another session may have
-        // claimed this task again meanwhile, or the read may fail.
-        if still_in_progress.is_none() {
-            still_in_progress = Some(!matches!(
-                in_progress_task(store, namespace, task_id).await,
-                Ok(None)
-            ));
+        // Read the row once, under the lock: the same session may have
+        // claimed this task again meanwhile, or the read may fail. A file
+        // whose claim another session has since taken over is cleared.
+        if row.is_none() {
+            row = Some(in_progress_task(store, namespace, task_id).await);
         }
-        if still_in_progress == Some(true) {
-            return;
+        let file_session = active.get("session_id").and_then(|v| v.as_str());
+        match row.as_ref() {
+            Some(Err(())) => return,
+            Some(Ok(Some(task))) if file_names_current_claim(file_session, task) => continue,
+            _ => {}
         }
         for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
             active.remove(key);
