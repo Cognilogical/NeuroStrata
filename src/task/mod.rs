@@ -2787,6 +2787,59 @@ pub async fn handle_task_update(
 
 // ── tool: neurostrata_task_list ────────────────────────────────────────────
 
+/// Notes a `neurostrata_task_get` reply carries without `include_history`:
+/// the latest ones, where a handoff note lands.
+const TASK_GET_RECENT_NOTES: usize = 5;
+
+/// `neurostrata_task_get`: one task's status, holder, worktree and notes,
+/// read without claiming it. A claim is a write: it is refused on a task a
+/// live session holds or a finished one, takes over a stale holder, and marks
+/// the task in progress, so it cannot stand in for a read. The reply carries
+/// the latest notes and `history_count`; `include_history: true` returns every
+/// note. A retired row (superseded or expired) is still returned, labelled
+/// `retired: true`.
+pub async fn handle_task_get(args: Value, store: Arc<dyn VectorStore>) -> String {
+    let id = match required_str(&args, "id") {
+        Ok(v) => v.to_string(),
+        Err(e) => return e,
+    };
+    let namespace = match required_str(&args, "namespace") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
+    if let Err(e) = check_namespace(&namespace) {
+        return e;
+    }
+    let include_history = args
+        .get("include_history")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let task = match load_task(&store, &namespace, &id).await {
+        Ok((task, _)) => task,
+        Err(e) => return e,
+    };
+    let mut summary = task_summary(&task.id, &task.payload);
+    let notes = summary
+        .get("history")
+        .and_then(|h| h.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(obj) = summary.as_object_mut() {
+        if !include_history && notes.len() > TASK_GET_RECENT_NOTES {
+            obj.insert(
+                "history".to_string(),
+                json!(notes[notes.len() - TASK_GET_RECENT_NOTES..]),
+            );
+        }
+        obj.insert("history_count".to_string(), json!(notes.len()));
+        if gate::is_retired(&task.payload.metadata, chrono::Utc::now().timestamp()) {
+            obj.insert("retired".to_string(), json!(true));
+        }
+    }
+    encode(&json!({ "id": id, "namespace": namespace, "task": summary }))
+}
+
 pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> String {
     let namespace = match required_str(&args, "namespace") {
         Ok(v) => v,
@@ -10006,6 +10059,68 @@ exit 0
                 "existing attribution must not be overwritten"
             );
         });
+    }
+
+    #[tokio::test]
+    async fn task_get_reads_a_task_without_claiming_it() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        handle_task_claim(
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
+            store.clone(),
+        )
+        .await;
+        for n in 0..7 {
+            handle_task_update(
+                json!({ "namespace": "MyProj", "id": id, "note": format!("note {n}"), "session_id": "ses_a" }),
+                emb(),
+                store.clone(),
+            )
+            .await;
+        }
+        let (_, before) = store.get("MyProj", &id).await.unwrap().unwrap();
+
+        let reply: Value = serde_json::from_str(
+            &handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store.clone()).await,
+        )
+        .expect("task_get replies with json");
+        let task = &reply["task"];
+        assert_eq!(task["status"], json!("in_progress"), "{reply}");
+        assert_eq!(task["assignee"], json!("agent-a"), "{reply}");
+        assert_eq!(task["session_id"], json!("ses_a"), "{reply}");
+        // The claim plus seven notes; the latest five come back, newest last.
+        assert_eq!(task["history_count"], json!(8), "{reply}");
+        let notes = task["history"].as_array().expect("history");
+        assert_eq!(notes.len(), TASK_GET_RECENT_NOTES, "{reply}");
+        assert_eq!(notes.last().unwrap()["note"], json!("note 6"), "{reply}");
+
+        let all: Value = serde_json::from_str(
+            &handle_task_get(
+                json!({ "id": id, "namespace": "MyProj", "include_history": true }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(all["task"]["history"].as_array().unwrap().len(), 8, "{all}");
+
+        // Reading changed nothing: same holder, same history, same timestamp.
+        let (_, after) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(before.metadata, after.metadata);
+    }
+
+    #[tokio::test]
+    async fn task_get_reads_a_done_task_and_refuses_a_non_task() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["task"]["status"] = json!("done");
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+        let reply = handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store.clone()).await;
+        assert!(reply.contains("\"status\": \"done\""), "{reply}");
+
+        let missing = handle_task_get(json!({ "id": "myproj-zzzz", "namespace": "MyProj" }), store).await;
+        assert!(missing.starts_with("ERROR: no task with id"), "{missing}");
     }
 
     #[tokio::test]
