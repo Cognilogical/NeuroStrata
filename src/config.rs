@@ -593,19 +593,21 @@ impl Drop for ConfigLock {
         let Some(file) = self.file.take() else {
             return;
         };
-        if !lock_nonce_is(&self.path, &self.nonce) {
-            // Somebody replaced the path; it is theirs, not ours to unlink.
-            return;
-        }
         #[cfg(unix)]
         {
+            if !lock_nonce_is(&self.path, &self.nonce) {
+                // Somebody replaced the path; it is theirs, not ours to unlink.
+                return;
+            }
             let _ = fs::remove_file(&self.path);
             drop(file); // release the advisory lock on the now-unlinked inode
         }
         #[cfg(not(unix))]
         {
-            // Windows refuses to unlink an open file: release, re-check, then
-            // remove only if the path still carries our nonce.
+            // Windows refuses to unlink an open file, and its lock also
+            // blocks reads through any other handle, so the nonce can only
+            // be checked after release: release, check, then remove only if
+            // the path still carries our nonce.
             drop(file);
             if lock_nonce_is(&self.path, &self.nonce) {
                 let _ = fs::remove_file(&self.path);
@@ -1116,8 +1118,15 @@ mod tests {
         let lock = config_path.with_file_name("config.json.lock");
         let held = ConfigLock::acquire(&config_path).unwrap();
         // A paused holder's path is overwritten by another writer. Its nonce
-        // differs, so our Drop must leave it alone.
-        fs::write(&lock, "9999:successor").unwrap();
+        // differs, so our Drop must leave it alone. Written through the held
+        // handle: on Windows the held lock refuses writes through any other.
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut file = held.file.as_ref().unwrap();
+            file.set_len(0).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(b"9999:successor").unwrap();
+        }
         drop(held);
         assert!(lock.exists(), "a foreign lock file must survive our drop");
         fs::remove_file(&lock).unwrap();
@@ -1197,8 +1206,16 @@ mod tests {
             Ok(_) => panic!("expected the contended acquisition to fail"),
             Err(err) => err,
         };
+        // On Windows the holder's lock also refuses our nonce write, so the
+        // acquisition fails one step earlier; the path must be reclaimed
+        // either way.
+        let expected = if cfg!(windows) {
+            "Could not write"
+        } else {
+            "Could not lock"
+        };
         assert!(
-            format!("{err:#}").contains("Could not lock"),
+            format!("{err:#}").contains(expected),
             "unexpected error: {err:#}"
         );
         assert!(

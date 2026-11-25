@@ -2337,7 +2337,22 @@ fn exit_report_of(db_path: &std::path::Path, pid: u32) -> Option<String> {
 /// wrote the report into the lock file. A current daemon empties the lock
 /// file when it takes the lock and never writes a report there.
 fn report_in_lock_file(db_path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(daemon_lock_path(db_path)).ok()?;
+    legacy_report(std::fs::read_to_string(daemon_lock_path(db_path)).ok()?)
+}
+
+/// The same report, read through the handle that holds the lock. On Windows
+/// the lock refuses reads through any other handle, so the daemon that just
+/// took the lock must read the file through its own.
+fn report_in_held_lock(file: &std::fs::File) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    let mut text = String::new();
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_to_string(&mut text).ok()?;
+    legacy_report(text)
+}
+
+fn legacy_report(text: String) -> Option<String> {
     (text == FINAL_CHECKPOINT_OK || text.starts_with("error: ")).then_some(text)
 }
 
@@ -2377,7 +2392,7 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
                 // the file so `shutdown` can still report it after this
                 // daemon takes over. Tagged with this daemon's id so only the
                 // replacement this stash belongs to consumes it.
-                if let Some(report) = report_in_lock_file(db_path) {
+                if let Some(report) = report_in_held_lock(&file) {
                     let parked = format!("{}\n{}", std::process::id(), report);
                     let _ = std::fs::write(daemon_legacy_report_path(db_path), parked);
                 }
@@ -3890,6 +3905,10 @@ mod tests {
     /// A valid config with no database yet and no usable embedder: the CLI's
     /// direct root registry must NOT mint a bare store, which would void the
     /// pending setup-time model choice before it is ever offered (#390).
+    /// Unix only: the test isolates the config by setting HOME, which
+    /// `dirs::home_dir` ignores on Windows, so there it would read the real
+    /// user config and could open the real store.
+    #[cfg(unix)]
     #[tokio::test]
     async fn cli_root_registry_refuses_a_pristine_store_without_an_embedder() {
         let _env = crate::daemon::project_root_env_test_lock();
