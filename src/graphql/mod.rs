@@ -295,18 +295,32 @@ fn is_retired_at(metadata: &Value, now: i64) -> bool {
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn build_memory_node(
-    id: &str,
-    namespace: &str,
-    payload: &crate::traits::MemoryPayload,
-    edges_by_source: &HashMap<String, Vec<(String, String, Option<String>)>>,
-    principal: &str,
-    variable_first: Option<i32>,
-    variable_after: Option<&str>,
-    include_archived: bool,
-    include_retired: bool,
-) -> Option<Value> {
+/// Parameters for `build_memory_node`, in the function's original
+/// parameter order.
+struct BuildMemoryNodeParams<'a> {
+    pub id: &'a str,
+    pub namespace: &'a str,
+    pub payload: &'a crate::traits::MemoryPayload,
+    pub edges_by_source: &'a HashMap<String, Vec<(String, String, Option<String>)>>,
+    pub principal: &'a str,
+    pub variable_first: Option<i32>,
+    pub variable_after: Option<&'a str>,
+    pub include_archived: bool,
+    pub include_retired: bool,
+}
+
+fn build_memory_node(params: BuildMemoryNodeParams<'_>) -> Option<Value> {
+    let BuildMemoryNodeParams {
+        id,
+        namespace,
+        payload,
+        edges_by_source,
+        principal,
+        variable_first,
+        variable_after,
+        include_archived,
+        include_retired,
+    } = params;
     if crate::registry::is_registry_row(&payload.metadata) {
         return None; // hard exclude registry even by id -> null
     }
@@ -800,17 +814,17 @@ pub fn execute_on_records(
                                 nested_edges_args(f, root_name, var_map);
                             for (id_str, payload) in records.iter() {
                                 if id_str == &id_arg && !payload.memory_type.is_empty() {
-                                    root_result = build_memory_node(
-                                        id_str,
+                                    root_result = build_memory_node(BuildMemoryNodeParams {
+                                        id: id_str,
                                         namespace,
                                         payload,
                                         edges_by_source,
                                         principal,
-                                        nested_first,
-                                        nested_after.as_deref(),
-                                        var_include_archived,
-                                        var_include_retired,
-                                    );
+                                        variable_first: nested_first,
+                                        variable_after: nested_after.as_deref(),
+                                        include_archived: var_include_archived,
+                                        include_retired: var_include_retired,
+                                    });
                                     break;
                                 }
                             }
@@ -1032,17 +1046,17 @@ pub fn execute_on_records(
                                 nested_edges_args(f, root_name, var_map);
                             let memory_edges_fixed: Vec<Value> = page.iter().map(|(id_str, payload)| {
                                 let sort_key = if root_name == "memories" { "valid_from" } else { "score" };
-                                if let Some(node) = build_memory_node(
-                                    id_str,
+                                if let Some(node) = build_memory_node(BuildMemoryNodeParams {
+                                    id: id_str,
                                     namespace,
                                     payload,
                                     edges_by_source,
                                     principal,
-                                    nested_first,
-                                    nested_after.as_deref(),
-                                    var_include_archived,
-                                    var_include_retired,
-                                ) {
+                                    variable_first: nested_first,
+                                    variable_after: nested_after.as_deref(),
+                                    include_archived: var_include_archived,
+                                    include_retired: var_include_retired,
+                                }) {
                                     json!({ "cursor": encode_cursor(sort_key, id_str), "node": node })
                                 } else {
                                     json!({ "cursor": encode_cursor(sort_key, id_str), "node": null })
