@@ -678,6 +678,25 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// Get a specific memory by its ID, returning its vector and payload
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>>;
 
+    /// The payloads of the rows in `namespaces` whose id is in `ids`, without
+    /// their vectors; ids with no row are left out. The default reads them one
+    /// by one; a store that can answer in one query should override it.
+    async fn get_many(
+        &self,
+        namespaces: &[&str],
+        ids: &[String],
+    ) -> Result<Vec<(String, MemoryPayload)>> {
+        let mut out = Vec::new();
+        for namespace in namespaces {
+            for id in ids {
+                if let Some((_, payload)) = self.get(namespace, id).await? {
+                    out.push((id.clone(), payload));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Moves a memory to another namespace by changing that one field, so its
     /// id, vector and edges stay as they were and nothing is ever deleted.
     ///
