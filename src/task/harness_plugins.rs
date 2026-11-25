@@ -219,7 +219,7 @@ main().catch((err) => {
   // Copilot CLI (its hooks file sets NEUROSTRATA_HOOK_EVENT) reads a
   // top-level decision on preToolUse and ignores hookSpecificOutput.
   if (process.env.NEUROSTRATA_HOOK_EVENT) {
-    process.stdout.write(JSON.stringify({ permissionDecision: "deny", permissionDecisionReason: reason }));
+    process.stdout.write(JSON.stringify({ permissionDecision: "deny", permissionDecisionReason: `NeuroStrata hook runner failed: ${reason}` }));
     return;
   }
   // PowerShell swallows `process.exit(2)`: the host sees a zero exit code
@@ -6135,7 +6135,7 @@ mod tests {
             "typeof mod.writeSessionHandoff === \"function\"",
             "process.env.NEUROSTRATA_HOOK_EVENT",
             "if (noDecisionEvent && !handled) {\n    await writeStdout(\"{}\");",
-            "JSON.stringify({ permissionDecision: \"deny\", permissionDecisionReason: reason })",
+            "JSON.stringify({ permissionDecision: \"deny\", permissionDecisionReason: `NeuroStrata hook runner failed: ${reason}` })",
         ] {
             assert!(CLI_HOOK_RUNNER_MJS.contains(needle), "{needle}");
         }
@@ -6298,6 +6298,13 @@ export default {};
             assert_eq!(status, 0, "{reply}");
             let decision = if top_level {
                 assert!(reply.get("hookSpecificOutput").is_none(), "{reply}");
+                // The same reason as the package runners' Copilot deny.
+                assert!(
+                    reply["permissionDecisionReason"]
+                        .as_str()
+                        .is_some_and(|r| r.starts_with("NeuroStrata hook runner failed: ")),
+                    "{reply}"
+                );
                 &reply["permissionDecision"]
             } else {
                 &reply["hookSpecificOutput"]["permissionDecision"]

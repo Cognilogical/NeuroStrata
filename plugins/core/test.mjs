@@ -3955,6 +3955,11 @@ export default { handleHookEvent };
           if (expected === 'top-level deny') {
             assert.equal(reply.permissionDecision, 'deny', what)
             assert.equal(reply.hookSpecificOutput, undefined, what)
+            assert.match(
+              reply.permissionDecisionReason,
+              /^NeuroStrata hook runner failed: /,
+              what
+            )
           } else if (expected === 'deny') {
             assert.equal(reply.hookSpecificOutput?.permissionDecision, 'deny', what)
           } else {
