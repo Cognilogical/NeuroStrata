@@ -50,6 +50,8 @@ When a task is in progress and a project root is known, `neurostrata_get_snapsho
 
 Active-task resolution is session/worktree scoped: when the daemon returns several `in_progress` tasks, resolution prefers an explicit `preferredTaskId`, then a task whose `session_id` and `worktree` both match the caller's session and project root, then a session-only match, then a worktree-only match, and only then any in-progress task. A fallback task owned by a different session does not overwrite an already known `activeSessionId`.
 
+On the daemon side, a task's stamped `worktree` is compared with the caller's root as a location, not as a string, so the verbatim `\\?\C:\...` form a claim stores on Windows matches a caller's plain `C:\...`. This applies to `neurostrata_get_snapshot`'s pick for `.NeuroStrata/active_session.json`, graph-query stamps, tool receipts, `neurostrata_guard_validate`, and the strict push gate. The snapshot names the in-progress task claimed in the caller's worktree. It never names a task claimed in another worktree or one with no worktree stamped.
+
 `neurostrata_guard_validate` unwraps a JSON shell payload via its `command`/`cmd` field when deciding whether a shell command is a read-only/verification exemption. The proxy caller's `cwd` (or `workdir`) is propagated into the guard request, with `worktree` defaulting to that `cwd`, so scope checks use the caller's real working tree rather than the daemon process directory. The `is_mutating` flag on the wire is client-supplied and untrusted; the daemon recomputes shell mutability from the raw payload and never trusts it.
 
 ## Code Intelligence & SCIP Call-Graph Tools
