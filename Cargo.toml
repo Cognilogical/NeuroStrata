@@ -146,6 +146,12 @@ protobuf = "=3.7.2"
 unidiff = "0.4"
 openssl = { version = "0.10.82", features = ["vendored"] }
 
+# Already in the tree through walkdir (same version in Cargo.lock). Windows
+# has no stable std file id; the config lock uses it to check that a path
+# still names the file it holds open.
+[target.'cfg(windows)'.dependencies]
+same-file = "1"
+
 [dev-dependencies]
 # Already in the tree as axum's transitive dependency (same version in
 # Cargo.lock); the direct dev edge only exposes `ServiceExt::oneshot`
