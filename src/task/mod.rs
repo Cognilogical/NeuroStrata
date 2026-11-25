@@ -1213,13 +1213,13 @@ const TRIMMED_CONTEXT_NOTE: &str = "rows are trimmed to a snippet. One memory's 
 
 /// The context `task_claim` and `task_create` answer with by default: the
 /// same keys, each memory row cut to id, type, location and snippet (plus a
-/// deprecation or not-definition banner when the row has one), and a `note`
-/// saying how to get more. The symbol names agents were seen using keep the
-/// field names and shapes the memory's metadata stores them under: a code
-/// row's `symbol` (a string) and a rule or fact's `refs` entries that name a
-/// symbol (`{file, symbol}` objects). The full rows carry every memory's
-/// metadata (calls lists, edge sources, source identity) and made one claim
-/// reply 61,337 characters. `include_metadata: true` returns the full
+/// deprecation or not-definition banner when the row has one), and, when
+/// anything was cut, a `note` saying how to get more. The symbol names agents
+/// were seen using keep the field names and shapes the memory's metadata
+/// stores them under: a code row's `symbol` (a string) and a rule or fact's
+/// `refs` entries that name both a file and a symbol (`{file, symbol}`
+/// objects). The full rows carry every memory's metadata (calls lists, edge
+/// sources, source identity) and made one claim reply 61,337 characters. `include_metadata: true` returns the full
 /// context. The prompt block returned as `subagent_prompt_injection` is the
 /// same either way.
 fn trimmed_graph_context(context: &Value) -> Value {
@@ -1248,10 +1248,14 @@ fn trimmed_graph_context(context: &Value) -> Value {
             .and_then(|m| m.get("refs"))
             .and_then(Value::as_array)
             .map(|refs| {
-                // Only file and symbol: a ref can also carry lines and a
-                // source_context, which are details, not the name.
+                // Only file and symbol, and only a ref that has both: a ref
+                // can also carry lines and a source_context, which are
+                // details, not the name.
                 refs.iter()
-                    .filter(|r| r.get("symbol").is_some_and(Value::is_string))
+                    .filter(|r| {
+                        r.get("file").is_some_and(Value::is_string)
+                            && r.get("symbol").is_some_and(Value::is_string)
+                    })
                     .map(|r| json!({ "file": r.get("file"), "symbol": r.get("symbol") }))
                     .collect()
             })
@@ -1263,13 +1267,18 @@ fn trimmed_graph_context(context: &Value) -> Value {
     }
     let mut out = context.clone();
     if let Some(obj) = out.as_object_mut() {
+        let mut trimmed = false;
         for key in CONTEXT_MEMORY_LISTS {
             if let Some(rows) = obj.get(key).and_then(Value::as_array) {
-                let slimmed = Value::Array(rows.iter().map(slim).collect());
-                obj.insert(key.to_string(), slimmed);
+                let slimmed: Vec<Value> = rows.iter().map(slim).collect();
+                trimmed |= slimmed != *rows;
+                obj.insert(key.to_string(), Value::Array(slimmed));
             }
         }
-        obj.insert("note".to_string(), json!(TRIMMED_CONTEXT_NOTE));
+        // The note says how to get what was cut; nothing cut, no note.
+        if trimmed {
+            obj.insert("note".to_string(), json!(TRIMMED_CONTEXT_NOTE));
+        }
     }
     out
 }
@@ -7368,6 +7377,7 @@ exit 0
         rule["metadata"]["refs"] = json!([
             { "file": "src/a.rs", "symbol": "a" },
             { "file": "src/b.rs" },
+            { "symbol": "no_file" },
             { "file": "src/c.rs", "symbol": "a", "lines": "3-9", "source_context": { "provider": "git" } }
         ]);
         let full = json!({
@@ -7427,7 +7437,7 @@ exit 0
             json!("DEPRECATED")
         );
         // The metadata's own names and shapes: a code row's `symbol` string,
-        // a rule's `refs` entries that name a symbol.
+        // a rule's `refs` entries that name a file and a symbol.
         assert_eq!(trimmed["items"][2]["symbol"], json!("parse_claim"));
         assert!(trimmed["items"][2].get("refs").is_none());
         assert_eq!(
@@ -7444,6 +7454,16 @@ exit 0
                 < serde_json::to_string(&full).unwrap().len(),
             "the trimmed form is a fraction of the full one"
         );
+    }
+
+    /// Rows that are already slim lose nothing, so the context gets no note
+    /// about how to get more.
+    #[test]
+    fn trimmed_context_adds_the_note_only_when_something_was_cut() {
+        let slim =
+            json!({"id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text"});
+        let context = json!({ "query": "q", "items": [slim], "golden_rules": [] });
+        assert_eq!(trimmed_graph_context(&context), context);
     }
 
     /// A namespace whose memories carry the heavy per-row metadata real
