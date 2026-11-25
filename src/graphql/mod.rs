@@ -1161,6 +1161,199 @@ mod tests {
     }
 
     #[test]
+    fn memory_id_via_variable_returns_record() {
+        let records = vec![(
+            "m1".into(),
+            crate::traits::MemoryPayload {
+                content: "variable target".into(),
+                user_id: "u".into(),
+                memory_type: "fact".into(),
+                agent_name: None,
+                location: "l".into(),
+                location_lines: "1".into(),
+                metadata: serde_json::json!({}),
+            },
+        )];
+        // Variable-backed id must resolve, not fall through to null.
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($id: ID!) { memory(id: $id) { id content } }",
+            Some(&json!({"id": "m1"})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap();
+        assert!(
+            !data["memory"].is_null(),
+            "variable-backed id must return the record, got: {}",
+            data
+        );
+        assert_eq!(data["memory"]["id"], "m1");
+        assert_eq!(data["memory"]["content"], "variable target");
+
+        // Literal-id control: same record via a string literal.
+        let control = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"m1\") { id content } }",
+            None,
+        );
+        assert!(control.errors.is_empty(), "errors: {:?}", control.errors);
+        let cdata = control.data.as_ref().unwrap();
+        assert_eq!(cdata["memory"]["id"], "m1");
+        assert_eq!(cdata["memory"]["content"], "variable target");
+    }
+
+    #[test]
+    fn memory_namespace_via_variable_is_resolved() {
+        let records = vec![(
+            "m1".into(),
+            crate::traits::MemoryPayload {
+                content: "x".into(),
+                user_id: "u".into(),
+                memory_type: "fact".into(),
+                agent_name: None,
+                location: "l".into(),
+                location_lines: "1".into(),
+                metadata: serde_json::json!({}),
+            },
+        )];
+        // Same-namespace variable is allowed and returns the record.
+        let ok = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($ns: String) { memory(id: \"m1\", namespace: $ns) { id } }",
+            Some(&json!({"ns": "ns"})),
+        );
+        assert!(ok.errors.is_empty(), "errors: {:?}", ok.errors);
+        assert_eq!(ok.data.as_ref().unwrap()["memory"]["id"], "m1");
+
+        // Cross-namespace variable must hit the isolation check (i.e. the
+        // variable was actually resolved, not silently ignored).
+        let bad = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($ns: String) { memory(id: \"m1\", namespace: $ns) { id } }",
+            Some(&json!({"ns": "other"})),
+        );
+        assert!(
+            bad.data.is_none(),
+            "cross-namespace variable must be rejected"
+        );
+        assert!(bad
+            .errors
+            .iter()
+            .any(|e| e.message.contains("namespace isolation violation")
+                && e.message.contains("'other'")
+                && e.message.contains("'ns'")));
+    }
+
+    #[test]
+    fn multi_field_query_returns_every_root_field() {
+        let mk = |content: &str| crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({}),
+        };
+        let records = vec![("m1".into(), mk("one")), ("m2".into(), mk("two"))];
+        // memory first, memories second: neither may replace the other.
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"m1\") { id content } memories { edges { node { id } } } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap();
+        assert_eq!(
+            data["memory"]["id"], "m1",
+            "memory field must survive: {data}"
+        );
+        assert_eq!(data["memory"]["content"], "one");
+        let rows = data["memories"]["edges"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "memories field must survive: {data}");
+
+        // Reverse order: memories first, memory second.
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories { edges { node { id } } } memory(id: \"m2\") { id content } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap();
+        let rows = data["memories"]["edges"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "memories field must survive: {data}");
+        assert_eq!(
+            data["memory"]["id"], "m2",
+            "memory field must survive: {data}"
+        );
+        assert_eq!(data["memory"]["content"], "two");
+    }
+
+    #[test]
+    fn aliased_root_fields_use_alias_as_response_key() {
+        let mk = |content: &str| crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({}),
+        };
+        let records = vec![("m1".into(), mk("one")), ("m2".into(), mk("two"))];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ one: memory(id: \"m1\") { id } two: memory(id: \"m2\") { id } missing: memory(id: \"nope\") { id } all: memories { edges { node { id } } } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap();
+        assert_eq!(
+            data["one"]["id"], "m1",
+            "first alias must key its result: {data}"
+        );
+        assert_eq!(
+            data["two"]["id"], "m2",
+            "second alias must key its own result: {data}"
+        );
+        assert!(
+            data["missing"].is_null(),
+            "a missing aliased memory must be null, not a stale earlier result: {data}"
+        );
+        let rows = data["all"]["edges"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "aliased memories field must survive: {data}");
+        assert!(
+            data.get("memory").is_none(),
+            "unaliased key must not appear: {data}"
+        );
+        assert!(
+            data.get("memories").is_none(),
+            "unaliased key must not appear: {data}"
+        );
+    }
+
+    #[test]
     fn valid_to_treated_as_retired() {
         let now = chrono::Utc::now().timestamp();
         let records = vec![(
@@ -1358,5 +1551,945 @@ mod tests {
             None,
         );
         assert!(resp.errors.iter().any(|e| e.message.contains("unknown")));
+    }
+
+    #[test]
+    fn f2_domain_registry_row_absent_from_memories_search_and_memory_by_id() {
+        let mk = |content: &str, meta: serde_json::Value| crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: meta,
+        };
+        let records = vec![
+            (
+                "reg1".into(),
+                mk(
+                    "alpha registry row",
+                    serde_json::json!({"domain_registry": {"domains": ["auth"]}}),
+                ),
+            ),
+            ("real1".into(), mk("alpha real row", serde_json::json!({}))),
+        ];
+        // memories surface
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories { edges { node { id } } } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let rows = resp.data.as_ref().unwrap()["memories"]["edges"]
+            .as_array()
+            .unwrap();
+        let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
+        assert!(
+            ids.contains(&&serde_json::json!("real1")),
+            "real row must be served in memories: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&&serde_json::json!("reg1")),
+            "domain_registry row must be absent from memories: {ids:?}"
+        );
+        // search surface
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ search(text: \"alpha\") { edges { node { id } } } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let rows = resp.data.as_ref().unwrap()["search"]["edges"]
+            .as_array()
+            .unwrap();
+        let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
+        assert!(
+            ids.contains(&&serde_json::json!("real1")),
+            "real row must be served in search: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&&serde_json::json!("reg1")),
+            "domain_registry row must be absent from search: {ids:?}"
+        );
+        // memory(id:) surface
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"reg1\") { id } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert!(
+            resp.data.as_ref().unwrap()["memory"].is_null(),
+            "domain_registry row must be null from memory(id:): {}",
+            resp.data.as_ref().unwrap()
+        );
+        // by-id control: the real row is served by id
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"real1\") { id } }",
+            None,
+        );
+        assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "real1");
+    }
+
+    #[test]
+    fn f2_domain_registry_row_consumes_no_page_slot_and_no_null_edge() {
+        let mk = |content: &str, valid_from: i64, meta: serde_json::Value| {
+            crate::traits::MemoryPayload {
+                content: content.into(),
+                user_id: "u".into(),
+                memory_type: "fact".into(),
+                agent_name: None,
+                location: "l".into(),
+                location_lines: "1".into(),
+                metadata: {
+                    let mut m = meta;
+                    m["valid_from"] = serde_json::json!(valid_from);
+                    m
+                },
+            }
+        };
+        // Registry row sorts first in memories (highest valid_from), so if it
+        // is not filtered before pagination it consumes the first page slot.
+        let records = vec![
+            (
+                "reg1".into(),
+                mk(
+                    "registry row",
+                    300,
+                    serde_json::json!({"domain_registry": {"domains": ["auth"]}}),
+                ),
+            ),
+            ("real1".into(), mk("real one", 200, serde_json::json!({}))),
+            ("real2".into(), mk("real two", 100, serde_json::json!({}))),
+        ];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories(first: 2) { edges { node { id } } } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let rows = resp.data.as_ref().unwrap()["memories"]["edges"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both real rows must fill the page: {rows:?}");
+        assert!(
+            rows.iter().all(|r| !r["node"].is_null()),
+            "no edge may carry node: null: {rows:?}"
+        );
+        let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
+        assert_eq!(
+            ids,
+            vec![&serde_json::json!("real1"), &serde_json::json!("real2")],
+            "page must contain exactly the real rows in order: {ids:?}"
+        );
+    }
+
+    // ---- T3 oracle helpers ----
+    fn t3_payload(
+        content: &str,
+        memory_type: &str,
+        metadata: serde_json::Value,
+    ) -> crate::traits::MemoryPayload {
+        crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: memory_type.into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata,
+        }
+    }
+
+    fn t3_numbered_records(n: usize) -> Vec<(String, crate::traits::MemoryPayload)> {
+        (1..=n)
+            .map(|i| {
+                (
+                    format!("m{i}"),
+                    t3_payload(
+                        "c",
+                        "fact",
+                        serde_json::json!({"valid_from": 1000 - (i as i64) * 10}),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn t3_edge_ids(resp: &GraphQLResponse, key: &str) -> Vec<String> {
+        let data = resp.data.as_ref().expect("data must be present");
+        data[key]["edges"]
+            .as_array()
+            .expect("edges must be an array")
+            .iter()
+            .map(|e| {
+                e["node"]["id"]
+                    .as_str()
+                    .expect("node id must be a string")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn t3_o1_renamed_variable_first() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({"n": 1})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories"), vec!["m1".to_string()]);
+    }
+
+    #[test]
+    fn t3_o1_renamed_variable_after() {
+        let records = t3_numbered_records(3);
+        let cursor = encode_cursor("valid_from", "m1");
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($c: String) { memories(after: $c) { edges { node { id } } } }",
+            Some(&json!({"c": cursor})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories"),
+            vec!["m2".to_string(), "m3".to_string()]
+        );
+    }
+
+    #[test]
+    fn t3_o1_renamed_variable_memory_type() {
+        let records = vec![
+            (
+                "f1".into(),
+                t3_payload("fact row", "fact", serde_json::json!({"valid_from": 200})),
+            ),
+            (
+                "n1".into(),
+                t3_payload("note row", "note", serde_json::json!({"valid_from": 100})),
+            ),
+        ];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($t: String) { memories(memoryType: $t) { edges { node { id } } } }",
+            Some(&json!({"t": "note"})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "memories"), vec!["n1".to_string()]);
+    }
+
+    #[test]
+    fn t3_o1_renamed_variable_include_archived() {
+        let records = vec![
+            (
+                "live".into(),
+                t3_payload("live", "fact", serde_json::json!({"valid_from": 200})),
+            ),
+            (
+                "arch".into(),
+                t3_payload(
+                    "archived",
+                    "fact",
+                    serde_json::json!({"valid_from": 100, "archived": true}),
+                ),
+            ),
+        ];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($a: Boolean) { memories(includeArchived: $a) { edges { node { id } } } }",
+            Some(&json!({"a": true})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let ids = t3_edge_ids(&resp, "memories");
+        assert_eq!(
+            ids.len(),
+            2,
+            "archived row must be included via renamed variable: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"arch".to_string()),
+            "archived row id missing: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn t3_o1_renamed_variable_include_retired() {
+        let now = chrono::Utc::now().timestamp();
+        let records = vec![
+            (
+                "live".into(),
+                t3_payload("live", "fact", serde_json::json!({"valid_from": 200})),
+            ),
+            (
+                "old".into(),
+                t3_payload(
+                    "retired",
+                    "fact",
+                    serde_json::json!({"valid_from": 100, "valid_to": now - 10}),
+                ),
+            ),
+        ];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($r: Boolean) { memories(includeRetired: $r) { edges { node { id } } } }",
+            Some(&json!({"r": true})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let ids = t3_edge_ids(&resp, "memories");
+        assert_eq!(
+            ids.len(),
+            2,
+            "retired row must be included via renamed variable: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"old".to_string()),
+            "retired row id missing: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn t3_o2_unreferenced_variable_first_does_not_paginate() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories { edges { node { id } } } }",
+            Some(&json!({"first": 1})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            3,
+            "unreferenced first=1 must not paginate: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn t3_o2_unreferenced_variable_include_archived_does_not_include() {
+        let records = vec![
+            (
+                "live".into(),
+                t3_payload("live", "fact", serde_json::json!({"valid_from": 200})),
+            ),
+            (
+                "arch".into(),
+                t3_payload(
+                    "archived",
+                    "fact",
+                    serde_json::json!({"valid_from": 100, "archived": true}),
+                ),
+            ),
+        ];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories { edges { node { id } } } }",
+            Some(&json!({"includeArchived": true})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories"),
+            vec!["live".to_string()],
+            "unreferenced includeArchived=true must not include archived rows: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn t3_o3_absent_referenced_variable_ignores_stray_seed() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({"first": 1})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            3,
+            "absent $n must page by default 20, not stray first=1: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn t3_o3_referenced_variable_wins_over_stray_seed() {
+        let records = t3_numbered_records(8);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({"n": 7, "first": 1})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            7,
+            "referenced $n=7 must win over stray first=1: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn t3_o4_definition_default_is_not_honoured() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($n: Int = 1) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            3,
+            "definition default must NOT be honoured; default-20 page expected: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn t3_o5_string_first_variable_yields_default() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({"n": "1"})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            3,
+            "string \"1\" must not coerce; default 20 expected: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn t3_o5_float_first_variable_yields_default() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({"n": 1.5})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories").len(),
+            3,
+            "float 1.5 must not coerce; default 20 expected: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn t3_o5_string_bool_variable_yields_default() {
+        let records = vec![
+            (
+                "live".into(),
+                t3_payload("live", "fact", serde_json::json!({"valid_from": 200})),
+            ),
+            (
+                "arch".into(),
+                t3_payload(
+                    "archived",
+                    "fact",
+                    serde_json::json!({"valid_from": 100, "archived": true}),
+                ),
+            ),
+        ];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($b: Boolean) { memories(includeArchived: $b) { edges { node { id } } } }",
+            Some(&json!({"b": "true"})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories"),
+            vec!["live".to_string()],
+            "string \"true\" must not coerce; archived stays excluded: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn t3_o6_per_field_isolation_literal_arguments() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "{ a: memories(first: 1) { edges { node { id } } } b: memories(first: 2) { edges { node { id } } } }",
+            None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "a"), vec!["m1".to_string()]);
+        assert_eq!(
+            t3_edge_ids(&resp, "b"),
+            vec!["m1".to_string(), "m2".to_string()]
+        );
+    }
+
+    #[test]
+    fn t3_o6_per_field_isolation_variable_arguments() {
+        let records = t3_numbered_records(3);
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin",
+            "query($x: Int, $y: Int) { a: memories(first: $x) { edges { node { id } } } b: memories(first: $y) { edges { node { id } } } }",
+            Some(&json!({"x": 1, "y": 2})));
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(t3_edge_ids(&resp, "a"), vec!["m1".to_string()]);
+        assert_eq!(
+            t3_edge_ids(&resp, "b"),
+            vec!["m1".to_string(), "m2".to_string()]
+        );
+    }
+
+    #[test]
+    fn t3_o7_int_literal_id_returns_row_42() {
+        let records = vec![(
+            "42".into(),
+            t3_payload("answer", "fact", serde_json::json!({})),
+        )];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: 42) { id } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            resp.data.as_ref().unwrap()["memory"]["id"],
+            "42",
+            "Int literal id must return row 42: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn t3_o7_int_variable_id_returns_row_42() {
+        let records = vec![(
+            "42".into(),
+            t3_payload("answer", "fact", serde_json::json!({})),
+        )];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($id: ID) { memory(id: $id) { id } }",
+            Some(&json!({"id": 42})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            resp.data.as_ref().unwrap()["memory"]["id"],
+            "42",
+            "integer variable id must return row 42: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn t3_o7_string_literal_id_control() {
+        let records = vec![(
+            "42".into(),
+            t3_payload("answer", "fact", serde_json::json!({})),
+        )];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"42\") { id } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(resp.data.as_ref().unwrap()["memory"]["id"], "42");
+    }
+
+    #[test]
+    fn f2_registry_true_only_row_is_served() {
+        let mk = |content: &str, meta: serde_json::Value| crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: meta,
+        };
+        let records = vec![
+            (
+                "boolreg".into(),
+                mk(
+                    "boolean registry row",
+                    serde_json::json!({"registry": true}),
+                ),
+            ),
+            ("real1".into(), mk("real row", serde_json::json!({}))),
+        ];
+        // memories surface: a registry:true-only row carries no
+        // domain_registry mark, so the canonical predicate serves it.
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memories { edges { node { id } } } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let rows = resp.data.as_ref().unwrap()["memories"]["edges"]
+            .as_array()
+            .unwrap();
+        let ids: Vec<&serde_json::Value> = rows.iter().map(|r| &r["node"]["id"]).collect();
+        assert!(
+            ids.contains(&&serde_json::json!("boolreg")),
+            "registry:true-only row must be served in memories: {ids:?}"
+        );
+        assert!(
+            ids.contains(&&serde_json::json!("real1")),
+            "real row must be served in memories: {ids:?}"
+        );
+        // memory(id:) surface
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ memory(id: \"boolreg\") { id } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            resp.data.as_ref().unwrap()["memory"]["id"],
+            "boolreg",
+            "registry:true-only row must be served by id: {}",
+            resp.data.as_ref().unwrap()
+        );
+    }
+
+    // ---- T4 (F3) nested edges oracles ----
+    // A node's edges live in `edges_by_source`; the node's JSON carries one
+    // fixed "edges" connection object ({ edges, pageInfo }) built by
+    // build_memory_node. Nested pagination state must come from the node's
+    // own nested `edges` field arguments, never from the root field's.
+
+    fn t4_payload(valid_from: i64) -> crate::traits::MemoryPayload {
+        t3_payload("c", "fact", serde_json::json!({"valid_from": valid_from}))
+    }
+
+    fn t4_edges_map(
+        n: usize,
+    ) -> std::collections::HashMap<String, Vec<(String, String, Option<String>)>> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "m1".to_string(),
+            (0..n)
+                .map(|i| (format!("t{i}"), "rel".to_string(), None))
+                .collect::<Vec<_>>(),
+        );
+        m
+    }
+
+    fn t4_targets(node: &serde_json::Value) -> Vec<String> {
+        node["edges"]["edges"]
+            .as_array()
+            .expect("node edges must be an array")
+            .iter()
+            .map(|e| {
+                e["targetId"]
+                    .as_str()
+                    .expect("targetId must be a string")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn t4_o1_memory_nested_first_and_after_resume() {
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memory(id: \"m1\") { edges(first: 1) { edges { targetId } pageInfo { hasNextPage endCursor } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memory"];
+        assert_eq!(t4_targets(node), vec!["t0".to_string()]);
+        assert_eq!(node["edges"]["pageInfo"]["hasNextPage"], json!(true));
+        let end_cursor = node["edges"]["pageInfo"]["endCursor"]
+            .as_str()
+            .expect("endCursor must be present when hasNextPage")
+            .to_string();
+        assert_eq!(end_cursor, encode_cursor("edge", "m1:0"));
+        let q2 = format!("{{ memory(id: \"m1\") {{ edges(first: 1, after: \"{end_cursor}\") {{ edges {{ targetId }} }} }} }}");
+        let resp2 = execute_on_records(&records, &edges, "ns", "admin", &q2, None);
+        assert!(resp2.errors.is_empty(), "errors: {:?}", resp2.errors);
+        assert_eq!(
+            t4_targets(&resp2.data.as_ref().unwrap()["memory"]),
+            vec!["t1".to_string()]
+        );
+    }
+
+    #[test]
+    fn t4_o2_connection_depth_nested_first() {
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(
+            &records,
+            &edges,
+            "ns",
+            "admin",
+            "{ memories { edges { node { id edges(first: 1) { edges { targetId } } } } } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
+        assert_eq!(t4_targets(node), vec!["t0".to_string()]);
+    }
+
+    #[test]
+    fn t4_o3_connection_level_edges_args_are_a_decoy() {
+        // edges(first: 99) sits on the CONNECTION-level field, which takes no
+        // arguments in the schema; the node's own edges(first: 2) governs.
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memories { edges(first: 99) { node { id edges(first: 2) { edges { targetId } } } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
+        assert_eq!(t4_targets(node), vec!["t0".to_string(), "t1".to_string()]);
+    }
+
+    #[test]
+    fn t4_o3b_connection_decoy_without_nested_args_keeps_default_page() {
+        // PIN: the plan's literal oracle-3 configuration — connection-level
+        // edges(first: 99) present with nested edges arguments ABSENT.
+        // Green pre- and post-fix by construction; guards against a future
+        // "nested-else-connection-fallback" regression, which would read
+        // the connection-level first: 99 and return 25 instead of the
+        // schema-default page of 20.
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(
+            &records,
+            &edges,
+            "ns",
+            "admin",
+            "{ memories { edges(first: 99) { node { id edges { edges { targetId } } } } } }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
+        let targets = t4_targets(node);
+        assert_eq!(
+            targets.len(),
+            20,
+            "expected the default page of 20, got {}: {targets:?}",
+            targets.len()
+        );
+        assert_eq!(targets.first().map(String::as_str), Some("t0"));
+        assert_eq!(targets.last().map(String::as_str), Some("t19"));
+    }
+
+    #[test]
+    fn t4_o4_aliased_memory_roots_extract_independently() {
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ a: memory(id: \"m1\") { edges(first: 1) { edges { targetId } } } b: memory(id: \"m1\") { edges(first: 3) { edges { targetId } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap();
+        assert_eq!(t4_targets(&data["a"]), vec!["t0".to_string()]);
+        assert_eq!(
+            t4_targets(&data["b"]),
+            vec!["t0".to_string(), "t1".to_string(), "t2".to_string()]
+        );
+    }
+
+    #[test]
+    fn t4_o5_root_state_isolation_and_memory_root_args_inert() {
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        // Root first: 1 must not cap the node's nested edges(first: 2).
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memories(first: 1) { edges { node { id edges(first: 2) { edges { targetId } pageInfo { hasNextPage endCursor } } } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
+        assert_eq!(t4_targets(node), vec!["t0".to_string(), "t1".to_string()]);
+        let end_cursor = node["edges"]["pageInfo"]["endCursor"]
+            .as_str()
+            .expect("endCursor must be present when hasNextPage")
+            .to_string();
+        // Nested after carrying that genuine edge cursor resumes at t2.
+        let q2 = format!("{{ memories(first: 1) {{ edges {{ node {{ id edges(first: 2, after: \"{end_cursor}\") {{ edges {{ targetId }} }} }} }} }} }}");
+        let resp2 = execute_on_records(&records, &edges, "ns", "admin", &q2, None);
+        assert!(resp2.errors.is_empty(), "errors: {:?}", resp2.errors);
+        let node2 = &resp2.data.as_ref().unwrap()["memories"]["edges"][0]["node"];
+        assert_eq!(t4_targets(node2), vec!["t2".to_string(), "t3".to_string()]);
+        // Inertness leg: schema-invalid first: 2 ON the memory root itself no
+        // longer caps the node's edges — with no nested arguments the node
+        // serves its edges under the default 20 (all 5 here).
+        let edges5 = t4_edges_map(5);
+        let resp3 = execute_on_records(
+            &records,
+            &edges5,
+            "ns",
+            "admin",
+            "{ memory(id: \"m1\", first: 2) { edges { edges { targetId } } } }",
+            None,
+        );
+        assert!(resp3.errors.is_empty(), "errors: {:?}", resp3.errors);
+        assert_eq!(
+            t4_targets(&resp3.data.as_ref().unwrap()["memory"]),
+            vec![
+                "t0".to_string(),
+                "t1".to_string(),
+                "t2".to_string(),
+                "t3".to_string(),
+                "t4".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn t4_o6_cursor_provenance_edge_resumes_root_restarts() {
+        let records = vec![
+            ("m1".into(), t4_payload(100)),
+            ("m2".into(), t4_payload(50)),
+        ];
+        let edges = t4_edges_map(25);
+        // Page 1 via the nested selection.
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memory(id: \"m1\") { edges(first: 2) { edges { targetId } pageInfo { endCursor } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let node = &resp.data.as_ref().unwrap()["memory"];
+        assert_eq!(t4_targets(node), vec!["t0".to_string(), "t1".to_string()]);
+        let edge_cursor = node["edges"]["pageInfo"]["endCursor"]
+            .as_str()
+            .expect("endCursor must be present when hasNextPage")
+            .to_string();
+        assert_eq!(edge_cursor, encode_cursor("edge", "m1:1"));
+        // Page 2 via page 1's EDGE endCursor resumes correctly.
+        let q2 = format!("{{ memory(id: \"m1\") {{ edges(first: 2, after: \"{edge_cursor}\") {{ edges {{ targetId }} }} }} }}");
+        let resp2 = execute_on_records(&records, &edges, "ns", "admin", &q2, None);
+        assert!(resp2.errors.is_empty(), "errors: {:?}", resp2.errors);
+        assert_eq!(
+            t4_targets(&resp2.data.as_ref().unwrap()["memory"]),
+            vec!["t2".to_string(), "t3".to_string()]
+        );
+        // The ROOT connection's endCursor lives in a different cursor domain.
+        let resp_root = execute_on_records(
+            &records,
+            &edges,
+            "ns",
+            "admin",
+            "{ memories(first: 1) { pageInfo { hasNextPage endCursor } } }",
+            None,
+        );
+        assert!(
+            resp_root.errors.is_empty(),
+            "errors: {:?}",
+            resp_root.errors
+        );
+        let root_cursor = resp_root.data.as_ref().unwrap()["memories"]["pageInfo"]["endCursor"]
+            .as_str()
+            .expect("root endCursor must be present when hasNextPage")
+            .to_string();
+        assert_ne!(root_cursor, edge_cursor);
+        // Feeding it as nested after restarts silently at the first edge.
+        let q3 = format!("{{ memory(id: \"m1\") {{ edges(first: 2, after: \"{root_cursor}\") {{ edges {{ targetId }} }} }} }}");
+        let resp3 = execute_on_records(&records, &edges, "ns", "admin", &q3, None);
+        assert!(resp3.errors.is_empty(), "errors: {:?}", resp3.errors);
+        assert_eq!(
+            t4_targets(&resp3.data.as_ref().unwrap()["memory"]),
+            vec!["t0".to_string(), "t1".to_string()]
+        );
+    }
+
+    #[test]
+    fn t4_o7_variable_form_nested_first() {
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(
+            &records,
+            &edges,
+            "ns",
+            "admin",
+            "query($n: Int) { memory(id: \"m1\") { edges(first: $n) { edges { targetId } } } }",
+            Some(&json!({"n": 1})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t4_targets(&resp.data.as_ref().unwrap()["memory"]),
+            vec!["t0".to_string()]
+        );
+    }
+
+    #[test]
+    fn t4_o8_within_node_aliased_edges_collapse_first_wins() {
+        // One node selection carrying edges(first: 1) and an aliased
+        // edges(first: 3): build_memory_node emits a single "edges" page, so
+        // the two fields collapse to one page — first wins.
+        let records = vec![("m1".into(), t4_payload(100))];
+        let edges = t4_edges_map(25);
+        let resp = execute_on_records(&records, &edges, "ns", "admin",
+            "{ memory(id: \"m1\") { edges(first: 1) { edges { targetId } } e2: edges(first: 3) { edges { targetId } } } }", None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t4_targets(&resp.data.as_ref().unwrap()["memory"]),
+            vec!["t0".to_string()]
+        );
     }
 }
