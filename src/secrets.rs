@@ -456,7 +456,7 @@ impl SecretScanner {
         // fall through to the weak-password check below.
         for cap in self.he_re.captures_iter(text) {
             let token = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            if is_placeholder(&token.to_ascii_lowercase()) || is_redaction_marker(text, &cap) {
+            if is_placeholder(&token.to_ascii_lowercase()) || is_redaction_marker(text, &cap, 1) {
                 continue;
             }
             if meets_high_entropy(token) {
@@ -472,7 +472,7 @@ impl SecretScanner {
             let value = cap.get(2).map(|m| m.as_str()).unwrap_or("");
             let value_lower = value.to_ascii_lowercase();
 
-            if is_placeholder(&value_lower) || is_redaction_marker(text, &cap) {
+            if is_placeholder(&value_lower) || is_redaction_marker(text, &cap, 2) {
                 continue;
             }
 
@@ -705,15 +705,18 @@ fn shannon_entropy_bits_per_char(s: &str) -> Option<f64> {
 /// The whole value an assignment pattern matched the start of. The patterns
 /// stop at characters such as `;`, `,`, `}` or `/` even inside quotes, so
 /// redacting only the match would keep the rest of the secret: a quoted value
-/// runs to its closing quote (a backslash-escaped quote does not close it) or
-/// the end of the line, an unquoted one to the next whitespace.
+/// runs to its closing quote, across lines (a pasted key block), or to the end
+/// of the line when it has none; a backslash-escaped quote does not close it.
+/// An unquoted value runs to the next whitespace.
 fn whole_value_span(text: &str, matched: std::ops::Range<usize>) -> std::ops::Range<usize> {
     let after = &text[matched.end..];
     let line_end = after.find(['\n', '\r']).unwrap_or(after.len());
     let end = match text[..matched.start].chars().last() {
         Some(quote @ ('"' | '\'')) => {
-            let mut escaped = text[..matched.end].ends_with('\\');
-            after[..line_end]
+            let backslashes = text[..matched.end].len()
+                - text[..matched.end].trim_end_matches('\\').len();
+            let mut escaped = backslashes % 2 == 1;
+            after
                 .char_indices()
                 .find(|&(_, c)| {
                     let closes = c == quote && !escaped;
@@ -727,12 +730,12 @@ fn whole_value_span(text: &str, matched: std::ops::Range<usize>) -> std::ops::Ra
     matched.start..matched.end + end
 }
 
-/// Whether an assignment's whole value (capture group 1 or 2, extended by
+/// Whether an assignment's whole value (capture group `group`, extended by
 /// `whole_value_span`) is exactly a marker `redact` wrote, so scrubbed text
 /// scrubs to itself. Only the scanner's own categories count, and only the
 /// whole value: `[REDACTED:jwt]tail` is still scanned as a secret.
-fn is_redaction_marker(text: &str, cap: &regex::Captures) -> bool {
-    let Some(value) = cap.get(cap.len() - 1) else {
+fn is_redaction_marker(text: &str, cap: &regex::Captures, group: usize) -> bool {
+    let Some(value) = cap.get(group) else {
         return false;
     };
     let whole = text[whole_value_span(text, value.range())].to_ascii_lowercase();
@@ -888,8 +891,8 @@ const REDACTION_CATEGORIES: &[&str] = &[
 ];
 
 /// Upper bound on secrets replaced one by one in a text, so a pathological
-/// input cannot loop for long. Past it, the rest of the text from the next
-/// secret on is replaced by one `[REDACTED:truncated]`, never kept unscanned.
+/// input cannot loop for long. Past it, the whole block being scrubbed (up to
+/// 256 KB) is replaced by one `[REDACTED:truncated]`, never kept unscanned.
 const MAX_REDACTIONS: usize = 256;
 
 /// Replaces every secret the scanner finds in `text` with
@@ -1353,6 +1356,9 @@ mod tests {
         for (text, kept) in [
             (r#"set password="abcd;efgh ij" now"#, r#"set password="[REDACTED:password]" now"#),
             (r#"set password="abcd\"e;f" now"#, r#"set password="[REDACTED:password]" now"#),
+            (r#"set password="abcd\\" now"#, r#"set password="[REDACTED:password]" now"#),
+            ("set password=\"abcd\nefgh\r\nijkl\" now", "set password=\"[REDACTED:password]\" now"),
+            ("set password=\"abcd;ef\nnext line", "set password=\"[REDACTED:password]\nnext line"),
             ("set password='wxyz,12}' now", "set password='[REDACTED:password]' now"),
             ("set password=abcd;efgh now", "set password=[REDACTED:password] now"),
         ] {
