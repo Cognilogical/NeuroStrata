@@ -5,9 +5,12 @@
 //! invoke no external tools, so they are deterministic on every platform and
 //! can run as the permanent `dependency-advisory` eval suite.
 //!
-//! Version checks compare numeric semver tuples, never strings, because
-//! `"0.18.10" < "0.18.9"` is true lexically but false semantically.
+//! Version checks compare parsed semver tuples, never strings, because
+//! `"0.18.10" < "0.18.9"` is true lexically but false semantically. A
+//! pre-release also sorts strictly below the release with the same triple, so
+//! `11.0.1-rc.1` can never satisfy a `>= 11.0.1` security floor.
 
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,23 +20,84 @@ fn manifest_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
-/// Parse the leading numeric `major.minor.patch` components of a version.
+/// A parsed `major.minor.patch[-prerelease]` version.
 ///
-/// Pre-release/build suffixes are ignored (`2.0.0-alpha.6` -> `(2, 0, 0)`),
-/// and missing components default to zero. Every version in this contract is
-/// a plain `x.y.z`, but the parser stays total so a future advisory floor
-/// cannot panic the suite.
-fn version_tuple(raw: &str) -> (u64, u64, u64) {
-    let mut parts = [0_u64; 3];
-    let cleaned = raw.trim().trim_start_matches(['v', 'V']);
-    for (slot, component) in cleaned.split('.').take(3).enumerate() {
-        let digits: String = component
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        parts[slot] = digits.parse().unwrap_or(0);
+/// Ordering compares the numeric triple first. When the triples are equal, a
+/// pre-release sorts below the release: `11.0.1-rc.1 < 11.0.1`. Build metadata
+/// (`+build`) does not make a version a pre-release and is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    is_prerelease: bool,
+}
+
+impl Version {
+    /// A plain release version, used for the contract floors.
+    const fn release(major: u64, minor: u64, patch: u64) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+            is_prerelease: false,
+        }
     }
-    (parts[0], parts[1], parts[2])
+}
+
+impl Ord for Version {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(|| {
+                // `false < true` would put the release first; reverse it so a
+                // pre-release is strictly less than its corresponding release.
+                self.is_prerelease.cmp(&other.is_prerelease).reverse()
+            })
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Parse `major.minor.patch` plus an optional pre-release suffix.
+///
+/// Fails closed: a missing or non-numeric component panics instead of silently
+/// defaulting to zero, so a malformed lockfile version can never satisfy a
+/// floor by accident.
+fn parse_version(raw: &str) -> Version {
+    let cleaned = raw.trim().trim_start_matches(['v', 'V']);
+    // Build metadata is everything after `+`; strip it before looking for the
+    // pre-release separator, because a build tag may itself contain `-`.
+    let without_build = cleaned.split('+').next().unwrap_or(cleaned);
+    let (core, prerelease) = match without_build.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (without_build, None),
+    };
+
+    let mut numbers = [0_u64; 3];
+    let mut components = core.split('.');
+    for (slot, number) in numbers.iter_mut().enumerate() {
+        let component = components
+            .next()
+            .unwrap_or_else(|| panic!("version {raw:?} has fewer than three numeric components"));
+        *number = component.parse::<u64>().unwrap_or_else(|_| {
+            panic!("version {raw:?} has a non-numeric component {component:?}")
+        });
+    }
+    if components.next().is_some() {
+        panic!("version {raw:?} has more than three numeric components");
+    }
+
+    Version {
+        major: numbers[0],
+        minor: numbers[1],
+        patch: numbers[2],
+        is_prerelease: prerelease.is_some_and(|value| !value.is_empty()),
+    }
 }
 
 fn srctauri_lock() -> toml::Value {
@@ -66,12 +130,13 @@ fn srctauri_versions(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// `(package path, version)` pairs for a package basename in
+/// `(package path, version)` pairs for a package in
 /// `web-ui/package-lock.json`'s `packages` map.
 ///
-/// Matches `node_modules/<name>` and any nested `.../node_modules/<name>`.
-/// Matching the final path component prevents `zod-validation-error` from
-/// being treated as `zod`.
+/// Matches exactly `node_modules/<name>` or any nested
+/// `.../node_modules/<name>`. Anchoring on the `node_modules/` segment keeps a
+/// scoped package such as `@types/zod` from being treated as `zod`, and the
+/// exact final component keeps `zod-validation-error` from matching too.
 fn webui_versions(name: &str) -> Vec<(String, String)> {
     let path = manifest_path("web-ui/package-lock.json");
     let raw = fs::read_to_string(&path)
@@ -84,13 +149,13 @@ fn webui_versions(name: &str) -> Vec<(String, String)> {
         .and_then(|value| value.as_object())
         .unwrap_or_else(|| panic!("web-ui/package-lock.json has no packages object"));
 
-    let basename = format!("node_modules/{name}");
-    let nested_suffix = format!("/{name}");
+    let top_level = format!("node_modules/{name}");
+    let nested = format!("/node_modules/{name}");
 
     packages
         .iter()
         .filter_map(|(package_path, package)| {
-            if package_path != &basename && !package_path.ends_with(&nested_suffix) {
+            if package_path != &top_level && !package_path.ends_with(&nested) {
                 return None;
             }
             let version = package.get("version")?.as_str()?;
@@ -109,7 +174,7 @@ fn format_webui_entries(entries: &[(String, String)]) -> String {
 
 #[test]
 fn srctauri_cookie_is_patched() {
-    const FLOOR: (u64, u64, u64) = (0, 18, 3);
+    const FLOOR: Version = Version::release(0, 18, 3);
     let versions = srctauri_versions("cookie");
 
     assert!(
@@ -118,7 +183,7 @@ fn srctauri_cookie_is_patched() {
     );
     for version in &versions {
         assert!(
-            version_tuple(version) >= FLOOR,
+            parse_version(version) >= FLOOR,
             "cookie {version} is below the C1 floor 0.18.3 (RUSTSEC-2026-0594)"
         );
     }
@@ -126,8 +191,8 @@ fn srctauri_cookie_is_patched() {
 
 #[test]
 fn srctauri_url_is_patched() {
-    const URL_FLOOR: (u64, u64, u64) = (2, 5, 9);
-    const FORM_URLENCODED_FLOOR: (u64, u64, u64) = (1, 2, 3);
+    const URL_FLOOR: Version = Version::release(2, 5, 9);
+    const FORM_URLENCODED_FLOOR: Version = Version::release(1, 2, 3);
 
     let urls = srctauri_versions("url");
     assert!(
@@ -136,7 +201,7 @@ fn srctauri_url_is_patched() {
     );
     for version in &urls {
         assert!(
-            version_tuple(version) >= URL_FLOOR,
+            parse_version(version) >= URL_FLOOR,
             "url {version} is below the C1 floor 2.5.9 (RUSTSEC-2026-0592)"
         );
     }
@@ -148,7 +213,7 @@ fn srctauri_url_is_patched() {
     );
     for version in &form_urlencoded {
         assert!(
-            version_tuple(version) >= FORM_URLENCODED_FLOOR,
+            parse_version(version) >= FORM_URLENCODED_FLOOR,
             "form_urlencoded {version} is below the C1 floor 1.2.3"
         );
     }
@@ -156,13 +221,13 @@ fn srctauri_url_is_patched() {
 
 #[test]
 fn srctauri_glib_decision_recorded() {
-    const PATCHED_FLOOR: (u64, u64, u64) = (0, 20, 0);
+    const PATCHED_FLOOR: Version = Version::release(0, 20, 0);
     let versions = srctauri_versions("glib");
 
     let all_patched = !versions.is_empty()
         && versions
             .iter()
-            .all(|version| version_tuple(version) >= PATCHED_FLOOR);
+            .all(|version| parse_version(version) >= PATCHED_FLOOR);
     if all_patched {
         return;
     }
@@ -192,8 +257,9 @@ fn srctauri_glib_decision_recorded() {
 
 #[test]
 fn webui_has_no_vulnerable_minimatch() {
-    const VULNERABLE_FLOOR: (u64, u64, u64) = (7, 0, 0);
-    const FIXED_FLOOR: (u64, u64, u64) = (11, 0, 1);
+    // C3.2.1: any minimatch strictly below 11.0.1 is vulnerable, regardless of
+    // where it sits in the tree; a pre-release of 11.0.1 does not clear it.
+    const FIXED_FLOOR: Version = Version::release(11, 0, 1);
 
     let entries = webui_versions("minimatch");
     assert!(
@@ -203,22 +269,19 @@ fn webui_has_no_vulnerable_minimatch() {
 
     let vulnerable: Vec<String> = entries
         .iter()
-        .filter(|(_, version)| {
-            let parsed = version_tuple(version);
-            parsed >= VULNERABLE_FLOOR && parsed < FIXED_FLOOR
-        })
+        .filter(|(_, version)| parse_version(version) < FIXED_FLOOR)
         .map(|(path, version)| format!("{path}@{version}"))
         .collect();
     assert!(
         vulnerable.is_empty(),
-        "vulnerable minimatch entries (>= 7.0.0, < 11.0.1): {}",
+        "vulnerable minimatch entries (< 11.0.1): {}",
         vulnerable.join(", ")
     );
 
     assert!(
         entries
             .iter()
-            .any(|(_, version)| version_tuple(version) >= FIXED_FLOOR),
+            .any(|(_, version)| parse_version(version) >= FIXED_FLOOR),
         "no minimatch >= 11.0.1 in web-ui/package-lock.json; entries: {}",
         format_webui_entries(&entries)
     );
@@ -226,7 +289,7 @@ fn webui_has_no_vulnerable_minimatch() {
 
 #[test]
 fn webui_has_no_vulnerable_zod() {
-    const FLOOR: (u64, u64, u64) = (4, 6, 6);
+    const FLOOR: Version = Version::release(4, 6, 6);
 
     let entries = webui_versions("zod");
     assert!(
@@ -236,7 +299,7 @@ fn webui_has_no_vulnerable_zod() {
 
     let vulnerable: Vec<String> = entries
         .iter()
-        .filter(|(_, version)| version_tuple(version) < FLOOR)
+        .filter(|(_, version)| parse_version(version) < FLOOR)
         .map(|(path, version)| format!("{path}@{version}"))
         .collect();
     assert!(

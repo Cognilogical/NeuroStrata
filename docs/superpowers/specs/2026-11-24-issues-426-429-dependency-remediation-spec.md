@@ -224,30 +224,37 @@ not vacuous.
 
 ### 6.1 `src-tauri` gate
 
-A dedicated CI job (macOS runner, because the Linux leg needs GTK/WebKit system
-headers) runs:
+The `audit` CI job (`ubuntu-latest`, `timeout-minutes: 20`) checks the excluded
+desktop workspace alongside the root graph:
 
 ```bash
 cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 > /dev/null
 cargo audit --file src-tauri/Cargo.lock
-cargo check --locked --manifest-path src-tauri/Cargo.toml
 ```
+
+Neither step needs GTK/WebKit system headers: `cargo metadata` only resolves the
+committed lockfile, and `cargo audit` reads `src-tauri/Cargo.lock` as data. The
+desktop compile is therefore not a CI step; `cargo check --locked --manifest-path
+src-tauri/Cargo.toml` is the documented pre-merge verification on macOS, where
+the desktop toolchain and system libraries are available.
 
 The audit uses the same `.cargo/audit.toml` as the root gate; no new ignore
 entry is added for C2.
 
 ### 6.2 `web-ui` gate
 
-A dedicated CI job runs:
+The `web-ui` CI job (`ubuntu-latest`, `timeout-minutes: 15`, Node 22) runs:
 
 ```bash
 npm ci --prefix web-ui
 npm run lint --prefix web-ui
 npm run build --prefix web-ui
+npm audit --prefix web-ui --audit-level=high
 ```
 
 The cache key includes `web-ui/package-lock.json`; `npm ci` is mandatory so a
 lockfile that does not match `package.json` fails instead of being rewritten.
+The audit gate fails only on high/critical advisories.
 
 ### 6.3 Registered `dependency-advisory` suite
 
@@ -266,16 +273,13 @@ lockfile that does not match `package.json` fails instead of being rewritten.
     "webui_has_no_vulnerable_zod"
   ],
   "thresholds": {
-    "srctauri_packages": 501,
-    "minimatch_vulnerable": 0,
-    "zod_below_floor": 0,
     "ignored": 0
   }
 }
 ```
 
-CI invokes `bash scripts/remediation-eval.sh dependency-advisory` so a renamed
-or silently skipped test cannot pass. The suite is offline: it reads only the
+The `test` CI job invokes `bash scripts/remediation-eval.sh dependency-advisory`
+so a renamed or silently skipped test cannot pass. The suite is offline: it reads only the
 two committed lockfiles and this spec.
 
 ### 6.4 Test-to-contract map

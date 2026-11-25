@@ -302,7 +302,8 @@ is empty.
   one `>= 11.0.1`; every `zod` entry `>= 4.6.6`.
 - Produces: `dependency-advisory` suite in `eval/registry.json` with the five
   C1–C3 test names.
-- Produces: `src-tauri-lock` and `web-ui` CI jobs from spec §6.
+- Produces: the `audit` (`src-tauri` metadata + advisory), `web-ui`, and
+  `test`-job `dependency-advisory` CI gates from spec §6.
 
 #### Step 1: Raise the manifest floors
 
@@ -367,15 +368,20 @@ Expected: all exit 0. `npm ci` must not rewrite the lockfile; confirm
 
 #### Step 5: Add the CI jobs
 
-Add two jobs to `.github/workflows/ci.yml` per spec §6:
+Wire the CI gates into `.github/workflows/ci.yml` per spec §6:
 
-- `src-tauri-lock` on `macos-15`:
-  `cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 > /dev/null`,
-  `cargo audit --file src-tauri/Cargo.lock`,
-  `cargo check --locked --manifest-path src-tauri/Cargo.toml`.
-- `web-ui` on `ubuntu-latest` with `actions/setup-node` caching
-  `web-ui/package-lock.json`: `npm ci --prefix web-ui`,
-  `npm run lint --prefix web-ui`, `npm run build --prefix web-ui`.
+- `audit` job on `ubuntu-latest` with `timeout-minutes: 20`, alongside the root
+  `cargo audit`:
+  `cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 > /dev/null`
+  and `cargo audit --file src-tauri/Cargo.lock`. Neither step needs GTK/WebKit
+  headers; `cargo check --locked --manifest-path src-tauri/Cargo.toml` stays the
+  documented pre-merge verification on macOS.
+- `web-ui` job on `ubuntu-latest` with `timeout-minutes: 15` and Node 22,
+  caching `web-ui/package-lock.json`: `npm ci --prefix web-ui`,
+  `npm run lint --prefix web-ui`, `npm run build --prefix web-ui`, and
+  `npm audit --prefix web-ui --audit-level=high`.
+- `test` job, after `scripts/test-remediation-eval.sh`:
+  `bash scripts/remediation-eval.sh dependency-advisory`.
 
 Pin action SHAs to the versions already used in the file. Do not add a new
 audit ignore entry.

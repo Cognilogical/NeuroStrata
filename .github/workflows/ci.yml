@@ -223,6 +223,12 @@ jobs:
         shell: bash
         run: bash scripts/test-remediation-eval.sh
 
+      # Registered-suite gate: a renamed or silently skipped advisory test in
+      # eval/registry.json fails here rather than passing as an empty suite.
+      - name: Dependency-advisory eval suite
+        shell: bash
+        run: bash scripts/remediation-eval.sh dependency-advisory
+
   # Full binary suite on the other two platforms, report-only: a platform
   # regression shows up on the PR without blocking the merge on a runner this
   # project cannot reproduce locally. The ubuntu test job above is the gate.
@@ -313,6 +319,7 @@ jobs:
   web-ui:
     name: web-ui
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -459,6 +466,7 @@ jobs:
   audit:
     name: audit (cargo-audit)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
