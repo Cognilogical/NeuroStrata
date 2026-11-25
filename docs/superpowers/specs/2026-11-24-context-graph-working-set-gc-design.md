@@ -24,13 +24,39 @@ NeuroStrata changes the memory hierarchy:
 - A deterministic Generational Garbage Collector performs mark, sweep,
   pointer stubbing, and page-fault re-expansion without model calls.
 
-The rendered frame has a fixed `4096` UTF-8-byte cap. Full memory and graph
-evidence remains in the persistent heap. Eviction removes full content from L1,
-never from LadybugDB. Per-turn collection work is independent of transcript
-length: non-immortal collections are capped, and the immortal prefix reuses its
-cached projection unless Golden Rules change. Hosts that cannot rewrite an
-immutable transcript retain that transcript outside NeuroStrata's bounded frame;
-§12.2 states each host's exact capability boundary.
+The rendered working set has a fixed `4096` UTF-8-byte cap. Full memory and
+graph evidence remains in the persistent heap. Eviction removes full content
+from L1, never from LadybugDB. Per-turn collection work is independent of
+transcript length: non-immortal collections are capped, and the immortal prefix
+reuses its cached projection unless Golden Rules change.
+
+To maximize LLM provider prefix KV-cache hit rates and replace lossy
+model-driven compaction, the Context Graph projects state across three
+cache-aligned tiers:
+
+- **Tier 0 (Frozen Immortal Prefix)**: On hosts exposing a system-prompt channel
+  (`event.system`), Golden Rules are projected in canonical ID order with zero
+  turn counters, epoch counters, or volatile task fields so the system prefix
+  remains byte-identical across turns.
+- **Tier 1 (Quantized Stride Message Folding)**: On hosts exposing mutable
+  per-call `event.messages`, historical messages before the quantized stride
+  frontier (`hot_tail_count = 12`, `stride = 8`) are folded into deterministic
+  L1 pointer blocks that step only at stride boundaries, preserving prefix
+  KV-cache stability for `stride` consecutive turns.
+- **Tier 2 (Volatile Tail Working-Set Graph Delta)**: Active task state, pinned
+  roots, young-generation nodes, explicit typed graph edges
+  (`working_set.edges`), and evicted/tool stubs render as a compact delta frame
+  attached to the tail of `event.messages` (or `event.context[]` /
+  `event.additionalContext` on flat-context hosts) so volatile state never
+  invalidates the cached prefix.
+- **Pre-Turn Prompt Activation & Zero-LLM Compaction Takeover**: Prompt hooks
+  (`session.hook("prompt")` / `UserPromptSubmit`) extract prompt anchors and
+  trigger 1-hop/2-hop spreading activation before the model call, and compaction
+  hooks (`session.hook("compaction")`) set `event.result = { summary }` from the
+  deterministic L1 Context Graph so the harness skips lossy compaction LLM
+  calls. Hosts that cannot rewrite an immutable transcript retain that
+  transcript outside NeuroStrata's bounded frame; §12.2 states each host's exact
+  capability boundary.
 
 ## 2. Non-Goals
 
@@ -161,16 +187,20 @@ clears in-memory state before reuse.
 | Constant                               |                   Value |
 | -------------------------------------- | ----------------------: |
 | `WORKING_SET_MAX_FRAME_BYTES`          |                  `4096` |
+| `WORKING_SET_TIER0_MAX_BYTES`          |                  `2048` |
 | `WORKING_SET_MAX_IDLE_TURNS`           |                     `3` |
 | `WORKING_SET_STUB_MAX_BYTES`           |                   `192` |
 | `WORKING_SET_MAX_ROOTS`                | `32` non-immortal roots |
 | `WORKING_SET_MAX_YOUNG_GEN`            |                    `64` |
 | `WORKING_SET_MAX_STUBS`                |                   `128` |
+| `WORKING_SET_MAX_EDGES`                |                   `128` |
 | `WORKING_SET_MAX_TOOL_STUBS`           |                   `128` |
 | `WORKING_SET_MAX_TOOL_DIGESTS`         |                   `128` |
 | `WORKING_SET_MAX_EVENT_IDS`            |                   `128` |
 | `WORKING_SET_MAX_INJECTION_KEYS`       |                   `128` |
 | `WORKING_SET_MAX_ACTIVE_SESSION_BYTES` |               `1048576` |
+| `WORKING_SET_STRIDE_MESSAGES`          |                     `8` |
+| `WORKING_SET_HOT_TAIL_MESSAGES`        |                    `12` |
 | `TOOL_GC_INLINE_THRESHOLD_BYTES`       |                  `3072` |
 | `TOOL_GC_HEAD_BYTES`                   |                   `512` |
 | `TOOL_GC_TAIL_BYTES`                   |                   `512` |
@@ -227,6 +257,33 @@ WorkingSetNodeKind =
   | "conceptual_bridge"
   | "recall_text"
 
+WorkingSetEdgeKind =
+  | "GOVERNS"
+  | "DEPENDS_ON"
+  | "CALLS"
+  | "IMPORTS"
+  | "CONCEPTUAL_BRIDGE"
+  | "EXTRACTED_FROM"
+
+WorkingSetEdge = {
+  from: string,
+  to: string,
+  kind: WorkingSetEdgeKind,
+  weight_bps: number,
+  last_touched_turn: number
+}
+
+WorkingSetCacheTier =
+  | "Tier0SystemPrefix"
+  | "Tier1QuantizedHistory"
+  | "Tier2TailDelta"
+  | "EvictedHeapStub"
+
+WorkingSetStrideAction =
+  | "retain_raw_message"
+  | "fold_into_quantized_stub"
+  | "invalid_message_index"
+
 WorkingSetExpansion = (
   request: WorkingSetExpansionRequest
 ) => Promise<WorkingSetNode | WorkingSetStub | null>
@@ -248,6 +305,18 @@ runWorkingSetToolCycle(input: {
   dehydrated: boolean
 }>
 
+runWorkingSetPromptCycle(input: {
+  scope: WorkingSetScope,
+  promptText: string,
+  turnId?: string,
+  eventId?: string
+}) -> Promise<{
+  frame: string,
+  fingerprint: string,
+  changed: boolean,
+  activatedIds: string[]
+}>
+
 runWorkingSetContextCycle(
   scope: WorkingSetScope,
   eventId?: string
@@ -264,6 +333,28 @@ markWorkingSetTouches(
   touched: WorkingSetTouch[],
   eventId?: string
 ) -> Promise<void>
+
+renderWorkingSetTier0Prefix(
+  state: WorkingSetState,
+  activeSession?: ActiveSessionState | null
+) -> { text: string, usedBytes: number, fingerprint: string }
+
+renderWorkingSetDeltaFrame(
+  state: WorkingSetState,
+  activeSession?: ActiveSessionState | null,
+  options?: { omitImmortalRules?: boolean, maxBytes?: number }
+) -> { text: string, usedBytes: number, fingerprint: string }
+
+renderWorkingSetCompactionSummary(
+  state: WorkingSetState,
+  activeSession?: ActiveSessionState | null
+) -> string
+
+projectWorkingSetMessages(
+  messages: unknown[],
+  state: WorkingSetState,
+  options?: { hotTailCount?: number, stride?: number }
+) -> { messages: unknown[], quantizedFrontier: number, foldedCount: number }
 
 upsertWorkingSetFrame(sink: unknown, frame: string) -> boolean
 ```
@@ -402,6 +493,94 @@ TTL equality versus expiry, pinned-root pressure, zero budget, and maximum
 integer inputs. Add Kani harnesses for panic-freedom and determinism under
 `#[cfg(kani)]`.
 
+### 7.5 KV-Cache Tier Routing and Quantized Stride Folding Kernel
+
+Add to `src/formal_kernel.rs`:
+
+```rust
+pub enum WorkingSetCacheTier {
+    Tier0SystemPrefix,
+    Tier1QuantizedHistory,
+    Tier2TailDelta,
+    EvictedHeapStub,
+}
+
+pub const fn evaluate_working_set_cache_tier(
+    tier: WorkingSetTier,
+    has_system_channel: bool,
+) -> WorkingSetCacheTier;
+
+pub enum WorkingSetStrideAction {
+    RetainRawMessage,
+    FoldIntoQuantizedStub,
+    InvalidMessageIndex,
+}
+
+pub struct WorkingSetStrideInput {
+    pub total_messages: u32,
+    pub message_index: u32,
+    pub hot_tail_count: u32,
+    pub stride: u32,
+    pub is_protected_system_or_pinned: bool,
+}
+
+pub const fn compute_working_set_quantized_frontier(
+    total_messages: u32,
+    hot_tail_count: u32,
+    stride: u32,
+) -> u32;
+
+pub const fn evaluate_working_set_stride_fold(
+    input: WorkingSetStrideInput,
+) -> WorkingSetStrideAction;
+```
+
+Decision semantics:
+
+- `evaluate_working_set_cache_tier`:
+  - `Immortal` with `has_system_channel = true` -> `Tier0SystemPrefix`
+  - `Immortal` with `has_system_channel = false` -> `Tier2TailDelta`
+  - `PinnedRoot` or `YoungGen` -> `Tier2TailDelta`
+  - `EvictedStub` -> `EvictedHeapStub`
+- `compute_working_set_quantized_frontier`:
+  - when `stride == 0` or `total_messages <= hot_tail_count`: returns `0`
+  - otherwise `let foldable = total_messages - hot_tail_count; (foldable / stride) * stride`
+- `evaluate_working_set_stride_fold`:
+  - when `message_index >= total_messages`: `InvalidMessageIndex`
+  - when `is_protected_system_or_pinned || stride == 0 || total_messages <= hot_tail_count`: `RetainRawMessage`
+  - when `message_index < compute_working_set_quantized_frontier(total_messages, hot_tail_count, stride)`: `FoldIntoQuantizedStub`
+  - otherwise: `RetainRawMessage`
+
+Extend `proofs/NeuroStrata/WorkingSetGc.lean` with three additional theorems
+(zero `sorry`, zero `axiom`):
+
+6. `immortal_routes_to_system_prefix`: `tier = .immortal ∧ hasSystemChannel = true`
+   iff `evaluateWorkingSetCacheTier tier hasSystemChannel = .tier0SystemPrefix`.
+7. `hot_tail_never_folded`: for every valid message index
+   `messageIndex < totalMessages` in the hot tail
+   (`totalMessages - hotTailCount ≤ messageIndex`),
+   `evaluateWorkingSetStrideFold input = .retainRawMessage`.
+8. `quantized_frontier_step_invariant`: for `stride > 0`, two message counts in
+   the same stride bucket (`(total1 - hotTail) / stride = (total2 - hotTail) / stride`
+   with `hotTail ≤ total1` and `hotTail ≤ total2`) produce the identical
+   quantized frontier, proving KV-cache prefix stability across consecutive turns
+   within a stride interval.
+
+Extend `proofs/Main.lean`, `tests/lean_parity_test.rs`, and `plugins/core/test.mjs`
+with:
+
+- `WORKING_SET_CACHE_TIER|tier|has_system_channel|cache_tier_tag`: `4 × 2 = 8` rows.
+- `WORKING_SET_STRIDE_FOLD|total_messages|message_index|hot_tail_count|stride|is_protected|action_tag`:
+  `4 × 4 × 2 × 2 × 2 = 128` rows (`total_messages ∈ [0, 12, 20, 28]`,
+  `message_index ∈ [0, 7, 8, 19]`, `hot_tail_count ∈ [0, 12]`,
+  `stride ∈ [0, 8]`, `is_protected ∈ [false, true]`).
+
+The `3833` rows plus `8` cache-tier rows plus `128` stride-fold rows produce
+`3969` canonical parity rows. Add Kani harnesses
+`proof_evaluate_working_set_cache_tier_contract` and
+`proof_evaluate_working_set_stride_fold_contract` in `src/formal_kernel.rs`, plus
+a `ws-stride` mutant in `scripts/kani-mutation-check.sh`.
+
 ## 8. Active Session JSON Contract
 
 `working_set` is additive. Existing `task_id`, `status`, `golden_rules`,
@@ -426,6 +605,7 @@ integer inputs. Add Kani harnesses for panic-freedom and determinism under
   "roots": [],
   "young_gen": [],
   "evicted_stubs": [],
+  "edges": [],
   "tool_output_stubs": [],
   "tool_output_digests": []
 }
@@ -585,6 +765,39 @@ project_id\nnamespace\nsession_id\nepoch\ntool_name\npath_key\nsha256
 duplicate detection checks for any retained digest with the same `path_key` in
 the active scope and epoch. Cap eviction forgets old duplicate history but never
 changes heap authority.
+
+### 8.5 WorkingSetEdge and 1-Hop/2-Hop Spreading Activation
+
+`edges` is an optional array on persisted v1 snapshots (defaulting to `[]` on
+load when absent) and is always written by `persistWorkingSet`. Each element has
+exactly these fields:
+
+| Field               | Type                                                                                                                                               |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `from`              | string; canonical node ID (`file:...`, `symbol:...`, `mem:...`, `bridge:...`, `task:...`)                                                          |
+| `to`                | string; canonical node ID                                                                                                                          |
+| `kind`              | `"GOVERNS" \| "DEPENDS_ON" \| "CALLS" \| "IMPORTS" \| "CONCEPTUAL_BRIDGE" \| "EXTRACTED_FROM"`                                                     |
+| `weight_bps`        | integer `0..10000` (`10000` for 1-hop `GOVERNS`/`EXTRACTED_FROM`, `7500` for `CONCEPTUAL_BRIDGE`, `5000` for 2-hop `CALLS`/`IMPORTS`/`DEPENDS_ON`) |
+| `last_touched_turn` | integer                                                                                                                                            |
+
+Edges are deduplicated by `(from, kind, to)`, pruned during `sweepWorkingSet`
+whenever neither endpoint remains in `roots ∪ young_gen ∪ evicted_stubs`, capped
+at `WORKING_SET_MAX_EDGES = 128`, and sorted by descending `last_touched_turn`,
+descending `weight_bps`, then ascending `(from, kind, to)`.
+
+Spreading activation rules during `advanceWorkingSetTurn` and
+`runWorkingSetPromptCycle`:
+
+1. **1-Hop Activation**: When a `file`, `symbol`, or `memory` node `u` is
+   touched, every incident edge `(u, v)` or `(v, u)` of kind `GOVERNS`,
+   `EXTRACTED_FROM`, or `CONCEPTUAL_BRIDGE` marks neighbor `v` as touched in the
+   current turn and triggers page-fault promotion if `v` is an `EvictedStub` that
+   fits the frame budget.
+2. **2-Hop Structural-to-Normative Activation**: When a `file` or `symbol` node
+   `u` is touched, any 1-hop structural neighbor `w` along `CALLS`, `IMPORTS`, or
+   `DEPENDS_ON` edges causes `GOVERNS` memory nodes `m` incident to `w` to have
+   their `last_touched_turn` refreshed (preventing TTL eviction of rules
+   governing direct callees/imports).
 
 ## 9. Per-Turn L1 Cycle
 
@@ -826,12 +1039,87 @@ Rules:
 Immortal means retained in working state. Frame projection may be compacted;
 the node is never demoted or removed.
 
-### 11.2 `sessionContextHandler`
+### 11.2 Split KV-Cache Projection (`renderWorkingSetTier0Prefix` and `renderWorkingSetDeltaFrame`)
+
+On hosts exposing a dedicated system-prompt array (`event.system`, such as
+OpenCode V2 `SessionContextHook`), `evaluateWorkingSetCacheTier` routes
+`Immortal` Golden Rules to `Tier0SystemPrefix` and all volatile working-set
+state (`task_header`, `PinnedRoot`, `YoungGen`, `edges`, `EvictedStub`,
+`ToolOutputStub`) to `Tier2TailDelta`:
+
+1. **`renderWorkingSetTier0Prefix(state, activeSession)`**:
+   - Canonical layout:
+
+```text
+[NeuroStrata Golden Rules — IMMORTAL PREFIX]
+  - <rule or bounded rule projection>
+[NeuroStrata End Immortal Prefix]
+```
+
+- Contains zero turn counters, zero epoch counters, and zero task headers so
+  its UTF-8 bytes and SHA-256 `fingerprint` are invariant across turns unless
+  the Golden Rule set itself changes.
+- Bounded to `WORKING_SET_TIER0_MAX_BYTES = 2048` UTF-8 bytes, falling back
+  to `[NeuroStrata Golden Rule Manifest]` on overflow.
+
+2. **`renderWorkingSetDeltaFrame(state, activeSession, options)`**:
+   - Canonical layout when `omitImmortalRules: true`:
+
+```text
+[NeuroStrata Active Context] Namespace: <ns> | Active Task: <task> [<status>] | Epoch: <e> | Turn: <t>
+[NeuroStrata Working Set]
+[Root] <id> | <summary> | expand:<tool>
+[Young] <id> | <summary> | expand:<tool>
+[Edge] <from> -<kind>-> <to>
+[Stub] <pointer>
+[ToolStub] <pointer>
+[NeuroStrata End Active Context]
+```
+
+- Bounded so `tier0.usedBytes + delta.usedBytes <= WORKING_SET_MAX_FRAME_BYTES`
+  (`4096` UTF-8 bytes).
+
+### 11.3 Tier 1 Quantized Stride Window Folding (`projectWorkingSetMessages`)
+
+When a host passes mutable per-call `event.messages` (`Message[]`),
+`projectWorkingSetMessages(messages, state, options)` evaluates
+`evaluateWorkingSetStrideFold` for each index `0..messages.length - 1` with
+default `hotTailCount = WORKING_SET_HOT_TAIL_MESSAGES` (`12`) and
+`stride = WORKING_SET_STRIDE_MESSAGES` (`8`):
+
+- `quantizedFrontier = computeWorkingSetQuantizedFrontier(messages.length, hotTailCount, stride)`.
+- If `quantizedFrontier === 0`, `messages` is returned unchanged.
+- Otherwise, contiguous non-protected messages at indices `< quantizedFrontier`
+  are folded into deterministic stride summary messages of the form:
+
+```text
+[NeuroStrata Quantized History Stride 0..<frontier>] folded_messages=<K> | heap=LadybugDB | working_set_roots=<R> | stubs=<S>
+```
+
+- Because `quantizedFrontier` steps only at multiples of `stride` (`8`), the
+  folded prefix of `event.messages` remains byte-identical across `stride`
+  consecutive turns while the hot tail (`12..19` messages) grows at the end.
+
+### 11.4 `sessionContextHandler`, `sessionPromptHandler`, and `sessionCompactionHandler`
 
 The handler no longer gates on `baselineInjectedEpoch` alone. It keeps a bounded
 in-memory last-injected fingerprint map keyed by project ID, namespace, session,
 and epoch. `last_injected_fingerprint` persists the same fact across processes.
 
+When `event` carries `Array.isArray(event.system)` and
+`Array.isArray(event.messages)` (OpenCode V2 `SessionContextHook`):
+
+1. **Tier 0 System Prefix**: `upsertWorkingSetSystemPrefix(event.system, tier0.text)`
+   replaces any existing `[NeuroStrata Golden Rules — IMMORTAL PREFIX]` part in
+   place (or appends one `{ type: "text", text: tier0.text }` entry) without
+   touching any other system parts.
+2. **Tier 1 Quantized Stride Folding**: `projectWorkingSetMessages` folds
+   pre-frontier history in `event.messages` in place.
+3. **Tier 2 Tail Delta**: `upsertWorkingSetMessageTailDelta(event.messages, delta.text)`
+   attaches or updates the volatile `[NeuroStrata Active Context]` delta block on
+   the tail message so prefix token positions `0..N-1` remain untouched.
+
+For flat-context events without `event.system`/`event.messages`,
 `upsertWorkingSetFrame` uses this sink precedence:
 
 1. Mutable `event.context[]`: replace the first complete or legacy plugin frame,
@@ -851,6 +1139,29 @@ returned. Append-only hosts receive a changed frame once; they cannot remove an
 older host-owned frame. Epoch advance clears injection fingerprints so the next
 context cycle emits the new baseline.
 
+**Pre-Turn Prompt Activation (`sessionPromptHandler`)**:
+
+- Registered on `ctx.session.hook("prompt")` in OpenCode V2 and invoked on
+  `UserPromptSubmit` in Claude and Codex.
+- Extracts explicit anchors (`mem:<id>`, `path:<relPath>`, `file:<relPath>`,
+  `symbol:<relPath>#<symbol>`, and project-relative file paths) from the prompt
+  payload.
+- Executes `runWorkingSetPromptCycle`: marks touched anchors, runs 1-hop and
+  2-hop spreading activation across `working_set.edges`, expands page-faulted
+  `EvictedStub` nodes through ReBAC-filtered daemon reads when they fit the frame
+  budget, sweeps, and persists `working_set` before the outgoing LLM call.
+
+**Zero-LLM Compaction Takeover (`sessionCompactionHandler`)**:
+
+- Registered on `ctx.session.hook("compaction")`.
+- Increments the compaction epoch, synthesizes a deterministic summary via
+  `renderWorkingSetCompactionSummary(state, activeSession)` containing Tier 0
+  Golden Rules, active task state, pinned roots, active graph edges, and heap
+  restoration pointers, and sets `event.result = { summary }`.
+- Setting `event.result = { summary }` instructs OpenCode V2 to use NeuroStrata's
+  deterministic Context Graph checkpoint directly and skip the harness's lossy
+  compaction LLM call.
+
 ## 12. Six-Harness Integration
 
 All GC decisions and rendering live in core. Harness code only canonicalizes
@@ -858,14 +1169,14 @@ native events, invokes the shared cycle, and maps the result to a native sink.
 
 ### 12.1 Capability Matrix
 
-| Harness      | Touch/cycle source                     | Result dehydration                        | Frame sink                                                   |
-| ------------ | -------------------------------------- | ----------------------------------------- | ------------------------------------------------------------ |
-| `opencode`   | `execute.after`; context hook renders  | Replaces text result fields               | Mutable `event.context[]` or `event.additionalContext`       |
-| `claude`     | `PostToolUse`; `Stop` boundary         | `updatedToolOutput`                       | Hook `additionalContext`                                     |
-| `codex`      | `PostToolUse`; `Stop` boundary         | Observe and stub only; raw result remains | Hook `additionalContext` on start, prompt, and result events |
-| `github-cli` | `postToolUse`; `agentStop` boundary    | `modifiedResult.textResultForLlm`         | Hook `additionalContext`                                     |
-| `openclaw`   | `beforeFileOp`; `onTurnEnd` boundary   | No result payload; marks path only        | Mutable turn `content` when exposed                          |
-| `hermes`     | `beforeToolCall`; `onTurnEnd` boundary | No result payload; marks path only        | Mutable turn `content` when exposed                          |
+| Harness      | Touch/cycle source                                     | Result dehydration                        | Frame sink                                                                                     |
+| ------------ | ------------------------------------------------------ | ----------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `opencode`   | `prompt` hook; `execute.after`; `context`/`compaction` | Replaces text result fields               | Tier 0 `event.system` + Tier 1/2 `event.messages` (`event.result = { summary }` on compaction) |
+| `claude`     | `UserPromptSubmit`; `PostToolUse`; `Stop` boundary     | `updatedToolOutput`                       | Hook `additionalContext`                                                                       |
+| `codex`      | `UserPromptSubmit`; `PostToolUse`; `Stop` boundary     | Observe and stub only; raw result remains | Hook `additionalContext` on start, prompt, and result events                                   |
+| `github-cli` | `postToolUse`; `agentStop` boundary                    | `modifiedResult.textResultForLlm`         | Hook `additionalContext`                                                                       |
+| `openclaw`   | `beforeFileOp`; `onTurnEnd` boundary                   | No result payload; marks path only        | Mutable turn `content` when exposed                                                            |
+| `hermes`     | `beforeToolCall`; `onTurnEnd` boundary                 | No result payload; marks path only        | Mutable turn `content` when exposed                                                            |
 
 OpenClaw's typed `FileOperation` covers write/edit/delete/mkdir, not read-result
 dehydration. Hermes exposes no post-tool result in the registered hook. Neither
@@ -878,8 +1189,14 @@ shim claims raw-output collection.
 `executeAfterHandler` extracts text from `result.content` string or all-text
 content array, then from `result.output`, `output`, `result`, `response`, or
 `content`. Any non-text part disables dehydration. Eligible text is replaced in
-every existing string result field; non-text parts remain unchanged. The context
-hook calls `runWorkingSetContextCycle` and `upsertWorkingSetFrame`.
+every existing string result field; non-text parts remain unchanged. The prompt
+hook (`ctx.session.hook("prompt")`) calls `runWorkingSetPromptCycle` to activate
+prompt anchors and 1-hop/2-hop neighbors before the model request. The context
+hook (`ctx.session.hook("context")`) projects Tier 0 into `event.system`, folds
+Tier 1 in `event.messages`, and attaches Tier 2 delta to the tail of
+`event.messages` (falling back to `upsertWorkingSetFrame` for legacy event
+shapes). The compaction hook (`ctx.session.hook("compaction")`) sets
+`event.result = { summary }` via `renderWorkingSetCompactionSummary`.
 
 #### Claude
 
@@ -1065,31 +1382,33 @@ Runner catches are event-aware:
 
 ### Modify
 
-| File                              | Responsibility                                                                           |
-| --------------------------------- | ---------------------------------------------------------------------------------------- |
-| `src/formal_kernel.rs`            | GC constants, types, pure decision function, unit tests, Kani harnesses                  |
-| `proofs/Main.lean`                | Import proof module and emit ordered GC parity rows                                      |
-| `tests/lean_parity_test.rs`       | Add `2560` rows and update expected total to `3833`                                      |
-| `docs/vision/product-vision.md`   | Document persistent-heap and bounded-L1 formal kernel                                    |
-| `plugins/core/index.ts`           | Scope, JSON contract, mirror kernel, cycles, sweep, render, dehydration, delta injection |
-| `plugins/core/test.mjs`           | GC, page-fault, immortality, cap, privacy, hook, and fail-soft tests                     |
-| `plugins/core/bundle-adapter.mjs` | Fresh four-artifact bundles and compiled-adapter mode                                    |
-| `src/task/harness_plugins.rs`     | Claude/Codex/GitHub native event installation and installer tests                        |
-| `plugins/opencode/test.mjs`       | Result dehydration and mutable frame replacement tests                                   |
-| `plugins/claude/cli-hook.mjs`     | Native result-event mapping and event-aware catch                                        |
-| `plugins/claude/test.mjs`         | `PostToolUse`, start, stop, and fail-soft tests                                          |
-| `plugins/codex/cli-hook.mjs`      | Native result-event mapping without unsupported output fields                            |
-| `plugins/codex/test.mjs`          | Result observation, additional context, and fail-soft tests                              |
-| `plugins/github-cli/cli-hook.mjs` | Native camelCase normalization and output mapping                                        |
-| `plugins/github-cli/test.mjs`     | Native result replacement and additional-context tests                                   |
-| `plugins/openclaw/index.ts`       | Core-backed shim while preserving host registration                                      |
-| `plugins/openclaw/tsconfig.json`  | Core declaration path mapping                                                            |
-| `plugins/openclaw/package.json`   | Core-plus-shim compile and bundle script                                                 |
-| `plugins/openclaw/test.mjs`       | Host registration preservation and bundled GC API tests                                  |
-| `plugins/hermes/index.ts`         | Core-backed shim while preserving host registration                                      |
-| `plugins/hermes/tsconfig.json`    | Core declaration path mapping                                                            |
-| `plugins/hermes/package.json`     | Core-plus-shim compile and bundle script                                                 |
-| `plugins/hermes/test.mjs`         | Host registration preservation and bundled GC API tests                                  |
+| File                              | Responsibility                                                                                         |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `src/formal_kernel.rs`            | GC constants, eviction/cache-tier/stride-fold functions, unit tests, Kani harnesses                    |
+| `scripts/kani-mutation-check.sh`  | Kani mutation checks for `ws-eviction` and `ws-stride`                                                 |
+| `proofs/Main.lean`                | Import proof module and emit ordered GC, cache-tier, and stride-fold parity rows                       |
+| `tests/lean_parity_test.rs`       | Add `2560` GC + `8` cache-tier + `128` stride-fold rows (`3969` total)                                 |
+| `docs/vision/product-vision.md`   | Document persistent-heap and bounded-L1 formal kernel                                                  |
+| `docs/extend/harness-plugins.md`  | Document 3-tier KV-cache context graph, prompt activation, and compaction takeover                     |
+| `plugins/core/index.ts`           | Scope, JSON contract, edges, spreading activation, 3-tier render, stride fold, prompt/compaction hooks |
+| `plugins/core/test.mjs`           | GC, page-fault, immortality, cap, privacy, hook, and fail-soft tests                                   |
+| `plugins/core/bundle-adapter.mjs` | Fresh four-artifact bundles and compiled-adapter mode                                                  |
+| `src/task/harness_plugins.rs`     | Claude/Codex/GitHub native event installation and installer tests                                      |
+| `plugins/opencode/test.mjs`       | Result dehydration and mutable frame replacement tests                                                 |
+| `plugins/claude/cli-hook.mjs`     | Native result-event mapping and event-aware catch                                                      |
+| `plugins/claude/test.mjs`         | `PostToolUse`, start, stop, and fail-soft tests                                                        |
+| `plugins/codex/cli-hook.mjs`      | Native result-event mapping without unsupported output fields                                          |
+| `plugins/codex/test.mjs`          | Result observation, additional context, and fail-soft tests                                            |
+| `plugins/github-cli/cli-hook.mjs` | Native camelCase normalization and output mapping                                                      |
+| `plugins/github-cli/test.mjs`     | Native result replacement and additional-context tests                                                 |
+| `plugins/openclaw/index.ts`       | Core-backed shim while preserving host registration                                                    |
+| `plugins/openclaw/tsconfig.json`  | Core declaration path mapping                                                                          |
+| `plugins/openclaw/package.json`   | Core-plus-shim compile and bundle script                                                               |
+| `plugins/openclaw/test.mjs`       | Host registration preservation and bundled GC API tests                                                |
+| `plugins/hermes/index.ts`         | Core-backed shim while preserving host registration                                                    |
+| `plugins/hermes/tsconfig.json`    | Core declaration path mapping                                                                          |
+| `plugins/hermes/package.json`     | Core-plus-shim compile and bundle script                                                               |
+| `plugins/hermes/test.mjs`         | Host registration preservation and bundled GC API tests                                                |
 
 ### Create
 
