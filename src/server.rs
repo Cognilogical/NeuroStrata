@@ -545,6 +545,7 @@ async fn _with_watch(
                                 "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Ids of tasks this one waits on; a ready task has none unfinished." },
                                 "user_id": { "type": "string", "description": "Optional user identifier for audit receipts." },
                                 "agent_name": { "type": "string", "description": "Optional agent identifier for audit receipts." },
+                                "include_metadata": { "type": "boolean", "description": "Defaults to false: each memory in auto_retrieved_context is one short row (id, memory_type, location, snippet, banners, a code row's symbol string, and a rule or fact's refs entries that name a symbol, as {file, symbol} objects as in the memory's metadata). Pass true to get every memory's full row with its metadata. subagent_prompt_injection is the same either way." },
                             },
                             "required": ["namespace", "title"]
                         }
@@ -563,6 +564,7 @@ async fn _with_watch(
                                 "branch": { "type": "string", "description": "Optional caller git branch for strict push-gate scoping." },
                                 "project_root": { "type": "string", "description": "Optional caller project root path used to capture worktree and branch scope." },
                                 "event_id": { "type": "string", "description": "Optional idempotency event ID for the claim receipt." },
+                                "include_metadata": { "type": "boolean", "description": "Defaults to false: each memory in auto_retrieved_context is one short row (id, memory_type, location, snippet, banners, a code row's symbol string, and a rule or fact's refs entries that name a symbol, as {file, symbol} objects as in the memory's metadata). Pass true to get every memory's full row with its metadata. subagent_prompt_injection is the same either way. A repeat claim by the session that already holds the task returns no context." },
                             },
                             "required": ["id", "namespace", "assignee", "session_id"]
                         }

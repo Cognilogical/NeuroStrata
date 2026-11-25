@@ -1194,6 +1194,102 @@ pub async fn build_task_graph_context(
     (auto_retrieved_context, subagent_prompt)
 }
 
+/// The memory lists in `auto_retrieved_context` whose rows carry each memory's
+/// full metadata. `normative_memories` and `structural_anchors` repeat rows
+/// of `items`.
+const CONTEXT_MEMORY_LISTS: [&str; 4] = [
+    "golden_rules",
+    "items",
+    "normative_memories",
+    "structural_anchors",
+];
+
+/// What the trimmed context says in its `note` field: how to get more, and
+/// only routes that work. `neurostrata_get_memory` needs the namespace, and a
+/// golden rule can live in `global`. A repeat claim by the session that holds
+/// the task returns no context at all, so `include_metadata` only helps on
+/// create or on the claim that takes the task.
+const TRIMMED_CONTEXT_NOTE: &str = "rows are trimmed to a snippet. One memory's whole text: neurostrata_get_memory with id and namespace (this task's namespace; a golden rule not found there is in global). Every row's details: pass include_metadata: true to neurostrata_task_create, or to the neurostrata_task_claim call that takes the task (a repeat claim by the same session returns no context)";
+
+/// The context `task_claim` and `task_create` answer with by default: the
+/// same keys, each memory row cut to id, type, location and snippet (plus a
+/// deprecation or not-definition banner when the row has one), and, when
+/// anything was cut, a `note` saying how to get more. The symbol names agents
+/// were seen using keep the field names and shapes the memory's metadata
+/// stores them under: a code row's `symbol` (a string) and a rule or fact's
+/// `refs` entries that name both a file and a symbol (`{file, symbol}`
+/// objects). The full rows carry every memory's metadata (calls lists, edge
+/// sources, source identity) and made one claim reply 61,337 characters. `include_metadata: true` returns the full
+/// context. The prompt block returned as `subagent_prompt_injection` is the
+/// same either way.
+fn trimmed_graph_context(context: &Value) -> Value {
+    fn slim(row: &Value) -> Value {
+        let mut out = serde_json::Map::new();
+        for key in [
+            "id",
+            "memory_type",
+            "location",
+            "snippet",
+            "deprecation_banner",
+            "not_definition",
+        ] {
+            if let Some(v) = row.get(key) {
+                out.insert(key.to_string(), v.clone());
+            }
+        }
+        let metadata = row.get("metadata");
+        if let Some(symbol) = metadata
+            .and_then(|m| m.get("symbol"))
+            .filter(|v| v.is_string())
+        {
+            out.insert("symbol".to_string(), symbol.clone());
+        }
+        let refs: Vec<Value> = metadata
+            .and_then(|m| m.get("refs"))
+            .and_then(Value::as_array)
+            .map(|refs| {
+                // Only file and symbol, and only a ref that has both: a ref
+                // can also carry lines and a source_context, which are
+                // details, not the name.
+                refs.iter()
+                    .filter(|r| {
+                        r.get("file").is_some_and(Value::is_string)
+                            && r.get("symbol").is_some_and(Value::is_string)
+                    })
+                    .map(|r| json!({ "file": r.get("file"), "symbol": r.get("symbol") }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !refs.is_empty() {
+            out.insert("refs".to_string(), Value::Array(refs));
+        }
+        Value::Object(out)
+    }
+    let mut out = context.clone();
+    if let Some(obj) = out.as_object_mut() {
+        let mut trimmed = false;
+        for key in CONTEXT_MEMORY_LISTS {
+            if let Some(rows) = obj.get(key).and_then(Value::as_array) {
+                let slimmed: Vec<Value> = rows.iter().map(slim).collect();
+                trimmed |= slimmed != *rows;
+                obj.insert(key.to_string(), Value::Array(slimmed));
+            }
+        }
+        // The note says how to get what was cut; nothing cut, no note.
+        if trimmed {
+            obj.insert("note".to_string(), json!(TRIMMED_CONTEXT_NOTE));
+        }
+    }
+    out
+}
+
+/// Full rows only when the caller passes `include_metadata: true`.
+fn wants_metadata(args: &Value) -> bool {
+    args.get("include_metadata")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Synthesise cross-domain conceptual bridges from retrieved seed memories.
 ///
 /// For each seed item, traverses 2 hops (`seed -> via -> target`) through the
@@ -2108,6 +2204,11 @@ pub async fn handle_task_create(
                     json!(subagent_prompt),
                 );
             }
+            let hits_json = if wants_metadata(&args) {
+                hits_json
+            } else {
+                trimmed_graph_context(&hits_json)
+            };
             encode(&json!({
                 "id": id,
                 "namespace": namespace,
@@ -2472,6 +2573,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
+    let hits_json = if wants_metadata(&args) {
+        hits_json
+    } else {
+        trimmed_graph_context(&hits_json)
+    };
     let mut reply = json!({
         "id": id,
         "namespace": namespace,
@@ -7248,6 +7354,289 @@ exit 0
         let parsed: Value = serde_json::from_str(&reply)
             .unwrap_or_else(|e| panic!("create failed: {} -- {}", reply, e));
         parsed["id"].as_str().expect("id").to_string()
+    }
+
+    /// The trimmed context keeps every key, cuts each memory row to id,
+    /// type, location and snippet (plus a banner and a symbol when the row
+    /// has one), leaves the other keys as they were, and says how to get more.
+    #[test]
+    fn trimmed_context_keeps_the_keys_and_drops_the_per_item_metadata() {
+        let big = json!({ "edge_sources": vec!["x".repeat(500); 20], "mentions": ["a", "b"] });
+        let item = json!({
+            "id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text",
+            "metadata": big, "calls": ["f"], "imports": null, "governs": ["g"],
+            "depends_on": null, "evidence": [{"kind": "direct_match"}],
+        });
+        let mut warned = item.clone();
+        warned["deprecation_banner"] = json!("DEPRECATED");
+        let mut code = item.clone();
+        code["memory_type"] = json!("code_ast");
+        code["metadata"]["symbol"] = json!("parse_claim");
+        let mut rule = item.clone();
+        rule["memory_type"] = json!("rule");
+        rule["metadata"]["refs"] = json!([
+            { "file": "src/a.rs", "symbol": "a" },
+            { "file": "src/b.rs" },
+            { "symbol": "no_file" },
+            { "file": "src/c.rs", "symbol": "a", "lines": "3-9", "source_context": { "provider": "git" } }
+        ]);
+        let full = json!({
+            "query": "q",
+            "golden_rules": [item.clone()],
+            "items": [item.clone(), warned, code, rule],
+            "related_edges": [{"source": "m1", "relation": "calls", "target": "f"}],
+            "next_hop_calls": [{"tool": "neurostrata_related", "trigger_id": "T_SEED_EXPAND"}],
+            "expansion_error": null,
+            "normative_memories": [item.clone()],
+            "structural_anchors": [item.clone()],
+            "conceptual_bridges": [{"id": "b1", "why_connected": "a -> b"}],
+            "project_thesis": {"text": "thesis"},
+            "domain_concepts": [],
+        });
+        let trimmed = trimmed_graph_context(&full);
+
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let mut expected = keys(&full);
+        expected.push("note".to_string());
+        expected.sort();
+        assert_eq!(keys(&trimmed), expected, "same keys plus the note");
+        assert!(trimmed.get("compact").is_none(), "no compact key");
+        let note = trimmed["note"]
+            .as_str()
+            .expect("a note says how to get more");
+        assert!(
+            note.contains("neurostrata_get_memory with id and namespace")
+                && note.contains("global")
+                && note.contains("include_metadata: true")
+                && note.contains("repeat claim"),
+            "{note}"
+        );
+        for key in [
+            "query",
+            "related_edges",
+            "next_hop_calls",
+            "expansion_error",
+            "conceptual_bridges",
+            "project_thesis",
+            "domain_concepts",
+        ] {
+            assert_eq!(trimmed[key], full[key], "`{key}` passes through");
+        }
+        let slim =
+            json!({"id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text"});
+        for key in CONTEXT_MEMORY_LISTS {
+            assert_eq!(trimmed[key][0], slim, "`{key}` rows are slim");
+        }
+        assert_eq!(trimmed["items"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            trimmed["items"][1]["deprecation_banner"],
+            json!("DEPRECATED")
+        );
+        // The metadata's own names and shapes: a code row's `symbol` string,
+        // a rule's `refs` entries that name a file and a symbol.
+        assert_eq!(trimmed["items"][2]["symbol"], json!("parse_claim"));
+        assert!(trimmed["items"][2].get("refs").is_none());
+        assert_eq!(
+            trimmed["items"][3]["refs"],
+            json!([
+                { "file": "src/a.rs", "symbol": "a" },
+                { "file": "src/c.rs", "symbol": "a" }
+            ])
+        );
+        assert!(trimmed["items"][3].get("symbol").is_none());
+        assert!(trimmed["items"][3].get("metadata").is_none());
+        assert!(
+            serde_json::to_string(&trimmed).unwrap().len() * 5
+                < serde_json::to_string(&full).unwrap().len(),
+            "the trimmed form is a fraction of the full one"
+        );
+    }
+
+    /// Rows that are already slim lose nothing, so the context gets no note
+    /// about how to get more.
+    #[test]
+    fn trimmed_context_adds_the_note_only_when_something_was_cut() {
+        let slim =
+            json!({"id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text"});
+        let context = json!({ "query": "q", "items": [slim], "golden_rules": [] });
+        assert_eq!(trimmed_graph_context(&context), context);
+    }
+
+    /// A namespace whose memories carry the heavy per-row metadata real
+    /// ingested rows have (calls lists, edge sources, source identity).
+    async fn store_with_heavy_memories(namespace: &str) -> Arc<dyn VectorStore> {
+        let store = store_with_namespace(namespace).await;
+        for (i, memory_type) in ["code_ast", "code_ast", "code_ast", "fact", "rule"]
+            .iter()
+            .enumerate()
+        {
+            let content = format!("compact fixture handler {i} parses the claim reply");
+            let vector = StubEmbedder.embed(&content).await.unwrap();
+            let calls: Vec<String> = (0..40).map(|n| format!("module::callee_{i}_{n}")).collect();
+            let edge_sources: Vec<String> = (0..20)
+                .map(|n| format!("ingest:src/fixture_{i}.rs#generation-{n}"))
+                .collect();
+            store
+                .upsert(
+                    namespace,
+                    &uuid::Uuid::new_v4().to_string(),
+                    vector,
+                    MemoryPayload {
+                        content,
+                        user_id: "kenton".to_string(),
+                        memory_type: memory_type.to_string(),
+                        agent_name: None,
+                        location: format!("src/fixture_{i}.rs"),
+                        location_lines: "1-80".to_string(),
+                        metadata: json!({
+                            "calls": calls,
+                            "imports": ["std::sync::Arc", "serde_json::Value"],
+                            "edge_sources": edge_sources,
+                            "source_identity": {
+                                "path": format!("src/fixture_{i}.rs"),
+                                "blob_sha": "0123456789abcdef0123456789abcdef01234567",
+                                "generation": i,
+                            },
+                        }),
+                    },
+                )
+                .await
+                .expect("seed a heavy memory");
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn claim_and_create_trim_rows_unless_asked_to_include_metadata() {
+        let store = store_with_heavy_memories("MyProj").await;
+        let create_reply = |args: Value| {
+            let store = store.clone();
+            async move {
+                serde_json::from_str::<Value>(&handle_task_create(args, emb(), store).await)
+                    .unwrap()
+            }
+        };
+        let created = create_reply(json!({
+            "namespace": "MyProj", "title": "compact fixture handler work"
+        }))
+        .await;
+        let created_full = create_reply(json!({
+            "namespace": "MyProj", "title": "compact fixture handler work", "include_metadata": true
+        }))
+        .await;
+        assert_eq!(
+            created["auto_retrieved_context"]["note"],
+            json!(TRIMMED_CONTEXT_NOTE)
+        );
+        assert!(created_full["auto_retrieved_context"].get("note").is_none());
+        assert!(created["auto_retrieved_context"].get("compact").is_none());
+        // `compact` is not an alias: `compact: false` still gets trimmed rows.
+        let created_old_arg = create_reply(json!({
+            "namespace": "MyProj", "title": "compact fixture handler work", "compact": false
+        }))
+        .await;
+        assert_eq!(
+            created_old_arg["auto_retrieved_context"]["note"],
+            json!(TRIMMED_CONTEXT_NOTE)
+        );
+
+        let id = created["id"].as_str().unwrap().to_string();
+        let claim = |include_metadata: Option<bool>, session: &'static str| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let mut args = json!({
+                    "namespace": "MyProj", "id": id, "assignee": "agent", "session_id": session
+                });
+                if let Some(m) = include_metadata {
+                    args["include_metadata"] = json!(m);
+                }
+                serde_json::from_str::<Value>(&handle_task_claim(args, store).await).unwrap()
+            }
+        };
+        let release = || {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                handle_task_update(
+                    json!({ "namespace": "MyProj", "id": id, "status": "open" }),
+                    emb(),
+                    store,
+                )
+                .await
+            }
+        };
+        let trimmed = claim(None, "s-compact").await;
+        // What the note says: a repeat claim by the holding session returns
+        // no context, include_metadata or not, so the note does not offer it.
+        let repeat = claim(Some(true), "s-compact").await;
+        assert_eq!(repeat["note"], json!("already claimed by this session"));
+        assert!(repeat.get("auto_retrieved_context").is_none(), "{repeat}");
+        release().await;
+        let full = claim(Some(true), "s-full").await;
+
+        assert_eq!(trimmed["claimed"], json!(true));
+        assert_eq!(full["claimed"], json!(true));
+        let ctx = &trimmed["auto_retrieved_context"];
+        assert_eq!(
+            ctx["note"],
+            json!(TRIMMED_CONTEXT_NOTE),
+            "trimmed rows are the default"
+        );
+        assert!(ctx.get("compact").is_none());
+        assert!(full["auto_retrieved_context"].get("note").is_none());
+        let items = ctx["items"].as_array().unwrap();
+        assert!(!items.is_empty(), "the fixture memories are retrieved");
+        for row in items {
+            assert!(
+                row.get("metadata").is_none() && row.get("calls").is_none(),
+                "{row}"
+            );
+        }
+        assert!(
+            full["auto_retrieved_context"]["items"][0]
+                .get("metadata")
+                .is_some(),
+            "include_metadata: true keeps each memory's metadata"
+        );
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v["auto_retrieved_context"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| *k != "note")
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&trimmed), keys(&full));
+        assert_eq!(
+            trimmed["subagent_prompt_injection"], full["subagent_prompt_injection"],
+            "the prompt block does not depend on include_metadata"
+        );
+        assert_eq!(
+            created["subagent_prompt_injection"],
+            created_full["subagent_prompt_injection"]
+                .as_str()
+                .map(|s| s.replace(
+                    created_full["id"].as_str().unwrap(),
+                    created["id"].as_str().unwrap()
+                ))
+                .map(Value::String)
+                .unwrap(),
+            "create returns the same prompt block either way"
+        );
+
+        let size = |v: &Value| serde_json::to_string(v).unwrap().len();
+        assert!(
+            size(&trimmed) * 2 < size(&full),
+            "the trimmed reply is well under half the full one"
+        );
     }
 
     async fn status_of(store: &Arc<dyn VectorStore>, namespace: &str, id: &str) -> Status {
