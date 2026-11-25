@@ -87,6 +87,29 @@ pub fn decode_cursor(cursor: &str) -> Result<(String, String), String> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
+/// Maximum number of root selections evaluated for one document.
+///
+/// Every aliased connection root materializes and retains its own page, so
+/// the alias count is caller-controlled fan-out; reject past this cap before
+/// dispatching any root field.
+const MAX_ROOT_SELECTIONS: usize = 20;
+
+/// Maximum total rows materialized across all root fields. Each root
+/// contributes its `first` clamped to the 100-row page cap (20 when absent),
+/// so the budget tracks real output while still rejecting alias fan-out even
+/// when every individual root stays under its own per-page cap.
+const MAX_TOTAL_ROOT_FIRST: i64 = 500;
+
+/// Narrow an `i64` to `i32`, saturating at the bounds instead of wrapping.
+///
+/// Pagination clamps run on the narrowed value, so a wrapping cast would turn
+/// `4294967297` into `1` (and `2147483648` into `i32::MIN`), returning a tiny
+/// or empty page instead of the cap. Saturating first keeps `clamp(1, 100)`
+/// meaningful for out-of-range requests.
+fn saturate_to_i32(value: i64) -> i32 {
+    value.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
 /// Shared typed resolver for GraphQL argument values.
 ///
 /// Takes an argument's `graphql_parser` value plus the variables map and
@@ -104,11 +127,11 @@ pub(crate) fn resolve_arg_i32<'a>(
     variables: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<i32> {
     match value {
-        graphql_parser::query::Value::Int(num) => num.as_i64().map(|i| i as i32),
+        graphql_parser::query::Value::Int(num) => num.as_i64().map(saturate_to_i32),
         graphql_parser::query::Value::Variable(name) => variables
             .get(*name)
             .and_then(|v| v.as_i64())
-            .map(|i| i as i32),
+            .map(saturate_to_i32),
         _ => None,
     }
 }
@@ -272,6 +295,7 @@ fn is_retired_at(metadata: &Value, now: i64) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn build_memory_node(
     id: &str,
     namespace: &str,
@@ -389,6 +413,7 @@ fn build_memory_node(
     }))
 }
 
+#[allow(clippy::type_complexity)]
 pub fn execute_on_records(
     records: &[(String, crate::traits::MemoryPayload)],
     edges_by_source: &std::collections::HashMap<String, Vec<(String, String, Option<String>)>>,
@@ -434,6 +459,22 @@ pub fn execute_on_records(
                 _ => {}
             }
         }
+    }
+
+    // A document with more than one operation is ambiguous: GraphQL picks the
+    // executed operation by `operationName`, which this executor does not
+    // implement. Evaluate-and-merge would surface results from operations the
+    // caller did not select, so fail closed until operationName is supported.
+    let operation_count = parsed
+        .definitions
+        .iter()
+        .filter(|def| matches!(def, graphql_parser::query::Definition::Operation(_)))
+        .count();
+    if operation_count > 1 {
+        errors.push(GraphQLError {
+            message: "Multiple operations require operationName, which is not supported".into(),
+        });
+        return GraphQLResponse { data: None, errors };
     }
 
     // Introspection shim (§7): a `__schema`/`_sdl` query is served with the
@@ -589,6 +630,61 @@ pub fn execute_on_records(
     let vars = variables.unwrap_or(&Value::Null);
     let empty_var_map = serde_json::Map::new();
     let var_map = vars.as_object().unwrap_or(&empty_var_map);
+
+    // Root-selection complexity budget, checked before any root field runs.
+    // Each root field is evaluated independently and its page retained under
+    // its response key, so a query full of aliased connection roots is
+    // caller-controlled fan-out in both evaluation time and response size.
+    let mut root_selections = 0usize;
+    let mut requested_rows: i64 = 0;
+    for def in &parsed.definitions {
+        if let graphql_parser::query::Definition::Operation(op_def) = def {
+            let selection_set_opt = match op_def {
+                graphql_parser::query::OperationDefinition::Query(query_def) => {
+                    Some(&query_def.selection_set)
+                }
+                graphql_parser::query::OperationDefinition::SelectionSet(sel_set) => Some(sel_set),
+                _ => None,
+            };
+            if let Some(sel_set) = selection_set_opt {
+                for sel in &sel_set.items {
+                    if let graphql_parser::query::Selection::Field(f) = sel {
+                        root_selections += 1;
+                        let mut requested_first: i64 = 20;
+                        for (k, v) in &f.arguments {
+                            if *k == "first" {
+                                if let Some(n) = resolve_arg_i32(v, var_map) {
+                                    requested_first = n as i64;
+                                }
+                            }
+                        }
+                        // Count the rows this root will actually materialize:
+                        // each root's `first` is clamped to the 100-row page
+                        // cap below, so the budget measures real output rather
+                        // than the (possibly saturated) requested number.
+                        requested_rows =
+                            requested_rows.saturating_add(requested_first.clamp(0, 100));
+                    }
+                }
+            }
+        }
+    }
+    if root_selections > MAX_ROOT_SELECTIONS {
+        errors.push(GraphQLError {
+            message: format!(
+                "query has {root_selections} root selections, exceeding the maximum of {MAX_ROOT_SELECTIONS}"
+            ),
+        });
+        return GraphQLResponse { data: None, errors };
+    }
+    if requested_rows > MAX_TOTAL_ROOT_FIRST {
+        errors.push(GraphQLError {
+            message: format!(
+                "query requests {requested_rows} rows across root fields, exceeding the {MAX_TOTAL_ROOT_FIRST} row budget"
+            ),
+        });
+        return GraphQLResponse { data: None, errors };
+    }
 
     // Build result from query type: determine operation
     let mut data = json!({});
@@ -964,6 +1060,13 @@ pub fn execute_on_records(
                                         }
                                     }),
                                 );
+                            }
+                        } else if root_name == "__typename" {
+                            // The root operation type is Query; emit it under
+                            // the response key (alias or bare `__typename`) so
+                            // generic clients can probe the root type.
+                            if let Some(obj) = data.as_object_mut() {
+                                obj.insert(response_key.to_string(), json!("Query"));
                             }
                         }
                     }
@@ -1570,8 +1673,7 @@ mod tests {
             None,
         );
         assert!(
-            resp.errors.is_empty()
-                || resp.errors.iter().any(|e| e.message.contains("clamped")) == false
+            resp.errors.is_empty() || !resp.errors.iter().any(|e| e.message.contains("clamped"))
         ); // default first=20, fine
 
         // first > 100 clamped
@@ -2623,6 +2725,213 @@ mod tests {
         assert_eq!(
             t4_targets(&resp.data.as_ref().unwrap()["memory"]),
             vec!["t0".to_string()]
+        );
+    }
+
+    // ── Review fixes: multi-operation rejection, i32 saturation, root
+    // __typename, and root-selection/row budgets ──────────────────────────
+
+    fn review_payload(content: &str) -> crate::traits::MemoryPayload {
+        crate::traits::MemoryPayload {
+            content: content.into(),
+            user_id: "u".into(),
+            memory_type: "fact".into(),
+            agent_name: None,
+            location: "l".into(),
+            location_lines: "1".into(),
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    fn review_records(n: usize) -> Vec<(String, crate::traits::MemoryPayload)> {
+        (0..n)
+            .map(|i| (format!("m{i}"), review_payload(&format!("memory {i}"))))
+            .collect()
+    }
+
+    fn review_row_count(resp: &GraphQLResponse) -> usize {
+        resp.data.as_ref().unwrap()["memories"]["edges"]
+            .as_array()
+            .unwrap()
+            .len()
+    }
+
+    #[test]
+    fn multiple_operations_without_operation_name_are_rejected() {
+        let records = review_records(2);
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query A { memories(first: 1) { edges { node { id } } } } \
+             query B { search(text: \"x\") { edges { node { id } } } }",
+            None,
+        );
+        assert!(
+            resp.data.is_none(),
+            "multi-operation document must fail closed: {:?}",
+            resp.data
+        );
+        assert!(
+            resp.errors.iter().any(|e| e
+                .message
+                .contains("Multiple operations require operationName")),
+            "expected multi-operation error, got {:?}",
+            resp.errors
+        );
+        // A single (even named) operation must keep working.
+        let single = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query Only { memories(first: 1) { edges { node { id } } } }",
+            None,
+        );
+        assert!(single.errors.is_empty(), "errors: {:?}", single.errors);
+        assert_eq!(review_row_count(&single), 1);
+    }
+
+    #[test]
+    fn oversized_literal_first_saturates_before_clamping() {
+        let records = review_records(3);
+        for requested in ["4294967297", "2147483648"] {
+            let query =
+                format!("{{ memories(first: {requested}) {{ edges {{ node {{ id }} }} }} }}");
+            let resp =
+                execute_on_records(&records, &Default::default(), "ns", "admin", &query, None);
+            assert_eq!(
+                review_row_count(&resp),
+                3,
+                "first: {requested} must clamp to 100, not wrap: {:?}",
+                resp.data
+            );
+            assert!(
+                resp.errors
+                    .iter()
+                    .any(|e| e.message.contains("first clamped to 100")),
+                "first: {requested} must report the clamp, got {:?}",
+                resp.errors
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_variable_first_saturates_before_clamping() {
+        let records = review_records(3);
+        for requested in [4294967297i64, 2147483648i64] {
+            let resp = execute_on_records(
+                &records,
+                &Default::default(),
+                "ns",
+                "admin",
+                "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+                Some(&json!({ "n": requested })),
+            );
+            assert_eq!(
+                review_row_count(&resp),
+                3,
+                "variable first {requested} must clamp to 100, not wrap: {:?}",
+                resp.data
+            );
+            assert!(
+                resp.errors
+                    .iter()
+                    .any(|e| e.message.contains("first clamped to 100")),
+                "variable first {requested} must report the clamp, got {:?}",
+                resp.errors
+            );
+        }
+        // A small variable still selects exactly that page size.
+        let small = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+            Some(&json!({ "n": 2 })),
+        );
+        assert_eq!(review_row_count(&small), 2);
+    }
+
+    #[test]
+    fn root_typename_emits_query_for_plain_and_aliased_selections() {
+        let resp = execute_on_records(
+            &[],
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ __typename t: __typename }",
+            None,
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap();
+        assert_eq!(data["__typename"], "Query", "data: {data}");
+        assert_eq!(data["t"], "Query", "aliased root __typename: {data}");
+    }
+
+    #[test]
+    fn more_than_twenty_root_selections_are_rejected_before_execution() {
+        let records = review_records(3);
+        let mut query = String::from("{");
+        for i in 0..21 {
+            query.push_str(&format!(
+                " f{i}: memories(first: 1) {{ edges {{ node {{ id }} }} }}"
+            ));
+        }
+        query.push('}');
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin", &query, None);
+        assert!(
+            resp.data.is_none(),
+            "root fan-out must fail closed, got data: {:?}",
+            resp.data
+        );
+        assert!(
+            resp.errors
+                .iter()
+                .any(|e| e.message.contains("root selections")),
+            "expected root-selection cap error, got {:?}",
+            resp.errors
+        );
+    }
+
+    #[test]
+    fn twenty_root_selections_still_execute() {
+        let records = review_records(3);
+        let mut query = String::from("{");
+        for i in 0..20 {
+            query.push_str(&format!(
+                " f{i}: memories(first: 1) {{ edges {{ node {{ id }} }} }}"
+            ));
+        }
+        query.push('}');
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin", &query, None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.as_ref().unwrap().as_object().unwrap();
+        assert_eq!(data.len(), 20, "all twenty alias keys must survive");
+    }
+
+    #[test]
+    fn cumulative_root_row_budget_rejects_fanout() {
+        let records = review_records(3);
+        let mut query = String::from("{");
+        for i in 0..20 {
+            query.push_str(&format!(
+                " f{i}: memories(first: 100) {{ edges {{ node {{ id }} }} }}"
+            ));
+        }
+        query.push('}');
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin", &query, None);
+        assert!(
+            resp.data.is_none(),
+            "cumulative row budget must fail closed, got data: {:?}",
+            resp.data
+        );
+        assert!(
+            resp.errors.iter().any(|e| e.message.contains("row budget")),
+            "expected row-budget error, got {:?}",
+            resp.errors
         );
     }
 }
