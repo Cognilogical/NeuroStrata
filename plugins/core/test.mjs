@@ -3839,17 +3839,12 @@ describe('round-9: CLI hook runners flush stdout before exiting', () => {
     ]
     for (const rel of sources) {
       const src = readFileSync(new URL(rel, import.meta.url), 'utf8')
-      const marker = 'await writeStdout(JSON.stringify(out));'
+      const marker = 'await writeStdout(JSON.stringify(out))'
       const idx = src.indexOf(marker)
       assert.ok(idx !== -1, `${rel}: missing awaited stdout write`)
       assert.ok(
         !src.includes('process.stdout.write(JSON.stringify(out))'),
         `${rel}: un-awaited stdout write still present`
-      )
-      const after = src.slice(idx + marker.length)
-      assert.ok(
-        /^\s*return;/.test(after),
-        `${rel}: the runner must return directly after the awaited write`
       )
       // process.exit while a daemon socket is open crashes node on Windows,
       // and the host then treats the hook as failed.
@@ -3864,7 +3859,7 @@ describe('round-9: CLI hook runners flush stdout before exiting', () => {
     }
   })
 
-  it('runner tails emit deny JSON instead of process.exit(2) (issue #368 F5)', () => {
+  it('runner catches fail closed only for pre-tool events and await stdout', () => {
     for (const name of ['claude', 'codex', 'github-cli', 'opencode']) {
       const rel = `../${name}/cli-hook.mjs`
       const src = readFileSync(new URL(rel, import.meta.url), 'utf8')
@@ -3877,14 +3872,75 @@ describe('round-9: CLI hook runners flush stdout before exiting', () => {
         `${rel}: nonzero exit is collapsed by PowerShell and fails open`
       )
       const tail = src.slice(src.indexOf('main().catch'))
-      assert.ok(
-        tail.includes('permissionDecision: "deny"'),
-        `${rel}: the fail-closed tail must emit a deny decision`
+      assert.match(
+        tail,
+        /name === ['"]PreToolUse['"]/,
+        `${rel}: fail-closed behavior must be limited to PreToolUse`
+      )
+      assert.match(
+        tail,
+        /permissionDecision:\s*['"]deny['"]/,
+        `${rel}: pre-tool failures must emit a deny decision`
       )
       assert.ok(
-        tail.includes('process.stdout.write'),
-        `${rel}: the deny JSON must be written to stdout`
+        tail.includes('await writeStdout(JSON.stringify(out))'),
+        `${rel}: the catch response must be awaited on stdout`
       )
+    }
+  })
+
+  it('generic runner catches return event-shaped no-ops except PreToolUse', async () => {
+    const { spawnSync } = await import('node:child_process')
+    const rust = readFileSync(
+      new URL('../../src/task/harness_plugins.rs', import.meta.url),
+      'utf8'
+    )
+    const runner = rust.match(
+      /const CLI_HOOK_RUNNER_MJS: &str = r#"([\s\S]*?)"#;/
+    )?.[1]
+    assert.ok(runner, 'generic runner source must be extractable')
+    const dir = mkdtempSync(join(tmpdir(), 'ns-generic-runner-fail-'))
+    try {
+      mkdirSync(join(dir, 'dist'), { recursive: true })
+      writeFileSync(
+        join(dir, 'package.json'),
+        JSON.stringify({ type: 'module' })
+      )
+      writeFileSync(
+        join(dir, 'dist', 'index.js'),
+        'export async function initialize() { throw new Error("fixture failure") }\n' +
+          'export default {}\n'
+      )
+      writeFileSync(join(dir, 'hook-runner.mjs'), runner)
+      const run = (hook_event_name) =>
+        spawnSync(process.execPath, [join(dir, 'hook-runner.mjs')], {
+          input: JSON.stringify({ hook_event_name }),
+          encoding: 'utf8',
+          timeout: 30000
+        })
+      for (const [name, expected] of [
+        ['Stop', { continue: true }],
+        ['SubagentStop', { continue: true }],
+        [
+          'PostToolUse',
+          { hookSpecificOutput: { hookEventName: 'PostToolUse' } }
+        ],
+        [
+          'FutureEvent',
+          { hookSpecificOutput: { hookEventName: 'FutureEvent' } }
+        ]
+      ]) {
+        const result = run(name)
+        assert.equal(result.status, 0, `${name}: ${result.stderr}`)
+        assert.deepEqual(JSON.parse(result.stdout.trim()), expected)
+      }
+      const pre = run('PreToolUse')
+      assert.equal(pre.status, 0, pre.stderr)
+      const reply = JSON.parse(pre.stdout.trim())
+      assert.equal(reply.hookSpecificOutput.hookEventName, 'PreToolUse')
+      assert.equal(reply.hookSpecificOutput.permissionDecision, 'deny')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 })
@@ -6155,6 +6211,84 @@ describe('working-set GC cycles, sweep, and rendering', () => {
     assert.equal(oversized.evicted_stubs[0].id, stub.id)
   })
 
+  it('promotes a page fault when another resident node remains in frame', async () => {
+    const scope = wsScope(REPO_ROOT)
+    const resident = wsNode('rule:resident', 'golden_rule', {
+      summary: 'resident rule'
+    })
+    const pointer =
+      '[GCStub mem:page | rule | governs:- | expand:neurostrata_get_memory]'
+    const stub = {
+      id: 'mem:page',
+      kind: 'memory',
+      pointer,
+      byte_cost: Buffer.byteLength(`${pointer}\n`),
+      last_touched_turn: 0,
+      governing_ids: [],
+      memory_type: 'rule'
+    }
+    const full = wsNode('mem:page', 'memory', { memory_type: 'rule' })
+    const promoted = await advanceWorkingSetTurn(
+      wsState(scope, { roots: [resident], evicted_stubs: [stub] }),
+      scope.namespace,
+      scope.sessionId,
+      scope.projectRoot,
+      [{ id: stub.id, kind: 'memory', memoryId: 'page' }],
+      async () => full
+    )
+    assert.equal(promoted.evicted_stubs.length, 0)
+    assert.ok(promoted.roots.some((node) => node.id === resident.id))
+    assert.ok(promoted.young_gen.some((node) => node.id === full.id))
+    const charged =
+      [...promoted.roots, ...promoted.young_gen].reduce(
+        (sum, node) => sum + node.byte_cost,
+        0
+      ) +
+      promoted.evicted_stubs.reduce((sum, entry) => sum + entry.byte_cost, 0)
+    assert.ok(charged <= promoted.max_frame_bytes)
+  })
+
+  it('prefixes symbol stub identities without duplicating an existing pointer', () => {
+    const scope = wsScope(REPO_ROOT)
+    const cases = [
+      {
+        id: 'src/a.ts#parse',
+        path: 'src/a.ts',
+        symbol: 'parse',
+        identity: 'symbol:src/a.ts#parse'
+      },
+      {
+        id: 'symbol:src/b.ts#run',
+        path: 'src/b.ts',
+        symbol: 'run',
+        identity: 'symbol:src/b.ts#run'
+      }
+    ]
+    for (const entry of cases) {
+      const target = wsNode(entry.id, 'symbol', {
+        path: entry.path,
+        symbol: entry.symbol,
+        summary: 't'.repeat(150)
+      })
+      const fillers = Array.from({ length: 32 }, (_, i) =>
+        wsNode(`file:filler-${i}`, 'symbol', {
+          path: `src/filler-${i}.ts`,
+          symbol: 'fn',
+          summary: 'f'.repeat(200)
+        })
+      )
+      const swept = sweepWorkingSet(
+        wsState(scope, { roots: [target, ...fillers] })
+      )
+      const stub = swept.evicted_stubs.find((node) => node.id === entry.id)
+      assert.ok(stub)
+      assert.equal(
+        stub.pointer,
+        `[GCStub ${entry.identity} | sha256:${wsHash(entry.id).slice(0, 12)} | expand:neurostrata_memories_for_file]`
+      )
+    }
+  })
+
   it('retains TTL equality, demotes expiry, and preserves current pinned roots under pressure', () => {
     const scope = wsScope(REPO_ROOT)
     const young = wsNode('mem:young', 'memory', {
@@ -6262,7 +6396,7 @@ describe('working-set GC cycles, sweep, and rendering', () => {
     }
   })
 
-  it('renders bounded UTF-8 frames with escaped dynamic text and a Golden Rule fallback', () => {
+  it('shortens overflowing Golden Rules before using the manifest fallback', () => {
     const scope = wsScope(REPO_ROOT)
     const rules = Array.from({ length: 30 }, (_, i) =>
       wsNode(`rule:${i}`, 'golden_rule', {
@@ -6288,7 +6422,32 @@ describe('working-set GC cycles, sweep, and rendering', () => {
       )
     )
     assert.ok(rendered.text.includes(WORKING_SET_FRAME_OPEN))
-    assert.ok(rendered.text.includes('[NeuroStrata Golden Rule Manifest]'))
+    assert.ok(!rendered.text.includes('[NeuroStrata Golden Rule Manifest]'))
+    assert.ok(!rendered.text.includes('🙂'.repeat(400)))
+    for (let i = 0; i < rules.length; i++)
+      assert.ok(rendered.text.includes(`  - rule:${i} |`))
+
+    const manifestRules = Array.from({ length: 5 }, (_, i) =>
+      wsNode(`rule:${'x'.repeat(900)}-${i}`, 'golden_rule', {
+        summary: 'minimum'
+      })
+    )
+    const manifestFrame = renderWorkingSetFrame(
+      wsState(scope, { roots: manifestRules }),
+      {}
+    )
+    const idsHash = wsHash(
+      manifestRules
+        .map((node) => node.id)
+        .sort()
+        .join('\n')
+    )
+    assert.ok(Buffer.byteLength(manifestFrame.text) <= 4096)
+    assert.ok(
+      manifestFrame.text.includes(
+        `[NeuroStrata Golden Rule Manifest] count=5 | ids_sha256=${idsHash} | expand:neurostrata_get_snapshot\n`
+      )
+    )
   })
 
   it('upserts mutable sinks in precedence order and replaces legacy blocks once', () => {
@@ -6623,6 +6782,48 @@ describe('working-set GC hook, recall, and fail-soft integration', () => {
       await sessionContextHandler(missing, config)
       assert.deepEqual(missing, { context: ['host context'] })
       assert.equal(readFileSync(parentPath, 'utf8'), beforeMissing)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('reinjects context after u32::MAX wraps despite a remembered fingerprint', async () => {
+    const root = canonicalTempDir('ns-core-ws-wrap-injection-')
+    try {
+      const scope = wsScope(root)
+      const parentPath = wsParent(root, wsState(scope))
+      const config = {
+        projectRoot: root,
+        namespace: 'NeuroStrata',
+        intentDetection: { enabled: false, injectReminder: false }
+      }
+      const initial = { sessionID: scope.sessionId, context: [] }
+      await sessionContextHandler(initial, config)
+      assert.equal(initial.context.length, 1)
+
+      const parent = JSON.parse(readFileSync(parentPath, 'utf8'))
+      parent.working_set.turn_seq = 0xffffffff
+      parent.working_set.frame_fingerprint = '0'.repeat(64)
+      parent.working_set.last_injected_fingerprint = '0'.repeat(64)
+      writeFileSync(parentPath, JSON.stringify(parent, null, 2))
+
+      const wrapped = await runWorkingSetTurnBoundary(
+        scope,
+        'event-wrap',
+        'turn-wrap'
+      )
+      assert.equal(wrapped.changed, true)
+      assert.equal((await loadWorkingSet(scope)).turn_seq, 0)
+
+      const next = { sessionID: scope.sessionId, context: [] }
+      await sessionContextHandler(next, config)
+      assert.equal(next.context.length, 1)
+      assert.equal(next.context[0], initial.context[0])
+      assert.equal(
+        (await loadWorkingSet(scope)).last_injected_fingerprint,
+        wsHash(initial.context[0])
+      )
     } finally {
       rmSync(root, { recursive: true, force: true })
       resetModuleState()

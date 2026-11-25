@@ -35,6 +35,12 @@ const CODEX_PKG_JSON: &str = include_str!("../../plugins/codex/package.json");
 const GITHUB_CLI_INDEX_JS: &str = include_str!("../../plugins/github-cli/dist/index.js");
 const GITHUB_CLI_PKG_JSON: &str = include_str!("../../plugins/github-cli/package.json");
 
+// Native CLI runners stay harness-specific: each one maps only the events its
+// host actually emits. The installer still owns one canonical path per harness.
+const CLAUDE_CLI_HOOK_RUNNER_MJS: &str = include_str!("../../plugins/claude/cli-hook.mjs");
+const CODEX_CLI_HOOK_RUNNER_MJS: &str = include_str!("../../plugins/codex/cli-hook.mjs");
+const GITHUB_CLI_CLI_HOOK_RUNNER_MJS: &str = include_str!("../../plugins/github-cli/cli-hook.mjs");
+
 // @neurostrata/plugin-core, bundled once so the harness adapters' relative
 // `../../core/dist/index.js` imports resolve on disk under
 // `.NeuroStrata/plugins/core/dist/index.js`.
@@ -51,6 +57,26 @@ import plugin, * as mod from "./dist/index.js";
 // the harness config of <root> is read first.
 const RUNNER_DIR = dirname(fileURLToPath(import.meta.url));
 const HARNESS = basename(RUNNER_DIR);
+let currentEvent = null;
+
+const writeStdout = (text) =>
+  new Promise((resolve) => {
+    process.stdout.write(text, () => resolve());
+  });
+
+function eventName(event) {
+  return (
+    process.env.NEUROSTRATA_HOOK_EVENT ||
+    event?.hook_event_name ||
+    event?.eventName ||
+    "PreToolUse"
+  );
+}
+
+function noOpReply(name) {
+  if (name === "Stop" || name === "SubagentStop") return { continue: true };
+  return { hookSpecificOutput: { hookEventName: name } };
+}
 
 async function main() {
   // Redirect all diagnostic logging to stderr so stdout carries only the
@@ -59,16 +85,6 @@ async function main() {
   console.log = console.error;
   console.info = console.error;
   console.warn = console.error;
-
-  // Await the write callback so a large hook response (e.g. a big
-  // `updatedInput`) is fully flushed before the runner ends. The runner then
-  // returns instead of calling process.exit: on Windows, process.exit while a
-  // daemon HTTP socket is still open crashes node, and the host reports the
-  // hook as failed (Codex then runs the tool anyway).
-  const writeStdout = (text) =>
-    new Promise((resolve) => {
-      process.stdout.write(text, () => resolve());
-    });
 
   let raw = "";
   try {
@@ -83,6 +99,7 @@ async function main() {
   } catch {
     return;
   }
+  currentEvent = event;
   // The namespace comes from the harness config the installer wrote; the
   // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
   // this config (the order of `neurostrata-mcp namespace resolve`).
@@ -124,33 +141,41 @@ async function main() {
     plugin?.handleHookEvent ??
     mod.handleClaudeHookEvent ??
     plugin?.handleClaudeHookEvent;
-  if (typeof handler === "function") {
-    const out = await handler(event);
-    await writeStdout(JSON.stringify(out));
+  const name = eventName(event);
+  if (["PreToolUse", "Stop", "SubagentStop"].includes(name)) {
+    if (typeof handler === "function") {
+      const out = await handler(event);
+      await writeStdout(JSON.stringify(out));
+      return;
+    }
+    if (name === "Stop" && typeof event.transcript === "string") {
+      const turnEnd = mod.onTurnEnd ?? plugin?.onTurnEnd;
+      if (typeof turnEnd === "function") {
+        await turnEnd({ role: "assistant", content: event.transcript });
+      }
+    }
+    await writeStdout(JSON.stringify({ continue: true }));
     return;
   }
-  if (event.hook_event_name === "Stop" && typeof event.transcript === "string") {
-    const turnEnd = mod.onTurnEnd ?? plugin?.onTurnEnd;
-    if (typeof turnEnd === "function") {
-      await turnEnd({ role: "assistant", content: event.transcript });
-    }
-  }
-  await writeStdout(JSON.stringify({ continue: true }));
+  await writeStdout(JSON.stringify(noOpReply(name)));
 }
-main().catch((err) => {
+main().catch(async (err) => {
   const reason = String(err);
   process.stderr.write(reason + "\n");
-  // PowerShell swallows `process.exit(2)`: the host sees a zero exit code
-  // and runs the tool anyway. Emit a deny decision so a failed hook still
-  // fails closed on Windows. No `continue` field: Codex rejects it on
-  // PreToolUse (the plugin's deny replies omit it too).
-  process.stdout.write(JSON.stringify({
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "deny",
-      permissionDecisionReason: reason
-    }
-  }));
+  const name = eventName(currentEvent);
+  // Only pre-tool failures fail closed. Every other event receives a valid,
+  // neutral success response and never inherits PreToolUse semantics.
+  const out =
+    name === "PreToolUse"
+      ? {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: reason
+          }
+        }
+      : noOpReply(name);
+  await writeStdout(JSON.stringify(out));
 });
 "#;
 
@@ -185,6 +210,15 @@ fn bundle_for(harness: &str) -> Option<(&'static str, &'static str)> {
         "codex" => Some((CODEX_INDEX_JS, CODEX_PKG_JSON)),
         "github-cli" => Some((GITHUB_CLI_INDEX_JS, GITHUB_CLI_PKG_JSON)),
         _ => None,
+    }
+}
+
+fn cli_hook_runner_for(harness: &str) -> &'static str {
+    match harness {
+        "claude" => CLAUDE_CLI_HOOK_RUNNER_MJS,
+        "codex" => CODEX_CLI_HOOK_RUNNER_MJS,
+        "github-cli" => GITHUB_CLI_CLI_HOOK_RUNNER_MJS,
+        _ => CLI_HOOK_RUNNER_MJS,
     }
 }
 
@@ -502,7 +536,7 @@ fn ensure_claude_hook(
 
 /// The order Claude hook events are read in for an older install's
 /// namespace; other events follow in the settings' order.
-const CLAUDE_HOOK_EVENT_ORDER: [&str; 3] = ["SessionStart", "PreToolUse", "Stop"];
+const CLAUDE_HOOK_EVENT_ORDER: [&str; 4] = ["SessionStart", "PreToolUse", "PostToolUse", "Stop"];
 
 /// Calls `f` on every hook of `hooks` (a Claude settings `hooks` object),
 /// event by event in [`CLAUDE_HOOK_EVENT_ORDER`].
@@ -694,6 +728,7 @@ fn codex_hook_commands(abs_runner: &str) -> (String, String) {
 
 /// The installer's Codex `command` value (kept separate so tests can parse
 /// the quoting without going through the hook writer).
+#[cfg(test)]
 fn codex_hook_command(abs_runner: &str) -> String {
     codex_hook_commands(abs_runner).0
 }
@@ -728,8 +763,11 @@ fn strip_installer_env_prefix(mut command: &str) -> &str {
 /// user's own and is not claimed.
 fn hook_command_runner(command: &str) -> Option<(String, &str)> {
     let quoted = strip_installer_env_prefix(command).strip_prefix("node ")?;
-    let parsers: [fn(&str) -> Option<(String, &str)>; 2] =
-        [shell_literal_value, powershell_literal_value];
+    let parsers: [fn(&str) -> Option<(String, &str)>; 3] = [
+        shell_literal_value,
+        powershell_literal_value,
+        sh_literal_value,
+    ];
     for parse in parsers {
         if let Some((path, rest)) = parse(quoted) {
             if rest.trim().is_empty() {
@@ -815,8 +853,8 @@ fn config_toml_wires_runner(
     }
 }
 
-/// Add the NeuroStrata PreToolUse and Stop hooks to `.codex/hooks.json`,
-/// keeping every other entry. A command running this project's canonical
+/// Add the NeuroStrata context, guard, result, and stop hooks to
+/// `.codex/hooks.json`, keeping every other entry. A command running this project's canonical
 /// runner is rewritten to the current form (both command variants), so a
 /// stale spelling is repaired and nothing is added twice; a foreign runner
 /// is left as-is. Codex's other
@@ -866,7 +904,10 @@ fn wire_codex_hooks(
         return None;
     };
     for (event, matcher) in [
+        ("SessionStart", None),
         ("PreToolUse", Some(CODEX_PRE_TOOL_USE_MATCHER)),
+        ("UserPromptSubmit", None),
+        ("PostToolUse", None),
         ("Stop", None),
     ] {
         let entries = h_obj.entry(event).or_insert_with(|| json!([]));
@@ -877,6 +918,29 @@ fn wire_codex_hooks(
             ));
             continue;
         };
+        if config_toml_wires_runner(&toml, project_root, abs_runner, event) {
+            arr.retain_mut(|entry| {
+                let Some(entry_hooks) = entry.get_mut("hooks").and_then(|v| v.as_array_mut())
+                else {
+                    return true;
+                };
+                let mut removed_owned = false;
+                entry_hooks.retain(|hook| {
+                    let owned = ["command", "commandWindows"].iter().any(|key| {
+                        hook.get(key)
+                            .and_then(Value::as_str)
+                            .and_then(hook_command_runner)
+                            .is_some_and(|(old_path, _)| {
+                                is_installer_codex_runner(&old_path, project_root, abs_runner)
+                            })
+                    });
+                    removed_owned |= owned;
+                    !owned
+                });
+                !(removed_owned && entry_hooks.is_empty())
+            });
+            continue;
+        }
         let mut present = false;
         for entry in arr.iter_mut() {
             let Some(entry_hooks) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
@@ -913,9 +977,6 @@ fn wire_codex_hooks(
                 }
                 present = true;
             }
-        }
-        if !present && config_toml_wires_runner(&toml, project_root, abs_runner, event) {
-            present = true;
         }
         if !present {
             let hook_entry = json!({
@@ -972,6 +1033,222 @@ fn exclude_codex_hooks(project_root: &Path) {
         updated.push('\n');
     }
     updated.push_str("/.codex/hooks.json\n");
+    let _ = write_atomically(&exclude, &updated);
+}
+
+/// Read a POSIX-shell single-quoted word independently of the installer's
+/// platform. GitHub CLI's `bash` command must stay valid when a Windows
+/// installer writes the shared hook file.
+fn sh_literal_value(text: &str) -> Option<(String, &str)> {
+    let mut rest = text.strip_prefix('\'')?;
+    let mut value = String::new();
+    loop {
+        let close = rest.find('\'')?;
+        value.push_str(&rest[..close]);
+        rest = &rest[close + 1..];
+        match rest.strip_prefix(r"\''") {
+            Some(after) => {
+                value.push('\'');
+                rest = after;
+            }
+            None => return Some((value, rest)),
+        }
+    }
+}
+
+/// GitHub CLI always runs `bash` through a POSIX shell and `powershell`
+/// through PowerShell, regardless of which platform generated the file.
+fn github_cli_hook_commands(abs_runner: &str) -> (String, String) {
+    (
+        format!("node '{}'", abs_runner.replace('\'', r"'\''")),
+        format!("node '{}'", abs_runner.replace('\'', "''")),
+    )
+}
+
+/// Whether a GitHub hook command names this project's canonical runner. A
+/// missing runner is repairable only at the installer's harness-specific
+/// location; an existing foreign runner is never claimed.
+fn is_installer_github_cli_runner(path: &str, project_root: &Path, abs_runner: &str) -> bool {
+    if path_key(path) == path_key(abs_runner)
+        || same_path_on_disk(&project_root.join(path).to_string_lossy(), abs_runner)
+    {
+        return true;
+    }
+    if path.contains(['$', '%']) || path.starts_with('~') {
+        return false;
+    }
+    if !matches!(project_root.join(path).try_exists(), Ok(false)) {
+        return false;
+    }
+    let folded = path.replace('\\', "/").to_ascii_lowercase();
+    let suffix = ".neurostrata/plugins/github-cli/cli-hook.mjs";
+    folded == suffix || folded.ends_with(&format!("/{suffix}"))
+}
+
+/// Merge GitHub CLI's native camelCase hooks while preserving foreign entries.
+/// Only commands running this project's canonical runner are repaired; the
+/// generated file is atomic and locally excluded because it embeds an absolute
+/// runner path.
+fn wire_github_cli_hooks(
+    project_root: &Path,
+    abs_runner: &str,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let path = project_root.join(".github/hooks/neurostrata.json");
+    if let Err(e) = refuse_symlink_components(project_root, &path) {
+        warnings.push(format!(
+            "{} refused: {e}; no GitHub CLI hook was wired",
+            path.display()
+        ));
+        return None;
+    }
+    let mut doc: Value = match read_config(&path) {
+        Ok(Some(d)) if d.is_object() => d,
+        Ok(Some(_)) => {
+            warnings.push(format!(
+                "{} is not a JSON object; no GitHub CLI hook was wired",
+                path.display()
+            ));
+            return None;
+        }
+        Ok(None) => json!({}),
+        Err(e) => {
+            warnings.push(format!("{e}; no GitHub CLI hook was wired"));
+            return None;
+        }
+    };
+    let obj = doc.as_object_mut()?;
+    obj.insert("version".to_string(), json!(1));
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    let Some(hooks_obj) = hooks.as_object_mut() else {
+        warnings.push(format!(
+            "{} has a non-object hooks value; no GitHub CLI hook was wired",
+            path.display()
+        ));
+        return None;
+    };
+    let (bash, powershell) = github_cli_hook_commands(abs_runner);
+    let mut all_wired = true;
+    for event in ["sessionStart", "preToolUse", "postToolUse", "agentStop"] {
+        let entries = hooks_obj.entry(event).or_insert_with(|| json!([]));
+        let Some(arr) = entries.as_array_mut() else {
+            warnings.push(format!(
+                "{} has a non-array {event} hook list; that event was left untouched",
+                path.display()
+            ));
+            all_wired = false;
+            continue;
+        };
+        let mut owned = Vec::new();
+        for (index, entry) in arr.iter_mut().enumerate() {
+            let Some(entry_obj) = entry.as_object_mut() else {
+                continue;
+            };
+            let env_event = entry_obj
+                .get("env")
+                .and_then(|env| env.get("NEUROSTRATA_HOOK_EVENT"))
+                .and_then(Value::as_str);
+            if env_event.is_some_and(|name| name != event) {
+                continue;
+            }
+            let mut recognized = false;
+            for (key, target) in [("bash", &bash), ("powershell", &powershell)] {
+                let Some(command) = entry_obj.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some((runner, _)) = hook_command_runner(command) else {
+                    continue;
+                };
+                if is_installer_github_cli_runner(&runner, project_root, abs_runner) {
+                    recognized = true;
+                    entry_obj.insert(key.to_string(), Value::String(target.clone()));
+                }
+            }
+            if !recognized {
+                continue;
+            }
+            entry_obj.insert("type".to_string(), json!("command"));
+            entry_obj.insert("bash".to_string(), Value::String(bash.clone()));
+            entry_obj.insert("powershell".to_string(), Value::String(powershell.clone()));
+            entry_obj.insert("cwd".to_string(), json!("."));
+            entry_obj.insert("timeoutSec".to_string(), json!(10));
+            entry_obj.insert(
+                "env".to_string(),
+                json!({ "NEUROSTRATA_HOOK_EVENT": event }),
+            );
+            owned.push(index);
+        }
+        if owned.is_empty() {
+            arr.push(json!({
+                "type": "command",
+                "bash": bash,
+                "powershell": powershell,
+                "cwd": ".",
+                "timeoutSec": 10,
+                "env": { "NEUROSTRATA_HOOK_EVENT": event }
+            }));
+        } else if owned.len() > 1 {
+            let mut index = 0;
+            arr.retain(|_| {
+                let current = index;
+                index += 1;
+                !owned[1..].contains(&current)
+            });
+        }
+    }
+    let serialized = serde_json::to_string_pretty(&doc).ok()?;
+    let needs_write = std::fs::read_to_string(&path)
+        .map(|existing| existing != serialized)
+        .unwrap_or(true);
+    if needs_write {
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return None;
+            }
+        }
+        write_atomically(&path, &serialized).ok()?;
+    }
+    if !all_wired {
+        warnings.push(format!(
+            "{} was only partially wired; check its native hook arrays",
+            path.display()
+        ));
+        return None;
+    }
+    exclude_github_cli_hooks(project_root);
+    Some(path.to_string_lossy().to_string())
+}
+
+/// Keep the generated GitHub CLI hook file, which contains an absolute runner
+/// path, out of commits just like Codex's generated hooks file.
+fn exclude_github_cli_hooks(project_root: &Path) {
+    let git_dir = project_root.join(".git");
+    if git_dir.is_file() {
+        return;
+    }
+    let exclude = git_dir.join("info").join("exclude");
+    if refuse_symlink_components(project_root, &exclude).is_err() {
+        return;
+    }
+    if let Some(parent) = exclude.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.lines().any(|line| {
+        matches!(
+            line.trim(),
+            "/.github/hooks/neurostrata.json" | ".github/hooks/neurostrata.json"
+        )
+    }) {
+        return;
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str("/.github/hooks/neurostrata.json\n");
     let _ = write_atomically(&exclude, &updated);
 }
 
@@ -1981,7 +2258,7 @@ pub fn auto_install_detected_plugins(
 
         write_if_changed(&dist_index, index_js);
         write_if_changed(&pkg_path, pkg_json);
-        write_if_changed(&runner_path, CLI_HOOK_RUNNER_MJS);
+        write_if_changed(&runner_path, cli_hook_runner_for(harness));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2486,6 +2763,14 @@ fn wire_harness_config(
                                 // folder when Claude Code gives no CLAUDE_PROJECT_DIR.
                                 ensure_claude_hook(
                                     h_obj,
+                                    "PostToolUse",
+                                    Some(CLAUDE_PRE_TOOL_USE_MATCHER),
+                                    |_| true,
+                                    &cmd,
+                                    &runs,
+                                );
+                                ensure_claude_hook(
+                                    h_obj,
                                     "SessionStart",
                                     None,
                                     |_| true,
@@ -2630,7 +2915,15 @@ fn wire_harness_config(
                     }),
                     namespace.as_deref(),
                 );
-                return write_json_if_changed(&cfg_path, &doc);
+                let _ = write_json_if_changed(&cfg_path, &doc);
+                let hooks_wired = wire_github_cli_hooks(project_root, abs_runner, warnings);
+                if hooks_wired.is_none() {
+                    warnings.push(format!(
+                        "GitHub CLI metadata {} was written but no native GitHub CLI hook was wired; check .github/hooks/neurostrata.json",
+                        cfg_path.display()
+                    ));
+                }
+                return hooks_wired;
             }
             None
         }
@@ -5698,5 +5991,399 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    mod working_set_gc {
+        use super::*;
+        use std::collections::BTreeSet;
+
+        fn project() -> (tempfile::TempDir, PathBuf) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = dunce::canonicalize(tmp.path()).unwrap().join("project");
+            std::fs::create_dir_all(root.join(".git/info")).unwrap();
+            (tmp, root)
+        }
+
+        fn installed_runner_for(report: &Value, harness: &str) -> String {
+            report["installed_plugins"]
+                .as_array()
+                .expect("installed array")
+                .iter()
+                .find(|entry| entry["harness"] == harness)
+                .expect("harness installed")["cli_hook_runner"]
+                .as_str()
+                .expect("runner path")
+                .to_string()
+        }
+
+        fn event_keys(doc: &Value) -> BTreeSet<String> {
+            doc["hooks"]
+                .as_object()
+                .expect("hooks object")
+                .keys()
+                .cloned()
+                .collect()
+        }
+
+        fn command_count(doc: &Value, event: &str, command: &str) -> usize {
+            doc["hooks"][event]
+                .as_array()
+                .expect("event array")
+                .iter()
+                .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+                .filter(|hook| {
+                    hook["command"].as_str() == Some(command)
+                        || hook["bash"].as_str() == Some(command)
+                })
+                .count()
+        }
+
+        #[test]
+        fn claude_post_tool_use_is_added_once_and_preserves_foreign_hooks() {
+            let (_tmp, root) = project();
+            std::fs::create_dir_all(root.join(".claude")).unwrap();
+            let foreign = json!({
+                "matcher": "Read",
+                "hooks": [{ "type": "command", "command": "echo foreign-post" }]
+            });
+            write_file(
+                &root.join(".claude/settings.local.json"),
+                &serde_json::to_string_pretty(&json!({
+                    "hooks": { "PostToolUse": [foreign.clone()] },
+                    "permissions": { "allow": ["Read"] }
+                }))
+                .unwrap(),
+            );
+
+            let report = auto_install_detected_plugins(
+                &root,
+                ConfigNamespace::Set("TestProj"),
+                Some("claude"),
+            );
+            let runner = installed_runner_for(&report, "claude");
+            let installed_runner =
+                std::fs::read_to_string(root.join(".NeuroStrata/plugins/claude/cli-hook.mjs"))
+                    .unwrap();
+            assert!(installed_runner.contains("runWorkingSetToolCycle"));
+            assert!(installed_runner.contains("const HARNESS = 'claude'"));
+            let command = claude_hook_command(&runner).expect("safe runner");
+            let path = root.join(".claude/settings.local.json");
+            let first = std::fs::read_to_string(&path).unwrap();
+            let doc: Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(
+                event_keys(&doc),
+                ["PostToolUse", "PreToolUse", "SessionStart", "Stop"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            );
+            assert_eq!(doc["permissions"]["allow"], json!(["Read"]));
+            let post = doc["hooks"]["PostToolUse"].as_array().unwrap();
+            assert_eq!(post.len(), 2);
+            assert_eq!(post[0], foreign);
+            assert_eq!(post[1]["matcher"], json!(CLAUDE_PRE_TOOL_USE_MATCHER));
+            assert_eq!(post[1]["hooks"][0]["command"], json!(command));
+            assert_eq!(command_count(&doc, "PostToolUse", &command), 1);
+            assert_eq!(
+                report["installed_plugins"][0]["config_wired"],
+                json!(path.to_string_lossy())
+            );
+
+            let _ = auto_install_detected_plugins(
+                &root,
+                ConfigNamespace::Set("TestProj"),
+                Some("claude"),
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        }
+
+        #[test]
+        fn codex_context_and_result_events_are_wired_and_deduplicated() {
+            let (_tmp, root) = project();
+            std::fs::create_dir_all(root.join(".codex")).unwrap();
+            let report = auto_install_detected_plugins(
+                &root,
+                ConfigNamespace::Set("TestProj"),
+                Some("codex"),
+            );
+            let runner = installed_runner_for(&report, "codex");
+            let installed_runner =
+                std::fs::read_to_string(root.join(".NeuroStrata/plugins/codex/cli-hook.mjs"))
+                    .unwrap();
+            assert!(installed_runner.contains("runWorkingSetToolCycle"));
+            assert!(installed_runner.contains("const HARNESS = 'codex'"));
+            let (command, command_windows) = codex_hook_commands(&runner);
+            let path = root.join(".codex/hooks.json");
+            let first = std::fs::read_to_string(&path).unwrap();
+            let doc: Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(
+                event_keys(&doc),
+                [
+                    "PostToolUse",
+                    "PreToolUse",
+                    "SessionStart",
+                    "Stop",
+                    "UserPromptSubmit",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+            );
+            assert_eq!(
+                doc["hooks"]["PreToolUse"][0]["matcher"],
+                json!(CODEX_PRE_TOOL_USE_MATCHER)
+            );
+            for event in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"] {
+                let entries = doc["hooks"][event].as_array().unwrap();
+                assert_eq!(entries.len(), 1, "{event}");
+                assert!(entries[0].get("matcher").is_none(), "{event}");
+                assert_eq!(entries[0]["hooks"][0]["command"], json!(command));
+                assert_eq!(
+                    entries[0]["hooks"][0]["commandWindows"],
+                    json!(command_windows)
+                );
+            }
+            let _ = auto_install_detected_plugins(
+                &root,
+                ConfigNamespace::Set("TestProj"),
+                Some("codex"),
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+
+            let mut doc: Value = serde_json::from_str(&first).unwrap();
+            let foreign_prompt = json!({
+                "hooks": [{ "type": "command", "command": "echo foreign-prompt" }]
+            });
+            let foreign_result = json!({
+                "hooks": [{ "type": "command", "command": "echo foreign-result" }]
+            });
+            doc["hooks"]["UserPromptSubmit"]
+                .as_array_mut()
+                .unwrap()
+                .push(foreign_prompt.clone());
+            doc["hooks"]["PostToolUse"]
+                .as_array_mut()
+                .unwrap()
+                .push(foreign_result.clone());
+            std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+            write_file(
+                &root.join(".codex/config.toml"),
+                &format!(
+                    "[hooks.session_start]\ncommand = \"{}\"\n",
+                    runner.replace('\\', "\\\\")
+                ),
+            );
+            let _ = auto_install_detected_plugins(
+                &root,
+                ConfigNamespace::Set("TestProj"),
+                Some("codex"),
+            );
+            let doc: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(doc["hooks"]["SessionStart"].as_array().unwrap().is_empty());
+            assert_eq!(doc["hooks"]["UserPromptSubmit"][1], foreign_prompt);
+            assert_eq!(doc["hooks"]["PostToolUse"][1], foreign_result);
+            for event in ["PreToolUse", "UserPromptSubmit", "PostToolUse", "Stop"] {
+                assert_eq!(command_count(&doc, event, &command), 1, "{event}");
+            }
+            let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+            assert_eq!(exclude.matches("/.codex/hooks.json").count(), 1);
+        }
+
+        #[test]
+        fn github_cli_native_camel_case_hooks_are_written_atomically() {
+            let (_tmp, root) = project();
+            let path = root.join(".github/hooks/neurostrata.json");
+            let foreign = json!({
+                "type": "command",
+                "bash": "echo foreign-start",
+                "powershell": "echo foreign-start",
+                "cwd": ".",
+                "timeoutSec": 10,
+                "env": { "NEUROSTRATA_HOOK_EVENT": "sessionStart", "KEEP": "yes" }
+            });
+            write_file(
+                &path,
+                &serde_json::to_string_pretty(&json!({
+                    "version": 1,
+                    "hooks": { "sessionStart": [foreign.clone()] },
+                    "other": true
+                }))
+                .unwrap(),
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            let report = auto_install_detected_plugins(
+                &root,
+                ConfigNamespace::Set("TestProj"),
+                Some("github-cli"),
+            );
+            let runner = installed_runner_for(&report, "github-cli");
+            let installed_runner =
+                std::fs::read_to_string(root.join(".NeuroStrata/plugins/github-cli/cli-hook.mjs"))
+                    .unwrap();
+            assert!(installed_runner.contains("runWorkingSetToolCycle"));
+            assert!(installed_runner.contains("NEUROSTRATA_HOOK_EVENT"));
+            let bash = format!("node '{}'", runner.replace('\'', r"'\''"));
+            let powershell = format!("node '{}'", runner.replace('\'', "''"));
+            let first = std::fs::read_to_string(&path).unwrap();
+            let doc: Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(doc["version"], json!(1));
+            assert_eq!(doc["other"], json!(true));
+            assert_eq!(
+                event_keys(&doc),
+                ["agentStop", "postToolUse", "preToolUse", "sessionStart"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            );
+            assert_eq!(doc["hooks"]["sessionStart"][0], foreign);
+            for event in ["sessionStart", "preToolUse", "postToolUse", "agentStop"] {
+                let entries = doc["hooks"][event].as_array().unwrap();
+                let owned = entries
+                    .iter()
+                    .find(|entry| {
+                        entry["bash"] == json!(bash) && entry["powershell"] == json!(powershell)
+                    })
+                    .expect("owned native hook");
+                assert_eq!(
+                    owned
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                    ["bash", "cwd", "env", "powershell", "timeoutSec", "type"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                );
+                assert_eq!(owned["type"], json!("command"));
+                assert_eq!(owned["bash"], json!(bash));
+                assert_eq!(owned["powershell"], json!(powershell));
+                assert_eq!(owned["cwd"], json!("."));
+                assert_eq!(owned["timeoutSec"], json!(10));
+                assert_eq!(owned["env"], json!({ "NEUROSTRATA_HOOK_EVENT": event }));
+            }
+            assert_eq!(
+                report["installed_plugins"][0]["config_wired"],
+                json!(path.to_string_lossy())
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o640
+                );
+            }
+            assert!(std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp-")));
+
+            let _ = auto_install_detected_plugins(
+                &root,
+                ConfigNamespace::Set("TestProj"),
+                Some("github-cli"),
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), first);
+        }
+
+        #[test]
+        fn working_set_gc_refresh_repairs_owned_paths_and_rejects_symlinks() {
+            let (_tmp, root) = project();
+            let report = auto_install_detected_plugins(
+                &root,
+                ConfigNamespace::Set("TestProj"),
+                Some("github-cli"),
+            );
+            let runner = installed_runner_for(&report, "github-cli");
+            let path = root.join(".github/hooks/neurostrata.json");
+            let mut doc: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let stale = root.join("moved/.NeuroStrata/plugins/github-cli/cli-hook.mjs");
+            let stale = stale.to_string_lossy();
+            let old_bash = format!("node '{}'", stale.replace('\'', r"'\''"));
+            let old_powershell = format!("node '{}'", stale.replace('\'', "''"));
+            let foreign = json!({
+                "type": "command",
+                "bash": format!("node {}", shell_literal(&root.join("tools/cli-hook.mjs").to_string_lossy())),
+                "powershell": format!("node {}", powershell_literal(&root.join("tools/cli-hook.mjs").to_string_lossy())),
+                "cwd": ".",
+                "timeoutSec": 10,
+                "env": { "NEUROSTRATA_HOOK_EVENT": "sessionStart" }
+            });
+            doc["hooks"]["sessionStart"]
+                .as_array_mut()
+                .unwrap()
+                .push(foreign.clone());
+            for entry in doc["hooks"]["sessionStart"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .take(1)
+            {
+                entry["bash"] = json!(old_bash);
+                entry["powershell"] = json!(old_powershell);
+            }
+            std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+            for _ in 0..2 {
+                let _ = auto_install_detected_plugins(
+                    &root,
+                    ConfigNamespace::Set("TestProj"),
+                    Some("github-cli"),
+                );
+            }
+            let doc: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let bash = format!("node '{}'", runner.replace('\'', r"'\''"));
+            let powershell = format!("node '{}'", runner.replace('\'', "''"));
+            assert_eq!(doc["hooks"]["sessionStart"][0]["bash"], json!(bash));
+            assert_eq!(
+                doc["hooks"]["sessionStart"][0]["powershell"],
+                json!(powershell)
+            );
+            assert_eq!(doc["hooks"]["sessionStart"][1], foreign);
+            assert_eq!(doc["hooks"]["sessionStart"].as_array().unwrap().len(), 2);
+            let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+            assert_eq!(
+                exclude.matches("/.github/hooks/neurostrata.json").count(),
+                1
+            );
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                let (tmp, linked) = project();
+                let outside = tmp.path().join("outside");
+                std::fs::create_dir_all(&outside).unwrap();
+                let victim = outside.join("neurostrata.json");
+                std::fs::write(&victim, "do not touch").unwrap();
+                symlink(&outside, linked.join(".github")).unwrap();
+                let report = auto_install_detected_plugins(
+                    &linked,
+                    ConfigNamespace::Set("TestProj"),
+                    Some("github-cli"),
+                );
+                assert_eq!(std::fs::read_to_string(&victim).unwrap(), "do not touch");
+                assert!(report["installed_plugins"][0]["config_wired"].is_null());
+                assert!(report["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|warning| {
+                        warning
+                            .as_str()
+                            .is_some_and(|text| text.contains("symlink"))
+                    }));
+            }
+        }
     }
 }

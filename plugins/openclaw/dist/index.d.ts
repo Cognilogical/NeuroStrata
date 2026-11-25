@@ -1,101 +1,29 @@
 /**
- * NeuroStrata OpenClaw Plugin — Client Shim
+ * @neurostrata/plugin-core — Shared ESM implementation for all NeuroStrata harness adapters.
  *
- * Phase 0 of the agent-adoption plan repaired the wire contract this shim
- * speaks:
+ * Zero `require()` calls and zero external npm runtime dependencies. Only Node built-ins
+ * (node:crypto, node:fs, node:os, node:path) are imported. Every harness adapter
+ * (opencode, claude, codex, github-cli, openclaw, hermes) re-exports this module and
+ * builds one plugin via `createHarnessPlugin`.
  *
- * - The core dispatches on `tools/call` — never on a bare tool name — so
- *   every call goes through the real JSON-RPC method and the answer is
- *   unwrapped from `result.content[].text`.
- * - The daemon listens on `:34343` and requires the bearer token from
- *   `~/.config/neurostrata/daemon.token`; both are used on every request.
- * - `neurostrata_detect_task_intents` was a phantom: the core answers
- *   "Unknown tool". The call is gone and the lexical detector runs locally,
- *   mirroring `src/task/intent.rs`. Phase 0 writes nothing.
- * - The plugin context is captured inside `initialize`, so no handler
- *   reaches for a `ctx` that is not in scope.
- * - A degraded core is reported through `adapterStatus()` instead of being
- *   masked by a silent local fallback.
+ * Implements:
+ *  - Bug 2: findProjectRoot / discoverProjectNamespace / resolveConfig (never hardcodes "NeuroStrata")
+ *  - Bug 3: canonical TOOL_CLASSIFICATION + is*Tool predicates + OpenCode V2 Code Mode inspector
+ *  - Bug 4: handleHookEvent / handleClaudeHookEvent (PreToolUse guard + subagent + recall)
+ *  - Bug 5: prefetchMemoriesForFile + formatFileTouchRecallBlock + recordLocalSessionQuery + execute.after recall delivery
+ *  - Enhancement 1: resolveActiveTaskFromDaemon (daemon-backed active task/session state)
+ *  - Enhancement 2 & 3: buildSubagentContextHeader / injectSubagentPrompt / extractRepoFilePaths / enrichAndInjectSubagentPrompt
+ *  - Enhancement 5: shared core architecture across all harness plugins
  */
-export interface GuardValidateParams {
-    action_type: string;
-    payload: string;
-    cwd: string;
-    use_sandbox?: boolean;
-}
-export interface GuardValidateResult {
-    verdict: 'pass' | 'reject';
-    /** The core's own verdict bucket, kept so nothing is flattened away. */
-    bucket: string;
-    reasons: string[];
-    constraints: string[];
-    notes: string[];
-    rule_ids: string[];
-}
-export interface TaskIntentSignal {
-    marker: string;
-    excerpt: string;
-}
-export interface TaskCreateParams {
-    namespace: string;
-    title: string;
-    description?: string;
-    priority?: number;
-    labels?: string[];
-    blocked_by?: string[];
-    parent_id?: string;
-}
-export interface OpenClawPluginContext {
-    config: Record<string, unknown>;
-    logger: {
-        info: (msg: string, meta?: Record<string, unknown>) => void;
-        warn: (msg: string, meta?: Record<string, unknown>) => void;
-        error: (msg: string, meta?: Record<string, unknown>) => void;
-    };
-    hooks: {
-        beforeFileOp: (handler: FileOpHandler) => void;
-        onTurnEnd: (handler: TurnEndHandler) => void;
-    };
-    conversation: {
-        injectSystemMessage: (message: string) => void;
-    };
-}
-export type FileOpHandler = (op: FileOperation) => Promise<FileOpResult>;
-export type TurnEndHandler = (turn: ConversationTurn) => Promise<void>;
-export interface FileOperation {
-    type: 'write' | 'edit' | 'delete' | 'mkdir';
-    path: string;
-    content?: string;
-    oldContent?: string;
-    newContent?: string;
-}
-export interface FileOpResult {
-    allowed: boolean;
-    reason?: string;
-    guardVerdict?: GuardValidateResult;
-    /** True when the core could not answer and the shim is running degraded. */
-    degraded?: boolean;
-}
-export interface ConversationTurn {
-    role: 'user' | 'assistant' | 'system';
-    content: string;
-}
-/** Where the daemon serves MCP. The setup default is 34343, not 8080. */
 export declare const DEFAULT_ENDPOINT = "http://127.0.0.1:34343/mcp";
-/** The daemon's bearer token, as the daemon itself lays it down. */
 export declare const DEFAULT_TOKEN_FILE = "daemon.token";
-/** The tools this shim needs from the core to do its job. */
 export declare const REQUIRED_TOOLS: string[];
 export interface PluginConfig {
     namespace: string;
-    /** The daemon's `/mcp` endpoint. */
     endpoint: string;
-    /** The bearer token, when the host config carries one explicitly. */
     bearerToken: string | null;
-    /** Where to read the daemon token from when the config carries none. */
     tokenFile: string | null;
     strictMode: boolean;
-    /** Upper bound on one MCP round trip. */
     requestTimeoutMs: number;
     intentDetection: {
         enabled: boolean;
@@ -104,13 +32,21 @@ export interface PluginConfig {
     /** Resolved project root directory (set in initialize from ctx.location / cwd). */
     projectRoot?: string;
 }
+/** Alias kept for readability in handler signatures (event, config: ResolvedConfig). */
+export type ResolvedConfig = PluginConfig;
+/** Allowlist namespace/task tokens before code-span interpolation (#316). */
+export declare function sanitizeSubagentHeaderToken(value: string): string;
 /**
- * Merge the host config over the defaults.
- *
- * `guardEndpoint` is still honored: it is what older installs wrote, and
- * silently ignoring it would point the shim at the wrong port.
+ * Resolve `namespace` in strict priority order, the same order as
+ * `neurostrata-mcp namespace resolve`:
+ *  1. the project root marker (`.NeuroStrata/config.json`, findRootMarker(cwd))
+ *  2. pluginConfig.namespace (the harness config; non-empty trimmed string)
+ *  3. process.env.NEUROSTRATA_NAMESPACE (trimmed, one quote pair stripped and
+ *     validated by `usableNamespace`, the CLI's `usable_env_namespace` rule)
+ *  4. discoverProjectNamespace(cwd)
+ * Never falls back to a hardcoded "NeuroStrata".
  */
-export declare function resolveConfig(raw: unknown, cwd?: string): PluginConfig;
+export declare function resolveConfig(pluginConfig?: unknown, cwd?: string): PluginConfig;
 /** Which walk found a project root marker. */
 export type RootMarkerVia = 'own' | 'main' | 'nogit';
 export interface FoundRootMarker {
@@ -141,6 +77,14 @@ export declare function usableNamespace(raw: unknown): string | undefined;
  */
 export declare function findRootMarker(startDir: string): FoundRootMarker | null;
 /**
+ * Walk up from resolve(startDir) looking for `.git` (dir or file); return the
+ * directory containing it. With no `.git` above (pass 2), the nearest folder
+ * holding a valid project marker (`.NeuroStrata/config.json`), else the
+ * nearest folder holding `.NeuroStrata` other than the home folder, else
+ * resolve(startDir).
+ */
+export declare function findProjectRoot(startDir?: string, home?: string): string;
+/**
  * The namespace `harness`'s plugin config names for the project at
  * `projectDir`, read from its checkout's top, then (for a linked worktree,
  * whose untracked configs usually live only in the main checkout) the main
@@ -158,29 +102,55 @@ export declare function readHarnessConfig(harness: string, projectDir: string, r
     namespace?: string;
 };
 /**
- * Walk up from resolve(startDir) to the filesystem root looking for `.git`
- * (dir or file) or `.NeuroStrata`; return the directory containing it, or
- * resolve(startDir) if none found.
+ * The project folder a CLI hook runner resolves its namespace from. Claude
+ * Code starts a new hook process per event, and the event's `cwd` follows
+ * every `cd`, so for Claude this is the session's project folder:
+ * `CLAUDE_PROJECT_DIR`, which Claude Code exports to hook processes as the
+ * project root where the session started. Without it, the folder recorded
+ * for this session at SessionStart (`claude_session_dirs` in
+ * `.NeuroStrata/active_session.json`; never the home folder's), else the
+ * event's `cwd`. Other harnesses use the event's `cwd`, else the process's.
+ *
+ * SessionStart also fires on resume, clear and compact, when the event's
+ * `cwd` may have moved: a folder already recorded for the session is kept.
+ * The file is replaced whole (temp + rename), and never when it exists but
+ * cannot be parsed, so the other fields it holds are not lost.
  */
-export declare function findProjectRoot(startDir?: string): string;
+export declare function resolveHookProjectDir(harness: string, event?: Record<string, unknown>, env?: Record<string, string | undefined>, home?: string): string;
+/**
+ * Whether `toolName` is one of [SESSION_SCOPED_TOOLS], bare or as a harness
+ * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
+ * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
+ */
+export declare function isSessionScopedTool(toolName: string): boolean;
+/**
+ * Claim scope from a linked worktree (design 6.5): `neurostrata_task_claim`
+ * and `neurostrata_get_snapshot` without `worktree`, `project_root` or `cwd`
+ * are scoped by the daemon to the namespace's registry root, the main
+ * checkout when a marker applies. This passes the session's project folder
+ * as `worktree` instead. Changes `args` in place; true when it did.
+ */
+export declare function addSessionWorktree(toolName: string, args: Record<string, unknown>, projectDir: string | undefined): boolean;
 /**
  * 1. Walk up to findProjectRoot(startDir) checking <dir>/.NeuroStrata/session_queries.json;
  *    if it parses as JSON with a non-empty string .namespace, return it trimmed.
  * 2. Otherwise return basename(findProjectRoot(startDir)) || "default".
  */
 export declare function discoverProjectNamespace(startDir?: string): string;
-/** The absolute path of the daemon token file. */
-export declare function daemonTokenPath(tokenFile?: string | null): string;
 /**
- * Read the daemon's bearer token.
- *
- * Returns `null` when there is no readable token: the daemon generates one
- * on first start, so an absent file means "the daemon has never run", not
- * "authentication is optional". The caller must report that as degraded
- * rather than pretend the request is anonymous.
+ * Resolve the project root from an OpenCode V2 host context, falling back
+ * through ctx fields to process.cwd(). Priority:
+ *   1. ctx.location.project.canonical
+ *   2. ctx.location.project.root
+ *   3. ctx.location.directory
+ *   4. ctx.projectDir
+ *   5. ctx.directory
+ *   6. ctx.cwd
+ *   7. process.cwd()
  */
+export declare function resolveProjectRoot(ctx?: any): string;
+export declare function daemonTokenPath(tokenFile?: string | null): string;
 export declare function loadDaemonToken(tokenFile?: string | null): string | null;
-/** The request headers, with the bearer attached when there is one. */
 export declare function buildHeaders(token: string | null): Record<string, string>;
 export interface JsonRpcRequest {
     jsonrpc: '2.0';
@@ -204,129 +174,556 @@ export interface McpToolResult {
     }>;
     isError?: boolean;
 }
-/** Build the `tools/call` request the core actually answers. */
 export declare function buildToolCallRequest(id: number, name: string, args: unknown): JsonRpcRequest;
-/** Build the `tools/list` request used for capability negotiation. */
 export declare function buildToolsListRequest(id: number): JsonRpcRequest;
-/**
- * Unwrap `result.content[].text`.
- *
- * The core answers a tool call with a content array, not with the typed
- * result a tool would return. An answer with no text is a broken answer:
- * it is reported, never treated as an empty success.
- */
 export declare function extractToolText(result: unknown): string;
-/** The tool names from a `tools/list` answer. */
 export declare function extractToolNames(result: unknown): string[];
 export declare class NeuroStrataMCPClient {
     private readonly endpoint;
     private readonly token;
     private readonly timeoutMs;
     private requestId;
+    /** Daemon memory advisory captured on the last errored tool call, drained by
+     *  the plugin's execute.after handler so the agent sees it as a suffix line
+     *  rather than an opaque throw. Cleared on every callTool. */
+    private pendingDaemonAdvisory;
     constructor(options: {
         endpoint: string;
         token: string | null;
         timeoutMs: number;
     });
-    /** Call one tool and return its text content. */
+    /** Drain the advisory captured by the last errored callTool, if any. */
+    flushPendingAdvisory(): string | null;
     callTool(name: string, args: unknown): Promise<string>;
-    /** The names of the tools the core exposes. */
     listToolNames(): Promise<string[]>;
     private post;
 }
-/**
- * Read the guard's answer.
- *
- * The core prefixes the body with `namespace:` and `trace_id:` lines, so the
- * JSON body is what lies between the first `{` and the last `}`. The verdict
- * is tagged with `bucket`, not `type`.
- */
+export interface GuardValidateResult {
+    verdict: 'pass' | 'reject';
+    bucket: string;
+    reasons: string[];
+    constraints: string[];
+    notes: string[];
+    rule_ids: string[];
+}
 export declare function parseGuardValidate(text: string): GuardValidateResult;
 export type AdapterState = 'uninitialized' | 'ready' | 'degraded' | 'unavailable';
 export interface AdapterStatus {
     state: AdapterState;
     endpoint: string;
     namespace: string;
-    /** Whether a bearer token was found and attached. */
     authenticated: boolean;
-    /** Tools this shim needs that the core does not expose. */
     missingTools: string[];
     lastError?: string;
     updatedAt: string;
 }
-/** Reset the tracked session/task state (test hook). */
-export declare function resetState(): void;
-/** The adapter's current state. A degraded core is visible here. */
 export declare function adapterStatus(): AdapterStatus;
+export interface TaskIntentSignal {
+    marker: string;
+    excerpt: string;
+}
 export declare const MARKERS: readonly [string, string][];
 export declare const NEGATION_PREFIXES: string[];
 export declare function detectTaskIntentsLocal(text: string): TaskIntentSignal[];
-/** LRU cap: how many recently touched (`namespace:path`) keys are kept. */
-export declare const PREFETCH_LRU_CAP = 128;
-/** Output budget: one file-touch recall injects at most this many chars. */
-export declare const PREFETCH_MAX_CHARS = 2048;
+export interface ProvenanceSpan {
+    turn_id?: string;
+    role?: string;
+    source_tool?: string;
+    channel?: string;
+    evidence_quote?: string;
+    quote?: string;
+    char_range?: [number, number];
+    parent_task_id?: string;
+    confidence?: number;
+}
+export interface Turn {
+    role: string;
+    content: string;
+    turn_id?: string;
+    source_tool?: string;
+    channel?: string;
+    parent_task_id?: string;
+}
+export interface TurnCandidate {
+    kind: 'task_obligation' | 'memory_candidate';
+    category?: 'fact' | 'decision' | 'rule_candidate';
+    title: string;
+    description?: string;
+    confidence: number;
+    auto_commit: boolean;
+    provenance: ProvenanceSpan;
+}
+export interface ConceptualBridge {
+    source_id?: string;
+    via_id?: string;
+    target_id?: string;
+    target_domain?: string;
+    target_type?: string;
+    target_summary?: string;
+    path?: string;
+}
 /**
- * Recently touched file paths, keyed `namespace:path`, in LRU order
- * (oldest first). Bounded so a long session cannot grow without bound.
+ * Extract task-obligation candidates from a turn's content. Detects local
+ * task-intent markers (TODO:, FIXME:, follow-up:, ...) via
+ * `detectTaskIntentsLocal` and attaches a provenance span
+ * (turn_id, role, source_tool, channel, evidence_quote, quote, char_range,
+ * confidence) to each. Pure: no daemon interaction. Rule candidates are
+ * never produced here (rule candidates never auto-promote).
  */
+export declare function extractTurnCandidates(turn: Turn): TurnCandidate[];
+/**
+ * Post turn candidates fail-soft to the intake ledger via
+ * `neurostrata_task_candidates` (`action: "record"`). Never throws: a missing
+ * MCP client or a daemon error is swallowed so a turn is never blocked by
+ * intake-ledger submission.
+ */
+export declare function postTurnCandidates(candidates: TurnCandidate[], namespace: string): Promise<void>;
+/**
+ * Extract de-duplicated conceptual bridges from `memories_for_file` hits.
+ * Each hit may carry a `conceptual_bridges` array (source -> via -> target
+ * 2-hop cross-domain paths). Bridges are de-duplicated by `path`.
+ */
+export declare function extractConceptualBridges(hits: unknown[]): ConceptualBridge[];
+/**
+ * Persist conceptual bridges into `.NeuroStrata/active_session.json` under
+ * the `conceptual_bridges` key, merging with any existing fields so the
+ * `sessionContextHandler` can inject them as `[NeuroStrata Conceptual Bridges]`.
+ */
+export declare function persistConceptualBridges(projectRoot: string, bridges: ConceptualBridge[]): void;
+export declare const WORKING_SET_MAX_FRAME_BYTES = 4096;
+export declare const WORKING_SET_MAX_IDLE_TURNS = 3;
+export declare const WORKING_SET_STUB_MAX_BYTES = 192;
+export declare const WORKING_SET_MAX_ROOTS = 32;
+export declare const WORKING_SET_MAX_YOUNG_GEN = 64;
+export declare const WORKING_SET_MAX_STUBS = 128;
+export declare const WORKING_SET_MAX_TOOL_STUBS = 128;
+export declare const WORKING_SET_MAX_TOOL_DIGESTS = 128;
+export declare const WORKING_SET_MAX_EVENT_IDS = 128;
+export declare const WORKING_SET_MAX_INJECTION_KEYS = 128;
+export declare const WORKING_SET_MAX_ACTIVE_SESSION_BYTES = 1048576;
+export declare const TOOL_GC_INLINE_THRESHOLD_BYTES = 3072;
+export declare const TOOL_GC_HEAD_BYTES = 512;
+export declare const TOOL_GC_TAIL_BYTES = 512;
+export declare const TOOL_GC_STUB_MAX_BYTES = 512;
+export declare const WORKING_SET_SUMMARY_MAX_BYTES = 512;
+export declare const WORKING_SET_FRAME_OPEN = "[NeuroStrata Active Context]";
+export declare const WORKING_SET_FRAME_CLOSE = "[NeuroStrata End Active Context]";
+export type WorkingSetNodeKind = 'task_header' | 'golden_rule' | 'file' | 'symbol' | 'memory' | 'ast_summary' | 'conceptual_bridge' | 'recall_text';
+export type WorkingSetTier = 'Immortal' | 'PinnedRoot' | 'YoungGen' | 'EvictedStub';
+export type WorkingSetGcAction = 'retain_full' | 'promote_to_young_gen' | 'demote_to_stub' | 'retain_stub';
+export interface WorkingSetScope {
+    projectRoot: string;
+    projectId: string;
+    namespace: string;
+    sessionId: string;
+    epoch: number;
+}
+export interface WorkingSetTouch {
+    id: string;
+    kind: Exclude<WorkingSetNodeKind, 'recall_text'>;
+    path?: string;
+    symbol?: string;
+    memoryId?: string;
+}
+export interface WorkingSetExpansionRequest {
+    id: string;
+    expandTool: string;
+    input: Record<string, unknown>;
+}
+export interface WorkingSetNode {
+    id: string;
+    kind: WorkingSetNodeKind;
+    label: string;
+    summary: string;
+    governing_ids: string[];
+    byte_cost: number;
+    last_touched_turn: number;
+    expand_tool: string;
+    path?: string;
+    symbol?: string;
+    memory_type?: string;
+}
+export interface WorkingSetStub {
+    id: string;
+    kind: WorkingSetNodeKind;
+    pointer: string;
+    byte_cost: number;
+    last_touched_turn: number;
+    governing_ids: string[];
+    path?: string;
+    memory_type?: string;
+    sha256?: string;
+}
+export interface ToolOutputStub {
+    id: string;
+    tool_name: string;
+    rel_path: string;
+    sha256: string;
+    bytes: number;
+    epoch: number;
+    last_touched_turn: number;
+    governing_ids: string[];
+    pointer: string;
+    byte_cost: number;
+}
+export interface ToolOutputDigest {
+    id: string;
+    project_id: string;
+    path_key: string;
+    tool_name: string;
+    sha256: string;
+    bytes: number;
+    epoch: number;
+    last_touched_turn: number;
+    read_count: number;
+}
+export interface WorkingSetState {
+    version: 1;
+    project_id: string;
+    namespace: string;
+    session_id: string;
+    epoch: number;
+    turn_seq: number;
+    active_turn_id: string | null;
+    recent_event_ids: string[];
+    max_frame_bytes: 4096;
+    max_idle_turns: number;
+    used_frame_bytes: number;
+    frame_fingerprint: string;
+    last_injected_fingerprint: string;
+    roots: WorkingSetNode[];
+    young_gen: WorkingSetNode[];
+    evicted_stubs: WorkingSetStub[];
+    tool_output_stubs: ToolOutputStub[];
+    tool_output_digests: ToolOutputDigest[];
+}
+export interface ActiveSessionState {
+    namespace?: string;
+    session_id?: string;
+    task_id?: string;
+    status?: string;
+    golden_rules?: string[];
+    conceptual_bridges?: unknown[];
+    subagent_prompt_injection?: string;
+    claude_session_dirs?: Record<string, string>;
+    working_set?: WorkingSetState;
+    [key: string]: unknown;
+}
+export type WorkingSetExpansion = (request: WorkingSetExpansionRequest) => Promise<WorkingSetNode | WorkingSetStub | null>;
+/** Mirrors the first-match Rust/Lean working-set decision table exactly. */
+export declare function evaluateWorkingSetEviction(input: {
+    tier: WorkingSetTier;
+    turn_age: number;
+    max_idle_turns: number;
+    node_bytes: number;
+    projected_frame_bytes: number;
+    max_frame_bytes: number;
+    is_re_referenced: boolean;
+}): WorkingSetGcAction;
+/** Load and strictly validate the reconstructible local L1 cache. */
+export declare function loadWorkingSet(scopeInput: WorkingSetScope): Promise<WorkingSetState>;
+/** Merge only working_set into a valid parent session file, best effort. */
+export declare function persistWorkingSet(scopeInput: WorkingSetScope, stateInput: WorkingSetState): Promise<void>;
+export declare const READ_FILE_TOOLS: Set<string>;
+export declare const MUTATING_FILE_TOOLS: Set<string>;
+export declare const SHELL_TOOLS: Set<string>;
+export declare const MUTATING_TOOLS: Set<string>;
+export declare const SUBAGENT_TOOLS: Set<string>;
+export declare const CODE_EXEC_TOOLS: Set<string>;
+export declare const TOOL_CLASSIFICATION: {
+    READ_FILE_TOOLS: Set<string>;
+    MUTATING_FILE_TOOLS: Set<string>;
+    SHELL_TOOLS: Set<string>;
+    MUTATING_TOOLS: Set<string>;
+    SUBAGENT_TOOLS: Set<string>;
+    CODE_EXEC_TOOLS: Set<string>;
+};
+export declare function isFileTouchTool(name: string): boolean;
+export declare function isMutatingTool(name: string): boolean;
+/** Apply TTL and deterministic pressure demotion without changing immortal nodes. */
+export declare function sweepWorkingSet(stateInput: WorkingSetState): WorkingSetState;
+/** Advance one deterministic turn, mark touches, and retry fitting page faults. */
+export declare function advanceWorkingSetTurn(stateInput: WorkingSetState, namespace: string, sessionId: string, projectRoot: string, touched: WorkingSetTouch[], expand: WorkingSetExpansion): Promise<WorkingSetState>;
+/** Pure size-based dehydration; duplicate history belongs to the scoped helper. */
+export declare function dehydrateToolOutput(rawText: string, toolName: string, filePath: string | null, governingIds: string[]): {
+    text: string;
+    dehydrated: boolean;
+    digest?: ToolOutputDigest;
+};
+/** Scoped duplicate-aware read dehydration with digest/stub pair persistence. */
+export declare function dehydrateRepeatedReadOutput(scopeInput: WorkingSetScope, rawText: string, toolName: string, filePath: string | null, governingIds: string[]): Promise<{
+    text: string;
+    dehydrated: boolean;
+    digest?: ToolOutputDigest;
+}>;
+/** Render one bounded, marker-safe frame; state nodes are never demoted here. */
+export declare function renderWorkingSetFrame(state: WorkingSetState, activeSession: Record<string, unknown>): {
+    text: string;
+    usedBytes: number;
+    fingerprint: string;
+};
+/** Upsert one mutable frame using context[], content, then additionalContext. */
+export declare function upsertWorkingSetFrame(sink: unknown, frame: string): boolean;
+/** Observe or advance one native turn, deduplicating native event/turn identity. */
+export declare function runWorkingSetTurnBoundary(scopeInput: WorkingSetScope, eventId?: string, turnId?: string): Promise<{
+    frame: string;
+    fingerprint: string;
+    changed: boolean;
+}>;
+/** Render current state without advancing turns or marking touches. */
+export declare function runWorkingSetContextCycle(scopeInput: WorkingSetScope, eventId?: string): Promise<{
+    frame: string;
+    fingerprint: string;
+    changed: boolean;
+}>;
+/** Mark deterministic file/symbol/memory touches without advancing the turn. */
+export declare function markWorkingSetTouches(scopeInput: WorkingSetScope, touched: WorkingSetTouch[], eventId?: string): Promise<void>;
+/** Shared tool cycle: observe touches, dehydrate text, and return one frame. */
+export declare function runWorkingSetToolCycle(input: {
+    scope: WorkingSetScope;
+    turnId?: string;
+    eventId?: string;
+    toolName: string;
+    toolInput: unknown;
+    rawText: string | null;
+    outputIsText: boolean;
+    isError: boolean;
+    advanceTurn: boolean;
+}): Promise<{
+    replacementText: string | null;
+    frame: string;
+    fingerprint: string;
+    dehydrated: boolean;
+}>;
+export declare function isReadOnlyInspectionTool(name: string): boolean;
+export declare function isSubagentTool(name: string): boolean;
+export declare function isCodeExecTool(name: string): boolean;
+/**
+ * True only for shell tools whose payload is provably read-only/verification.
+ * JSON payloads are unwrapped via `command`/`cmd`; substitutions, redirection
+ * and chains containing any mutating segment fail closed.
+ */
+export declare function isZeroActionExemptShellPayload(actionType: string, payloadOrCommand: string): boolean;
+export interface CodeModeInspection {
+    id?: string;
+    sessionId?: string;
+    note?: string;
+    taskClaimed?: boolean;
+    taskUpdated?: boolean;
+    taskCompleted?: boolean;
+    memoryMutated?: boolean;
+    queriedFiles: string[];
+}
+/**
+ * Inspect JS code strings passed to OpenCode V2 `execute` (Code Mode).
+ * Detects neurostrata_task_claim / _update / _complete / _memories_for_file
+ * calls in order and extracts id / session_id / note / path arguments from
+ * each matched call's own argument slice.
+ */
+export declare function inspectCodeModeExecution(code: string): CodeModeInspection;
+export declare const PREFETCH_LRU_CAP = 128;
+export declare const PREFETCH_MAX_CHARS = 2048;
 export declare const prefetchedPaths: Map<string, number>;
-/** `(memory_id:valid_from)` keys already injected this session. */
 export declare const injectedMemoryIds: Set<string>;
-/** One governing memory as `memories_for_file` returns it. */
 export interface FileMemoryHit {
     id: string;
     valid_from: string;
     memory_type: string;
     content: string;
 }
-/**
- * Read the `memories_for_file` answer: the array arrives as `hits` or
- * `memories` between the first `{` and the last `}` of the content text.
- */
 export declare function parseFileMemoryHits(text: string): FileMemoryHit[];
 /**
- * Recall governing memories when a file is touched (design §4.5).
- *
- * Each `namespace:path` key is prefetched at most once per LRU window;
- * each memory is injected at most once per `(id, valid_from)` key. Never
- * increments `access_count` — this is a read-only recall.
+ * Recall governing memories for a touched file. LRU path dedup (no re-query within the
+ * window) and injectedMemoryIds dedup (each memory injected once per session).
  */
-export declare function prefetchMemoriesForFile(namespace: string, filePath: string): Promise<string[]>;
+export declare function prefetchMemoriesForFile(namespace: string, filePath: string, opts?: {
+    recordLedgerDir?: string;
+    projectRoot?: string;
+}): Promise<string[]>;
+/**
+ * Mark a prefetch as delivered: its memories were handed to the caller, so the
+ * dedup state stays and a later touch of the same file does not re-inject
+ * them.
+ */
+export declare function confirmPrefetchDelivery(namespace: string, filePath: string): void;
+/**
+ * Roll back the dedup state of a prefetch whose recall was never delivered
+ * (the guard denied the edit). The path is un-marked and the memory ids the
+ * prefetch consumed are returned, so the allowed retry still sees the
+ * governing rules.
+ */
+export declare function restorePrefetchDelivery(namespace: string, filePath: string): void;
+export declare function formatFileTouchRecallBlock(filePath: string, snippets: string[]): string;
 export declare const SUBAGENT_CONTEXT_MARKER = "### NeuroStrata Task & Graph Context";
-export declare function sanitizeSubagentHeaderToken(value: string): string;
-export declare function buildSubagentContextHeader(namespace: string, taskId: string | null): string;
-export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null): boolean;
+export declare function isReadOnlySubagentAgent(agentId?: string | null): boolean;
+/** Resolve the subagent agent id from the fields harnesses use to name it. */
+export declare function resolveSubagentAgentId(target: Record<string, unknown>): string | undefined;
+/** Code-Mode harnesses (OpenCode V2) expose MCP via `execute` + tools.neurostrata.*. */
+export declare function detectCodeMode(ctx?: any, cfg?: PluginConfig): boolean;
+export interface SubagentHeaderOptions {
+    agentId?: string | null;
+    codeMode?: boolean;
+}
 /**
- * Whether `toolName` is one of SESSION_SCOPED_TOOLS, bare or as a host
- * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
- * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
- * A copy of core's `isSessionScopedTool`.
+ * Render a value inside a markdown backtick code span without allowing a
+ * breakout: backticks close the span and newlines end its line, so both are
+ * collapsed to single spaces. The namespace is not privileged input — it can
+ * arrive from a committed `.NeuroStrata/session_queries.json`, plugin config,
+ * or an environment variable — so every header interpolation goes through
+ * here (issue #316).
  */
-export declare function isSessionScopedTool(toolName: string): boolean;
+export declare function markdownCodeSpanValue(value: unknown): string;
 /**
- * Claim scope from a linked worktree (design 6.5): passes the session's
- * project folder as `worktree` on `neurostrata_task_claim` and
- * `neurostrata_get_snapshot` calls that carry no `worktree`, `project_root`
- * or `cwd`, which the daemon would otherwise scope to the namespace's
- * registry root (the main checkout when a marker applies). Changes `args`
- * in place; true when it did. A copy of core's `addSessionWorktree`.
+ * Public header builder: sanitizes the two caller-supplied values before
+ * rendering (issue #316).
  */
-export declare function addSessionWorktree(toolName: string, args: Record<string, unknown>, projectDir: string | undefined): boolean;
-export declare function initialize(ctx: (Partial<OpenClawPluginContext> & Record<string, unknown>) | undefined): Promise<void>;
+export declare function buildSubagentContextHeader(namespace: string, taskId: string | null, extraContext?: string, options?: SubagentHeaderOptions): string;
+export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null, extraContext?: string, options?: SubagentHeaderOptions): boolean;
+export declare function extractRepoFilePaths(promptText: string): string[];
+export declare const cachedTaskInjection: Map<string, string | null>;
+export declare const cachedSubagentPromptByTask: Map<string, string | null>;
 /**
- * CLI hook runner entry point. The daemon installs hook-runner.mjs beside
- * dist/ and dispatches host hook events here; initialize may have been
- * called with only a config object (no hooks host), so a default client is
- * built the same way core's handleHookEvent does. File-op and shell events
- * run the same guard as the native beforeFileOp hook, with a rejection
- * returned as a deny decision instead of a failed FileOpResult.
+ * Resolve the active task from the daemon (fail-soft). Caches activeTaskId,
+ * activeSessionId and cachedTaskInjection.
  */
+export declare function resolveActiveTaskFromDaemon(namespace: string, preferredTaskId?: string | null): Promise<{
+    taskId: string | null;
+    sessionId: string | null;
+    promptInjection: string | null;
+}>;
+/**
+ * Prefetch governing memories for repo file paths mentioned in a subagent prompt and
+ * inject the daemon's subagent_prompt_injection plus any recalled snippets into the
+ * target prompt. Idempotent.
+ */
+export declare function enrichAndInjectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId?: string | null): Promise<boolean>;
+export declare let activeSessionId: string | null;
+export declare let activeTaskId: string | null;
+export declare let mutationsSinceNote: number;
+export declare function resetState(): void;
+export declare function resetClientForTesting(): void;
+export declare function getTrackingState(): {
+    activeTaskId: string | null;
+    activeSessionId: string | null;
+    mutationsSinceNote: number;
+};
+/** Structured marker the daemon writes on its error/diagnostic channel when
+ *  it reports buffer-pool / RSS pressure. Memory payloads and tool-result
+ *  rows never carry it, so matching it can never misfire on user content. */
+export declare const DAEMON_MEMORY_ADVICE_MARKER = "NEUROSTRATA_ADVICE[daemon_memory]";
+export declare function resetAdvisoryStateForTesting(): void;
+/** Drain the live client's pending advisory (if any). Returns-and-clears. */
+export declare function flushPendingDaemonAdvisory(): string | null;
+/** Pull the daemon memory advisory out of the error/diagnostic channel.
+ * Only text carrying the marker is inspected — memory payloads and result
+ * rows are never matched, so a memory that merely discusses
+ * `NEUROSTRATA_BUFFER_POOL_MB` cannot synthesize an advisory. Returns the
+ * guidance string once per 10-minute window, or `null` when already shown
+ * or absent. */
+export declare function extractDaemonMemoryAdvisory(errorChannelText: string | null | undefined, nowMs?: number): string | null;
+export interface SessionEpochState {
+    epoch: number;
+    baselineInjectedEpoch: number;
+    seenFiles: Set<string>;
+}
+/** Current epoch for a session (starts at 0, incremented by compaction). */
+export declare function currentSessionEpoch(sessionId: string | null | undefined): number;
+/** Increment the epoch and clear seen files so the next context hook re-injects. */
+export declare function incrementSessionEpoch(sessionId: string | null | undefined): void;
+export declare function sessionSeenFiles(sessionId: string | null | undefined): Set<string>;
+export declare function resetSessionEpoch(sessionId: string | null | undefined): void;
+export declare function resetAllSessionEpochs(): void;
+/**
+ * `session.hook("context")` handler. Reads `.NeuroStrata/active_session.json`
+ * from the project root; when an active task exists and its baseline has not
+ * been injected this epoch, injects `[NeuroStrata Active Context] ...` once.
+ * Same-epoch repeat calls leave the event untouched.
+ */
+export declare function sessionContextHandler(event: any, config: ResolvedConfig): Promise<void>;
+/**
+ * `session.hook("compaction")` handler. Increments the session epoch and
+ * clears seen files, so the very next context hook re-injects the active
+ * task / rules baseline.
+ */
+export declare function sessionCompactionHandler(event: any, config: ResolvedConfig): Promise<void>;
+export declare const pendingRecallBlocks: string[];
+export declare const pendingRecallByCall: Map<string, string>;
+/**
+ * Tool-name extraction for execute.after events. OpenCode V2 passes
+ * `event.name`; V1 / Claude / Hermes pass `event.tool` / `event.tool_name`.
+ * `event.toolName` is checked first.
+ */
+export declare function extractToolName(event: any): string;
+export declare function initialize(ctx: any): Promise<void>;
 export declare function handleHookEvent(event: Record<string, unknown>): Promise<Record<string, unknown>>;
-declare const _default: {
+export declare const handleClaudeHookEvent: typeof handleHookEvent;
+export declare function onTurnEnd(turn: {
+    role: 'user' | 'assistant';
+    content: string;
+}): Promise<void>;
+export declare function fetchContextPlan(opts: {
+    namespace: string;
+    query?: string;
+    file_path?: string;
+    max_items?: number;
+    max_bytes?: number;
+    format?: 'json' | 'text';
+}): Promise<string>;
+export declare function createHarnessPlugin(pluginId?: string, harnessName?: string): {
     id: string;
+    name: string;
     setup: typeof initialize;
     initialize: typeof initialize;
     handleHookEvent: typeof handleHookEvent;
+    handleClaudeHookEvent: typeof handleHookEvent;
+    onTurnEnd: typeof onTurnEnd;
+    fetchContextPlan: typeof fetchContextPlan;
+    adapterStatus: typeof adapterStatus;
+};
+export interface OpenClawPluginContext {
+    projectDir?: string;
+    config?: Record<string, unknown>;
+    hooks?: {
+        beforeFileOp?: (handler: FileOpHandler) => void | Promise<void>;
+        onTurnEnd?: (handler: TurnEndHandler) => void | Promise<void>;
+    };
+    conversation?: {
+        injectSystemMessage?: (message: string) => void | Promise<void>;
+    };
+    logger?: {
+        info?: (message: string, detail?: unknown) => void;
+        warn?: (message: string, detail?: unknown) => void;
+        error?: (message: string, detail?: unknown) => void;
+    };
+}
+export interface FileOperation {
+    type: 'write' | 'edit' | 'delete' | 'mkdir';
+    path: string;
+    content?: string;
+    oldContent?: string;
+    newContent?: string;
+}
+export interface FileOpResult {
+    allowed: boolean;
+    reason?: string;
+    guardVerdict?: GuardValidateResult;
+    degraded?: boolean;
+}
+export interface ConversationTurn {
+    role: 'user' | 'assistant' | 'system';
+    content: string;
+    turnId?: string;
+    sessionId?: string;
+}
+export type FileOpHandler = (op: FileOperation) => Promise<FileOpResult>;
+export type TurnEndHandler = (turn: ConversationTurn) => Promise<void>;
+declare const _default: {
+    id: string;
+    setup: (ctx: (Partial<OpenClawPluginContext> & Record<string, unknown>) | undefined) => Promise<void>;
+    initialize: (ctx: (Partial<OpenClawPluginContext> & Record<string, unknown>) | undefined) => Promise<void>;
+    handleHookEvent: (event: Record<string, unknown>) => Promise<Record<string, unknown>>;
+    onTurnEnd: (turn: ConversationTurn) => Promise<void>;
+    resetState: () => void;
 };
 export default _default;
 //# sourceMappingURL=index.d.ts.map

@@ -2121,7 +2121,9 @@ function wsMakeStub(node) {
     }
     else if (node.kind === 'file' || node.kind === 'symbol') {
         const identity = node.kind === 'symbol' && node.symbol
-            ? `${node.path ?? '-'}#${node.symbol}`
+            ? node.id.startsWith('symbol:')
+                ? node.id
+                : `symbol:${node.path ?? '-'}#${node.symbol}`
             : node.id;
         pointer = `[GCStub ${wsEscapePointerToken(identity)} | sha256:${wsSha(node.id).slice(0, 12)} | expand:neurostrata_memories_for_file]`;
     }
@@ -2342,6 +2344,7 @@ export async function advanceWorkingSetTurn(stateInput, namespace, sessionId, pr
         state.recent_event_ids = [];
         state.frame_fingerprint = wsEmptyFingerprint();
         state.last_injected_fingerprint = wsEmptyFingerprint();
+        workingSetInjectionFingerprints.delete(workingSetInjectionKey(scope));
         for (const node of [...state.roots, ...state.young_gen])
             node.last_touched_turn = 0;
         for (const item of [
@@ -2373,17 +2376,6 @@ export async function advanceWorkingSetTurn(stateInput, namespace, sessionId, pr
             if (prior.kind !== touch.kind)
                 continue;
             prior.last_touched_turn = turn;
-            const projected = wsChargedBytes(state) - prior.byte_cost + WORKING_SET_MAX_FRAME_BYTES;
-            if (evaluateWorkingSetEviction({
-                tier: 'EvictedStub',
-                turn_age: 0,
-                max_idle_turns: state.max_idle_turns,
-                node_bytes: prior.byte_cost,
-                projected_frame_bytes: projected,
-                max_frame_bytes: state.max_frame_bytes,
-                is_re_referenced: true
-            }) !== 'promote_to_young_gen')
-                continue;
             try {
                 const expanded = await expand({
                     id: prior.id,
@@ -2755,11 +2747,39 @@ export function renderWorkingSetFrame(state, activeSession) {
         }
     }
     else if (golden.length > 0) {
-        const idsHash = wsSha(golden
-            .map((node) => node.id)
-            .sort()
-            .join('\n'));
-        lines.push(`[NeuroStrata Golden Rule Manifest] count=${golden.length} | ids_sha256=${idsHash} | expand:neurostrata_get_snapshot\n`);
+        const availableBytes = WORKING_SET_MAX_FRAME_BYTES - baseBytes;
+        const taskHeaders = immortal.filter((entry) => entry.node.kind === 'task_header');
+        const minimumGolden = golden.map((node) => wsGoldenProjection(node, ''));
+        const taskHeaderBytes = taskHeaders.reduce((sum, entry) => sum + Buffer.byteLength(entry.line), 0);
+        const minimumBytes = taskHeaderBytes +
+            minimumGolden.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
+        let shortenedGolden = null;
+        if (taskHeaders.every(({ line }) => Buffer.byteLength(line) <= WORKING_SET_MAX_FRAME_BYTES) &&
+            minimumGolden.every((line) => Buffer.byteLength(line) <= WORKING_SET_MAX_FRAME_BYTES) &&
+            minimumBytes <= availableBytes) {
+            let perRuleBudget = Math.floor((availableBytes - minimumBytes) / golden.length);
+            while (perRuleBudget >= 0) {
+                const candidate = golden.map((node) => wsGoldenProjection(node, wsTruncateUtf8(node.summary, perRuleBudget)));
+                const candidateBytes = taskHeaderBytes +
+                    candidate.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
+                if (candidate.every((line) => Buffer.byteLength(line) <= WORKING_SET_MAX_FRAME_BYTES) &&
+                    candidateBytes <= availableBytes) {
+                    shortenedGolden = candidate;
+                    break;
+                }
+                perRuleBudget--;
+            }
+        }
+        if (shortenedGolden !== null) {
+            lines.push(...shortenedGolden, ...taskHeaders.map((entry) => entry.line));
+        }
+        else {
+            const idsHash = wsSha(golden
+                .map((node) => node.id)
+                .sort()
+                .join('\n'));
+            lines.push(`[NeuroStrata Golden Rule Manifest] count=${golden.length} | ids_sha256=${idsHash} | expand:neurostrata_get_snapshot\n`);
+        }
     }
     let text = header + goldenHeading + lines.join('') + workingHeading + close;
     if (Buffer.byteLength(text) > WORKING_SET_MAX_FRAME_BYTES) {

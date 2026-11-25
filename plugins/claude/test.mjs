@@ -1,16 +1,22 @@
-import test from "node:test";
-import assert from "node:assert/strict";
-import http from "node:http";
-import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import http from 'node:http'
+import { spawnSync } from 'node:child_process'
+import {
+  copyFileSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   buildLayout,
   canonicalTempDir,
   under,
-  writeMarker,
-} from "../../tests/fixtures/root-marker-layout.mjs";
+  writeMarker
+} from '../../tests/fixtures/root-marker-layout.mjs'
 import plugin, {
   detectTaskIntentsLocal,
   parseGuardValidate,
@@ -27,456 +33,562 @@ import plugin, {
   PREFETCH_LRU_CAP,
   SUBAGENT_CONTEXT_MARKER,
   buildSubagentContextHeader,
-  injectSubagentPrompt,
-} from "./dist/index.js";
+  injectSubagentPrompt
+} from './dist/index.js'
 
-test("Plugin.define exports V2 setup and registers execute.before hook", async () => {
-  assert.ok(plugin.id.startsWith("neurostrata"));
-  assert.equal(typeof plugin.setup, "function");
+function resetModuleState() {
+  resetClientForTesting()
+}
 
-  let registeredHook = null;
-  let registeredCallback = null;
+test('Plugin.define exports V2 setup and registers execute.before hook', async () => {
+  assert.ok(plugin.id.startsWith('neurostrata'))
+  assert.equal(typeof plugin.setup, 'function')
+
+  let registeredHook = null
+  let registeredCallback = null
   const ctx = {
     config: {
-      namespace: "test-ns",
-      endpoint: "http://127.0.0.1:1/mcp",
-      bearerToken: "test-token",
+      namespace: 'test-ns',
+      endpoint: 'http://127.0.0.1:1/mcp',
+      bearerToken: 'test-token',
       strictMode: true,
-      requestTimeoutMs: 100,
+      requestTimeoutMs: 100
     },
     tool: {
       hook: async (name, cb) => {
-        registeredHook = name;
-        registeredCallback = cb;
-      },
-    },
-  };
+        registeredHook = name
+        registeredCallback = cb
+      }
+    }
+  }
 
-  await plugin.setup(ctx);
-  assert.equal(registeredHook, "execute.before");
-  assert.equal(typeof registeredCallback, "function");
+  await plugin.setup(ctx)
+  assert.equal(registeredHook, 'execute.before')
+  assert.equal(typeof registeredCallback, 'function')
 
   // Non-mutating tool passes through without throwing
-  await registeredCallback({ tool: "read", input: { path: "foo" }, sessionID: "s1" });
+  await registeredCallback({
+    tool: 'read',
+    input: { path: 'foo' },
+    sessionID: 's1'
+  })
 
   // Mutating tool invokes guard_validate and fails closed when core unreachable
   await assert.rejects(
     () =>
       registeredCallback({
-        tool: "write",
-        input: { path: "foo.txt", content: "bar" },
-        sessionID: "s1",
+        tool: 'write',
+        input: { path: 'foo.txt', content: 'bar' },
+        sessionID: 's1'
       }),
     /Guard validation unavailable/
-  );
-});
+  )
+})
 
-test("parseGuardValidate and detectTaskIntentsLocal", () => {
+test('parseGuardValidate and detectTaskIntentsLocal', () => {
   const verdict = parseGuardValidate(
     JSON.stringify({
       verdict: {
-        bucket: "DeterministicReject",
-        reasons: ["claim task first"],
+        bucket: 'DeterministicReject',
+        reasons: ['claim task first']
       },
-      rule_ids_triggered: ["r1"],
+      rule_ids_triggered: ['r1']
     })
-  );
-  assert.equal(verdict.verdict, "reject");
-  assert.deepEqual(verdict.reasons, ["claim task first"]);
+  )
+  assert.equal(verdict.verdict, 'reject')
+  assert.deepEqual(verdict.reasons, ['claim task first'])
 
-  const intents = detectTaskIntentsLocal("TODO: wire up validation later");
-  assert.equal(intents.length, 1);
-  assert.equal(intents[0].marker, "todo:");
-});
+  const intents = detectTaskIntentsLocal('TODO: wire up validation later')
+  assert.equal(intents.length, 1)
+  assert.equal(intents[0].marker, 'todo:')
+})
 
 // ─── Mock local HTTP JSON-RPC server for healthy daemon round-trip ───
 
 function makeMockRpcResponse(id, resultObj, errorObj = null) {
   return JSON.stringify({
-    jsonrpc: "2.0",
+    jsonrpc: '2.0',
     id,
-    ...(errorObj ? { error: errorObj } : { result: resultObj }),
-  });
+    ...(errorObj ? { error: errorObj } : { result: resultObj })
+  })
 }
 
 function createMockDaemonServer(port = 0) {
   // Cross-test call counter, surfaced so tests can assert a deduped touch
   // did not re-query the daemon.
-  const counters = { memoriesForFile: 0 };
+  const counters = { memoriesForFile: 0 }
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
-      if (req.method !== "POST") {
-        res.writeHead(405); res.end(); return;
+      if (req.method !== 'POST') {
+        res.writeHead(405)
+        res.end()
+        return
       }
-      let body = "";
-      req.on("data", (chunk) => (body += chunk));
-      req.on("end", () => {
+      let body = ''
+      req.on('data', (chunk) => (body += chunk))
+      req.on('end', () => {
         try {
-          const payload = JSON.parse(body);
-          const id = payload.id ?? 0;
-          const method = payload.method;
-          if (method === "tools/list") {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(makeMockRpcResponse(id, {
-              tools: [
-                { name: "neurostrata_guard_validate" },
-                { name: "neurostrata_task_create" },
-                { name: "neurostrata_get_snapshot" },
-                { name: "neurostrata_append_log" },
-                { name: "neurostrata_search_memory" },
-                { name: "neurostrata_context_plan" },
-                { name: "neurostrata_memories_for_file" },
-              ],
-            }));
-            return;
+          const payload = JSON.parse(body)
+          const id = payload.id ?? 0
+          const method = payload.method
+          if (method === 'tools/list') {
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(
+              makeMockRpcResponse(id, {
+                tools: [
+                  { name: 'neurostrata_guard_validate' },
+                  { name: 'neurostrata_task_create' },
+                  { name: 'neurostrata_get_snapshot' },
+                  { name: 'neurostrata_append_log' },
+                  { name: 'neurostrata_search_memory' },
+                  { name: 'neurostrata_context_plan' },
+                  { name: 'neurostrata_memories_for_file' }
+                ]
+              })
+            )
+            return
           }
-          if (method === "tools/call") {
-            const params = payload.params ?? {};
-            const name = params.name ?? params.arguments?.name;
-            if (name === "neurostrata_memories_for_file") {
-              counters.memoriesForFile++;
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(makeMockRpcResponse(id, {
-                content: [{
-                  type: "text",
-                  text: JSON.stringify({
-                    hits: [
-                      {
-                        id: "mem-rule-1",
-                        valid_from: "2026-01-01T00:00:00Z",
-                        memory_type: "rule",
-                        content: "Always claim a task before editing files.",
-                      },
-                      {
-                        id: "mem-fact-2",
-                        valid_from: "2026-01-02T00:00:00Z",
-                        memory_type: "fact",
-                        content: "The daemon serves MCP on 127.0.0.1:34343.",
-                      },
-                    ],
-                  }),
-                }],
-              }));
-              return;
+          if (method === 'tools/call') {
+            const params = payload.params ?? {}
+            const name = params.name ?? params.arguments?.name
+            if (name === 'neurostrata_memories_for_file') {
+              counters.memoriesForFile++
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(
+                makeMockRpcResponse(id, {
+                  content: [
+                    {
+                      type: 'text',
+                      text: JSON.stringify({
+                        hits: [
+                          {
+                            id: 'mem-rule-1',
+                            valid_from: '2026-01-01T00:00:00Z',
+                            memory_type: 'rule',
+                            content: 'Always claim a task before editing files.'
+                          },
+                          {
+                            id: 'mem-fact-2',
+                            valid_from: '2026-01-02T00:00:00Z',
+                            memory_type: 'fact',
+                            content: 'The daemon serves MCP on 127.0.0.1:34343.'
+                          }
+                        ]
+                      })
+                    }
+                  ]
+                })
+              )
+              return
             }
             // Healthy pass for guard; snapshot / log / search return ready + unlocked
-            if (name === "neurostrata_get_snapshot") {
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(makeMockRpcResponse(id, {
-                content: [{ type: "text", text: '{"status":"ready","preflight_unlocked":true}' }],
-              }));
-              return;
+            if (name === 'neurostrata_get_snapshot') {
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(
+                makeMockRpcResponse(id, {
+                  content: [
+                    {
+                      type: 'text',
+                      text: '{"status":"ready","preflight_unlocked":true}'
+                    }
+                  ]
+                })
+              )
+              return
             }
-            if (name === "neurostrata_append_log") {
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(makeMockRpcResponse(id, {
-                content: [{ type: "text", text: '{"status":"ready","preflight_unlocked":true,"logged":true}' }],
-              }));
-              return;
+            if (name === 'neurostrata_append_log') {
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(
+                makeMockRpcResponse(id, {
+                  content: [
+                    {
+                      type: 'text',
+                      text: '{"status":"ready","preflight_unlocked":true,"logged":true}'
+                    }
+                  ]
+                })
+              )
+              return
             }
-            if (name === "neurostrata_search_memory") {
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(makeMockRpcResponse(id, {
-                content: [{ type: "text", text: '{"status":"ready","unlocked_preflight":true}' }],
-              }));
-              return;
+            if (name === 'neurostrata_search_memory') {
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(
+                makeMockRpcResponse(id, {
+                  content: [
+                    {
+                      type: 'text',
+                      text: '{"status":"ready","unlocked_preflight":true}'
+                    }
+                  ]
+                })
+              )
+              return
             }
-            if (name === "neurostrata_context_plan") {
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(makeMockRpcResponse(id, {
-                content: [{ type: "text", text: '{"schema_version":"v1","items":[]}' }],
-              }));
-              return;
+            if (name === 'neurostrata_context_plan') {
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(
+                makeMockRpcResponse(id, {
+                  content: [
+                    { type: 'text', text: '{"schema_version":"v1","items":[]}' }
+                  ]
+                })
+              )
+              return
             }
-            if (name === "neurostrata_guard_validate") {
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(makeMockRpcResponse(id, {
-                content: [{ type: "text", text: '{"verdict":{"bucket":"Pass"},"rule_ids_triggered":[]}' }],
-              }));
-              return;
+            if (name === 'neurostrata_guard_validate') {
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(
+                makeMockRpcResponse(id, {
+                  content: [
+                    {
+                      type: 'text',
+                      text: '{"verdict":{"bucket":"Pass"},"rule_ids_triggered":[]}'
+                    }
+                  ]
+                })
+              )
+              return
             }
             // Unknown tool → error response
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(makeMockRpcResponse(id, null, { code: -32601, message: "Unknown tool" }));
-            return;
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(
+              makeMockRpcResponse(id, null, {
+                code: -32601,
+                message: 'Unknown tool'
+              })
+            )
+            return
           }
           // Unknown method
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(makeMockRpcResponse(id, null, { code: -32601, message: "Unknown method" }));
+          res.writeHead(200, { 'Content-Type': 'application/json' })
+          res.end(
+            makeMockRpcResponse(id, null, {
+              code: -32601,
+              message: 'Unknown method'
+            })
+          )
         } catch {
-          res.writeHead(400); res.end();
+          res.writeHead(400)
+          res.end()
         }
-      });
-    });
+      })
+    })
     server.listen(port, () => {
-      const addr = server.address();
-      resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp`, counters });
-    });
-  });
+      const addr = server.address()
+      resolve({ server, url: `http://127.0.0.1:${addr.port}/mcp`, counters })
+    })
+  })
 }
 
 // ─── (a) Healthy daemon round-trip + adapter status "ready" / unlocked ───
 
-test("Healthy mock daemon: JSON-RPC 2.0 round-trip and unlocked pre-flight", async () => {
-  const { server, url } = await createMockDaemonServer();
+test('Healthy mock daemon: JSON-RPC 2.0 round-trip and unlocked pre-flight', async () => {
+  const { server, url } = await createMockDaemonServer()
   try {
     const client = new NeuroStrataMCPClient({
       endpoint: url,
-      token: "mock-token",
-      timeoutMs: 2000,
-    });
+      token: 'mock-token',
+      timeoutMs: 2000
+    })
 
     // Snapshot
-    const snapshotText = await client.callTool("neurostrata_get_snapshot", {});
-    const snapshot = JSON.parse(snapshotText);
-    assert.equal(snapshot.status, "ready");
-    assert.equal(snapshot.preflight_unlocked, true);
+    const snapshotText = await client.callTool('neurostrata_get_snapshot', {})
+    const snapshot = JSON.parse(snapshotText)
+    assert.equal(snapshot.status, 'ready')
+    assert.equal(snapshot.preflight_unlocked, true)
 
     // Append log
-    const logText = await client.callTool("neurostrata_append_log", { tags: ["test"] });
-    const log = JSON.parse(logText);
-    assert.equal(log.status, "ready");
-    assert.equal(log.preflight_unlocked, true);
-    assert.equal(log.logged, true);
+    const logText = await client.callTool('neurostrata_append_log', {
+      tags: ['test']
+    })
+    const log = JSON.parse(logText)
+    assert.equal(log.status, 'ready')
+    assert.equal(log.preflight_unlocked, true)
+    assert.equal(log.logged, true)
 
     // Search memory
-    const searchText = await client.callTool("neurostrata_search_memory", { query: "preflight" });
-    const search = JSON.parse(searchText);
-    assert.equal(search.status, "ready");
-    assert.equal(search.unlocked_preflight, true);
+    const searchText = await client.callTool('neurostrata_search_memory', {
+      query: 'preflight'
+    })
+    const search = JSON.parse(searchText)
+    assert.equal(search.status, 'ready')
+    assert.equal(search.unlocked_preflight, true)
 
     // Adapter status via initialize on a healthy endpoint should report ready
     const ctxHealthy = {
       config: {
-        namespace: "healthy-ns",
+        namespace: 'healthy-ns',
         endpoint: url,
-        bearerToken: "mock-token",
+        bearerToken: 'mock-token',
         strictMode: false,
-        requestTimeoutMs: 500,
+        requestTimeoutMs: 500
       },
-      tool: { hook: async () => {} },
-    };
-    await plugin.setup(ctxHealthy);
-    const status = adapterStatus();
-    assert.equal(status.state, "ready", "adapter should be ready with healthy daemon");
-    assert.equal(status.endpoint, url);
+      tool: { hook: async () => {} }
+    }
+    await plugin.setup(ctxHealthy)
+    const status = adapterStatus()
+    assert.equal(
+      status.state,
+      'ready',
+      'adapter should be ready with healthy daemon'
+    )
+    assert.equal(status.endpoint, url)
   } finally {
-    server.close();
+    server.close()
   }
-});
+})
 
 // ─── (b) Unreachable daemon fail-open fallback (degraded / unavailable) ───
 
-test("Unreachable daemon fail-open fallback keeps degraded endpoint visible", async () => {
+test('Unreachable daemon fail-open fallback keeps degraded endpoint visible', async () => {
   // Intentionally use unreachable endpoint (127.0.0.1:1)
   const ctxUnreachable = {
     config: {
-      namespace: "fail-open",
-      endpoint: "http://127.0.0.1:1/mcp",
+      namespace: 'fail-open',
+      endpoint: 'http://127.0.0.1:1/mcp',
       bearerToken: null,
       strictMode: true,
-      requestTimeoutMs: 100,
+      requestTimeoutMs: 100
     },
     tool: {
       hook: async (name, cb) => {
         // Mutating tool should throw because guard is unreachable
-        if (name === "execute.before") {
+        if (name === 'execute.before') {
           await assert.rejects(
             () =>
               cb({
-                tool: "write",
-                input: { path: "x.txt", content: "y" },
-                sessionID: "s1",
+                tool: 'write',
+                input: { path: 'x.txt', content: 'y' },
+                sessionID: 's1'
               }),
             /Guard validation unavailable/
-          );
+          )
         }
-      },
-    },
-  };
-  await plugin.setup(ctxUnreachable);
-  const status = adapterStatus();
-  assert.equal(status.endpoint, "http://127.0.0.1:1/mcp", "degraded endpoint preserved");
-  assert.equal(status.state, "unavailable", "adapter should be unavailable when daemon unreachable");
-});
+      }
+    }
+  }
+  await plugin.setup(ctxUnreachable)
+  const status = adapterStatus()
+  assert.equal(
+    status.endpoint,
+    'http://127.0.0.1:1/mcp',
+    'degraded endpoint preserved'
+  )
+  assert.equal(
+    status.state,
+    'unavailable',
+    'adapter should be unavailable when daemon unreachable'
+  )
+})
 
 // ─── (c) onTurnEnd + fetchContextPlan ───
 
-test("onTurnEnd resolves without throwing", async () => {
-  await onTurnEnd({ role: "user", content: "TODO: track this work" });
-  await onTurnEnd({ role: "assistant", content: "no intents here" });
-});
+test('onTurnEnd resolves without throwing', async () => {
+  await onTurnEnd({ role: 'user', content: 'TODO: track this work' })
+  await onTurnEnd({ role: 'assistant', content: 'no intents here' })
+})
 
-test("fetchContextPlan calls neurostrata_context_plan and returns text", async () => {
-  const { server, url } = await createMockDaemonServer();
+test('fetchContextPlan calls neurostrata_context_plan and returns text', async () => {
+  const { server, url } = await createMockDaemonServer()
   try {
     const ctx = {
       config: {
-        namespace: "ctx-ns",
+        namespace: 'ctx-ns',
         endpoint: url,
-        bearerToken: "mock-token",
+        bearerToken: 'mock-token',
         strictMode: false,
-        requestTimeoutMs: 500,
+        requestTimeoutMs: 500
       },
-      tool: { hook: async () => {} },
-    };
-    await plugin.setup(ctx);
-    const text = await fetchContextPlan({ namespace: "ctx-ns", query: "foo", max_items: 2 });
-    assert.equal(typeof text, "string");
-    assert.ok(text.includes("schema_version") || text.includes("items"));
+      tool: { hook: async () => {} }
+    }
+    await plugin.setup(ctx)
+    const text = await fetchContextPlan({
+      namespace: 'ctx-ns',
+      query: 'foo',
+      max_items: 2
+    })
+    assert.equal(typeof text, 'string')
+    assert.ok(text.includes('schema_version') || text.includes('items'))
   } finally {
-    server.close();
+    server.close()
   }
-});
+})
 
-test("fetchContextPlan throws when MCP client not initialized", async () => {
+test('fetchContextPlan throws when MCP client not initialized', async () => {
   // Drop the cached client so the module is back to "not initialized".
-  resetClientForTesting();
+  resetClientForTesting()
   await assert.rejects(
-    () => fetchContextPlan({ namespace: "ctx-ns" }),
+    () => fetchContextPlan({ namespace: 'ctx-ns' }),
     /NeuroStrata MCP client not initialized/
-  );
-});
+  )
+})
 
 // ─── (d) File-touch prefetch (design §4.5) ───
 
-test("parseFileMemoryHits reads hits and memories arrays", () => {
+test('parseFileMemoryHits reads hits and memories arrays', () => {
   const asHits = parseFileMemoryHits(
-    JSON.stringify({ hits: [{ id: "m1", valid_from: "t0", memory_type: "rule", content: "x" }] })
-  );
-  assert.equal(asHits.length, 1);
-  assert.equal(asHits[0].id, "m1");
+    JSON.stringify({
+      hits: [{ id: 'm1', valid_from: 't0', memory_type: 'rule', content: 'x' }]
+    })
+  )
+  assert.equal(asHits.length, 1)
+  assert.equal(asHits[0].id, 'm1')
 
   const asMemories = parseFileMemoryHits(
-    JSON.stringify({ memories: [{ id: "m2", valid_from: "t1", memory_type: "fact", content: "y" }] })
-  );
-  assert.equal(asMemories.length, 1);
-  assert.equal(asMemories[0].id, "m2");
+    JSON.stringify({
+      memories: [
+        { id: 'm2', valid_from: 't1', memory_type: 'fact', content: 'y' }
+      ]
+    })
+  )
+  assert.equal(asMemories.length, 1)
+  assert.equal(asMemories[0].id, 'm2')
 
   // A hit without an id can never be deduped, so it is never surfaced.
   const noId = parseFileMemoryHits(
-    JSON.stringify({ hits: [{ valid_from: "t2", content: "z" }, { id: "m3", content: "w" }] })
-  );
-  assert.equal(noId.length, 1);
-  assert.equal(noId[0].id, "m3");
-});
+    JSON.stringify({
+      hits: [
+        { valid_from: 't2', content: 'z' },
+        { id: 'm3', content: 'w' }
+      ]
+    })
+  )
+  assert.equal(noId.length, 1)
+  assert.equal(noId[0].id, 'm3')
+})
 
-test("prefetchMemoriesForFile: LRU path dedup and injectedMemoryIds dedup", async () => {
-  const { server, url, counters } = await createMockDaemonServer();
+test('prefetchMemoriesForFile: LRU path dedup and injectedMemoryIds dedup', async () => {
+  const { server, url, counters } = await createMockDaemonServer()
   try {
     const ctx = {
       config: {
-        namespace: "prefetch-ns",
+        namespace: 'prefetch-ns',
         endpoint: url,
-        bearerToken: "mock-token",
+        bearerToken: 'mock-token',
         strictMode: false,
-        requestTimeoutMs: 500,
+        requestTimeoutMs: 500
       },
-      tool: { hook: async () => {} },
-    };
-    await plugin.setup(ctx);
+      tool: { hook: async () => {} }
+    }
+    await plugin.setup(ctx)
 
     // Isolate from any earlier test's module-level state.
-    prefetchedPaths.clear();
-    injectedMemoryIds.clear();
-    counters.memoriesForFile = 0;
+    prefetchedPaths.clear()
+    injectedMemoryIds.clear()
+    counters.memoriesForFile = 0
 
     // First touch of a path: one daemon query, both governing memories returned.
-    const first = await prefetchMemoriesForFile("prefetch-ns", "src/foo.rs");
-    assert.equal(first.length, 2);
-    assert.ok(first[0].startsWith("[NeuroStrata rule mem-rule-1"));
-    assert.ok(first[1].startsWith("[NeuroStrata fact mem-fact-2"));
-    assert.equal(counters.memoriesForFile, 1);
+    const first = await prefetchMemoriesForFile('prefetch-ns', 'src/foo.rs')
+    assert.equal(first.length, 2)
+    assert.ok(first[0].startsWith('[NeuroStrata rule mem-rule-1'))
+    assert.ok(first[1].startsWith('[NeuroStrata fact mem-fact-2'))
+    assert.equal(counters.memoriesForFile, 1)
 
     // Second touch of the same path: LRU dedup — no re-query, empty answer.
-    const second = await prefetchMemoriesForFile("prefetch-ns", "src/foo.rs");
-    assert.deepEqual(second, []);
-    assert.equal(counters.memoriesForFile, 1, "LRU dedup must not re-query");
+    const second = await prefetchMemoriesForFile('prefetch-ns', 'src/foo.rs')
+    assert.deepEqual(second, [])
+    assert.equal(counters.memoriesForFile, 1, 'LRU dedup must not re-query')
 
     // A different file returning the same memories: injectedMemoryIds dedup
     // — the query happens but yields no new snippets.
-    const third = await prefetchMemoriesForFile("prefetch-ns", "src/bar.rs");
-    assert.deepEqual(third, []);
-    assert.equal(counters.memoriesForFile, 2, "new path was queried once");
-    assert.equal(injectedMemoryIds.size, 2, "no duplicate memory keys injected");
+    const third = await prefetchMemoriesForFile('prefetch-ns', 'src/bar.rs')
+    assert.deepEqual(third, [])
+    assert.equal(counters.memoriesForFile, 2, 'new path was queried once')
+    assert.equal(injectedMemoryIds.size, 2, 'no duplicate memory keys injected')
 
     // LRU cap: the prefetched-path map never grows past 128 entries.
     for (let i = 0; i < PREFETCH_LRU_CAP * 2; i++) {
-      await prefetchMemoriesForFile("prefetch-ns", `file-${i}.rs`);
+      await prefetchMemoriesForFile('prefetch-ns', `file-${i}.rs`)
     }
-    assert.equal(prefetchedPaths.size, PREFETCH_LRU_CAP);
+    assert.equal(prefetchedPaths.size, PREFETCH_LRU_CAP)
 
     // Empty path is a no-op that touches nothing.
-    const empty = await prefetchMemoriesForFile("prefetch-ns", "   ");
-    assert.deepEqual(empty, []);
+    const empty = await prefetchMemoriesForFile('prefetch-ns', '   ')
+    assert.deepEqual(empty, [])
 
-    prefetchedPaths.clear();
-    injectedMemoryIds.clear();
+    prefetchedPaths.clear()
+    injectedMemoryIds.clear()
   } finally {
-    server.close();
+    server.close()
   }
-});
+})
 
-test("injectSubagentPrompt prepends context header once and is idempotent", () => {
-  const target = { prompt: "Original prompt text" };
-  const namespace = "test-ns";
-  const taskId = "task-123";
+test('injectSubagentPrompt prepends context header once and is idempotent', () => {
+  const target = { prompt: 'Original prompt text' }
+  const namespace = 'test-ns'
+  const taskId = 'task-123'
 
   // First call should inject
-  const first = injectSubagentPrompt(target, namespace, taskId);
-  assert.equal(first, true, "first call returns true");
-  assert.ok(target.prompt.includes(SUBAGENT_CONTEXT_MARKER));
-  assert.ok(target.prompt.startsWith(`### NeuroStrata Task & Graph Context (AUTO-INJECTED BY NEUROSTRATA PLUGIN)`));
-  assert.ok(target.prompt.includes(`Namespace: \`${namespace}\``));
-  assert.ok(target.prompt.includes(`Active Task ID: \`${taskId}\``));
-  assert.ok(target.prompt.endsWith("Original prompt text"));
+  const first = injectSubagentPrompt(target, namespace, taskId)
+  assert.equal(first, true, 'first call returns true')
+  assert.ok(target.prompt.includes(SUBAGENT_CONTEXT_MARKER))
+  assert.ok(
+    target.prompt.startsWith(
+      `### NeuroStrata Task & Graph Context (AUTO-INJECTED BY NEUROSTRATA PLUGIN)`
+    )
+  )
+  assert.ok(target.prompt.includes(`Namespace: \`${namespace}\``))
+  assert.ok(target.prompt.includes(`Active Task ID: \`${taskId}\``))
+  assert.ok(target.prompt.endsWith('Original prompt text'))
 
   // Second call should be idempotent (no double-injection)
-  const second = injectSubagentPrompt(target, namespace, taskId);
-  assert.equal(second, false, "second call returns false");
+  const second = injectSubagentPrompt(target, namespace, taskId)
+  assert.equal(second, false, 'second call returns false')
   // Header embeds the marker twice (title line + body reference); assert count
   // stability across repeated injection rather than an exact count of 1.
-  const afterFirst = (target.prompt.match(/### NeuroStrata Task & Graph Context/g) || []).length;
-  assert.ok(afterFirst >= 1, "header injected at least once");
-  assert.equal(injectSubagentPrompt(target, namespace, taskId), false, "third call is also a no-op");
-  assert.equal((target.prompt.match(/### NeuroStrata Task & Graph Context/g) || []).length, afterFirst, "idempotent: no additional markers injected");
+  const afterFirst = (
+    target.prompt.match(/### NeuroStrata Task & Graph Context/g) || []
+  ).length
+  assert.ok(afterFirst >= 1, 'header injected at least once')
+  assert.equal(
+    injectSubagentPrompt(target, namespace, taskId),
+    false,
+    'third call is also a no-op'
+  )
+  assert.equal(
+    (target.prompt.match(/### NeuroStrata Task & Graph Context/g) || []).length,
+    afterFirst,
+    'idempotent: no additional markers injected'
+  )
 
   // Missing prompt property returns false
-  const noPrompt = { other: "data" };
-  assert.equal(injectSubagentPrompt(noPrompt, namespace, taskId), false);
+  const noPrompt = { other: 'data' }
+  assert.equal(injectSubagentPrompt(noPrompt, namespace, taskId), false)
 
   // null prompt property returns false
-  const nullPrompt = { prompt: null };
-  assert.equal(injectSubagentPrompt(nullPrompt, namespace, taskId), false);
-});
+  const nullPrompt = { prompt: null }
+  assert.equal(injectSubagentPrompt(nullPrompt, namespace, taskId), false)
+})
 
-test("buildSubagentContextHeader includes required fields", () => {
-  const header = buildSubagentContextHeader("my-ns", "task-abc");
-  assert.ok(header.includes("### NeuroStrata Task & Graph Context"));
-  assert.ok(header.includes("AUTO-INJECTED BY NEUROSTRATA PLUGIN"));
-  assert.ok(header.includes("Namespace: \`my-ns\`"));
-  assert.ok(header.includes("Active Task ID: \`task-abc\`"));
-  assert.ok(header.includes("Graph-First Lookup Rule"));
-  assert.ok(header.includes("neurostrata_memories_for_file"));
-  assert.ok(header.includes("neurostrata_search_memory"));
+test('buildSubagentContextHeader includes required fields', () => {
+  const header = buildSubagentContextHeader('my-ns', 'task-abc')
+  assert.ok(header.includes('### NeuroStrata Task & Graph Context'))
+  assert.ok(header.includes('AUTO-INJECTED BY NEUROSTRATA PLUGIN'))
+  assert.ok(header.includes('Namespace: \`my-ns\`'))
+  assert.ok(header.includes('Active Task ID: \`task-abc\`'))
+  assert.ok(header.includes('Graph-First Lookup Rule'))
+  assert.ok(header.includes('neurostrata_memories_for_file'))
+  assert.ok(header.includes('neurostrata_search_memory'))
 
   // With null taskId
-  const headerNull = buildSubagentContextHeader("other-ns", null);
-  assert.ok(headerNull.includes("Active Task ID: \`unclaimed (claim a task first)\`"));
-});
+  const headerNull = buildSubagentContextHeader('other-ns', null)
+  assert.ok(
+    headerNull.includes('Active Task ID: \`unclaimed (claim a task first)\`')
+  )
+})
 
 // ── The Claude hook runner's namespace (spec 6.3) ─────────────────────────
 // The runner is spawned as Claude Code runs it: a new process per event,
 // event JSON on stdin. The plugin logs its resolved namespace to stderr at
 // initialize; the endpoint points at a closed port so no daemon is reached.
 
-const RUNNER = fileURLToPath(new URL("./cli-hook.mjs", import.meta.url));
+const RUNNER = fileURLToPath(new URL('./cli-hook.mjs', import.meta.url))
 
 function runnerEnv(extra) {
-  const env = { ...process.env };
-  delete env.CLAUDE_PROJECT_DIR;
-  delete env.NEUROSTRATA_NAMESPACE;
-  return { ...env, ...extra };
+  const env = { ...process.env }
+  delete env.CLAUDE_PROJECT_DIR
+  delete env.NEUROSTRATA_NAMESPACE
+  return { ...env, ...extra }
 }
 
 function runClaudeHook(event, cwd, env) {
@@ -484,214 +596,463 @@ function runClaudeHook(event, cwd, env) {
     input: JSON.stringify(event),
     cwd,
     env,
-    encoding: "utf8",
-    timeout: 30000,
-  });
-  return run.stderr ?? "";
+    encoding: 'utf8',
+    timeout: 30000
+  })
+  return run.stderr ?? ''
 }
 
 function namespaceIn(stderr) {
-  const match = /plugin initialized[\s\S]*?namespace: '([^']*)'/.exec(stderr);
-  return match ? match[1] : `(none in stderr: ${stderr.slice(0, 300)})`;
+  const match = /plugin initialized[\s\S]*?namespace: '([^']*)'/.exec(stderr)
+  return match ? match[1] : `(none in stderr: ${stderr.slice(0, 300)})`
 }
 
 /** repo (outer marker) with a split subfolder packages/api (inner marker). */
 function splitProject() {
-  const base = canonicalTempDir("ns-claude-runner-");
+  const base = canonicalTempDir('ns-claude-runner-')
   buildLayout(base, [
-    "repo git-dir",
-    "repo marker:example-outer",
-    "repo/packages/api marker:example-inner",
-  ]);
-  const repo = under(base, "repo");
-  for (const dir of [repo, under(base, "repo/packages/api")]) {
+    'repo git-dir',
+    'repo marker:example-outer',
+    'repo/packages/api marker:example-inner'
+  ])
+  const repo = under(base, 'repo')
+  for (const dir of [repo, under(base, 'repo/packages/api')]) {
     writeFileSync(
-      join(dir, ".NeuroStrata", "neurostrata-plugin.json"),
-      JSON.stringify({ endpoint: "http://127.0.0.1:1/mcp" })
-    );
+      join(dir, '.NeuroStrata', 'neurostrata-plugin.json'),
+      JSON.stringify({ endpoint: 'http://127.0.0.1:1/mcp' })
+    )
   }
-  return { base, repo, api: under(base, "repo/packages/api") };
+  return { base, repo, api: under(base, 'repo/packages/api') }
 }
 
 const stopEvent = (cwd, extra = {}) => ({
-  hook_event_name: "Stop",
-  session_id: "runner-namespace-test",
+  hook_event_name: 'Stop',
+  session_id: 'runner-namespace-test',
   cwd,
-  ...extra,
-});
+  ...extra
+})
 
-test("claude runner uses CLAUDE_PROJECT_DIR not cwd", () => {
-  const { base, repo, api } = splitProject();
+test('claude runner uses CLAUDE_PROJECT_DIR not cwd', () => {
+  const { base, repo, api } = splitProject()
   try {
-    const top = runClaudeHook(stopEvent(api), api, runnerEnv({ CLAUDE_PROJECT_DIR: repo }));
-    assert.equal(namespaceIn(top), "example-outer");
+    const top = runClaudeHook(
+      stopEvent(api),
+      api,
+      runnerEnv({ CLAUDE_PROJECT_DIR: repo })
+    )
+    assert.equal(namespaceIn(top), 'example-outer')
     // A session started inside the split subfolder uses the inner namespace.
-    const inner = runClaudeHook(stopEvent(api), api, runnerEnv({ CLAUDE_PROJECT_DIR: api }));
-    assert.equal(namespaceIn(inner), "example-inner");
+    const inner = runClaudeHook(
+      stopEvent(api),
+      api,
+      runnerEnv({ CLAUDE_PROJECT_DIR: api })
+    )
+    assert.equal(namespaceIn(inner), 'example-inner')
   } finally {
-    rmSync(base, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true })
   }
-});
+})
 
-test("claude runner falls back to SessionStart folder when CLAUDE_PROJECT_DIR is unset", () => {
-  const { base, repo, api } = splitProject();
+test('claude runner falls back to SessionStart folder when CLAUDE_PROJECT_DIR is unset', () => {
+  const { base, repo, api } = splitProject()
   try {
-    const env = runnerEnv({});
-    const start = runClaudeHook(stopEvent(repo, { hook_event_name: "SessionStart" }), repo, env);
-    assert.equal(namespaceIn(start), "example-outer");
-    const later = runClaudeHook(stopEvent(api), api, env);
-    assert.equal(namespaceIn(later), "example-outer");
+    const env = runnerEnv({})
+    const start = runClaudeHook(
+      stopEvent(repo, { hook_event_name: 'SessionStart' }),
+      repo,
+      env
+    )
+    assert.equal(namespaceIn(start), 'example-outer')
+    const later = runClaudeHook(stopEvent(api), api, env)
+    assert.equal(namespaceIn(later), 'example-outer')
     // Another session with no recorded start follows its own folder.
-    const other = runClaudeHook(stopEvent(api, { session_id: "another" }), api, env);
-    assert.equal(namespaceIn(other), "example-inner");
+    const other = runClaudeHook(
+      stopEvent(api, { session_id: 'another' }),
+      api,
+      env
+    )
+    assert.equal(namespaceIn(other), 'example-inner')
   } finally {
-    rmSync(base, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true })
   }
-});
+})
 
-test("cli hook passes harness config, not env, as config", () => {
-  const base = canonicalTempDir("ns-claude-runner-");
+test('cli hook passes harness config, not env, as config', () => {
+  const base = canonicalTempDir('ns-claude-runner-')
   try {
-    buildLayout(base, ["repo git-dir", "repo neurostrata-dir"]);
-    const repo = under(base, "repo");
+    buildLayout(base, ['repo git-dir', 'repo neurostrata-dir'])
+    const repo = under(base, 'repo')
     writeFileSync(
-      join(repo, ".NeuroStrata", "neurostrata-plugin.json"),
-      JSON.stringify({ endpoint: "http://127.0.0.1:1/mcp" })
-    );
-    const configFile = join(repo, ".NeuroStrata", "plugins", "claude", "neurostrata.json");
-    mkdirSync(dirname(configFile), { recursive: true });
-    writeFileSync(configFile, JSON.stringify({ id: "neurostrata-claude", namespace: "from-config" }));
-    const env = runnerEnv({ CLAUDE_PROJECT_DIR: repo, NEUROSTRATA_NAMESPACE: "from-env" });
-    assert.equal(namespaceIn(runClaudeHook(stopEvent(repo), repo, env)), "from-config");
-    rmSync(configFile);
-    assert.equal(namespaceIn(runClaudeHook(stopEvent(repo), repo, env)), "from-env");
+      join(repo, '.NeuroStrata', 'neurostrata-plugin.json'),
+      JSON.stringify({ endpoint: 'http://127.0.0.1:1/mcp' })
+    )
+    const configFile = join(
+      repo,
+      '.NeuroStrata',
+      'plugins',
+      'claude',
+      'neurostrata.json'
+    )
+    mkdirSync(dirname(configFile), { recursive: true })
+    writeFileSync(
+      configFile,
+      JSON.stringify({ id: 'neurostrata-claude', namespace: 'from-config' })
+    )
+    const env = runnerEnv({
+      CLAUDE_PROJECT_DIR: repo,
+      NEUROSTRATA_NAMESPACE: 'from-env'
+    })
+    assert.equal(
+      namespaceIn(runClaudeHook(stopEvent(repo), repo, env)),
+      'from-config'
+    )
+    rmSync(configFile)
+    assert.equal(
+      namespaceIn(runClaudeHook(stopEvent(repo), repo, env)),
+      'from-env'
+    )
     // The project marker outranks both.
-    writeMarker(repo, "from-marker");
-    assert.equal(namespaceIn(runClaudeHook(stopEvent(repo), repo, env)), "from-marker");
+    writeMarker(repo, 'from-marker')
+    assert.equal(
+      namespaceIn(runClaudeHook(stopEvent(repo), repo, env)),
+      'from-marker'
+    )
   } finally {
-    rmSync(base, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true })
   }
-  const source = readFileSync(RUNNER, "utf8");
-  const envIndex = source.indexOf("...envConfig");
-  const configIndex = source.indexOf("...readHarnessConfig(");
+  const source = readFileSync(RUNNER, 'utf8')
+  const envIndex = source.indexOf('...envConfig')
+  const configIndex = source.indexOf('...readHarnessConfig(')
   assert.ok(
     envIndex >= 0 && configIndex >= 0 && envIndex < configIndex,
-    "the harness config must be spread after the env namespace so it wins"
-  );
-});
+    'the harness config must be spread after the env namespace so it wins'
+  )
+})
 
 // The runner Claude Code actually runs is the one the installer embeds
 // (CLI_HOOK_RUNNER_MJS) and writes to <root>/.NeuroStrata/plugins/claude/;
 // it takes its harness from that folder's name.
-test("installed claude runner: config over env, and CLAUDE_PROJECT_DIR", () => {
+test('installed claude runner: config over env, and CLAUDE_PROJECT_DIR', () => {
   const embedded = readFileSync(
-    new URL("../../src/task/harness_plugins.rs", import.meta.url),
-    "utf8"
-  ).match(/const CLI_HOOK_RUNNER_MJS: &str = r#"([\s\S]*?)"#;/);
-  assert.ok(embedded, "CLI_HOOK_RUNNER_MJS must be extractable");
-  const base = canonicalTempDir("ns-claude-installed-");
+    new URL('../../src/task/harness_plugins.rs', import.meta.url),
+    'utf8'
+  ).match(/const CLI_HOOK_RUNNER_MJS: &str = r#"([\s\S]*?)"#;/)
+  assert.ok(embedded, 'CLI_HOOK_RUNNER_MJS must be extractable')
+  const base = canonicalTempDir('ns-claude-installed-')
   try {
-    buildLayout(base, ["repo git-dir", "repo neurostrata-dir", "repo/sub"]);
-    const repo = under(base, "repo");
-    const pluginDir = join(repo, ".NeuroStrata", "plugins", "claude");
-    mkdirSync(join(pluginDir, "dist"), { recursive: true });
+    buildLayout(base, ['repo git-dir', 'repo neurostrata-dir', 'repo/sub'])
+    const repo = under(base, 'repo')
+    const pluginDir = join(repo, '.NeuroStrata', 'plugins', 'claude')
+    mkdirSync(join(pluginDir, 'dist'), { recursive: true })
     copyFileSync(
-      fileURLToPath(new URL("./dist/index.js", import.meta.url)),
-      join(pluginDir, "dist", "index.js")
-    );
-    writeFileSync(join(pluginDir, "package.json"), JSON.stringify({ type: "module" }));
-    const runner = join(pluginDir, "cli-hook.mjs");
-    writeFileSync(runner, embedded[1]);
+      fileURLToPath(new URL('./dist/index.js', import.meta.url)),
+      join(pluginDir, 'dist', 'index.js')
+    )
     writeFileSync(
-      join(pluginDir, "neurostrata.json"),
-      JSON.stringify({ id: "neurostrata-claude", namespace: "from-config" })
-    );
-    const closedPort = JSON.stringify({ endpoint: "http://127.0.0.1:1/mcp" });
-    writeFileSync(join(repo, ".NeuroStrata", "neurostrata-plugin.json"), closedPort);
+      join(pluginDir, 'package.json'),
+      JSON.stringify({ type: 'module' })
+    )
+    const runner = join(pluginDir, 'cli-hook.mjs')
+    writeFileSync(runner, embedded[1])
+    writeFileSync(
+      join(pluginDir, 'neurostrata.json'),
+      JSON.stringify({ id: 'neurostrata-claude', namespace: 'from-config' })
+    )
+    const closedPort = JSON.stringify({ endpoint: 'http://127.0.0.1:1/mcp' })
+    writeFileSync(
+      join(repo, '.NeuroStrata', 'neurostrata-plugin.json'),
+      closedPort
+    )
     const run = (cwd, env) =>
       namespaceIn(
         spawnSync(process.execPath, [runner], {
           input: JSON.stringify(stopEvent(cwd)),
           cwd,
           env,
-          encoding: "utf8",
-          timeout: 30000,
-        }).stderr ?? ""
-      );
-    const sub = under(base, "repo/sub");
+          encoding: 'utf8',
+          timeout: 30000
+        }).stderr ?? ''
+      )
+    const sub = under(base, 'repo/sub')
     assert.equal(
-      run(sub, runnerEnv({ CLAUDE_PROJECT_DIR: repo, NEUROSTRATA_NAMESPACE: "from-env" })),
-      "from-config"
-    );
+      run(
+        sub,
+        runnerEnv({
+          CLAUDE_PROJECT_DIR: repo,
+          NEUROSTRATA_NAMESPACE: 'from-env'
+        })
+      ),
+      'from-config'
+    )
 
     // Markers: the session's folder decides, not the event's cwd.
-    writeMarker(repo, "example-outer");
-    const api = under(base, "repo/packages/api");
-    writeMarker(api, "example-inner");
-    writeFileSync(join(api, ".NeuroStrata", "neurostrata-plugin.json"), closedPort);
-    assert.equal(run(api, runnerEnv({ CLAUDE_PROJECT_DIR: repo })), "example-outer");
-    assert.equal(run(api, runnerEnv({ CLAUDE_PROJECT_DIR: api })), "example-inner");
+    writeMarker(repo, 'example-outer')
+    const api = under(base, 'repo/packages/api')
+    writeMarker(api, 'example-inner')
+    writeFileSync(
+      join(api, '.NeuroStrata', 'neurostrata-plugin.json'),
+      closedPort
+    )
+    assert.equal(
+      run(api, runnerEnv({ CLAUDE_PROJECT_DIR: repo })),
+      'example-outer'
+    )
+    assert.equal(
+      run(api, runnerEnv({ CLAUDE_PROJECT_DIR: api })),
+      'example-inner'
+    )
   } finally {
-    rmSync(base, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true })
   }
-});
+})
+
+function writeClaudeWorkingSetParent(
+  root,
+  goldenRule = 'claim before editing'
+) {
+  writeMarker(root, 'gc-claude')
+  writeFileSync(
+    join(root, '.NeuroStrata', 'neurostrata-plugin.json'),
+    JSON.stringify({ endpoint: 'http://127.0.0.1:1/mcp', requestTimeoutMs: 50 })
+  )
+  writeFileSync(
+    join(root, '.NeuroStrata', 'active_session.json'),
+    JSON.stringify({
+      namespace: 'gc-claude',
+      session_id: 'ses-claude-gc',
+      task_id: 'task-claude-gc',
+      status: 'in_progress',
+      golden_rules: [goldenRule]
+    })
+  )
+}
+
+function runClaudeReply(event, root) {
+  const run = runFailingRunner(event, root)
+  assert.equal(run.status, 0, run.stderr)
+  return JSON.parse(run.stdout)
+}
+
+test('working-set GC PostToolUse maps updatedToolOutput and additionalContext', () => {
+  const root = canonicalTempDir('ns-claude-ws-result-')
+  try {
+    writeClaudeWorkingSetParent(root)
+    const raw = `HEAD${'x'.repeat(4000)}TAIL`
+    const out = runClaudeReply(
+      {
+        hook_event_name: 'PostToolUse',
+        session_id: 'ses-claude-gc',
+        tool_name: 'Read',
+        tool_use_id: 'tool-claude-1',
+        tool_input: { file_path: 'src/a.ts' },
+        tool_response: raw,
+        cwd: root
+      },
+      root
+    )
+    assert.deepEqual(Object.keys(out), ['hookSpecificOutput'])
+    assert.deepEqual(Object.keys(out.hookSpecificOutput).sort(), [
+      'additionalContext',
+      'hookEventName',
+      'updatedToolOutput'
+    ])
+    assert.equal(out.hookSpecificOutput.hookEventName, 'PostToolUse')
+    assert.match(
+      out.hookSpecificOutput.updatedToolOutput,
+      /\[NeuroStrata GC Stub ->/
+    )
+    assert.ok(!out.hookSpecificOutput.updatedToolOutput.includes(raw))
+    assert.equal(out.hookSpecificOutput.additionalContext.length, 1)
+    assert.match(
+      out.hookSpecificOutput.additionalContext[0],
+      /task:task-claude-gc/
+    )
+
+    const mixed = runClaudeReply(
+      {
+        hook_event_name: 'PostToolUse',
+        session_id: 'ses-claude-gc',
+        tool_name: 'Read',
+        tool_use_id: 'tool-claude-mixed',
+        tool_input: { file_path: 'src/mixed.ts' },
+        tool_response: {
+          content: [
+            { type: 'image', url: 'image' },
+            { type: 'text', text: raw }
+          ]
+        },
+        cwd: root
+      },
+      root
+    )
+    assert.deepEqual(Object.keys(mixed.hookSpecificOutput).sort(), [
+      'additionalContext',
+      'hookEventName'
+    ])
+  } finally {
+    resetModuleState()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('working-set GC SessionStart and Stop emit native shapes', () => {
+  const root = canonicalTempDir('ns-claude-ws-boundary-')
+  try {
+    writeClaudeWorkingSetParent(root)
+    const start = runClaudeReply(
+      {
+        hook_event_name: 'SessionStart',
+        session_id: 'ses-claude-gc',
+        cwd: root
+      },
+      root
+    )
+    assert.deepEqual(Object.keys(start), ['hookSpecificOutput'])
+    assert.deepEqual(Object.keys(start.hookSpecificOutput).sort(), [
+      'additionalContext',
+      'hookEventName'
+    ])
+    assert.equal(start.hookSpecificOutput.hookEventName, 'SessionStart')
+    assert.equal(start.hookSpecificOutput.additionalContext.length, 1)
+
+    writeClaudeWorkingSetParent(root, 'changed claude rule')
+    const stop = runClaudeReply(
+      { hook_event_name: 'Stop', session_id: 'ses-claude-gc', cwd: root },
+      root
+    )
+    assert.deepEqual(Object.keys(stop).sort(), [
+      'continue',
+      'hookSpecificOutput'
+    ])
+    assert.equal(stop.continue, true)
+    assert.equal(stop.hookSpecificOutput.hookEventName, 'Stop')
+    assert.equal(stop.hookSpecificOutput.additionalContext.length, 1)
+    assert.match(
+      stop.hookSpecificOutput.additionalContext[0],
+      /changed claude rule/
+    )
+
+    const subagent = runClaudeReply(
+      {
+        hook_event_name: 'SubagentStop',
+        session_id: 'ses-claude-gc',
+        cwd: root
+      },
+      root
+    )
+    assert.deepEqual(subagent, { continue: true })
+  } finally {
+    resetModuleState()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('working-set GC non-pretool failures return event-shaped no-op', () => {
+  const root = canonicalTempDir('ns-claude-ws-failure-')
+  try {
+    mkdirSync(join(root, '.NeuroStrata', 'plugins', 'claude'), {
+      recursive: true
+    })
+    writeFileSync(
+      join(root, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'),
+      '{'
+    )
+    const expected = [
+      ['PostToolUse', { hookSpecificOutput: { hookEventName: 'PostToolUse' } }],
+      [
+        'SessionStart',
+        { hookSpecificOutput: { hookEventName: 'SessionStart' } }
+      ],
+      ['Stop', { continue: true }],
+      ['SubagentStop', { continue: true }],
+      [
+        'UnknownEvent',
+        { hookSpecificOutput: { hookEventName: 'UnknownEvent' } }
+      ]
+    ]
+    for (const [hook_event_name, want] of expected) {
+      assert.deepEqual(
+        runClaudeReply({ hook_event_name, cwd: root }, root),
+        want
+      )
+    }
+  } finally {
+    resetModuleState()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
 
 // ── PR #400: event-specific hook failure replies ────────────────────────
 function runFailingRunner(event, projectDir) {
-  const env = { ...process.env };
-  delete env.CLAUDE_PROJECT_DIR;
-  delete env.NEUROSTRATA_NAMESPACE;
+  const env = { ...process.env }
+  delete env.CLAUDE_PROJECT_DIR
+  delete env.NEUROSTRATA_NAMESPACE
   return spawnSync(process.execPath, [RUNNER], {
     input: JSON.stringify(event),
     cwd: projectDir,
     env: { ...env, CLAUDE_PROJECT_DIR: projectDir },
-    encoding: "utf8",
-    timeout: 30000,
-  });
+    encoding: 'utf8',
+    timeout: 30000
+  })
 }
 
-test("hook runner replies in the shape of the failing event (#400)", () => {
-  const base = canonicalTempDir("ns-claude-hookfail-");
+test('hook runner replies in the shape of the failing event (#400)', () => {
+  const base = canonicalTempDir('ns-claude-hookfail-')
   try {
-    buildLayout(base, ["repo neurostrata-dir"]);
-    const repo = under(base, "repo");
-    const config = join(repo, ".NeuroStrata", "plugins", "claude", "neurostrata.json");
-    mkdirSync(dirname(config), { recursive: true });
-    writeFileSync(config, "{ broken json");
+    buildLayout(base, ['repo neurostrata-dir'])
+    const repo = under(base, 'repo')
+    const config = join(
+      repo,
+      '.NeuroStrata',
+      'plugins',
+      'claude',
+      'neurostrata.json'
+    )
+    mkdirSync(dirname(config), { recursive: true })
+    writeFileSync(config, '{ broken json')
 
-    const stop = runFailingRunner(stopEvent(repo), repo);
-    assert.equal(stop.status, 2, `Stop must exit 2; stderr=${stop.stderr.slice(0, 200)}`);
-    assert.equal(stop.stdout.trim(), "{}");
+    const stop = runFailingRunner(stopEvent(repo), repo)
+    assert.equal(
+      stop.status,
+      0,
+      `Stop must fail soft; stderr=${stop.stderr.slice(0, 200)}`
+    )
+    assert.deepEqual(JSON.parse(stop.stdout), { continue: true })
 
     const pre = runFailingRunner(
-      { hook_event_name: "PreToolUse", cwd: repo, tool_name: "Write", tool_input: {} },
+      {
+        hook_event_name: 'PreToolUse',
+        cwd: repo,
+        tool_name: 'Write',
+        tool_input: {}
+      },
       repo
-    );
-    assert.equal(pre.status, 0);
-    const reply = JSON.parse(pre.stdout);
-    assert.equal(reply.hookSpecificOutput.hookEventName, "PreToolUse");
-    assert.equal(reply.hookSpecificOutput.permissionDecision, "deny");
+    )
+    assert.equal(pre.status, 0)
+    const reply = JSON.parse(pre.stdout)
+    assert.equal(reply.hookSpecificOutput.hookEventName, 'PreToolUse')
+    assert.equal(reply.hookSpecificOutput.permissionDecision, 'deny')
   } finally {
-    rmSync(base, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true })
   }
-});
+})
 
-test("cli hook ignores an invalid NEUROSTRATA_NAMESPACE (#400)", () => {
-  const base = canonicalTempDir("ns-claude-badenv-");
+test('cli hook ignores an invalid NEUROSTRATA_NAMESPACE (#400)', () => {
+  const base = canonicalTempDir('ns-claude-badenv-')
   try {
-    buildLayout(base, ["repo neurostrata-dir"]);
-    const repo = under(base, "repo");
+    buildLayout(base, ['repo neurostrata-dir'])
+    const repo = under(base, 'repo')
     writeFileSync(
-      join(repo, ".NeuroStrata", "neurostrata-plugin.json"),
-      JSON.stringify({ endpoint: "http://127.0.0.1:1/mcp" })
-    );
+      join(repo, '.NeuroStrata', 'neurostrata-plugin.json'),
+      JSON.stringify({ endpoint: 'http://127.0.0.1:1/mcp' })
+    )
     const env = runnerEnv({
       CLAUDE_PROJECT_DIR: repo,
-      NEUROSTRATA_NAMESPACE: "$NS; rm -rf /",
-    });
-    const ns = namespaceIn(runClaudeHook(stopEvent(repo), repo, env));
-    assert.notEqual(ns, "$NS; rm -rf /");
+      NEUROSTRATA_NAMESPACE: '$NS; rm -rf /'
+    })
+    const ns = namespaceIn(runClaudeHook(stopEvent(repo), repo, env))
+    assert.notEqual(ns, '$NS; rm -rf /')
   } finally {
-    rmSync(base, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true })
   }
-});
+})
