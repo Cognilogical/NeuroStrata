@@ -138,15 +138,16 @@ pub fn read_marker(dir: &Path) -> MarkerRead {
     // On Windows, a `canonicalize` that opens the old marker while
     // `replace_marker` renames a new file over it can return the old file's
     // deleted location: outside the folder, and NotFound when read. The
-    // marker name itself never disappears, so retry a few times while it
-    // exists, and a concurrent replace never reads as `Absent` or outside.
+    // marker name itself never disappears, so a few retries let a concurrent
+    // replace settle; a truly missing marker only costs those retries. No
+    // separate existence probe: every path read here goes through the
+    // containment check in `read_marker_once` (CodeQL rust/path-injection).
     const WINDOWS_REPLACE_RETRIES: usize = 4;
     let mut answer = read_marker_once(dir);
     for _ in 0..WINDOWS_REPLACE_RETRIES {
         if !(cfg!(windows)
             && (matches!(answer, MarkerRead::Absent)
-                || matches!(&answer, MarkerRead::Unreadable { reason, .. } if reason == MARKER_OUTSIDE_DIR))
-            && std::fs::symlink_metadata(dir.join(ROOT_CONFIG_REL)).is_ok())
+                || matches!(&answer, MarkerRead::Unreadable { reason, .. } if reason == MARKER_OUTSIDE_DIR)))
         {
             break;
         }
