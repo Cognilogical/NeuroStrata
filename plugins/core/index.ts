@@ -854,17 +854,25 @@ const SESSION_SCOPED_TOOLS = [
 ]
 
 /**
+ * The bare `neurostrata_<tool>` name of a NeuroStrata MCP tool, however a
+ * harness spells it (`mcp__<server>__neurostrata_task_claim` in Claude Code,
+ * `<server>_neurostrata_task_claim` in OpenCode, `<server>.neurostrata_task_claim`).
+ * Any other name comes back unchanged. Every check against a NeuroStrata
+ * tool name goes through this, or the prefixed names real harnesses send
+ * never match.
+ */
+export function canonicalToolName(toolName: string): string {
+  const name = String(toolName ?? '')
+  const match = name.match(/^(?:.*[_.:])?(neurostrata_[A-Za-z0-9]\w*)$/)
+  return match ? match[1] : name
+}
+
+/**
  * Whether `toolName` is one of [SESSION_SCOPED_TOOLS], bare or as a harness
- * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
- * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
+ * spells an MCP tool (see [canonicalToolName]).
  */
 export function isSessionScopedTool(toolName: string): boolean {
-  const name = String(toolName ?? '')
-  return SESSION_SCOPED_TOOLS.some(
-    (tool) =>
-      name === tool ||
-      (name.endsWith(tool) && /[_.:]$/.test(name.slice(0, -tool.length)))
-  )
+  return SESSION_SCOPED_TOOLS.includes(canonicalToolName(toolName))
 }
 
 /**
@@ -3342,7 +3350,8 @@ const NEUROSTRATA_NATIVE_TOOLS = new Set([
   'neurostrata_update_memory',
   'neurostrata_guard_validate',
   'neurostrata_memories_for_file',
-  'neurostrata_locate'
+  'neurostrata_locate',
+  'neurostrata_task_get'
 ])
 
 /**
@@ -3388,7 +3397,9 @@ const executeAfterHandler = async (
   // Resolve the tool name from BOTH arguments (issue #311): in the
   // two-argument (input, output) form Code Mode hosts carry the name on the
   // input argument, while the output argument holds the result text.
-  const toolName = extractToolName(event) || extractToolName(output)
+  const toolName = canonicalToolName(
+    extractToolName(event) || extractToolName(output)
+  )
 
   // OpenCode V2 envelope: { name, callID, args, status, result: { content, output, metadata } }
   // Read raw tool text in priority order. OpenCode v2.2.6 delivers
@@ -3548,13 +3559,14 @@ const executeAfterHandler = async (
 }
 
 const executeBeforeHandler = async (input: any): Promise<any> => {
-  const toolName: string =
+  const toolName: string = canonicalToolName(
     input?.tool ??
-    input?.tool_name ??
-    input?.name ??
-    input?.action ??
-    input?.command ??
-    ''
+      input?.tool_name ??
+      input?.name ??
+      input?.action ??
+      input?.command ??
+      ''
+  )
   const args = firstRecord(input?.input, input?.args, input)
   const altArgs = asRecord(input?.args)
   addSessionWorktree(toolName, args, effectiveProjectRoot(config))

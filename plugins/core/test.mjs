@@ -173,7 +173,8 @@ import {
   extractDaemonMemoryAdvisory,
   daemonTokenPath,
   addSessionWorktree,
-  isSessionScopedTool
+  isSessionScopedTool,
+  canonicalToolName
 } from './dist/index.js'
 
 // ──────────────────────────────────────────────────────────────────────
@@ -5771,6 +5772,54 @@ describe('audit W4: two-argument Code Mode intent intake (#311)', () => {
     } finally {
       server.close()
       resetModuleState()
+    }
+  })
+
+  it('a NeuroStrata tool under a harness prefix gets no reminder', async () => {
+    const { server, afterHandler } = await setupAfterHandler()
+    try {
+      // Real harnesses prefix MCP tools; a task's stored notes are data.
+      for (const name of [
+        'mcp__neurostrata__neurostrata_task_get',
+        'neurostrata_neurostrata_task_get',
+        'neurostrata_task_get'
+      ]) {
+        const event = {
+          name,
+          sessionID: 'ses-w4',
+          args: {},
+          status: 'completed',
+          result: {
+            content: 'next step: TODO: wire the hook',
+            output: 'next step: TODO: wire the hook'
+          }
+        }
+        await afterHandler(event)
+        assert.ok(
+          !JSON.stringify(event).includes('TASK INTENT DETECTED'),
+          `${name} must not carry the intent reminder`
+        )
+      }
+    } finally {
+      server.close()
+      resetModuleState()
+    }
+  })
+})
+
+describe('canonicalToolName', () => {
+  it('strips each harness prefix from a NeuroStrata tool and nothing else', () => {
+    for (const [raw, bare] of [
+      ['neurostrata_task_claim', 'neurostrata_task_claim'],
+      ['mcp__neurostrata__neurostrata_task_claim', 'neurostrata_task_claim'],
+      ['neurostrata_neurostrata_get_snapshot', 'neurostrata_get_snapshot'],
+      ['neurostrata.neurostrata_add_memory', 'neurostrata_add_memory'],
+      ['xneurostrata_task_claim', 'xneurostrata_task_claim'],
+      ['Read', 'Read'],
+      ['mcp__other__search', 'mcp__other__search'],
+      ['', '']
+    ]) {
+      assert.equal(canonicalToolName(raw), bare, raw)
     }
   })
 })

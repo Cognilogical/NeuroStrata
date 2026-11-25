@@ -175,10 +175,15 @@ export declare function buildSubagentContextHeader(namespace: string, taskId: st
 export declare function injectSubagentPrompt(target: Record<string, unknown>, namespace: string, taskId: string | null): boolean;
 export declare function resetClientForTesting(): void;
 /**
+ * The bare `neurostrata_<tool>` name of a NeuroStrata MCP tool, however a
+ * host spells it (`mcp__<server>__neurostrata_task_claim`,
+ * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`); any
+ * other name unchanged. A copy of core's `canonicalToolName`.
+ */
+export declare function canonicalToolName(toolName: string): string;
+/**
  * Whether `toolName` is one of SESSION_SCOPED_TOOLS, bare or as a host
- * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
- * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
- * A copy of core's `isSessionScopedTool`.
+ * spells an MCP tool. A copy of core's `isSessionScopedTool`.
  */
 export declare function isSessionScopedTool(toolName: string): boolean;
 /**
