@@ -223,6 +223,12 @@ jobs:
         shell: bash
         run: bash scripts/test-remediation-eval.sh
 
+      # Registered-suite gate: a renamed or silently skipped advisory test in
+      # eval/registry.json fails here rather than passing as an empty suite.
+      - name: Dependency-advisory eval suite
+        shell: bash
+        run: bash scripts/remediation-eval.sh dependency-advisory
+
   # Full binary suite on the other two platforms, report-only: a platform
   # regression shows up on the PR without blocking the merge on a runner this
   # project cannot reproduce locally. The ubuntu test job above is the gate.
@@ -306,6 +312,44 @@ jobs:
       - name: Test
         shell: bash
         run: node --test plugins/core/test.mjs
+
+  # The web UI carries a second lockfile that neither the Rust gates nor the
+  # plugin suite reads. `npm ci` is deliberate: a lockfile that disagrees with
+  # package.json must fail here rather than being silently rewritten.
+  web-ui:
+    name: web-ui
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # eslint 10 accepts ^20.19 || ^22.13 || >=24; 22 is the LTS line the
+          # lockfile was resolved on.
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: web-ui/package-lock.json
+
+      - name: Install
+        shell: bash
+        run: npm --prefix web-ui ci
+
+      - name: Lint
+        shell: bash
+        run: npm --prefix web-ui run lint
+
+      - name: Build
+        shell: bash
+        run: npm --prefix web-ui run build
+
+      # Fails on high/critical advisories only: the audit report is a gate for
+      # what ships, while low-severity dev-tool noise stays visible.
+      - name: Audit
+        shell: bash
+        run: npm --prefix web-ui audit --audit-level=high
 
   # The backup script's sidecar/WAL carry and pruning are shell behavior, not
   # Rust behavior; test them where they run.
@@ -422,6 +466,7 @@ jobs:
   audit:
     name: audit (cargo-audit)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -435,6 +480,21 @@ jobs:
       - name: Audit dependencies
         shell: bash
         run: cargo audit
+
+      # src-tauri is a separate, excluded workspace with its own lockfile, so
+      # the root gate above never reads it. Resolve it exactly as committed
+      # first: this fails in seconds when the desktop lockfile is stale.
+      - name: Verify the desktop lockfile resolves
+        shell: bash
+        run: cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 > /dev/null
+
+      # No -D warnings on purpose: the dated glib decision (#427) and the two
+      # unmaintained-crate advisories are accepted and must stay visible in the
+      # report, while any real vulnerability still fails the job. The same
+      # .cargo/audit.toml applies as for the root gate.
+      - name: Audit the desktop lockfile
+        shell: bash
+        run: cargo audit --file src-tauri/Cargo.lock
 
   # The release narrative names MCP tools, daemon routes, CLI subcommands and
   # in-tree files. A name that never shipped is a user-facing failure, so the

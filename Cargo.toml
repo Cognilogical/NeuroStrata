@@ -223,3 +223,9 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Dependency-advisory eval contract: offline lockfile assertions for the
+# pinned desktop and web-ui dependency graphs (#426–#429).
+[[test]]
+name = "dependency_integrity"
+path = "tests/dependency_integrity.rs"
+
