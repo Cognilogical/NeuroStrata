@@ -6335,7 +6335,7 @@ export default {};
             );
         }
 
-        // A second run writes nothing and excludes the file only once.
+        // A second run leaves the file as it is and excludes it only once.
         let before = std::fs::read_to_string(&path).unwrap();
         let _ = auto_install_detected_plugins(
             tmp.path(),
