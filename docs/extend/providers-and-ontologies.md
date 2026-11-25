@@ -23,6 +23,8 @@ The `VectorStore` trait is the pluggable interface for vector persistence and si
 - `fn search(&self, query: &[f32], limit: usize) -> Result<Vec<(String, f32)>>` — nearest-neighbor search
 - `fn delete(&mut self, id: &str) -> Result<()>` — remove a vector
 
+`get_many(namespaces, ids)` returns the payloads of the rows with those ids in those namespaces, without their vectors, and leaves out ids with no row. Its default reads them one by one with `get`; a backend that can answer in one query should override it, as `LadybugStore` does. `get_snapshot` uses it to leave retired rules out of the session file's task block.
+
 Stores that project edges into a graph additionally implement the optional seam
 
 - `async fn reconcile_declared_edges(&self, namespace: &str, id: &str, rel_type: &str, keep: &[String]) -> Result<usize>` — retire the edges this store materialised from a previous declaration of `rel_type` whose target is not in `keep`

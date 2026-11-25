@@ -387,7 +387,10 @@ impl ConfigLock {
         let nonce = format!("{}:{}", std::process::id(), uuid::Uuid::new_v4());
         let deadline = Instant::now() + CONFIG_LOCK_WAIT;
         loop {
+            // Read access lets Drop check the nonce through this handle on
+            // Windows, where the lock refuses reads through any other.
             match fs::OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .open(&path)
@@ -492,8 +495,22 @@ fn lock_nonce_is(path: &Path, nonce: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the lock file we hold open still carries `nonce`, read through our
+/// own handle. While we hold the lock, no acquirer or breaker can replace the
+/// path, so this is the file the path names.
+#[cfg(not(unix))]
+fn held_nonce_is(file: &std::fs::File, nonce: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    let mut text = String::new();
+    file.seek(SeekFrom::Start(0)).is_ok()
+        && file.read_to_string(&mut text).is_ok()
+        && text.trim() == nonce
+}
+
 /// Whether nobody holds the advisory lock on an existing lock file. A file
 /// that cannot be opened cannot be proven free, so it stays untouched.
+#[cfg(test)]
 fn lock_is_free(path: &Path) -> bool {
     match fs::OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => matches!(file.try_lock(), Ok(())),
@@ -523,9 +540,9 @@ fn same_file_at_path(file: &std::fs::File, path: &Path) -> bool {
 ///
 /// Serialized by a short-lived sibling `.break` lock. Under that guard the
 /// lock file is re-checked for staleness and acquired with the OS advisory
-/// lock; on Unix the path is unlinked *while that advisory lock is held*, so a
-/// writer cannot acquire the file between the check and the unlink. The inode
-/// is re-validated against `path` before removal. A `.break` file older than
+/// lock; the path is unlinked *while that advisory lock is held*, so a
+/// writer cannot acquire the file between the check and the unlink. On Unix
+/// the inode is re-validated against `path` before removal. A `.break` file older than
 /// the stale limit was left by a process that died mid-break and is removed.
 fn try_break_stale_lock(path: &Path) -> bool {
     let mut breaker = path.as_os_str().to_owned();
@@ -568,15 +585,18 @@ fn try_break_stale_lock(path: &Path) -> bool {
         }
         #[cfg(not(unix))]
         {
-            // Windows refuses to unlink an open file; close first, then
-            // re-validate before the final removal. The `.break` guard still
-            // serializes competing breakers.
-            drop(file);
-            if is_stale(path) && lock_is_free(path) {
-                fs::remove_file(path).is_ok()
-            } else {
-                false
+            // As on Unix, unlink while the lock is held so no writer can take
+            // the path in between. Windows allows it: the file was opened with
+            // delete sharing. Windows has no stable same-file check, so
+            // re-check staleness: if the holder unlinked the file between our
+            // open and our lock, a successor's fresh file now names the path.
+            if !is_stale(path) {
+                drop(file);
+                return false;
             }
+            let removed = fs::remove_file(path).is_ok();
+            drop(file);
+            removed
         }
     })();
 
@@ -593,23 +613,25 @@ impl Drop for ConfigLock {
         let Some(file) = self.file.take() else {
             return;
         };
-        if !lock_nonce_is(&self.path, &self.nonce) {
-            // Somebody replaced the path; it is theirs, not ours to unlink.
-            return;
-        }
         #[cfg(unix)]
         {
+            if !lock_nonce_is(&self.path, &self.nonce) {
+                // Somebody replaced the path; it is theirs, not ours to unlink.
+                return;
+            }
             let _ = fs::remove_file(&self.path);
             drop(file); // release the advisory lock on the now-unlinked inode
         }
         #[cfg(not(unix))]
         {
-            // Windows refuses to unlink an open file: release, re-check, then
-            // remove only if the path still carries our nonce.
-            drop(file);
-            if lock_nonce_is(&self.path, &self.nonce) {
-                let _ = fs::remove_file(&self.path);
+            // The lock refuses reads through any other handle, so check the
+            // nonce through ours; then unlink while still holding the lock
+            // (the file was opened with delete sharing), as on Unix.
+            if !held_nonce_is(&file, &self.nonce) {
+                return;
             }
+            let _ = fs::remove_file(&self.path);
+            drop(file);
         }
     }
 }
@@ -1116,8 +1138,15 @@ mod tests {
         let lock = config_path.with_file_name("config.json.lock");
         let held = ConfigLock::acquire(&config_path).unwrap();
         // A paused holder's path is overwritten by another writer. Its nonce
-        // differs, so our Drop must leave it alone.
-        fs::write(&lock, "9999:successor").unwrap();
+        // differs, so our Drop must leave it alone. Written through the held
+        // handle: on Windows the held lock refuses writes through any other.
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut file = held.file.as_ref().unwrap();
+            file.set_len(0).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(b"9999:successor").unwrap();
+        }
         drop(held);
         assert!(lock.exists(), "a foreign lock file must survive our drop");
         fs::remove_file(&lock).unwrap();
@@ -1197,8 +1226,16 @@ mod tests {
             Ok(_) => panic!("expected the contended acquisition to fail"),
             Err(err) => err,
         };
+        // On Windows the holder's lock also refuses our nonce write, so the
+        // acquisition fails one step earlier; the path must be reclaimed
+        // either way.
+        let expected = if cfg!(windows) {
+            "Could not write"
+        } else {
+            "Could not lock"
+        };
         assert!(
-            format!("{err:#}").contains("Could not lock"),
+            format!("{err:#}").contains(expected),
             "unexpected error: {err:#}"
         );
         assert!(

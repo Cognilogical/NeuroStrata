@@ -12918,6 +12918,54 @@ impl VectorStore for LadybugStore {
         .await
     }
 
+    async fn get_many(
+        &self,
+        namespaces: &[&str],
+        ids: &[String],
+    ) -> Result<Vec<(String, MemoryPayload)>> {
+        if namespaces.is_empty() || ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let quoted = |items: Vec<&str>| {
+            items
+                .iter()
+                .map(|s| format!("'{}'", escape_ladybug_string(s)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let query = format!(
+            "MATCH (m:Memory) WHERE m.namespace IN [{}] AND m.id IN [{}] RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
+            quoted(namespaces.to_vec()),
+            quoted(ids.iter().map(String::as_str).collect()),
+        );
+        self.with_conn(move |conn| {
+            let mut out = Vec::new();
+            for row in conn.query(&query)? {
+                let metadata_str = format!("{}", row[7]);
+                let metadata = serde_json::from_str(&metadata_str).unwrap_or_else(|e| {
+                    if !metadata_str.trim().is_empty() {
+                        tracing::warn!("corrupt metadata JSON in store row: {e}");
+                    }
+                    Value::Null
+                });
+                out.push((
+                    format!("{}", row[0]),
+                    MemoryPayload {
+                        content: format!("{}", row[1]),
+                        user_id: format!("{}", row[2]),
+                        memory_type: format!("{}", row[3]),
+                        agent_name: Some(format!("{}", row[4])),
+                        location: format!("{}", row[5]),
+                        location_lines: format!("{}", row[6]),
+                        metadata,
+                    },
+                ));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     async fn list_namespaces(&self) -> Result<Vec<String>> {
         self.with_conn(move |conn| {
             let query = "MATCH (m:Memory) RETURN DISTINCT m.namespace AS ns;";
