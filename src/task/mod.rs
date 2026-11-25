@@ -2310,8 +2310,8 @@ pub async fn handle_task_create(
     };
     let mut redactions = Vec::new();
     let title = match arg_str(&args, "title") {
-        Some(t) => match check_title(&redact_into(t, &mut redactions)) {
-            Ok(v) => v,
+        Some(t) => match check_title(t) {
+            Ok(v) => redact_into(&v, &mut redactions),
             Err(e) => return e,
         },
         None => {
@@ -2890,11 +2890,8 @@ pub async fn handle_task_update(
     // rewriting content AND re-embedding: a title is what search_memory reads.
     let new_title = match args.get("title") {
         None => None,
-        Some(_) => match check_title(&redact_into(
-            arg_str(&args, "title").unwrap_or_default(),
-            &mut redactions,
-        )) {
-            Ok(t) => Some(t),
+        Some(_) => match check_title(arg_str(&args, "title").unwrap_or_default()) {
+            Ok(t) => Some(redact_into(&t, &mut redactions)),
             Err(e) => return e,
         },
     };
@@ -3404,8 +3401,8 @@ pub async fn handle_task_complete(
                     return Err(format!("ERROR: follow_up_tasks[{}] must be an object.", i));
                 }
                 let title = match item.get("title").and_then(|t| t.as_str()) {
-                    Some(t) => match check_title(&redact_into(t, &mut redactions)) {
-                        Ok(v) => v,
+                    Some(t) => match check_title(t) {
+                        Ok(v) => redact_into(&v, &mut redactions),
                         Err(e) => {
                             return Err(format!("ERROR: follow_up_tasks[{}].title: {}", i, e))
                         }
@@ -10496,7 +10493,10 @@ exit 0
         )
         .await;
         assert!(!reply.contains(key), "{reply}");
-        assert!(!stored(id.clone()).await.contains(key));
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["redactions"], json!([{ "category": "github_pat" }]));
+        let row = stored(id.clone()).await;
+        assert!(row.contains("rotate [REDACTED:github_pat] now") && !row.contains(key), "{row}");
 
         claim(&store, &id).await;
         let mem_id = uuid::Uuid::new_v4().to_string();
@@ -10538,9 +10538,12 @@ exit 0
             parsed["redactions"],
             json!([{ "category": "password" }, { "category": "github_pat" }])
         );
-        assert!(!stored(id.clone()).await.contains("hunter22"));
+        let row = stored(id.clone()).await;
+        assert!(row.contains("rotated, old password=[REDACTED:password]"), "{row}");
+        assert!(!row.contains("hunter22"), "{row}");
         let follow_up = parsed["follow_up_tasks_created"][0].as_str().unwrap().to_string();
-        assert!(!stored(follow_up).await.contains(key));
+        let row = stored(follow_up).await;
+        assert!(row.contains("check [REDACTED:github_pat]") && !row.contains(key), "{row}");
     }
 
     #[test]
