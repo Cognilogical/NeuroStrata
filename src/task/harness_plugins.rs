@@ -1181,7 +1181,8 @@ fn warn_unwritten_config(written: Option<String>, cfg_path: &Path, warnings: &mu
 /// relative to the checkout, with `/` separators). A linked worktree's
 /// `.git` is a file; git reads `info/exclude` from the common git directory
 /// every worktree shares ([`crate::paths::common_git_dir`]), so the entry
-/// goes there and covers each worktree's own copy of the file.
+/// goes there and covers each worktree's own copy of the file. A folder
+/// that is not a git checkout gets no exclude file.
 fn exclude_local_file(project_root: &Path, rel: &str) {
     let dot_git = project_root.join(".git");
     let (exclude, symlink_root) = if dot_git.is_file() {
@@ -1190,11 +1191,15 @@ fn exclude_local_file(project_root: &Path, rel: &str) {
         };
         let common = PathBuf::from(common);
         (common.join("info").join("exclude"), common)
-    } else {
+    } else if dot_git.is_dir() {
         (
             dot_git.join("info").join("exclude"),
             project_root.to_path_buf(),
         )
+    } else {
+        // Not a git checkout: creating `.git/info` here would make the folder
+        // look like a repository root to every `.git` probe.
+        return;
     };
     if refuse_symlink_components(&symlink_root, &exclude).is_err() {
         return;
@@ -7003,6 +7008,25 @@ export default {};
             "{exclude}"
         );
         assert!(!gitdir.join("info/exclude").exists());
+    }
+
+    /// A folder that is not a git checkout gets its hooks files but no
+    /// `.git`: a stray `.git/info` would make it look like a repository root.
+    #[test]
+    fn non_git_folder_gets_no_git_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".github")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        for harness in ["github-cli", "codex"] {
+            let _ = auto_install_detected_plugins(
+                tmp.path(),
+                ConfigNamespace::Set("TestProj"),
+                Some(harness),
+            );
+        }
+        assert!(tmp.path().join(COPILOT_HOOKS_REL).exists());
+        assert!(tmp.path().join(".codex/hooks.json").exists());
+        assert!(!tmp.path().join(".git").exists());
     }
 
     /// #368 F7: Codex detected only through the user's home install still
