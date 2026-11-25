@@ -592,7 +592,7 @@ async fn _with_watch(
                     },
                     {
                         "name": "neurostrata_task_list",
-                        "description": "List tasks in a namespace. ready: true is the actionable backlog (open and every blocker done); done tasks are hidden unless include_done; retired rows (superseded or expired) are history and hidden unless include_retired.",
+                        "description": "List tasks in a namespace. ready: true is the actionable backlog (open and every blocker done); done tasks are hidden unless include_done; retired rows (superseded or expired) are history and hidden unless include_retired. Each row gives the number of notes in its history as history_count; include_history: true returns the notes themselves.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -601,7 +601,8 @@ async fn _with_watch(
                                 "assignee": { "type": "string", "description": "Only tasks claimed by this assignee." },
                                 "ready": { "type": "boolean", "description": "Only actionable work: open (not retired), with every blocker done. A retired blocker counts as done -- it is history, unless the row at the end of its supersession chain still carries the work." },
                                 "include_done": { "type": "boolean", "description": "Include finished tasks in the unfiltered listing." },
-                                "include_retired": { "type": "boolean", "description": "Include retired rows (superseded or expired) in the listing. They come back labelled retired: true -- history, not work." }
+                                "include_retired": { "type": "boolean", "description": "Include retired rows (superseded or expired) in the listing. They come back labelled retired: true -- history, not work." },
+                                "include_history": { "type": "boolean", "description": "Return each task's full note history instead of history_count. Defaults to false." }
                             },
                             "required": ["namespace"]
                         }
