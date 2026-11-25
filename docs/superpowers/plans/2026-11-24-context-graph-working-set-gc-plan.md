@@ -44,6 +44,23 @@ rejects symlinked or oversized state`.
 - Codex result replacement/suppression fields unsupported by its pinned parser →
   Task 3, `plugins/codex/test.mjs`: `working-set GC PostToolUse never emits
 updatedMCPToolOutput or suppressOutput`.
+- Tier 0 system prefix (`renderWorkingSetTier0Prefix`) containing any volatile
+  turn, epoch, or task counter would invalidate provider prefix KV-caches every
+  turn → Task 5, `plugins/core/test.mjs`: `renderWorkingSetTier0Prefix is
+byte-identical across turn and task changes when Golden Rules are unchanged`.
+- Quantized stride message folding (`evaluate_working_set_stride_fold` /
+  `projectWorkingSetMessages`) folding hot-tail or system messages, or shifting
+  the fold frontier on non-stride turns → Task 4 (`src/formal_kernel.rs` +
+  `proofs/NeuroStrata/WorkingSetGc.lean` theorems `hot_tail_never_folded` and
+  `quantized_frontier_step_invariant`) and Task 5 (`plugins/core/test.mjs`).
+- 1-hop/2-hop spreading activation on cyclic `working_set.edges` graphs causing
+  duplicate touches or unbounded loops → Task 5, `plugins/core/test.mjs`:
+  `spreading activation terminates on cyclic edges and promotes 1-hop stubs`.
+- Compaction takeover (`sessionCompactionHandler`) failing to populate
+  `event.result = { summary }`, allowing the harness to fall back to a lossy
+  compaction LLM call → Task 5, `plugins/core/test.mjs` and
+  `plugins/opencode/test.mjs`: `sessionCompactionHandler sets deterministic
+event.result.summary without model calls`.
 
 ## Non-Goals
 
@@ -750,13 +767,270 @@ Expected: one integration commit; three task commits total; no unrelated files.
 
 ---
 
+### Task 4: KV-Cache Tier Routing & Quantized Stride Folding Formal Kernel, Lean 4 Theorems, Kani Harnesses, and 3,969-Row Parity
+
+**Files:**
+
+- Modify: `src/formal_kernel.rs`
+- Modify: `proofs/NeuroStrata/WorkingSetGc.lean`
+- Modify: `proofs/Main.lean`
+- Modify: `tests/lean_parity_test.rs`
+- Modify: `scripts/kani-mutation-check.sh`
+
+**Interfaces:**
+
+- Consumes: `WorkingSetTier` from Task 1 in `src/formal_kernel.rs` and
+  `proofs/NeuroStrata/WorkingSetGc.lean`.
+- Produces: exact Rust contract in `src/formal_kernel.rs`:
+
+```rust
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingSetCacheTier {
+    Tier0SystemPrefix,
+    Tier1QuantizedHistory,
+    Tier2TailDelta,
+    EvictedHeapStub,
+}
+
+impl WorkingSetCacheTier {
+    pub const fn as_tag(self) -> &'static str;
+}
+
+pub const fn evaluate_working_set_cache_tier(
+    tier: WorkingSetTier,
+    has_system_channel: bool,
+) -> WorkingSetCacheTier;
+
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingSetStrideAction {
+    RetainRawMessage,
+    FoldIntoQuantizedStub,
+    InvalidMessageIndex,
+}
+
+impl WorkingSetStrideAction {
+    pub const fn as_tag(self) -> &'static str;
+}
+
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkingSetStrideInput {
+    pub total_messages: u32,
+    pub message_index: u32,
+    pub hot_tail_count: u32,
+    pub stride: u32,
+    pub is_protected_system_or_pinned: bool,
+}
+
+pub const fn compute_working_set_quantized_frontier(
+    total_messages: u32,
+    hot_tail_count: u32,
+    stride: u32,
+) -> u32;
+
+pub const fn evaluate_working_set_stride_fold(
+    input: WorkingSetStrideInput,
+) -> WorkingSetStrideAction;
+```
+
+- `WorkingSetCacheTier::as_tag` values: `"tier0_system_prefix"`,
+  `"tier1_quantized_history"`, `"tier2_tail_delta"`, `"evicted_heap_stub"`.
+- `WorkingSetStrideAction::as_tag` values: `"retain_raw_message"`,
+  `"fold_into_quantized_stub"`, `"invalid_message_index"`.
+- Produces three Lean 4 theorems in `proofs/NeuroStrata/WorkingSetGc.lean`:
+  `immortal_routes_to_system_prefix`, `hot_tail_never_folded`, and
+  `quantized_frontier_step_invariant` (zero `sorry`, zero `axiom`).
+- Produces `8` `WORKING_SET_CACHE_TIER` rows and `128` `WORKING_SET_STRIDE_FOLD`
+  rows in `proofs/Main.lean` and `tests/lean_parity_test.rs` (`3969` total rows).
+
+- [ ] **Step 1: Write failing kernel unit tests in `src/formal_kernel.rs`**
+
+Add unit tests `working_set_cache_tier_routes_immortal_to_system_prefix` and
+`working_set_stride_fold_preserves_hot_tail_and_quantizes_frontier` asserting:
+
+- `evaluate_working_set_cache_tier(WorkingSetTier::Immortal, true) == WorkingSetCacheTier::Tier0SystemPrefix`
+- `evaluate_working_set_cache_tier(WorkingSetTier::Immortal, false) == WorkingSetCacheTier::Tier2TailDelta`
+- `evaluate_working_set_cache_tier(WorkingSetTier::PinnedRoot, true) == WorkingSetCacheTier::Tier2TailDelta`
+- `evaluate_working_set_cache_tier(WorkingSetTier::EvictedStub, true) == WorkingSetCacheTier::EvictedHeapStub`
+- `compute_working_set_quantized_frontier(20, 12, 8) == 8` and
+  `compute_working_set_quantized_frontier(27, 12, 8) == 8` (identical frontier
+  across 8 consecutive turns) and `compute_working_set_quantized_frontier(28, 12, 8) == 16`
+- `evaluate_working_set_stride_fold` returns `InvalidMessageIndex` when
+  `message_index >= total_messages`, `RetainRawMessage` when
+  `is_protected_system_or_pinned` or in hot tail, and `FoldIntoQuantizedStub`
+  when `message_index < frontier`.
+
+- [ ] **Step 2: Run the kernel test to verify it fails**
+
+Run: `cargo test --locked --bin neurostrata-mcp formal_kernel::tests::working_set -- --nocapture`
+Expected: FAIL to compile (`WorkingSetCacheTier` and `evaluate_working_set_stride_fold` not defined).
+
+- [ ] **Step 3: Implement `evaluate_working_set_cache_tier`, `compute_working_set_quantized_frontier`, `evaluate_working_set_stride_fold`, and Kani harnesses in `src/formal_kernel.rs` and `scripts/kani-mutation-check.sh`**
+
+Implement the pure `const fn` functions and Kani harnesses
+`proof_evaluate_working_set_cache_tier_contract` and
+`proof_evaluate_working_set_stride_fold_contract` in `src/formal_kernel.rs`, and
+add the `ws-stride` mutant in `scripts/kani-mutation-check.sh`.
+
+- [ ] **Step 4: Prove theorems 6–8 in `proofs/NeuroStrata/WorkingSetGc.lean` and extend `proofs/Main.lean` + `tests/lean_parity_test.rs`**
+
+Implement `WorkingSetCacheTier`, `evaluateWorkingSetCacheTier`,
+`WorkingSetStrideAction`, `WorkingSetStrideInput`,
+`computeWorkingSetQuantizedFrontier`, `evaluateWorkingSetStrideFold`, and
+theorems `immortal_routes_to_system_prefix`, `hot_tail_never_folded`, and
+`quantized_frontier_step_invariant` in `proofs/NeuroStrata/WorkingSetGc.lean`.
+Append the `8` `WORKING_SET_CACHE_TIER` rows and `128` `WORKING_SET_STRIDE_FOLD`
+rows to `proofs/Main.lean` and `tests/lean_parity_test.rs` (updating expected
+row count from `3833` to `3969`).
+
+- [ ] **Step 5: Verify Rust, Lean, parity, and Kani mutation checks pass**
+
+Run:
+
+```bash
+lake --dir proofs build
+cargo test --locked --bin neurostrata-mcp formal_kernel::tests::working_set -- --nocapture
+cargo test --locked --test lean_parity_test -- --nocapture
+bash scripts/kani-mutation-check.sh
+```
+
+Expected: PASS (`3969` parity rows match; zero `sorry`/`axiom`; all Kani mutants rejected).
+
+- [ ] **Step 6: Commit Task 4**
+
+```bash
+git add src/formal_kernel.rs proofs/NeuroStrata/WorkingSetGc.lean proofs/Main.lean tests/lean_parity_test.rs scripts/kani-mutation-check.sh
+git commit -m "feat(kernel): quantize message folding so the KV-cache stops paying retail"
+```
+
+---
+
+### Task 5: 3-Tier KV-Cache Context Graph, Typed Edges & Spreading Activation, Pre-Turn Prompt Hook, Zero-LLM Compaction Takeover, and 28 Bundled Artifacts
+
+**Files:**
+
+- Modify: `plugins/core/index.ts`
+- Modify: `plugins/core/test.mjs`
+- Modify: `plugins/opencode/test.mjs`
+- Modify: `plugins/claude/cli-hook.mjs`
+- Modify: `plugins/claude/test.mjs`
+- Modify: `plugins/codex/test.mjs`
+- Modify: `docs/extend/harness-plugins.md`
+- Rebuild: `plugins/{core,opencode,claude,codex,github-cli,openclaw,hermes}/dist/index.{js,js.map,d.ts,d.ts.map}`
+
+**Interfaces:**
+
+- Consumes: Task 4 decision tables (`evaluate_working_set_cache_tier`,
+  `compute_working_set_quantized_frontier`, `evaluate_working_set_stride_fold`)
+  and Task 2 working-set GC state (`WorkingSetState`, `advanceWorkingSetTurn`,
+  `sweepWorkingSet`, `renderWorkingSetFrame`).
+- Produces in `plugins/core/index.ts`:
+
+  - Constants:
+    - `WORKING_SET_TIER0_MAX_BYTES = 2048`
+    - `WORKING_SET_MAX_EDGES = 128`
+    - `WORKING_SET_STRIDE_MESSAGES = 8`
+    - `WORKING_SET_HOT_TAIL_MESSAGES = 12`
+  - Types: `WorkingSetEdgeKind`, `WorkingSetEdge`, `WorkingSetCacheTier`,
+    `WorkingSetStrideAction`, `WorkingSetStrideInput`, plus `edges: WorkingSetEdge[]`
+    on `WorkingSetState` (defaulting to `[]` when loading older v1 snapshots).
+  - Pure TypeScript kernel mirrors:
+    - `evaluateWorkingSetCacheTier(tier: WorkingSetTier, hasSystemChannel: boolean): WorkingSetCacheTier`
+    - `computeWorkingSetQuantizedFrontier(totalMessages: number, hotTailCount: number, stride: number): number`
+    - `evaluateWorkingSetStrideFold(input: WorkingSetStrideInput): WorkingSetStrideAction`
+  - Graph & cycle functions:
+    - `recordWorkingSetEdges(state: WorkingSetState, edges: Array<Omit<WorkingSetEdge, "last_touched_turn"> & { last_touched_turn?: number }>): WorkingSetState`
+    - `runWorkingSetPromptCycle(input: { scope: WorkingSetScope, promptText: string, turnId?: string, eventId?: string }): Promise<{ frame: string, fingerprint: string, changed: boolean, activatedIds: string[] }>`
+    - `renderWorkingSetTier0Prefix(state: WorkingSetState, activeSession?: ActiveSessionState | null): { text: string, usedBytes: number, fingerprint: string }`
+    - `renderWorkingSetDeltaFrame(state: WorkingSetState, activeSession?: ActiveSessionState | null, options?: { omitImmortalRules?: boolean, maxBytes?: number }): { text: string, usedBytes: number, fingerprint: string }`
+    - `renderWorkingSetCompactionSummary(state: WorkingSetState, activeSession?: ActiveSessionState | null): string`
+    - `projectWorkingSetMessages(messages: unknown[], state: WorkingSetState, options?: { hotTailCount?: number, stride?: number }): { messages: unknown[], quantizedFrontier: number, foldedCount: number }`
+    - `upsertWorkingSetSystemPrefix(system: unknown[], tier0Text: string): boolean`
+    - `upsertWorkingSetMessageTailDelta(messages: unknown[], deltaText: string): boolean`
+    - `sessionPromptHandler(event: any): Promise<any>`
+    - `ctx.session.hook("prompt", sessionPromptHandler)` registered alongside `"context"` and `"compaction"` in `createHarnessPlugin`.
+
+- [ ] **Step 1: Write failing tests in `plugins/core/test.mjs` and `plugins/opencode/test.mjs`**
+
+Add tests in `plugins/core/test.mjs` and `plugins/opencode/test.mjs` covering:
+
+1. TypeScript mirror parity for all `8` `WORKING_SET_CACHE_TIER` rows and all
+   `128` `WORKING_SET_STRIDE_FOLD` rows.
+2. `WorkingSetState.edges` validation, deduplication by `(from, kind, to)`,
+   `WORKING_SET_MAX_EDGES = 128` cap, endpoint pruning during `sweepWorkingSet`,
+   and 1-hop (`GOVERNS`/`EXTRACTED_FROM`/`CONCEPTUAL_BRIDGE`) + 2-hop
+   (`CALLS`/`IMPORTS`/`DEPENDS_ON` -> `GOVERNS`) spreading activation (including
+   termination on cyclic edges and page-fault stub promotion).
+3. `renderWorkingSetTier0Prefix` emits zero turn/epoch/task counters and keeps
+   an identical SHA-256 fingerprint across turn advances and task updates when
+   Golden Rules are unchanged.
+4. `renderWorkingSetDeltaFrame` with `omitImmortalRules: true` omits Golden
+   Rules, renders `[Edge] <from> -<kind>-> <to>` lines, and enforces
+   `tier0.usedBytes + delta.usedBytes <= 4096`.
+5. `projectWorkingSetMessages` keeps `quantizedFrontier` constant across 8
+   consecutive turns (`12..19` messages -> frontier `0`; `20..27` messages ->
+   frontier `8`; `28..35` messages -> frontier `16`), never folds protected
+   system messages or the hot tail (`12` messages), and produces byte-identical
+   folded prefix messages within each stride bucket.
+6. `sessionPromptHandler` (`ctx.session.hook("prompt")` and `UserPromptSubmit`)
+   extracts prompt anchors (`file:`, `symbol:`, `mem:`, and project-relative
+   paths), marks 1-hop/2-hop neighbors, and promotes page-faulted stubs before
+   the LLM call.
+7. `sessionContextHandler` on OpenCode V2 `{ system: SystemPart[], messages: Message[] }`
+   routes Tier 0 to `event.system`, folds Tier 1 in `event.messages`, and
+   attaches Tier 2 delta to the tail of `event.messages`.
+8. `sessionCompactionHandler` sets `event.result = { summary }` via
+   `renderWorkingSetCompactionSummary` so OpenCode V2 skips the compaction LLM
+   call.
+
+- [ ] **Step 2: Run the core and OpenCode tests to verify they fail**
+
+Run: `npm --prefix plugins/core run build && node --test plugins/core/test.mjs plugins/opencode/test.mjs`
+Expected: FAIL (new exports and 3-tier/prompt/compaction behaviors not yet implemented).
+
+- [ ] **Step 3: Implement the 3-tier KV-cache projection, edges, spreading activation, stride folding, prompt hook, and compaction takeover in `plugins/core/index.ts` and `plugins/claude/cli-hook.mjs`**
+
+Implement the interfaces above in `plugins/core/index.ts`, wire `UserPromptSubmit`
+in `plugins/claude/cli-hook.mjs` (alongside Codex `UserPromptSubmit` in
+`handleHookEvent`), and update `docs/extend/harness-plugins.md`.
+
+- [ ] **Step 4: Rebuild all 7 plugin packages, verify deterministic 28-artifact regeneration, and run all test suites**
+
+Run:
+
+```bash
+npm --prefix plugins/core run build
+for adapter in opencode claude codex github-cli openclaw hermes; do
+  npm --prefix "plugins/$adapter" run build
+done
+node --test plugins/core/test.mjs plugins/opencode/test.mjs plugins/claude/test.mjs plugins/codex/test.mjs plugins/github-cli/test.mjs plugins/openclaw/test.mjs plugins/hermes/test.mjs
+cargo test --locked --bin neurostrata-mcp task::harness_plugins::tests::working_set_gc -- --nocapture
+```
+
+Expected: PASS across all 7 Node test suites and Rust harness plugin installer tests.
+
+- [ ] **Step 5: Commit Task 5**
+
+```bash
+git add plugins/core/index.ts plugins/core/test.mjs plugins/opencode/test.mjs plugins/claude/cli-hook.mjs plugins/claude/test.mjs plugins/codex/test.mjs docs/extend/harness-plugins.md plugins/{core,opencode,claude,codex,github-cli,openclaw,hermes}/dist/index.{js,js.map,d.ts,d.ts.map}
+git commit -m "feat(context-graph): evict lossy LLM compaction with 3-tier KV-cache graph projection"
+```
+
+---
+
 ## Acceptance Criteria
 
-- [ ] All five Lean theorems compile with zero `sorry` and zero `axiom`.
-- [ ] Rust and Lean emit identical ordered `3833`-row parity output.
-- [ ] TypeScript mirror matches the Rust decision table on all `2560` boundary
-      rows.
-- [ ] Every rendered frame is at most `4096` UTF-8 bytes.
+- [ ] All eight Lean theorems compile with zero `sorry` and zero `axiom`.
+- [ ] Rust and Lean emit identical ordered `3969`-row parity output (`2560` GC + `8` cache-tier + `128` stride-fold + `1273` existing rows), and Kani mutation checks pass (`8/8` mutants including `ws-eviction` and `ws-stride`).
+- [ ] TypeScript mirror matches the Rust decision tables on all `2560` eviction rows, `8` cache-tier rows, and `128` stride-fold rows.
+- [ ] Every rendered frame (and `tier0.usedBytes + delta.usedBytes`) is at most `4096` UTF-8 bytes.
+- [ ] Tier 0 system prefix (`renderWorkingSetTier0Prefix` -> `event.system`) contains zero turn/epoch/task counters and remains byte-identical across turns when Golden Rules are unchanged.
+- [ ] Tier 1 quantized stride message folding (`projectWorkingSetMessages` -> `event.messages`) steps its fold frontier only at `stride = 8` boundaries and never folds hot-tail (`12`) or system messages.
+- [ ] Tier 2 delta frame (`renderWorkingSetDeltaFrame` -> message tail) renders active task, roots, young gen, typed `working_set.edges`, and stubs without mutating cached prefix tokens.
+- [ ] Pre-turn prompt activation (`sessionPromptHandler` / `ctx.session.hook("prompt")` / `UserPromptSubmit`) activates prompt anchors and 1-hop/2-hop `working_set.edges` neighbors before the outgoing model call.
+- [ ] Zero-LLM compaction takeover (`sessionCompactionHandler`) sets `event.result = { summary }` via `renderWorkingSetCompactionSummary`.
 - [ ] Golden Rules and active-task header are never demoted or removed.
 - [ ] Page-fault re-expansion restores full young-generation content through
       ReBAC-filtered daemon reads.
