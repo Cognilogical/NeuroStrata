@@ -40,6 +40,8 @@ The installer adds its runner to each Claude hook event (PreToolUse, SessionStar
 
 **Claim scope from a linked worktree.** `neurostrata_task_claim` and `neurostrata_get_snapshot` without `worktree`, `project_root` or `cwd` are scoped by the daemon to the namespace's registered root, the main checkout once a project marker applies. The plugins pass the session's project folder as `worktree` on those calls when they name none: OpenCode and Hermes in their before-tool hooks, and every CLI hook runner in its PreToolUse reply (`updatedInput`). For Claude the installer adds a PreToolUse entry with the matcher `mcp__.*__neurostrata_(task_claim|get_snapshot)`. Without the argument the registered root (the main checkout) is used.
 
+**Tool names.** Harnesses prefix MCP tools: OpenCode names them `<server>_<tool>` (`neurostrata_neurostrata_task_claim`), Claude Code and Codex `mcp__<server>__<tool>`. The plugins map every spelling to the bare `neurostrata_<tool>` name (`canonicalToolName` in core, copied in Hermes) before any check against a NeuroStrata tool: claim and memory-write tracking, the session-scoped tools, and the NeuroStrata tools whose results get no task-intent reminder, because a task note or memory they return is stored data, not new work.
+
 Without `.git` above the folder, `findProjectRoot` takes the nearest folder holding a valid marker, else the nearest folder holding `.NeuroStrata`, but never the home folder: `~/.NeuroStrata` holds the user's own state, not a project's.
 
 The plugin is harness-agnostic: the same `createHarnessPlugin` function works for OpenCode, Claude, Hermes, and Codex because it only depends on the harness hook interface, not on harness internals.
