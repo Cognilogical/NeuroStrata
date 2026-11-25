@@ -2483,7 +2483,6 @@ dependencies = [
  "reasonable",
  "regex",
  "reqwest 0.13.5",
- "same-file",
  "scip",
  "serde",
  "serde_json",

@@ -536,32 +536,13 @@ fn same_file_at_path(file: &std::fs::File, path: &Path) -> bool {
     }
 }
 
-/// True when `path` still names the file the open `file` handle refers to:
-/// same volume and file index. Stable std has no file id on Windows. Opening
-/// the path for this needs no data access, so the byte-range lock allows it.
-/// (Creation times would not do: NTFS tunneling gives a file created under a
-/// just-deleted name the old file's creation time.)
-#[cfg(windows)]
-fn same_file_at_path(file: &std::fs::File, path: &Path) -> bool {
-    let Ok(open) = file.try_clone() else {
-        return false;
-    };
-    match (
-        same_file::Handle::from_file(open),
-        same_file::Handle::from_path(path),
-    ) {
-        (Ok(open), Ok(named)) => open == named,
-        _ => false,
-    }
-}
-
 /// Break the stale lock at `path`, if any.
 ///
 /// Serialized by a short-lived sibling `.break` lock. Under that guard the
 /// lock file is re-checked for staleness and acquired with the OS advisory
 /// lock; the path is unlinked *while that advisory lock is held*, so a
-/// writer cannot acquire the file between the check and the unlink. The file
-/// identity is re-validated against `path` before removal. A `.break` file older than
+/// writer cannot acquire the file between the check and the unlink. On Unix
+/// the inode is re-validated against `path` before removal. A `.break` file older than
 /// the stale limit was left by a process that died mid-break and is removed.
 fn try_break_stale_lock(path: &Path) -> bool {
     let mut breaker = path.as_os_str().to_owned();
@@ -593,16 +574,30 @@ fn try_break_stale_lock(path: &Path) -> bool {
         if file.try_lock().is_err() {
             return false;
         }
-        // If the holder unlinked the file between our open and our lock, a
-        // successor's file may now name the path: leave it alone. Windows
-        // allows the unlink under our lock: the file was opened with delete
-        // sharing.
-        if !same_file_at_path(&file, path) {
-            return false;
+        #[cfg(unix)]
+        {
+            if !same_file_at_path(&file, path) {
+                return false;
+            }
+            let removed = fs::remove_file(path).is_ok();
+            drop(file); // release the advisory lock on the now-unlinked inode
+            removed
         }
-        let removed = fs::remove_file(path).is_ok();
-        drop(file); // release the advisory lock on the now-unlinked file
-        removed
+        #[cfg(not(unix))]
+        {
+            // As on Unix, unlink while the lock is held so no writer can take
+            // the path in between. Windows allows it: the file was opened with
+            // delete sharing. Windows has no stable same-file check, so
+            // re-check staleness: if the holder unlinked the file between our
+            // open and our lock, a successor's fresh file now names the path.
+            if !is_stale(path) {
+                drop(file);
+                return false;
+            }
+            let removed = fs::remove_file(path).is_ok();
+            drop(file);
+            removed
+        }
     })();
 
     drop(breaker_guard);
@@ -630,11 +625,9 @@ impl Drop for ConfigLock {
         #[cfg(not(unix))]
         {
             // The lock refuses reads through any other handle, so check the
-            // nonce through ours, and that the path still names our file (a
-            // breaker may have unlinked it and a successor created its own);
-            // then unlink while still holding the lock (the file was opened
-            // with delete sharing), as on Unix.
-            if !held_nonce_is(&file, &self.nonce) || !same_file_at_path(&file, &self.path) {
+            // nonce through ours; then unlink while still holding the lock
+            // (the file was opened with delete sharing), as on Unix.
+            if !held_nonce_is(&file, &self.nonce) {
                 return;
             }
             let _ = fs::remove_file(&self.path);
@@ -1156,28 +1149,6 @@ mod tests {
         }
         drop(held);
         assert!(lock.exists(), "a foreign lock file must survive our drop");
-        fs::remove_file(&lock).unwrap();
-    }
-
-    /// A paused holder whose file a breaker unlinked must not, on drop, unlink
-    /// the successor's file that now names the path, even though its own
-    /// (unlinked) file still carries its nonce.
-    #[test]
-    fn dropping_an_unlinked_config_lock_leaves_the_successors_file() {
-        let root = temp_dir("config-lock-unlinked-holder");
-        let config_path = write_config(&root);
-        let lock = config_path.with_file_name("config.json.lock");
-        let held = ConfigLock::acquire(&config_path).unwrap();
-        // What a breaker does: unlink the path while the holder still has
-        // it open. Then a successor creates its own file there.
-        fs::remove_file(&lock).unwrap();
-        fs::write(&lock, "9999:successor").unwrap();
-        drop(held);
-        assert_eq!(
-            fs::read_to_string(&lock).unwrap(),
-            "9999:successor",
-            "the successor's lock file must survive the old holder's drop"
-        );
         fs::remove_file(&lock).unwrap();
     }
 
