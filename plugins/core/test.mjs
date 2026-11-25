@@ -1,6 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import { createHash } from 'node:crypto'
 import {
   readFileSync,
   mkdirSync,
@@ -154,6 +155,7 @@ import {
   isCodeExecTool,
   adapterStatus,
   pendingRecallBlocks,
+  pendingRecallByCall,
   injectedMemoryIds,
   prefetchedPaths,
   cachedTaskInjection,
@@ -173,7 +175,38 @@ import {
   extractDaemonMemoryAdvisory,
   daemonTokenPath,
   addSessionWorktree,
-  isSessionScopedTool
+  isSessionScopedTool,
+  WORKING_SET_MAX_FRAME_BYTES,
+  WORKING_SET_MAX_IDLE_TURNS,
+  WORKING_SET_STUB_MAX_BYTES,
+  WORKING_SET_MAX_ROOTS,
+  WORKING_SET_MAX_YOUNG_GEN,
+  WORKING_SET_MAX_STUBS,
+  WORKING_SET_MAX_TOOL_STUBS,
+  WORKING_SET_MAX_TOOL_DIGESTS,
+  WORKING_SET_MAX_EVENT_IDS,
+  WORKING_SET_MAX_INJECTION_KEYS,
+  WORKING_SET_MAX_ACTIVE_SESSION_BYTES,
+  TOOL_GC_INLINE_THRESHOLD_BYTES,
+  TOOL_GC_HEAD_BYTES,
+  TOOL_GC_TAIL_BYTES,
+  TOOL_GC_STUB_MAX_BYTES,
+  WORKING_SET_SUMMARY_MAX_BYTES,
+  WORKING_SET_FRAME_OPEN,
+  WORKING_SET_FRAME_CLOSE,
+  loadWorkingSet,
+  persistWorkingSet,
+  advanceWorkingSetTurn,
+  sweepWorkingSet,
+  evaluateWorkingSetEviction,
+  dehydrateToolOutput,
+  dehydrateRepeatedReadOutput,
+  renderWorkingSetFrame,
+  upsertWorkingSetFrame,
+  runWorkingSetToolCycle,
+  runWorkingSetContextCycle,
+  runWorkingSetTurnBoundary,
+  markWorkingSetTouches
 } from './dist/index.js'
 
 // ──────────────────────────────────────────────────────────────────────
@@ -629,9 +662,12 @@ describe('project root marker and namespace order', () => {
     // With no config of its own, the session checkout falls back to the
     // runner's install root (the legitimate use of runnerDir).
     buildLayout(base, ['bare git-dir'])
-    assert.deepEqual(readHarnessConfig('claude', under(base, 'bare'), runnerDir), {
-      namespace: 'example-project'
-    })
+    assert.deepEqual(
+      readHarnessConfig('claude', under(base, 'bare'), runnerDir),
+      {
+        namespace: 'example-project'
+      }
+    )
     assert.deepEqual(readHarnessConfig('claude', other), {
       namespace: 'from-other'
     })
@@ -659,9 +695,14 @@ describe('project root marker and namespace order', () => {
     const originalError = console.error
     console.error = (line) => errors.push(String(line))
     try {
-      assert.throws(() => readHarnessConfig('claude', repo), /could not be read/)
+      assert.throws(
+        () => readHarnessConfig('claude', repo),
+        /could not be read/
+      )
       assert.ok(
-        errors.some((line) => line.includes(config) && line.includes('valid JSON')),
+        errors.some(
+          (line) => line.includes(config) && line.includes('valid JSON')
+        ),
         `unreadable config must be reported on stderr; saw ${JSON.stringify(errors)}`
       )
       // A missing config stays a normal miss, not a fail-closed error.
@@ -821,7 +862,11 @@ describe('project root marker and namespace order', () => {
       return
     }
     assert.equal(
-      resolveHookProjectDir('claude', { ...start, hook_event_name: 'PreToolUse' }, {}),
+      resolveHookProjectDir(
+        'claude',
+        { ...start, hook_event_name: 'PreToolUse' },
+        {}
+      ),
       repo
     )
     // Byte-for-byte: a Windows path's backslashes are JSON-escaped, so a
@@ -3993,24 +4038,22 @@ describe('sessionContextHandler bridge formatting (no [object Object])', () => {
       await sessionContextHandler(ev, config)
       const ctx = ev.additionalContext ?? ''
       assert.ok(
-        ctx.includes('[NeuroStrata Conceptual Bridges]'),
-        'bridges section present'
+        ctx.includes('[Young] bridge:t1 | always claim first'),
+        'object bridge projected into YoungGen'
+      )
+      assert.ok(
+        ctx.includes('[Young] bridge:t3 | gate blocks'),
+        'object with source_id falls back to target_type'
+      )
+      assert.ok(
+        ctx.includes(
+          '[Young] bridge:a plain string bridge | a plain string bridge'
+        ),
+        'string bridge passed through'
       )
       assert.ok(
         !ctx.includes('[object Object]'),
         'no [object Object] in bridge formatting'
-      )
-      assert.ok(
-        ctx.includes('[rule] t1: always claim first (src/a.rs)'),
-        'object bridge formatted cleanly'
-      )
-      assert.ok(
-        ctx.includes('a plain string bridge'),
-        'string bridge passed through'
-      )
-      assert.ok(
-        ctx.includes('[fact] t3: gate blocks'),
-        'object with source_id falls back to target_type'
       )
     } finally {
       rmSync(tmpDir, { recursive: true, force: true })
@@ -5634,7 +5677,11 @@ describe('audit W4: two-argument Code Mode intent intake (#311)', () => {
 describe('usableNamespace — linear quote stripping (code-scanning 25-27)', () => {
   async function usable() {
     const mod = await import('./dist/index.js')
-    assert.equal(typeof mod.usableNamespace, 'function', 'helper exported from dist')
+    assert.equal(
+      typeof mod.usableNamespace,
+      'function',
+      'helper exported from dist'
+    )
     return mod.usableNamespace
   }
 
@@ -5651,7 +5698,9 @@ describe('usableNamespace — linear quote stripping (code-scanning 25-27)', () 
 
   it('handles long quote runs without superlinear backtracking', async () => {
     const f = await usable()
-    const adversarial = Array.from({ length: 200 }, () => '"'.repeat(50) + 'x').join('') + "'".repeat(50)
+    const adversarial =
+      Array.from({ length: 200 }, () => '"'.repeat(50) + 'x').join('') +
+      "'".repeat(50)
     assert.equal(f(adversarial), undefined)
     assert.equal(f('"'.repeat(20000) + 'ns' + "'".repeat(20000)), 'ns')
   })
@@ -5672,10 +5721,22 @@ describe('PR #400 namespace resolution regressions', () => {
   it('stops at a session config whose namespace is unusable', () => {
     const session = tmp()
     const runnerRoot = tmp()
-    const sessionCfg = join(session, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json')
+    const sessionCfg = join(
+      session,
+      '.NeuroStrata',
+      'plugins',
+      'claude',
+      'neurostrata.json'
+    )
     mkdirSync(dirname(sessionCfg), { recursive: true })
     writeFileSync(sessionCfg, JSON.stringify({ namespace: '$INVALID' }))
-    const runnerCfg = join(runnerRoot, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json')
+    const runnerCfg = join(
+      runnerRoot,
+      '.NeuroStrata',
+      'plugins',
+      'claude',
+      'neurostrata.json'
+    )
     mkdirSync(dirname(runnerCfg), { recursive: true })
     writeFileSync(runnerCfg, JSON.stringify({ namespace: 'runner-project' }))
     const runnerDir = dirname(runnerCfg)
@@ -5695,6 +5756,1459 @@ describe('PR #400 namespace resolution regressions', () => {
       assert.notEqual(cfg.namespace, invalid)
     } finally {
       delete process.env.NEUROSTRATA_NAMESPACE
+    }
+  })
+})
+
+const wsHash = (value) => createHash('sha256').update(value).digest('hex')
+const wsScope = (root, overrides = {}) => ({
+  projectRoot: root,
+  projectId: wsHash(root),
+  namespace: 'NeuroStrata',
+  sessionId: 'session-ws',
+  epoch: 0,
+  ...overrides
+})
+const wsNode = (id, kind, overrides = {}) => {
+  const value = {
+    id,
+    kind,
+    label: id,
+    summary: `summary:${id}`,
+    governing_ids: [],
+    byte_cost: 64,
+    last_touched_turn: 0,
+    expand_tool:
+      kind === 'golden_rule'
+        ? 'neurostrata_get_snapshot'
+        : kind === 'file' || kind === 'symbol'
+          ? 'neurostrata_memories_for_file'
+          : 'neurostrata_get_memory',
+    ...overrides
+  }
+  if (kind === 'golden_rule' || kind === 'task_header') {
+    value.byte_cost = Buffer.byteLength(
+      `[Root] ${id} | ${value.summary} | expand:${value.expand_tool}\n`
+    )
+  } else if (kind === 'file' || kind === 'symbol') {
+    value.byte_cost = Buffer.byteLength(
+      `[Root] ${id} | ${value.summary} | expand:${value.expand_tool}\n`
+    )
+  } else {
+    value.byte_cost = Buffer.byteLength(
+      `[Young] ${id} | ${value.summary} | expand:${value.expand_tool}\n`
+    )
+  }
+  return value
+}
+const wsState = (scope, overrides = {}) => ({
+  version: 1,
+  project_id: scope.projectId,
+  namespace: scope.namespace,
+  session_id: scope.sessionId,
+  epoch: scope.epoch,
+  turn_seq: 0,
+  active_turn_id: null,
+  recent_event_ids: [],
+  max_frame_bytes: 4096,
+  max_idle_turns: 3,
+  used_frame_bytes: 0,
+  frame_fingerprint: '0'.repeat(64),
+  last_injected_fingerprint: '0'.repeat(64),
+  roots: [],
+  young_gen: [],
+  evicted_stubs: [],
+  tool_output_stubs: [],
+  tool_output_digests: [],
+  ...overrides
+})
+const wsParent = (root, state, extra = {}) => {
+  const dir = join(root, '.NeuroStrata')
+  mkdirSync(dir, { recursive: true })
+  const path = join(dir, 'active_session.json')
+  writeFileSync(
+    path,
+    JSON.stringify(
+      {
+        namespace: state.namespace,
+        session_id: state.session_id,
+        task_id: 'task-parent',
+        status: 'in_progress',
+        golden_rules: ['always claim first'],
+        owner_field: { preserved: true },
+        working_set: state,
+        ...extra
+      },
+      null,
+      2
+    )
+  )
+  return path
+}
+
+describe('working-set GC decision and strict state', () => {
+  it('exports every fixed working-set budget', () => {
+    assert.deepEqual(
+      [
+        WORKING_SET_MAX_FRAME_BYTES,
+        WORKING_SET_MAX_IDLE_TURNS,
+        WORKING_SET_STUB_MAX_BYTES,
+        WORKING_SET_MAX_ROOTS,
+        WORKING_SET_MAX_YOUNG_GEN,
+        WORKING_SET_MAX_STUBS,
+        WORKING_SET_MAX_TOOL_STUBS,
+        WORKING_SET_MAX_TOOL_DIGESTS,
+        WORKING_SET_MAX_EVENT_IDS,
+        WORKING_SET_MAX_INJECTION_KEYS,
+        WORKING_SET_MAX_ACTIVE_SESSION_BYTES,
+        TOOL_GC_INLINE_THRESHOLD_BYTES,
+        TOOL_GC_HEAD_BYTES,
+        TOOL_GC_TAIL_BYTES,
+        TOOL_GC_STUB_MAX_BYTES,
+        WORKING_SET_SUMMARY_MAX_BYTES
+      ],
+      [
+        4096, 3, 192, 32, 64, 128, 128, 128, 128, 128, 1048576, 3072, 512, 512,
+        512, 512
+      ]
+    )
+  })
+
+  it('matches the complete 2560-row Rust/Lean decision corpus', () => {
+    const tiers = ['Immortal', 'PinnedRoot', 'YoungGen', 'EvictedStub']
+    const ages = [0, 1, 3, 4, 0xffffffff]
+    const ttls = [0, 3]
+    const sizes = [0, 1, 256, 0xffffffff]
+    const projections = [0, 4096, 4097, 0xffffffff]
+    const caps = [0, 4096]
+    let rows = 0
+    for (const tier of tiers)
+      for (const turn_age of ages)
+        for (const max_idle_turns of ttls)
+          for (const node_bytes of sizes)
+            for (const projected_frame_bytes of projections)
+              for (const max_frame_bytes of caps)
+                for (const is_re_referenced of [false, true]) {
+                  let expected
+                  if (tier === 'Immortal') expected = 'retain_full'
+                  else if (tier === 'EvictedStub')
+                    expected =
+                      is_re_referenced &&
+                      projected_frame_bytes <= max_frame_bytes
+                        ? 'promote_to_young_gen'
+                        : 'retain_stub'
+                  else if (tier === 'YoungGen')
+                    expected =
+                      (!is_re_referenced && turn_age > max_idle_turns) ||
+                      projected_frame_bytes > max_frame_bytes
+                        ? 'demote_to_stub'
+                        : 'retain_full'
+                  else
+                    expected =
+                      !is_re_referenced &&
+                      turn_age > 0 &&
+                      projected_frame_bytes > max_frame_bytes
+                        ? 'demote_to_stub'
+                        : 'retain_full'
+                  assert.equal(
+                    evaluateWorkingSetEviction({
+                      tier,
+                      turn_age,
+                      max_idle_turns,
+                      node_bytes,
+                      projected_frame_bytes,
+                      max_frame_bytes,
+                      is_re_referenced
+                    }),
+                    expected,
+                    `row ${rows}`
+                  )
+                  rows++
+                }
+    assert.equal(rows, 2560)
+  })
+
+  it('loads and persists strict state while preserving unknown parent fields', async () => {
+    const root = canonicalTempDir('ns-core-ws-state-')
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        roots: [wsNode('rule:abc', 'golden_rule', { summary: 'always claim' })]
+      })
+      const parent = wsParent(root, state)
+      const loaded = await loadWorkingSet(scope)
+      assert.deepEqual(loaded, state)
+      loaded.turn_seq = 2
+      await persistWorkingSet(scope, loaded)
+      const saved = JSON.parse(readFileSync(parent, 'utf8'))
+      assert.equal(saved.working_set.turn_seq, 2)
+      assert.deepEqual(saved.owner_field, { preserved: true })
+      assert.equal(saved.task_id, 'task-parent')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects non-4096 caps and unknown nested fields without overwriting parents', async () => {
+    const root = canonicalTempDir('ns-core-ws-invalid-')
+    try {
+      const scope = wsScope(root)
+      for (const mutate of [
+        (state) => {
+          state.max_frame_bytes = 123
+        },
+        (state) => {
+          state.roots[0].unexpected = true
+        },
+        (state) => {
+          state.young_gen = 'invalid'
+        }
+      ]) {
+        const state = wsState(scope, {
+          roots: [wsNode('rule:abc', 'golden_rule')]
+        })
+        mutate(state)
+        const parent = wsParent(root, state)
+        const before = readFileSync(parent, 'utf8')
+        const loaded = await loadWorkingSet(scope)
+        assert.deepEqual(loaded.roots, [])
+        assert.equal(loaded.turn_seq, 0)
+        assert.equal(readFileSync(parent, 'utf8'), before)
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects corrupt, oversized, mismatched, and symlinked state without overwriting it', async () => {
+    const root = canonicalTempDir('ns-core-ws-corrupt-')
+    const outside = canonicalTempDir('ns-core-ws-outside-')
+    try {
+      const scope = wsScope(root)
+      const dir = join(root, '.NeuroStrata')
+      const parent = join(dir, 'active_session.json')
+      mkdirSync(dir, { recursive: true })
+      for (const text of ['{broken', 'x'.repeat(1048577)]) {
+        writeFileSync(parent, text)
+        assert.deepEqual((await loadWorkingSet(scope)).roots, [])
+        assert.equal(readFileSync(parent, 'utf8'), text)
+      }
+      const state = wsState(scope, {
+        roots: [wsNode('rule:abc', 'golden_rule')]
+      })
+      wsParent(root, state)
+      for (const mismatch of [
+        { namespace: 'Other' },
+        { sessionId: 'other-session' },
+        { epoch: -1 }
+      ]) {
+        assert.deepEqual(
+          (await loadWorkingSet(wsScope(root, mismatch))).roots,
+          []
+        )
+      }
+      const external = join(outside, 'active_session.json')
+      writeFileSync(external, JSON.stringify({ working_set: state }))
+      rmSync(parent)
+      symlinkSync(external, parent)
+      assert.deepEqual((await loadWorkingSet(scope)).roots, [])
+      assert.equal(
+        readFileSync(external, 'utf8'),
+        JSON.stringify({ working_set: state })
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('adopts newer epochs but starts older epochs clean', async () => {
+    const root = canonicalTempDir('ns-core-ws-epoch-')
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        epoch: 1,
+        turn_seq: 8,
+        active_turn_id: 'turn-old',
+        recent_event_ids: ['event-old'],
+        frame_fingerprint: 'a'.repeat(64),
+        last_injected_fingerprint: 'b'.repeat(64),
+        roots: [wsNode('rule:abc', 'golden_rule')],
+        young_gen: [wsNode('mem:old', 'memory', { memory_type: 'fact' })]
+      })
+      wsParent(root, state)
+      const newer = await loadWorkingSet(wsScope(root, { epoch: 0 }))
+      assert.equal(newer.epoch, 1)
+      assert.equal(newer.turn_seq, 8)
+      assert.deepEqual(newer.recent_event_ids, [])
+      assert.equal(newer.frame_fingerprint, '0'.repeat(64))
+      assert.equal(newer.last_injected_fingerprint, '0'.repeat(64))
+      assert.equal(newer.young_gen.length, 1)
+      assert.equal(newer.roots.length, 1)
+      wsParent(
+        root,
+        wsState(scope, { roots: [wsNode('rule:abc', 'golden_rule')] })
+      )
+      const older = await loadWorkingSet(wsScope(root, { epoch: 1 }))
+      assert.deepEqual(older.roots, [])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps runtime imports inside the four approved Node built-ins', () => {
+    const source = readFileSync(
+      join(REPO_ROOT, 'plugins/core/index.ts'),
+      'utf8'
+    )
+    const imports = [...source.matchAll(/\bfrom\s+['"](node:[^'"]+)['"]/g)].map(
+      (m) => m[1]
+    )
+    assert.ok(imports.length >= 3)
+    assert.deepEqual([...new Set(imports)].sort(), [
+      'node:crypto',
+      'node:fs',
+      'node:os',
+      'node:path'
+    ])
+  })
+})
+
+describe('working-set GC cycles, sweep, and rendering', () => {
+  it('marks touches, advances once, and resets all derived identity at u32::MAX', async () => {
+    const root = canonicalTempDir('ns-core-ws-turn-')
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        turn_seq: 0xffffffff,
+        active_turn_id: 'old-turn',
+        recent_event_ids: ['old-event'],
+        frame_fingerprint: 'a'.repeat(64),
+        last_injected_fingerprint: 'b'.repeat(64),
+        roots: [
+          wsNode('rule:abc', 'golden_rule', { last_touched_turn: 0xffffffff })
+        ]
+      })
+      wsParent(root, state)
+      const advanced = await advanceWorkingSetTurn(
+        await loadWorkingSet(scope),
+        scope.namespace,
+        scope.sessionId,
+        scope.projectRoot,
+        [{ id: 'file:src/a.ts', kind: 'file', path: 'src/a.ts' }],
+        async () => null
+      )
+      assert.equal(advanced.turn_seq, 0)
+      assert.equal(advanced.active_turn_id, null)
+      assert.deepEqual(advanced.recent_event_ids, [])
+      assert.equal(advanced.frame_fingerprint, '0'.repeat(64))
+      assert.equal(advanced.last_injected_fingerprint, '0'.repeat(64))
+      assert.ok(advanced.roots.every((node) => node.last_touched_turn === 0))
+      assert.ok(advanced.roots.some((node) => node.id === 'file:src/a.ts'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('promotes fitting page faults and retains failed or oversized stubs', async () => {
+    const scope = wsScope(REPO_ROOT)
+    const pointer =
+      '[GCStub mem:page | rule | governs:- | expand:neurostrata_get_memory]'
+    const stub = {
+      id: 'mem:page',
+      kind: 'memory',
+      pointer,
+      byte_cost: Buffer.byteLength(`${pointer}\n`),
+      last_touched_turn: 0,
+      governing_ids: [],
+      memory_type: 'rule'
+    }
+    const state = wsState(scope, { evicted_stubs: [stub] })
+    const full = wsNode('mem:page', 'memory', { memory_type: 'rule' })
+    const promoted = await advanceWorkingSetTurn(
+      state,
+      scope.namespace,
+      scope.sessionId,
+      scope.projectRoot,
+      [{ id: stub.id, kind: 'memory', memoryId: 'page' }],
+      async () => full
+    )
+    assert.equal(promoted.evicted_stubs.length, 0)
+    assert.equal(promoted.young_gen[0].summary, full.summary)
+    const failed = await advanceWorkingSetTurn(
+      state,
+      scope.namespace,
+      scope.sessionId,
+      scope.projectRoot,
+      [{ id: stub.id, kind: 'memory', memoryId: 'page' }],
+      async () => null
+    )
+    assert.equal(failed.evicted_stubs[0].id, stub.id)
+    const oversized = await advanceWorkingSetTurn(
+      state,
+      scope.namespace,
+      scope.sessionId,
+      scope.projectRoot,
+      [{ id: stub.id, kind: 'memory', memoryId: 'page' }],
+      async () => ({ ...full, summary: 'x'.repeat(5000) })
+    )
+    assert.equal(oversized.evicted_stubs[0].id, stub.id)
+  })
+
+  it('retains TTL equality, demotes expiry, and preserves current pinned roots under pressure', () => {
+    const scope = wsScope(REPO_ROOT)
+    const young = wsNode('mem:young', 'memory', {
+      summary: 'y'.repeat(300),
+      memory_type: 'fact'
+    })
+    const pinned = wsNode('file:src/a.ts', 'file', {
+      path: 'src/a.ts',
+      summary: 'p'.repeat(300)
+    })
+    const atThree = sweepWorkingSet(
+      wsState(scope, {
+        turn_seq: 3,
+        young_gen: [{ ...young, last_touched_turn: 0 }]
+      })
+    )
+    assert.equal(atThree.young_gen.length, 1)
+    const atFour = sweepWorkingSet(
+      wsState(scope, {
+        turn_seq: 4,
+        young_gen: [{ ...young, last_touched_turn: 0 }]
+      })
+    )
+    assert.equal(atFour.young_gen.length, 0)
+    assert.equal(atFour.evicted_stubs[0].id, young.id)
+    const pressured = sweepWorkingSet(
+      wsState(scope, {
+        turn_seq: 5,
+        roots: [
+          { ...pinned, last_touched_turn: 5 },
+          ...Array.from({ length: 12 }, (_, i) => ({
+            ...pinned,
+            id: `file:src/b-${i}.ts`,
+            path: `src/b-${i}.ts`,
+            last_touched_turn: 1
+          }))
+        ]
+      })
+    )
+    assert.ok(
+      pressured.roots.some(
+        (node) => node.id === pinned.id && node.last_touched_turn === 5
+      )
+    )
+    assert.ok(!pressured.roots.some((node) => node.id === 'file:src/b-0.ts'))
+  })
+
+  it('enforces canonical ordering and every collection cap', () => {
+    const scope = wsScope(REPO_ROOT)
+    const roots = [wsNode('rule:immortal', 'golden_rule')]
+    for (let i = 0; i < 40; i++)
+      roots.push(
+        wsNode(`file:src/${String(i).padStart(2, '0')}.ts`, 'file', {
+          path: `src/${String(i).padStart(2, '0')}.ts`,
+          last_touched_turn: i
+        })
+      )
+    const rootState = sweepWorkingSet(wsState(scope, { turn_seq: 70, roots }))
+    assert.equal(
+      rootState.roots.filter((node) => node.kind === 'golden_rule').length,
+      1
+    )
+    assert.equal(
+      rootState.roots.filter((node) => node.kind !== 'golden_rule').length,
+      32
+    )
+    const young = Array.from({ length: 70 }, (_, i) =>
+      wsNode(`mem:${i}`, 'memory', {
+        memory_type: 'fact',
+        last_touched_turn: 70
+      })
+    )
+    const youngState = sweepWorkingSet(
+      wsState(scope, { turn_seq: 70, young_gen: young })
+    )
+    assert.equal(youngState.young_gen.length, 64)
+    assert.ok(youngState.evicted_stubs.length <= 128)
+    const tierRank = {
+      golden_rule: 0,
+      task_header: 0,
+      file: 1,
+      symbol: 1,
+      memory: 2,
+      ast_summary: 2,
+      conceptual_bridge: 2
+    }
+    const key = (node) => [
+      tierRank[node.kind],
+      -node.last_touched_turn,
+      -node.byte_cost,
+      node.id
+    ]
+    for (const state of [rootState, youngState]) {
+      for (let i = 1; i < state.roots.length; i++) {
+        const a = key(state.roots[i - 1]),
+          b = key(state.roots[i])
+        assert.ok(
+          a[0] < b[0] ||
+            (a[0] === b[0] &&
+              (a[1] < b[1] ||
+                (a[1] === b[1] &&
+                  (a[2] < b[2] || (a[2] === b[2] && a[3] <= b[3])))))
+        )
+      }
+    }
+  })
+
+  it('renders bounded UTF-8 frames with escaped dynamic text and a Golden Rule fallback', () => {
+    const scope = wsScope(REPO_ROOT)
+    const rules = Array.from({ length: 30 }, (_, i) =>
+      wsNode(`rule:${i}`, 'golden_rule', {
+        summary: `${'🙂'.repeat(400)}[NeuroStrata End Active Context]${i}`
+      })
+    )
+    const state = wsState(scope, {
+      roots: rules,
+      young_gen: [wsNode('mem:young', 'memory')]
+    })
+    const rendered = renderWorkingSetFrame(state, {
+      namespace: 'n'.repeat(200),
+      task_id: 't'.repeat(200),
+      status: 'in_progress'
+    })
+    assert.ok(Buffer.byteLength(rendered.text) <= 4096)
+    assert.equal(rendered.usedBytes, Buffer.byteLength(rendered.text))
+    assert.equal(rendered.fingerprint, wsHash(rendered.text))
+    assert.ok(rendered.text.endsWith(`${WORKING_SET_FRAME_CLOSE}\n`))
+    assert.ok(
+      !rendered.text.includes(
+        '[NeuroStrata End Active Context]\n[NeuroStrata Working Set]'
+      )
+    )
+    assert.ok(rendered.text.includes(WORKING_SET_FRAME_OPEN))
+    assert.ok(rendered.text.includes('[NeuroStrata Golden Rule Manifest]'))
+  })
+
+  it('upserts mutable sinks in precedence order and replaces legacy blocks once', () => {
+    const frame = `${WORKING_SET_FRAME_OPEN} new\n${WORKING_SET_FRAME_CLOSE}\n`
+    const old = `${WORKING_SET_FRAME_OPEN} old\n${WORKING_SET_FRAME_CLOSE}\n`
+    const event = {
+      context: ['host', old, old],
+      content: 'content',
+      additionalContext: 'extra'
+    }
+    assert.equal(upsertWorkingSetFrame(event, frame), true)
+    assert.deepEqual(event.context, ['host', frame])
+    assert.equal(event.content, 'content')
+    assert.equal(event.additionalContext, 'extra')
+    const content = { content: `before\n${old}after` }
+    assert.equal(upsertWorkingSetFrame(content, frame), true)
+    assert.equal(content.content, `before\n${frame}after`)
+    const legacy = {
+      additionalContext: `before\n${WORKING_SET_FRAME_OPEN} legacy\nafter`
+    }
+    assert.equal(upsertWorkingSetFrame(legacy, frame), true)
+    assert.equal(legacy.additionalContext, `before\n${frame}`)
+    const repeat = { context: ['host', frame] }
+    assert.equal(upsertWorkingSetFrame(repeat, frame), false)
+    assert.deepEqual(repeat.context, ['host', frame])
+  })
+
+  it('deduplicates turn/event identity and never advances context cycles', async () => {
+    const root = canonicalTempDir('ns-core-ws-cycle-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const first = await runWorkingSetTurnBoundary(scope, 'event-1', 'turn-1')
+      assert.equal(first.changed, true)
+      const state1 = await loadWorkingSet(scope)
+      assert.equal(state1.turn_seq, 1)
+      const repeat = await runWorkingSetTurnBoundary(scope, 'event-1', 'turn-1')
+      assert.equal(repeat.changed, false)
+      assert.equal((await loadWorkingSet(scope)).turn_seq, 1)
+      await markWorkingSetTouches(
+        scope,
+        [{ id: 'file:src/a.ts', kind: 'file', path: 'src/a.ts' }],
+        'event-2'
+      )
+      assert.equal(
+        (await runWorkingSetContextCycle(scope, 'event-2')).changed,
+        true
+      )
+      const before = await loadWorkingSet(scope)
+      const context = await runWorkingSetContextCycle(scope, 'event-2')
+      assert.equal(context.changed, false)
+      assert.deepEqual(await loadWorkingSet(scope), before)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('working-set tool-output and recall dehydration', () => {
+  it('normalizes CRLF and dehydrates only eligible output over 3072 bytes', () => {
+    const raw = `head\r\n${'🙂'.repeat(2000)}`
+    const result = dehydrateToolOutput(raw, ' Read ', 'src/a.ts', ['rule-1'])
+    assert.equal(result.dehydrated, true)
+    assert.ok(result.text.includes('[NeuroStrata GC Summary — head]'))
+    assert.ok(result.text.includes('[NeuroStrata GC Summary — tail]'))
+    assert.ok(result.text.includes('[NeuroStrata GC Stub ->'))
+    assert.ok(!result.text.includes('\r'))
+    assert.equal(
+      dehydrateToolOutput('tiny', 'edit', 'src/a.ts', []).dehydrated,
+      false
+    )
+    assert.equal(
+      dehydrateToolOutput('x'.repeat(3073), 'unknown', null, []).dehydrated,
+      false
+    )
+    assert.equal(
+      dehydrateToolOutput('x'.repeat(3073), 'grep', null, []).text.includes(
+        'path=-'
+      ),
+      true
+    )
+  })
+
+  it('records first small reads inline and produces deterministic repeated-read stubs', async () => {
+    const root = canonicalTempDir('ns-core-ws-tool-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const first = await dehydrateRepeatedReadOutput(
+        scope,
+        'tiny\r\ntext',
+        'Read',
+        'src/a.ts',
+        ['rule-1']
+      )
+      assert.equal(first.dehydrated, false)
+      assert.equal(first.text, 'tiny\r\ntext')
+      const firstState = await loadWorkingSet(scope)
+      assert.equal(firstState.tool_output_digests.length, 1)
+      assert.equal(firstState.tool_output_stubs.length, 1)
+      assert.deepEqual(Object.keys(firstState.tool_output_digests[0]).sort(), [
+        'bytes',
+        'epoch',
+        'id',
+        'last_touched_turn',
+        'path_key',
+        'project_id',
+        'read_count',
+        'sha256',
+        'tool_name'
+      ])
+      const second = await dehydrateRepeatedReadOutput(
+        scope,
+        'tiny\r\ntext',
+        'read',
+        'src/a.ts',
+        ['rule-1']
+      )
+      assert.equal(second.dehydrated, true)
+      assert.ok(second.text.includes('[NeuroStrata GC Stub ->'))
+      assert.ok(second.text.includes('tiny\ntext'))
+      assert.ok(!second.text.includes('\r'))
+      const third = await dehydrateRepeatedReadOutput(
+        scope,
+        'tiny\r\ntext',
+        'read',
+        'src/a.ts',
+        ['rule-1']
+      )
+      assert.equal(third.text, second.text)
+      const state = await loadWorkingSet(scope)
+      assert.equal(state.tool_output_digests[0].read_count, 3)
+      assert.ok(!JSON.stringify(state).includes('tiny'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('isolates digest identity by project, namespace, session, and epoch', async () => {
+    const roots = [
+      canonicalTempDir('ns-core-ws-id-a-'),
+      canonicalTempDir('ns-core-ws-id-b-')
+    ]
+    try {
+      const variants = [
+        wsScope(roots[0]),
+        wsScope(roots[1]),
+        wsScope(roots[0], { namespace: 'Other' }),
+        wsScope(roots[0], { sessionId: 'other-session' }),
+        wsScope(roots[0], { epoch: 1 })
+      ]
+      const ids = []
+      for (const scope of variants) {
+        wsParent(scope.projectRoot, wsState(scope))
+        const result = await dehydrateRepeatedReadOutput(
+          scope,
+          'same output',
+          'read',
+          'src/a.ts',
+          []
+        )
+        assert.equal(result.dehydrated, false)
+        const digest = (await loadWorkingSet(scope)).tool_output_digests[0]
+        assert.match(digest.id, /^tool:[0-9a-f]{64}$/)
+        assert.equal(digest.project_id, scope.projectId)
+        ids.push(digest.id)
+      }
+      assert.equal(new Set(ids).size, variants.length)
+    } finally {
+      for (const root of roots) rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps mutating, errored, unknown, and non-text cycle output unchanged', async () => {
+    const root = canonicalTempDir('ns-core-ws-shapes-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      for (const input of [
+        {
+          toolName: 'edit',
+          rawText: 'x'.repeat(4000),
+          outputIsText: true,
+          isError: false
+        },
+        {
+          toolName: 'read',
+          rawText: 'x'.repeat(4000),
+          outputIsText: true,
+          isError: true
+        },
+        {
+          toolName: 'read',
+          rawText: 'x'.repeat(4000),
+          outputIsText: false,
+          isError: false
+        },
+        {
+          toolName: 'unknown',
+          rawText: 'x'.repeat(4000),
+          outputIsText: true,
+          isError: false
+        }
+      ]) {
+        const result = await runWorkingSetToolCycle({
+          scope,
+          toolInput: {},
+          advanceTurn: false,
+          ...input
+        })
+        assert.equal(result.replacementText, null)
+        assert.equal(result.dehydrated, false)
+        assert.ok(Buffer.byteLength(result.frame) <= 4096)
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('replaces large eligible text without persisting raw or restricted output', async () => {
+    const root = canonicalTempDir('ns-core-ws-privacy-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const raw = `raw-secret-${'x'.repeat(4000)}`
+      const result = await runWorkingSetToolCycle({
+        scope,
+        toolName: 'read',
+        toolInput: { path: 'src/a.ts' },
+        rawText: raw,
+        outputIsText: true,
+        isError: false,
+        advanceTurn: true
+      })
+      assert.equal(result.dehydrated, true)
+      assert.ok(result.replacementText.includes('[NeuroStrata GC Stub ->'))
+      const persisted = readFileSync(
+        join(root, '.NeuroStrata/active_session.json'),
+        'utf8'
+      )
+      assert.ok(!persisted.includes('raw-secret-'))
+      assert.ok(!persisted.includes('x'.repeat(100)))
+      assert.ok(Buffer.byteLength(result.frame) <= 4096)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('working-set GC hook, recall, and fail-soft integration', () => {
+  async function registerAfter(root) {
+    resetClientForTesting()
+    let after = null
+    await initialize({
+      location: {
+        directory: root,
+        project: { root, canonical: root }
+      },
+      session: { hook: () => {} },
+      tool: {
+        hook: (name, cb) => {
+          if (name === 'execute.after') after = cb
+        }
+      },
+      hooks: {},
+      config: {
+        namespace: 'NeuroStrata',
+        endpoint: 'http://127.0.0.1:1/mcp',
+        requestTimeoutMs: 50,
+        intentDetection: { enabled: false, injectReminder: false }
+      }
+    })
+    assert.equal(typeof after, 'function')
+    return after
+  }
+
+  it('injects one bounded frame, replaces changed fingerprints, and skips missing sessions', async () => {
+    const root = canonicalTempDir('ns-core-ws-context-hook-')
+    try {
+      const scope = wsScope(root)
+      const parentPath = wsParent(root, wsState(scope), {
+        conceptual_bridges: [
+          {
+            target_id: 'bridge-target',
+            target_type: 'fact',
+            target_summary: 'bridge summary',
+            path: 'src/a.ts -> src/b.ts'
+          }
+        ]
+      })
+      const config = {
+        projectRoot: root,
+        namespace: 'NeuroStrata',
+        intentDetection: { enabled: false, injectReminder: false }
+      }
+      const first = { sessionID: scope.sessionId, context: ['host context'] }
+      await sessionContextHandler(first, config)
+      assert.equal(first.additionalContext, undefined)
+      assert.equal(first.context.length, 2)
+      const frame = first.context[0]
+      assert.ok(frame.startsWith(WORKING_SET_FRAME_OPEN))
+      assert.ok(frame.endsWith(`${WORKING_SET_FRAME_CLOSE}\n`))
+      assert.ok(frame.includes('bridge:bridge-target'))
+      assert.ok(Buffer.byteLength(frame) <= 4096)
+      const injected = await loadWorkingSet(scope)
+      assert.equal(injected.last_injected_fingerprint, wsHash(frame))
+
+      const repeat = { sessionID: scope.sessionId, context: [...first.context] }
+      await sessionContextHandler(repeat, config)
+      assert.deepEqual(repeat.context, first.context)
+
+      const parent = JSON.parse(readFileSync(parentPath, 'utf8'))
+      parent.golden_rules = ['changed golden rule']
+      writeFileSync(parentPath, JSON.stringify(parent, null, 2))
+      const changed = {
+        sessionID: scope.sessionId,
+        context: [...first.context]
+      }
+      await sessionContextHandler(changed, config)
+      assert.equal(changed.context.length, 2)
+      assert.notEqual(changed.context[0], frame)
+      assert.ok(changed.context[0].includes('changed golden rule'))
+      assert.equal(
+        changed.context.filter((v) =>
+          String(v).includes(WORKING_SET_FRAME_OPEN)
+        ).length,
+        1
+      )
+
+      const beforeMissing = readFileSync(parentPath, 'utf8')
+      const missing = { context: ['host context'] }
+      await sessionContextHandler(missing, config)
+      assert.deepEqual(missing, { context: ['host context'] })
+      assert.equal(readFileSync(parentPath, 'utf8'), beforeMissing)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('rebuilds the working set on compaction without consuming the next context injection', async () => {
+    const root = canonicalTempDir('ns-core-ws-compaction-hook-')
+    try {
+      const scope = wsScope(root)
+      const stale = wsState(scope)
+      stale.young_gen = [wsNode('mem:stale', 'memory')]
+      wsParent(root, stale, { task_id: 'task-compact', status: 'in_progress' })
+      const config = {
+        projectRoot: root,
+        namespace: 'NeuroStrata',
+        intentDetection: { enabled: false, injectReminder: false }
+      }
+      const initial = { sessionID: scope.sessionId, context: [] }
+      await sessionContextHandler(initial, config)
+      assert.equal(initial.context.length, 1)
+
+      await sessionCompactionHandler({ sessionID: scope.sessionId }, config)
+      const compacted = await loadWorkingSet(scope)
+      assert.equal(compacted.epoch, 1)
+      assert.ok(compacted.roots.some((node) => node.id === 'task:task-compact'))
+      assert.ok(!compacted.young_gen.some((node) => node.id === 'mem:stale'))
+      assert.equal(compacted.last_injected_fingerprint, '0'.repeat(64))
+
+      const next = { sessionID: scope.sessionId, context: [] }
+      await sessionContextHandler(next, config)
+      assert.equal(next.context.length, 1)
+      assert.ok(next.context[0].includes('task:task-compact'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('dehydrates execute.after text once per read and preserves non-text parts', async () => {
+    const root = canonicalTempDir('ns-core-ws-after-hook-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const after = await registerAfter(root)
+      const raw = `HEAD${'x'.repeat(4000)}TAIL`
+      const large = {
+        name: 'read',
+        callID: 'call-large',
+        sessionID: scope.sessionId,
+        args: { path: 'src/a.ts' },
+        result: { content: raw, output: raw }
+      }
+      await after(large)
+      assert.ok(
+        large.result.content.includes('[NeuroStrata GC Summary — head]')
+      )
+      assert.ok(large.result.content.includes('[NeuroStrata GC Stub ->'))
+      assert.equal(large.result.output, large.result.content)
+      assert.ok(!large.result.content.includes(raw))
+      const largeState = await loadWorkingSet(scope)
+      assert.equal(largeState.tool_output_digests.length, 1)
+      assert.equal(largeState.turn_seq, 1)
+      assert.ok(largeState.roots.some((node) => node.id === 'file:src/a.ts'))
+
+      const repeated = {
+        name: 'read',
+        callID: 'call-small',
+        sessionID: scope.sessionId,
+        args: { path: 'src/a.ts' },
+        result: {
+          content: 'small repeated read',
+          output: 'small repeated read'
+        }
+      }
+      await after(repeated)
+      assert.ok(repeated.result.content.includes('[NeuroStrata GC Stub ->'))
+      const repeatedState = await loadWorkingSet(scope)
+      assert.equal(repeatedState.tool_output_digests.length, 2)
+      const changedRead = repeatedState.tool_output_digests.find(
+        (digest) => digest.bytes === Buffer.byteLength('small repeated read')
+      )
+      assert.equal(changedRead.read_count, 1)
+      assert.equal(repeatedState.turn_seq, 2)
+
+      const image = { type: 'image', url: 'https://example.invalid/image.png' }
+      const mixed = {
+        name: 'read',
+        callID: 'call-mixed',
+        sessionID: scope.sessionId,
+        args: { path: 'src/mixed.ts' },
+        result: { content: [image, { type: 'text', text: 'z'.repeat(4000) }] }
+      }
+      await after(mixed)
+      assert.deepEqual(mixed.result.content, [
+        image,
+        { type: 'text', text: 'z'.repeat(4000) }
+      ])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('deduplicates native result events without advancing or replacing twice', async () => {
+    const root = canonicalTempDir('ns-core-ws-after-dedupe-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const after = await registerAfter(root)
+      const raw = `HEAD${'x'.repeat(4000)}TAIL`
+      const first = {
+        name: 'read',
+        callID: 'call-dedupe',
+        sessionID: scope.sessionId,
+        args: { path: 'src/a.ts' },
+        result: { content: raw, output: raw }
+      }
+      await after(first)
+      assert.ok(first.result.content.includes('[NeuroStrata GC Stub ->'))
+      const before = await loadWorkingSet(scope)
+      const repeated = {
+        name: 'read',
+        callID: 'call-dedupe',
+        sessionID: scope.sessionId,
+        args: { path: 'src/a.ts' },
+        result: { content: raw, output: raw }
+      }
+      await after(repeated)
+      assert.equal(repeated.result.content, raw)
+      const afterState = await loadWorkingSet(scope)
+      assert.equal(afterState.turn_seq, before.turn_seq)
+      assert.equal(afterState.tool_output_digests[0].read_count, 1)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('dehydrates text-only and resident structured recall without persisting bodies', async () => {
+    const root = canonicalTempDir('ns-core-ws-recall-hook-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const after = await registerAfter(root)
+      const textOnly = `[NeuroStrata Governing Memories for src/a.ts]\n${'restricted-body-'.repeat(300)}`
+      pendingRecallBlocks.push(textOnly)
+      pendingRecallByCall.set('call:call-text-recall', textOnly)
+      const textEvent = {
+        name: 'read',
+        callID: 'call-text-recall',
+        sessionID: scope.sessionId,
+        args: { path: 'src/a.ts' },
+        result: { content: 'tool output' }
+      }
+      await after(textEvent)
+      assert.ok(textEvent.result.content.includes('[GCStub text:'))
+      assert.ok(!textEvent.result.content.includes(textOnly))
+      assert.ok(textEvent.result.content.length < textOnly.length)
+
+      await markWorkingSetTouches(scope, [
+        {
+          id: 'mem:mem-rule-1',
+          kind: 'memory',
+          memoryId: 'mem-rule-1'
+        }
+      ])
+      const structured =
+        '[NeuroStrata Governing Memories for src/b.ts]\n[NeuroStrata rule mem-rule-1 (valid_from 2026-01-01T00:00:00Z)] short restricted body'
+      pendingRecallBlocks.push(structured)
+      pendingRecallByCall.set('call:call-structured-recall', structured)
+      const structuredEvent = {
+        name: 'read',
+        callID: 'call-structured-recall',
+        sessionID: scope.sessionId,
+        args: { path: 'src/b.ts' },
+        result: { content: 'tool output' }
+      }
+      await after(structuredEvent)
+      assert.ok(
+        structuredEvent.result.content.includes('[GCStub mem:mem-rule-1')
+      )
+      const persisted = readFileSync(
+        join(root, '.NeuroStrata/active_session.json'),
+        'utf8'
+      )
+      assert.ok(!persisted.includes('restricted-body-'))
+      assert.ok(!persisted.includes('short restricted body'))
+    } finally {
+      pendingRecallBlocks.length = 0
+      pendingRecallByCall.clear()
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('keeps tool execution fail-soft when the session parent is corrupt', async () => {
+    const root = canonicalTempDir('ns-core-ws-corrupt-hook-')
+    try {
+      mkdirSync(join(root, '.NeuroStrata'), { recursive: true })
+      const parentPath = join(root, '.NeuroStrata/active_session.json')
+      writeFileSync(parentPath, '{not-json')
+      const after = await registerAfter(root)
+      const event = {
+        name: 'read',
+        callID: 'call-corrupt',
+        sessionID: 'session-corrupt',
+        args: { path: 'src/a.ts' },
+        result: { content: 'x'.repeat(4000) }
+      }
+      await after(event)
+      assert.equal(readFileSync(parentPath, 'utf8'), '{not-json')
+      assert.equal(typeof event.result.content, 'string')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+})
+
+describe('working-set GC four-artifact adapter bundler', () => {
+  const coreSource = [
+    'export declare const coreValue: number;',
+    'export declare function createHarnessPlugin(): {};',
+    'export default createHarnessPlugin();',
+    ''
+  ].join('\n')
+  const coreJs = [
+    'export const coreValue = 1;',
+    'export function createHarnessPlugin() { return {}; }',
+    'export default createHarnessPlugin();',
+    '//# sourceMappingURL=index.js.map',
+    ''
+  ].join('\n')
+  const coreDts = [
+    'export declare const coreValue: number;',
+    'export declare function createHarnessPlugin(): {};',
+    'declare const _default: {',
+    '    id: string;',
+    '};',
+    'export default _default;',
+    '//# sourceMappingURL=index.d.ts.map',
+    ''
+  ].join('\n')
+  const thinSource = [
+    'export * from "@neurostrata/plugin-core";',
+    'import { createHarnessPlugin } from "@neurostrata/plugin-core";',
+    '',
+    'export const plugin = createHarnessPlugin("neurostrata", "OpenCode");',
+    'export default plugin;',
+    ''
+  ].join('\n')
+  const compiledSource = [
+    'import { createHarnessPlugin, coreValue } from "@neurostrata/plugin-core";',
+    'export { coreValue } from "@neurostrata/plugin-core";',
+    'const host = "keep";',
+    'export const plugin = createHarnessPlugin(host);',
+    'export default plugin;',
+    ''
+  ].join('\n')
+  const compiledJs = [
+    'import { createHarnessPlugin, coreValue } from "@neurostrata/plugin-core";',
+    'export { coreValue } from "@neurostrata/plugin-core";',
+    'const host = "keep";',
+    'export const plugin = createHarnessPlugin(host);',
+    'export default plugin;',
+    '//# sourceMappingURL=index.js.map',
+    ''
+  ].join('\n')
+  const compiledDts = [
+    'import { createHarnessPlugin } from "@neurostrata/plugin-core";',
+    'export { coreValue } from "@neurostrata/plugin-core";',
+    'export declare const plugin: ReturnType<typeof createHarnessPlugin>;',
+    'export default plugin;',
+    '//# sourceMappingURL=index.d.ts.map',
+    ''
+  ].join('\n')
+
+  function lineCount(text) {
+    return text.endsWith('\n')
+      ? text.split('\n').length - 1
+      : text.split('\n').length
+  }
+
+  function identityMap(source, file) {
+    return {
+      version: 3,
+      file,
+      sources: ['../index.ts'],
+      sourcesContent: [source],
+      names: [],
+      mappings: Array.from({ length: lineCount(source) }, (_, index) =>
+        index === 0 ? 'AAAA' : 'AACA'
+      ).join(';')
+    }
+  }
+
+  function tscStyleMap(source, file) {
+    const map = identityMap(source, file)
+    map.sourceRoot = ''
+    delete map.sourcesContent
+    return map
+  }
+
+  function makeFixture(adapterName = 'opencode') {
+    const root = mkdtempSync(join(tmpdir(), 'ns-core-bundle-'))
+    const coreDir = join(root, 'plugins/core')
+    const adapterDir = join(root, 'plugins', adapterName)
+    mkdirSync(join(coreDir, 'dist'), { recursive: true })
+    mkdirSync(adapterDir, { recursive: true })
+    copyFileSync(
+      join(REPO_ROOT, 'plugins/core/bundle-adapter.mjs'),
+      join(coreDir, 'bundle-adapter.mjs')
+    )
+    writeFileSync(join(coreDir, 'index.ts'), coreSource)
+    writeFileSync(join(coreDir, 'dist/index.js'), coreJs)
+    writeFileSync(join(coreDir, 'dist/index.d.ts'), coreDts)
+    writeFileSync(
+      join(coreDir, 'dist/index.js.map'),
+      JSON.stringify(tscStyleMap(coreSource, 'index.js'))
+    )
+    writeFileSync(
+      join(coreDir, 'dist/index.d.ts.map'),
+      JSON.stringify(tscStyleMap(coreSource, 'index.d.ts'))
+    )
+    writeFileSync(join(adapterDir, 'index.ts'), thinSource)
+    return { root, coreDir, adapterDir }
+  }
+
+  function writeCompiledFixture(adapterDir) {
+    const compiled = join(adapterDir, 'dist/.compiled')
+    mkdirSync(compiled, { recursive: true })
+    writeFileSync(join(adapterDir, 'index.ts'), compiledSource)
+    writeFileSync(join(compiled, 'index.js'), compiledJs)
+    writeFileSync(join(compiled, 'index.d.ts'), compiledDts)
+    const jsMap = tscStyleMap(compiledSource, 'index.js')
+    jsMap.sources = ['../../index.ts']
+    jsMap.mappings = jsMap.mappings
+      .split(';')
+      .map((line, index) => (index === 2 ? 'KACK' : line))
+      .join(';')
+    writeFileSync(join(compiled, 'index.js.map'), JSON.stringify(jsMap))
+    const dtsMap = tscStyleMap(compiledSource, 'index.d.ts')
+    dtsMap.sources = ['../../index.ts']
+    writeFileSync(join(compiled, 'index.d.ts.map'), JSON.stringify(dtsMap))
+    return compiled
+  }
+
+  function runBundle(root, cwd, args = []) {
+    return execFileSyncTop(
+      process.execPath,
+      [join(root, 'plugins/core/bundle-adapter.mjs'), ...args],
+      { cwd, encoding: 'utf8' }
+    )
+  }
+
+  function readMap(path) {
+    return JSON.parse(readFileSync(path, 'utf8'))
+  }
+
+  function decodeMappings(mappings) {
+    const alphabet =
+      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    const digits = new Map([...alphabet].map((char, index) => [char, index]))
+    let source = 0
+    let originalLine = 0
+    let originalColumn = 0
+    let name = 0
+    return mappings.split(';').map((line) => {
+      let generatedColumn = 0
+      if (!line) return []
+      return line.split(',').map((segment) => {
+        const values = []
+        let raw = 0
+        let shift = 0
+        for (const char of segment) {
+          const digit = digits.get(char)
+          assert.notEqual(digit, undefined)
+          raw += (digit & 31) * 2 ** shift
+          if (digit & 32) {
+            shift += 5
+            continue
+          }
+          const magnitude = Math.floor(raw / 2)
+          values.push(raw % 2 === 1 ? -magnitude : magnitude)
+          raw = 0
+          shift = 0
+        }
+        assert.equal(raw, 0)
+        generatedColumn += values[0]
+        const decoded = { generatedColumn }
+        if (values.length > 1) {
+          source += values[1]
+          originalLine += values[2]
+          originalColumn += values[3]
+          decoded.source = source
+          decoded.originalLine = originalLine
+          decoded.originalColumn = originalColumn
+        }
+        if (values.length > 4) {
+          name += values[4]
+          decoded.name = name
+        }
+        return decoded
+      })
+    })
+  }
+
+  function assertComposedMap(path, file, sourcesContent) {
+    const map = readMap(path)
+    assert.equal(map.version, 3)
+    assert.equal(map.file, file)
+    assert.equal('sourceRoot' in map, false)
+    assert.deepEqual(map.sources, ['../../core/index.ts', '../index.ts'])
+    assert.deepEqual(map.sourcesContent, sourcesContent)
+    assert.ok(map.mappings.length > 0)
+    return decodeMappings(map.mappings)
+  }
+
+  it('emits four deterministic thin-adapter artifacts with exact composed maps', () => {
+    const { root, adapterDir } = makeFixture()
+    try {
+      runBundle(root, adapterDir)
+      const dist = join(adapterDir, 'dist')
+      for (const name of [
+        'index.js',
+        'index.js.map',
+        'index.d.ts',
+        'index.d.ts.map'
+      ]) {
+        assert.ok(existsSync(join(dist, name)), name)
+      }
+      const js = readFileSync(join(dist, 'index.js'), 'utf8')
+      assert.ok(js.includes('export const coreValue = 1;'))
+      assert.ok(
+        js.includes(
+          'export const plugin = createHarnessPlugin("neurostrata", "OpenCode");'
+        )
+      )
+      assert.ok(!js.includes('@neurostrata/plugin-core'))
+      assert.ok(!js.includes('export default createHarnessPlugin();'))
+      assert.equal((js.match(/\bexport default\b/g) ?? []).length, 1)
+
+      const jsLines = assertComposedMap(
+        join(dist, 'index.js.map'),
+        'index.js',
+        [coreSource, thinSource]
+      )
+      const pluginLine = js
+        .split('\n')
+        .findIndex((line) => line.startsWith('export const plugin'))
+      assert.equal(jsLines[pluginLine][0].source, 1)
+      assert.equal(jsLines[pluginLine][0].originalLine, 3)
+
+      const dts = readFileSync(join(dist, 'index.d.ts'), 'utf8')
+      assert.ok(dts.includes('export declare const coreValue: number;'))
+      assert.ok(
+        dts.includes(
+          'export declare const plugin: ReturnType<typeof createHarnessPlugin>;'
+        )
+      )
+      assert.equal((dts.match(/\bexport default\b/g) ?? []).length, 1)
+      assertComposedMap(join(dist, 'index.d.ts.map'), 'index.d.ts', [
+        coreSource,
+        thinSource
+      ])
+
+      const before = [
+        'index.js',
+        'index.js.map',
+        'index.d.ts',
+        'index.d.ts.map'
+      ].map((name) => readFileSync(join(dist, name)))
+      runBundle(root, adapterDir)
+      const after = [
+        'index.js',
+        'index.js.map',
+        'index.d.ts',
+        'index.d.ts.map'
+      ].map((name) => readFileSync(join(dist, name)))
+      assert.deepEqual(after, before)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('composes compiled OpenClaw shims, preserves host bytes, and removes .compiled', () => {
+    const { root, adapterDir } = makeFixture('openclaw')
+    const compiled = writeCompiledFixture(adapterDir)
+    try {
+      runBundle(root, adapterDir, ['--compiled-adapter'])
+      const dist = join(adapterDir, 'dist')
+      const js = readFileSync(join(dist, 'index.js'), 'utf8')
+      assert.ok(js.includes('const host = "keep";'))
+      assert.ok(js.includes('export const plugin = createHarnessPlugin(host);'))
+      assert.ok(js.includes('//# sourceMappingURL=index.js.map'))
+      assert.ok(!js.includes('@neurostrata/plugin-core'))
+      assert.ok(!js.includes('export default createHarnessPlugin();'))
+      assert.equal((js.match(/\bexport default\b/g) ?? []).length, 1)
+      assert.equal(existsSync(compiled), false)
+
+      const jsLines = assertComposedMap(
+        join(dist, 'index.js.map'),
+        'index.js',
+        [coreSource, compiledSource]
+      )
+      const hostLine = js
+        .split('\n')
+        .findIndex((line) => line === 'const host = "keep";')
+      assert.equal(jsLines[hostLine][0].source, 1)
+      assert.equal(jsLines[hostLine][0].originalLine, 2)
+      assert.equal(jsLines[hostLine][0].originalColumn, 5)
+
+      const dts = readFileSync(join(dist, 'index.d.ts'), 'utf8')
+      assert.ok(
+        dts.includes(
+          'export declare const plugin: ReturnType<typeof createHarnessPlugin>;'
+        )
+      )
+      assert.ok(!dts.includes('@neurostrata/plugin-core'))
+      assert.equal((dts.match(/\bexport default\b/g) ?? []).length, 1)
+      const dtsLines = assertComposedMap(
+        join(dist, 'index.d.ts.map'),
+        'index.d.ts',
+        [coreSource, compiledSource]
+      )
+      const declarationLine = dts
+        .split('\n')
+        .findIndex((line) => line.startsWith('export declare const plugin'))
+      assert.equal(dtsLines[declarationLine][0].source, 1)
+      assert.equal(dtsLines[declarationLine][0].originalLine, 2)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects compiled-adapter mode outside OpenClaw or Hermes before writes', () => {
+    const { root, adapterDir } = makeFixture('opencode')
+    try {
+      mkdirSync(join(adapterDir, 'dist'), { recursive: true })
+      writeFileSync(join(adapterDir, 'dist/keep.txt'), 'keep')
+      assert.throws(
+        () => runBundle(root, adapterDir, ['--compiled-adapter']),
+        /compiled-adapter.*(?:openclaw|hermes)/i
+      )
+      assert.equal(existsSync(join(adapterDir, 'dist/index.js')), false)
+      assert.equal(existsSync(join(adapterDir, 'dist/index.d.ts')), false)
+      assert.equal(
+        readFileSync(join(adapterDir, 'dist/keep.txt'), 'utf8'),
+        'keep'
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects aliased core imports and multiple shim default exports before writes', () => {
+    const { root, adapterDir } = makeFixture('openclaw')
+    const compiled = writeCompiledFixture(adapterDir)
+    try {
+      writeFileSync(
+        join(compiled, 'index.js'),
+        compiledJs.replace(
+          'import { createHarnessPlugin, coreValue }',
+          'import { createHarnessPlugin, coreValue as renamedCoreValue }'
+        )
+      )
+      assert.throws(
+        () => runBundle(root, adapterDir, ['--compiled-adapter']),
+        /alias|unaliased/i
+      )
+      assert.equal(existsSync(join(adapterDir, 'dist/index.js')), false)
+      assert.equal(existsSync(compiled), true)
+
+      writeFileSync(
+        join(compiled, 'index.js'),
+        `${compiledJs}export default plugin;\n`
+      )
+      assert.throws(
+        () => runBundle(root, adapterDir, ['--compiled-adapter']),
+        /default export/i
+      )
+      assert.equal(existsSync(join(adapterDir, 'dist/index.js')), false)
+      assert.equal(existsSync(compiled), true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
     }
   })
 })

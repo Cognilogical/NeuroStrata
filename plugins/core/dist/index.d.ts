@@ -2,9 +2,9 @@
  * @neurostrata/plugin-core — Shared ESM implementation for all NeuroStrata harness adapters.
  *
  * Zero `require()` calls and zero external npm runtime dependencies. Only Node built-ins
- * (node:fs, node:os, node:path) are imported. Every harness adapter (opencode, claude,
- * codex, github-cli) is a thin wrapper that re-exports this module and builds one plugin
- * via `createHarnessPlugin`.
+ * (node:crypto, node:fs, node:os, node:path) are imported. Every harness adapter
+ * (opencode, claude, codex, github-cli, openclaw, hermes) re-exports this module and
+ * builds one plugin via `createHarnessPlugin`.
  *
  * Implements:
  *  - Bug 2: findProjectRoot / discoverProjectNamespace / resolveConfig (never hardcodes "NeuroStrata")
@@ -290,6 +290,140 @@ export declare function extractConceptualBridges(hits: unknown[]): ConceptualBri
  * `sessionContextHandler` can inject them as `[NeuroStrata Conceptual Bridges]`.
  */
 export declare function persistConceptualBridges(projectRoot: string, bridges: ConceptualBridge[]): void;
+export declare const WORKING_SET_MAX_FRAME_BYTES = 4096;
+export declare const WORKING_SET_MAX_IDLE_TURNS = 3;
+export declare const WORKING_SET_STUB_MAX_BYTES = 192;
+export declare const WORKING_SET_MAX_ROOTS = 32;
+export declare const WORKING_SET_MAX_YOUNG_GEN = 64;
+export declare const WORKING_SET_MAX_STUBS = 128;
+export declare const WORKING_SET_MAX_TOOL_STUBS = 128;
+export declare const WORKING_SET_MAX_TOOL_DIGESTS = 128;
+export declare const WORKING_SET_MAX_EVENT_IDS = 128;
+export declare const WORKING_SET_MAX_INJECTION_KEYS = 128;
+export declare const WORKING_SET_MAX_ACTIVE_SESSION_BYTES = 1048576;
+export declare const TOOL_GC_INLINE_THRESHOLD_BYTES = 3072;
+export declare const TOOL_GC_HEAD_BYTES = 512;
+export declare const TOOL_GC_TAIL_BYTES = 512;
+export declare const TOOL_GC_STUB_MAX_BYTES = 512;
+export declare const WORKING_SET_SUMMARY_MAX_BYTES = 512;
+export declare const WORKING_SET_FRAME_OPEN = "[NeuroStrata Active Context]";
+export declare const WORKING_SET_FRAME_CLOSE = "[NeuroStrata End Active Context]";
+export type WorkingSetNodeKind = 'task_header' | 'golden_rule' | 'file' | 'symbol' | 'memory' | 'ast_summary' | 'conceptual_bridge' | 'recall_text';
+export type WorkingSetTier = 'Immortal' | 'PinnedRoot' | 'YoungGen' | 'EvictedStub';
+export type WorkingSetGcAction = 'retain_full' | 'promote_to_young_gen' | 'demote_to_stub' | 'retain_stub';
+export interface WorkingSetScope {
+    projectRoot: string;
+    projectId: string;
+    namespace: string;
+    sessionId: string;
+    epoch: number;
+}
+export interface WorkingSetTouch {
+    id: string;
+    kind: Exclude<WorkingSetNodeKind, 'recall_text'>;
+    path?: string;
+    symbol?: string;
+    memoryId?: string;
+}
+export interface WorkingSetExpansionRequest {
+    id: string;
+    expandTool: string;
+    input: Record<string, unknown>;
+}
+export interface WorkingSetNode {
+    id: string;
+    kind: WorkingSetNodeKind;
+    label: string;
+    summary: string;
+    governing_ids: string[];
+    byte_cost: number;
+    last_touched_turn: number;
+    expand_tool: string;
+    path?: string;
+    symbol?: string;
+    memory_type?: string;
+}
+export interface WorkingSetStub {
+    id: string;
+    kind: WorkingSetNodeKind;
+    pointer: string;
+    byte_cost: number;
+    last_touched_turn: number;
+    governing_ids: string[];
+    path?: string;
+    memory_type?: string;
+    sha256?: string;
+}
+export interface ToolOutputStub {
+    id: string;
+    tool_name: string;
+    rel_path: string;
+    sha256: string;
+    bytes: number;
+    epoch: number;
+    last_touched_turn: number;
+    governing_ids: string[];
+    pointer: string;
+    byte_cost: number;
+}
+export interface ToolOutputDigest {
+    id: string;
+    project_id: string;
+    path_key: string;
+    tool_name: string;
+    sha256: string;
+    bytes: number;
+    epoch: number;
+    last_touched_turn: number;
+    read_count: number;
+}
+export interface WorkingSetState {
+    version: 1;
+    project_id: string;
+    namespace: string;
+    session_id: string;
+    epoch: number;
+    turn_seq: number;
+    active_turn_id: string | null;
+    recent_event_ids: string[];
+    max_frame_bytes: 4096;
+    max_idle_turns: number;
+    used_frame_bytes: number;
+    frame_fingerprint: string;
+    last_injected_fingerprint: string;
+    roots: WorkingSetNode[];
+    young_gen: WorkingSetNode[];
+    evicted_stubs: WorkingSetStub[];
+    tool_output_stubs: ToolOutputStub[];
+    tool_output_digests: ToolOutputDigest[];
+}
+export interface ActiveSessionState {
+    namespace?: string;
+    session_id?: string;
+    task_id?: string;
+    status?: string;
+    golden_rules?: string[];
+    conceptual_bridges?: unknown[];
+    subagent_prompt_injection?: string;
+    claude_session_dirs?: Record<string, string>;
+    working_set?: WorkingSetState;
+    [key: string]: unknown;
+}
+export type WorkingSetExpansion = (request: WorkingSetExpansionRequest) => Promise<WorkingSetNode | WorkingSetStub | null>;
+/** Mirrors the first-match Rust/Lean working-set decision table exactly. */
+export declare function evaluateWorkingSetEviction(input: {
+    tier: WorkingSetTier;
+    turn_age: number;
+    max_idle_turns: number;
+    node_bytes: number;
+    projected_frame_bytes: number;
+    max_frame_bytes: number;
+    is_re_referenced: boolean;
+}): WorkingSetGcAction;
+/** Load and strictly validate the reconstructible local L1 cache. */
+export declare function loadWorkingSet(scopeInput: WorkingSetScope): Promise<WorkingSetState>;
+/** Merge only working_set into a valid parent session file, best effort. */
+export declare function persistWorkingSet(scopeInput: WorkingSetScope, stateInput: WorkingSetState): Promise<void>;
 export declare const READ_FILE_TOOLS: Set<string>;
 export declare const MUTATING_FILE_TOOLS: Set<string>;
 export declare const SHELL_TOOLS: Set<string>;
@@ -306,6 +440,61 @@ export declare const TOOL_CLASSIFICATION: {
 };
 export declare function isFileTouchTool(name: string): boolean;
 export declare function isMutatingTool(name: string): boolean;
+/** Apply TTL and deterministic pressure demotion without changing immortal nodes. */
+export declare function sweepWorkingSet(stateInput: WorkingSetState): WorkingSetState;
+/** Advance one deterministic turn, mark touches, and retry fitting page faults. */
+export declare function advanceWorkingSetTurn(stateInput: WorkingSetState, namespace: string, sessionId: string, projectRoot: string, touched: WorkingSetTouch[], expand: WorkingSetExpansion): Promise<WorkingSetState>;
+/** Pure size-based dehydration; duplicate history belongs to the scoped helper. */
+export declare function dehydrateToolOutput(rawText: string, toolName: string, filePath: string | null, governingIds: string[]): {
+    text: string;
+    dehydrated: boolean;
+    digest?: ToolOutputDigest;
+};
+/** Scoped duplicate-aware read dehydration with digest/stub pair persistence. */
+export declare function dehydrateRepeatedReadOutput(scopeInput: WorkingSetScope, rawText: string, toolName: string, filePath: string | null, governingIds: string[]): Promise<{
+    text: string;
+    dehydrated: boolean;
+    digest?: ToolOutputDigest;
+}>;
+/** Render one bounded, marker-safe frame; state nodes are never demoted here. */
+export declare function renderWorkingSetFrame(state: WorkingSetState, activeSession: Record<string, unknown>): {
+    text: string;
+    usedBytes: number;
+    fingerprint: string;
+};
+/** Upsert one mutable frame using context[], content, then additionalContext. */
+export declare function upsertWorkingSetFrame(sink: unknown, frame: string): boolean;
+/** Observe or advance one native turn, deduplicating native event/turn identity. */
+export declare function runWorkingSetTurnBoundary(scopeInput: WorkingSetScope, eventId?: string, turnId?: string): Promise<{
+    frame: string;
+    fingerprint: string;
+    changed: boolean;
+}>;
+/** Render current state without advancing turns or marking touches. */
+export declare function runWorkingSetContextCycle(scopeInput: WorkingSetScope, eventId?: string): Promise<{
+    frame: string;
+    fingerprint: string;
+    changed: boolean;
+}>;
+/** Mark deterministic file/symbol/memory touches without advancing the turn. */
+export declare function markWorkingSetTouches(scopeInput: WorkingSetScope, touched: WorkingSetTouch[], eventId?: string): Promise<void>;
+/** Shared tool cycle: observe touches, dehydrate text, and return one frame. */
+export declare function runWorkingSetToolCycle(input: {
+    scope: WorkingSetScope;
+    turnId?: string;
+    eventId?: string;
+    toolName: string;
+    toolInput: unknown;
+    rawText: string | null;
+    outputIsText: boolean;
+    isError: boolean;
+    advanceTurn: boolean;
+}): Promise<{
+    replacementText: string | null;
+    frame: string;
+    fingerprint: string;
+    dehydrated: boolean;
+}>;
 export declare function isReadOnlyInspectionTool(name: string): boolean;
 export declare function isSubagentTool(name: string): boolean;
 export declare function isCodeExecTool(name: string): boolean;
