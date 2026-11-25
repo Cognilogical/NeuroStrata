@@ -2934,4 +2934,86 @@ mod tests {
             resp.errors
         );
     }
+    #[test]
+    fn i8_edge_cursor_as_root_after_restarts_connection() {
+        let records = t3_numbered_records(3);
+        let edge_cursor = encode_cursor("edge", "m1:1");
+        let q = format!("{{ memories(after: \"{edge_cursor}\") {{ edges {{ node {{ id }} }} }} }}");
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin", &q, None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories"),
+            vec!["m1".to_string(), "m2".to_string(), "m3".to_string()],
+            "edge cursor as root after must restart the connection: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn i8_stray_text_variable_is_inert() {
+        let records = vec![
+            (
+                "db1".into(),
+                t3_payload(
+                    "database writes are batched",
+                    "fact",
+                    serde_json::json!({"valid_from": 200}),
+                ),
+            ),
+            (
+                "oth".into(),
+                t3_payload(
+                    "unrelated memory",
+                    "fact",
+                    serde_json::json!({"valid_from": 100}),
+                ),
+            ),
+        ];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ search { edges { node { id } } } }",
+            Some(&json!({"text": "database"})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let mut ids = t3_edge_ids(&resp, "search");
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["db1".to_string(), "oth".to_string()],
+            "unreferenced text variable must not filter search: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn i8_variable_first_clamp_forms() {
+        let records = t3_numbered_records(120);
+        let run = |n: serde_json::Value| {
+            execute_on_records(
+                &records,
+                &Default::default(),
+                "ns",
+                "admin",
+                "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+                Some(&json!({"n": n})),
+            )
+        };
+        let resp200 = run(json!(200));
+        assert_eq!(t3_edge_ids(&resp200, "memories").len(), 100);
+        assert!(
+            resp200
+                .errors
+                .iter()
+                .any(|e| e.message.contains("first clamped to 100")),
+            "expected clamp error for variable first=200, got: {:?}",
+            resp200.errors
+        );
+        let resp0 = run(json!(0));
+        assert_eq!(t3_edge_ids(&resp0, "memories").len(), 1);
+        let resp_neg = run(json!(-5));
+        assert_eq!(t3_edge_ids(&resp_neg, "memories").len(), 1);
+    }
 }
