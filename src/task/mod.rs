@@ -10163,16 +10163,23 @@ exit 0
     #[tokio::test]
     async fn task_get_labels_a_retired_or_archived_task() {
         let store = store_with_namespace("MyProj").await;
-        let expired = json!({ "valid_to": chrono::Utc::now().timestamp() - 60 });
-        let archived = json!({ "archived": true });
+        // Expired: valid_to in the past. Archived: through the real archive
+        // tool, so the label reads the tombstone archive_memory writes.
+        let expired = create_task(&store, "MyProj", "the old work", 2).await;
+        let (vector, mut payload) = store.get("MyProj", &expired).await.unwrap().unwrap();
+        payload.metadata["valid_to"] = json!(chrono::Utc::now().timestamp() - 60);
+        store.upsert("MyProj", &expired, vector, payload).await.unwrap();
+        let shelved = create_task(&store, "MyProj", "the shelved work", 2).await;
+        let archived = crate::handlers::archive_memory::archive_memory(
+            json!({ "namespace": "MyProj", "id": shelved }),
+            store.clone(),
+            Arc::new(crate::events::ThalamicBus::new(16)),
+        )
+        .await;
+        assert!(archived.is_archived(), "{archived}");
+
         let mut read = Vec::new();
-        for (title, fields) in [("the old work", expired), ("the shelved work", archived)] {
-            let id = create_task(&store, "MyProj", title, 2).await;
-            let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-            for (k, v) in fields.as_object().unwrap() {
-                payload.metadata[k] = v.clone();
-            }
-            store.upsert("MyProj", &id, vector, payload).await.unwrap();
+        for id in [&expired, &shelved] {
             let reply: Value = serde_json::from_str(
                 &handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store.clone()).await,
             )
