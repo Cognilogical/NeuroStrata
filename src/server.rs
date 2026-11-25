@@ -23845,7 +23845,8 @@ mod tests {
             .expect("seed the pinned rule");
 
         let proj_root = std::env::temp_dir().join(format!("ns-session-file-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&proj_root).unwrap();
+        // A `.NeuroStrata` folder marks a project; the session file is written only there.
+        std::fs::create_dir_all(proj_root.join(".NeuroStrata")).unwrap();
         let session_file = proj_root.join(".NeuroStrata").join("active_session.json");
         let read_session = || -> Value {
             serde_json::from_str(&std::fs::read_to_string(&session_file).expect("session file"))
@@ -24109,7 +24110,7 @@ mod tests {
     async fn a_late_cleanup_keeps_a_new_claim_of_the_same_task() {
         let (store, _) = store_with_one_rule("probe").await;
         let proj_root = std::env::temp_dir().join(format!("ns-session-reclaim-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&proj_root).unwrap();
+        std::fs::create_dir_all(proj_root.join(".NeuroStrata")).unwrap();
         let session_file = proj_root.join(".NeuroStrata").join("active_session.json");
         let read_session = || -> Value {
             serde_json::from_str(&std::fs::read_to_string(&session_file).expect("session file"))
