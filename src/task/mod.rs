@@ -741,12 +741,13 @@ pub(crate) async fn task_payload_without_retired_entries(
     }
     let mut lines: Vec<&str> = Vec::new();
     for (i, part) in kept.iter().enumerate() {
-        // The renderer writes the bridges header only above bridges, so a
-        // header whose bridges were all dropped goes too.
-        let bridges_left = kept
+        // A memory-entries or bridges header whose entries were all dropped
+        // goes too (the renderer writes the bridges header only above
+        // bridges).
+        let entries_left = kept
             .get(i + 1)
-            .is_some_and(|next| next.section == TaskBlockSection::Bridges && next.is_entry);
-        if part.is_header && part.section == TaskBlockSection::Bridges && !bridges_left {
+            .is_some_and(|next| next.section == part.section && next.is_entry);
+        if part.is_header && part.section != TaskBlockSection::Other && !entries_left {
             continue;
         }
         lines.extend(part.lines.iter().copied());
@@ -6282,6 +6283,32 @@ mod tests {
                 "- Mandatory Graph-First Lookup Rule: ...",
             ]
             .join("\n"))
+        );
+
+        // When every memory entry is dropped, its header goes with them.
+        let only_retired_entries = [
+            "- Namespace: `probe` | Task ID: `probe-t1` | Goal: Fix the deploy",
+            TASK_BLOCK_ENTRIES_HEADER,
+            "  - [GOLDEN rule] `rule-gone`: Use the old script.",
+            "  - [fact] `fact-gone` (memory): Expired fact.",
+            TASK_BLOCK_BRIDGES_HEADER,
+            "  - fact-live -> src/a.rs -> rule-live",
+            "- Mandatory Graph-First Lookup Rule: ...",
+        ]
+        .join("
+");
+        task.metadata["task"]["subagent_prompt_injection"] = json!(only_retired_entries);
+        let current = task_payload_without_retired_entries(&store, "probe", &task).await;
+        assert_eq!(
+            current.metadata["task"]["subagent_prompt_injection"],
+            json!([
+                "- Namespace: `probe` | Task ID: `probe-t1` | Goal: Fix the deploy",
+                TASK_BLOCK_BRIDGES_HEADER,
+                "  - fact-live -> src/a.rs -> rule-live",
+                "- Mandatory Graph-First Lookup Rule: ...",
+            ]
+            .join("
+"))
         );
 
         task.metadata["task"]["subagent_prompt_injection"] = json!(block);
