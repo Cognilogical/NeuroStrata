@@ -729,7 +729,7 @@ fn persist_active_session_file_with_home(
 
     if std::fs::create_dir_all(&ns_dir).is_ok() {
         if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
-            let _ = std::fs::write(&session_path, serialized);
+            let _ = harness_plugins::write_atomically(&session_path, &serialized);
         }
     }
 }
@@ -1009,7 +1009,7 @@ pub(crate) async fn clear_finished_task_from_session_file(
         }
         active.insert("updated_at".to_string(), json!(machine::timestamp()));
         if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
-            let _ = std::fs::write(&session_path, serialized);
+            let _ = harness_plugins::write_atomically(&session_path, &serialized);
         }
     }
 }
@@ -2471,6 +2471,9 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             );
         }
     }
+    // The worktree a stale holder claimed in; its session file still names
+    // the task under the old session until it is cleared after this claim.
+    let mut taken_over_worktree: Option<std::path::PathBuf> = None;
     match evaluate_claim_decision(k_status, same_session, age, gate::STALE_AFTER_SECS) {
         KernelClaimDecision::IdempotentSameSession => {
             // Legacy rows written before attribution existed keep the holder
@@ -2554,6 +2557,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
                 Ok(released) => task = released,
                 Err(e) => return format!("ERROR: {}", e),
             }
+            taken_over_worktree = task
+                .task_field("worktree")
+                .and_then(|v| v.as_str())
+                .filter(|w| !w.trim().is_empty())
+                .map(std::path::PathBuf::from);
             {
                 let obj = task_obj_mut(&mut task.payload);
                 obj.remove("assignee");
@@ -2657,6 +2665,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             None,
         )
         .await;
+    }
+    // After the new claim is written: a file there that names this task under
+    // the new session is kept.
+    if let Some(old) = taken_over_worktree {
+        clear_finished_task_from_session_file(&store, &namespace, &id, &[old]).await;
     }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("claim-{}", id))
@@ -10262,6 +10275,53 @@ exit 0
             "the release says why: {:?}",
             history[1]["note"]
         );
+    }
+
+    /// A takeover clears the old holder's session file, so a session started
+    /// there before its first snapshot is not told to work on the task.
+    #[tokio::test]
+    async fn a_takeover_clears_the_old_holders_session_file() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let git_dir = || {
+            let dir = tempfile::tempdir().unwrap();
+            let init = std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg(dir.path())
+                .status()
+                .unwrap();
+            assert!(init.success());
+            dir
+        };
+        let (old, new) = (git_dir(), git_dir());
+        let session = |dir: &tempfile::TempDir| -> serde_json::Value {
+            let path = dir.path().join(".NeuroStrata").join("active_session.json");
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let claim = |session_id: &str, dir: &tempfile::TempDir| {
+            handle_task_claim(
+                json!({
+                    "namespace": "MyProj", "id": id, "assignee": session_id,
+                    "session_id": session_id, "worktree": dir.path().to_string_lossy()
+                }),
+                store.clone(),
+            )
+        };
+        claim("ses_a", &old).await;
+        assert_eq!(session(&old)["task_id"], json!(id), "{}", session(&old));
+
+        // Age the claim past the staleness window.
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["task"]["updated_at"] = json!("2020-01-01T00:00:00Z");
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+
+        let takeover = claim("ses_b", &new).await;
+        assert!(takeover.contains("in_progress"), "{}", takeover);
+        assert_eq!(session(&new)["session_id"], json!("ses_b"), "{}", session(&new));
+        let old_file = session(&old);
+        assert!(old_file.get("task_id").is_none(), "{}", old_file);
+        assert_eq!(old_file["namespace"], json!("MyProj"), "{}", old_file);
     }
 
     #[tokio::test]
