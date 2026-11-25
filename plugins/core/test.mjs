@@ -3955,16 +3955,29 @@ export default { handleHookEvent };
           const { stdout, code: status } = results[i]
           assert.equal(status, code, `${what}: exit code`)
           const reply = JSON.parse(stdout)
+          // A deny carries exactly these fields: Codex rejects any other
+          // (such as `continue`) on PreToolUse.
           if (expected === 'top-level deny') {
+            assert.deepEqual(
+              Object.keys(reply).sort(),
+              ['permissionDecision', 'permissionDecisionReason'],
+              what
+            )
             assert.equal(reply.permissionDecision, 'deny', what)
-            assert.equal(reply.hookSpecificOutput, undefined, what)
             assert.match(
               reply.permissionDecisionReason,
               /^NeuroStrata hook runner failed: /,
               what
             )
           } else if (expected === 'deny') {
-            assert.equal(reply.hookSpecificOutput?.permissionDecision, 'deny', what)
+            assert.deepEqual(Object.keys(reply), ['hookSpecificOutput'], what)
+            assert.deepEqual(
+              Object.keys(reply.hookSpecificOutput).sort(),
+              ['hookEventName', 'permissionDecision', 'permissionDecisionReason'],
+              what
+            )
+            assert.equal(reply.hookSpecificOutput.hookEventName, 'PreToolUse', what)
+            assert.equal(reply.hookSpecificOutput.permissionDecision, 'deny', what)
           } else {
             const want = typeof expected === 'function' ? expected(runner.harness) : expected
             assert.deepEqual(reply, want, what)

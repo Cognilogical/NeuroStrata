@@ -5995,33 +5995,46 @@ export default {};
                 "{named:?} {copilot:?} {flags:?}"
             );
         }
-        // Copilot reads a top-level decision on preToolUse; the others read
-        // hookSpecificOutput.
-        let denies: [(Option<&str>, Option<&str>, &[&str], bool); 4] = [
-            (None, Some("preToolUse"), &["THROW"], true),
-            (None, Some("preToolUse"), &["THROW_EARLY"], true),
-            (Some("PreToolUse"), None, &["THROW"], false),
-            (None, None, &["THROW"], false),
+        // Copilot reads a top-level decision on preToolUse (with the package
+        // runners' reason); the others read hookSpecificOutput. A deny has
+        // no other field: Codex rejects one (such as `continue`) on
+        // PreToolUse.
+        let copilot_deny = |reason: &str| {
+            json!({
+                "permissionDecision": "deny",
+                "permissionDecisionReason": format!("NeuroStrata hook runner failed: {reason}")
+            })
+        };
+        let deny = json!({ "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Error: boom"
+        }});
+        let denies: [(Option<&str>, Option<&str>, &[&str], Value); 4] = [
+            (
+                None,
+                Some("preToolUse"),
+                &["THROW"],
+                copilot_deny("Error: boom"),
+            ),
+            (
+                None,
+                Some("preToolUse"),
+                &["THROW_EARLY"],
+                copilot_deny("Error: early"),
+            ),
+            (Some("PreToolUse"), None, &["THROW"], deny.clone()),
+            (None, None, &["THROW"], deny),
         ];
-        for (named, copilot, flags, top_level) in denies {
+        for (named, copilot, flags, expected) in denies {
             let Some((reply, status)) = run_installed_runner(named, copilot, flags) else {
                 return;
             };
-            assert_eq!(status, 0, "{reply}");
-            let decision = if top_level {
-                assert!(reply.get("hookSpecificOutput").is_none(), "{reply}");
-                // The same reason as the package runners' Copilot deny.
-                assert!(
-                    reply["permissionDecisionReason"]
-                        .as_str()
-                        .is_some_and(|r| r.starts_with("NeuroStrata hook runner failed: ")),
-                    "{reply}"
-                );
-                &reply["permissionDecision"]
-            } else {
-                &reply["hookSpecificOutput"]["permissionDecision"]
-            };
-            assert_eq!(decision, &json!("deny"), "{named:?} {copilot:?} {flags:?}");
+            assert_eq!(
+                (&reply, status),
+                (&expected, 0),
+                "{named:?} {copilot:?} {flags:?}"
+            );
         }
     }
 
