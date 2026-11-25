@@ -10116,11 +10116,53 @@ exit 0
         let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
         payload.metadata["task"]["status"] = json!("done");
         store.upsert("MyProj", &id, vector, payload).await.unwrap();
-        let reply = handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store.clone()).await;
-        assert!(reply.contains("\"status\": \"done\""), "{reply}");
+        let reply: Value = serde_json::from_str(
+            &handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store.clone()).await,
+        )
+        .expect("task_get replies with json");
+        assert_eq!(reply["task"]["status"], json!("done"), "{reply}");
+        assert!(reply["task"].get("retired").is_none(), "{reply}");
 
-        let missing = handle_task_get(json!({ "id": "myproj-zzzz", "namespace": "MyProj" }), store).await;
+        let rule_id = "myproj-rule";
+        store
+            .upsert(
+                "MyProj",
+                rule_id,
+                StubEmbedder.embed("a rule").await.unwrap(),
+                MemoryPayload {
+                    content: "a rule".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        let not_a_task =
+            handle_task_get(json!({ "id": rule_id, "namespace": "MyProj" }), store.clone()).await;
+        assert!(not_a_task.contains("is a rule memory, not a task"), "{not_a_task}");
+
+        let missing =
+            handle_task_get(json!({ "id": "myproj-zzzz", "namespace": "MyProj" }), store).await;
         assert!(missing.starts_with("ERROR: no task with id"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn task_get_labels_a_retired_task() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the old work", 2).await;
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["valid_to"] = json!(chrono::Utc::now().timestamp() - 60);
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+
+        let reply: Value = serde_json::from_str(
+            &handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store).await,
+        )
+        .expect("task_get replies with json");
+        assert_eq!(reply["task"]["retired"], json!(true), "{reply}");
     }
 
     #[tokio::test]
