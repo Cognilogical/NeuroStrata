@@ -2253,7 +2253,7 @@ export function sweepWorkingSet(stateInput) {
             if (wsDemote(state, candidate.node, collection))
                 charged = wsChargedBytes(state);
             if (charged >= before)
-                break;
+                continue;
         }
     }
     wsSortAndCap(state);
@@ -2588,7 +2588,7 @@ function wsRecallStub(state, block, memoryIds) {
                 kind: 'memory',
                 label: id,
                 summary: '',
-                governing_ids: [],
+                governing_ids: [id],
                 byte_cost: WORKING_SET_STUB_MAX_BYTES + 1,
                 last_touched_turn: state.turn_seq,
                 expand_tool: 'neurostrata_get_memory',
@@ -2978,19 +2978,23 @@ export async function runWorkingSetTurnBoundary(scopeInput, eventId, turnId) {
     const before = await loadWorkingSet(scope);
     const parent = wsActiveParent(scope);
     const state = before;
-    if (!wsRememberEvent(state, eventId))
+    if (!wsRememberEvent(state, eventId)) {
+        const rendered = renderWorkingSetFrame(state, parent);
         return {
-            frame: renderWorkingSetFrame(state, parent).text,
-            fingerprint: state.frame_fingerprint,
+            frame: rendered.text,
+            fingerprint: rendered.fingerprint,
             changed: false
         };
+    }
     const newTurn = !!turnId && wsText(turnId, 128) && turnId !== state.active_turn_id;
-    if (!newTurn && !eventId)
+    if (!newTurn && !eventId) {
+        const rendered = renderWorkingSetFrame(state, parent);
         return {
-            frame: renderWorkingSetFrame(state, parent).text,
-            fingerprint: state.frame_fingerprint,
+            frame: rendered.text,
+            fingerprint: rendered.fingerprint,
             changed: false
         };
+    }
     const advanced = await advanceWorkingSetTurn(state, scope.namespace, scope.sessionId, scope.projectRoot, [], wsExpansion);
     advanced.active_turn_id = newTurn ? turnId : advanced.active_turn_id;
     const final = wsFinalize(advanced, scope, parent);
@@ -4874,7 +4878,10 @@ const executeBeforeHandler = async (input) => {
         }
         for (const fp of inspection.queriedFiles) {
             try {
-                await prefetchMemoriesForFile(config.namespace, fp);
+                await prefetchMemoriesForFile(config.namespace, fp, {
+                    recordLedgerDir: config.projectRoot,
+                    projectRoot: config.projectRoot
+                });
             }
             catch {
                 // prefetch never blocks execution
@@ -4930,7 +4937,10 @@ const executeBeforeHandler = async (input) => {
         filePath = extractFilePath(args, altArgs, input?.input);
         if (filePath) {
             try {
-                snippets = await prefetchMemoriesForFile(config.namespace, filePath);
+                snippets = await prefetchMemoriesForFile(config.namespace, filePath, {
+                    recordLedgerDir: config.projectRoot,
+                    projectRoot: config.projectRoot
+                });
             }
             catch {
                 snippets = [];
@@ -5402,12 +5412,18 @@ function createOpenClawShim() {
         }
     }
     function parentSessionId(root) {
+        const canonical = canonicalRoot(root);
+        if (!canonical)
+            return null;
         try {
-            const stateDir = join(root, '.NeuroStrata');
+            const stateDir = join(canonical, '.NeuroStrata');
             const stateStat = lstatSync(stateDir);
             if (!stateStat.isDirectory() || stateStat.isSymbolicLink())
                 return null;
-            const path = join(stateDir, 'active_session.json');
+            const realStateDir = canonicalRoot(stateDir);
+            if (!realStateDir || realStateDir !== `${canonical}/.NeuroStrata`)
+                return null;
+            const path = join(realStateDir, 'active_session.json');
             const stat = lstatSync(path);
             if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1048576)
                 return null;

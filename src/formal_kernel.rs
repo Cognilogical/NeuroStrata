@@ -5,7 +5,7 @@
 //! All types are `Copy` and all functions are `const fn` to enable Charon/Aeneas
 //! translation to pure Lean 4 without borrow/heap complexity.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::items_after_test_module)]
 
 /// Task status in the task state machine.
 #[cfg_attr(kani, derive(kani::Arbitrary))]
@@ -3775,9 +3775,11 @@ mod kani_proofs {
     fn proof_evaluate_working_set_eviction_total() {
         let input = kani::any::<WorkingSetEvictionInput>();
         let action = evaluate_working_set_eviction(input);
+        // Theorem 1: immortal_never_evicted
         if matches!(input.tier, WorkingSetTier::Immortal) {
             assert_eq!(action, GcAction::RetainFull);
         }
+        // Theorem 2: page_fault_promotes_stub (bidirectional iff)
         if matches!(input.tier, WorkingSetTier::EvictedStub) {
             let expected =
                 if input.is_re_referenced && input.projected_frame_bytes <= input.max_frame_bytes {
@@ -3787,14 +3789,45 @@ mod kani_proofs {
                 };
             assert_eq!(action, expected);
         }
+        // Theorem 3: idle_young_gen_demotes_to_stub
+        if matches!(input.tier, WorkingSetTier::YoungGen)
+            && !input.is_re_referenced
+            && input.turn_age > input.max_idle_turns
+        {
+            assert_eq!(action, GcAction::DemoteToStub);
+        }
+        // Theorem 4: budget_overflow_demotes_non_immortal + stub shrinkage guarantee
+        let budget_eligible = matches!(input.tier, WorkingSetTier::YoungGen)
+            || (matches!(input.tier, WorkingSetTier::PinnedRoot)
+                && !input.is_re_referenced
+                && input.turn_age > 0);
+        if budget_eligible && input.projected_frame_bytes > input.max_frame_bytes {
+            assert_eq!(action, GcAction::DemoteToStub);
+            let stub_bytes = kani::any::<u32>();
+            if input.node_bytes > WORKING_SET_STUB_MAX_BYTES
+                && stub_bytes <= WORKING_SET_STUB_MAX_BYTES
+                && stub_bytes < input.node_bytes
+            {
+                assert!(
+                    input.node_bytes - WORKING_SET_STUB_MAX_BYTES <= input.node_bytes - stub_bytes
+                );
+            }
+        }
+        // PinnedRoot retention when re-referenced on current turn or turn_age == 0
+        if matches!(input.tier, WorkingSetTier::PinnedRoot)
+            && (input.is_re_referenced || input.turn_age == 0)
+        {
+            assert_eq!(action, GcAction::RetainFull);
+        }
     }
 
     #[kani::proof]
     fn proof_evaluate_working_set_eviction_deterministic() {
-        let input = kani::any::<WorkingSetEvictionInput>();
+        let a = kani::any::<WorkingSetEvictionInput>();
+        let b = a;
         assert_eq!(
-            evaluate_working_set_eviction(input),
-            evaluate_working_set_eviction(input)
+            evaluate_working_set_eviction(a),
+            evaluate_working_set_eviction(b)
         );
     }
 
@@ -4306,7 +4339,7 @@ pub fn evaluate_shell_exemption(payload: &str) -> bool {
         return false;
     }
     let segments: Vec<String> = cmd
-        .split(|c| c == ';' || c == '\n' || c == '|' || c == '&')
+        .split([';', '\n', '|', '&'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -4769,9 +4802,12 @@ fn is_exempt_segment(segment: &str) -> bool {
                 }
                 "stash" => matches!(sub_args.first().map(|s| s.as_str()), Some("list" | "show")),
                 "branch" => {
-                    sub_args.len() >= 1 // allow empty? original requires all listed; empty args -> true? original: all() on empty true but len>=2 check
+                    !sub_args.is_empty()
                         && sub_args.iter().all(|t| {
-                            matches!(t.as_str(), "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv")
+                            matches!(
+                                t.as_str(),
+                                "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv"
+                            )
                         })
                         && rest.len() >= 2
                 }

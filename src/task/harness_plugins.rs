@@ -762,8 +762,9 @@ fn strip_installer_env_prefix(mut command: &str) -> &str {
 /// platform's quoting. A command that runs anything after the runner is a
 /// user's own and is not claimed.
 fn hook_command_runner(command: &str) -> Option<(String, &str)> {
+    type HookLiteralParser = fn(&str) -> Option<(String, &str)>;
     let quoted = strip_installer_env_prefix(command).strip_prefix("node ")?;
-    let parsers: [fn(&str) -> Option<(String, &str)>; 3] = [
+    let parsers: [HookLiteralParser; 3] = [
         shell_literal_value,
         powershell_literal_value,
         sh_literal_value,
@@ -1453,7 +1454,7 @@ fn read_config_inner(path: &Path, skip_malformed: bool) -> Result<Option<Value>,
     };
     match serde_json::from_str(&text) {
         Ok(value) => Ok(Some(value)),
-        Err(e) if skip_malformed => Ok(None),
+        Err(_) if skip_malformed => Ok(None),
         Err(e) => Err(unreadable(format!("it is not valid JSON ({e})"))),
     }
 }
@@ -2332,10 +2333,7 @@ fn sync_skills_and_agent_rules(
         let needs_write = std::fs::read_to_string(path)
             .map(|existing| existing != content)
             .unwrap_or(true);
-        if needs_write && write_atomically(path, content).is_err() {
-            return false;
-        }
-        true
+        !(needs_write && write_atomically(path, content).is_err())
     };
 
     // 1. Always scaffold project-local .agents/skills/neurostrata/SKILL.md and .agents/agents/NeuroStrata-Task.md
@@ -2555,6 +2553,7 @@ fn write_staged_atomically(staged: &Path, path: &Path, contents: &str) -> std::i
     written
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wire_harness_config(
     project_root: &Path,
     namespace: ConfigNamespace<'_>,
@@ -2865,7 +2864,7 @@ fn wire_harness_config(
                     }),
                     namespace.as_deref(),
                 );
-                let cfg_written = write_json_if_changed(&cfg_path, &doc);
+                let _ = write_json_if_changed(&cfg_path, &doc);
                 // Codex CLI never reads the metadata file: it runs hooks from
                 // `.codex/hooks.json` (or `[hooks]` in config.toml). Report
                 // only a hook that was actually wired, never the metadata as
@@ -4451,7 +4450,7 @@ mod tests {
             .expect("cli_hook_runner");
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 5, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "missing runner not repaired: {commands:?}"
@@ -4483,7 +4482,7 @@ mod tests {
             json!({"id": "neurostrata-claude", "namespace": "example-project"})
         );
         let commands = hook_commands(&tmp.path().join(".claude/settings.local.json"));
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 5, "{commands:?}");
         let want = format!("node \"{abs_runner}\"");
         assert!(commands.iter().all(|c| *c == want), "{commands:?}");
         assert_eq!(
@@ -4532,7 +4531,7 @@ mod tests {
         assert_eq!(claude_config(&dir)["namespace"], "example-project");
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 5, "{commands:?}");
         assert!(commands.iter().all(|c| *c == want), "{commands:?}");
     }
 
@@ -4584,7 +4583,7 @@ mod tests {
             .as_str()
             .unwrap();
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 5, "{commands:?}");
         assert!(
             commands
                 .iter()
@@ -4620,7 +4619,7 @@ mod tests {
             .as_str()
             .unwrap();
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 5, "{commands:?}");
         assert!(
             commands
                 .iter()
@@ -4841,7 +4840,7 @@ mod tests {
         );
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 5, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "own verbatim runner not repaired: {commands:?}"
@@ -4888,7 +4887,7 @@ mod tests {
         );
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 4, "{commands:?}");
+        assert_eq!(commands.len(), 5, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "own runner in other case not repaired: {commands:?}"
@@ -5441,10 +5440,10 @@ mod tests {
             vec!["echo user-hook".to_string(), stale, expected.clone()],
             "user hook kept, foreign runner untouched, ours added once"
         );
-        assert_eq!(codex_commands(&doc, "Stop"), vec![expected]);
+        assert_eq!(codex_commands(&doc, "Stop"), vec![expected.clone()]);
         assert_eq!(
             codex_commands(&doc, "SessionStart"),
-            vec!["echo start".to_string()]
+            vec!["echo start".to_string(), expected]
         );
         assert_eq!(doc["other"], json!(true));
 

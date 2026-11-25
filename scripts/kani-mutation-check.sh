@@ -87,6 +87,10 @@ check digest-order proof_evaluate_connector_post_gate_total \
 check epoch-swap proof_epoch_gate_total \
     's/KernelEpochDecision::QuarantineOld\s*\} else \{\s*KernelEpochDecision::RefuseFuture/KernelEpochDecision::RefuseFuture\n    } else {\n        KernelEpochDecision::QuarantineOld/'
 
+# I: break working-set eviction (allow Immortal tier to demote).
+check ws-eviction proof_evaluate_working_set_eviction_total \
+    's/WorkingSetTier::Immortal => GcAction::RetainFull,/WorkingSetTier::Immortal => GcAction::DemoteToStub,/'
+
 if [ "$failures" -ne 0 ]; then
     echo "kani mutation check: $failures failure(s)" >&2
     exit 1

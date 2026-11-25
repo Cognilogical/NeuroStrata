@@ -1776,6 +1776,10 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         "CERT_FULL|1|true|[255:2:true]|true|unknown_rule",
         "CERT_HASH|42|42|valid",
         "CERT_HASH|42|99|mismatch",
+        "WORKING_SET_GC|Immortal|4|3|256|4097|4096|false|retain_full",
+        "WORKING_SET_GC|EvictedStub|4|3|256|4096|4096|true|promote_to_young_gen",
+        "WORKING_SET_GC|YoungGen|4|3|256|0|4096|false|demote_to_stub",
+        "WORKING_SET_GC|PinnedRoot|1|3|256|4097|4096|false|demote_to_stub",
     ] {
         assert!(
             rust_lines.iter().any(|l| l == expected),

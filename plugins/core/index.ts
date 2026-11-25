@@ -2794,7 +2794,7 @@ export function sweepWorkingSet(stateInput: WorkingSetState): WorkingSetState {
       const before = charged
       if (wsDemote(state, candidate.node, collection))
         charged = wsChargedBytes(state)
-      if (charged >= before) break
+      if (charged >= before) continue
     }
   }
   wsSortAndCap(state)
@@ -3206,7 +3206,7 @@ function wsRecallStub(
         kind: 'memory',
         label: id,
         summary: '',
-        governing_ids: [],
+        governing_ids: [id],
         byte_cost: WORKING_SET_STUB_MAX_BYTES + 1,
         last_touched_turn: state.turn_seq,
         expand_tool: 'neurostrata_get_memory',
@@ -3673,20 +3673,24 @@ export async function runWorkingSetTurnBoundary(
   const before = await loadWorkingSet(scope)
   const parent = wsActiveParent(scope)
   const state = before
-  if (!wsRememberEvent(state, eventId))
+  if (!wsRememberEvent(state, eventId)) {
+    const rendered = renderWorkingSetFrame(state, parent)
     return {
-      frame: renderWorkingSetFrame(state, parent).text,
-      fingerprint: state.frame_fingerprint,
+      frame: rendered.text,
+      fingerprint: rendered.fingerprint,
       changed: false
     }
+  }
   const newTurn =
     !!turnId && wsText(turnId, 128) && turnId !== state.active_turn_id
-  if (!newTurn && !eventId)
+  if (!newTurn && !eventId) {
+    const rendered = renderWorkingSetFrame(state, parent)
     return {
-      frame: renderWorkingSetFrame(state, parent).text,
-      fingerprint: state.frame_fingerprint,
+      frame: rendered.text,
+      fingerprint: rendered.fingerprint,
       changed: false
     }
+  }
   const advanced = await advanceWorkingSetTurn(
     state,
     scope.namespace,
@@ -5926,7 +5930,10 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
     }
     for (const fp of inspection.queriedFiles) {
       try {
-        await prefetchMemoriesForFile(config.namespace, fp)
+        await prefetchMemoriesForFile(config.namespace, fp, {
+          recordLedgerDir: config.projectRoot,
+          projectRoot: config.projectRoot
+        })
       } catch {
         // prefetch never blocks execution
       }
@@ -5994,7 +6001,10 @@ const executeBeforeHandler = async (input: any): Promise<any> => {
     filePath = extractFilePath(args, altArgs, input?.input)
     if (filePath) {
       try {
-        snippets = await prefetchMemoriesForFile(config.namespace, filePath)
+        snippets = await prefetchMemoriesForFile(config.namespace, filePath, {
+          recordLedgerDir: config.projectRoot,
+          projectRoot: config.projectRoot
+        })
       } catch {
         snippets = []
       }

@@ -1,3 +1,9 @@
+/-!
+  Mechanized L1 Working-Set Garbage Collector eviction precedence theorems,
+  paired with Kani symbolic model checking harnesses
+  `proof_evaluate_working_set_eviction_total` and
+  `proof_evaluate_working_set_eviction_deterministic` in `src/formal_kernel.rs`.
+-/
 namespace NeuroStrata.WorkingSetGc
 
 def workingSetMaxFrameBytes : Nat := 4096

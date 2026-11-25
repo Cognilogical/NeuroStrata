@@ -118,11 +118,16 @@ function createOpenClawShim() {
   }
 
   function parentSessionId(root: string): string | null {
+    const canonical = canonicalRoot(root)
+    if (!canonical) return null
     try {
-      const stateDir = join(root, '.NeuroStrata')
+      const stateDir = join(canonical, '.NeuroStrata')
       const stateStat = lstatSync(stateDir)
       if (!stateStat.isDirectory() || stateStat.isSymbolicLink()) return null
-      const path = join(stateDir, 'active_session.json')
+      const realStateDir = canonicalRoot(stateDir)
+      if (!realStateDir || realStateDir !== `${canonical}/.NeuroStrata`)
+        return null
+      const path = join(realStateDir, 'active_session.json')
       const stat = lstatSync(path)
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1048576)
         return null
