@@ -5390,19 +5390,89 @@ export function extractDaemonMemoryAdvisory(
   ].join(' ')
 }
 
+const WS_RECALL_EXCLUDED_HEADINGS = new Set([
+  'AST',
+  'Governing',
+  'File',
+  'Active',
+  'End',
+  'Plugin',
+  'Working',
+  'GC',
+  'Tool'
+])
+
+function isAsciiRecallKind(kind: string): boolean {
+  if (!kind || WS_RECALL_EXCLUDED_HEADINGS.has(kind)) return false
+  const first = kind.charCodeAt(0)
+  const firstAlpha =
+    (first >= 65 && first <= 90) || (first >= 97 && first <= 122)
+  if (!firstAlpha) return false
+  for (let i = 1; i < kind.length; i++) {
+    const code = kind.charCodeAt(i)
+    const ok =
+      (code >= 65 && code <= 90) ||
+      (code >= 97 && code <= 122) ||
+      (code >= 48 && code <= 57) ||
+      code === 95 ||
+      code === 45
+    if (!ok) return false
+  }
+  return true
+}
+
+function splitFirstToken(input: string): [string, string] {
+  const trimmed = input.trim()
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed.charCodeAt(i)
+    if (ch === 32 || ch === 9 || ch === 10 || ch === 13) {
+      return [trimmed.slice(0, i), trimmed.slice(i + 1).trim()]
+    }
+  }
+  return [trimmed, '']
+}
+
 export function wsRecallMemoryIds(block: string): string[] {
   const ids: string[] = []
-  for (const match of block.matchAll(
-    /\[NeuroStrata\s+(?!(?:AST|Governing|File|Active|End|Plugin|Working|GC|Tool)\b)(?:Golden\s+Rule|([A-Za-z][\w-]*))\s+([^\]]+)\]/gu
-  )) {
-    const raw = match[2]
-      .trim()
-      .replace(/\s*\(valid_from\s*[^)]*\)\s*$/u, '')
-      .trim()
-    if (!raw || raw === 'Manifest' || raw.includes('—') || raw.includes('|'))
+  const prefix = '[NeuroStrata'
+  let cursor = 0
+  while (cursor < block.length) {
+    const open = block.indexOf(prefix, cursor)
+    if (open < 0) break
+    const afterPrefix = open + prefix.length
+    const nextChar = block.charCodeAt(afterPrefix)
+    if (nextChar !== 32 && nextChar !== 9) {
+      cursor = afterPrefix
       continue
-    const memId = raw.split(/\s+/)[0] ?? raw
-    if (memId) ids.push(memId)
+    }
+    const close = block.indexOf(']', afterPrefix + 1)
+    if (close < 0) break
+    const newline = block.indexOf('\n', afterPrefix + 1)
+    if (newline >= 0 && newline < close) {
+      cursor = newline + 1
+      continue
+    }
+    const inner = block.slice(afterPrefix + 1, close).trim()
+    cursor = close + 1
+    if (!inner || inner.includes('—') || inner.includes('|')) continue
+    const [firstToken, afterFirst] = splitFirstToken(inner)
+    let rest = ''
+    if (firstToken === 'Golden') {
+      const [secondToken, afterSecond] = splitFirstToken(afterFirst)
+      if (secondToken !== 'Rule') continue
+      rest = afterSecond
+    } else if (isAsciiRecallKind(firstToken)) {
+      rest = afterFirst
+    } else {
+      continue
+    }
+    const validFromIdx = rest.indexOf('(valid_from')
+    if (validFromIdx >= 0) {
+      rest = rest.slice(0, validFromIdx).trim()
+    }
+    if (!rest || rest === 'Manifest') continue
+    const [memId] = splitFirstToken(rest)
+    if (memId && !memId.startsWith('(')) ids.push(memId)
   }
   return [...new Set(ids)].slice(0, 8)
 }

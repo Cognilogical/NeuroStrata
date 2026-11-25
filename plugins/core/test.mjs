@@ -7572,6 +7572,11 @@ describe('PR #435 regression tests', () => {
       !ids.includes('Governing'),
       'must not extract "Governing" as a memory ID'
     )
+    const pathological = `[NeuroStrata${'  '.repeat(5000)}rule${'  '.repeat(5000)}mem-999 ${'(valid_from '.repeat(2000)}${' '.repeat(5000)}]`
+    const t0 = performance.now()
+    const pathIds = wsRecallMemoryIds(pathological)
+    assert.deepEqual(pathIds, ['mem-999'])
+    assert.ok(performance.now() - t0 < 50)
   })
 
   it('upsertWorkingSetFrame linearly strips pathological repeated Active Context prefixes without regex backtracking', () => {
