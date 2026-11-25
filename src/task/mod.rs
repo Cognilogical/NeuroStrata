@@ -124,6 +124,26 @@ fn check_title(title: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Caller text a task stores and returns to later sessions (title,
+/// description, note, close reason) with each secret replaced by
+/// `[REDACTED:<category>]`; the categories are added to `found`. Task text is
+/// kept rather than refused, since a note written at session end has no one
+/// to fix a rejected call.
+fn redact_into(text: &str, found: &mut Vec<&'static str>) -> String {
+    let (scrubbed, categories) = crate::secrets::redact(text);
+    found.extend(categories);
+    scrubbed
+}
+
+/// The `redactions` reply field: one `{"category": ...}` per secret replaced,
+/// empty when none. Never the secret itself.
+fn redactions_json(found: &[&'static str]) -> Value {
+    json!(found
+        .iter()
+        .map(|category| json!({ "category": category }))
+        .collect::<Vec<_>>())
+}
+
 const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 /// How many fresh suffixes to try before declaring a collision problem.
 const ID_ATTEMPTS: usize = 64;
@@ -2288,8 +2308,9 @@ pub async fn handle_task_create(
         Ok(n) => n,
         Err(e) => return e,
     };
+    let mut redactions = Vec::new();
     let title = match arg_str(&args, "title") {
-        Some(t) => match check_title(t) {
+        Some(t) => match check_title(&redact_into(t, &mut redactions)) {
             Ok(v) => v,
             Err(e) => return e,
         },
@@ -2351,7 +2372,7 @@ pub async fn handle_task_create(
         Err(e) => return e,
     };
     let description = arg_str(&args, "description")
-        .map(|s| s.to_string())
+        .map(|s| redact_into(s, &mut redactions))
         .filter(|s| !s.is_empty());
     let parent_id = arg_str(&args, "parent_id").map(|s| s.to_string());
     let user_id = arg_str(&args, "user_id").unwrap_or("unknown").to_string();
@@ -2439,6 +2460,7 @@ pub async fn handle_task_create(
                 "task": task_summary(&id, &payload),
                 "auto_retrieved_context": hits_json,
                 "subagent_prompt_injection": subagent_prompt,
+                "redactions": redactions_json(&redactions),
             }))
         }
         Err(e) => e,
@@ -2859,21 +2881,19 @@ pub async fn handle_task_update(
             }
         },
     };
-    // A note is never refused (a handoff must not be lost): add_memory's
-    // secret scanner finds each secret and the note is stored with it
-    // replaced by `[REDACTED:<category>]`. The reply names the categories.
-    let (note, note_redactions) = match arg_str(&args, "note") {
-        Some(raw) => {
-            let (scrubbed, found) = crate::secrets::redact(raw);
-            (Some(scrubbed), found)
-        }
-        None => (None, Vec::new()),
-    };
+    // A note is never refused (a handoff must not be lost): it is stored
+    // with each secret replaced (`redact_into`), and so is a new title. The
+    // reply names the categories.
+    let mut redactions = Vec::new();
+    let note = arg_str(&args, "note").map(|raw| redact_into(raw, &mut redactions));
     // The title is the task's content (section 1.1), so renaming it means
     // rewriting content AND re-embedding: a title is what search_memory reads.
     let new_title = match args.get("title") {
         None => None,
-        Some(_) => match check_title(arg_str(&args, "title").unwrap_or_default()) {
+        Some(_) => match check_title(&redact_into(
+            arg_str(&args, "title").unwrap_or_default(),
+            &mut redactions,
+        )) {
             Ok(t) => Some(t),
             Err(e) => return e,
         },
@@ -3121,12 +3141,7 @@ pub async fn handle_task_update(
         "task": task_summary(&id, &task.payload),
         "graph_queries_count": graph_queries_count,
         "graph_lookup_nudge": Value::Null,
-        // One entry per secret replaced in the note, by the scanner's finding
-        // type; empty when none. Never the secret itself.
-        "redactions": note_redactions
-            .iter()
-            .map(|category| json!({ "category": category }))
-            .collect::<Vec<_>>(),
+        "redactions": redactions_json(&redactions),
     }))
 }
 
@@ -3329,10 +3344,15 @@ pub async fn handle_task_complete(
         ));
     }
 
-    let reason = arg_str(&args, "reason")
-        .or_else(|| arg_str(&args, "close_reason"))
-        .unwrap_or("")
-        .to_string();
+    // The close reason and follow-up task texts are stored and returned like
+    // notes, so each secret in them is replaced, never stored.
+    let mut redactions = Vec::new();
+    let reason = redact_into(
+        arg_str(&args, "reason")
+            .or_else(|| arg_str(&args, "close_reason"))
+            .unwrap_or(""),
+        &mut redactions,
+    );
     let link_memory_id = arg_str(&args, "link_memory_id").map(|s| s.to_string());
     let memory = args.get("memory").cloned();
 
@@ -3384,7 +3404,7 @@ pub async fn handle_task_complete(
                     return Err(format!("ERROR: follow_up_tasks[{}] must be an object.", i));
                 }
                 let title = match item.get("title").and_then(|t| t.as_str()) {
-                    Some(t) => match check_title(t) {
+                    Some(t) => match check_title(&redact_into(t, &mut redactions)) {
                         Ok(v) => v,
                         Err(e) => {
                             return Err(format!("ERROR: follow_up_tasks[{}].title: {}", i, e))
@@ -3400,7 +3420,7 @@ pub async fn handle_task_complete(
                 let description = item
                     .get("description")
                     .and_then(|s| s.as_str())
-                    .map(|s| s.to_string())
+                    .map(|s| redact_into(s, &mut redactions))
                     .filter(|s| !s.is_empty());
                 let task_type = match item.get("task_type").and_then(|t| t.as_str()) {
                     None => "task".to_string(),
@@ -3897,6 +3917,7 @@ pub async fn handle_task_complete(
         "follow_up_tasks_created": follow_up_created_ids,
         "task_intent_signals": signals,
         "transition": { "from": task.status().as_str(), "to": "done" },
+        "redactions": redactions_json(&redactions),
     });
     reply["learning_hook"] = serde_json::to_value(&learning_report)
         .unwrap_or_else(|_| json!({ "errors": ["serialize learning hook report"] }));
@@ -10430,6 +10451,96 @@ exit 0
         let parsed: Value = serde_json::from_str(&reply).expect("json reply");
         assert_eq!(parsed["redactions"], json!([]));
         assert!(history().await.contains("Handoff: run the suite"));
+    }
+
+    /// Every task text a later session reads back is scrubbed the same way as
+    /// a note: the title and description on create and rename, and the close
+    /// reason and follow-up tasks on complete.
+    #[tokio::test]
+    async fn task_titles_descriptions_and_close_reasons_are_stored_redacted() {
+        let store = store_with_namespace("MyProj").await;
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let stored = |id: String| {
+            let store = store.clone();
+            async move {
+                let (_, p) = store.get("MyProj", &id).await.unwrap().unwrap();
+                format!("{} {}", p.content, p.metadata)
+            }
+        };
+
+        let reply = handle_task_create(
+            json!({
+                "namespace": "MyProj",
+                "title": format!("rotate {key}"),
+                "description": "then set password=hunter22 everywhere",
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.contains(key) && !reply.contains("hunter22"), "{reply}");
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(
+            parsed["redactions"],
+            json!([{ "category": "github_pat" }, { "category": "password" }])
+        );
+        let id = parsed["id"].as_str().unwrap().to_string();
+        let row = stored(id.clone()).await;
+        assert!(!row.contains(key) && !row.contains("hunter22"), "{row}");
+        assert!(row.contains("rotate [REDACTED:github_pat]"), "{row}");
+
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "title": format!("rotate {key} now") }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.contains(key), "{reply}");
+        assert!(!stored(id.clone()).await.contains(key));
+
+        claim(&store, &id).await;
+        let mem_id = uuid::Uuid::new_v4().to_string();
+        let vector = StubEmbedder.embed("the lesson").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &mem_id,
+                vector,
+                MemoryPayload {
+                    content: "the lesson".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "extracted_from": [id.as_str()] }),
+                },
+            )
+            .await
+            .unwrap();
+        let reply = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "reason": "rotated, old password=hunter22",
+                "follow_up_tasks": [{ "title": "audit", "description": format!("check {key}") }],
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect("completes");
+        assert!(!reply.contains(key) && !reply.contains("hunter22"), "{reply}");
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(
+            parsed["redactions"],
+            json!([{ "category": "password" }, { "category": "github_pat" }])
+        );
+        assert!(!stored(id.clone()).await.contains("hunter22"));
+        let follow_up = parsed["follow_up_tasks_created"][0].as_str().unwrap().to_string();
+        assert!(!stored(follow_up).await.contains(key));
     }
 
     #[test]

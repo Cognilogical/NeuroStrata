@@ -462,7 +462,7 @@ impl SecretScanner {
             if meets_high_entropy(token) {
                 return Some((
                     "high_entropy_secret",
-                    cap.get(1).map_or(0..0, |m| m.range()),
+                    cap.get(1).map_or(0..0, |m| whole_value_span(text, m.range())),
                 ));
             }
         }
@@ -517,7 +517,10 @@ impl SecretScanner {
                     .chars()
                     .all(|c| c == value.chars().next().unwrap_or('x'))
             {
-                return Some(("password", cap.get(2).map_or(0..0, |m| m.range())));
+                return Some((
+                    "password",
+                    cap.get(2).map_or(0..0, |m| whole_value_span(text, m.range())),
+                ));
             }
         }
 
@@ -701,6 +704,21 @@ fn shannon_entropy_bits_per_char(s: &str) -> Option<f64> {
 
 /// Whether the (lowercased) text matches known placeholder/documentation
 /// fixture patterns and should not be treated as a secret.
+/// The whole value an assignment pattern matched the start of. The patterns
+/// stop at characters such as `;`, `,`, `}` or `/` even inside quotes, so
+/// redacting only the match would keep the rest of the secret: a quoted value
+/// runs to its closing quote (or the end of the line), an unquoted one to the
+/// next whitespace.
+fn whole_value_span(text: &str, matched: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let after = &text[matched.end..];
+    let line_end = after.find(['\n', '\r']).unwrap_or(after.len());
+    let end = match text[..matched.start].chars().last() {
+        Some(quote @ ('"' | '\'')) => after[..line_end].find(quote).unwrap_or(line_end),
+        _ => after.find(char::is_whitespace).unwrap_or(after.len()),
+    };
+    matched.start..matched.end + end
+}
+
 fn is_placeholder(lower: &str) -> bool {
     let trimmed = lower.trim();
     // Empty or near-empty.
@@ -849,10 +867,12 @@ const REDACTION_CATEGORIES: &[&str] = &[
     "provider_token",
     "high_entropy_secret",
     "password",
+    "truncated",
 ];
 
-/// Upper bound on secrets replaced in one text, so a pathological input
-/// cannot loop for long.
+/// Upper bound on secrets replaced one by one in a text, so a pathological
+/// input cannot loop for long. Past it, the rest of the text from the next
+/// secret on is replaced by one `[REDACTED:truncated]`, never kept unscanned.
 const MAX_REDACTIONS: usize = 256;
 
 /// Replaces every secret the scanner finds in `text` with
@@ -876,12 +896,14 @@ pub fn redact(text: &str) -> (String, Vec<&'static str>) {
             }
         }
         let mut block = rest[..end].to_string();
-        while found.len() < MAX_REDACTIONS {
-            let Some((category, span)) = scanner.find_first(&block) else {
-                break;
-            };
-            if span.is_empty() {
-                break;
+        while let Some((category, span)) = scanner.find_first(&block) {
+            if span.is_empty() || found.len() >= MAX_REDACTIONS {
+                // Nothing after this point is kept unscanned.
+                block.truncate(span.start);
+                block.push_str("[REDACTED:truncated]");
+                found.push("truncated");
+                out.push_str(&block);
+                return (out, found);
             }
             block.replace_range(span, &format!("[REDACTED:{category}]"));
             found.push(category);
@@ -1302,6 +1324,43 @@ mod tests {
             redact("run the suite, then push"),
             ("run the suite, then push".to_string(), vec![])
         );
+    }
+
+    /// The value patterns stop at `;`, `,`, `}`, `]` or `/`, so `redact`
+    /// replaces the whole value: a quoted one up to its closing quote, an
+    /// unquoted one up to the next whitespace. No part of it is kept.
+    #[test]
+    fn redact_replaces_the_whole_value_not_only_the_matched_start() {
+        for (text, kept) in [
+            (r#"set password="abcd;efgh ij" now"#, r#"set password="[REDACTED:password]" now"#),
+            ("set password='wxyz,12}' now", "set password='[REDACTED:password]' now"),
+            ("set password=abcd;efgh now", "set password=[REDACTED:password] now"),
+        ] {
+            let (scrubbed, found) = redact(text);
+            assert_eq!(scrubbed, kept, "{text}");
+            assert_eq!(found, vec!["password"], "{text}");
+            assert_eq!(redact(&scrubbed), (scrubbed.clone(), vec![]), "{text}");
+        }
+        let secret = "Zq8vR2mXw4Lp9Tn6Ks3Hd7Fb";
+        let (scrubbed, found) = redact(&format!("api_key={secret}/Yc5Gj1Qa"));
+        assert_eq!(found, vec!["high_entropy_secret"]);
+        assert_eq!(scrubbed, "api_key=[REDACTED:high_entropy_secret]");
+    }
+
+    /// Past the replacement cap, the rest of the text from the next secret on
+    /// becomes one `[REDACTED:truncated]`: nothing is kept unscanned.
+    #[test]
+    fn redact_past_the_cap_truncates_instead_of_keeping_secrets() {
+        let text = (0..MAX_REDACTIONS + 3)
+            .map(|i| format!("password=hunter{i:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (scrubbed, found) = redact(&text);
+        assert_eq!(found.len(), MAX_REDACTIONS + 1);
+        assert_eq!(found.last(), Some(&"truncated"));
+        assert!(scrubbed.ends_with("password=[REDACTED:truncated]"), "{}", &scrubbed[scrubbed.len() - 80..]);
+        assert!(!scrubbed.contains("hunter"));
+        assert_eq!(redact(&scrubbed), (scrubbed.clone(), vec![]));
     }
 
     #[test]
