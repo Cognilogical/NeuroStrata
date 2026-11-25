@@ -863,8 +863,12 @@ const SESSION_SCOPED_TOOLS = [
  */
 export function canonicalToolName(toolName: string): string {
   const name = String(toolName ?? '')
-  const match = name.match(/^(?:.*[_.:])?(neurostrata_[A-Za-z0-9]\w*)$/)
-  return match ? match[1] : name
+  // The last `neurostrata_` that starts the name or follows a separator. A
+  // string search, not a backtracking regex: the name comes from the host.
+  const at = name.lastIndexOf('neurostrata_')
+  if (at < 0 || (at > 0 && !'_.:'.includes(name[at - 1]))) return name
+  const bare = name.slice(at)
+  return /^neurostrata_[A-Za-z0-9]\w*$/.test(bare) ? bare : name
 }
 
 /**
@@ -3922,8 +3926,9 @@ export async function handleHookEvent(
 
   const hookEventName =
     asString(event.hook_event_name) ?? asString(event.eventName) ?? 'PreToolUse'
-  const toolNameRaw =
+  const toolNameRaw = canonicalToolName(
     asString(event.tool_name) ?? asString(event.toolName) ?? ''
+  )
   const toolInputRaw = event.tool_input ?? event.input ?? event.args ?? {}
   const toolInput = firstRecord(toolInputRaw)
 

@@ -5800,6 +5800,22 @@ describe('audit W4: two-argument Code Mode intent intake (#311)', () => {
           `${name} must not carry the intent reminder`
         )
       }
+      // Positive control: another server's tool with the same text still nudges.
+      const other = {
+        name: 'mcp__other__search',
+        sessionID: 'ses-w4',
+        args: {},
+        status: 'completed',
+        result: {
+          content: 'next step: TODO: wire the hook',
+          output: 'next step: TODO: wire the hook'
+        }
+      }
+      await afterHandler(other)
+      assert.ok(
+        JSON.stringify(other).includes('TASK INTENT DETECTED'),
+        'a non-NeuroStrata tool result still receives the reminder'
+      )
     } finally {
       server.close()
       resetModuleState()

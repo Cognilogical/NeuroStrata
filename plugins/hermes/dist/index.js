@@ -1020,8 +1020,13 @@ const SESSION_SCOPED_TOOLS = [
  */
 export function canonicalToolName(toolName) {
     const name = String(toolName ?? '');
-    const match = name.match(/^(?:.*[_.:])?(neurostrata_[A-Za-z0-9]\w*)$/);
-    return match ? match[1] : name;
+    // The last `neurostrata_` that starts the name or follows a separator. A
+    // string search, not a backtracking regex: the name comes from the host.
+    const at = name.lastIndexOf('neurostrata_');
+    if (at < 0 || (at > 0 && !'_.:'.includes(name[at - 1])))
+        return name;
+    const bare = name.slice(at);
+    return /^neurostrata_[A-Za-z0-9]\w*$/.test(bare) ? bare : name;
 }
 /**
  * Whether `toolName` is one of SESSION_SCOPED_TOOLS, bare or as a host
