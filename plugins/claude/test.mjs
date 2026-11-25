@@ -641,6 +641,7 @@ function runFailingRunner(event, projectDir) {
   const env = { ...process.env };
   delete env.CLAUDE_PROJECT_DIR;
   delete env.NEUROSTRATA_NAMESPACE;
+  delete env.NEUROSTRATA_HOOK_EVENT;
   return spawnSync(process.execPath, [RUNNER], {
     input: JSON.stringify(event),
     cwd: projectDir,
@@ -671,6 +672,15 @@ test("hook runner replies in the shape of the failing event (#400)", () => {
     const reply = JSON.parse(pre.stdout);
     assert.equal(reply.hookSpecificOutput.hookEventName, "PreToolUse");
     assert.equal(reply.hookSpecificOutput.permissionDecision, "deny");
+
+    // An event without a permission decision answers {}, whether the bundle
+    // lacks its handler or the hook fails on the broken config (Claude's
+    // SessionStart always goes to the plugin).
+    for (const name of ["SessionStart", "SessionEnd", "PreCompact", "PostToolUse"]) {
+      const quiet = runFailingRunner({ hook_event_name: name, cwd: repo, session_id: "failing" }, repo);
+      assert.equal(quiet.status, 0, name);
+      assert.deepEqual(JSON.parse(quiet.stdout), {}, name);
+    }
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
