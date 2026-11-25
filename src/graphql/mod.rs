@@ -140,7 +140,7 @@ pub(crate) fn resolve_arg_bool<'a>(
     }
 }
 
-/// ID resolver (C2): the `ID` type has two literal forms, so accept string
+/// ID resolver: the `ID` type has two literal forms, so accept string
 /// and integer forms alike — `Value::Int` literals via `as_i64()` to a
 /// decimal string, and variables holding either a JSON string or a JSON
 /// integer.
@@ -160,10 +160,10 @@ pub(crate) fn resolve_arg_id<'a>(
     }
 }
 
-/// Path-aware extraction of a node's nested `edges` field arguments (F3).
+/// Path-aware extraction of a node's nested `edges` field arguments.
 ///
 /// A node's edge pagination state comes from that node's own nested
-/// `edges` selection, resolved through the shared T3 resolver (literal +
+/// `edges` selection, resolved through the shared resolver (literal +
 /// variable forms) — never from the root field's pagination state. The
 /// walk follows the actual path per root field kind: for `memory` the
 /// nested field is a direct child of the root field's selection set; for
@@ -695,7 +695,7 @@ pub fn execute_on_records(
                                 ) });
                                 return GraphQLResponse { data: None, errors };
                             }
-                            // F3: the node's edges paginate from its own
+                            // The node's edges paginate from its own
                             // nested `edges` arguments (direct child of
                             // this root field), never from the root field's
                             // pagination state — schema-invalid pagination
@@ -927,7 +927,7 @@ pub fn execute_on_records(
                                 None
                             };
 
-                            // F3: each node's edges paginate from the
+                            // Each node's edges paginate from the
                             // node's own nested `edges` arguments, walked
                             // path-aware via edges { node { edges(…) } } —
                             // never from this root field's pagination state
@@ -1834,7 +1834,7 @@ mod tests {
         );
     }
 
-    // ---- T3 oracle helpers ----
+    // ---- Variable-resolution helpers ----
     fn t3_payload(
         content: &str,
         memory_type: &str,
@@ -2354,7 +2354,7 @@ mod tests {
         );
     }
 
-    // ---- T4 (F3) nested edges oracles ----
+    // ---- Nested-edges cursor tests ----
     // A node's edges live in `edges_by_source`; the node's JSON carries one
     // fixed "edges" connection object ({ edges, pageInfo }) built by
     // build_memory_node. Nested pagination state must come from the node's
@@ -2447,7 +2447,7 @@ mod tests {
 
     #[test]
     fn t4_o3b_connection_decoy_without_nested_args_keeps_default_page() {
-        // PIN: the plan's literal oracle-3 configuration — connection-level
+        // PIN: the decoy configuration — connection-level
         // edges(first: 99) present with nested edges arguments ABSENT.
         // Green pre- and post-fix by construction; guards against a future
         // "nested-else-connection-fallback" regression, which would read
