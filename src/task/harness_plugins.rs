@@ -5949,7 +5949,7 @@ export default {};
     fn installed_runner_replies_in_the_shape_of_the_event() {
         let ran = json!({ "ran": "handleHookEvent" });
         let empty = json!({});
-        let cases: [(Option<&str>, Option<&str>, &[&str], &Value, i32); 13] = [
+        let cases: [(Option<&str>, Option<&str>, &[&str], &Value, i32); 16] = [
             (None, Some("postToolUse"), &[], &empty, 0),
             (None, Some("postToolUse"), &["HANDLERS"], &ran, 0),
             (None, Some("postToolUse"), &["HANDLERS", "THROW"], &empty, 0),
@@ -5968,6 +5968,9 @@ export default {};
                 &empty,
                 0,
             ),
+            (None, Some("sessionEnd"), &["HANDLERS"], &ran, 0),
+            (Some("SessionStart"), None, &["HANDLERS"], &ran, 0),
+            (Some("PreCompact"), None, &["HANDLERS"], &ran, 0),
             (
                 None,
                 Some("sessionStart"),
