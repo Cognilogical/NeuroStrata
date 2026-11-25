@@ -277,7 +277,13 @@ pub fn task_summary(id: &str, payload: &MemoryPayload, with_history: bool) -> Va
     });
     let history = field("history");
     if with_history {
-        summary["history"] = history;
+        // A task with no notes yet has no history field: an empty list, as
+        // its history_count of 0 says.
+        summary["history"] = if history.is_null() {
+            json!([])
+        } else {
+            history
+        };
     } else {
         summary["history_count"] = json!(history.as_array().map_or(0, Vec::len));
     }
@@ -9185,6 +9191,22 @@ exit 0
         let summary = task_summary("neurostrata-test", &payload, false);
         assert_eq!(summary["branch"], json!("feature/scope"));
         assert_eq!(summary["worktree"], json!("/wt/scope"));
+    }
+
+    /// With the history asked for, a task that has none gets `[]`, not null.
+    #[test]
+    fn task_summary_gives_an_empty_history_when_the_task_has_none() {
+        let payload = MemoryPayload {
+            content: "no notes yet".to_string(),
+            user_id: "kenton".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({ "task": { "status": "open" } }),
+        };
+        assert_eq!(task_summary("t", &payload, true)["history"], json!([]));
+        assert_eq!(task_summary("t", &payload, false)["history_count"], json!(0));
     }
 
     #[tokio::test]
