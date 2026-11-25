@@ -129,9 +129,35 @@ pub fn is_valid_namespace(ns: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
 }
 
+/// What [`read_marker`] answers for a marker that resolves outside its folder.
+const MARKER_OUTSIDE_DIR: &str = "root marker resolves outside the target directory";
+
 /// The marker in `dir`, if any. A UTF-8 BOM is accepted; bad JSON, an
 /// unknown `version` or a bad `namespace` is `Unreadable`, never `Absent`.
 pub fn read_marker(dir: &Path) -> MarkerRead {
+    // On Windows, a `canonicalize` that opens the old marker while
+    // `replace_marker` renames a new file over it can return the old file's
+    // deleted location: outside the folder, and NotFound when read. The
+    // marker name itself never disappears, so a few retries let a concurrent
+    // replace settle; a truly missing marker only costs those retries. No
+    // separate existence probe: every path read here goes through the
+    // containment check in `read_marker_once` (CodeQL rust/path-injection).
+    const WINDOWS_REPLACE_RETRIES: usize = 4;
+    let mut answer = read_marker_once(dir);
+    for _ in 0..WINDOWS_REPLACE_RETRIES {
+        if !(cfg!(windows)
+            && (matches!(answer, MarkerRead::Absent)
+                || matches!(&answer, MarkerRead::Unreadable { reason, .. } if reason == MARKER_OUTSIDE_DIR)))
+        {
+            break;
+        }
+        std::thread::yield_now();
+        answer = read_marker_once(dir);
+    }
+    answer
+}
+
+fn read_marker_once(dir: &Path) -> MarkerRead {
     let reported = dir.join(ROOT_CONFIG_REL);
     let unreadable = |reason: String| MarkerRead::Unreadable {
         path: reported.clone(),
@@ -149,7 +175,7 @@ pub fn read_marker(dir: &Path) -> MarkerRead {
     // folder, so the file read stays inside the folder the caller pointed at
     // (CodeQL rust/path-injection).
     if !path.starts_with(&canonical_dir) {
-        return unreadable("root marker resolves outside the target directory".to_string());
+        return unreadable(MARKER_OUTSIDE_DIR.to_string());
     }
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -183,7 +209,7 @@ fn contained_marker_path(dir: &Path) -> Result<(PathBuf, Option<PathBuf>), Strin
         Err(err) => return Err(err.to_string()),
     };
     if !canonical_file.starts_with(&canonical_dir) {
-        return Err("root marker resolves outside the target directory".to_string());
+        return Err(MARKER_OUTSIDE_DIR.to_string());
     }
     Ok((canonical_dir, Some(canonical_file)))
 }
