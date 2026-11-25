@@ -1237,8 +1237,8 @@ const COPILOT_HOOKS_REL: &str = ".github/hooks/neurostrata.json";
 /// sessionEnd and preCompact let it write the handoff note. postToolUse lets
 /// it deliver the session-start text a slow start missed and left-out rules:
 /// its `additionalContext` is appended to the tool result, while a preToolUse
-/// reply carries no text on an allowed call. postToolUse is wired only for a
-/// bundle that handles it ([`copilot_hook_events`]).
+/// reply carries no text on an allowed call. preToolUse and postToolUse are
+/// wired only for a bundle that handles them ([`copilot_hook_events`]).
 const COPILOT_HOOK_EVENTS: [&str; 5] = [
     "sessionStart",
     "preToolUse",
@@ -1248,13 +1248,19 @@ const COPILOT_HOOK_EVENTS: [&str; 5] = [
 ];
 
 /// The Copilot events wired for the plugin bundle the installer ships:
-/// postToolUse only when the bundle exports `handlePostToolUseEvent`.
-/// Without it the runner answers `{}`, so the hook would only start node on
-/// every tool call.
+/// preToolUse only when the bundle exports `copilotPreToolUseReply`, and
+/// postToolUse only when it exports `handlePostToolUseEvent`. A bundle
+/// without the first answers preToolUse in a shape Copilot ignores; without
+/// the second the runner answers `{}`. Either way the hook would only start
+/// node on every tool call.
 fn copilot_hook_events(bundle: &str) -> impl Iterator<Item = &'static str> + '_ {
-    COPILOT_HOOK_EVENTS.into_iter().filter(move |event| {
-        *event != "postToolUse" || bundle_exports(bundle, "handlePostToolUseEvent")
-    })
+    COPILOT_HOOK_EVENTS
+        .into_iter()
+        .filter(move |event| match *event {
+            "preToolUse" => bundle_exports(bundle, "copilotPreToolUseReply"),
+            "postToolUse" => bundle_exports(bundle, "handlePostToolUseEvent"),
+            _ => true,
+        })
 }
 
 /// Whether a plugin bundle exports `name` as a top-level `export function`,
@@ -6639,7 +6645,7 @@ export default {};
                 "version": 1,
                 "hooks": {
                     "sessionStart": [user_entry.clone()],
-                    "preToolUse": [{
+                    "preCompact": [{
                         "type": "command",
                         "bash": format!("env NEUROSTRATA_NAMESPACE=x {bash}"),
                         "env": { "KEEP": "1" },
@@ -6676,12 +6682,12 @@ export default {};
             json!([user_entry.clone(), ours("sessionStart")])
         );
         assert_eq!(
-            doc["hooks"]["preToolUse"],
+            doc["hooks"]["preCompact"],
             json!([{
                 "type": "command",
                 "bash": bash,
                 "powershell": powershell,
-                "env": { "KEEP": "1", "NEUROSTRATA_HOOK_EVENT": "preToolUse" },
+                "env": { "KEEP": "1", "NEUROSTRATA_HOOK_EVENT": "preCompact" },
                 "timeoutSec": 10
             }])
         );
@@ -6795,6 +6801,51 @@ export default {};
         let mut with_ours = users.as_array().unwrap().clone();
         with_ours.push(ours);
         assert_eq!(wire(handles)["hooks"]["postToolUse"], json!(with_ours));
+    }
+
+    /// preToolUse is wired only for a bundle that exports
+    /// `copilotPreToolUseReply`, the reply in the shape Copilot reads (a
+    /// top-level decision); without it the bundle's deny would be ignored.
+    #[test]
+    fn copilot_pre_tool_use_hook_follows_the_bundle() {
+        let handles = "export function copilotPreToolUseReply(reply, originalArgs) {
+}
+";
+        let lacks = "// copilotPreToolUseReply is only mentioned here
+                     export async function handleHookEvent(event) {}
+";
+        assert!(bundle_exports(handles, "copilotPreToolUseReply"));
+        assert!(!bundle_exports(lacks, "copilotPreToolUseReply"));
+        assert!(copilot_hook_events(handles).any(|e| e == "preToolUse"));
+        assert!(!copilot_hook_events(lacks).any(|e| e == "preToolUse"));
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".github")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("github-cli"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let wire = |bundle: &str| {
+            let mut warnings = Vec::new();
+            let wired = wire_copilot_hooks(tmp.path(), &runner, bundle, &mut warnings);
+            assert!(wired.is_some(), "{warnings:?}");
+            read_copilot_hooks(tmp.path())
+        };
+        assert_eq!(
+            wire(handles)["hooks"]["preToolUse"],
+            json!([{
+                "type": "command",
+                "bash": format!("node {}", posix_literal(&runner)),
+                "powershell": format!("node {}", powershell_literal(&runner)),
+                "env": { "NEUROSTRATA_HOOK_EVENT": "preToolUse" }
+            }])
+        );
+        assert!(wire(lacks)["hooks"].get("preToolUse").is_none());
     }
 
     /// The `bash` command is quoted for `sh` on every platform, so a path
