@@ -254,17 +254,6 @@ fn is_structural(memory_type: &str) -> bool {
     STRUCTURAL.contains(&memory_type)
 }
 
-fn is_registry_row(metadata: &Value) -> bool {
-    metadata
-        .get("registry")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-        || metadata
-            .get("is_registry")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-}
-
 fn is_mesh_conflicting(metadata: &Value) -> bool {
     crate::synaptic_mesh::conflict::is_conflicting_metadata(metadata)
 }
@@ -294,7 +283,7 @@ fn build_memory_node(
     include_archived: bool,
     include_retired: bool,
 ) -> Option<Value> {
-    if is_registry_row(&payload.metadata) {
+    if crate::registry::is_registry_row(&payload.metadata) {
         return None; // hard exclude registry even by id -> null
     }
     if is_mesh_conflicting(&payload.metadata) {
@@ -343,7 +332,7 @@ fn build_memory_node(
         })
         .collect();
 
-    let first = variable_first.unwrap_or(20).max(1).min(100);
+    let first = variable_first.unwrap_or(20).clamp(1, 100);
     // Edge cursors encode the edge's index (`{node_id}:{idx}`), so an `after`
     // cursor can resume at exactly the edge that follows it.
     let skipped = match variable_after {
@@ -598,38 +587,11 @@ pub fn execute_on_records(
 
     // Variables extraction
     let vars = variables.unwrap_or(&Value::Null);
-    let mut var_first = vars
-        .get("first")
-        .and_then(|v| v.as_i64())
-        .map(|i| i as i32)
-        .unwrap_or(20);
-    let mut var_after = vars
-        .get("after")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let mut var_memory_type = vars
-        .get("memoryType")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let mut var_include_archived = vars
-        .get("includeArchived")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let mut var_include_retired = vars
-        .get("includeRetired")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let mut var_text = vars
-        .get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let empty_var_map = serde_json::Map::new();
+    let var_map = vars.as_object().unwrap_or(&empty_var_map);
 
     // Build result from query type: determine operation
     let mut data = json!({});
-    let mut root_result: Option<Value> = None;
 
     // Try to locate the first selection (memory, memories, search)
     for def in &parsed.definitions {
@@ -645,33 +607,46 @@ pub fn execute_on_records(
                 for sel in &sel_set.items {
                     if let graphql_parser::query::Selection::Field(f) = sel {
                         let root_name: &str = f.name;
+                        // Each root selection is evaluated independently and
+                        // accumulated into `data` under its response key
+                        // (the alias when one is given, else the field
+                        // name). Per-field state therefore starts from the
+                        // constant defaults and a fresh result, so
+                        // an earlier field's arguments or result can never
+                        // leak into a later field.
+                        let response_key: &str = f.alias.unwrap_or(root_name);
+                        let mut var_first: i32 = 20;
+                        let mut var_after = String::new();
+                        let mut var_memory_type = String::new();
+                        let mut var_include_archived = false;
+                        let mut var_include_retired = false;
+                        let mut var_text = String::new();
+                        let mut root_result: Option<Value> = None;
                         for (k, v) in &f.arguments {
                             match *k {
                                 "first" => {
-                                    if let graphql_parser::query::Value::Int(num) = v {
-                                        if let Some(n) = num.as_i64() {
-                                            var_first = n as i32;
-                                        }
+                                    if let Some(n) = resolve_arg_i32(v, var_map) {
+                                        var_first = n;
                                     }
                                 }
                                 "after" => {
-                                    if let graphql_parser::query::Value::String(s) = v {
-                                        var_after = s.clone();
+                                    if let Some(s) = resolve_arg_string(v, var_map) {
+                                        var_after = s;
                                     }
                                 }
                                 "memoryType" => {
-                                    if let graphql_parser::query::Value::String(s) = v {
-                                        var_memory_type = s.clone();
+                                    if let Some(s) = resolve_arg_string(v, var_map) {
+                                        var_memory_type = s;
                                     }
                                 }
                                 "includeArchived" => {
-                                    if let graphql_parser::query::Value::Boolean(b) = v {
-                                        var_include_archived = *b;
+                                    if let Some(b) = resolve_arg_bool(v, var_map) {
+                                        var_include_archived = b;
                                     }
                                 }
                                 "includeRetired" => {
-                                    if let graphql_parser::query::Value::Boolean(b) = v {
-                                        var_include_retired = *b;
+                                    if let Some(b) = resolve_arg_bool(v, var_map) {
+                                        var_include_retired = b;
                                     }
                                 }
                                 "text" => match v {
@@ -690,8 +665,8 @@ pub fn execute_on_records(
                             let mut id_arg = "".to_string();
                             for (k, v) in &f.arguments {
                                 if *k == "id" {
-                                    if let graphql_parser::query::Value::String(s) = v {
-                                        id_arg = s.clone();
+                                    if let Some(s) = resolve_arg_id(v, var_map) {
+                                        id_arg = s;
                                     }
                                 }
                             }
@@ -699,8 +674,17 @@ pub fn execute_on_records(
                             let mut ns_arg = namespace.to_string();
                             for (k, v) in &f.arguments {
                                 if *k == "namespace" {
-                                    if let graphql_parser::query::Value::String(s) = v {
-                                        ns_arg = s.clone();
+                                    match v {
+                                        graphql_parser::query::Value::String(s) => {
+                                            ns_arg = s.clone()
+                                        }
+                                        graphql_parser::query::Value::Variable(name) => {
+                                            if let Some(s) = vars.get(name).and_then(|v| v.as_str())
+                                            {
+                                                ns_arg = s.to_string();
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -711,16 +695,23 @@ pub fn execute_on_records(
                                 ) });
                                 return GraphQLResponse { data: None, errors };
                             }
+                            // F3: the node's edges paginate from its own
+                            // nested `edges` arguments (direct child of
+                            // this root field), never from the root field's
+                            // pagination state — schema-invalid pagination
+                            // arguments on the memory root itself are inert.
+                            let (nested_first, nested_after) =
+                                nested_edges_args(f, root_name, var_map);
                             for (id_str, payload) in records.iter() {
-                                if id_str == &id_arg && payload.memory_type != "" {
+                                if id_str == &id_arg && !payload.memory_type.is_empty() {
                                     root_result = build_memory_node(
-                                        &id_str,
+                                        id_str,
                                         namespace,
                                         payload,
                                         edges_by_source,
                                         principal,
-                                        Some(var_first),
-                                        Some(&var_after),
+                                        nested_first,
+                                        nested_after.as_deref(),
                                         var_include_archived,
                                         var_include_retired,
                                     );
@@ -732,7 +723,12 @@ pub fn execute_on_records(
                                 // Explicit null when queried by id but excluded (registry, mesh-conflict, privacy) or missing
                                 root_result = None;
                             }
-                            data = json!({ "memory": root_result });
+                            if let Some(obj) = data.as_object_mut() {
+                                obj.insert(
+                                    response_key.to_string(),
+                                    root_result.unwrap_or(Value::Null),
+                                );
+                            }
                         } else if root_name == "memories" || root_name == "search" {
                             let mut ns_arg = namespace.to_string();
                             for (k, v) in &f.arguments {
@@ -758,13 +754,7 @@ pub fn execute_on_records(
                                 ) });
                                 return GraphQLResponse { data: None, errors };
                             }
-                            let first = if var_first < 1 {
-                                1
-                            } else if var_first > 100 {
-                                100
-                            } else {
-                                var_first
-                            };
+                            let first = var_first.clamp(1, 100);
                             if var_first > 100 {
                                 errors.push(GraphQLError {
                                     message: "first clamped to 100".into(),
@@ -779,7 +769,7 @@ pub fn execute_on_records(
                                 Vec::new();
                             let now = chrono::Utc::now().timestamp();
                             for (id_str, payload) in records.iter() {
-                                if payload.memory_type == "" {
+                                if payload.memory_type.is_empty() {
                                     continue;
                                 }
                                 if is_structural(&payload.memory_type)
@@ -799,7 +789,7 @@ pub fn execute_on_records(
                                 if !var_include_retired && is_retired_at(&payload.metadata, now) {
                                     continue;
                                 }
-                                if is_registry_row(&payload.metadata)
+                                if crate::registry::is_registry_row(&payload.metadata)
                                     || is_mesh_conflicting(&payload.metadata)
                                 {
                                     continue;
@@ -937,6 +927,13 @@ pub fn execute_on_records(
                                 None
                             };
 
+                            // F3: each node's edges paginate from the
+                            // node's own nested `edges` arguments, walked
+                            // path-aware via edges { node { edges(…) } } —
+                            // never from this root field's pagination state
+                            // (which governs the connection page above only).
+                            let (nested_first, nested_after) =
+                                nested_edges_args(f, root_name, var_map);
                             let memory_edges_fixed: Vec<Value> = page.iter().map(|(id_str, payload)| {
                                 let sort_key = if root_name == "memories" { "valid_from" } else { "score" };
                                 if let Some(node) = build_memory_node(
@@ -945,8 +942,8 @@ pub fn execute_on_records(
                                     payload,
                                     edges_by_source,
                                     principal,
-                                    Some(var_first),
-                                    Some(&var_after),
+                                    nested_first,
+                                    nested_after.as_deref(),
                                     var_include_archived,
                                     var_include_retired,
                                 ) {
@@ -956,18 +953,18 @@ pub fn execute_on_records(
                                 }
                             }).collect();
 
-                            let mut root_map = serde_json::Map::new();
-                            root_map.insert(
-                                root_name.to_string(),
-                                json!({
-                                    "edges": memory_edges_fixed,
-                                    "pageInfo": {
-                                        "hasNextPage": has_next,
-                                        "endCursor": end_cursor_opt
-                                    }
-                                }),
-                            );
-                            data = Value::Object(root_map);
+                            if let Some(obj) = data.as_object_mut() {
+                                obj.insert(
+                                    response_key.to_string(),
+                                    json!({
+                                        "edges": memory_edges_fixed,
+                                        "pageInfo": {
+                                            "hasNextPage": has_next,
+                                            "endCursor": end_cursor_opt
+                                        }
+                                    }),
+                                );
+                            }
                         }
                     }
                 }
