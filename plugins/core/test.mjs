@@ -7606,4 +7606,77 @@ describe('PR #435 regression tests', () => {
       `linear scan should complete quickly, took ${elapsed}ms`
     )
   })
+
+  it('runWorkingSetToolCycle enforces delta-only injection and records touches across repeated turnId tool calls', async () => {
+    const root = canonicalTempDir('ns-core-ws-delta-inject-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope, { turn_seq: 0 }))
+      const start1 = await runWorkingSetContextCycle(scope, 'e1')
+      assert.equal(start1.changed, true)
+      const start2 = await runWorkingSetContextCycle(scope, 'e2')
+      assert.equal(start2.changed, false)
+
+      const read1 = await runWorkingSetToolCycle({
+        scope,
+        eventId: 'u1',
+        toolName: 'Read',
+        toolInput: { file_path: join(root, 'a.txt') },
+        rawText: 'alpha\n',
+        outputIsText: true,
+        isError: false,
+        advanceTurn: false
+      })
+      assert.equal(read1.changed, true)
+
+      const bash1 = await runWorkingSetToolCycle({
+        scope,
+        eventId: 'u2',
+        toolName: 'Bash',
+        toolInput: { command: 'ls' },
+        rawText: 'a.txt\n',
+        outputIsText: true,
+        isError: false,
+        advanceTurn: false
+      })
+      assert.equal(bash1.changed, false)
+
+      const start3 = await runWorkingSetContextCycle(scope, 'e3')
+      assert.equal(start3.changed, false)
+
+      await runWorkingSetTurnBoundary(scope, 'stop-1', 't1')
+      const stop1 = await runWorkingSetContextCycle(scope, 'stop-1')
+      assert.equal(stop1.changed, false)
+
+      // Second tool call in the same turnId with advanceTurn: true still records touches
+      await runWorkingSetToolCycle({
+        scope,
+        turnId: 't2',
+        eventId: 'u3',
+        toolName: 'Read',
+        toolInput: { file_path: join(root, 'b.txt') },
+        rawText: 'beta\n',
+        outputIsText: true,
+        isError: false,
+        advanceTurn: true
+      })
+      await runWorkingSetToolCycle({
+        scope,
+        turnId: 't2',
+        eventId: 'u4',
+        toolName: 'Read',
+        toolInput: { file_path: join(root, 'c.txt') },
+        rawText: 'gamma\n',
+        outputIsText: true,
+        isError: false,
+        advanceTurn: true
+      })
+      const loaded = await loadWorkingSet(scope)
+      assert.equal(loaded.turn_seq, 2)
+      assert.ok(loaded.roots.some((n) => n.path === 'b.txt'))
+      assert.ok(loaded.roots.some((n) => n.path === 'c.txt'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })

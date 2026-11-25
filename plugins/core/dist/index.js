@@ -3218,7 +3218,7 @@ export async function runWorkingSetToolCycle(input) {
         });
     if (input.advanceTurn) {
         const boundary = await runWorkingSetTurnBoundary(scope, input.eventId, input.turnId);
-        if (!boundary.duplicateEvent && (boundary.changed || !input.eventId)) {
+        if (!boundary.duplicateEvent) {
             await markWorkingSetTouches(scope, touched);
         }
     }
@@ -3237,13 +3237,18 @@ export async function runWorkingSetToolCycle(input) {
     }
     const state = await loadWorkingSet(scope);
     const parent = wsActiveParent(scope);
-    const rendered = renderWorkingSetFrame(state, parent);
-    const changed = rendered.fingerprint !== beforeFingerprint ||
-        rendered.fingerprint !== beforeInjected;
+    const final = wsFinalize(state, scope, parent);
+    const changed = final.fingerprint !== beforeFingerprint &&
+        final.fingerprint !== beforeInjected;
+    if (changed && !input.advanceTurn) {
+        final.state.last_injected_fingerprint = final.fingerprint;
+        rememberWorkingSetInjection(scope, final.fingerprint);
+    }
+    await persistWorkingSet(scope, final.state);
     return {
         replacementText,
-        frame: rendered.text,
-        fingerprint: rendered.fingerprint,
+        frame: final.frame,
+        fingerprint: final.fingerprint,
         dehydrated,
         changed
     };
