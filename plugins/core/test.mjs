@@ -206,7 +206,9 @@ import {
   runWorkingSetToolCycle,
   runWorkingSetContextCycle,
   runWorkingSetTurnBoundary,
-  markWorkingSetTouches
+  markWorkingSetTouches,
+  wsSyncBridges,
+  wsRecallMemoryIds
 } from './dist/index.js'
 
 // ──────────────────────────────────────────────────────────────────────
@@ -7411,5 +7413,197 @@ describe('working-set GC four-artifact adapter bundler', () => {
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  })
+})
+
+describe('PR #435 regression tests', () => {
+  it('wsSyncBridges does not create duplicate bridge IDs after eviction to stubs', async () => {
+    const root = canonicalTempDir('ns-core-ws-bridge-dup-')
+    try {
+      const scope = wsScope(root)
+      const parent = wsParent(root, wsState(scope, { roots: [] }))
+      // Create a bridge in young_gen
+      const state = wsState(scope, {
+        young_gen: [
+          wsNode('bridge:test-bridge', 'conceptual_bridge', {
+            memoryId: 'test-bridge'
+          })
+        ],
+        roots: []
+      })
+      wsParent(root, state)
+      const loaded = await loadWorkingSet(scope)
+      // Simulate eviction by moving to evicted_stubs with valid stub fields
+      const stub = {
+        id: 'bridge:test-bridge',
+        kind: 'conceptual_bridge',
+        pointer: 'test-bridge',
+        byte_cost: Buffer.byteLength('test-bridge\n'),
+        last_touched_turn: 1,
+        governing_ids: []
+      }
+      loaded.evicted_stubs.push(stub)
+      loaded.young_gen = []
+      await persistWorkingSet(scope, loaded)
+      // Now sync bridges again - should skip because it's in evicted_stubs
+      const newState = await loadWorkingSet(scope)
+      const testParent = { conceptual_bridges: ['test-bridge'] }
+      wsSyncBridges(newState, testParent)
+      const bridges = newState.young_gen.filter(
+        (n) => n.kind === 'conceptual_bridge'
+      )
+      assert.equal(
+        bridges.length,
+        0,
+        'bridge should not be duplicated after eviction to stubs'
+      )
+      // Also verify roots check
+      loaded.roots.push(
+        wsNode('bridge:another-bridge', 'conceptual_bridge', {
+          memoryId: 'another-bridge'
+        })
+      )
+      loaded.evicted_stubs = []
+      await persistWorkingSet(scope, loaded)
+      const state2 = await loadWorkingSet(scope)
+      const testParent2 = { conceptual_bridges: ['another-bridge'] }
+      wsSyncBridges(state2, testParent2)
+      const bridges2 = state2.young_gen.filter(
+        (n) => n.kind === 'conceptual_bridge' && n.memoryId === 'another-bridge'
+      )
+      assert.equal(
+        bridges2.length,
+        0,
+        'bridge should not be duplicated when in roots'
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('runWorkingSetTurnBoundary does not advance turn_seq for repeated turnId with distinct eventIds', async () => {
+    const root = canonicalTempDir('ns-core-ws-turn-dup-')
+    try {
+      const scope = wsScope(root)
+      // Initial state
+      const state = wsState(scope, { turn_seq: 0 })
+      wsParent(root, state)
+      // First call with turn-1, call-1
+      let boundary = await runWorkingSetTurnBoundary(scope, 'call-1', 'turn-1')
+      assert.equal(boundary.changed, true, 'first call should advance turn')
+      assert.equal(
+        boundary.duplicateEvent,
+        undefined,
+        'first call should not be duplicate'
+      )
+      // Second call with same turnId, different eventId
+      boundary = await runWorkingSetTurnBoundary(scope, 'call-2', 'turn-1')
+      assert.equal(
+        boundary.changed,
+        false,
+        'second call same turnId should not advance'
+      )
+      assert.equal(
+        boundary.duplicateEvent,
+        undefined,
+        'different eventId should not be duplicate'
+      )
+      const state2 = await loadWorkingSet(scope)
+      assert.equal(
+        state2.turn_seq,
+        1,
+        'turn_seq should be 1 after two calls with same turnId'
+      )
+      assert.deepEqual(state2.recent_event_ids, ['call-2', 'call-1'])
+      // Third call with same turnId, different eventId
+      boundary = await runWorkingSetTurnBoundary(scope, 'call-3', 'turn-1')
+      assert.equal(
+        boundary.changed,
+        false,
+        'third call same turnId should not advance'
+      )
+      const state3 = await loadWorkingSet(scope)
+      assert.equal(state3.turn_seq, 1, 'turn_seq should still be 1')
+      assert.deepEqual(state3.recent_event_ids, ['call-3', 'call-2', 'call-1'])
+      // Fourth call
+      boundary = await runWorkingSetTurnBoundary(scope, 'call-4', 'turn-1')
+      assert.equal(
+        boundary.changed,
+        false,
+        'fourth call same turnId should not advance'
+      )
+      const state4 = await loadWorkingSet(scope)
+      assert.equal(state4.turn_seq, 1, 'turn_seq should still be 1')
+      assert.deepEqual(state4.recent_event_ids, [
+        'call-4',
+        'call-3',
+        'call-2',
+        'call-1'
+      ])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('execute.after / dehydrateWorkingSetRecall extracts only mem-123 not Context from File Context heading', async () => {
+    const block = `[NeuroStrata File Context — src/a.ts]\n[NeuroStrata rule mem-123] Always claim a task before editing.\n[NeuroStrata Golden Rule mem-456] Another rule.`
+    const ids = wsRecallMemoryIds(block)
+    assert.deepEqual(
+      ids,
+      ['mem-123', 'mem-456'],
+      'should extract mem-123 and mem-456 but not Context from File Context heading'
+    )
+    assert.ok(
+      !ids.includes('Context'),
+      'must not extract "Context" as a memory ID'
+    )
+    assert.ok(!ids.includes('File'), 'must not extract "File" as a memory ID')
+    assert.ok(
+      !ids.includes('Active'),
+      'must not extract "Active" as a memory ID'
+    )
+    assert.ok(!ids.includes('End'), 'must not extract "End" as a memory ID')
+    assert.ok(
+      !ids.includes('Plugin'),
+      'must not extract "Plugin" as a memory ID'
+    )
+    assert.ok(!ids.includes('AST'), 'must not extract "AST" as a memory ID')
+    assert.ok(
+      !ids.includes('Governing'),
+      'must not extract "Governing" as a memory ID'
+    )
+  })
+
+  it('upsertWorkingSetFrame linearly strips pathological repeated Active Context prefixes without regex backtracking', () => {
+    const repeatedFrames =
+      '[NeuroStrata Active Context]\n[NeuroStrata End Active Context]\n'.repeat(
+        1000
+      )
+    const frame = `[NeuroStrata Active Context]\nNew frame content\n[NeuroStrata End Active Context]\n`
+    const sink = { additionalContext: repeatedFrames }
+    const changed = upsertWorkingSetFrame(sink, frame)
+    assert.equal(changed, true)
+    assert.ok(sink.additionalContext.includes('New frame content'))
+    assert.ok(
+      !sink.additionalContext.includes(
+        '[NeuroStrata Active Context]\n[NeuroStrata End Active Context]\n'.repeat(
+          1000
+        )
+      )
+    )
+    // Verify no polynomial time behavior - this should complete quickly
+    const start = performance.now()
+    const sink2 = {
+      additionalContext:
+        '[NeuroStrata Active Context]\n[NeuroStrata End Active Context]\n'.repeat(
+          5000
+        )
+    }
+    upsertWorkingSetFrame(sink2, frame)
+    const elapsed = performance.now() - start
+    assert.ok(
+      elapsed < 200,
+      `linear scan should complete quickly, took ${elapsed}ms`
+    )
   })
 })

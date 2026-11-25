@@ -154,7 +154,7 @@ async function postToolUseReply(projectDir, event) {
       textResultForLlm: cycle.replacementText
     }
   }
-  if (cycle.frame && cycle.fingerprint !== before.frame_fingerprint) {
+  if (cycle.changed && cycle.frame) {
     output.additionalContext = cycle.frame
   }
   return output

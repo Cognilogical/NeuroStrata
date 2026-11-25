@@ -148,11 +148,7 @@ async function postToolUseReply(projectDir, event) {
   if (cycle.replacementText !== null) {
     output.hookSpecificOutput.updatedToolOutput = cycle.replacementText
   }
-  if (
-    cycle.changed !== false &&
-    cycle.frame &&
-    cycle.fingerprint !== before.frame_fingerprint
-  ) {
+  if (cycle.changed && cycle.frame) {
     output.hookSpecificOutput.additionalContext = [cycle.frame]
   }
   return output

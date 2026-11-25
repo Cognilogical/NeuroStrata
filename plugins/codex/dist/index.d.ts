@@ -464,11 +464,13 @@ export declare function renderWorkingSetFrame(state: WorkingSetState, activeSess
 };
 /** Upsert one mutable frame using context[], content, then additionalContext. */
 export declare function upsertWorkingSetFrame(sink: unknown, frame: string): boolean;
+export declare function wsSyncBridges(state: WorkingSetState, parent: Record<string, unknown>): void;
 /** Observe or advance one native turn, deduplicating native event/turn identity. */
 export declare function runWorkingSetTurnBoundary(scopeInput: WorkingSetScope, eventId?: string, turnId?: string): Promise<{
     frame: string;
     fingerprint: string;
     changed: boolean;
+    duplicateEvent?: boolean;
 }>;
 /** Render current state without advancing turns or marking touches. */
 export declare function runWorkingSetContextCycle(scopeInput: WorkingSetScope, eventId?: string): Promise<{
@@ -494,6 +496,7 @@ export declare function runWorkingSetToolCycle(input: {
     frame: string;
     fingerprint: string;
     dehydrated: boolean;
+    changed: boolean;
 }>;
 export declare function isReadOnlyInspectionTool(name: string): boolean;
 export declare function isSubagentTool(name: string): boolean;
@@ -621,6 +624,7 @@ export declare function flushPendingDaemonAdvisory(): string | null;
  * guidance string once per 10-minute window, or `null` when already shown
  * or absent. */
 export declare function extractDaemonMemoryAdvisory(errorChannelText: string | null | undefined, nowMs?: number): string | null;
+export declare function wsRecallMemoryIds(block: string): string[];
 export interface SessionEpochState {
     epoch: number;
     baselineInjectedEpoch: number;
