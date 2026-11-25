@@ -19,30 +19,6 @@ static ATOMIC_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 const OPENCODE_INDEX_JS: &str = include_str!("../../plugins/opencode/dist/index.js");
 const OPENCODE_PKG_JSON: &str = include_str!("../../plugins/opencode/package.json");
-/// OpenCode 2.x's TUI entry, installed beside the server bundle as
-/// `.NeuroStrata/plugins/opencode/tui.js`.
-const OPENCODE_TUI_JS: &str = include_str!("../../plugins/opencode/tui.js");
-
-/// The plugin folder the installer owns in OpenCode's plugin directory.
-/// OpenCode 2.0.32 loads a folder there on both sides: the server takes its
-/// `server` entry, else `index` (packages/plugin/src/host.ts:43, the empty
-/// subpath becoming "index" at :22; packages/core/src/plugin/module.ts:115),
-/// and the TUI loads only folders (packages/tui/src/plugin/discovery.ts:35-45)
-/// and takes their `tui` entry (host.ts:43, packages/tui/src/plugin/
-/// context.tsx:670). Each entry re-exports the bundle the installer keeps
-/// under `.NeuroStrata/plugins/opencode/`, three levels up.
-const OPENCODE_PLUGIN_DIR_REL: &str = ".opencode/plugins/neurostrata";
-const OPENCODE_SERVER_LOADER: &str = "export { default } from \"../../../.NeuroStrata/plugins/opencode/dist/index.js\";\n\
-                                      export * from \"../../../.NeuroStrata/plugins/opencode/dist/index.js\";\n";
-const OPENCODE_TUI_LOADER: &str = "export { default } from \"../../../.NeuroStrata/plugins/opencode/tui.js\";\n\
-                                   export * from \"../../../.NeuroStrata/plugins/opencode/tui.js\";\n";
-/// The single-file loader every earlier installer wrote, and its exact text.
-/// OpenCode's server still loads a loose `.js` file in its plugin directory
-/// (packages/core/src/plugin/source-directory.ts:23-24), so beside the folder
-/// it would run the plugin a second time.
-const OPENCODE_LEGACY_LOADER_REL: &str = ".opencode/plugins/neurostrata.js";
-const OPENCODE_LEGACY_LOADER: &str = "export { default } from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";\n\
-                                      export * from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";\n";
 
 const OPENCLAW_INDEX_JS: &str = include_str!("../../plugins/openclaw/dist/index.js");
 const OPENCLAW_PKG_JSON: &str = include_str!("../../plugins/openclaw/package.json");
@@ -503,33 +479,6 @@ fn installer_hook_parts(
 /// `opencode.json` exists. The installer wires OpenCode only then.
 fn opencode_in_project(root: &Path) -> bool {
     root.join(".opencode").exists() || root.join("opencode.json").exists()
-}
-
-/// Removes `.opencode/plugins/neurostrata.js` when it is still the loader an
-/// earlier installer wrote (a checkout may have turned its line ends into
-/// CRLF). Anything else there is the user's: it stays, with a warning,
-/// because OpenCode loads it as well as the plugin folder.
-fn remove_legacy_opencode_loader(project_root: &Path, warnings: &mut Vec<String>) {
-    let path = project_root.join(OPENCODE_LEGACY_LOADER_REL);
-    let meta = match std::fs::symlink_metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        found => found.ok(),
-    };
-    let ours = meta.is_some_and(|m| m.is_file())
-        && refuse_symlink_components(project_root, &path).is_ok()
-        && std::fs::read_to_string(&path)
-            .is_ok_and(|text| text.replace("\r\n", "\n") == OPENCODE_LEGACY_LOADER);
-    let kept = if ours {
-        std::fs::remove_file(&path).err().map(|e| e.to_string())
-    } else {
-        Some("it is not the loader NeuroStrata wrote".to_string())
-    };
-    if let Some(reason) = kept {
-        warnings.push(format!(
-            "opencode: kept {} ({reason}); OpenCode loads it as well as {OPENCODE_PLUGIN_DIR_REL}/",
-            path.display()
-        ));
-    }
 }
 
 /// The Claude hook command `node "<abs_runner>"`, or `None` when the runner
@@ -2461,9 +2410,6 @@ pub fn auto_install_detected_plugins(
         write_if_changed(&dist_index, index_js);
         write_if_changed(&pkg_path, pkg_json);
         write_if_changed(&runner_path, CLI_HOOK_RUNNER_MJS);
-        if harness == "opencode" {
-            write_if_changed(&plugin_dir.join("tui.js"), OPENCODE_TUI_JS);
-        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2770,23 +2716,21 @@ fn wire_harness_config(
     abs_runner: &str,
     warnings: &mut Vec<String>,
 ) -> Option<String> {
-    let write_text_if_changed = |path: &Path, text: &str| -> Option<String> {
+    let write_json_if_changed = |path: &Path, val: &Value| -> Option<String> {
         if refuse_symlink_components(project_root, path).is_err() {
             return None;
         }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let serialized = serde_json::to_string_pretty(val).ok()?;
         let needs_write = std::fs::read_to_string(path)
-            .map(|existing| existing != text)
+            .map(|existing| existing != serialized)
             .unwrap_or(true);
         if needs_write {
-            write_atomically(path, text).ok()?;
+            write_atomically(path, &serialized).ok()?;
         }
         Some(path.to_string_lossy().to_string())
-    };
-    let write_json_if_changed = |path: &Path, val: &Value| -> Option<String> {
-        write_text_if_changed(path, &serde_json::to_string_pretty(val).ok()?)
     };
     // Read before anything below writes: the namespace this config keeps, or
     // the one it gets, or none. A refresh (Keep) with no usable answer writes a
@@ -2813,30 +2757,15 @@ fn wire_harness_config(
     match harness {
         "opencode" => {
             if is_active || opencode_in_project(project_root) {
-                // 1. The plugin folder (see OPENCODE_PLUGIN_DIR_REL): its
-                //    server and TUI entries are ours and rewritten when they
-                //    differ; any other file in it or beside it stays.
-                let plugin_dir = project_root.join(OPENCODE_PLUGIN_DIR_REL);
-                let server_path = plugin_dir.join("index.js");
-                let server_loader = write_text_if_changed(&server_path, OPENCODE_SERVER_LOADER);
-                if server_loader.is_none() {
-                    warnings.push(format!(
-                        "opencode: {} could not be written; OpenCode does not load the NeuroStrata plugin",
-                        server_path.display()
-                    ));
-                }
-                let tui_path = plugin_dir.join("tui.js");
-                if write_text_if_changed(&tui_path, OPENCODE_TUI_LOADER).is_none() {
-                    warnings.push(format!(
-                        "opencode: {} could not be written; NeuroStrata's user lines do not show in OpenCode",
-                        tui_path.display()
-                    ));
-                }
-                // The old single-file loader goes only once the folder can
-                // take its place.
-                if server_loader.is_some() {
-                    remove_legacy_opencode_loader(project_root, warnings);
-                }
+                // 1. Write the thin OpenCode loader at .opencode/plugins/neurostrata.js
+                //    (creating .opencode/plugins/ if needed). The relative import
+                //    resolves from the loader file's location back to the bundled core.
+                let plugins_dir = project_root.join(".opencode/plugins");
+                let loader_path = plugins_dir.join("neurostrata.js");
+                let loader = "export { default } from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";\n\
+                              export * from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";\n";
+                let _ = std::fs::create_dir_all(&plugins_dir);
+                let _ = std::fs::write(&loader_path, loader);
 
                 // 2. Never insert the plugin path into opencode.json. If
                 //    `.opencode/opencode.json` exists, strip any legacy
@@ -2907,7 +2836,7 @@ fn wire_harness_config(
                     let _ = write_json_if_changed(&cfg_path, &doc);
                 }
 
-                return server_loader;
+                return Some(loader_path.to_string_lossy().to_string());
             }
             None
         }
@@ -5213,20 +5142,19 @@ mod tests {
             .join(".NeuroStrata/plugins/opencode/cli-hook.mjs")
             .exists());
 
-        // Thin loader wired into OpenCode: the plugin folder's server entry.
-        let loader = tmp.path().join(".opencode/plugins/neurostrata/index.js");
+        // Thin loader wired into OpenCode.
+        let loader = tmp.path().join(".opencode/plugins/neurostrata.js");
         assert!(loader.exists());
         let loader_src = std::fs::read_to_string(&loader).expect("read loader");
         assert!(
             loader_src.contains(
-                "export { default } from \"../../../.NeuroStrata/plugins/opencode/dist/index.js\";"
+                "export { default } from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"
             ),
             "loader re-exports default"
         );
         assert!(
-            loader_src.contains(
-                "export * from \"../../../.NeuroStrata/plugins/opencode/dist/index.js\";"
-            ),
+            loader_src
+                .contains("export * from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";"),
             "loader re-exports all"
         );
 
@@ -5308,9 +5236,8 @@ mod tests {
         );
         assert!(wired.is_some(), "loader should be wired for opencode");
         assert!(
-            root.join(".opencode/plugins/neurostrata/index.js")
-                .is_file(),
-            "autoload shim written at .opencode/plugins/neurostrata/index.js"
+            root.join(".opencode/plugins/neurostrata.js").is_file(),
+            "autoload shim written at .opencode/plugins/neurostrata.js"
         );
 
         let parsed: serde_json::Value = serde_json::from_str(
@@ -5325,224 +5252,6 @@ mod tests {
             .expect("plugins array preserved for remaining entry");
         assert_eq!(plugins.len(), 1, "plugins: {plugins:?}");
         assert_eq!(plugins[0].as_str(), Some("custom-plugin-dir"));
-    }
-
-    /// The installer's OpenCode wiring run once on `root`: what it reports
-    /// as wired, and its warnings.
-    fn wire_opencode(root: &Path) -> (Option<String>, Vec<String>) {
-        let mut warnings = Vec::new();
-        let wired = wire_harness_config(
-            root,
-            ConfigNamespace::Set("TestProj"),
-            "opencode",
-            true,
-            &["opencode"],
-            "./.NeuroStrata/plugins/opencode/dist/index.js",
-            "./.NeuroStrata/plugins/opencode/cli-hook.mjs",
-            &mut warnings,
-        );
-        (wired, warnings)
-    }
-
-    /// OpenCode 2.x loads TUI plugins only from a folder in its plugin
-    /// directory. A fresh install writes the folder's server and TUI entries,
-    /// each re-exporting a bundle file that is on disk, and no single-file
-    /// loader.
-    #[test]
-    fn opencode_installs_the_plugin_as_a_folder_with_server_and_tui_entries() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join(".opencode")).unwrap();
-        let report =
-            auto_install_detected_plugins(root, ConfigNamespace::Set("TestProj"), Some("opencode"));
-
-        assert_eq!(
-            std::fs::read_to_string(root.join(".NeuroStrata/plugins/opencode/tui.js")).unwrap(),
-            OPENCODE_TUI_JS
-        );
-        let dir = root.join(".opencode/plugins/neurostrata");
-        let server = std::fs::read_to_string(dir.join("index.js")).expect("server entry");
-        assert_eq!(
-            server,
-            "export { default } from \"../../../.NeuroStrata/plugins/opencode/dist/index.js\";\n\
-             export * from \"../../../.NeuroStrata/plugins/opencode/dist/index.js\";\n"
-        );
-        let tui = std::fs::read_to_string(dir.join("tui.js")).expect("TUI entry");
-        assert_eq!(
-            tui,
-            "export { default } from \"../../../.NeuroStrata/plugins/opencode/tui.js\";\n\
-             export * from \"../../../.NeuroStrata/plugins/opencode/tui.js\";\n"
-        );
-        for entry in [&server, &tui] {
-            let target = entry.split('"').nth(1).expect("import path");
-            assert!(
-                dir.join(target).is_file(),
-                "{target} from {}",
-                dir.display()
-            );
-        }
-        assert!(!root.join(".opencode/plugins/neurostrata.js").exists());
-
-        let opencode = report["installed_plugins"]
-            .as_array()
-            .expect("installed array")
-            .iter()
-            .find(|p| p["harness"] == json!("opencode"))
-            .expect("opencode installed");
-        assert_eq!(
-            opencode["config_wired"],
-            json!(dir.join("index.js").to_string_lossy().to_string())
-        );
-        assert!(
-            !report["warnings"]
-                .as_array()
-                .expect("warnings")
-                .iter()
-                .any(|w| w.as_str().is_some_and(|w| w.starts_with("opencode:"))),
-            "{report}"
-        );
-    }
-
-    /// The single-file loader every earlier installer wrote is removed once
-    /// the folder is in place, also with CRLF line ends.
-    #[test]
-    fn opencode_removes_the_single_file_loader_an_older_installer_wrote() {
-        let generated =
-            "export { default } from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";\n\
-             export * from \"../../.NeuroStrata/plugins/opencode/dist/index.js\";\n";
-        for old_text in [generated.to_string(), generated.replace('\n', "\r\n")] {
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let root = tmp.path();
-            let old = root.join(".opencode/plugins/neurostrata.js");
-            write_file(&old, &old_text);
-            let (wired, warnings) = wire_opencode(root);
-            assert!(wired.is_some());
-            assert!(!old.exists(), "{old_text:?} was not removed");
-            assert!(warnings.is_empty(), "{warnings:?}");
-            assert!(root
-                .join(".opencode/plugins/neurostrata/index.js")
-                .is_file());
-        }
-    }
-
-    /// A `neurostrata.js` the user changed is theirs: it stays as it is and
-    /// the reply says so.
-    #[test]
-    fn opencode_keeps_a_changed_single_file_loader_and_says_so() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        let old = root.join(".opencode/plugins/neurostrata.js");
-        let mine = format!("{OPENCODE_LEGACY_LOADER}// my own addition\n");
-        write_file(&old, &mine);
-        let (wired, warnings) = wire_opencode(root);
-        assert!(wired.is_some());
-        assert_eq!(std::fs::read_to_string(&old).unwrap(), mine);
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("kept") && w.contains("neurostrata.js")),
-            "{warnings:?}"
-        );
-        assert!(root
-            .join(".opencode/plugins/neurostrata/index.js")
-            .is_file());
-    }
-
-    /// Other plugins beside the folder, and other files inside it, are left
-    /// byte-identical.
-    #[test]
-    fn opencode_leaves_other_files_in_its_plugin_folders_alone() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        let files = [
-            (
-                ".opencode/plugins/other.js",
-                "export default { id: \"other\" };\n",
-            ),
-            (
-                ".opencode/plugins/theirs/index.js",
-                "export default { id: \"theirs\" };\n",
-            ),
-            (
-                ".opencode/plugins/neurostrata/extra.js",
-                "// the user's own file\n",
-            ),
-        ];
-        for (rel, text) in files {
-            write_file(&root.join(rel), text);
-        }
-        let (wired, warnings) = wire_opencode(root);
-        assert!(wired.is_some());
-        assert!(warnings.is_empty(), "{warnings:?}");
-        for (rel, text) in files {
-            assert_eq!(
-                std::fs::read_to_string(root.join(rel)).unwrap(),
-                text,
-                "{rel}"
-            );
-        }
-        assert!(root
-            .join(".opencode/plugins/neurostrata/index.js")
-            .is_file());
-        assert!(root.join(".opencode/plugins/neurostrata/tui.js").is_file());
-    }
-
-    /// The folder's two entries are the installer's: a changed one is
-    /// rewritten.
-    #[test]
-    fn opencode_repairs_a_changed_folder_loader() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        let dir = root.join(".opencode/plugins/neurostrata");
-        // The single-file loader's text points two levels up: wrong here.
-        write_file(&dir.join("index.js"), OPENCODE_LEGACY_LOADER);
-        write_file(&dir.join("tui.js"), "export default {};\n");
-        let (wired, warnings) = wire_opencode(root);
-        assert!(wired.is_some());
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(
-            std::fs::read_to_string(dir.join("index.js")).unwrap(),
-            OPENCODE_SERVER_LOADER
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join("tui.js")).unwrap(),
-            OPENCODE_TUI_LOADER
-        );
-    }
-
-    /// A second run finds everything in place and writes nothing.
-    #[test]
-    fn opencode_wiring_twice_changes_nothing_the_second_time() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join(".opencode")).unwrap();
-        let state = || {
-            let dir = root.join(".opencode/plugins/neurostrata");
-            let mut names: Vec<String> = std::fs::read_dir(root.join(".opencode/plugins"))
-                .unwrap()
-                .chain(std::fs::read_dir(&dir).unwrap())
-                .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-                .collect();
-            names.sort();
-            let stamp = |path: PathBuf| {
-                (
-                    std::fs::read_to_string(&path).unwrap(),
-                    std::fs::metadata(&path).unwrap().modified().unwrap(),
-                )
-            };
-            (
-                names,
-                stamp(dir.join("index.js")),
-                stamp(dir.join("tui.js")),
-                stamp(root.join(".opencode/neurostrata-plugin.json")),
-            )
-        };
-        let first = wire_opencode(root);
-        let before = state();
-        assert_eq!(before.0, ["index.js", "neurostrata", "tui.js"]);
-        let second = wire_opencode(root);
-        assert_eq!(first, second);
-        assert_eq!(before, state());
     }
 
     #[test]
