@@ -21,14 +21,14 @@
 
 The installer writes one config file per harness, each naming the namespace:
 
-| Harness | Config file |
-| --- | --- |
+| Harness     | Config file                                                                                         |
+| ----------- | --------------------------------------------------------------------------------------------------- |
 | Claude Code | `.NeuroStrata/plugins/claude/neurostrata.json` (`{"id": "neurostrata-claude", "namespace": "..."}`) |
-| OpenCode | `.opencode/neurostrata-plugin.json` (`neurostrata.namespace`) |
-| Codex | `.codex/plugins/neurostrata.json` |
-| Hermes | `.hermes/plugins/neurostrata.json` |
-| OpenClaw | `.openclaw/plugins/neurostrata.json` |
-| GitHub CLI | `.NeuroStrata/plugins/github-cli/copilot-extension.json` |
+| OpenCode    | `.opencode/neurostrata-plugin.json` (`neurostrata.namespace`)                                       |
+| Codex       | `.codex/plugins/neurostrata.json`                                                                   |
+| Hermes      | `.hermes/plugins/neurostrata.json`                                                                  |
+| OpenClaw    | `.openclaw/plugins/neurostrata.json`                                                                |
+| GitHub CLI  | `.NeuroStrata/plugins/github-cli/copilot-extension.json`                                            |
 
 Each CLI hook runner (`cli-hook.mjs`) reads its harness's config file (`readHarnessConfig`) and passes it to the plugin as config; the plugin reads `NEUROSTRATA_NAMESPACE` itself, in its own place in the order. The runner the installer writes to `<root>/.NeuroStrata/plugins/<harness>/` reads `<root>`'s config first, then the one at the project folder's checkout top (and its main checkout's, for a linked worktree). The Claude hooks (PreToolUse, SessionStart, Stop) run `node "<runner>"`, with no namespace in the command. An older install's `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"` commands are repaired by the installer: the first namespace they name (SessionStart, then PreToolUse, then Stop) is written to Claude's config file and read back before the commands lose it; if that fails, those commands stay as they are and the install reply carries a warning. A fresh install whose config file cannot be written still installs the hooks, with the same warning.
 
@@ -63,6 +63,16 @@ Claude Code `NotebookEdit` is a file-mutating tool like `Write` and `Edit`: it i
 `neurostrata-1e14`: subagent context headers sanitize namespace and task labels to `[A-Za-z0-9_.:-]` before interpolation. Code Mode's `execute`/`mcp_execute` tool output is also excluded from task-intent intake.
 
 `neurostrata-nb9q`: subagent graph-first injection is agent- and harness-aware: read-only subagents (`reviewer`, `checker`, `checker-free`, `explore`) receive a skip note instead of directives to call MCP tools they do not have, and Code Mode harnesses reference `execute` with `tools.neurostrata.*`. Intent extraction from `read`/`grep`/`glob`/shell tool output is suppressed, because `TODO:`/`defer` in stdout or source comments is not a task obligation; user and assistant turns still nudge.
+
+## Generational Context Graph L1 Working-Set Garbage Collector (`neurostrata-zji8`)
+
+`@neurostrata/plugin-core` implements an $O(1)$ per-turn Generational Context Graph L1 Working-Set Garbage Collector (`WORKING_SET_MAX_FRAME_BYTES = 4096` UTF-8 bytes) backed by `.NeuroStrata/active_session.json#working_set` (`WORKING_SET_SCHEMA_VERSION = 1`). Instead of accumulating unbounded recall blocks or tool outputs in the prompt history, the working-set engine maintains four tiers (`Immortal`, `PinnedRoot`, `YoungGen`, `EvictedStub`) whose eviction precedence (`evaluateWorkingSetEviction`) is formally verified across 2,560 truth-table parity rows in `src/formal_kernel.rs::evaluate_working_set_eviction` and `proofs/NeuroStrata/WorkingSetGc.lean`:
+
+- **Metadata-only persistence:** `.NeuroStrata/active_session.json#working_set` stores only bounded node metadata, pointer lines, and SHA-256 digests (`tool_output_digests` / `tool_output_stubs`); raw tool outputs and private memory contents are never persisted to disk.
+- **Dehydration and delta frame rendering:** Read-only inspection tool outputs exceeding `WORKING_SET_DEHYDRATE_THRESHOLD_BYTES = 3072` bytes or repeating an identical canonical read in the same epoch are dehydrated into bounded UTF-8 head/tail previews plus deterministic 1-line pointer stubs (`[NeuroStrata GC Stub -> ...]`). `renderWorkingSetFrame` and `upsertWorkingSetFrameInMessages` inject or replace the `[NeuroStrata Active Context] ... [NeuroStrata End Active Context]` frame only when its SHA-256 `frame_fingerprint` changes.
+- **Six-harness lifecycle & installer wiring (`src/task/harness_plugins.rs`):**
+  - **OpenCode, Claude Code, Codex, and GitHub CLI** build thin adapters via `plugins/core/bundle-adapter.mjs`; **OpenClaw** and **Hermes** compile against `@neurostrata/plugin-core` via `bundle-adapter.mjs --compiled-adapter`, emitting deterministic 4-artifact bundles (`dist/index.{js,js.map,d.ts,d.ts.map}`) across all 7 packages (28 artifacts total).
+  - The Rust installer wires native lifecycle hooks for Claude (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`), Codex (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`), and GitHub CLI (`.github/hooks/neurostrata.json` with `sessionStart`, `userPromptSubmitted`, `preToolUse`, `postToolUse`, `agentStop` plus `.git/info/exclude`), preserving foreign hooks and refusing symlinks.
 
 ## Implementing a New Harness Adapter
 

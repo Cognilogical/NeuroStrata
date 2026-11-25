@@ -1143,13 +1143,13 @@ for adapter in opencode claude codex github-cli openclaw hermes; do
   npm --prefix "plugins/$adapter" run build
 done
 artifacts=(plugins/{core,opencode,claude,codex,github-cli,openclaw,hermes}/dist/index.{js,js.map,d.ts,d.ts.map})
-sha256sum "${artifacts[@]}" > /tmp/opencode/working-set-gc-before.sha256
+sha256sum "${artifacts[@]}" > $TMPDIR/working-set-gc-before.sha256
 npm --prefix plugins/core run build
 for adapter in opencode claude codex github-cli openclaw hermes; do
   npm --prefix "plugins/$adapter" run build
 done
-sha256sum "${artifacts[@]}" > /tmp/opencode/working-set-gc-after.sha256
-diff -u /tmp/opencode/working-set-gc-before.sha256 /tmp/opencode/working-set-gc-after.sha256
+sha256sum "${artifacts[@]}" > $TMPDIR/working-set-gc-after.sha256
+diff -u $TMPDIR/working-set-gc-before.sha256 $TMPDIR/working-set-gc-after.sha256
 npm --prefix plugins/core test
 node --test plugins/core/test.mjs plugins/opencode/test.mjs plugins/claude/test.mjs plugins/codex/test.mjs plugins/github-cli/test.mjs plugins/openclaw/test.mjs plugins/hermes/test.mjs
 git diff --check -- "${artifacts[@]}"

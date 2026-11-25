@@ -141,7 +141,7 @@ pub const fn evaluate_working_set_eviction(
 - Decision precedence is the spec §7.2 table: immortal always retains full;
   fitting re-referenced stubs promote; other stubs retain; idle young nodes
   demote; young overflow demotes; unreferenced pinned roots older than zero
-  demote only under overflow; all remaining nodes retain full.
+  demote only under overflow; all other nodes retain full.
 - Produces Lean theorems `immortal_never_evicted`, `page_fault_promotes_stub`,
   `idle_young_gen_demotes_to_stub`, `budget_overflow_demotes_non_immortal`, and
   `eviction_deterministic` with the exact qualified contracts in spec §7.3.
@@ -444,7 +444,7 @@ Add tests pinning: 512-byte UTF-8-safe head/tail cuts; complete normalized text
 as head with empty tail at 1024 bytes or less; CRLF normalization; aggregate
 search `path=-`; first small reads staying inline while recording duplicate
 history; repeated reads producing deterministic stubs; output over 3072 bytes
-dehydrating; mutating output, errors, unknown shapes, and non-text parts remaining
+dehydrating; mutating output, errors, unknown shapes, and non-text parts staying
 unchanged; exact digest fields and LF-delimited identity preimage; stable identity
 across processes and changed identity across project/namespace/session/epoch;
 digest/stub pair eviction; `read_count` saturation; pointer-token escaping and
@@ -702,13 +702,13 @@ use exactly `../../core/index.ts` then `../index.ts`.
 
 ```bash
 artifacts=(plugins/{core,opencode,claude,codex,github-cli,openclaw,hermes}/dist/index.{js,js.map,d.ts,d.ts.map})
-sha256sum "${artifacts[@]}" > /tmp/opencode/working-set-gc-before.sha256
+sha256sum "${artifacts[@]}" > $TMPDIR/working-set-gc-before.sha256
 npm --prefix plugins/core run build
 for adapter in opencode claude codex github-cli openclaw hermes; do
   npm --prefix "plugins/$adapter" run build
 done
-sha256sum "${artifacts[@]}" > /tmp/opencode/working-set-gc-after.sha256
-diff -u /tmp/opencode/working-set-gc-before.sha256 /tmp/opencode/working-set-gc-after.sha256
+sha256sum "${artifacts[@]}" > $TMPDIR/working-set-gc-after.sha256
+diff -u $TMPDIR/working-set-gc-before.sha256 $TMPDIR/working-set-gc-after.sha256
 ```
 
 Expected: no diff; all 28 artifacts are byte-identical across consecutive builds.
