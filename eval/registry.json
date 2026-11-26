@@ -603,6 +603,21 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "guard-sandbox-hardening": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp guard::sandbox::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "guard::sandbox::tests::sandbox_image_is_digest_pinned_and_never_latest",
+        "guard::sandbox::tests::sandbox_args_pin_the_hardening_set",
+        "guard::sandbox::tests::forbidden_working_directories_are_refused",
+        "guard::sandbox::tests::a_project_working_directory_is_allowed",
+        "guard::sandbox::tests::a_timed_out_run_kills_and_reaps_its_child"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }

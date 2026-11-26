@@ -6,14 +6,14 @@
 
 ## 1. Defense-in-Depth Summary
 
-| Threat Vector (OWASP LLM Top-10) | NeuroStrata Mitigation | Source Module |
-| :--- | :--- | :--- |
-| **Unauthorized Network Access** | Loopback-only HTTP binding (`127.0.0.1:34343`) + mandatory 256-bit Bearer Token (`~/.config/neurostrata/daemon.token`, `0600` permissions). | `src/server.rs`, `src/main.rs` |
-| **Arbitrary Path Traversal (`J6`)** | Caller-Path Authority (`check_caller_path`) canonicalizes every path passed to `/ingest`, `/backup`, `/export-graph`, `/tasks/import`, and the root passed to `/cli/root` (`hooks install` and `root set` setting a cached root), restricting access to `startup_root` or explicit `allowed_external_dirs`. | `src/server.rs`, `src/config.rs` |
-| **Secret & Credential Leakage** | A fail-closed secret scanner **rejects** the write outright when the payload contains a credential, so sensitive material never reaches a vector index, the Episodic Buffer, or a Git-shared SynapticMesh record. | `src/secrets.rs`, `src/buffer.rs` |
-| **Cypher / SPARQL Injection** | Strict string escaping (backslashes escaped prior to quotes) and validated identifier checks across all LadybugDB Cypher and SPARQL (`spargebra` / `sparopt`) queries. | `src/store/ladybug.rs`, `src/rdf/sparql.rs` |
-| **Destructive Agent Hallucinations** | Zero destructive MCP tools: `delete`, `move`, and `restore` do not exist on the MCP JSON-RPC surface and can only be invoked by an operator via the CLI. | `src/server.rs`, `src/main.rs` |
-| **Unsafe Shell / Action Execution** | Prefrontal Cortex intercepts candidate actions via `neurostrata_guard_validate`, evaluates semantic guard rules, and supports Podman-sandboxed verification. | `src/guard/` |
+| Threat Vector (OWASP LLM Top-10)     | NeuroStrata Mitigation                                                                                                                                                                                                                                                                                      | Source Module                               |
+| :----------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------ |
+| **Unauthorized Network Access**      | Loopback-only HTTP binding (`127.0.0.1:34343`) + mandatory 256-bit Bearer Token (`~/.config/neurostrata/daemon.token`, `0600` permissions).                                                                                                                                                                 | `src/server.rs`, `src/main.rs`              |
+| **Arbitrary Path Traversal (`J6`)**  | Caller-Path Authority (`check_caller_path`) canonicalizes every path passed to `/ingest`, `/backup`, `/export-graph`, `/tasks/import`, and the root passed to `/cli/root` (`hooks install` and `root set` setting a cached root), restricting access to `startup_root` or explicit `allowed_external_dirs`. | `src/server.rs`, `src/config.rs`            |
+| **Secret & Credential Leakage**      | A fail-closed secret scanner **rejects** the write outright when the payload contains a credential, so sensitive material never reaches a vector index, the Episodic Buffer, or a Git-shared SynapticMesh record.                                                                                           | `src/secrets.rs`, `src/buffer.rs`           |
+| **Cypher / SPARQL Injection**        | Strict string escaping (backslashes escaped prior to quotes) and validated identifier checks across all LadybugDB Cypher and SPARQL (`spargebra` / `sparopt`) queries.                                                                                                                                      | `src/store/ladybug.rs`, `src/rdf/sparql.rs` |
+| **Destructive Agent Hallucinations** | Zero destructive MCP tools: `delete`, `move`, and `restore` do not exist on the MCP JSON-RPC surface and can only be invoked by an operator via the CLI.                                                                                                                                                    | `src/server.rs`, `src/main.rs`              |
+| **Unsafe Shell / Action Execution**  | Prefrontal Cortex intercepts candidate actions via `neurostrata_guard_validate`, evaluates semantic guard rules, and supports Podman-sandboxed verification with a digest-pinned image, no capabilities, bounded pids/memory, and no network.                                                               | `src/guard/`                                |
 
 ---
 
@@ -26,6 +26,7 @@ When running in HTTP daemon mode, `neurostrata-mcp` binds exclusively to `127.0.
 ## 3. Caller-Path Authority (`J6`)
 
 Because multiple workspaces can share a single user-level daemon, NeuroStrata enforces strict path boundaries via `check_caller_path`:
+
 - Every caller-supplied filesystem path is resolved to its canonical absolute path (`std::fs::canonicalize`), defeating `..` traversal and symlink escapes.
 - The canonical path must reside inside the daemon's `startup_root` or an explicit directory listed in `allowed_external_dirs` within `~/.config/neurostrata/config.json`.
 - Any path outside those boundaries is rejected before touching the filesystem.
@@ -37,6 +38,7 @@ Because multiple workspaces can share a single user-level daemon, NeuroStrata en
 Before any memory node is embedded into LadybugDB or appended to the rolling Episodic Buffer (`.NeuroStrata/sessions/current.md`), NeuroStrata runs the payload through a fail-closed secret scanner (`src/secrets.rs`). The scanner compiles its regexes once, and **rejects the write outright** — it does not redact and does not silently drop the secret. There is no `[REDACTED]` substitution anywhere in the codebase.
 
 The scanner recognizes:
+
 - **Provider token forms** — `sk-ant-*`, `sk-*`, `sk-proj-*`, `ghp_` / `gho_` / `ghs_` / `ghr_` / `github_pat_*`, `xoxb-` / `xoxp-` / `xoxr-` / `xoxs-`, `AKIA*` — validated against per-provider length and character-class rules rather than a bare prefix match.
 - **Key/value credentials** — `api_key`, `apikey`, `secret`, `token`, `password`, `passwd`, `private_key`, `client_secret`, `access_token`, `refresh_token`, `bearer` assigned a value.
 - **JWTs** — three base64url segments separated by dots.
@@ -49,3 +51,32 @@ Rejection categories are `provider_token`, `jwt`, `password`, `high_entropy_secr
 ## 5. Non-Destructive MCP Surface & Bi-Temporal Auditability
 
 Autonomous agents can create, search, relate, and supersede memories (`neurostrata_add_memory`, `neurostrata_supersede_memory`, `neurostrata_archive_memory`), which preserve full historical provenance via `valid_from` and `valid_to` timestamps. Permanent row deletion (`neurostrata-mcp delete`) is physically omitted from the MCP server schema so a prompt-injected or hallucinating agent cannot wipe project knowledge.
+
+---
+
+## 6. Guard Sandbox Execution Hardening (issue #410)
+
+When `use_sandbox: true` evaluates a `bash` or `script` action, the payload runs in an ephemeral Podman container whose image is **pinned by digest**, not by tag:
+
+```
+alpine@sha256:bc21487101ae47172509130ee1092cc273a831968d64b617776d1f69c81e42ab
+```
+
+The digest is the multi-arch `alpine:3.21` OCI index, resolved on 2026-11-25 from the Docker Hub registry (`Docker-Content-Digest` on the manifest `HEAD` for `library/alpine:3.21`) and cross-checked against `docker pull alpine:3.21`'s `RepoDigests`. A tag such as `alpine:3.21` can be re-pushed, which would silently change the code the guard executes; the digest cannot.
+
+Every run pins this hardening set in `sandbox_run_args` (`src/guard/sandbox.rs`):
+
+| Flag                      | Effect                                                      |
+| :------------------------ | :---------------------------------------------------------- |
+| `--rm`                    | The container is discarded after the verdict.               |
+| `--cap-drop=ALL`          | No Linux capabilities.                                      |
+| `--pids-limit=256`        | Bounds fork bombs.                                          |
+| `--memory=512m`           | Bounds memory use.                                          |
+| `--network=none`          | No network access.                                          |
+| `-v <cwd>:/workspace:ro`  | The project is mounted read-only.                           |
+| `--tmpfs=/tmp`            | Scratch space only; nothing persists.                       |
+| `-w=/workspace` + `sh -s` | The payload is streamed over stdin, never passed in `argv`. |
+
+The working directory is refused (`working_directory_refusal`) when it is `/` or sits under `/etc`, `/home`, `/var/run`, `/root`, `/sys`, `/dev`, `/proc`, or `/boot`. The check compares whole path components, so `/etcetera` and `/homework` are ordinary project directories while `/etc/passwd` is refused. A timed-out run is killed **and reaped** (`start_kill` followed by `wait`) before the guard returns `SandboxReject`, so no container or zombie outlives the verdict.
+
+**Bump cadence:** move the digest deliberately — not on a schedule-driven tag update. Re-resolve the `alpine:3.21` index digest, update `SANDBOX_IMAGE_DIGEST`/`SANDBOX_IMAGE` together, run the `guard-sandbox-hardening` eval suite and the guard tests, then record the verification date and registry source here. Treat an unexpected digest change as an incident, since it means the registry's content moved.
