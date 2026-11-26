@@ -611,7 +611,8 @@
       "tests": [
         "csp_is_set_and_strict",
         "capability_has_no_file_or_root_open_patterns",
-        "daemon_connect_src_is_loopback_only"
+        "daemon_connect_src_is_loopback_only",
+        "dev_csp_permits_vite_hmr_without_loosening_production_csp"
       ],
       "thresholds": {
         "ignored": 0

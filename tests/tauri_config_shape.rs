@@ -46,6 +46,19 @@ fn csp() -> String {
     }
 }
 
+fn dev_csp() -> String {
+    let conf = read_json("src-tauri/tauri.conf.json");
+    match conf.pointer("/app/security/devCsp").and_then(Value::as_str) {
+        Some(policy) => policy.to_string(),
+        None => panic!(
+            "app.security.devCsp must be a policy string, got: {}",
+            conf.pointer("/app/security/devCsp")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "missing".to_string())
+        ),
+    }
+}
+
 /// Tokens of a single CSP directive, in source order.
 fn directive_tokens(policy: &str, name: &str) -> Vec<String> {
     policy
@@ -188,6 +201,44 @@ fn capability_has_no_file_or_root_open_patterns() {
                 .map(Value::to_string)
                 .unwrap_or_else(|| "missing".to_string())
         ),
+    }
+}
+
+#[test]
+fn dev_csp_permits_vite_hmr_without_loosening_production_csp() {
+    // Without `devCsp`, Tauri injects the production `csp` in dev too
+    // (tauri-utils SecurityConfig: "If dev_csp is not specified, this
+    // value is also injected on dev"), which blocks Vite's HMR websocket
+    // to the configured `devUrl` origin and kills hot-reload.
+    let prod = csp();
+    assert!(
+        !prod.contains("localhost:5173"),
+        "production CSP must not carry the dev-server origin: {prod}"
+    );
+    let dev = dev_csp();
+    let mut tokens = directive_tokens(&dev, "connect-src");
+    tokens.sort();
+    let mut expected = directive_tokens(&prod, "connect-src");
+    expected.push("http://localhost:5173".to_string());
+    expected.push("ws://localhost:5173".to_string());
+    expected.sort();
+    assert_eq!(
+        tokens, expected,
+        "devCsp connect-src must be the production set plus only the Vite HMR origins"
+    );
+    // Every non-connect directive stays identical to production.
+    for name in [
+        "default-src",
+        "script-src",
+        "style-src",
+        "img-src",
+        "form-action",
+    ] {
+        assert_eq!(
+            directive_tokens(&dev, name),
+            directive_tokens(&prod, name),
+            "devCsp {name} must match the production policy"
+        );
     }
 }
 
