@@ -402,3 +402,25 @@ def main : IO Unit := do
                     maxFrameBytes, isReReferenced }
                 let action := evaluateWorkingSetEviction input
                 IO.println s!"WORKING_SET_GC|{tier.asStr}|{turnAge}|{maxIdleTurns}|{nodeBytes}|{projectedFrameBytes}|{maxFrameBytes}|{boolToStr isReReferenced}|{action.asTag}"
+  -- KV-cache tier routing: 4 tiers × 2 system-channel states = 8 rows.
+  let cacheTiers : List WorkingSetTier :=
+    [.immortal, .pinnedRoot, .youngGen, .evictedStub]
+  for tier in cacheTiers do
+    for hasSystemChannel in [false, true] do
+      let cacheTier := evaluateWorkingSetCacheTier tier hasSystemChannel
+      IO.println s!"WORKING_SET_CACHE_TIER|{tier.asStr}|{boolToStr hasSystemChannel}|{cacheTier.asTag}"
+  -- Quantized stride folding: 4 × 4 × 2 × 2 × 2 = 128 rows.
+  let foldTotalMessages : List Nat := [0, 12, 20, 28]
+  let foldMessageIndices : List Nat := [0, 7, 8, 19]
+  let foldHotTails : List Nat := [0, 12]
+  let foldStrides : List Nat := [0, 8]
+  for totalMessages in foldTotalMessages do
+    for messageIndex in foldMessageIndices do
+      for hotTailCount in foldHotTails do
+        for stride in foldStrides do
+          for isProtected in [false, true] do
+            let input : WorkingSetStrideInput :=
+              { totalMessages, messageIndex, hotTailCount, stride
+                isProtectedSystemOrPinned := isProtected }
+            let action := evaluateWorkingSetStrideFold input
+            IO.println s!"WORKING_SET_STRIDE_FOLD|{totalMessages}|{messageIndex}|{hotTailCount}|{stride}|{boolToStr isProtected}|{action.asTag}"

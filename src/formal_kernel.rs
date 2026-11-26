@@ -2742,6 +2742,119 @@ pub const fn evaluate_working_set_eviction(input: WorkingSetEvictionInput) -> Gc
     }
 }
 
+/// KV-cache tier a working-set node projects into.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingSetCacheTier {
+    Tier0SystemPrefix,
+    Tier1QuantizedHistory,
+    Tier2TailDelta,
+    EvictedHeapStub,
+}
+
+impl WorkingSetCacheTier {
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            WorkingSetCacheTier::Tier0SystemPrefix => "tier0_system_prefix",
+            WorkingSetCacheTier::Tier1QuantizedHistory => "tier1_quantized_history",
+            WorkingSetCacheTier::Tier2TailDelta => "tier2_tail_delta",
+            WorkingSetCacheTier::EvictedHeapStub => "evicted_heap_stub",
+        }
+    }
+}
+
+/// Routes a generational tier to its KV-cache projection. Tier 1 is reserved
+/// for the state layer's folded stubs, never emitted by this pure decision.
+pub const fn evaluate_working_set_cache_tier(
+    tier: WorkingSetTier,
+    has_system_channel: bool,
+) -> WorkingSetCacheTier {
+    match tier {
+        WorkingSetTier::Immortal => {
+            if has_system_channel {
+                WorkingSetCacheTier::Tier0SystemPrefix
+            } else {
+                WorkingSetCacheTier::Tier2TailDelta
+            }
+        }
+        WorkingSetTier::EvictedStub => WorkingSetCacheTier::EvictedHeapStub,
+        WorkingSetTier::PinnedRoot | WorkingSetTier::YoungGen => {
+            WorkingSetCacheTier::Tier2TailDelta
+        }
+    }
+}
+
+/// Action applied to one message while projecting the quantized history window.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingSetStrideAction {
+    RetainRawMessage,
+    FoldIntoQuantizedStub,
+    InvalidMessageIndex,
+}
+
+impl WorkingSetStrideAction {
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            WorkingSetStrideAction::RetainRawMessage => "retain_raw_message",
+            WorkingSetStrideAction::FoldIntoQuantizedStub => "fold_into_quantized_stub",
+            WorkingSetStrideAction::InvalidMessageIndex => "invalid_message_index",
+        }
+    }
+}
+
+/// Inputs for one deterministic quantized-stride folding decision.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkingSetStrideInput {
+    pub total_messages: u32,
+    pub message_index: u32,
+    pub hot_tail_count: u32,
+    pub stride: u32,
+    pub is_protected_system_or_pinned: bool,
+}
+
+/// Largest message index eligible for folding, stepped down to a stride
+/// boundary. A zero stride or a history fully covered by the hot tail yields
+/// no foldable prefix.
+pub const fn compute_working_set_quantized_frontier(
+    total_messages: u32,
+    hot_tail_count: u32,
+    stride: u32,
+) -> u32 {
+    if stride == 0 || total_messages <= hot_tail_count {
+        0
+    } else {
+        let foldable = total_messages - hot_tail_count;
+        (foldable / stride) * stride
+    }
+}
+
+/// First-match decision: invalid index, protected/stride-disabled/hot-tail
+/// retention, then fold only indices strictly before the quantized frontier.
+pub const fn evaluate_working_set_stride_fold(
+    input: WorkingSetStrideInput,
+) -> WorkingSetStrideAction {
+    if input.message_index >= input.total_messages {
+        WorkingSetStrideAction::InvalidMessageIndex
+    } else if input.is_protected_system_or_pinned
+        || input.stride == 0
+        || input.total_messages <= input.hot_tail_count
+    {
+        WorkingSetStrideAction::RetainRawMessage
+    } else if input.message_index
+        < compute_working_set_quantized_frontier(
+            input.total_messages,
+            input.hot_tail_count,
+            input.stride,
+        )
+    {
+        WorkingSetStrideAction::FoldIntoQuantizedStub
+    } else {
+        WorkingSetStrideAction::RetainRawMessage
+    }
+}
+
 // Unit tests for formal_kernel.rs – covering classify_epistemic_status, validate_taxonomy_dag, validate_skos_disjointness, compute_epistemic_coverage_bps, realization_status_gap_bps, compute_frontier_leverage_bps
 #[cfg(test)]
 mod tests {
@@ -3338,6 +3451,94 @@ mod tests {
     }
 
     #[test]
+    fn working_set_cache_tier_routes_immortal_to_system_prefix() {
+        assert_eq!(
+            evaluate_working_set_cache_tier(WorkingSetTier::Immortal, true),
+            WorkingSetCacheTier::Tier0SystemPrefix
+        );
+        assert_eq!(
+            evaluate_working_set_cache_tier(WorkingSetTier::Immortal, false),
+            WorkingSetCacheTier::Tier2TailDelta
+        );
+        assert_eq!(
+            evaluate_working_set_cache_tier(WorkingSetTier::PinnedRoot, true),
+            WorkingSetCacheTier::Tier2TailDelta
+        );
+        assert_eq!(
+            evaluate_working_set_cache_tier(WorkingSetTier::YoungGen, true),
+            WorkingSetCacheTier::Tier2TailDelta
+        );
+        assert_eq!(
+            evaluate_working_set_cache_tier(WorkingSetTier::EvictedStub, true),
+            WorkingSetCacheTier::EvictedHeapStub
+        );
+        assert_eq!(
+            WorkingSetCacheTier::Tier0SystemPrefix.as_tag(),
+            "tier0_system_prefix"
+        );
+        assert_eq!(
+            WorkingSetCacheTier::Tier1QuantizedHistory.as_tag(),
+            "tier1_quantized_history"
+        );
+        assert_eq!(
+            WorkingSetCacheTier::Tier2TailDelta.as_tag(),
+            "tier2_tail_delta"
+        );
+        assert_eq!(
+            WorkingSetCacheTier::EvictedHeapStub.as_tag(),
+            "evicted_heap_stub"
+        );
+    }
+
+    #[test]
+    fn working_set_stride_fold_preserves_hot_tail_and_quantizes_frontier() {
+        assert_eq!(compute_working_set_quantized_frontier(20, 12, 8), 8);
+        assert_eq!(compute_working_set_quantized_frontier(27, 12, 8), 8);
+        assert_eq!(compute_working_set_quantized_frontier(28, 12, 8), 16);
+        assert_eq!(compute_working_set_quantized_frontier(20, 12, 0), 0);
+        assert_eq!(compute_working_set_quantized_frontier(12, 12, 8), 0);
+        let stride_input = |total, index, hot, stride, protected| WorkingSetStrideInput {
+            total_messages: total,
+            message_index: index,
+            hot_tail_count: hot,
+            stride,
+            is_protected_system_or_pinned: protected,
+        };
+        assert_eq!(
+            evaluate_working_set_stride_fold(stride_input(20, 20, 12, 8, false)),
+            WorkingSetStrideAction::InvalidMessageIndex
+        );
+        assert_eq!(
+            evaluate_working_set_stride_fold(stride_input(20, 7, 12, 8, false)),
+            WorkingSetStrideAction::FoldIntoQuantizedStub
+        );
+        assert_eq!(
+            evaluate_working_set_stride_fold(stride_input(20, 16, 12, 8, false)),
+            WorkingSetStrideAction::RetainRawMessage
+        );
+        assert_eq!(
+            evaluate_working_set_stride_fold(stride_input(20, 7, 12, 8, true)),
+            WorkingSetStrideAction::RetainRawMessage
+        );
+        assert_eq!(
+            evaluate_working_set_stride_fold(stride_input(20, 7, 12, 0, false)),
+            WorkingSetStrideAction::RetainRawMessage
+        );
+        assert_eq!(
+            WorkingSetStrideAction::RetainRawMessage.as_tag(),
+            "retain_raw_message"
+        );
+        assert_eq!(
+            WorkingSetStrideAction::FoldIntoQuantizedStub.as_tag(),
+            "fold_into_quantized_stub"
+        );
+        assert_eq!(
+            WorkingSetStrideAction::InvalidMessageIndex.as_tag(),
+            "invalid_message_index"
+        );
+    }
+
+    #[test]
     fn data_connector_gate_parity() {
         // Test Pre-Gate Verdicts
         assert_eq!(
@@ -3829,6 +4030,61 @@ mod kani_proofs {
             evaluate_working_set_eviction(a),
             evaluate_working_set_eviction(b)
         );
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_working_set_cache_tier_contract() {
+        let tier = kani::any::<WorkingSetTier>();
+        let has_system_channel = kani::any::<bool>();
+        let cache_tier = evaluate_working_set_cache_tier(tier, has_system_channel);
+        // Theorem 6: Tier0 is reachable only for an immortal node with a
+        // system channel; the pure kernel never emits Tier1 itself.
+        assert!(cache_tier != WorkingSetCacheTier::Tier1QuantizedHistory);
+        if matches!(tier, WorkingSetTier::Immortal) && has_system_channel {
+            assert_eq!(cache_tier, WorkingSetCacheTier::Tier0SystemPrefix);
+        } else {
+            let expected = if matches!(tier, WorkingSetTier::Immortal)
+                || matches!(tier, WorkingSetTier::PinnedRoot)
+                || matches!(tier, WorkingSetTier::YoungGen)
+            {
+                WorkingSetCacheTier::Tier2TailDelta
+            } else {
+                WorkingSetCacheTier::EvictedHeapStub
+            };
+            assert_eq!(cache_tier, expected);
+        }
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_working_set_stride_fold_contract() {
+        let input = kani::any::<WorkingSetStrideInput>();
+        let action = evaluate_working_set_stride_fold(input);
+        if input.message_index >= input.total_messages {
+            assert_eq!(action, WorkingSetStrideAction::InvalidMessageIndex);
+        } else if input.is_protected_system_or_pinned
+            || input.stride == 0
+            || input.total_messages <= input.hot_tail_count
+        {
+            assert_eq!(action, WorkingSetStrideAction::RetainRawMessage);
+        } else {
+            let frontier = compute_working_set_quantized_frontier(
+                input.total_messages,
+                input.hot_tail_count,
+                input.stride,
+            );
+            // Theorem 8: the frontier steps on stride boundaries and never
+            // crosses into the hot tail.
+            assert_eq!(frontier % input.stride, 0);
+            assert!(frontier <= input.total_messages - input.hot_tail_count);
+            // Theorem 7: the hot tail is never folded.
+            if input.total_messages - input.hot_tail_count <= input.message_index {
+                assert_eq!(action, WorkingSetStrideAction::RetainRawMessage);
+            } else if input.message_index < frontier {
+                assert_eq!(action, WorkingSetStrideAction::FoldIntoQuantizedStub);
+            } else {
+                assert_eq!(action, WorkingSetStrideAction::RetainRawMessage);
+            }
+        }
     }
 
     #[kani::proof]

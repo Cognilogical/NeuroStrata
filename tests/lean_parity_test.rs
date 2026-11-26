@@ -7,7 +7,7 @@
 //! Three contracts:
 //! 1. the kernel compiles standalone with zero `--extern` flags (Aeneas/Charon
 //!    extractability precondition);
-//! 2. the exhaustive 3,833-row truth table produced by the Rust kernel equals the
+//! 2. the exhaustive 3,969-row truth table produced by the Rust kernel equals the
 //!    one emitted by `lake --dir proofs exe neurostrata-proofs`;
 //! 3. no Lean proof source carries a `sorry` placeholder or an `axiom`.
 
@@ -22,24 +22,24 @@ use std::process::Command;
 
 use formal_kernel::{
     action_gate_tag, action_revert_tag, action_task_effect_tag, allocate_hybrid_slots,
-    cert_verdict_tag, claim_decision_tag, claim_scope_verdict_tag, classify_merge_decision_tag,
-    classify_tour_stop, epoch_gate_tag, evaluate_action_gate, evaluate_action_revert,
-    evaluate_action_task_effect, evaluate_claim_decision, evaluate_claim_scope_gate,
-    evaluate_connector_post_gate, evaluate_connector_pre_gate, evaluate_import_precheck,
-    evaluate_insight_define, evaluate_procedure_fire, evaluate_reducer_total,
-    evaluate_retention_gate, evaluate_scenario_commit, evaluate_seq_continuity,
-    evaluate_sovereignty_gate, hash_verdict_tag, import_precheck_tag, intersect_var_bounds,
-    is_action_memory_shareable, is_memory_valid_at, join_task_status, kernel_rule_tag,
-    lifecycle_can_transition, owl2rl_rule_tag, procedure_fire_tag, resolve_cross_file_call,
-    resolve_scenario_row, retention_verdict_tag, seq_decision_tag, sovereignty_decision_tag,
-    step_verdict_tag, task_step_tag, verify_certificate_chain, verify_certificate_chain_slices,
-    verify_certificate_hash, verify_derivation_certificate, verify_derivation_step_structure,
-    ActionMemoryKind, ActionReceiptState, ActionTaskTargetStatus, EpistemicStatus,
-    KernelActionReceiptState, KernelCertVerdict, KernelCertificateStep, KernelCertificateVerdict,
-    KernelConnectorOp, KernelConnectorPostGateInput, KernelConnectorPostVerdict,
-    KernelConnectorPreGateInput, KernelConnectorPreVerdict, KernelHashVerdict, KernelOwl2RlRuleId,
-    KernelProcedureTrust, KernelStepVerdict, ReducerOpKind, TwinBoundError,
+    claim_decision_tag, claim_scope_verdict_tag, classify_merge_decision_tag, classify_tour_stop,
+    epoch_gate_tag, evaluate_action_gate, evaluate_action_revert, evaluate_action_task_effect,
+    evaluate_claim_decision, evaluate_claim_scope_gate, evaluate_connector_post_gate,
+    evaluate_connector_pre_gate, evaluate_import_precheck, evaluate_insight_define,
+    evaluate_procedure_fire, evaluate_reducer_total, evaluate_retention_gate,
+    evaluate_scenario_commit, evaluate_seq_continuity, evaluate_sovereignty_gate,
+    import_precheck_tag, intersect_var_bounds, is_action_memory_shareable, is_memory_valid_at,
+    join_task_status, kernel_rule_tag, lifecycle_can_transition, procedure_fire_tag,
+    resolve_cross_file_call, resolve_scenario_row, retention_verdict_tag, seq_decision_tag,
+    sovereignty_decision_tag, task_step_tag, verify_derivation_certificate, ActionMemoryKind,
+    ActionReceiptState, ActionTaskTargetStatus, EpistemicStatus, KernelActionReceiptState,
+    KernelCertificateStep, KernelCertificateVerdict, KernelConnectorOp,
+    KernelConnectorPostGateInput, KernelConnectorPostVerdict, KernelConnectorPreGateInput,
+    KernelConnectorPreVerdict, KernelProcedureTrust, ReducerOpKind, TwinBoundError,
 };
+
+/// Compact witness tuple for the short CERT_CHAIN fail-closed cases.
+type ShortCertChainCase<'a> = (usize, &'a [bool], &'a [bool], &'a [bool], bool);
 
 /// The statuses in the exact order used by `proofs/Main.lean`.
 const TASK_STATUSES: [formal_kernel::KernelTaskStatus; 4] = [
@@ -153,9 +153,10 @@ fn repo_root() -> PathBuf {
 }
 
 /// Generates the canonical truth table in `proofs/Main.lean` order:
-/// 1,273 existing rows followed by 2,560 working-set GC rows.
+/// 1,273 existing rows followed by 2,560 working-set GC rows, 8 cache-tier
+/// rows, and 128 quantized stride-fold rows.
 fn generate_rust_truth_table() -> Vec<String> {
-    let mut lines: Vec<String> = Vec::with_capacity(3833);
+    let mut lines: Vec<String> = Vec::with_capacity(3969);
 
     for &from in TASK_STATUSES.iter() {
         for &to in TASK_STATUSES.iter() {
@@ -1162,7 +1163,7 @@ fn generate_rust_truth_table() -> Vec<String> {
     }
 
     // CERT_CHAIN: 7 rows (baseline 4 + short-list fail-closed 2 + 64-cap 1)
-    let short_cases: [(usize, &[bool], &[bool], &[bool], bool); 6] = [
+    let short_cases: [ShortCertChainCase<'_>; 6] = [
         (2, &[true, true], &[true, true], &[true, true], true),
         (2, &[true, true], &[true, true], &[true, true], false),
         (2, &[true, true], &[true, false], &[true, true], true),
@@ -1310,6 +1311,50 @@ fn generate_rust_truth_table() -> Vec<String> {
                                 ));
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // WORKING_SET_CACHE_TIER: 4 tiers × 2 system-channel states = 8 rows.
+    for &tier in working_set_tiers.iter() {
+        for &has_system_channel in [false, true].iter() {
+            let cache_tier =
+                formal_kernel::evaluate_working_set_cache_tier(tier, has_system_channel);
+            lines.push(format!(
+                "WORKING_SET_CACHE_TIER|{}|{}|{}",
+                working_set_tier_tag(tier),
+                bool_str(has_system_channel),
+                cache_tier.as_tag()
+            ));
+        }
+    }
+
+    // WORKING_SET_STRIDE_FOLD: 4 × 4 × 2 × 2 × 2 = 128 rows.
+    for &total_messages in [0u32, 12, 20, 28].iter() {
+        for &message_index in [0u32, 7, 8, 19].iter() {
+            for &hot_tail_count in [0u32, 12].iter() {
+                for &stride in [0u32, 8].iter() {
+                    for &is_protected in [false, true].iter() {
+                        let action = formal_kernel::evaluate_working_set_stride_fold(
+                            formal_kernel::WorkingSetStrideInput {
+                                total_messages,
+                                message_index,
+                                hot_tail_count,
+                                stride,
+                                is_protected_system_or_pinned: is_protected,
+                            },
+                        );
+                        lines.push(format!(
+                            "WORKING_SET_STRIDE_FOLD|{}|{}|{}|{}|{}|{}",
+                            total_messages,
+                            message_index,
+                            hot_tail_count,
+                            stride,
+                            bool_str(is_protected),
+                            action.as_tag()
+                        ));
                     }
                 }
             }
@@ -1487,8 +1532,8 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
     let rust_lines = generate_rust_truth_table();
     assert_eq!(
         rust_lines.len(),
-        3833,
-        "expected 3833 canonical lines (1273 existing + 2560 WORKING_SET_GC)"
+        3969,
+        "expected 3969 canonical lines (1273 existing + 2560 WORKING_SET_GC + 8 cache-tier + 128 stride-fold)"
     );
 
     // Section-count verification: 64 TASK_FSM + 16 LIFECYCLE + 128 MESH_MERGE
@@ -1661,6 +1706,16 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         2560,
         "expected 2560 WORKING_SET_GC rows"
     );
+    assert_eq!(
+        *section_counts.get("WORKING_SET_CACHE_TIER").unwrap_or(&0),
+        8,
+        "expected 8 WORKING_SET_CACHE_TIER rows"
+    );
+    assert_eq!(
+        *section_counts.get("WORKING_SET_STRIDE_FOLD").unwrap_or(&0),
+        128,
+        "expected 128 WORKING_SET_STRIDE_FOLD rows"
+    );
 
     let lake = find_lake().expect(
         "lake not found on PATH or ~/.elan/bin/lake; install elan to run Lean parity tests",
@@ -1780,6 +1835,15 @@ fn rust_formal_kernel_truth_table_matches_lean_cli() {
         "WORKING_SET_GC|EvictedStub|4|3|256|4096|4096|true|promote_to_young_gen",
         "WORKING_SET_GC|YoungGen|4|3|256|0|4096|false|demote_to_stub",
         "WORKING_SET_GC|PinnedRoot|1|3|256|4097|4096|false|demote_to_stub",
+        "WORKING_SET_CACHE_TIER|Immortal|true|tier0_system_prefix",
+        "WORKING_SET_CACHE_TIER|Immortal|false|tier2_tail_delta",
+        "WORKING_SET_CACHE_TIER|EvictedStub|false|evicted_heap_stub",
+        "WORKING_SET_STRIDE_FOLD|20|7|12|8|false|fold_into_quantized_stub",
+        "WORKING_SET_STRIDE_FOLD|20|8|12|8|false|retain_raw_message",
+        "WORKING_SET_STRIDE_FOLD|28|19|12|8|false|retain_raw_message",
+        "WORKING_SET_STRIDE_FOLD|20|7|12|8|true|retain_raw_message",
+        "WORKING_SET_STRIDE_FOLD|12|8|12|8|false|retain_raw_message",
+        "WORKING_SET_STRIDE_FOLD|0|0|0|8|false|invalid_message_index",
     ] {
         assert!(
             rust_lines.iter().any(|l| l == expected),
