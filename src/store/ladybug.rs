@@ -37724,6 +37724,14 @@ mod store_identity {
             marker.adopted_from_model.is_none() && marker.adopted_at.is_none(),
             "a fresh store records its own identity, not an adoption provenance"
         );
+        assert!(
+            store
+                .get("probe", "m1")
+                .await
+                .expect("read the first vector row")
+                .is_some(),
+            "the marker and the first vector commit together, not the marker alone"
+        );
     }
 
     #[tokio::test]
