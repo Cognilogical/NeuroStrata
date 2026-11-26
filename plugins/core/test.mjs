@@ -208,7 +208,8 @@ import {
   runWorkingSetTurnBoundary,
   markWorkingSetTouches,
   wsSyncBridges,
-  wsRecallMemoryIds
+  wsRecallMemoryIds,
+  canonicalToolName
 } from './dist/index.js'
 
 // ──────────────────────────────────────────────────────────────────────
@@ -3865,18 +3866,12 @@ describe('round-9: CLI hook runners flush stdout before exiting', () => {
     for (const name of ['claude', 'codex', 'github-cli', 'opencode']) {
       const rel = `../${name}/cli-hook.mjs`
       const src = readFileSync(new URL(rel, import.meta.url), 'utf8')
-      const code = src
-        .split(/\r?\n/)
-        .filter((line) => !line.trim().startsWith('//'))
-        .join('\n')
-      assert.ok(
-        !/process\.exit\(2\)/.test(code),
-        `${rel}: nonzero exit is collapsed by PowerShell and fails open`
-      )
       const tail = src.slice(src.indexOf('main().catch'))
+      // A failed Stop blocks the turn with exit code 2; elsewhere only
+      // PreToolUse takes a deny decision (#425).
       assert.match(
         tail,
-        /name === ['"]PreToolUse['"]/,
+        /failed !== ['"]pretooluse['"]/,
         `${rel}: fail-closed behavior must be limited to PreToolUse`
       )
       assert.match(
@@ -3885,64 +3880,183 @@ describe('round-9: CLI hook runners flush stdout before exiting', () => {
         `${rel}: pre-tool failures must emit a deny decision`
       )
       assert.ok(
-        tail.includes('await writeStdout(JSON.stringify(out))'),
+        tail.includes('await writeStdout('),
         `${rel}: the catch response must be awaited on stdout`
       )
     }
   })
 
-  it('generic runner catches return event-shaped no-ops except PreToolUse', async () => {
-    const { spawnSync } = await import('node:child_process')
-    const rust = readFileSync(
+  // The installer's CLI_HOOK_RUNNER_MJS and each package's cli-hook.mjs keep
+  // their own structure but must behave the same; both run here against one
+  // stand-in bundle. HANDLERS exports every handler a newer bundle has, THROW
+  // fails the handler, THROW_EARLY fails the project folder lookup.
+  it('both runners gate unhandled events and reply to a failure by event', async () => {
+    const embedded = readFileSync(
       new URL('../../src/task/harness_plugins.rs', import.meta.url),
       'utf8'
-    )
-    const runner = rust.match(
-      /const CLI_HOOK_RUNNER_MJS: &str = r#"([\s\S]*?)"#;/
-    )?.[1]
-    assert.ok(runner, 'generic runner source must be extractable')
-    const dir = mkdtempSync(join(tmpdir(), 'ns-generic-runner-fail-'))
-    try {
-      mkdirSync(join(dir, 'dist'), { recursive: true })
-      writeFileSync(
-        join(dir, 'package.json'),
-        JSON.stringify({ type: 'module' })
+    ).match(/const CLI_HOOK_RUNNER_MJS: &str = r#"([\s\S]*?)"#;/)
+    assert.ok(embedded, 'CLI_HOOK_RUNNER_MJS must be extractable')
+    const bundle = `const on = (name) => Boolean(process.env[name]);
+const marker = on("HANDLERS") ? async () => ({}) : undefined;
+export const handleSessionStartEvent = marker;
+export const writeSessionHandoff = marker;
+export const handlePostToolUseEvent = marker;
+export function resolveHookProjectDir(harness, event) {
+  if (on("THROW_EARLY")) throw new Error("early");
+  return event.cwd;
+}
+export const readHarnessConfig = () => ({});
+export const usableNamespace = () => undefined;
+export async function initialize() {}
+export async function onTurnEnd() {}
+export async function handleHookEvent() {
+  if (on("THROW")) throw new Error("boom");
+  return { ran: "handleHookEvent" };
+}
+export default { handleHookEvent };
+`
+    const base = mkdtempSync(join(tmpdir(), 'ns-runner-sync-'))
+    const runners = []
+    for (const harness of ['claude', 'codex', 'github-cli', 'opencode']) {
+      const copy = readFileSync(
+        new URL(`../${harness}/cli-hook.mjs`, import.meta.url),
+        'utf8'
       )
-      writeFileSync(
-        join(dir, 'dist', 'index.js'),
-        'export async function initialize() { throw new Error("fixture failure") }\n' +
-          'export default {}\n'
-      )
-      writeFileSync(join(dir, 'hook-runner.mjs'), runner)
-      const run = (hook_event_name) =>
-        spawnSync(process.execPath, [join(dir, 'hook-runner.mjs')], {
-          input: JSON.stringify({ hook_event_name }),
-          encoding: 'utf8',
-          timeout: 30000
+      runners.push({
+        label: `plugins/${harness}/cli-hook.mjs`,
+        harness,
+        source: copy
+      })
+    }
+    for (const harness of ['claude', 'github-cli']) {
+      runners.push({
+        label: `installer runner as ${harness}`,
+        harness,
+        source: embedded[1]
+      })
+    }
+    const run = (dir, { named, copilot, flags = [] }) =>
+      new Promise((resolveRun, rejectRun) => {
+        const env = { ...process.env }
+        for (const name of [
+          'NEUROSTRATA_HOOK_EVENT',
+          'NEUROSTRATA_NAMESPACE',
+          'CLAUDE_PROJECT_DIR',
+          'HANDLERS',
+          'THROW',
+          'THROW_EARLY'
+        ]) {
+          delete env[name]
+        }
+        // Copilot names its event only in NEUROSTRATA_HOOK_EVENT.
+        if (copilot) env.NEUROSTRATA_HOOK_EVENT = copilot
+        for (const flag of flags) env[flag] = '1'
+        const input = { cwd: dir, toolName: 'bash', toolArgs: '{}' }
+        if (named) input.hook_event_name = named
+        const child = spawn(process.execPath, [join(dir, 'cli-hook.mjs')], {
+          cwd: dir,
+          env,
+          stdio: ['pipe', 'pipe', 'ignore']
         })
-      for (const [name, expected] of [
-        ['Stop', { continue: true }],
-        ['SubagentStop', { continue: true }],
-        [
-          'PostToolUse',
-          { hookSpecificOutput: { hookEventName: 'PostToolUse' } }
-        ],
-        [
-          'FutureEvent',
-          { hookSpecificOutput: { hookEventName: 'FutureEvent' } }
-        ]
-      ]) {
-        const result = run(name)
-        assert.equal(result.status, 0, `${name}: ${result.stderr}`)
-        assert.deepEqual(JSON.parse(result.stdout.trim()), expected)
+        let stdout = ''
+        child.stdout.on('data', (chunk) => {
+          stdout += chunk
+        })
+        child.on('error', rejectRun)
+        child.on('close', (code) => resolveRun({ stdout, code }))
+        child.stdin.end(JSON.stringify(input))
+      })
+    const ran = { ran: 'handleHookEvent' }
+    // Claude's SessionStart always goes to the plugin.
+    const sessionStart = (harness) => (harness === 'claude' ? ran : {})
+    // [input, expected reply (or the deny shape), exit code]
+    const cases = [
+      [{ copilot: 'postToolUse' }, {}, 0],
+      [{ copilot: 'postToolUse', flags: ['HANDLERS'] }, ran, 0],
+      [{ copilot: 'postToolUse', flags: ['HANDLERS', 'THROW'] }, {}, 0],
+      [{ copilot: 'postToolUse', flags: ['HANDLERS', 'THROW_EARLY'] }, {}, 0],
+      [{ copilot: 'preToolUse' }, ran, 0],
+      [{ copilot: 'sessionStart' }, sessionStart, 0],
+      [{ copilot: 'sessionEnd', flags: ['HANDLERS', 'THROW_EARLY'] }, {}, 0],
+      [{ copilot: 'sessionEnd', flags: ['HANDLERS'] }, ran, 0],
+      [{ named: 'SessionStart' }, sessionStart, 0],
+      [{ named: 'SessionStart', flags: ['HANDLERS'] }, ran, 0],
+      [{ named: 'PreCompact', flags: ['HANDLERS'] }, ran, 0],
+      [{ named: 'SessionStart', flags: ['THROW'] }, {}, 0],
+      [{ named: 'PreCompact' }, {}, 0],
+      [{ named: 'PreCompact', flags: ['HANDLERS', 'THROW'] }, {}, 0],
+      [{ named: 'PostToolUse' }, {}, 0],
+      [{ named: 'SubagentStop', flags: ['THROW'] }, {}, 0],
+      [{ named: 'Stop' }, ran, 0],
+      [{ named: 'Stop', flags: ['THROW'] }, {}, 2],
+      [{ copilot: 'preToolUse', flags: ['THROW'] }, 'top-level deny', 0],
+      [{ named: 'PreToolUse', flags: ['THROW'] }, 'deny', 0],
+      [{ flags: ['THROW'] }, 'deny', 0]
+    ]
+    try {
+      for (const [index, runner] of runners.entries()) {
+        const dir = join(base, String(index), runner.harness)
+        mkdirSync(join(dir, 'dist'), { recursive: true })
+        writeFileSync(join(dir, 'cli-hook.mjs'), runner.source)
+        writeFileSync(
+          join(dir, 'package.json'),
+          JSON.stringify({ type: 'module' })
+        )
+        writeFileSync(join(dir, 'dist', 'index.js'), bundle)
+        const results = await Promise.all(
+          cases.map(([input]) => run(dir, input))
+        )
+        for (const [i, [input, expected, code]] of cases.entries()) {
+          const what = `${runner.label} ${JSON.stringify(input)}`
+          const { stdout, code: status } = results[i]
+          assert.equal(status, code, `${what}: exit code`)
+          const reply = JSON.parse(stdout)
+          // A deny carries exactly these fields: Codex rejects any other
+          // (such as `continue`) on PreToolUse.
+          if (expected === 'top-level deny') {
+            assert.deepEqual(
+              Object.keys(reply).sort(),
+              ['permissionDecision', 'permissionDecisionReason'],
+              what
+            )
+            assert.equal(reply.permissionDecision, 'deny', what)
+            assert.match(
+              reply.permissionDecisionReason,
+              /^NeuroStrata hook runner failed: /,
+              what
+            )
+          } else if (expected === 'deny') {
+            assert.deepEqual(Object.keys(reply), ['hookSpecificOutput'], what)
+            assert.deepEqual(
+              Object.keys(reply.hookSpecificOutput).sort(),
+              [
+                'hookEventName',
+                'permissionDecision',
+                'permissionDecisionReason'
+              ],
+              what
+            )
+            assert.equal(
+              reply.hookSpecificOutput.hookEventName,
+              'PreToolUse',
+              what
+            )
+            assert.equal(
+              reply.hookSpecificOutput.permissionDecision,
+              'deny',
+              what
+            )
+          } else {
+            const want =
+              typeof expected === 'function'
+                ? expected(runner.harness)
+                : expected
+            assert.deepEqual(reply, want, what)
+          }
+        }
       }
-      const pre = run('PreToolUse')
-      assert.equal(pre.status, 0, pre.stderr)
-      const reply = JSON.parse(pre.stdout.trim())
-      assert.equal(reply.hookSpecificOutput.hookEventName, 'PreToolUse')
-      assert.equal(reply.hookSpecificOutput.permissionDecision, 'deny')
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      rmSync(base, { recursive: true, force: true })
     }
   })
 })
@@ -5726,6 +5840,70 @@ describe('audit W4: two-argument Code Mode intent intake (#311)', () => {
     } finally {
       server.close()
       resetModuleState()
+    }
+  })
+
+  it('a NeuroStrata tool under a harness prefix gets no reminder', async () => {
+    const { server, afterHandler } = await setupAfterHandler()
+    try {
+      // Real harnesses prefix MCP tools; a task's stored notes are data.
+      for (const name of [
+        'mcp__neurostrata__neurostrata_task_get',
+        'neurostrata_neurostrata_task_get',
+        'neurostrata_task_get'
+      ]) {
+        const event = {
+          name,
+          sessionID: 'ses-w4',
+          args: {},
+          status: 'completed',
+          result: {
+            content: 'next step: TODO: wire the hook',
+            output: 'next step: TODO: wire the hook'
+          }
+        }
+        await afterHandler(event)
+        assert.ok(
+          !JSON.stringify(event).includes('TASK INTENT DETECTED'),
+          `${name} must not carry the intent reminder`
+        )
+      }
+      // Positive control: another server's tool with the same text still nudges.
+      const other = {
+        name: 'mcp__other__search',
+        sessionID: 'ses-w4',
+        args: {},
+        status: 'completed',
+        result: {
+          content: 'next step: TODO: wire the hook',
+          output: 'next step: TODO: wire the hook'
+        }
+      }
+      await afterHandler(other)
+      assert.ok(
+        JSON.stringify(other).includes('TASK INTENT DETECTED'),
+        'a non-NeuroStrata tool result still receives the reminder'
+      )
+    } finally {
+      server.close()
+      resetModuleState()
+    }
+  })
+})
+
+describe('canonicalToolName', () => {
+  it('strips each harness prefix from a NeuroStrata tool and nothing else', () => {
+    for (const [raw, bare] of [
+      ['neurostrata_task_claim', 'neurostrata_task_claim'],
+      ['mcp__neurostrata__neurostrata_task_claim', 'neurostrata_task_claim'],
+      ['neurostrata_neurostrata_get_snapshot', 'neurostrata_get_snapshot'],
+      ['neurostrata.neurostrata_add_memory', 'neurostrata_add_memory'],
+      ['xneurostrata_task_claim', 'xneurostrata_task_claim'],
+      ['Read', 'Read'],
+      ['mcp__other__search', 'mcp__other__search'],
+      ['', '']
+    ]) {
+      assert.equal(canonicalToolName(raw), bare, raw)
     }
   })
 })

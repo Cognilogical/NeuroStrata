@@ -118,9 +118,17 @@ export declare function readHarnessConfig(harness: string, projectDir: string, r
  */
 export declare function resolveHookProjectDir(harness: string, event?: Record<string, unknown>, env?: Record<string, string | undefined>, home?: string): string;
 /**
+ * The bare `neurostrata_<tool>` name of a NeuroStrata MCP tool, however a
+ * harness spells it (`mcp__<server>__neurostrata_task_claim` in Claude Code,
+ * `<server>_neurostrata_task_claim` in OpenCode, `<server>.neurostrata_task_claim`).
+ * Any other name comes back unchanged. Every check against a NeuroStrata
+ * tool name goes through this, or the prefixed names real harnesses send
+ * never match.
+ */
+export declare function canonicalToolName(toolName: string): string;
+/**
  * Whether `toolName` is one of [SESSION_SCOPED_TOOLS], bare or as a harness
- * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
- * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
+ * spells an MCP tool (see [canonicalToolName]).
  */
 export declare function isSessionScopedTool(toolName: string): boolean;
 /**

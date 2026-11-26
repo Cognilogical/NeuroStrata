@@ -68,7 +68,7 @@ function eventName(event) {
   return (
     process.env.NEUROSTRATA_HOOK_EVENT ||
     event?.hook_event_name ||
-    event?.eventName ||
+    event?.failedEventName ||
     "PreToolUse"
   );
 }
@@ -77,6 +77,19 @@ function noOpReply(name) {
   if (name === "Stop" || name === "SubagentStop") return { continue: true };
   return { hookSpecificOutput: { hookEventName: name } };
 }
+// Events whose reply carries no permission decision (the session events and
+// PostToolUse), by the lowercase name every harness spelling folds to.
+const NO_DECISION_EVENTS = {
+  sessionstart: "SessionStart",
+  sessionend: "SessionEnd",
+  precompact: "PreCompact",
+  posttooluse: "PostToolUse"
+};
+// The working-set bundle marks itself with this constant; a stand-in bundle
+// without it keeps the #425 route through the plugin's own handlers.
+const hasWorkingSet = typeof mod.WORKING_SET_FRAME_OPEN === "string";
+// The name of the event being handled, so the catch can reply in its shape.
+let failedEventName;
 
 async function main() {
   // Redirect all diagnostic logging to stderr so stdout carries only the
@@ -100,6 +113,23 @@ async function main() {
     return;
   }
   currentEvent = event;
+  failedEventName = [
+    event.hook_event_name,
+    event.hookEventName,
+    event.failedEventName,
+    process.env.NEUROSTRATA_HOOK_EVENT
+  ].find((name) => typeof name === "string" && name);
+  const noDecisionEvent = failedEventName ? NO_DECISION_EVENTS[failedEventName.toLowerCase()] : undefined;
+  const handled = {
+    SessionStart: HARNESS === "claude" || typeof mod.handleSessionStartEvent === "function" || hasWorkingSet,
+    SessionEnd: typeof mod.writeSessionHandoff === "function" || hasWorkingSet,
+    PreCompact: typeof mod.writeSessionHandoff === "function" || hasWorkingSet,
+    PostToolUse: typeof mod.handlePostToolUseEvent === "function" || hasWorkingSet
+  }[noDecisionEvent];
+  if (noDecisionEvent && !handled) {
+    await writeStdout("{}");
+    return;
+  }
   // The namespace comes from the harness config the installer wrote; the
   // plugin reads NEUROSTRATA_NAMESPACE itself, after the project marker and
   // this config (the order of `neurostrata-mcp namespace resolve`).
@@ -141,6 +171,11 @@ async function main() {
     plugin?.handleHookEvent ??
     mod.handleClaudeHookEvent ??
     plugin?.handleClaudeHookEvent;
+  if (!hasWorkingSet && typeof handler === 'function') {
+    const out = await handler(event);
+    await writeStdout(JSON.stringify(out));
+    return;
+  }
   const name = eventName(event);
   if (["PreToolUse", "Stop", "SubagentStop"].includes(name)) {
     if (typeof handler === "function") {
@@ -162,20 +197,41 @@ async function main() {
 main().catch(async (err) => {
   const reason = String(err);
   process.stderr.write(reason + "\n");
-  const name = eventName(currentEvent);
-  // Only pre-tool failures fail closed. Every other event receives a valid,
-  // neutral success response and never inherits PreToolUse semantics.
-  const out =
-    name === "PreToolUse"
-      ? {
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse",
-            permissionDecision: "deny",
-            permissionDecisionReason: reason
-          }
-        }
-      : noOpReply(name);
-  await writeStdout(JSON.stringify(out));
+  // Reply in the shape of the event that failed; an event without a name is
+  // a PreToolUse, as for the plugin. A PreToolUse deny means nothing at Stop,
+  // where Claude Code treats exit code 2 as a block; stdout still has to be
+  // valid JSON. PowerShell can collapse nonzero exits, so the reason stays on
+  // stderr as well.
+  const failed = (failedEventName ?? "PreToolUse").toLowerCase();
+  if (failed === "stop") {
+    await writeStdout("{}");
+    process.exitCode = 2;
+    return;
+  }
+  // Only PreToolUse takes a permission decision. Every other event (the
+  // session events, PostToolUse, each Copilot event but preToolUse) answers
+  // `{}`, so the session and the tool result go on.
+  if (failed !== "pretooluse") {
+    await writeStdout("{}");
+    return;
+  }
+  // Copilot CLI (its hooks file sets NEUROSTRATA_HOOK_EVENT) reads a
+  // top-level decision on preToolUse and ignores hookSpecificOutput.
+  if (process.env.NEUROSTRATA_HOOK_EVENT) {
+    await writeStdout(JSON.stringify({ permissionDecision: "deny", permissionDecisionReason: `NeuroStrata hook runner failed: ${reason}` }));
+    return;
+  }
+  // PowerShell swallows `process.exit(2)`: the host sees a zero exit code
+  // and runs the tool anyway. Emit a deny decision so a failed hook still
+  // fails closed on Windows. No `continue` field: Codex rejects it on
+  // PreToolUse (the plugin's deny replies omit it too).
+  await writeStdout(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: reason
+    }
+  }));
 });
 "#;
 
@@ -492,8 +548,12 @@ fn repair_installer_hook_command(
 const CLAUDE_FILE_TOOLS_MATCHER: &str = "Read|Write|Edit|MultiEdit|Bash|Task";
 
 /// The NeuroStrata MCP tools whose PreToolUse runs the runner so it can pass
-/// the session's project folder as `worktree`.
-const CLAUDE_SESSION_SCOPE_MATCHER: &str = "mcp__.*__neurostrata_(task_claim|get_snapshot)";
+/// the session's project folder as `worktree` (and, with a plugin that does,
+/// record the harness's session id on a claim). Claude Code and Codex both
+/// name an MCP tool `mcp__<server>__<tool>` in hook payloads and matchers
+/// (Codex 0.170: `McpHandler::hook_tool_name_for`, which also accepts an
+/// `updatedInput` rewrite of MCP arguments).
+const SESSION_SCOPE_MATCHER: &str = "mcp__.*__neurostrata_(task_claim|get_snapshot)";
 
 /// Adds an entry running `cmd` (with `matcher`, when given) to Claude's
 /// `event` hooks unless an entry whose matcher passes `matcher_counts`
@@ -652,24 +712,40 @@ const CODEX_PRE_TOOL_USE_MATCHER: &str = "apply_patch|Bash";
 /// written differently (`''` in PowerShell, `'\''` in `sh`).
 fn shell_literal(value: &str) -> String {
     if cfg!(windows) {
-        format!("'{}'", value.replace('\'', "''"))
+        powershell_literal(value)
     } else {
-        format!("'{}'", value.replace('\'', r"'\''"))
+        posix_literal(value)
     }
 }
 
-/// Read back a word written by `shell_literal`; `None` when `text` does not
-/// start with one. Returns the value and the text after it.
+/// `sh` single-quote rules, independent of the platform the installer runs
+/// on: an embedded single quote is written `'\''`. Copilot's `bash` hook
+/// command uses them even when the installer runs on Windows.
+fn posix_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Read back a word written by `shell_literal`.
+#[cfg(test)]
 fn shell_literal_value(text: &str) -> Option<(String, &str)> {
+    if cfg!(windows) {
+        powershell_literal_value(text)
+    } else {
+        posix_literal_value(text)
+    }
+}
+
+/// Read a word written by [`posix_literal`]; `None` when `text` does not
+/// start with one. Returns the value and the text after it.
+fn posix_literal_value(text: &str) -> Option<(String, &str)> {
     let mut rest = text.strip_prefix('\'')?;
     let mut value = String::new();
-    // After a closing quote, this continues the same word with a quote.
-    let escaped = if cfg!(windows) { "'" } else { r"\''" };
     loop {
         let close = rest.find('\'')?;
         value.push_str(&rest[..close]);
         rest = &rest[close + 1..];
-        match rest.strip_prefix(escaped) {
+        // After a closing quote, this continues the same word with a quote.
+        match rest.strip_prefix(r"\''") {
             Some(after) => {
                 value.push('\'');
                 rest = after;
@@ -684,35 +760,60 @@ fn shell_literal_value(text: &str) -> Option<(String, &str)> {
 /// taken relative to this project root. A monorepo root must not claim a
 /// nested project's `cli-hook.mjs` just because its path ends with the
 /// installer layout (#368 F9).
-fn is_installer_codex_runner(path: &str, project_root: &Path, abs_runner: &str) -> bool {
+fn is_installer_runner(path: &str, project_root: &Path, abs_runner: &str) -> bool {
     path_key(path) == path_key(abs_runner)
         || same_path_on_disk(&project_root.join(path).to_string_lossy(), abs_runner)
 }
 
+/// The characters PowerShell treats as a single quote: the ASCII one and
+/// the typographic ones (U+2018 to U+201B). Any of them ends a single-quoted
+/// string, and one followed by another is one literal quote.
+const POWERSHELL_SINGLE_QUOTES: [char; 5] = ['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'];
+
 /// PowerShell's single-quote rules, independent of the platform the
-/// installer runs on: only `''` is an escape inside single quotes. Codex
-/// uses `commandWindows` on Windows even when the installer was produced on
-/// another OS, so this cannot use `cfg!(windows)` in [`shell_literal`].
+/// installer runs on: inside single quotes the only escape is a doubled
+/// quote, and every character in [`POWERSHELL_SINGLE_QUOTES`] needs it (a
+/// path may hold a typographic one). Codex uses `commandWindows` on Windows
+/// even when the installer was produced on another OS, so this cannot use
+/// `cfg!(windows)` in [`shell_literal`].
 fn powershell_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    let mut word = String::with_capacity(value.len() + 2);
+    word.push('\'');
+    for c in value.chars() {
+        if POWERSHELL_SINGLE_QUOTES.contains(&c) {
+            word.push(c);
+        }
+        word.push(c);
+    }
+    word.push('\'');
+    word
 }
 
-/// Read a word written by [`powershell_literal`].
+/// Read a word written by [`powershell_literal`]; `None` when `text` does
+/// not start with one. Returns the value and the text after it. As in
+/// PowerShell, a quote followed by another quote is one literal quote (the
+/// second), and a lone quote ends the word.
 fn powershell_literal_value(text: &str) -> Option<(String, &str)> {
-    let mut rest = text.strip_prefix('\'')?;
+    let mut chars = text.char_indices().peekable();
+    let (_, open) = chars.next()?;
+    if !POWERSHELL_SINGLE_QUOTES.contains(&open) {
+        return None;
+    }
     let mut value = String::new();
-    loop {
-        let close = rest.find('\'')?;
-        value.push_str(&rest[..close]);
-        rest = &rest[close + 1..];
-        match rest.strip_prefix('\'') {
-            Some(after) => {
-                value.push('\'');
-                rest = after;
+    while let Some((i, c)) = chars.next() {
+        if !POWERSHELL_SINGLE_QUOTES.contains(&c) {
+            value.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some(&(_, next)) if POWERSHELL_SINGLE_QUOTES.contains(&next) => {
+                value.push(next);
+                chars.next();
             }
-            None => return Some((value, rest)),
+            _ => return Some((value, &text[i + c.len_utf8()..])),
         }
     }
+    None
 }
 
 /// The two command forms the installer writes into a Codex hook entry:
@@ -758,25 +859,27 @@ fn strip_installer_env_prefix(mut command: &str) -> &str {
     }
 }
 
-/// The runner path in a hook command after any environment prefix, in either
-/// platform's quoting. A command that runs anything after the runner is a
-/// user's own and is not claimed.
-fn hook_command_runner(command: &str) -> Option<(String, &str)> {
-    type HookLiteralParser = fn(&str) -> Option<(String, &str)>;
-    let quoted = strip_installer_env_prefix(command).strip_prefix("node ")?;
-    let parsers: [HookLiteralParser; 3] = [
-        shell_literal_value,
-        powershell_literal_value,
-        sh_literal_value,
-    ];
+/// The runner path a hook command runs after any environment prefix, read in
+/// each platform's quoting; empty when it is not `node <one quoted word>`. A
+/// word can read differently in the two (`'a’’b'` holds two typographic
+/// quotes in `sh`, one in PowerShell), so every full reading is returned and
+/// the caller checks each. A command that runs anything after the runner is
+/// a user's own and is not claimed.
+fn hook_command_runners(command: &str) -> Vec<String> {
+    let Some(quoted) = strip_installer_env_prefix(command).strip_prefix("node ") else {
+        return Vec::new();
+    };
+    let parsers: [fn(&str) -> Option<(String, &str)>; 2] =
+        [posix_literal_value, powershell_literal_value];
+    let mut paths: Vec<String> = Vec::new();
     for parse in parsers {
         if let Some((path, rest)) = parse(quoted) {
-            if rest.trim().is_empty() {
-                return Some((path, rest));
+            if rest.trim().is_empty() && !paths.contains(&path) {
+                paths.push(path);
             }
         }
     }
-    None
+    paths
 }
 
 /// Whether a `[hooks]` table in Codex's other config layer
@@ -854,8 +957,45 @@ fn config_toml_wires_runner(
     }
 }
 
-/// Add the NeuroStrata context, guard, result, and stop hooks to
-/// `.codex/hooks.json`, keeping every other entry. A command running this project's canonical
+/// Add the NeuroStrata hooks to `.codex/hooks.json`, keeping every other
+/// entry. A command running this project's canonical runner is rewritten to
+/// the current form (both command variants), so a stale spelling is repaired
+/// and nothing is added twice; a foreign runner is left as-is. Codex's other
+/// hook layer (`.codex/config.toml` [`hooks`]) is checked so a hook already
+/// there is not duplicated. Anything unreadable or not shaped as expected
+/// leaves the file alone with a warning (#368 F6).
+/// SessionStart injects the session file; UserPromptSubmit and PostToolUse
+/// carry the working-set prompt/result projection; SessionEnd and PreCompact
+/// write the handoff note.
+const CODEX_HOOK_EVENTS: [(&str, Option<&str>); 8] = [
+    ("SessionStart", None),
+    ("PreToolUse", Some(CODEX_PRE_TOOL_USE_MATCHER)),
+    ("PreToolUse", Some(SESSION_SCOPE_MATCHER)),
+    ("UserPromptSubmit", None),
+    ("PostToolUse", None),
+    ("Stop", None),
+    ("SessionEnd", None),
+    ("PreCompact", None),
+];
+
+/// Which of the installer's Codex entries for `event` an entry with
+/// `entry_matcher` stands for: the one with the same matcher, else (a matcher
+/// the user changed) the event's first one, so it is not added again.
+fn codex_entry_slot<'a>(event: &str, entry_matcher: Option<&'a str>) -> Option<&'a str> {
+    let ours: Vec<Option<&str>> = CODEX_HOOK_EVENTS
+        .iter()
+        .filter(|(e, _)| *e == event)
+        .map(|(_, m)| *m)
+        .collect();
+    if ours.contains(&entry_matcher) {
+        entry_matcher
+    } else {
+        ours.first().copied().flatten()
+    }
+}
+
+/// Add the NeuroStrata hooks ([CODEX_HOOK_EVENTS]) to `.codex/hooks.json`,
+/// keeping every other entry.
 /// runner is rewritten to the current form (both command variants), so a
 /// stale spelling is repaired and nothing is added twice; a foreign runner
 /// is left as-is. Codex's other
@@ -904,23 +1044,30 @@ fn wire_codex_hooks(
         ));
         return None;
     };
-    for (event, matcher) in [
-        ("SessionStart", None),
-        ("PreToolUse", Some(CODEX_PRE_TOOL_USE_MATCHER)),
-        ("UserPromptSubmit", None),
-        ("PostToolUse", None),
-        ("Stop", None),
-    ] {
+    if let Some(event) = non_array_hook_list(h_obj) {
+        warnings.push(format!(
+            "{} has a non-array {event} hook list, which disables the whole file; no Codex hook was wired",
+            hooks_path.display()
+        ));
+        return None;
+    }
+    for (event, matcher) in CODEX_HOOK_EVENTS {
         let entries = h_obj.entry(event).or_insert_with(|| json!([]));
         let Some(arr) = entries.as_array_mut() else {
-            warnings.push(format!(
-                "{} has a non-array {event} hook list; that event was left untouched",
-                hooks_path.display()
-            ));
             continue;
         };
-        if config_toml_wires_runner(&toml, project_root, abs_runner, event) {
+        // `[hooks]` in config.toml names no matcher this check reads: it
+        // stands for the event's first entry only. Other entries (the
+        // session-scope matcher) still belong in hooks.json.
+        let first_slot = CODEX_HOOK_EVENTS
+            .iter()
+            .find(|(e, _)| *e == event)
+            .is_some_and(|(_, m)| *m == matcher);
+        if first_slot && config_toml_wires_runner(&toml, project_root, abs_runner, event) {
             arr.retain_mut(|entry| {
+                if entry.get("matcher").and_then(Value::as_str) != matcher {
+                    return true;
+                }
                 let Some(entry_hooks) = entry.get_mut("hooks").and_then(|v| v.as_array_mut())
                 else {
                     return true;
@@ -930,9 +1077,11 @@ fn wire_codex_hooks(
                     let owned = ["command", "commandWindows"].iter().any(|key| {
                         hook.get(key)
                             .and_then(Value::as_str)
-                            .and_then(hook_command_runner)
-                            .is_some_and(|(old_path, _)| {
-                                is_installer_codex_runner(&old_path, project_root, abs_runner)
+                            .map(hook_command_runners)
+                            .is_some_and(|paths| {
+                                paths.iter().any(|old_path| {
+                                    is_installer_runner(old_path, project_root, abs_runner)
+                                })
                             })
                     });
                     removed_owned |= owned;
@@ -940,10 +1089,16 @@ fn wire_codex_hooks(
                 });
                 !(removed_owned && entry_hooks.is_empty())
             });
-            continue;
         }
         let mut present = false;
         for entry in arr.iter_mut() {
+            // An owned hook counts only for the entry it stands for (see
+            // codex_entry_slot), so each of an event's entries is checked.
+            let entry_matcher = entry
+                .get("matcher")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let this_slot = codex_entry_slot(event, entry_matcher.as_deref()) == matcher;
             let Some(entry_hooks) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) else {
                 continue;
             };
@@ -953,10 +1108,10 @@ fn wire_codex_hooks(
                     let Some(command) = hook.get(key).and_then(Value::as_str) else {
                         continue;
                     };
-                    let Some((old_path, _)) = hook_command_runner(command) else {
-                        continue;
-                    };
-                    if !is_installer_codex_runner(&old_path, project_root, abs_runner) {
+                    if !hook_command_runners(command)
+                        .iter()
+                        .any(|old_path| is_installer_runner(old_path, project_root, abs_runner))
+                    {
                         continue;
                     }
                     owned = true;
@@ -976,8 +1131,16 @@ fn wire_codex_hooks(
                 if hook.get("commandWindows").is_none() {
                     hook["commandWindows"] = Value::String(cmd_windows.clone());
                 }
-                present = true;
+                if this_slot {
+                    present = true;
+                }
             }
+        }
+        if !present
+            && first_slot
+            && config_toml_wires_runner(&toml, project_root, abs_runner, event)
+        {
+            present = true;
         }
         if !present {
             let hook_entry = json!({
@@ -1001,20 +1164,60 @@ fn wire_codex_hooks(
     }
     // hooks.json is untracked and carries an absolute runner path. Keep it
     // out of a commit by listing it in the checkout's local exclude file
-    // (#368 F10). Best effort: a bare directory has no git, and a linked
-    // worktree's `.git` is a file pointing elsewhere.
-    exclude_codex_hooks(project_root);
+    // (#368 F10). Best effort: a bare directory has no git.
+    exclude_local_file(project_root, ".codex/hooks.json");
     Some(hooks_path.to_string_lossy().to_string())
 }
 
-/// Add `/.codex/hooks.json` to this checkout's `.git/info/exclude` once.
-fn exclude_codex_hooks(project_root: &Path) {
-    let git_dir = project_root.join(".git");
-    if git_dir.is_file() {
-        return;
+/// The first event in a hooks object whose list is not an array. Codex and
+/// Copilot CLI each parse the hooks file as a whole, so one such list
+/// disables every hook in the file (Copilot's hooks reference: "a non-array
+/// event list" rejects "the entire file"). The installer then leaves the
+/// file as it is rather than add hooks that would never run.
+fn non_array_hook_list(hooks: &serde_json::Map<String, Value>) -> Option<&str> {
+    hooks
+        .iter()
+        .find(|(_, list)| !list.is_array())
+        .map(|(event, _)| event.as_str())
+}
+
+/// Warn when a harness config beside a hooks file was not written: the hooks
+/// still run, and the runner takes the namespace from the project marker or
+/// discovers it.
+fn warn_unwritten_config(written: Option<String>, cfg_path: &Path, warnings: &mut Vec<String>) {
+    if written.is_none() {
+        warnings.push(format!(
+            "{} could not be written; the hook runner takes the namespace from the project marker or discovers it",
+            cfg_path.display()
+        ));
     }
-    let exclude = git_dir.join("info").join("exclude");
-    if refuse_symlink_components(project_root, &exclude).is_err() {
+}
+
+/// Add `/<rel>` to this checkout's `.git/info/exclude` once (`rel` is a path
+/// relative to the checkout, with `/` separators). A linked worktree's
+/// `.git` is a file; git reads `info/exclude` from the common git directory
+/// every worktree shares ([`crate::paths::common_git_dir`]), so the entry
+/// goes there and covers each worktree's own copy of the file. A folder
+/// that is not a git checkout gets no exclude file.
+fn exclude_local_file(project_root: &Path, rel: &str) {
+    let dot_git = project_root.join(".git");
+    let (exclude, symlink_root) = if dot_git.is_file() {
+        let Some(common) = crate::paths::common_git_dir(&project_root.to_string_lossy()) else {
+            return;
+        };
+        let common = PathBuf::from(common);
+        (common.join("info").join("exclude"), common)
+    } else if dot_git.is_dir() {
+        (
+            dot_git.join("info").join("exclude"),
+            project_root.to_path_buf(),
+        )
+    } else {
+        // Not a git checkout: creating `.git/info` here would make the folder
+        // look like a repository root to every `.git` probe.
+        return;
+    };
+    if refuse_symlink_components(&symlink_root, &exclude).is_err() {
         return;
     }
     if let Some(parent) = exclude.parent() {
@@ -1022,10 +1225,11 @@ fn exclude_codex_hooks(project_root: &Path) {
             return;
         }
     }
+    let anchored = format!("/{rel}");
     let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
     if existing
         .lines()
-        .any(|line| matches!(line.trim(), "/.codex/hooks.json" | ".codex/hooks.json"))
+        .any(|line| line.trim() == anchored || line.trim() == rel)
     {
         return;
     }
@@ -1033,224 +1237,238 @@ fn exclude_codex_hooks(project_root: &Path) {
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push('\n');
     }
-    updated.push_str("/.codex/hooks.json\n");
+    updated.push_str(&anchored);
+    updated.push('\n');
     let _ = write_atomically(&exclude, &updated);
 }
 
-/// Read a POSIX-shell single-quoted word independently of the installer's
-/// platform. GitHub CLI's `bash` command must stay valid when a Windows
-/// installer writes the shared hook file.
-fn sh_literal_value(text: &str) -> Option<(String, &str)> {
-    let mut rest = text.strip_prefix('\'')?;
-    let mut value = String::new();
-    loop {
-        let close = rest.find('\'')?;
-        value.push_str(&rest[..close]);
-        rest = &rest[close + 1..];
-        match rest.strip_prefix(r"\''") {
-            Some(after) => {
-                value.push('\'');
-                rest = after;
-            }
-            None => return Some((value, rest)),
-        }
-    }
+/// The Copilot CLI hooks file the installer owns. Copilot CLI loads every
+/// `.github/hooks/*.json` of the repository (`enableFileHooks`: "repository-
+/// origin file hooks from `.github/hooks/`"), so NeuroStrata keeps its own
+/// file there instead of editing one of the user's.
+const COPILOT_HOOKS_REL: &str = ".github/hooks/neurostrata.json";
+
+/// The Copilot CLI hook events the installer wires (camelCase, hooks file
+/// version 1). sessionStart lets the runner inject the session file;
+/// sessionEnd and preCompact let it write the handoff note. postToolUse lets
+/// it deliver the session-start text a slow start missed and left-out rules:
+/// its `additionalContext` is appended to the tool result, while a preToolUse
+/// reply carries no text on an allowed call. preToolUse and postToolUse are
+/// wired only for a bundle that handles them ([`copilot_hook_events`]).
+const COPILOT_HOOK_EVENTS: [&str; 5] = [
+    "sessionStart",
+    "preToolUse",
+    "postToolUse",
+    "sessionEnd",
+    "preCompact",
+];
+
+/// The Copilot events wired for the plugin bundle the installer ships:
+/// preToolUse only when the bundle exports `copilotPreToolUseReply`, and
+/// postToolUse only when it exports `handlePostToolUseEvent`. A bundle
+/// without the first answers preToolUse in a shape Copilot ignores; without
+/// the second the runner answers `{}`. Either way the hook would only start
+/// node on every tool call.
+fn copilot_hook_events(bundle: &str) -> impl Iterator<Item = &'static str> + '_ {
+    COPILOT_HOOK_EVENTS
+        .into_iter()
+        .filter(move |event| match *event {
+            "preToolUse" => bundle_exports(bundle, "copilotPreToolUseReply"),
+            "postToolUse" => bundle_exports(bundle, "handlePostToolUseEvent"),
+            _ => true,
+        })
 }
 
-/// GitHub CLI always runs `bash` through a POSIX shell and `powershell`
-/// through PowerShell, regardless of which platform generated the file.
-fn github_cli_hook_commands(abs_runner: &str) -> (String, String) {
-    (
-        format!("node '{}'", abs_runner.replace('\'', r"'\''")),
-        format!("node '{}'", abs_runner.replace('\'', "''")),
-    )
+/// Whether a plugin bundle exports `name` as a top-level `export function`,
+/// `export async function`, `export const` or `export let` declaration (the
+/// bundles are tsc output and declare every export that way).
+fn bundle_exports(bundle: &str, name: &str) -> bool {
+    bundle.lines().any(|line| {
+        let Some(rest) = line.strip_prefix("export ") else {
+            return false;
+        };
+        let rest = rest.strip_prefix("async ").unwrap_or(rest);
+        ["function ", "const ", "let "].iter().any(|kind| {
+            rest.strip_prefix(kind)
+                .and_then(|declared| declared.strip_prefix(name))
+                .is_some_and(|tail| {
+                    !tail.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$')
+                })
+        })
+    })
 }
 
-/// Whether a GitHub hook command names this project's canonical runner. A
-/// missing runner is repairable only at the installer's harness-specific
-/// location; an existing foreign runner is never claimed.
-fn is_installer_github_cli_runner(path: &str, project_root: &Path, abs_runner: &str) -> bool {
-    if path_key(path) == path_key(abs_runner)
-        || same_path_on_disk(&project_root.join(path).to_string_lossy(), abs_runner)
-    {
-        return true;
-    }
-    if path.contains(['$', '%']) || path.starts_with('~') {
-        return false;
-    }
-    if !matches!(project_root.join(path).try_exists(), Ok(false)) {
-        return false;
-    }
-    let folded = path.replace('\\', "/").to_ascii_lowercase();
-    let suffix = ".neurostrata/plugins/github-cli/cli-hook.mjs";
-    folded == suffix || folded.ends_with(&format!("/{suffix}"))
-}
+/// The environment variable that tells the runner which Copilot event it
+/// handles: Copilot's hook input does not name the event.
+const COPILOT_HOOK_EVENT_ENV: &str = "NEUROSTRATA_HOOK_EVENT";
 
-/// Merge GitHub CLI's native camelCase hooks while preserving foreign entries.
-/// Only commands running this project's canonical runner are repaired; the
-/// generated file is atomic and locally excluded because it embeds an absolute
-/// runner path.
-fn wire_github_cli_hooks(
+/// Add the NeuroStrata hooks ([`copilot_hook_events`] for `bundle`, the
+/// plugin bundle the runner loads) to [`COPILOT_HOOKS_REL`]: per event one
+/// `{"type": "command", "bash", "powershell", "env"}` entry running the
+/// runner (`bash` in `sh` quoting, `powershell` in PowerShell quoting, no
+/// namespace), with the event name in `env`. Other entries and keys stay; an
+/// entry running this project's runner is repaired in place, so nothing is
+/// added twice and a second run writes nothing. For an event the bundle does
+/// not handle, the runner's commands are removed instead (an entry left with
+/// no command is dropped, then an emptied list). A file that is unreadable,
+/// not an object, or of another `version` is left alone with a warning.
+/// `Some(path)` means the hooks are wired.
+fn wire_copilot_hooks(
     project_root: &Path,
     abs_runner: &str,
+    bundle: &str,
     warnings: &mut Vec<String>,
 ) -> Option<String> {
-    let path = project_root.join(".github/hooks/neurostrata.json");
-    if let Err(e) = refuse_symlink_components(project_root, &path) {
+    let hooks_path = project_root.join(COPILOT_HOOKS_REL);
+    if let Err(e) = refuse_symlink_components(project_root, &hooks_path) {
         warnings.push(format!(
-            "{} refused: {e}; no GitHub CLI hook was wired",
-            path.display()
+            "{} refused: {e}; no Copilot hook was wired",
+            hooks_path.display()
         ));
         return None;
     }
-    let mut doc: Value = match read_config(&path) {
+    let mut doc: Value = match read_config(&hooks_path) {
         Ok(Some(d)) if d.is_object() => d,
         Ok(Some(_)) => {
             warnings.push(format!(
-                "{} is not a JSON object; no GitHub CLI hook was wired",
-                path.display()
+                "{} is not a JSON object; no Copilot hook was wired",
+                hooks_path.display()
             ));
             return None;
         }
         Ok(None) => json!({}),
         Err(e) => {
-            warnings.push(format!("{e}; no GitHub CLI hook was wired"));
+            warnings.push(format!("{e}; no Copilot hook was wired"));
             return None;
         }
     };
     let obj = doc.as_object_mut()?;
-    obj.insert("version".to_string(), json!(1));
+    match obj.get("version") {
+        None => {
+            obj.insert("version".to_string(), json!(1));
+        }
+        Some(v) if v == &json!(1) => {}
+        Some(_) => {
+            warnings.push(format!(
+                "{} has a version other than 1; no Copilot hook was wired",
+                hooks_path.display()
+            ));
+            return None;
+        }
+    }
+    let bash = format!("node {}", posix_literal(abs_runner));
+    let powershell = format!("node {}", powershell_literal(abs_runner));
     let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
-    let Some(hooks_obj) = hooks.as_object_mut() else {
+    let Some(h_obj) = hooks.as_object_mut() else {
         warnings.push(format!(
-            "{} has a non-object hooks value; no GitHub CLI hook was wired",
-            path.display()
+            "{} has a non-object hooks value; no Copilot hook was wired",
+            hooks_path.display()
         ));
         return None;
     };
-    let (bash, powershell) = github_cli_hook_commands(abs_runner);
-    let mut all_wired = true;
-    for event in ["sessionStart", "preToolUse", "postToolUse", "agentStop"] {
-        let entries = hooks_obj.entry(event).or_insert_with(|| json!([]));
-        let Some(arr) = entries.as_array_mut() else {
-            warnings.push(format!(
-                "{} has a non-array {event} hook list; that event was left untouched",
-                path.display()
-            ));
-            all_wired = false;
-            continue;
-        };
-        let mut owned = Vec::new();
-        for (index, entry) in arr.iter_mut().enumerate() {
-            let Some(entry_obj) = entry.as_object_mut() else {
-                continue;
-            };
-            let env_event = entry_obj
-                .get("env")
-                .and_then(|env| env.get("NEUROSTRATA_HOOK_EVENT"))
-                .and_then(Value::as_str);
-            if env_event.is_some_and(|name| name != event) {
-                continue;
-            }
-            let mut recognized = false;
-            for (key, target) in [("bash", &bash), ("powershell", &powershell)] {
-                let Some(command) = entry_obj.get(key).and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some((runner, _)) = hook_command_runner(command) else {
-                    continue;
-                };
-                if is_installer_github_cli_runner(&runner, project_root, abs_runner) {
-                    recognized = true;
-                    entry_obj.insert(key.to_string(), Value::String(target.clone()));
-                }
-            }
-            if !recognized {
-                continue;
-            }
-            entry_obj.insert("type".to_string(), json!("command"));
-            entry_obj.insert("bash".to_string(), Value::String(bash.clone()));
-            entry_obj.insert("powershell".to_string(), Value::String(powershell.clone()));
-            entry_obj.insert("cwd".to_string(), json!("."));
-            entry_obj.insert("timeoutSec".to_string(), json!(10));
-            entry_obj.insert(
-                "env".to_string(),
-                json!({ "NEUROSTRATA_HOOK_EVENT": event }),
-            );
-            owned.push(index);
-        }
-        if owned.is_empty() {
-            arr.push(json!({
-                "type": "command",
-                "bash": bash,
-                "powershell": powershell,
-                "cwd": ".",
-                "timeoutSec": 10,
-                "env": { "NEUROSTRATA_HOOK_EVENT": event }
-            }));
-        } else if owned.len() > 1 {
-            let mut index = 0;
-            arr.retain(|_| {
-                let current = index;
-                index += 1;
-                !owned[1..].contains(&current)
-            });
-        }
-    }
-    let serialized = serde_json::to_string_pretty(&doc).ok()?;
-    let needs_write = std::fs::read_to_string(&path)
-        .map(|existing| existing != serialized)
-        .unwrap_or(true);
-    if needs_write {
-        if let Some(parent) = path.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
-                return None;
-            }
-        }
-        write_atomically(&path, &serialized).ok()?;
-    }
-    if !all_wired {
+    if let Some(event) = non_array_hook_list(h_obj) {
         warnings.push(format!(
-            "{} was only partially wired; check its native hook arrays",
-            path.display()
+            "{} has a non-array {event} hook list, which disables the whole file; no Copilot hook was wired",
+            hooks_path.display()
         ));
         return None;
     }
-    exclude_github_cli_hooks(project_root);
-    Some(path.to_string_lossy().to_string())
-}
-
-/// Keep the generated GitHub CLI hook file, which contains an absolute runner
-/// path, out of commits just like Codex's generated hooks file.
-fn exclude_github_cli_hooks(project_root: &Path) {
-    let git_dir = project_root.join(".git");
-    if git_dir.is_file() {
-        return;
-    }
-    let exclude = git_dir.join("info").join("exclude");
-    if refuse_symlink_components(project_root, &exclude).is_err() {
-        return;
-    }
-    if let Some(parent) = exclude.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
+    let runs_ours = |command: &str| {
+        hook_command_runners(command).iter().any(|path| {
+            is_installer_runner(path, project_root, abs_runner)
+                || runner_is_installers_hook(path, project_root, abs_runner)
+        })
+    };
+    let wired: Vec<&str> = copilot_hook_events(bundle).collect();
+    for event in COPILOT_HOOK_EVENTS {
+        if !wired.contains(&event) {
+            let Some(entries) = h_obj.get_mut(event).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let had = entries.len();
+            entries.retain_mut(|entry| {
+                let Some(fields) = entry.as_object_mut() else {
+                    return true;
+                };
+                let before = fields.len();
+                fields.retain(|key, command| {
+                    !(matches!(key.as_str(), "bash" | "powershell")
+                        && command.as_str().is_some_and(runs_ours))
+                });
+                before == fields.len()
+                    || fields.contains_key("bash")
+                    || fields.contains_key("powershell")
+            });
+            if had > 0 && entries.is_empty() {
+                h_obj.remove(event);
+            }
+            continue;
+        }
+        let Some(entries) = h_obj
+            .entry(event)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+        else {
+            continue;
+        };
+        let mut present = false;
+        for entry in entries.iter_mut() {
+            if !entry.is_object() {
+                continue;
+            }
+            // As for Codex: only a command that runs this project's runner
+            // is rewritten; a user's own command in the other shell's key
+            // stays, and a missing key is filled once the entry is ours.
+            let mut owned = false;
+            for (key, target) in [("bash", &bash), ("powershell", &powershell)] {
+                let Some(command) = entry.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                if !runs_ours(command) {
+                    continue;
+                }
+                owned = true;
+                if command != target.as_str() {
+                    entry[key] = json!(target);
+                }
+            }
+            if !owned {
+                continue;
+            }
+            for (key, target) in [("bash", &bash), ("powershell", &powershell)] {
+                if entry.get(key).is_none() {
+                    entry[key] = json!(target);
+                }
+            }
+            entry["type"] = json!("command");
+            if !entry.get("env").is_some_and(Value::is_object) {
+                entry["env"] = json!({});
+            }
+            entry["env"][COPILOT_HOOK_EVENT_ENV] = json!(event);
+            present = true;
+        }
+        if !present {
+            entries.push(json!({
+                "type": "command",
+                "bash": bash,
+                "powershell": powershell,
+                "env": { (COPILOT_HOOK_EVENT_ENV): event }
+            }));
         }
     }
-    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if existing.lines().any(|line| {
-        matches!(
-            line.trim(),
-            "/.github/hooks/neurostrata.json" | ".github/hooks/neurostrata.json"
-        )
-    }) {
-        return;
+    let serialized = serde_json::to_string_pretty(&doc).ok()?;
+    let needs_write = std::fs::read_to_string(&hooks_path)
+        .map(|existing| existing != serialized)
+        .unwrap_or(true);
+    if needs_write {
+        if let Some(parent) = hooks_path.parent() {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        write_atomically(&hooks_path, &serialized).ok()?;
     }
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str("/.github/hooks/neurostrata.json\n");
-    let _ = write_atomically(&exclude, &updated);
+    // The file carries an absolute runner path: keep it out of commits.
+    exclude_local_file(project_root, COPILOT_HOOKS_REL);
+    Some(hooks_path.to_string_lossy().to_string())
 }
 
 fn has_any_env(keys: &[&str]) -> bool {
@@ -2743,7 +2961,7 @@ fn wire_harness_config(
                                     h_obj,
                                     "PreToolUse",
                                     Some(CLAUDE_FILE_TOOLS_MATCHER),
-                                    |m| m != Some(CLAUDE_SESSION_SCOPE_MATCHER),
+                                    |m| m != Some(SESSION_SCOPE_MATCHER),
                                     &cmd,
                                     &runs,
                                 );
@@ -2753,8 +2971,8 @@ fn wire_harness_config(
                                 ensure_claude_hook(
                                     h_obj,
                                     "PreToolUse",
-                                    Some(CLAUDE_SESSION_SCOPE_MATCHER),
-                                    |m| m == Some(CLAUDE_SESSION_SCOPE_MATCHER),
+                                    Some(SESSION_SCOPE_MATCHER),
+                                    |m| m == Some(SESSION_SCOPE_MATCHER),
                                     &cmd,
                                     &runs,
                                 );
@@ -2777,6 +2995,12 @@ fn wire_harness_config(
                                     &runs,
                                 );
                                 ensure_claude_hook(h_obj, "Stop", None, |_| true, &cmd, &runs);
+                                // SessionEnd and PreCompact let the runner write the
+                                // handoff note before the session ends or its
+                                // context is compacted.
+                                for event in ["SessionEnd", "PreCompact"] {
+                                    ensure_claude_hook(h_obj, event, None, |_| true, &cmd, &runs);
+                                }
                             }
                             // An older installer wrote a matcher without
                             // NotebookEdit, so notebook edits skipped the
@@ -2864,17 +3088,17 @@ fn wire_harness_config(
                     }),
                     namespace.as_deref(),
                 );
-                let _ = write_json_if_changed(&cfg_path, &doc);
+                warn_unwritten_config(write_json_if_changed(&cfg_path, &doc), &cfg_path, warnings);
                 // Codex CLI never reads the metadata file: it runs hooks from
                 // `.codex/hooks.json` (or `[hooks]` in config.toml). Report
                 // only a hook that was actually wired, never the metadata as
                 // a fallback; say so loudly when wiring failed (#368 F6).
                 let hooks_wired = wire_codex_hooks(project_root, abs_runner, warnings);
                 if hooks_wired.is_none() {
-                    warnings.push(format!(
-                        "Codex metadata {} was written but no Codex hook was wired; check .codex/hooks.json and .codex/config.toml",
-                        cfg_path.display()
-                    ));
+                    warnings.push(
+                        "no Codex hook was wired; check .codex/hooks.json and .codex/config.toml"
+                            .to_string(),
+                    );
                 }
                 return hooks_wired;
             }
@@ -2914,12 +3138,16 @@ fn wire_harness_config(
                     }),
                     namespace.as_deref(),
                 );
-                let _ = write_json_if_changed(&cfg_path, &doc);
-                let hooks_wired = wire_github_cli_hooks(project_root, abs_runner, warnings);
+                warn_unwritten_config(write_json_if_changed(&cfg_path, &doc), &cfg_path, warnings);
+                // Copilot CLI never reads the extension file: it runs hooks
+                // from `.github/hooks/*.json`. Report only a hook that was
+                // actually wired, as for Codex.
+                let hooks_wired =
+                    wire_copilot_hooks(project_root, abs_runner, GITHUB_CLI_INDEX_JS, warnings);
                 if hooks_wired.is_none() {
                     warnings.push(format!(
-                        "GitHub CLI metadata {} was written but no native GitHub CLI hook was wired; check .github/hooks/neurostrata.json",
-                        cfg_path.display()
+                        "no Copilot hook was wired; check {}",
+                        project_root.join(COPILOT_HOOKS_REL).display()
                     ));
                 }
                 return hooks_wired;
@@ -4185,7 +4413,7 @@ mod tests {
                     LEGACY_CLAUDE_PRE_TOOL_USE_MATCHER.to_string(),
                     "echo user-hook".to_string()
                 ),
-                (CLAUDE_SESSION_SCOPE_MATCHER.to_string(), ours.clone()),
+                (SESSION_SCOPE_MATCHER.to_string(), ours.clone()),
             ],
             "only the installer's own entry is widened; session-scope stays"
         );
@@ -4450,7 +4678,7 @@ mod tests {
             .expect("cli_hook_runner");
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 5, "{commands:?}");
+        assert_eq!(commands.len(), 7, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "missing runner not repaired: {commands:?}"
@@ -4482,7 +4710,7 @@ mod tests {
             json!({"id": "neurostrata-claude", "namespace": "example-project"})
         );
         let commands = hook_commands(&tmp.path().join(".claude/settings.local.json"));
-        assert_eq!(commands.len(), 5, "{commands:?}");
+        assert_eq!(commands.len(), 7, "{commands:?}");
         let want = format!("node \"{abs_runner}\"");
         assert!(commands.iter().all(|c| *c == want), "{commands:?}");
         assert_eq!(
@@ -4531,7 +4759,7 @@ mod tests {
         assert_eq!(claude_config(&dir)["namespace"], "example-project");
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 5, "{commands:?}");
+        assert_eq!(commands.len(), 7, "{commands:?}");
         assert!(commands.iter().all(|c| *c == want), "{commands:?}");
     }
 
@@ -4583,7 +4811,7 @@ mod tests {
             .as_str()
             .unwrap();
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 5, "{commands:?}");
+        assert_eq!(commands.len(), 7, "{commands:?}");
         assert!(
             commands
                 .iter()
@@ -4619,7 +4847,7 @@ mod tests {
             .as_str()
             .unwrap();
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 5, "{commands:?}");
+        assert_eq!(commands.len(), 7, "{commands:?}");
         assert!(
             commands
                 .iter()
@@ -4768,9 +4996,17 @@ mod tests {
             .collect();
         assert_eq!(
             matchers,
-            vec![CLAUDE_PRE_TOOL_USE_MATCHER, CLAUDE_SESSION_SCOPE_MATCHER]
+            vec![CLAUDE_PRE_TOOL_USE_MATCHER, SESSION_SCOPE_MATCHER]
         );
         assert!(entries("Stop").iter().any(runs_ours));
+        for event in ["SessionEnd", "PreCompact"] {
+            let list = entries(event);
+            assert_eq!(list.len(), 1, "{event}: {list:?}");
+            assert!(
+                runs_ours(&list[0]) && list[0].get("matcher").is_none(),
+                "{event}"
+            );
+        }
         // A second install adds nothing.
         let before = std::fs::read_to_string(&cfg).unwrap();
         auto_install_detected_plugins(
@@ -4840,7 +5076,7 @@ mod tests {
         );
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 5, "{commands:?}");
+        assert_eq!(commands.len(), 6, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "own verbatim runner not repaired: {commands:?}"
@@ -4887,7 +5123,7 @@ mod tests {
         );
         let want = format!("node \"{abs_runner}\"");
         let commands = hook_commands(&cfg);
-        assert_eq!(commands.len(), 5, "{commands:?}");
+        assert_eq!(commands.len(), 6, "{commands:?}");
         assert!(
             commands.iter().all(|c| *c == want),
             "own runner in other case not repaired: {commands:?}"
@@ -5375,11 +5611,26 @@ mod tests {
 
         let doc = read_codex_hooks(tmp.path());
         let pre = doc["hooks"]["PreToolUse"].as_array().expect("PreToolUse");
-        assert_eq!(pre.len(), 1);
+        assert_eq!(pre.len(), 2);
         assert_eq!(pre[0]["matcher"], json!("apply_patch|Bash"));
+        // NeuroStrata's own MCP calls (Codex names them mcp__<server>__<tool>).
+        assert_eq!(pre[1]["matcher"], json!(SESSION_SCOPE_MATCHER));
         assert_eq!(pre[0]["hooks"][0]["type"], json!("command"));
-        assert_eq!(codex_commands(&doc, "PreToolUse"), vec![expected.clone()]);
+        assert_eq!(
+            codex_commands(&doc, "PreToolUse"),
+            vec![expected.clone(), expected.clone()]
+        );
         assert_eq!(codex_commands(&doc, "Stop"), vec![expected.clone()]);
+        // The session-start injection and the handoff write (session file
+        // contract) run on these, with no matcher.
+        for event in ["SessionStart", "SessionEnd", "PreCompact"] {
+            assert_eq!(
+                codex_commands(&doc, event),
+                vec![expected.clone()],
+                "{event}"
+            );
+            assert!(doc["hooks"][event][0].get("matcher").is_none(), "{event}");
+        }
         // No namespace in the command: the callers that refresh it only have
         // a folder-name guess, and PowerShell cannot run a NAME=value prefix.
         assert!(!expected.contains("TestProj") && !expected.contains("NEUROSTRATA_NAMESPACE="));
@@ -5437,13 +5688,19 @@ mod tests {
         let doc = read_codex_hooks(tmp.path());
         assert_eq!(
             codex_commands(&doc, "PreToolUse"),
-            vec!["echo user-hook".to_string(), stale, expected.clone()],
-            "user hook kept, foreign runner untouched, ours added once"
+            vec![
+                "echo user-hook".to_string(),
+                stale,
+                expected.clone(),
+                expected.clone()
+            ],
+            "user hook kept, foreign runner untouched, ours added once per entry"
         );
         assert_eq!(codex_commands(&doc, "Stop"), vec![expected.clone()]);
         assert_eq!(
             codex_commands(&doc, "SessionStart"),
-            vec!["echo start".to_string(), expected]
+            vec!["echo start".to_string(), expected],
+            "the user's SessionStart hook kept, ours added beside it"
         );
         assert_eq!(doc["other"], json!(true));
 
@@ -5561,7 +5818,7 @@ mod tests {
         let doc = read_codex_hooks(tmp.path());
         assert_eq!(
             codex_commands(&doc, "PreToolUse"),
-            vec![custom, ours.clone()],
+            vec![custom, ours.clone(), ours.clone()],
             "the user command keeps its suffix"
         );
         assert_eq!(codex_commands(&doc, "Stop"), vec![ours]);
@@ -5638,14 +5895,221 @@ mod tests {
         let doc = read_codex_hooks(tmp.path());
         assert_eq!(
             codex_commands(&doc, "PreToolUse"),
-            vec![user_policy, moved.clone(), ours.clone()],
-            "user hook kept as written; foreign runner kept; ours added once"
+            vec![user_policy, moved.clone(), ours.clone(), ours.clone()],
+            "user hook kept as written; foreign runner kept; ours added once per entry"
         );
         assert_eq!(
             codex_commands(&doc, "Stop"),
             vec![moved, ours],
             "foreign Stop hook kept as written; ours added beside it"
         );
+    }
+
+    /// The installed runner works with a plugin build that has no session
+    /// handlers (merged in either order): it answers `{}` on a session event
+    /// the bundle cannot handle, since that bundle's default reply carries a
+    /// permission decision Codex's SessionStart and PreCompact output schemas
+    /// reject (`additionalProperties: false`, Codex 0.170). A failed session
+    /// event also answers `{}`, and Copilot gets its top-level deny shape.
+    #[test]
+    fn runner_answers_session_events_an_older_plugin_cannot_handle() {
+        for needle in [
+            "typeof mod.handleSessionStartEvent === \"function\"",
+            "typeof mod.writeSessionHandoff === \"function\"",
+            "process.env.NEUROSTRATA_HOOK_EVENT",
+            "if (noDecisionEvent && !handled) {\n    await writeStdout(\"{}\");",
+            "JSON.stringify({ permissionDecision: \"deny\", permissionDecisionReason: `NeuroStrata hook runner failed: ${reason}` })",
+        ] {
+            assert!(CLI_HOOK_RUNNER_MJS.contains(needle), "{needle}");
+        }
+    }
+
+    /// Runs the installed runner under node with a stand-in plugin bundle.
+    /// The hook input names `named` in `hook_event_name` (Claude, Codex);
+    /// `copilot` goes into `NEUROSTRATA_HOOK_EVENT` (Copilot names its event
+    /// only there). `flags` become env variables the bundle reads. Returns
+    /// the reply and the exit code; `None` when node is not installed.
+    fn run_installed_runner(
+        named: Option<&str>,
+        copilot: Option<&str>,
+        flags: &[&str],
+    ) -> Option<(Value, i32)> {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("github-cli");
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join("cli-hook.mjs"), CLI_HOOK_RUNNER_MJS).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"type": "module"}"#).unwrap();
+        // HANDLERS exports every handler a newer bundle has; THROW fails the
+        // handler; THROW_EARLY fails the project folder lookup, before the
+        // plugin is initialized.
+        std::fs::write(
+            dir.join("dist/index.js"),
+            r#"const on = (name) => Boolean(process.env[name]);
+const marker = on("HANDLERS") ? async () => ({}) : undefined;
+export const handleSessionStartEvent = marker;
+export const writeSessionHandoff = marker;
+export const handlePostToolUseEvent = marker;
+export const resolveHookProjectDir = on("THROW_EARLY")
+  ? () => { throw new Error("early"); }
+  : undefined;
+export async function handleHookEvent() {
+  if (on("THROW")) throw new Error("boom");
+  return { ran: "handleHookEvent" };
+}
+export default {};
+"#,
+        )
+        .unwrap();
+        let mut command = std::process::Command::new("node");
+        command
+            .arg(dir.join("cli-hook.mjs"))
+            .current_dir(tmp.path())
+            .env_remove("NEUROSTRATA_HOOK_EVENT")
+            .env_remove("NEUROSTRATA_NAMESPACE")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(event) = copilot {
+            command.env("NEUROSTRATA_HOOK_EVENT", event);
+        }
+        for name in ["HANDLERS", "THROW", "THROW_EARLY"] {
+            command.env_remove(name);
+        }
+        for flag in flags {
+            command.env(flag, "1");
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                eprintln!("skipped: node is not installed");
+                return None;
+            }
+        };
+        let mut input = json!({
+            "sessionId": "s1",
+            "timestamp": 1,
+            "cwd": tmp.path().to_string_lossy(),
+            "toolName": "bash",
+            "toolArgs": "{}"
+        });
+        if let Some(event) = named {
+            input["hook_event_name"] = json!(event);
+        }
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let reply = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!(
+                "{named:?} {copilot:?} {flags:?}: stdout {stdout:?} is not JSON ({e}); stderr {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        Some((reply, out.status.code().unwrap_or(-1)))
+    }
+
+    /// Merged before the plugin handles postToolUse, the runner answers `{}`
+    /// to it instead of running the bundle's PreToolUse work a second time;
+    /// a bundle that exports `handlePostToolUseEvent` gets it through
+    /// `handleHookEvent`. A failed event replies in its own shape: Stop gets
+    /// `{}` with exit code 2 (a block for Claude Code), PreToolUse a deny (an
+    /// unnamed event counts as one), and every other event `{}`.
+    #[test]
+    fn installed_runner_replies_in_the_shape_of_the_event() {
+        let ran = json!({ "ran": "handleHookEvent" });
+        let empty = json!({});
+        let cases: [(Option<&str>, Option<&str>, &[&str], &Value, i32); 16] = [
+            (None, Some("postToolUse"), &[], &empty, 0),
+            (None, Some("postToolUse"), &["HANDLERS"], &ran, 0),
+            (None, Some("postToolUse"), &["HANDLERS", "THROW"], &empty, 0),
+            (
+                None,
+                Some("postToolUse"),
+                &["HANDLERS", "THROW_EARLY"],
+                &empty,
+                0,
+            ),
+            (None, Some("preToolUse"), &[], &ran, 0),
+            (
+                None,
+                Some("sessionEnd"),
+                &["HANDLERS", "THROW_EARLY"],
+                &empty,
+                0,
+            ),
+            (None, Some("sessionEnd"), &["HANDLERS"], &ran, 0),
+            (Some("SessionStart"), None, &["HANDLERS"], &ran, 0),
+            (Some("PreCompact"), None, &["HANDLERS"], &ran, 0),
+            (
+                None,
+                Some("sessionStart"),
+                &["HANDLERS", "THROW"],
+                &empty,
+                0,
+            ),
+            (Some("PreCompact"), None, &[], &empty, 0),
+            (Some("PreCompact"), None, &["HANDLERS", "THROW"], &empty, 0),
+            (Some("PostToolUse"), None, &[], &empty, 0),
+            (Some("SubagentStop"), None, &["THROW"], &empty, 0),
+            (Some("Stop"), None, &["THROW"], &empty, 2),
+            (Some("Stop"), None, &[], &ran, 0),
+        ];
+        for (named, copilot, flags, expected, code) in cases {
+            let Some((reply, status)) = run_installed_runner(named, copilot, flags) else {
+                return;
+            };
+            assert_eq!(
+                (&reply, status),
+                (expected, code),
+                "{named:?} {copilot:?} {flags:?}"
+            );
+        }
+        // Copilot reads a top-level decision on preToolUse (with the package
+        // runners' reason); the others read hookSpecificOutput. A deny has
+        // no other field: Codex rejects one (such as `continue`) on
+        // PreToolUse.
+        let copilot_deny = |reason: &str| {
+            json!({
+                "permissionDecision": "deny",
+                "permissionDecisionReason": format!("NeuroStrata hook runner failed: {reason}")
+            })
+        };
+        let deny = json!({ "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Error: boom"
+        }});
+        let denies: [(Option<&str>, Option<&str>, &[&str], Value); 4] = [
+            (
+                None,
+                Some("preToolUse"),
+                &["THROW"],
+                copilot_deny("Error: boom"),
+            ),
+            (
+                None,
+                Some("preToolUse"),
+                &["THROW_EARLY"],
+                copilot_deny("Error: early"),
+            ),
+            (Some("PreToolUse"), None, &["THROW"], deny.clone()),
+            (None, None, &["THROW"], deny),
+        ];
+        for (named, copilot, flags, expected) in denies {
+            let Some((reply, status)) = run_installed_runner(named, copilot, flags) else {
+                return;
+            };
+            assert_eq!(
+                (&reply, status),
+                (&expected, 0),
+                "{named:?} {copilot:?} {flags:?}"
+            );
+        }
     }
 
     // ---- issue #382 regressions ----
@@ -5667,7 +6131,7 @@ mod tests {
             .as_str()
             .expect("runner");
         let doc = read_codex_hooks(tmp.path());
-        for event in ["PreToolUse", "Stop"] {
+        for (event, _) in CODEX_HOOK_EVENTS {
             let hook = &doc["hooks"][event][0]["hooks"][0];
             assert_eq!(
                 hook["command"],
@@ -5780,9 +6244,11 @@ mod tests {
             ConfigNamespace::Set("TestProj"),
             Some("codex"),
         );
+        // The repaired entry has no matcher, so it stands for the file-tool
+        // entry; the session-scope entry is added beside it.
         assert_eq!(
             codex_commands(&read_codex_hooks(tmp.path()), "PreToolUse"),
-            vec![ours.clone()]
+            vec![ours.clone(), ours.clone()]
         );
 
         // A `[hooks.pre_tool_use]` entry in config.toml covers PreToolUse;
@@ -5802,7 +6268,10 @@ mod tests {
             Some("codex"),
         );
         let doc = read_codex_hooks(tmp.path());
-        assert!(doc["hooks"]["PreToolUse"].as_array().unwrap().is_empty());
+        // The TOML entry stands for the file-tool entry only.
+        let pre = doc["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1, "{doc}");
+        assert_eq!(pre[0]["matcher"], json!(SESSION_SCOPE_MATCHER));
         assert_eq!(codex_commands(&doc, "Stop"), vec![ours]);
     }
 
@@ -5838,11 +6307,11 @@ mod tests {
             Some("codex"),
         );
         let doc = read_codex_hooks(tmp.path());
-        for event in ["PreToolUse", "Stop"] {
+        for (event, entries) in [("PreToolUse", 2), ("Stop", 1)] {
             let hook = &doc["hooks"][event][0]["hooks"][0];
             assert_eq!(hook["command"], json!(cmd), "{event}");
             assert_eq!(hook["commandWindows"], json!(cmd_windows), "{event}");
-            assert_eq!(codex_commands(&doc, event).len(), 1, "{event}");
+            assert_eq!(codex_commands(&doc, event).len(), entries, "{event}");
         }
     }
 
@@ -5881,7 +6350,540 @@ mod tests {
             Some("codex"),
         );
         let doc = read_codex_hooks(tmp.path());
-        assert_eq!(codex_commands(&doc, "PreToolUse"), vec![ours]);
+        assert_eq!(codex_commands(&doc, "PreToolUse"), vec![ours.clone(), ours]);
+    }
+
+    fn read_copilot_hooks(root: &Path) -> Value {
+        let raw = std::fs::read_to_string(root.join(COPILOT_HOOKS_REL)).expect("read hooks file");
+        serde_json::from_str(&raw).expect("parse hooks file")
+    }
+
+    /// Copilot CLI runs hooks only from `.github/hooks/*.json`; the
+    /// extension file alone never ran anything.
+    #[test]
+    fn github_cli_install_wires_copilot_hooks_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".github")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git/info")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("github-cli"),
+        );
+        let entry = &report["installed_plugins"][0];
+        assert_eq!(entry["harness"], json!("github-cli"), "{report}");
+        let runner = entry["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let path = tmp.path().join(COPILOT_HOOKS_REL);
+        assert_eq!(entry["config_wired"], json!(path.to_string_lossy()));
+        assert!(tmp
+            .path()
+            .join(".NeuroStrata/plugins/github-cli/copilot-extension.json")
+            .exists());
+
+        let doc = read_copilot_hooks(tmp.path());
+        assert_eq!(doc["version"], json!(1));
+        let mut events: Vec<&str> = doc["hooks"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        events.sort_unstable();
+        let wired: Vec<&str> = copilot_hook_events(GITHUB_CLI_INDEX_JS).collect();
+        let mut expected = wired.clone();
+        expected.sort_unstable();
+        assert_eq!(events, expected, "{doc}");
+        for event in wired {
+            assert_eq!(
+                doc["hooks"][event],
+                json!([{
+                    "type": "command",
+                    "bash": format!("node {}", posix_literal(&runner)),
+                    "powershell": format!("node {}", powershell_literal(&runner)),
+                    "env": { "NEUROSTRATA_HOOK_EVENT": event }
+                }]),
+                "{event}"
+            );
+        }
+
+        // A second run leaves the file as it is and excludes it only once.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("github-cli"),
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            exclude.matches("/.github/hooks/neurostrata.json").count(),
+            1,
+            "{exclude}"
+        );
+    }
+
+    /// The installer's file keeps the user's entries and keys; its own entry
+    /// is repaired in place (old quoting, extra env kept), never duplicated.
+    /// A file that is not a version 1 JSON object is left alone.
+    #[test]
+    fn copilot_hooks_file_merges_and_keeps_user_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".github")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("github-cli"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let bash = format!("node {}", posix_literal(&runner));
+        let powershell = format!("node {}", powershell_literal(&runner));
+        let path = tmp.path().join(COPILOT_HOOKS_REL);
+        let user_entry = json!({ "type": "command", "bash": "echo hi", "powershell": "echo hi" });
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "hooks": {
+                    "sessionStart": [user_entry.clone()],
+                    "preCompact": [{
+                        "type": "command",
+                        "bash": format!("env NEUROSTRATA_NAMESPACE=x {bash}"),
+                        "env": { "KEEP": "1" },
+                        "timeoutSec": 10
+                    }],
+                    "sessionEnd": [{
+                        "type": "command",
+                        "bash": bash,
+                        "powershell": "echo custom"
+                    }],
+                    "postToolUse": [user_entry.clone()]
+                },
+                "other": true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let _ = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("github-cli"),
+        );
+        let doc = read_copilot_hooks(tmp.path());
+        let ours = |event: &str| {
+            json!({
+                "type": "command",
+                "bash": bash,
+                "powershell": powershell,
+                "env": { "NEUROSTRATA_HOOK_EVENT": event }
+            })
+        };
+        assert_eq!(
+            doc["hooks"]["sessionStart"],
+            json!([user_entry.clone(), ours("sessionStart")])
+        );
+        assert_eq!(
+            doc["hooks"]["preCompact"],
+            json!([{
+                "type": "command",
+                "bash": bash,
+                "powershell": powershell,
+                "env": { "KEEP": "1", "NEUROSTRATA_HOOK_EVENT": "preCompact" },
+                "timeoutSec": 10
+            }])
+        );
+        // A user's own command in the other shell's key is kept.
+        assert_eq!(
+            doc["hooks"]["sessionEnd"],
+            json!([{
+                "type": "command",
+                "bash": bash,
+                "powershell": "echo custom",
+                "env": { "NEUROSTRATA_HOOK_EVENT": "sessionEnd" }
+            }])
+        );
+        // postToolUse gets our entry only when the shipped bundle handles it.
+        let post_tool_use = if bundle_exports(GITHUB_CLI_INDEX_JS, "handlePostToolUseEvent") {
+            json!([user_entry.clone(), ours("postToolUse")])
+        } else {
+            json!([user_entry.clone()])
+        };
+        assert_eq!(doc["hooks"]["postToolUse"], post_tool_use);
+        assert_eq!(doc["other"], json!(true));
+
+        for left_alone in ["not json", r#"{"version": 2, "hooks": {}}"#] {
+            std::fs::write(&path, left_alone).unwrap();
+            let report = auto_install_detected_plugins(
+                tmp.path(),
+                ConfigNamespace::Set("TestProj"),
+                Some("github-cli"),
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), left_alone);
+            assert!(
+                report["installed_plugins"][0]["config_wired"].is_null(),
+                "{report}"
+            );
+            assert!(
+                report["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|w| w.as_str().is_some_and(|s| s.contains("no Copilot hook"))),
+                "{report}"
+            );
+        }
+    }
+
+    /// postToolUse is wired only for a bundle that exports
+    /// `handlePostToolUseEvent`; otherwise the runner would answer `{}` after
+    /// starting node on every tool call. For a bundle without it, the
+    /// runner's commands leave an entry the installer wrote earlier (dropped
+    /// when no command is left, then the emptied list); a user's own entries
+    /// and commands stay.
+    #[test]
+    fn copilot_post_tool_use_hook_follows_the_bundle() {
+        let handles =
+            "export async function handlePostToolUseEvent(event, dialect = 'copilot') {\n}\n";
+        let lacks = "// handlePostToolUseEvent is only mentioned here\n\
+                     export async function handlePostToolUseEventLater() {}\n\
+                     export async function handleHookEvent(event) {}\n";
+        assert!(bundle_exports(handles, "handlePostToolUseEvent"));
+        assert!(bundle_exports(
+            "export const handlePostToolUseEvent = async () => ({});",
+            "handlePostToolUseEvent"
+        ));
+        assert!(!bundle_exports(lacks, "handlePostToolUseEvent"));
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".github")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("github-cli"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let bash = format!("node {}", posix_literal(&runner));
+        let ours = json!({
+            "type": "command",
+            "bash": bash,
+            "powershell": format!("node {}", powershell_literal(&runner)),
+            "env": { "NEUROSTRATA_HOOK_EVENT": "postToolUse" }
+        });
+        let wire = |bundle: &str| {
+            let mut warnings = Vec::new();
+            let wired = wire_copilot_hooks(tmp.path(), &runner, bundle, &mut warnings);
+            assert!(wired.is_some(), "{warnings:?}");
+            read_copilot_hooks(tmp.path())
+        };
+
+        let mut doc = wire(handles);
+        assert_eq!(doc["hooks"]["postToolUse"], json!([ours.clone()]));
+        assert!(wire(lacks)["hooks"].get("postToolUse").is_none());
+
+        let user_entry = json!({ "type": "command", "bash": "echo hi", "powershell": "echo hi" });
+        doc["hooks"]["postToolUse"] = json!([
+            user_entry.clone(),
+            ours.clone(),
+            { "type": "command", "bash": bash, "powershell": "echo custom" }
+        ]);
+        std::fs::write(
+            tmp.path().join(COPILOT_HOOKS_REL),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+        let users = json!([
+            user_entry,
+            { "type": "command", "powershell": "echo custom" }
+        ]);
+        assert_eq!(wire(lacks)["hooks"]["postToolUse"], users);
+        let mut with_ours = users.as_array().unwrap().clone();
+        with_ours.push(ours);
+        assert_eq!(wire(handles)["hooks"]["postToolUse"], json!(with_ours));
+    }
+
+    /// preToolUse is wired only for a bundle that exports
+    /// `copilotPreToolUseReply`, the reply in the shape Copilot reads (a
+    /// top-level decision); without it the bundle's deny would be ignored.
+    #[test]
+    fn copilot_pre_tool_use_hook_follows_the_bundle() {
+        let handles = "export function copilotPreToolUseReply(reply, originalArgs) {
+}
+";
+        let lacks = "// copilotPreToolUseReply is only mentioned here
+                     export async function handleHookEvent(event) {}
+";
+        assert!(bundle_exports(handles, "copilotPreToolUseReply"));
+        assert!(!bundle_exports(lacks, "copilotPreToolUseReply"));
+        assert!(copilot_hook_events(handles).any(|e| e == "preToolUse"));
+        assert!(!copilot_hook_events(lacks).any(|e| e == "preToolUse"));
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".github")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("github-cli"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let wire = |bundle: &str| {
+            let mut warnings = Vec::new();
+            let wired = wire_copilot_hooks(tmp.path(), &runner, bundle, &mut warnings);
+            assert!(wired.is_some(), "{warnings:?}");
+            read_copilot_hooks(tmp.path())
+        };
+        assert_eq!(
+            wire(handles)["hooks"]["preToolUse"],
+            json!([{
+                "type": "command",
+                "bash": format!("node {}", posix_literal(&runner)),
+                "powershell": format!("node {}", powershell_literal(&runner)),
+                "env": { "NEUROSTRATA_HOOK_EVENT": "preToolUse" }
+            }])
+        );
+        assert!(wire(lacks)["hooks"].get("preToolUse").is_none());
+    }
+
+    /// The `bash` command is quoted for `sh` on every platform, so a path
+    /// with a single quote round-trips through both parsers.
+    #[test]
+    fn copilot_bash_command_uses_sh_quoting_on_every_platform() {
+        let path = r"/home/o'brien/$HOME/.NeuroStrata/plugins/github-cli/cli-hook.mjs";
+        let word = posix_literal(path);
+        assert_eq!(
+            word,
+            r"'/home/o'\''brien/$HOME/.NeuroStrata/plugins/github-cli/cli-hook.mjs'"
+        );
+        assert_eq!(posix_literal_value(&word), Some((path.to_string(), "")));
+        let command = format!("node {word}");
+        assert_eq!(hook_command_runners(&command), vec![path.to_string()]);
+        let ps = format!("node {}", powershell_literal(path));
+        assert_eq!(hook_command_runners(&ps), vec![path.to_string()]);
+    }
+
+    /// PowerShell ends a single-quoted string at a typographic quote too
+    /// (U+2018 to U+201B), so each one in a path is doubled like `'`. The
+    /// PowerShell parser reads `'C:\o’’brien\x‘‘y\a''b\cli-hook.mjs'` as
+    /// `C:\o’brien\x‘y\a'b\cli-hook.mjs` (checked with
+    /// `[System.Management.Automation.Language.Parser]::ParseInput`).
+    #[test]
+    fn powershell_literal_doubles_typographic_quotes() {
+        let path = "C:\\o\u{2019}brien\\x\u{2018}y\\a'b\\cli-hook.mjs";
+        let word = powershell_literal(path);
+        assert_eq!(
+            word,
+            "'C:\\o\u{2019}\u{2019}brien\\x\u{2018}\u{2018}y\\a''b\\cli-hook.mjs'"
+        );
+        assert_eq!(
+            powershell_literal_value(&word),
+            Some((path.to_string(), ""))
+        );
+        for quote in POWERSHELL_SINGLE_QUOTES {
+            let path = format!("C:\\a{quote}b\\cli-hook.mjs");
+            let word = powershell_literal(&path);
+            assert_eq!(powershell_literal_value(&word), Some((path.clone(), "")));
+            // `sh` reads the typographic quotes literally, so the command has
+            // two readings; the PowerShell one is among them.
+            assert!(hook_command_runners(&format!("node {word}")).contains(&path));
+        }
+        // A lone typographic quote ends the word, as in PowerShell.
+        assert_eq!(
+            powershell_literal_value("'a\u{2019} rest"),
+            Some(("a".to_string(), " rest"))
+        );
+    }
+
+    /// The installer recognizes its own PowerShell command for a runner path
+    /// with a typographic quote (on Windows both Codex commands use it), so a
+    /// second run repairs it in place instead of adding a second entry.
+    #[test]
+    fn hooks_for_a_path_with_a_typographic_quote_are_written_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("o\u{2019}brien");
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        for harness in ["github-cli", "codex"] {
+            for _ in 0..2 {
+                let _ = auto_install_detected_plugins(
+                    &root,
+                    ConfigNamespace::Set("TestProj"),
+                    Some(harness),
+                );
+            }
+        }
+        let copilot = read_copilot_hooks(&root);
+        for event in copilot_hook_events(GITHUB_CLI_INDEX_JS) {
+            assert_eq!(
+                copilot["hooks"][event].as_array().unwrap().len(),
+                1,
+                "{copilot}"
+            );
+        }
+        let codex = read_codex_hooks(&root);
+        for (event, _) in CODEX_HOOK_EVENTS {
+            let ours = CODEX_HOOK_EVENTS
+                .iter()
+                .filter(|(e, _)| *e == event)
+                .count();
+            assert_eq!(
+                codex["hooks"][event].as_array().unwrap().len(),
+                ours,
+                "{codex}"
+            );
+        }
+    }
+
+    /// Codex fires PreToolUse for MCP tools as `mcp__<server>__<tool>` (0.170
+    /// `McpHandler::hook_tool_name_for`), so a second PreToolUse entry runs the
+    /// runner on NeuroStrata's task_claim and get_snapshot. An older install
+    /// (file tools only) gets it added once; a matcher the user changed still
+    /// stands for the file-tool entry; a second run writes nothing.
+    #[test]
+    fn codex_pre_tool_use_covers_neurostrata_mcp_calls() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        let report = auto_install_detected_plugins(
+            tmp.path(),
+            ConfigNamespace::Set("TestProj"),
+            Some("codex"),
+        );
+        let runner = report["installed_plugins"][0]["cli_hook_runner"]
+            .as_str()
+            .expect("runner")
+            .to_string();
+        let (cmd, cmd_windows) = codex_hook_commands(&runner);
+        let ours = json!({"type": "command", "command": cmd, "commandWindows": cmd_windows});
+        let matcher = regex::Regex::new(SESSION_SCOPE_MATCHER).unwrap();
+        for name in [
+            "mcp__neurostrata__neurostrata_task_claim",
+            "mcp__neurostrata__neurostrata_get_snapshot",
+        ] {
+            assert!(matcher.is_match(name), "{name}");
+        }
+        assert!(!matcher.is_match("mcp__neurostrata__neurostrata_search_memory"));
+        for user_matcher in ["apply_patch|Bash", "apply_patch|Bash|Read"] {
+            let path = tmp.path().join(".codex/hooks.json");
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&json!({"hooks": {
+                    "PreToolUse": [{"matcher": user_matcher, "hooks": [ours.clone()]}]
+                }}))
+                .unwrap(),
+            )
+            .unwrap();
+            for _ in 0..2 {
+                let _ = auto_install_detected_plugins(
+                    tmp.path(),
+                    ConfigNamespace::Set("TestProj"),
+                    Some("codex"),
+                );
+            }
+            let doc = read_codex_hooks(tmp.path());
+            let pre = doc["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(pre.len(), 2, "{user_matcher}: {doc}");
+            assert_eq!(pre[0]["matcher"], json!(user_matcher));
+            assert_eq!(pre[1]["matcher"], json!(SESSION_SCOPE_MATCHER));
+            assert_eq!(pre[1]["hooks"], json!([ours.clone()]));
+        }
+    }
+
+    /// Copilot rejects the whole hooks file when any event list is not an
+    /// array, and Codex parses its file as a whole: the installer leaves such
+    /// a file as it is and reports no hook wired.
+    #[test]
+    fn hooks_file_with_a_non_array_event_list_is_left_alone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".github/hooks")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        let copilot = r#"{"version": 1, "hooks": {"postToolUse": {"type": "command"}}}"#;
+        let codex = r#"{"hooks": {"PostToolUse": "echo user"}}"#;
+        std::fs::write(tmp.path().join(COPILOT_HOOKS_REL), copilot).unwrap();
+        std::fs::write(tmp.path().join(".codex/hooks.json"), codex).unwrap();
+        for (harness, rel, text, event) in [
+            ("github-cli", COPILOT_HOOKS_REL, copilot, "postToolUse"),
+            ("codex", ".codex/hooks.json", codex, "PostToolUse"),
+        ] {
+            let report = auto_install_detected_plugins(
+                tmp.path(),
+                ConfigNamespace::Set("TestProj"),
+                Some(harness),
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join(rel)).unwrap(),
+                text,
+                "{harness}"
+            );
+            assert!(
+                report["installed_plugins"][0]["config_wired"].is_null(),
+                "{harness}: {report}"
+            );
+            let warned = report["warnings"].as_array().unwrap().iter().any(|w| {
+                w.as_str()
+                    .is_some_and(|s| s.contains(&format!("non-array {event} hook list")))
+            });
+            assert!(warned, "{harness}: {report}");
+        }
+    }
+
+    /// A linked worktree's `.git` is a file: the exclude entry goes into the
+    /// common git directory's `info/exclude`, which git reads for every
+    /// worktree.
+    #[test]
+    fn linked_worktree_hooks_file_is_excluded_in_the_common_git_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main = tmp.path().join("main");
+        let gitdir = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(wt.join(".github")).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", gitdir.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+        let _ = auto_install_detected_plugins(
+            &wt,
+            ConfigNamespace::Set("TestProj"),
+            Some("github-cli"),
+        );
+        assert!(wt.join(COPILOT_HOOKS_REL).exists());
+        let exclude = std::fs::read_to_string(main.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            exclude.matches("/.github/hooks/neurostrata.json").count(),
+            1,
+            "{exclude}"
+        );
+        assert!(!gitdir.join("info/exclude").exists());
+    }
+
+    /// A folder that is not a git checkout gets its hooks files but no
+    /// `.git`: a stray `.git/info` would make it look like a repository root.
+    #[test]
+    fn non_git_folder_gets_no_git_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".github")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        for harness in ["github-cli", "codex"] {
+            let _ = auto_install_detected_plugins(
+                tmp.path(),
+                ConfigNamespace::Set("TestProj"),
+                Some(harness),
+            );
+        }
+        assert!(tmp.path().join(COPILOT_HOOKS_REL).exists());
+        assert!(tmp.path().join(".codex/hooks.json").exists());
+        assert!(!tmp.path().join(".git").exists());
     }
 
     /// #368 F7: Codex detected only through the user's home install still
@@ -6071,10 +7073,17 @@ mod tests {
             let doc: Value = serde_json::from_str(&first).unwrap();
             assert_eq!(
                 event_keys(&doc),
-                ["PostToolUse", "PreToolUse", "SessionStart", "Stop"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect()
+                [
+                    "PostToolUse",
+                    "PreCompact",
+                    "PreToolUse",
+                    "SessionEnd",
+                    "SessionStart",
+                    "Stop"
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
             );
             assert_eq!(doc["permissions"]["allow"], json!(["Read"]));
             let post = doc["hooks"]["PostToolUse"].as_array().unwrap();
@@ -6119,7 +7128,9 @@ mod tests {
                 event_keys(&doc),
                 [
                     "PostToolUse",
+                    "PreCompact",
                     "PreToolUse",
+                    "SessionEnd",
                     "SessionStart",
                     "Stop",
                     "UserPromptSubmit",
@@ -6182,9 +7193,12 @@ mod tests {
             assert!(doc["hooks"]["SessionStart"].as_array().unwrap().is_empty());
             assert_eq!(doc["hooks"]["UserPromptSubmit"][1], foreign_prompt);
             assert_eq!(doc["hooks"]["PostToolUse"][1], foreign_result);
-            for event in ["PreToolUse", "UserPromptSubmit", "PostToolUse", "Stop"] {
+            for event in ["UserPromptSubmit", "PostToolUse", "Stop"] {
                 assert_eq!(command_count(&doc, event, &command), 1, "{event}");
             }
+            // The file-tool and session-scope matchers each carry the
+            // canonical command once.
+            assert_eq!(command_count(&doc, "PreToolUse", &command), 2);
             let exclude = std::fs::read_to_string(root.join(".git/info/exclude")).unwrap();
             assert_eq!(exclude.matches("/.codex/hooks.json").count(), 1);
         }
@@ -6232,15 +7246,17 @@ mod tests {
             let doc: Value = serde_json::from_str(&first).unwrap();
             assert_eq!(doc["version"], json!(1));
             assert_eq!(doc["other"], json!(true));
+            // The shipped bundle gates preToolUse/postToolUse on its own
+            // exports; sessionStart/sessionEnd/preCompact are always wired.
             assert_eq!(
                 event_keys(&doc),
-                ["agentStop", "postToolUse", "preToolUse", "sessionStart"]
+                ["preCompact", "sessionEnd", "sessionStart"]
                     .into_iter()
                     .map(str::to_string)
                     .collect()
             );
             assert_eq!(doc["hooks"]["sessionStart"][0], foreign);
-            for event in ["sessionStart", "preToolUse", "postToolUse", "agentStop"] {
+            for event in ["preCompact", "sessionEnd", "sessionStart"] {
                 let entries = doc["hooks"][event].as_array().unwrap();
                 let owned = entries
                     .iter()
@@ -6255,7 +7271,7 @@ mod tests {
                         .keys()
                         .cloned()
                         .collect::<BTreeSet<_>>(),
-                    ["bash", "cwd", "env", "powershell", "timeoutSec", "type"]
+                    ["bash", "env", "powershell", "type"]
                         .into_iter()
                         .map(str::to_string)
                         .collect()
@@ -6263,8 +7279,6 @@ mod tests {
                 assert_eq!(owned["type"], json!("command"));
                 assert_eq!(owned["bash"], json!(bash));
                 assert_eq!(owned["powershell"], json!(powershell));
-                assert_eq!(owned["cwd"], json!("."));
-                assert_eq!(owned["timeoutSec"], json!(10));
                 assert_eq!(owned["env"], json!({ "NEUROSTRATA_HOOK_EVENT": event }));
             }
             assert_eq!(

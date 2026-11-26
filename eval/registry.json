@@ -588,6 +588,21 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "dependency-advisory": {
+      "commands": [
+        "cargo test --locked --test dependency_integrity -- --test-threads=1"
+      ],
+      "tests": [
+        "srctauri_cookie_is_patched",
+        "srctauri_url_is_patched",
+        "srctauri_glib_decision_recorded",
+        "webui_has_no_vulnerable_minimatch",
+        "webui_has_no_vulnerable_zod"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }

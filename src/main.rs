@@ -2337,7 +2337,22 @@ fn exit_report_of(db_path: &std::path::Path, pid: u32) -> Option<String> {
 /// wrote the report into the lock file. A current daemon empties the lock
 /// file when it takes the lock and never writes a report there.
 fn report_in_lock_file(db_path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(daemon_lock_path(db_path)).ok()?;
+    legacy_report(std::fs::read_to_string(daemon_lock_path(db_path)).ok()?)
+}
+
+/// The same report, read through the handle that holds the lock. On Windows
+/// the lock refuses reads through any other handle, so the daemon that just
+/// took the lock must read the file through its own.
+fn report_in_held_lock(file: &std::fs::File) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    let mut text = String::new();
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_to_string(&mut text).ok()?;
+    legacy_report(text)
+}
+
+fn legacy_report(text: String) -> Option<String> {
     (text == FINAL_CHECKPOINT_OK || text.starts_with("error: ")).then_some(text)
 }
 
@@ -2360,6 +2375,43 @@ fn parked_legacy_report(db_path: &std::path::Path, current: LockHolder) -> Optio
     }
 }
 
+/// The final checkpoint report of the daemon `shutdown` stopped (`holder`),
+/// or empty when there is none. `current` is the lock holder now; `replaced`
+/// says a different daemon took the lock after `holder` exited.
+fn stopped_daemon_report(
+    db_path: &std::path::Path,
+    holder: LockHolder,
+    current: LockHolder,
+    replaced: bool,
+) -> String {
+    let own_report = match holder {
+        LockHolder::Pid(pid) => exit_report_of(db_path, pid),
+        _ => None,
+    };
+    own_report
+        .or_else(|| {
+            if replaced {
+                None
+            } else {
+                report_in_lock_file(db_path)
+            }
+        })
+        // A parked report belongs to the older daemon that `current` (the
+        // parker) found, never to the parker itself. So skip it when the
+        // stopped daemon is `current`: a parking daemon that crashed would be
+        // credited with the old one's checkpoint. Comparing holders instead
+        // of `replaced` also covers a replacement that took the lock just
+        // after the wait loop saw it free.
+        .or_else(|| {
+            if current != holder {
+                parked_legacy_report(db_path, current)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
 /// How long a starting daemon keeps retrying a lock that someone else holds.
 /// `daemon_holds_lock` takes the lock for an instant when it finds it free, so
 /// a daemon starting at that instant would otherwise refuse to run.
@@ -2377,9 +2429,17 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
                 // the file so `shutdown` can still report it after this
                 // daemon takes over. Tagged with this daemon's id so only the
                 // replacement this stash belongs to consumes it.
-                if let Some(report) = report_in_lock_file(db_path) {
+                if let Some(report) = report_in_held_lock(&file) {
                     let parked = format!("{}\n{}", std::process::id(), report);
-                    let _ = std::fs::write(daemon_legacy_report_path(db_path), parked);
+                    // Emptying the lock file anyway is deliberate: a report
+                    // left there could later be read as this daemon's own.
+                    // Losing it only means `shutdown` cannot confirm the old
+                    // daemon's checkpoint.
+                    if let Err(e) = std::fs::write(daemon_legacy_report_path(db_path), parked) {
+                        tracing::warn!(
+                            "could not park the previous daemon's checkpoint report: {e}"
+                        );
+                    }
                 }
                 // The process id identifies this daemon: `shutdown` uses it
                 // to tell this daemon from one that replaces it, and to pick
@@ -2391,10 +2451,12 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
             None if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            None => return Err(anyhow::anyhow!(
+            None => {
+                return Err(anyhow::anyhow!(
                 "Another NeuroStrata daemon, or a CLI command working on the store, holds {:?}.",
                 db_path
-            )),
+            ))
+            }
         }
     }
 }
@@ -3890,6 +3952,10 @@ mod tests {
     /// A valid config with no database yet and no usable embedder: the CLI's
     /// direct root registry must NOT mint a bare store, which would void the
     /// pending setup-time model choice before it is ever offered (#390).
+    /// Unix only: the test isolates the config by setting HOME, which
+    /// `dirs::home_dir` ignores on Windows, so there it would read the real
+    /// user config and could open the real store.
+    #[cfg(unix)]
     #[tokio::test]
     async fn cli_root_registry_refuses_a_pristine_store_without_an_embedder() {
         let _env = crate::daemon::project_root_env_test_lock();
@@ -4355,6 +4421,28 @@ mod tests {
             "stash is one-shot"
         );
         drop(lock);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `shutdown` stops the daemon that parked an older daemon's report, and
+    /// it exits without a report of its own: the parked report is the older
+    /// daemon's and must not be taken for this one's final checkpoint.
+    #[test]
+    fn shutdown_does_not_credit_a_parked_report_to_the_daemon_that_parked_it() {
+        let root = std::env::temp_dir().join(format!("ns-parked-crash-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(daemon_lock_path(&db), FINAL_CHECKPOINT_OK).unwrap();
+        let lock = take_daemon_lock(&db).expect("take the lock");
+        drop(lock); // exits without writing an exit report
+        let me = LockHolder::Pid(std::process::id());
+        assert_eq!(stopped_daemon_report(&db, me, me, false), "");
+        // The older daemon still gets its parked report, also when the wait
+        // loop saw the lock free before the replacement took it.
+        assert_eq!(
+            stopped_daemon_report(&db, LockHolder::Legacy, me, false),
+            FINAL_CHECKPOINT_OK
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -8459,20 +8547,7 @@ async fn run() -> anyhow::Result<()> {
                         }
                         saw_lock = true;
                     } else if saw_lock || replaced {
-                        let own_report = match holder {
-                            LockHolder::Pid(pid) => exit_report_of(&db_path, pid),
-                            _ => None,
-                        };
-                        let report = own_report
-                            .or_else(|| {
-                                if replaced {
-                                    None
-                                } else {
-                                    report_in_lock_file(&db_path)
-                                }
-                            })
-                            .or_else(|| parked_legacy_report(&db_path, current))
-                            .unwrap_or_default();
+                        let report = stopped_daemon_report(&db_path, holder, current, replaced);
                         if report == FINAL_CHECKPOINT_OK {
                             println!("Daemon stopped and checkpointed.");
                             return Ok(());

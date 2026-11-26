@@ -726,6 +726,7 @@ test('hook runner replies in the shape of the failing event (#400)', async () =>
     const env = { ...process.env }
     delete env.NEUROSTRATA_NAMESPACE
     delete env.CLAUDE_PROJECT_DIR
+    delete env.NEUROSTRATA_HOOK_EVENT
     const run = (event) =>
       spawnSync(process.execPath, [runner], {
         input: JSON.stringify(event),
@@ -741,10 +742,10 @@ test('hook runner replies in the shape of the failing event (#400)', async () =>
     })
     assert.equal(
       stop.status,
-      0,
-      `Stop must fail soft; stderr=${stop.stderr.slice(0, 200)}`
+      2,
+      `Stop must exit 2; stderr=${stop.stderr.slice(0, 200)}`
     )
-    assert.deepEqual(JSON.parse(stop.stdout), { continue: true })
+    assert.equal(stop.stdout.trim(), '{}')
     const pre = run({
       hook_event_name: 'PreToolUse',
       cwd: base,
@@ -755,6 +756,30 @@ test('hook runner replies in the shape of the failing event (#400)', async () =>
     const reply = JSON.parse(pre.stdout)
     assert.equal(reply.hookSpecificOutput.hookEventName, 'PreToolUse')
     assert.equal(reply.hookSpecificOutput.permissionDecision, 'deny')
+    // Copilot names its event only in NEUROSTRATA_HOOK_EVENT. An event
+    // without a permission decision answers {}, whether the bundle lacks its
+    // handler or the hook failed; preToolUse gets Copilot's top-level deny.
+    const copilot = (name) =>
+      spawnSync(process.execPath, [runner], {
+        input: JSON.stringify({ cwd: base, toolName: 'bash', toolArgs: '{}' }),
+        cwd: base,
+        env: { ...env, NEUROSTRATA_HOOK_EVENT: name },
+        encoding: 'utf8',
+        timeout: 30000
+      })
+    for (const name of [
+      'sessionStart',
+      'postToolUse',
+      'sessionEnd',
+      'preCompact'
+    ]) {
+      const quiet = copilot(name)
+      assert.equal(quiet.status, 0, name)
+      assert.deepEqual(JSON.parse(quiet.stdout), {}, name)
+    }
+    const copilotPre = JSON.parse(copilot('preToolUse').stdout)
+    assert.equal(copilotPre.permissionDecision, 'deny')
+    assert.equal(copilotPre.hookSpecificOutput, undefined)
   } finally {
     rmSync(base, { recursive: true, force: true })
   }

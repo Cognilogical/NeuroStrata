@@ -249,7 +249,7 @@ fn is_checkout_root(dir: &str) -> bool {
 /// it relative to the checkout); a linked worktree's gitdir holds a
 /// `commondir` file naming the shared directory, a submodule's does not, so a
 /// submodule is its own repository.
-fn common_git_dir(checkout: &str) -> Option<String> {
+pub(crate) fn common_git_dir(checkout: &str) -> Option<String> {
     let checkout = host_path(checkout)?;
     let dot_git = checkout.join(".git");
     if dot_git.is_dir() {
@@ -289,7 +289,7 @@ fn joined(base: &Path, rel: &str) -> String {
 
 /// Whether `a` and `b` name the same location: by spelling, else by their
 /// canonical forms on this host.
-fn same_location(a: &str, b: &str) -> bool {
+pub(crate) fn same_location(a: &str, b: &str) -> bool {
     let lexical = |a: &str, b: &str| matches!((parse_absolute(a), parse_absolute(b)), (Some(a), Some(b)) if a == b);
     if lexical(a, b) {
         return true;

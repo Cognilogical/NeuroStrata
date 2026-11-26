@@ -820,26 +820,16 @@ test('working-set GC failures and unknown events return neutral success', () => 
   try {
     mkdirSync(join(root, '.codex', 'plugins'), { recursive: true })
     writeFileSync(join(root, '.codex', 'plugins', 'neurostrata.json'), '{')
-    const expected = [
-      ['PostToolUse', { hookSpecificOutput: { hookEventName: 'PostToolUse' } }],
-      [
-        'SessionStart',
-        { hookSpecificOutput: { hookEventName: 'SessionStart' } }
-      ],
-      [
-        'UserPromptSubmit',
-        { hookSpecificOutput: { hookEventName: 'UserPromptSubmit' } }
-      ],
-      ['Stop', { continue: true }],
-      [
-        'UnknownEvent',
-        { hookSpecificOutput: { hookEventName: 'UnknownEvent' } }
-      ]
-    ]
-    for (const [hook_event_name, want] of expected) {
+    // A failed hook answers `{}` for every event but PreToolUse (#425).
+    for (const hook_event_name of [
+      'PostToolUse',
+      'SessionStart',
+      'UserPromptSubmit',
+      'UnknownEvent'
+    ]) {
       assert.deepEqual(
         runCodexReply({ hook_event_name, cwd: root }, root).reply,
-        want
+        {}
       )
     }
   } finally {
@@ -866,6 +856,7 @@ test('hook runner replies in the shape of the failing event (#400)', async () =>
     const env = { ...process.env }
     delete env.NEUROSTRATA_NAMESPACE
     delete env.CLAUDE_PROJECT_DIR
+    delete env.NEUROSTRATA_HOOK_EVENT
     const run = (event) =>
       spawnSync(process.execPath, [runner], {
         input: JSON.stringify(event),
@@ -881,10 +872,10 @@ test('hook runner replies in the shape of the failing event (#400)', async () =>
     })
     assert.equal(
       stop.status,
-      0,
-      `Stop must fail soft; stderr=${stop.stderr.slice(0, 200)}`
+      2,
+      `Stop must exit 2; stderr=${stop.stderr.slice(0, 200)}`
     )
-    assert.deepEqual(JSON.parse(stop.stdout), { continue: true })
+    assert.equal(stop.stdout.trim(), '{}')
     const pre = run({
       hook_event_name: 'PreToolUse',
       cwd: base,
@@ -895,6 +886,23 @@ test('hook runner replies in the shape of the failing event (#400)', async () =>
     const reply = JSON.parse(pre.stdout)
     assert.equal(reply.hookSpecificOutput.hookEventName, 'PreToolUse')
     assert.equal(reply.hookSpecificOutput.permissionDecision, 'deny')
+    // An event without a permission decision answers {}, whether the bundle
+    // lacks its handler or the hook failed; Codex rejects a decision on
+    // SessionStart and PreCompact.
+    for (const name of [
+      'SessionStart',
+      'SessionEnd',
+      'PreCompact',
+      'PostToolUse'
+    ]) {
+      const quiet = run({
+        hook_event_name: name,
+        cwd: base,
+        session_id: 'failing'
+      })
+      assert.equal(quiet.status, 0, name)
+      assert.deepEqual(JSON.parse(quiet.stdout), {}, name)
+    }
   } finally {
     rmSync(base, { recursive: true, force: true })
   }

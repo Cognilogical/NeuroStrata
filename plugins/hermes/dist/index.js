@@ -778,14 +778,29 @@ const SESSION_SCOPED_TOOLS = [
     'neurostrata_get_snapshot'
 ];
 /**
+ * The bare `neurostrata_<tool>` name of a NeuroStrata MCP tool, however a
+ * harness spells it (`mcp__<server>__neurostrata_task_claim` in Claude Code,
+ * `<server>_neurostrata_task_claim` in OpenCode, `<server>.neurostrata_task_claim`).
+ * Any other name comes back unchanged. Every check against a NeuroStrata
+ * tool name goes through this, or the prefixed names real harnesses send
+ * never match.
+ */
+export function canonicalToolName(toolName) {
+    const name = String(toolName ?? '');
+    // The last `neurostrata_` that starts the name or follows a separator. A
+    // string search, not a backtracking regex: the name comes from the host.
+    const at = name.lastIndexOf('neurostrata_');
+    if (at < 0 || (at > 0 && !'_.:'.includes(name[at - 1])))
+        return name;
+    const bare = name.slice(at);
+    return /^neurostrata_[A-Za-z0-9]\w*$/.test(bare) ? bare : name;
+}
+/**
  * Whether `toolName` is one of [SESSION_SCOPED_TOOLS], bare or as a harness
- * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
- * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
+ * spells an MCP tool (see [canonicalToolName]).
  */
 export function isSessionScopedTool(toolName) {
-    const name = String(toolName ?? '');
-    return SESSION_SCOPED_TOOLS.some((tool) => name === tool ||
-        (name.endsWith(tool) && /[_.:]$/.test(name.slice(0, -tool.length))));
+    return SESSION_SCOPED_TOOLS.includes(canonicalToolName(toolName));
 }
 /**
  * Claim scope from a linked worktree (design 6.5): `neurostrata_task_claim`
@@ -5441,7 +5456,8 @@ const NEUROSTRATA_NATIVE_TOOLS = new Set([
     'neurostrata_update_memory',
     'neurostrata_guard_validate',
     'neurostrata_memories_for_file',
-    'neurostrata_locate'
+    'neurostrata_locate',
+    'neurostrata_task_get'
 ]);
 /**
  * Read the active task_id from `.NeuroStrata/active_session.json` so the
@@ -5480,7 +5496,7 @@ const executeAfterHandler = async (output, secondArg) => {
     // Resolve the tool name from BOTH arguments (issue #311): in the
     // two-argument (input, output) form Code Mode hosts carry the name on the
     // input argument, while the output argument holds the result text.
-    const toolName = extractToolName(event) || extractToolName(output);
+    const toolName = canonicalToolName(extractToolName(event) || extractToolName(output));
     // OpenCode V2 envelope: { name, callID, args, status, result: { content, output, metadata } }
     // Read raw tool text in priority order. OpenCode v2.2.6 delivers
     // `event.result.content` as an array of content parts `[{ type: "text", text: ... }]`.
@@ -5685,12 +5701,12 @@ const executeAfterHandler = async (output, secondArg) => {
     return target ?? output;
 };
 const executeBeforeHandler = async (input) => {
-    const toolName = input?.tool ??
+    const toolName = canonicalToolName(input?.tool ??
         input?.tool_name ??
         input?.name ??
         input?.action ??
         input?.command ??
-        '';
+        '');
     const args = firstRecord(input?.input, input?.args, input);
     const altArgs = asRecord(input?.args);
     addSessionWorktree(toolName, args, effectiveProjectRoot(config));
@@ -6000,7 +6016,7 @@ export async function handleHookEvent(event) {
         });
     }
     const hookEventName = asString(event.hook_event_name) ?? asString(event.eventName) ?? 'PreToolUse';
-    const toolNameRaw = asString(event.tool_name) ?? asString(event.toolName) ?? '';
+    const toolNameRaw = canonicalToolName(asString(event.tool_name) ?? asString(event.toolName) ?? '');
     const toolInputRaw = event.tool_input ?? event.input ?? event.args ?? {};
     const toolInput = firstRecord(toolInputRaw);
     if (hookEventName === 'PreToolUse') {
@@ -6335,7 +6351,7 @@ function createHermesShim() {
         return id ? `hermes:${eventName}:${id}` : undefined;
     }
     function toolName(input) {
-        return (asString(input?.tool) ??
+        return canonicalToolName(asString(input?.tool) ??
             asString(input?.name) ??
             asString(input?.action) ??
             asString(input?.command) ??

@@ -4,6 +4,7 @@ import * as hermesPath from 'node:path'
 import {
   NeuroStrataMCPClient,
   addSessionWorktree,
+  canonicalToolName,
   currentSessionEpoch,
   detectTaskIntentsLocal,
   discoverProjectNamespace,
@@ -181,12 +182,12 @@ function createHermesShim() {
   }
 
   function toolName(input: any): string {
-    return (
+    return canonicalToolName(
       asString(input?.tool) ??
-      asString(input?.name) ??
-      asString(input?.action) ??
-      asString(input?.command) ??
-      ''
+        asString(input?.name) ??
+        asString(input?.action) ??
+        asString(input?.command) ??
+        ''
     )
   }
 

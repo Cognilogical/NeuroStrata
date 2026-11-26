@@ -240,7 +240,13 @@ fn is_ready(payload: &MemoryPayload, statuses: &HashMap<String, Status>) -> bool
 }
 
 /// The base record every tool returns alongside its own fields.
-pub fn task_summary(id: &str, payload: &MemoryPayload) -> Value {
+///
+/// The note history is the crash-recovery read: a fresh claim (a new
+/// session, or one taking over a stale claim) gets it whole to see where the
+/// work stopped (`with_history`). Every other reply goes to the session that
+/// wrote that history -- claims are exclusive per session -- so it carries
+/// only `history_count`; task_list returns the history on request.
+pub fn task_summary(id: &str, payload: &MemoryPayload, with_history: bool) -> Value {
     let task = payload.metadata.get("task");
     let field = |key: &str| {
         task.and_then(|t| t.get(key))
@@ -252,7 +258,7 @@ pub fn task_summary(id: &str, payload: &MemoryPayload) -> Value {
         .and_then(|s| s.as_str())
         .and_then(Status::parse)
         .unwrap_or(Status::Open);
-    json!({
+    let mut summary = json!({
         "id": id,
         "title": payload.content,
         "status": status.as_str(),
@@ -268,8 +274,20 @@ pub fn task_summary(id: &str, payload: &MemoryPayload) -> Value {
         "close_reason": field("close_reason"),
         "created_at": field("created_at"),
         "updated_at": field("updated_at"),
-        "history": field("history"),
-    })
+    });
+    let history = field("history");
+    if with_history {
+        // A task with no notes yet has no history field: an empty list, as
+        // its history_count of 0 says.
+        summary["history"] = if history.is_null() {
+            json!([])
+        } else {
+            history
+        };
+    } else {
+        summary["history_count"] = json!(history.as_array().map_or(0, Vec::len));
+    }
+    summary
 }
 
 async fn load_task(
@@ -522,12 +540,19 @@ pub fn is_rule_prefixed_content(content: &str) -> bool {
 }
 
 fn is_active_golden_candidate(r: &SearchResult) -> bool {
-    if r.payload.memory_type == "task"
-        || r.payload.memory_type == "community_summary"
-        || crate::registry::is_registry_row(&r.payload.metadata)
-        || crate::handlers::archive_memory::is_archived(&r.payload)
-        || r.payload.metadata.get("superseded_by").is_some()
-        || r.payload
+    is_active_golden_payload(&r.payload)
+}
+
+/// Whether a row may still be quoted as a Golden Rule: the test
+/// `collect_golden_rules` applies, also used to drop golden entries from a
+/// task block cached at claim time.
+fn is_active_golden_payload(payload: &MemoryPayload) -> bool {
+    if payload.memory_type == "task"
+        || payload.memory_type == "community_summary"
+        || crate::registry::is_registry_row(&payload.metadata)
+        || crate::handlers::archive_memory::is_archived(payload)
+        || payload.metadata.get("superseded_by").is_some()
+        || payload
             .metadata
             .get("valid_to")
             .and_then(|v| v.as_i64())
@@ -536,9 +561,8 @@ fn is_active_golden_candidate(r: &SearchResult) -> bool {
     {
         return false;
     }
-    if r.payload.memory_type == "guard_rule" {
-        return r
-            .payload
+    if payload.memory_type == "guard_rule" {
+        return payload
             .metadata
             .get("status")
             .and_then(|v| v.as_str())
@@ -645,6 +669,230 @@ pub fn format_golden_rules_section(golden_rules: &[SearchResult]) -> String {
     out
 }
 
+/// The in_progress task claimed in the worktree at `root`. A task claimed in
+/// another worktree, or with no worktree stamped, is never named, or its
+/// Breath note would land in this session.
+pub fn active_task_for_root<'a>(
+    rows: &'a [SearchResult],
+    root: &str,
+    is_active: impl Fn(&SearchResult) -> bool,
+) -> Option<&'a SearchResult> {
+    rows.iter()
+        .find(|r| is_active(r) && gate::task_in_worktree(r, root))
+}
+
+/// The line that opens the memory entries in a rendered task block.
+const TASK_BLOCK_ENTRIES_HEADER: &str = "- Auto-Retrieved Governing Rules & Graph Nodes:";
+/// The line that opens the conceptual bridges in a rendered task block.
+const TASK_BLOCK_BRIDGES_HEADER: &str = "### Cross-Domain Bridges";
+
+/// The active task's payload with the entries of its cached
+/// `subagent_prompt_injection` left out that quote a memory retired since the
+/// claim (superseded, expired or archived): memory entries naming it and
+/// Cross-Domain Bridges whose path runs through it. The block is written once at
+/// claim time; `get_snapshot` hands it to every session start through
+/// `active_session.json`, so it must not quote a retired rule there. Only one
+/// keyed read by id: rebuilding the block with `build_task_graph_context` runs
+/// a hybrid search and lists the namespace, which took seconds on a large
+/// store, longer than session start waits. An entry whose row is not found is
+/// kept (it may live in a namespace this read does not ask), and if the rows
+/// cannot be read the cached block is kept whole.
+pub(crate) async fn task_payload_without_retired_entries(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    payload: &MemoryPayload,
+) -> MemoryPayload {
+    let Some(block) = payload
+        .metadata
+        .get("task")
+        .and_then(|t| t.get("subagent_prompt_injection"))
+        .and_then(Value::as_str)
+    else {
+        return payload.clone();
+    };
+    let parts = task_block_parts(block);
+    let mut ids: Vec<String> = parts
+        .iter()
+        .flat_map(|p| p.ids.iter().map(|id| id.to_string()))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        return payload.clone();
+    }
+    // Golden rules come from `global` as well as the task's namespace.
+    let namespaces: Vec<&str> = if namespace == "global" {
+        vec![namespace]
+    } else {
+        vec![namespace, "global"]
+    };
+    let Ok(rows) = store.get_many(&namespaces, &ids).await else {
+        return payload.clone();
+    };
+    let now = chrono::Utc::now().timestamp();
+    let is_live = |row: &MemoryPayload| {
+        row.metadata.get("superseded_by").is_none_or(Value::is_null)
+            && !crate::store::ladybug::is_retired_at(&row.metadata, now)
+            && !crate::handlers::archive_memory::is_archived(row)
+    };
+    // An id is dropped only when no row found for it passes; the same id can
+    // exist once in the task's namespace and once in `global`. Golden entries
+    // are held to the test that picked them (`collect_golden_rules`), the
+    // others to the retirement checks search applies.
+    fn retired_by<'a>(
+        rows: &'a [(String, MemoryPayload)],
+        passes: impl Fn(&MemoryPayload) -> bool,
+    ) -> HashSet<&'a str> {
+        let passing: HashSet<&str> = rows
+            .iter()
+            .filter(|(_, row)| passes(row))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        rows.iter()
+            .map(|(id, _)| id.as_str())
+            .filter(|id| !passing.contains(id))
+            .collect()
+    }
+    let retired = retired_by(&rows, is_live);
+    let retired_golden = retired_by(&rows, is_active_golden_payload);
+    let kept: Vec<&TaskBlockPart> = parts
+        .iter()
+        .filter(|p| {
+            let gone = if p.is_golden {
+                &retired_golden
+            } else {
+                &retired
+            };
+            !p.ids.iter().any(|id| gone.contains(id))
+        })
+        .collect();
+    if kept.len() == parts.len() {
+        return payload.clone();
+    }
+    let mut lines: Vec<&str> = Vec::new();
+    for (i, part) in kept.iter().enumerate() {
+        // A memory-entries or bridges header whose entries were all dropped
+        // goes too (the renderer writes the bridges header only above
+        // bridges).
+        let entries_left = kept
+            .get(i + 1)
+            .is_some_and(|next| next.section == part.section && next.is_entry);
+        if part.is_header && part.section != TaskBlockSection::Other && !entries_left {
+            continue;
+        }
+        lines.extend(part.lines.iter().copied());
+    }
+    let mut current = payload.clone();
+    task_obj_mut(&mut current).insert(
+        "subagent_prompt_injection".to_string(),
+        json!(lines.join("\n")),
+    );
+    current
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskBlockSection {
+    /// Header, goal, taxonomy and instruction text: never pruned.
+    Other,
+    /// Golden rules and retrieved memories, one entry per memory.
+    Entries,
+    /// Cross-Domain Bridges, one `seed -> via -> target` entry per bridge.
+    Bridges,
+}
+
+/// One piece of a rendered task block: a section header, one entry with any
+/// lines that continue it, or a line of other text.
+struct TaskBlockPart<'a> {
+    section: TaskBlockSection,
+    is_header: bool,
+    is_entry: bool,
+    /// A Golden Rule entry (`  - [GOLDEN <type>] ...`).
+    is_golden: bool,
+    /// The memory ids an entry names; empty for headers and other text.
+    ids: Vec<&'a str>,
+    lines: Vec<&'a str>,
+}
+
+/// Split a task block, as [`render_subagent_prompt`] writes it, into parts.
+/// Entries are read only inside the memory-entries and bridges sections, so a
+/// goal or taxonomy line that looks like an entry is never taken for one. An
+/// entry starts at a `  - ` line and runs until the next entry or section
+/// line (`###...` or a `- ` line at column 0).
+fn task_block_parts(block: &str) -> Vec<TaskBlockPart<'_>> {
+    let mut parts: Vec<TaskBlockPart> = Vec::new();
+    let mut section = TaskBlockSection::Other;
+    for line in block.lines() {
+        let header = if line == TASK_BLOCK_ENTRIES_HEADER {
+            Some(TaskBlockSection::Entries)
+        } else if line == TASK_BLOCK_BRIDGES_HEADER {
+            Some(TaskBlockSection::Bridges)
+        } else if line.starts_with("###") || line.starts_with("- ") {
+            Some(TaskBlockSection::Other)
+        } else {
+            None
+        };
+        if let Some(next) = header {
+            section = next;
+            parts.push(TaskBlockPart {
+                section,
+                is_header: true,
+                is_entry: false,
+                is_golden: false,
+                ids: Vec::new(),
+                lines: vec![line],
+            });
+            continue;
+        }
+        if section != TaskBlockSection::Other {
+            if let Some(entry) = line.strip_prefix("  - ") {
+                let ids = if section == TaskBlockSection::Entries {
+                    task_block_entry_id(line).into_iter().collect()
+                } else {
+                    entry
+                        .split(" -> ")
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .collect()
+                };
+                parts.push(TaskBlockPart {
+                    section,
+                    is_header: false,
+                    is_entry: true,
+                    is_golden: section == TaskBlockSection::Entries
+                        && entry.starts_with("[GOLDEN "),
+                    ids,
+                    lines: vec![line],
+                });
+                continue;
+            }
+            if let Some(entry) = parts.last_mut().filter(|p| p.is_entry) {
+                entry.lines.push(line);
+                continue;
+            }
+        }
+        parts.push(TaskBlockPart {
+            section,
+            is_header: false,
+            is_entry: false,
+            is_golden: false,
+            ids: Vec::new(),
+            lines: vec![line],
+        });
+    }
+    parts
+}
+
+/// The memory id of one entry line of a task block, as
+/// [`build_task_graph_context`] renders golden rules (`  - [GOLDEN rule] `id`: ...`)
+/// and retrieved memories (`  - [fact] `id` (location): ...`); `None` for any
+/// other line.
+fn task_block_entry_id(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("  - [")?;
+    let (_, rest) = rest.split_once("] `")?;
+    let (id, _) = rest.split_once('`')?;
+    (!id.is_empty()).then_some(id)
+}
+
 /// Best-effort persistence of `.NeuroStrata/active_session.json` so harness
 /// plugins can inject Golden Rules and active task context on session startup
 /// (`sessionContextHandler`) even before the first tool call.
@@ -749,10 +997,16 @@ fn render_subagent_prompt(
     format!(
         "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)\n\
          - Namespace: `{}` | Task ID: `{}` | Goal: {}\n\
-         - Auto-Retrieved Governing Rules & Graph Nodes:\n{}{}{}\n\
+         {}\n{}{}{}\n\
          - Mandatory Graph-First Lookup Rule: Before editing any file, check whether its path and governing memory IDs (`mem-...`) are already listed under `### NeuroStrata Task & Graph Context` in your prompt. For any file you touch that is NOT listed in that block, call `neurostrata_memories_for_file` first (or `neurostrata_related` / `neurostrata_search_memory` with `mode`: `hybrid` (default) + `include_references`: true / `neurostrata_sparql_query`).\n\
          - Formal Verification Reflex: When adding or modifying a state machine, gate, sovereignty/ACL check, CRDT/merge rule, lease/claim rule, or conservation invariant, evaluate whether to extract the pure decision into `src/formal_kernel.rs`, prove its theorems in `proofs/NeuroStrata/*.lean` (zero `sorry`/`axiom`), and extend `tests/lean_parity_test.rs`.",
-        namespace, task_id, goal, hits_block, bridges_prompt, taxonomy_prompt
+        namespace,
+        task_id,
+        goal,
+        TASK_BLOCK_ENTRIES_HEADER,
+        hits_block,
+        bridges_prompt,
+        taxonomy_prompt
     )
 }
 
@@ -1137,7 +1391,7 @@ pub async fn build_task_graph_context(
                             .map(|s| format!("  - {s}"))
                     })
                     .collect();
-                format!("\n### Cross-Domain Bridges\n{}", lines.join("\n"))
+                format!("\n{TASK_BLOCK_BRIDGES_HEADER}\n{}", lines.join("\n"))
             }
         })
         .unwrap_or_default();
@@ -1192,6 +1446,102 @@ pub async fn build_task_graph_context(
         "rendered subagent prompt exceeded the 3,500-char bound"
     );
     (auto_retrieved_context, subagent_prompt)
+}
+
+/// The memory lists in `auto_retrieved_context` whose rows carry each memory's
+/// full metadata. `normative_memories` and `structural_anchors` repeat rows
+/// of `items`.
+const CONTEXT_MEMORY_LISTS: [&str; 4] = [
+    "golden_rules",
+    "items",
+    "normative_memories",
+    "structural_anchors",
+];
+
+/// What the trimmed context says in its `note` field: how to get more, and
+/// only routes that work. `neurostrata_get_memory` needs the namespace, and a
+/// golden rule can live in `global`. A repeat claim by the session that holds
+/// the task returns no context at all, so `include_metadata` only helps on
+/// create or on the claim that takes the task.
+const TRIMMED_CONTEXT_NOTE: &str = "rows are trimmed to a snippet. One memory's whole text: neurostrata_get_memory with id and namespace (this task's namespace; a golden rule not found there is in global). Every row's details: pass include_metadata: true to neurostrata_task_create, or to the neurostrata_task_claim call that takes the task (a repeat claim by the same session returns no context)";
+
+/// The context `task_claim` and `task_create` answer with by default: the
+/// same keys, each memory row cut to id, type, location and snippet (plus a
+/// deprecation or not-definition banner when the row has one), and, when
+/// anything was cut, a `note` saying how to get more. The symbol names agents
+/// were seen using keep the field names and shapes the memory's metadata
+/// stores them under: a code row's `symbol` (a string) and a rule or fact's
+/// `refs` entries that name both a file and a symbol (`{file, symbol}`
+/// objects). The full rows carry every memory's metadata (calls lists, edge
+/// sources, source identity) and made one claim reply 61,337 characters. `include_metadata: true` returns the full
+/// context. The prompt block returned as `subagent_prompt_injection` is the
+/// same either way.
+fn trimmed_graph_context(context: &Value) -> Value {
+    fn slim(row: &Value) -> Value {
+        let mut out = serde_json::Map::new();
+        for key in [
+            "id",
+            "memory_type",
+            "location",
+            "snippet",
+            "deprecation_banner",
+            "not_definition",
+        ] {
+            if let Some(v) = row.get(key) {
+                out.insert(key.to_string(), v.clone());
+            }
+        }
+        let metadata = row.get("metadata");
+        if let Some(symbol) = metadata
+            .and_then(|m| m.get("symbol"))
+            .filter(|v| v.is_string())
+        {
+            out.insert("symbol".to_string(), symbol.clone());
+        }
+        let refs: Vec<Value> = metadata
+            .and_then(|m| m.get("refs"))
+            .and_then(Value::as_array)
+            .map(|refs| {
+                // Only file and symbol, and only a ref that has both: a ref
+                // can also carry lines and a source_context, which are
+                // details, not the name.
+                refs.iter()
+                    .filter(|r| {
+                        r.get("file").is_some_and(Value::is_string)
+                            && r.get("symbol").is_some_and(Value::is_string)
+                    })
+                    .map(|r| json!({ "file": r.get("file"), "symbol": r.get("symbol") }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !refs.is_empty() {
+            out.insert("refs".to_string(), Value::Array(refs));
+        }
+        Value::Object(out)
+    }
+    let mut out = context.clone();
+    if let Some(obj) = out.as_object_mut() {
+        let mut trimmed = false;
+        for key in CONTEXT_MEMORY_LISTS {
+            if let Some(rows) = obj.get(key).and_then(Value::as_array) {
+                let slimmed: Vec<Value> = rows.iter().map(slim).collect();
+                trimmed |= slimmed != *rows;
+                obj.insert(key.to_string(), Value::Array(slimmed));
+            }
+        }
+        // The note says how to get what was cut; nothing cut, no note.
+        if trimmed {
+            obj.insert("note".to_string(), json!(TRIMMED_CONTEXT_NOTE));
+        }
+    }
+    out
+}
+
+/// Full rows only when the caller passes `include_metadata: true`.
+fn wants_metadata(args: &Value) -> bool {
+    args.get("include_metadata")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Synthesise cross-domain conceptual bridges from retrieved seed memories.
@@ -1924,13 +2274,13 @@ pub async fn record_tool_receipt(
             let session = (!session.is_empty()).then_some(session);
             let worktree = caller_root.map(str::trim).filter(|w| !w.is_empty());
             let attributed = match (session, worktree) {
-                (Some(s), Some(w)) => pick(&|r| {
-                    task_meta(r, "session_id") == Some(s) && task_meta(r, "worktree") == Some(w)
-                })
-                .or_else(|| pick(&|r| task_meta(r, "session_id") == Some(s)))
-                .or_else(|| pick(&|r| task_meta(r, "worktree") == Some(w))),
+                (Some(s), Some(w)) => {
+                    pick(&|r| task_meta(r, "session_id") == Some(s) && gate::task_in_worktree(r, w))
+                        .or_else(|| pick(&|r| task_meta(r, "session_id") == Some(s)))
+                        .or_else(|| pick(&|r| gate::task_in_worktree(r, w)))
+                }
                 (Some(s), None) => pick(&|r| task_meta(r, "session_id") == Some(s)),
-                (None, Some(w)) => pick(&|r| task_meta(r, "worktree") == Some(w)),
+                (None, Some(w)) => pick(&|r| gate::task_in_worktree(r, w)),
                 (None, None) => None,
             }
             .or_else(|| pick(&|_| true));
@@ -2108,10 +2458,15 @@ pub async fn handle_task_create(
                     json!(subagent_prompt),
                 );
             }
+            let hits_json = if wants_metadata(&args) {
+                hits_json
+            } else {
+                trimmed_graph_context(&hits_json)
+            };
             encode(&json!({
                 "id": id,
                 "namespace": namespace,
-                "task": task_summary(&id, &payload),
+                "task": task_summary(&id, &payload, false),
                 "auto_retrieved_context": hits_json,
                 "subagent_prompt_injection": subagent_prompt,
             }))
@@ -2322,7 +2677,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
                 "status": from.as_str(),
                 "claimed": true,
                 "note": "already claimed by this session",
-                "task": task_summary(&id, &task.payload),
+                "task": task_summary(&id, &task.payload, false),
             });
             return encode(&body);
         }
@@ -2472,13 +2827,19 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             dirty_tree_hash: binding.dirty_tree_hash,
         });
     }
+    let hits_json = if wants_metadata(&args) {
+        hits_json
+    } else {
+        trimmed_graph_context(&hits_json)
+    };
+    // A fresh claim is the crash-recovery read: it carries the whole history.
     let mut reply = json!({
         "id": id,
         "namespace": namespace,
         "status": task.status().as_str(),
         "claimed": true,
         "transition": { "from": from.as_str(), "to": "in_progress" },
-        "task": task_summary(&id, &task.payload),
+        "task": task_summary(&id, &task.payload, true),
         "auto_retrieved_context": hits_json,
         "subagent_prompt_injection": subagent_prompt,
     });
@@ -2575,6 +2936,10 @@ pub async fn handle_task_update(
         Err(e) => return e,
     };
     let from = task.status();
+    let history_before = task
+        .task_field("history")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
 
     // A rename is history, not a transition: without a caller's note the
     // history entry says what the title became, so Working Memory keeps the
@@ -2773,13 +3138,22 @@ pub async fn handle_task_update(
         .and_then(|t| t.get("graph_queries_count"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
+    // Only the entry this call wrote comes back (null when it wrote none,
+    // e.g. a priority change); task_list include_history returns the rest.
+    let appended = task
+        .task_field("history")
+        .and_then(Value::as_array)
+        .filter(|h| h.len() > history_before)
+        .and_then(|h| h.last())
+        .cloned();
     encode(&json!({
         "id": id,
         "namespace": namespace,
         "status": task.status().as_str(),
         "transition": transition,
         "renamed": rename_note,
-        "task": task_summary(&id, &task.payload),
+        "appended": appended,
+        "task": task_summary(&id, &task.payload, false),
         "graph_queries_count": graph_queries_count,
         "graph_lookup_nudge": Value::Null,
     }))
@@ -2820,6 +3194,10 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
     // not either. The opt-in shows them, labelled, for the audit.
     let include_retired = args
         .get("include_retired")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let include_history = args
+        .get("include_history")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
@@ -2880,7 +3258,7 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
             let retired = gate::is_retired(&m.payload.metadata, now);
             let ready =
                 gate::task_status(m) == Status::Open && !retired && is_ready(&m.payload, &statuses);
-            let mut summary = task_summary(&m.id, &m.payload);
+            let mut summary = task_summary(&m.id, &m.payload, include_history);
             if let Some(obj) = summary.as_object_mut() {
                 obj.insert("ready".to_string(), json!(ready));
                 if retired {
@@ -3547,7 +3925,7 @@ pub async fn handle_task_complete(
     .await;
 
     let mut reply = json!({
-        "task": task_summary(&id, &completed.payload),
+        "task": task_summary(&id, &completed.payload, false),
         "extracted_memory_ids": extracted,
         "follow_up_tasks_created": follow_up_created_ids,
         "task_intent_signals": signals,
@@ -5950,6 +6328,157 @@ mod tests {
         }
     }
 
+    /// The session-start task block drops whole entries whose rule was retired
+    /// after the claim (with the lines that continue them) and bridges whose
+    /// path runs through one; it keeps live and unknown entries and leaves the
+    /// goal and taxonomy text alone even when a line there looks like an entry.
+    /// It stays whole when the rows cannot be read.
+    #[tokio::test]
+    async fn task_block_drops_retired_entries_and_keeps_it_whole_on_a_read_error() {
+        use crate::guard::testkit::MockStore;
+
+        let mock = Arc::new(MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let rule = |metadata: Value| MemoryPayload {
+            content: "rule".to_string(),
+            user_id: "kenton".to_string(),
+            memory_type: "rule".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata,
+        };
+        for (id, metadata) in [
+            ("rule-live", json!({})),
+            ("fact-live", json!({})),
+            (
+                "rule-gone",
+                json!({ "superseded_by": "rule-live", "valid_to": 1 }),
+            ),
+            ("fact-gone", json!({ "valid_to": 1 })),
+            ("fact-ending", json!({ "valid_to": 4_000_000_000i64 })),
+        ] {
+            store
+                .upsert("probe", id, vec![0.1; 4], rule(metadata))
+                .await
+                .unwrap();
+        }
+        // A guard rule deprecated after the claim no longer qualifies as a
+        // Golden Rule, though nothing retired it.
+        let mut deprecated = rule(json!({ "status": "deprecated" }));
+        deprecated.memory_type = "guard_rule".to_string();
+        store
+            .upsert("global", "guard-deprecated", vec![0.1; 4], deprecated)
+            .await
+            .unwrap();
+        let block = [
+            "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)",
+            "- Namespace: `probe` | Task ID: `probe-t1` | Goal: Fix the deploy",
+            "  - [rule] `rule-gone`: a goal line that looks like an entry",
+            TASK_BLOCK_ENTRIES_HEADER,
+            "  - [GOLDEN rule] `rule-live`: Run the tests.",
+            "  - [GOLDEN rule] `rule-gone`: Use the old script.",
+            "    and this line continues the retired rule.",
+            "  - [GOLDEN guard_rule] `guard-deprecated`: A deprecated guard.",
+            "  - [fact] `fact-elsewhere` (src/a.rs): Lives in another namespace.",
+            "  - [fact] `fact-gone` (memory): Expired fact.",
+            "continued expired fact",
+            "  - [fact] `fact-ending` (memory): Expires later, still live.",
+            TASK_BLOCK_BRIDGES_HEADER,
+            "  - fact-live -> src/a.rs -> rule-live",
+            "  - fact-live -> src/a.rs -> rule-gone",
+            "  - fact-gone -> src/b.rs -> rule-live",
+            "### Project Thesis & Domain Expertise",
+            "  - [concept:a | b] `rule-gone` (Label): a concept line",
+            "- Mandatory Graph-First Lookup Rule: ...",
+        ]
+        .join("\n");
+        let mut task = rule(json!({ "task": { "status": "in_progress" } }));
+        task.memory_type = "task".to_string();
+        task.metadata["task"]["subagent_prompt_injection"] = json!(block);
+
+        let current = task_payload_without_retired_entries(&store, "probe", &task).await;
+        let expected = [
+            "### NeuroStrata Task & Graph Context (PASTE INTO ALL SUBAGENT PROMPTS)",
+            "- Namespace: `probe` | Task ID: `probe-t1` | Goal: Fix the deploy",
+            "  - [rule] `rule-gone`: a goal line that looks like an entry",
+            TASK_BLOCK_ENTRIES_HEADER,
+            "  - [GOLDEN rule] `rule-live`: Run the tests.",
+            "  - [fact] `fact-elsewhere` (src/a.rs): Lives in another namespace.",
+            "  - [fact] `fact-ending` (memory): Expires later, still live.",
+            TASK_BLOCK_BRIDGES_HEADER,
+            "  - fact-live -> src/a.rs -> rule-live",
+            "### Project Thesis & Domain Expertise",
+            "  - [concept:a | b] `rule-gone` (Label): a concept line",
+            "- Mandatory Graph-First Lookup Rule: ...",
+        ]
+        .join("\n");
+        assert_eq!(
+            current.metadata["task"]["subagent_prompt_injection"],
+            json!(expected)
+        );
+
+        // When every bridge is dropped, the bridges header goes with them.
+        let only_retired_bridges = [
+            TASK_BLOCK_ENTRIES_HEADER,
+            "  - [GOLDEN rule] `rule-live`: Run the tests.",
+            TASK_BLOCK_BRIDGES_HEADER,
+            "  - fact-live -> src/a.rs -> rule-gone",
+            "- Mandatory Graph-First Lookup Rule: ...",
+        ]
+        .join("\n");
+        task.metadata["task"]["subagent_prompt_injection"] = json!(only_retired_bridges);
+        let current = task_payload_without_retired_entries(&store, "probe", &task).await;
+        assert_eq!(
+            current.metadata["task"]["subagent_prompt_injection"],
+            json!([
+                TASK_BLOCK_ENTRIES_HEADER,
+                "  - [GOLDEN rule] `rule-live`: Run the tests.",
+                "- Mandatory Graph-First Lookup Rule: ...",
+            ]
+            .join("\n"))
+        );
+
+        // When every memory entry is dropped, its header goes with them.
+        let only_retired_entries = [
+            "- Namespace: `probe` | Task ID: `probe-t1` | Goal: Fix the deploy",
+            TASK_BLOCK_ENTRIES_HEADER,
+            "  - [GOLDEN rule] `rule-gone`: Use the old script.",
+            "  - [fact] `fact-gone` (memory): Expired fact.",
+            TASK_BLOCK_BRIDGES_HEADER,
+            "  - fact-live -> src/a.rs -> rule-live",
+            "- Mandatory Graph-First Lookup Rule: ...",
+        ]
+        .join(
+            "
+",
+        );
+        task.metadata["task"]["subagent_prompt_injection"] = json!(only_retired_entries);
+        let current = task_payload_without_retired_entries(&store, "probe", &task).await;
+        assert_eq!(
+            current.metadata["task"]["subagent_prompt_injection"],
+            json!([
+                "- Namespace: `probe` | Task ID: `probe-t1` | Goal: Fix the deploy",
+                TASK_BLOCK_BRIDGES_HEADER,
+                "  - fact-live -> src/a.rs -> rule-live",
+                "- Mandatory Graph-First Lookup Rule: ...",
+            ]
+            .join(
+                "
+"
+            ))
+        );
+
+        task.metadata["task"]["subagent_prompt_injection"] = json!(block);
+        mock.set_get_fails(true);
+        let unread = task_payload_without_retired_entries(&store, "probe", &task).await;
+        assert_eq!(
+            unread.metadata["task"]["subagent_prompt_injection"],
+            json!(block),
+            "a read error keeps the cached block whole"
+        );
+    }
+
     // hook hash marker tests (Task 1)
     #[test]
     fn hook_sha256_is_64_hex() {
@@ -7248,6 +7777,289 @@ exit 0
         let parsed: Value = serde_json::from_str(&reply)
             .unwrap_or_else(|e| panic!("create failed: {} -- {}", reply, e));
         parsed["id"].as_str().expect("id").to_string()
+    }
+
+    /// The trimmed context keeps every key, cuts each memory row to id,
+    /// type, location and snippet (plus a banner and a symbol when the row
+    /// has one), leaves the other keys as they were, and says how to get more.
+    #[test]
+    fn trimmed_context_keeps_the_keys_and_drops_the_per_item_metadata() {
+        let big = json!({ "edge_sources": vec!["x".repeat(500); 20], "mentions": ["a", "b"] });
+        let item = json!({
+            "id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text",
+            "metadata": big, "calls": ["f"], "imports": null, "governs": ["g"],
+            "depends_on": null, "evidence": [{"kind": "direct_match"}],
+        });
+        let mut warned = item.clone();
+        warned["deprecation_banner"] = json!("DEPRECATED");
+        let mut code = item.clone();
+        code["memory_type"] = json!("code_ast");
+        code["metadata"]["symbol"] = json!("parse_claim");
+        let mut rule = item.clone();
+        rule["memory_type"] = json!("rule");
+        rule["metadata"]["refs"] = json!([
+            { "file": "src/a.rs", "symbol": "a" },
+            { "file": "src/b.rs" },
+            { "symbol": "no_file" },
+            { "file": "src/c.rs", "symbol": "a", "lines": "3-9", "source_context": { "provider": "git" } }
+        ]);
+        let full = json!({
+            "query": "q",
+            "golden_rules": [item.clone()],
+            "items": [item.clone(), warned, code, rule],
+            "related_edges": [{"source": "m1", "relation": "calls", "target": "f"}],
+            "next_hop_calls": [{"tool": "neurostrata_related", "trigger_id": "T_SEED_EXPAND"}],
+            "expansion_error": null,
+            "normative_memories": [item.clone()],
+            "structural_anchors": [item.clone()],
+            "conceptual_bridges": [{"id": "b1", "why_connected": "a -> b"}],
+            "project_thesis": {"text": "thesis"},
+            "domain_concepts": [],
+        });
+        let trimmed = trimmed_graph_context(&full);
+
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let mut expected = keys(&full);
+        expected.push("note".to_string());
+        expected.sort();
+        assert_eq!(keys(&trimmed), expected, "same keys plus the note");
+        assert!(trimmed.get("compact").is_none(), "no compact key");
+        let note = trimmed["note"]
+            .as_str()
+            .expect("a note says how to get more");
+        assert!(
+            note.contains("neurostrata_get_memory with id and namespace")
+                && note.contains("global")
+                && note.contains("include_metadata: true")
+                && note.contains("repeat claim"),
+            "{note}"
+        );
+        for key in [
+            "query",
+            "related_edges",
+            "next_hop_calls",
+            "expansion_error",
+            "conceptual_bridges",
+            "project_thesis",
+            "domain_concepts",
+        ] {
+            assert_eq!(trimmed[key], full[key], "`{key}` passes through");
+        }
+        let slim =
+            json!({"id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text"});
+        for key in CONTEXT_MEMORY_LISTS {
+            assert_eq!(trimmed[key][0], slim, "`{key}` rows are slim");
+        }
+        assert_eq!(trimmed["items"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            trimmed["items"][1]["deprecation_banner"],
+            json!("DEPRECATED")
+        );
+        // The metadata's own names and shapes: a code row's `symbol` string,
+        // a rule's `refs` entries that name a file and a symbol.
+        assert_eq!(trimmed["items"][2]["symbol"], json!("parse_claim"));
+        assert!(trimmed["items"][2].get("refs").is_none());
+        assert_eq!(
+            trimmed["items"][3]["refs"],
+            json!([
+                { "file": "src/a.rs", "symbol": "a" },
+                { "file": "src/c.rs", "symbol": "a" }
+            ])
+        );
+        assert!(trimmed["items"][3].get("symbol").is_none());
+        assert!(trimmed["items"][3].get("metadata").is_none());
+        assert!(
+            serde_json::to_string(&trimmed).unwrap().len() * 5
+                < serde_json::to_string(&full).unwrap().len(),
+            "the trimmed form is a fraction of the full one"
+        );
+    }
+
+    /// Rows that are already slim lose nothing, so the context gets no note
+    /// about how to get more.
+    #[test]
+    fn trimmed_context_adds_the_note_only_when_something_was_cut() {
+        let slim =
+            json!({"id": "m1", "memory_type": "fact", "location": "src/a.rs", "snippet": "text"});
+        let context = json!({ "query": "q", "items": [slim], "golden_rules": [] });
+        assert_eq!(trimmed_graph_context(&context), context);
+    }
+
+    /// A namespace whose memories carry the heavy per-row metadata real
+    /// ingested rows have (calls lists, edge sources, source identity).
+    async fn store_with_heavy_memories(namespace: &str) -> Arc<dyn VectorStore> {
+        let store = store_with_namespace(namespace).await;
+        for (i, memory_type) in ["code_ast", "code_ast", "code_ast", "fact", "rule"]
+            .iter()
+            .enumerate()
+        {
+            let content = format!("compact fixture handler {i} parses the claim reply");
+            let vector = StubEmbedder.embed(&content).await.unwrap();
+            let calls: Vec<String> = (0..40).map(|n| format!("module::callee_{i}_{n}")).collect();
+            let edge_sources: Vec<String> = (0..20)
+                .map(|n| format!("ingest:src/fixture_{i}.rs#generation-{n}"))
+                .collect();
+            store
+                .upsert(
+                    namespace,
+                    &uuid::Uuid::new_v4().to_string(),
+                    vector,
+                    MemoryPayload {
+                        content,
+                        user_id: "kenton".to_string(),
+                        memory_type: memory_type.to_string(),
+                        agent_name: None,
+                        location: format!("src/fixture_{i}.rs"),
+                        location_lines: "1-80".to_string(),
+                        metadata: json!({
+                            "calls": calls,
+                            "imports": ["std::sync::Arc", "serde_json::Value"],
+                            "edge_sources": edge_sources,
+                            "source_identity": {
+                                "path": format!("src/fixture_{i}.rs"),
+                                "blob_sha": "0123456789abcdef0123456789abcdef01234567",
+                                "generation": i,
+                            },
+                        }),
+                    },
+                )
+                .await
+                .expect("seed a heavy memory");
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn claim_and_create_trim_rows_unless_asked_to_include_metadata() {
+        let store = store_with_heavy_memories("MyProj").await;
+        let create_reply = |args: Value| {
+            let store = store.clone();
+            async move {
+                serde_json::from_str::<Value>(&handle_task_create(args, emb(), store).await)
+                    .unwrap()
+            }
+        };
+        let created = create_reply(json!({
+            "namespace": "MyProj", "title": "compact fixture handler work"
+        }))
+        .await;
+        let created_full = create_reply(json!({
+            "namespace": "MyProj", "title": "compact fixture handler work", "include_metadata": true
+        }))
+        .await;
+        assert_eq!(
+            created["auto_retrieved_context"]["note"],
+            json!(TRIMMED_CONTEXT_NOTE)
+        );
+        assert!(created_full["auto_retrieved_context"].get("note").is_none());
+        assert!(created["auto_retrieved_context"].get("compact").is_none());
+        // `compact` is not an alias: `compact: false` still gets trimmed rows.
+        let created_old_arg = create_reply(json!({
+            "namespace": "MyProj", "title": "compact fixture handler work", "compact": false
+        }))
+        .await;
+        assert_eq!(
+            created_old_arg["auto_retrieved_context"]["note"],
+            json!(TRIMMED_CONTEXT_NOTE)
+        );
+
+        let id = created["id"].as_str().unwrap().to_string();
+        let claim = |include_metadata: Option<bool>, session: &'static str| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let mut args = json!({
+                    "namespace": "MyProj", "id": id, "assignee": "agent", "session_id": session
+                });
+                if let Some(m) = include_metadata {
+                    args["include_metadata"] = json!(m);
+                }
+                serde_json::from_str::<Value>(&handle_task_claim(args, store).await).unwrap()
+            }
+        };
+        let release = || {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                handle_task_update(
+                    json!({ "namespace": "MyProj", "id": id, "status": "open" }),
+                    emb(),
+                    store,
+                )
+                .await
+            }
+        };
+        let trimmed = claim(None, "s-compact").await;
+        // What the note says: a repeat claim by the holding session returns
+        // no context, include_metadata or not, so the note does not offer it.
+        let repeat = claim(Some(true), "s-compact").await;
+        assert_eq!(repeat["note"], json!("already claimed by this session"));
+        assert!(repeat.get("auto_retrieved_context").is_none(), "{repeat}");
+        release().await;
+        let full = claim(Some(true), "s-full").await;
+
+        assert_eq!(trimmed["claimed"], json!(true));
+        assert_eq!(full["claimed"], json!(true));
+        let ctx = &trimmed["auto_retrieved_context"];
+        assert_eq!(
+            ctx["note"],
+            json!(TRIMMED_CONTEXT_NOTE),
+            "trimmed rows are the default"
+        );
+        assert!(ctx.get("compact").is_none());
+        assert!(full["auto_retrieved_context"].get("note").is_none());
+        let items = ctx["items"].as_array().unwrap();
+        assert!(!items.is_empty(), "the fixture memories are retrieved");
+        for row in items {
+            assert!(
+                row.get("metadata").is_none() && row.get("calls").is_none(),
+                "{row}"
+            );
+        }
+        assert!(
+            full["auto_retrieved_context"]["items"][0]
+                .get("metadata")
+                .is_some(),
+            "include_metadata: true keeps each memory's metadata"
+        );
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v["auto_retrieved_context"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| *k != "note")
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&trimmed), keys(&full));
+        assert_eq!(
+            trimmed["subagent_prompt_injection"], full["subagent_prompt_injection"],
+            "the prompt block does not depend on include_metadata"
+        );
+        assert_eq!(
+            created["subagent_prompt_injection"],
+            created_full["subagent_prompt_injection"]
+                .as_str()
+                .map(|s| s.replace(
+                    created_full["id"].as_str().unwrap(),
+                    created["id"].as_str().unwrap()
+                ))
+                .map(Value::String)
+                .unwrap(),
+            "create returns the same prompt block either way"
+        );
+
+        let size = |v: &Value| serde_json::to_string(v).unwrap().len();
+        assert!(
+            size(&trimmed) * 2 < size(&full),
+            "the trimmed reply is well under half the full one"
+        );
     }
 
     async fn status_of(store: &Arc<dyn VectorStore>, namespace: &str, id: &str) -> Status {
@@ -9152,9 +9964,28 @@ exit 0
                 }
             }),
         };
-        let summary = task_summary("neurostrata-test", &payload);
+        let summary = task_summary("neurostrata-test", &payload, false);
         assert_eq!(summary["branch"], json!("feature/scope"));
         assert_eq!(summary["worktree"], json!("/wt/scope"));
+    }
+
+    /// With the history asked for, a task that has none gets `[]`, not null.
+    #[test]
+    fn task_summary_gives_an_empty_history_when_the_task_has_none() {
+        let payload = MemoryPayload {
+            content: "no notes yet".to_string(),
+            user_id: "kenton".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({ "task": { "status": "open" } }),
+        };
+        assert_eq!(task_summary("t", &payload, true)["history"], json!([]));
+        assert_eq!(
+            task_summary("t", &payload, false)["history_count"],
+            json!(0)
+        );
     }
 
     #[tokio::test]
@@ -10052,6 +10883,199 @@ exit 0
             "the release says why: {:?}",
             history[1]["note"]
         );
+    }
+
+    /// Claims are exclusive per session, so the session holding a task wrote
+    /// its note history and already has it. Only a fresh claim (the
+    /// crash-recovery read) and task_list include_history return it whole;
+    /// every other reply carries history_count. Sizes are measured on 45
+    /// notes of about 1 KB, which real tasks reach.
+    #[tokio::test]
+    async fn task_replies_carry_the_history_only_where_the_caller_lacks_it() {
+        // The size a reply had when task_summary carried the whole history.
+        fn size_with_history(reply: &Value, history: &Value) -> usize {
+            let mut old = reply.clone();
+            let task = old["task"].as_object_mut().expect("task object");
+            task.remove("history_count");
+            task.insert("history".to_string(), history.clone());
+            encode(&old).len()
+        }
+        let store = store_with_namespace("MyProj").await;
+        let created: Value = serde_json::from_str(
+            &handle_task_create(
+                json!({ "namespace": "MyProj", "title": "long running work" }),
+                emb(),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert!(created["task"].get("history").is_none(), "{created}");
+        assert_eq!(created["task"]["history_count"], json!(0));
+        let id = created["id"].as_str().unwrap().to_string();
+        let holder = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
+        handle_task_claim(holder.clone(), store.clone()).await;
+        let note = "Checked the parser against the fixture; the writer is next. ".repeat(17);
+        for step in 0..44 {
+            handle_task_update(
+                json!({ "namespace": "MyProj", "id": id, "note": format!("{step}: {note}") }),
+                emb(),
+                store.clone(),
+            )
+            .await;
+        }
+        let stored_history = |store: Arc<dyn VectorStore>, id: String| async move {
+            let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            payload.metadata["task"]["history"].clone()
+        };
+
+        // task_update: the entry it wrote, and the count.
+        let text = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "note": format!("44: {note}") }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let update: Value = serde_json::from_str(&text).unwrap();
+        let history = stored_history(store.clone(), id.clone()).await;
+        assert_eq!(history.as_array().unwrap().len(), 46, "claim + 45 notes");
+        assert!(update["task"].get("history").is_none(), "{text}");
+        assert_eq!(update["task"]["history_count"], json!(46));
+        assert_eq!(update["appended"], history[45]);
+        let update_sizes = (text.len(), size_with_history(&update, &history));
+
+        // A repeat claim by the holder: the count.
+        let text = handle_task_claim(holder.clone(), store.clone()).await;
+        let again: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(again["note"], json!("already claimed by this session"));
+        assert!(again["task"].get("history").is_none(), "{text}");
+        assert_eq!(again["task"]["history_count"], json!(46));
+        let repeat_claim_sizes = (text.len(), size_with_history(&again, &history));
+
+        // task_list: the count per row, the notes on request.
+        let text = handle_task_list(json!({ "namespace": "MyProj" }), store.clone()).await;
+        let list: Value = serde_json::from_str(&text).unwrap();
+        assert!(list["tasks"][0].get("history").is_none(), "{text}");
+        assert_eq!(list["tasks"][0]["history_count"], json!(46));
+        let full_text = handle_task_list(
+            json!({ "namespace": "MyProj", "include_history": true }),
+            store.clone(),
+        )
+        .await;
+        let full: Value = serde_json::from_str(&full_text).unwrap();
+        assert_eq!(full["tasks"][0]["history"], history);
+        assert!(full["tasks"][0].get("history_count").is_none());
+        let list_sizes = (text.len(), full_text.len());
+
+        // A fresh claim by a new session after the holder went stale: whole.
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["task"]["updated_at"] = json!("2020-01-01T00:00:00Z");
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+        let text = handle_task_claim(
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-b", "session_id": "ses_b" }),
+            store.clone(),
+        )
+        .await;
+        let fresh: Value = serde_json::from_str(&text).unwrap();
+        let history = stored_history(store.clone(), id.clone()).await;
+        assert_eq!(history.as_array().unwrap().len(), 48, "+ release + claim");
+        assert_eq!(fresh["task"]["history"], history, "{text}");
+        assert!(fresh["task"].get("history_count").is_none());
+        let fresh_claim_size = text.len();
+
+        // task_complete: the count.
+        let vector = StubEmbedder.embed("the lesson").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &uuid::Uuid::new_v4().to_string(),
+                vector,
+                MemoryPayload {
+                    content: "the lesson".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "extracted_from": [id.as_str()] }),
+                },
+            )
+            .await
+            .unwrap();
+        let text = handle_task_complete(
+            json!({ "namespace": "MyProj", "id": id, "reason": "lesson extracted" }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect("the edge exists");
+        let done: Value = serde_json::from_str(&text).unwrap();
+        let history = stored_history(store.clone(), id.clone()).await;
+        assert!(done["task"].get("history").is_none(), "{text}");
+        assert_eq!(done["task"]["history_count"], json!(49));
+        let complete_sizes = (text.len(), size_with_history(&done, &history));
+
+        println!(
+            "reply bytes, now vs with the whole history (46-49 notes of ~1 KB): \
+             update {update_sizes:?}, repeat claim {repeat_claim_sizes:?}, \
+             task_list {list_sizes:?}, complete {complete_sizes:?}; \
+             fresh claim {fresh_claim_size} (unchanged)"
+        );
+        for (name, (now, before)) in [
+            ("update", update_sizes),
+            ("repeat claim", repeat_claim_sizes),
+            ("task_list", list_sizes),
+            ("complete", complete_sizes),
+        ] {
+            assert!(now * 5 < before, "{name}: {now} bytes vs {before}");
+        }
+    }
+
+    #[tokio::test]
+    async fn task_update_returns_the_history_entry_it_wrote() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        handle_task_claim(
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
+            store.clone(),
+        )
+        .await;
+        let update = |args: Value| {
+            let store = store.clone();
+            async move {
+                let text = handle_task_update(args, emb(), store).await;
+                serde_json::from_str::<Value>(&text)
+                    .unwrap_or_else(|e| panic!("json reply: {text} -- {e}"))
+            }
+        };
+
+        let noted =
+            update(json!({ "namespace": "MyProj", "id": id, "note": "3 of 5: parser done" })).await;
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        let history = payload.metadata["task"]["history"].as_array().unwrap();
+        assert_eq!(noted["appended"], history[1], "the stored entry: {noted}");
+        assert_eq!(noted["appended"]["note"], json!("3 of 5: parser done"));
+        assert_eq!(noted["task"]["history_count"], json!(2));
+
+        // A transition writes one entry too.
+        let blocked = update(json!({
+            "namespace": "MyProj", "id": id, "status": "blocked", "note": "waiting on review"
+        }))
+        .await;
+        assert_eq!(blocked["appended"]["from"], json!("in_progress"));
+        assert_eq!(blocked["appended"]["to"], json!("blocked"));
+        assert_eq!(blocked["appended"]["note"], json!("waiting on review"));
+        assert_eq!(blocked["task"]["history_count"], json!(3));
+
+        // A change that writes no history entry says so.
+        let reprioritized = update(json!({ "namespace": "MyProj", "id": id, "priority": 0 })).await;
+        assert!(
+            reprioritized.get("appended") == Some(&Value::Null),
+            "{reprioritized}"
+        );
+        assert_eq!(reprioritized["task"]["history_count"], json!(3));
     }
 
     #[tokio::test]
@@ -11730,6 +12754,38 @@ exit 0
             },
             evidence: None,
         }
+    }
+
+    #[test]
+    fn active_task_for_root_names_this_worktree_only() {
+        let in_progress = |r: &SearchResult| gate::task_status(r) == Status::InProgress;
+        let other = task_row(
+            "t-other",
+            json!({ "status": "in_progress", "worktree": r"\\?\C:\repo\other" }),
+        );
+        let mine = task_row(
+            "t-mine",
+            json!({ "status": "in_progress", "worktree": r"\\?\C:\repo\mine" }),
+        );
+        let unstamped = task_row("t-unstamped", json!({ "status": "in_progress" }));
+        let open_mine = task_row(
+            "t-open",
+            json!({ "status": "open", "worktree": r"C:\repo\mine" }),
+        );
+        let pick = |rows: &[SearchResult], root: &str| {
+            active_task_for_root(rows, root, in_progress).map(|r| r.id.clone())
+        };
+
+        // The verbatim spelling a claim stores matches the caller's plain root,
+        // and beats an unstamped claim listed earlier.
+        let rows = [open_mine.clone(), other.clone(), unstamped.clone(), mine];
+        assert_eq!(pick(&rows, r"C:\repo\mine").as_deref(), Some("t-mine"));
+        // A task claimed in another worktree, or with no worktree stamped
+        // (it may come from any folder of the namespace), is never named.
+        let rows = [other, unstamped, open_mine];
+        assert_eq!(pick(&rows, r"C:\repo\mine"), None);
+        let outside_git = tempfile::tempdir().unwrap();
+        assert_eq!(pick(&rows, &outside_git.path().to_string_lossy()), None);
     }
 
     #[test]

@@ -1040,7 +1040,7 @@ test('UserPromptSubmit activates typed-edge neighbors before the model call', ()
   }
 })
 
-test('working-set GC non-pretool failures return event-shaped no-op', () => {
+test('working-set GC non-pretool failures return neutral success', () => {
   const root = canonicalTempDir('ns-claude-ws-failure-')
   try {
     mkdirSync(join(root, '.NeuroStrata', 'plugins', 'claude'), {
@@ -1050,25 +1050,24 @@ test('working-set GC non-pretool failures return event-shaped no-op', () => {
       join(root, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json'),
       '{'
     )
-    const expected = [
-      ['PostToolUse', { hookSpecificOutput: { hookEventName: 'PostToolUse' } }],
-      [
-        'SessionStart',
-        { hookSpecificOutput: { hookEventName: 'SessionStart' } }
-      ],
-      ['Stop', { continue: true }],
-      ['SubagentStop', { continue: true }],
-      [
-        'UnknownEvent',
-        { hookSpecificOutput: { hookEventName: 'UnknownEvent' } }
-      ]
-    ]
-    for (const [hook_event_name, want] of expected) {
-      assert.deepEqual(
-        runClaudeReply({ hook_event_name, cwd: root }, root),
-        want
-      )
+    // A failed hook answers `{}` for every event but PreToolUse; a failed
+    // Stop additionally blocks the turn with exit code 2 (#425).
+    for (const hook_event_name of [
+      'PostToolUse',
+      'SessionStart',
+      'UnknownEvent'
+    ]) {
+      assert.deepEqual(runClaudeReply({ hook_event_name, cwd: root }, root), {})
     }
+    const stop = runFailingRunner(stopEvent(root), root)
+    assert.equal(stop.status, 2, stop.stderr)
+    assert.equal(stop.stdout.trim(), '{}')
+    const sub = runFailingRunner(
+      { hook_event_name: 'SubagentStop', cwd: root },
+      root
+    )
+    assert.equal(sub.status, 0, sub.stderr)
+    assert.deepEqual(JSON.parse(sub.stdout), {})
   } finally {
     resetModuleState()
     rmSync(root, { recursive: true, force: true })
@@ -1080,6 +1079,7 @@ function runFailingRunner(event, projectDir) {
   const env = { ...process.env }
   delete env.CLAUDE_PROJECT_DIR
   delete env.NEUROSTRATA_NAMESPACE
+  delete env.NEUROSTRATA_HOOK_EVENT
   return spawnSync(process.execPath, [RUNNER], {
     input: JSON.stringify(event),
     cwd: projectDir,
@@ -1107,10 +1107,10 @@ test('hook runner replies in the shape of the failing event (#400)', () => {
     const stop = runFailingRunner(stopEvent(repo), repo)
     assert.equal(
       stop.status,
-      0,
-      `Stop must fail soft; stderr=${stop.stderr.slice(0, 200)}`
+      2,
+      `Stop must block the turn; stderr=${stop.stderr.slice(0, 200)}`
     )
-    assert.deepEqual(JSON.parse(stop.stdout), { continue: true })
+    assert.equal(stop.stdout.trim(), '{}')
 
     const pre = runFailingRunner(
       {
@@ -1125,6 +1125,23 @@ test('hook runner replies in the shape of the failing event (#400)', () => {
     const reply = JSON.parse(pre.stdout)
     assert.equal(reply.hookSpecificOutput.hookEventName, 'PreToolUse')
     assert.equal(reply.hookSpecificOutput.permissionDecision, 'deny')
+
+    // An event without a permission decision answers {}, whether the bundle
+    // lacks its handler or the hook fails on the broken config (Claude's
+    // SessionStart always goes to the plugin).
+    for (const name of [
+      'SessionStart',
+      'SessionEnd',
+      'PreCompact',
+      'PostToolUse'
+    ]) {
+      const quiet = runFailingRunner(
+        { hook_event_name: name, cwd: repo, session_id: 'failing' },
+        repo
+      )
+      assert.equal(quiet.status, 0, name)
+      assert.deepEqual(JSON.parse(quiet.stdout), {}, name)
+    }
   } finally {
     rmSync(base, { recursive: true, force: true })
   }
