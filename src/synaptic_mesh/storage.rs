@@ -482,7 +482,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
         let _ = stdout_tx.send(());
     }) {
         kill_child(&mut child);
-        reap_within(&mut child, GIT_DRAIN_GRACE);
+        reap_within(child, GIT_DRAIN_GRACE);
         return Err(error)
             .with_context(|| format!("git {display} could not start its stdout reader"));
     }
@@ -510,7 +510,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
     }) {
         reader_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         kill_child(&mut child);
-        reap_within(&mut child, GIT_DRAIN_GRACE);
+        reap_within(child, GIT_DRAIN_GRACE);
         return Err(error)
             .with_context(|| format!("git {display} could not start its stderr reader"));
     }
@@ -526,7 +526,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
             Ok(None) if started.elapsed() < timeout => std::thread::sleep(GIT_POLL_INTERVAL),
             Ok(None) => {
                 kill_child(&mut child);
-                reap_within(&mut child, GIT_DRAIN_GRACE);
+                reap_within(child, GIT_DRAIN_GRACE);
                 // Detach rather than block forever on a pipe a grandchild may
                 // still hold: the drain threads exit on their own once the
                 // last writer closes.
@@ -544,7 +544,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
             }
             Err(error) => {
                 kill_child(&mut child);
-                reap_within(&mut child, GIT_DRAIN_GRACE);
+                reap_within(child, GIT_DRAIN_GRACE);
                 drain_within(
                     &stdout_rx,
                     &stderr_rx,
@@ -615,13 +615,27 @@ fn kill_child(child: &mut std::process::Child) {
 /// to enforce. Returns false when the child is still unreaped at the bound;
 /// the caller proceeds anyway (the kill is already delivered, so the child
 /// is terminated as soon as the kernel lets it die).
-fn reap_within(child: &mut std::process::Child, bound: Duration) -> bool {
+///
+/// On the false path the child is NOT dropped: `Child` drop does not reap,
+/// so a process that dies after the bound would linger as a zombie until
+/// daemon exit, accumulating across occurrences. Instead ownership moves to
+/// a detached reaper thread that blocks on `wait()` off the caller's path —
+/// the caller still returns within `bound`, and the zombie is collected
+/// whenever the process finally exits. If the reaper thread itself cannot
+/// be spawned, the child drops unreaped, degrading to the pre-reaper
+/// behaviour rather than blocking or panicking past the bound.
+fn reap_within(mut child: std::process::Child, bound: Duration) -> bool {
     let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return true,
             Ok(None) if started.elapsed() < bound => std::thread::sleep(GIT_POLL_INTERVAL),
-            _ => return false,
+            _ => {
+                let _ = std::thread::Builder::new().spawn(move || {
+                    let _ = child.wait();
+                });
+                return false;
+            }
         }
     }
 }
