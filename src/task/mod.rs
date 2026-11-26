@@ -12812,6 +12812,31 @@ exit 0
         )
         .await;
         assert!(!reply.contains("ERROR"), "{}", reply);
+        // A success reply alone would pass a handler that silently drops
+        // the update: read the row back and assert both fields persisted.
+        let (_, updated) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert!(
+            updated.metadata["task"]["labels"]
+                .as_array()
+                .map(|labels| labels.iter().any(|l| l.as_str() == Some("release")))
+                .unwrap_or(false),
+            "the clean label is persisted: {}",
+            updated.metadata
+        );
+        assert!(
+            updated.metadata["task"]["history"]
+                .as_array()
+                .map(|history| {
+                    history.iter().any(|entry| {
+                        entry
+                            .to_string()
+                            .contains("deployed through the release pipeline")
+                    })
+                })
+                .unwrap_or(false),
+            "the clean note is persisted in history: {}",
+            updated.metadata
+        );
 
         let reply = handle_task_claim(
             json!({
