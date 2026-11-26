@@ -1174,7 +1174,15 @@ pub(crate) async fn refresh_active_session_file(
     }
     let mut active: Option<Task> = None;
     // The task the file names counts only while the session that wrote it
-    // still holds the claim.
+    // still holds the claim. The snapshot's candidate counts only while its
+    // claim is still in this worktree: another worktree may have taken it over
+    // between the snapshot's listing and this lock.
+    let root = project_root.to_string_lossy();
+    let claimed_here = |task: &Task| {
+        task.task_field("worktree")
+            .and_then(|v| v.as_str())
+            .is_some_and(|w| !w.is_empty() && crate::paths::same_location(w, &root))
+    };
     let named = session_file_task_id(project_root);
     let candidates = candidate
         .map(|id| (id.to_string(), None))
@@ -1183,9 +1191,10 @@ pub(crate) async fn refresh_active_session_file(
     for (id, file_session) in candidates {
         match in_progress_task(store, namespace, &id).await {
             Ok(Some(task))
-                if file_session
-                    .as_ref()
-                    .is_none_or(|session| file_names_current_claim(session.as_deref(), &task)) =>
+                if match file_session.as_ref() {
+                    Some(session) => file_names_current_claim(session.as_deref(), &task),
+                    None => claimed_here(&task),
+                } =>
             {
                 active = Some(task);
                 break;
@@ -11347,6 +11356,16 @@ exit 0
         let old_file = session(&old);
         assert!(old_file.get("task_id").is_none(), "{}", old_file);
         assert_eq!(old_file["namespace"], json!("MyProj"), "{}", old_file);
+
+        // A snapshot in the old worktree that listed the task before the
+        // takeover does not write it back: under the lock, its claim is now in
+        // the other worktree.
+        refresh_active_session_file(&store, old.path(), "MyProj", &[], None, Some(&id)).await;
+        let old_file = session(&old);
+        assert!(old_file.get("task_id").is_none(), "{}", old_file);
+        // In its own worktree the same candidate is still written.
+        refresh_active_session_file(&store, new.path(), "MyProj", &[], None, Some(&id)).await;
+        assert_eq!(session(&new)["task_id"], json!(id), "{}", session(&new));
     }
 
     #[tokio::test]
