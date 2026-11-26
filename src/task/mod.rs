@@ -6455,10 +6455,8 @@ mod tests {
             "  - fact-live -> src/a.rs -> rule-live",
             "- Mandatory Graph-First Lookup Rule: ...",
         ]
-        .join(
-            "
-",
-        );
+        .join("
+");
         task.metadata["task"]["subagent_prompt_injection"] = json!(only_retired_entries);
         let current = task_payload_without_retired_entries(&store, "probe", &task).await;
         assert_eq!(
@@ -6469,10 +6467,8 @@ mod tests {
                 "  - fact-live -> src/a.rs -> rule-live",
                 "- Mandatory Graph-First Lookup Rule: ...",
             ]
-            .join(
-                "
-"
-            ))
+            .join("
+"))
         );
 
         task.metadata["task"]["subagent_prompt_injection"] = json!(block);
@@ -9988,10 +9984,7 @@ exit 0
             metadata: json!({ "task": { "status": "open" } }),
         };
         assert_eq!(task_summary("t", &payload, true)["history"], json!([]));
-        assert_eq!(
-            task_summary("t", &payload, false)["history_count"],
-            json!(0)
-        );
+        assert_eq!(task_summary("t", &payload, false)["history_count"], json!(0));
     }
 
     #[tokio::test]
@@ -12784,7 +12777,12 @@ exit 0
 
         // The verbatim spelling a claim stores matches the caller's plain root,
         // and beats an unstamped claim listed earlier.
-        let rows = [open_mine.clone(), other.clone(), unstamped.clone(), mine];
+        let rows = [
+            open_mine.clone(),
+            other.clone(),
+            unstamped.clone(),
+            mine,
+        ];
         assert_eq!(pick(&rows, r"C:\repo\mine").as_deref(), Some("t-mine"));
         // A task claimed in another worktree, or with no worktree stamped
         // (it may come from any folder of the namespace), is never named.

@@ -8766,19 +8766,23 @@ impl LadybugStore {
                                 } else {
                                     (namespace.to_string(), target.to_string())
                                 };
-                            if let Ok(Some((_, tpayload))) = self.get(&ns, &tid).await {
-                                let target_type = tpayload.memory_type;
-                                if !crate::rdf::shacl::endpoint_role_allowed(
-                                    rel_type,
-                                    &source_type,
-                                    &target_type,
-                                ) {
-                                    out.push(serde_json::json!({
-                                        "id": r.id,
-                                        "field": format!("metadata.{}", key),
-                                        "why": format!("endpoint role mismatch: {} (source={} target={})", rel_type, source_type, target_type),
-                                    }));
-                                }
+                            // A target that does not exist contributes no
+                            // warning, but a read that failed -- a busy turn
+                            // above all -- must not be read as "no target".
+                            let Some((_, tpayload)) = self.get(&ns, &tid).await? else {
+                                continue;
+                            };
+                            let target_type = tpayload.memory_type;
+                            if !crate::rdf::shacl::endpoint_role_allowed(
+                                rel_type,
+                                &source_type,
+                                &target_type,
+                            ) {
+                                out.push(serde_json::json!({
+                                    "id": r.id,
+                                    "field": format!("metadata.{}", key),
+                                    "why": format!("endpoint role mismatch: {} (source={} target={})", rel_type, source_type, target_type),
+                                }));
                             }
                         }
                     }
@@ -12003,7 +12007,9 @@ impl VectorStore for LadybugStore {
         // copies below. An external writer (another process, or the same
         // store without this instance's lock) can still mutate the source
         // mid-copy; the metadata bracket on the copy catches that.
-        let mut turn = Arc::clone(&self.write_lock).lock_owned().await;
+        let mut turn = self
+            .acquire_write_turn_within("exporting the database", write_turn_budget())
+            .await?;
         let started = std::time::Instant::now();
         let latch = self.checkpoints.clone();
         let checkpoint_run: CheckpointRun = {
@@ -33470,6 +33476,8 @@ eurostrata\src\daemon.rs",
     /// flushes it.
     mod store_busy {
         use super::super::*;
+        use super::{retired_test_payload, retired_test_store, PROBE_SOURCE};
+        use serde_json::json;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;
         use std::time::Duration;
@@ -33614,6 +33622,138 @@ eurostrata\src\daemon.rs",
             };
 
             assert!(is_store_busy(&err), "{err:?}");
+            drop(held);
+        }
+
+        /// The typed classification must not mistake an ordinary failure for a
+        /// busy store: callers retry a busy store and not a broken one.
+        #[test]
+        fn busy_detection_rejects_an_ordinary_error() {
+            let ordinary = anyhow::anyhow!("the engine refused a duplicate key");
+            assert!(!is_store_busy(&ordinary), "{ordinary:?}");
+            assert_eq!(store_busy_message(&ordinary), None);
+        }
+
+        /// A busy store stays recognisable under the context a caller adds.
+        #[test]
+        fn busy_detection_finds_a_wrapped_busy() {
+            let wrapped = anyhow::Error::new(StoreBusy {
+                operation: "reading a memory".to_string(),
+                budget: Duration::from_secs(3),
+            })
+            .context("outer context");
+            assert!(is_store_busy(&wrapped), "{wrapped:?}");
+            assert_eq!(
+                store_busy_message(&wrapped).as_deref(),
+                Some(
+                    "the database is busy: reading a memory did not finish within 3s. The statement may still be running, so read the record back before retrying."
+                ),
+                "{wrapped}"
+            );
+        }
+
+        /// A busy refresh must leave the last good list in place: an empty list
+        /// cached here would silently drop every mention the caller checks.
+        #[tokio::test]
+        async fn mention_symbol_ids_keep_their_cache_when_a_refresh_is_busy() {
+            let store = retired_test_store().await;
+            let id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/lib.rs");
+            store
+                .upsert(
+                    "probe",
+                    &id,
+                    vec![0.5; 4],
+                    retired_test_payload("file", "auto-ingestor", json!({})),
+                )
+                .await
+                .expect("store the symbol row");
+            store
+                .publish_generation("probe", PROBE_SOURCE, 1)
+                .await
+                .expect("publish generation 1");
+
+            let seeded = store
+                .mention_symbol_ids("probe")
+                .await
+                .expect("seed the cache");
+            assert_eq!(
+                seeded.as_slice(),
+                std::slice::from_ref(&id),
+                "the seeded cache must hold the symbol"
+            );
+
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+            let err = store
+                .mention_symbol_ids("probe")
+                .await
+                .expect_err("a held turn must report busy, not an empty list");
+            assert!(is_store_busy(&err), "{err:?}");
+            drop(held);
+
+            // The busy refresh inserted nothing: the cached list still holds
+            // the symbol rather than an empty list.
+            let cached = store
+                .mention_symbol_ids
+                .read()
+                .await
+                .get("probe")
+                .cloned()
+                .expect("the cache entry survives a busy refresh");
+            assert_eq!(cached.1.as_slice(), std::slice::from_ref(&id));
+
+            let after = store
+                .mention_symbol_ids("probe")
+                .await
+                .expect("the cache is served cleanly once the turn is free");
+            assert_eq!(after.as_slice(), std::slice::from_ref(&id));
+            assert!(
+                !after.is_empty(),
+                "a busy refresh must not poison the cache with an empty list"
+            );
+        }
+
+        /// `get` is a direct read: behind a held turn it must say busy, never
+        /// report the row as absent.
+        #[tokio::test]
+        async fn get_behind_a_held_turn_reports_busy_not_a_missing_row() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let err = store
+                .get("probe", "missing-row")
+                .await
+                .expect_err("a held turn must report busy, not a missing row");
+            assert!(is_store_busy(&err), "{err:?}");
+            drop(held);
+        }
+
+        /// `write_with_deadline` must bound its wait for the turn: a caller
+        /// behind a held turn hears busy instead of queueing for the default
+        /// thirty seconds, and its statement is never dispatched.
+        #[tokio::test]
+        async fn write_with_deadline_behind_a_held_turn_reports_busy() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+            let previous_timeout = std::env::var("NEUROSTRATA_WRITE_TIMEOUT_SECS").ok();
+            std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "1");
+
+            let outcome = store
+                .write_with_deadline("writing a memory", |_conn| Ok(()))
+                .await;
+
+            match previous_timeout {
+                Some(value) => std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", value),
+                None => std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS"),
+            }
+            let err =
+                outcome.expect_err("a held turn must report busy, not dispatch the statement");
+            assert!(is_store_busy(&err), "{err:?}");
+            assert!(
+                store_busy_message(&err)
+                    .as_deref()
+                    .is_some_and(|m| m.contains("writing a memory")),
+                "{err}"
+            );
             drop(held);
         }
 
@@ -36113,7 +36253,9 @@ impl LadybugStore {
     /// `OntologyProperty`, `ShaclShape`, `ShaclProperty`, `Namespace`, `RdfNode`, `Statement`),
     /// and returns `ontobug::Catalog::from_database(self.db.clone(), &self.local_path)`.
     pub async fn ontobug_catalog(&self) -> anyhow::Result<ontobug::Catalog> {
-        let _guard = self.write_lock.lock().await;
+        let _guard = self
+            .acquire_write_turn_within("reading the ontobug catalog", write_turn_budget())
+            .await?;
         ontobug::Catalog::from_database(self.db.clone(), &self.local_path)
             .map_err(|e| anyhow::anyhow!(e))
     }
@@ -36124,7 +36266,9 @@ impl LadybugStore {
     where
         F: FnOnce(&mut ontobug::Catalog) -> ontobug::Result<R>,
     {
-        let _guard = self.write_lock.lock().await;
+        let _guard = self
+            .acquire_write_turn_within("updating the ontobug catalog", write_turn_budget())
+            .await?;
         let mut catalog = ontobug::Catalog::from_database(self.db.clone(), &self.local_path)
             .map_err(|e| anyhow::anyhow!(e))?;
         f(&mut catalog).map_err(|e| anyhow::anyhow!(e))
