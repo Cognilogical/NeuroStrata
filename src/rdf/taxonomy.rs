@@ -1268,24 +1268,31 @@ pub async fn execute_taxonomy(
 /// (including when one namespace is `a-b` with slug `c` and another is `a`
 /// with slug `b-c`).
 pub fn taxonomy_namespace_token(namespace: &str) -> String {
+    use std::fmt::Write;
     let mut out = String::with_capacity(namespace.len());
-    let bytes = namespace.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        let is_double_dash = b == b'-' && (i > 0 && bytes[i - 1] == b'-');
+    for &b in namespace.as_bytes() {
         match b {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' => out.push(b as char),
-            b'-' if !is_double_dash => out.push('-'),
+            // Escape every hyphen, not only the second of a pair. Escaping
+            // only some hyphens makes `a.b` and the literal namespace
+            // `a-2e-b` encode identically.
+            b'-' => out.push_str("-2d-"),
             _ => {
-                use std::fmt::Write;
-                // DR-2-safe escape: `~` is not in the bare-id charset, so a
-                // dotted namespace (`team.proj` -> `team-2e-proj`) must not
-                // produce an id the store rejects. Hexadecimal escapes stay
-                // injective without the tilde.
                 let _ = write!(&mut out, "-{:02x}-", b);
             }
         }
     }
-    out
+    // Generated ids must stay under DR-2's 128-character bare-id cap even for
+    // a 64-character namespace and a 64-character concept slug. A namespace
+    // long enough to threaten that is represented by its SHA-256 digest; the
+    // collision probability is negligible and the token remains bounded.
+    if out.len() > 48 {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(namespace.as_bytes());
+        format!("h{}", hex::encode(digest))
+    } else {
+        out
+    }
 }
 
 /// Deterministic, namespace-qualified row ID for a thesis version.
@@ -1295,10 +1302,16 @@ pub fn thesis_row_id(namespace: &str, version: u64) -> String {
 
 /// Deterministic, namespace-qualified row ID for a SKOS concept version.
 pub fn concept_row_id(namespace: &str, slug: &str, version: u64) -> String {
-    format!(
-        "concept-{}--{slug}-v{version}",
-        taxonomy_namespace_token(namespace)
-    )
+    let token = taxonomy_namespace_token(namespace);
+    let raw = format!("concept-{token}--{slug}-v{version}");
+    if raw.len() <= 128 {
+        return raw;
+    }
+    // Keep the row id inside DR-2's bare-id cap. The slug is content-addressed
+    // only when the combined id would overflow; ordinary slugs stay readable.
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(slug.as_bytes());
+    format!("concept-{token}--h{}-v{version}", &hex::encode(digest)[..32])
 }
 
 async fn execute_set_thesis(
@@ -3795,6 +3808,26 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!("namespace {namespace:?} produced an invalid concept id: {error}")
                 });
+        }
+        assert_ne!(
+            taxonomy_namespace_token("a.b"),
+            taxonomy_namespace_token("a-2e-b"),
+            "a dotted namespace and a literal escape-looking namespace must not collide"
+        );
+        let long_namespace = format!("{}{}", "a".repeat(63), ".");
+        let long_slug = "s".repeat(64);
+        for id in [
+            thesis_row_id(&long_namespace, 1),
+            concept_row_id(&long_namespace, &long_slug, 1),
+        ] {
+            assert!(
+                id.len() <= 128,
+                "generated taxonomy id exceeds DR-2's cap: {} chars ({id})",
+                id.len()
+            );
+            crate::domain::validate_id(&id).unwrap_or_else(|error| {
+                panic!("long taxonomy input produced an invalid id: {error}")
+            });
         }
     }
 
