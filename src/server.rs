@@ -19022,19 +19022,20 @@ mod tests {
     }
 
     /// A correction is the same memory with better words. Resetting its usage
-    /// to zero would rank it below siblings the old row outranked, in
-    /// memories_for_file (access_count is a sort key) and in search (usage
-    /// boost), so the corrected text would surface less than the wrong one did.
+    /// to zero would rank it below siblings the old row outranked: in
+    /// memories_for_file for a rule on a folder above the file (access_count
+    /// orders those; direct matches go newest first), in search (usage boost)
+    /// and in the snapshot's rule list.
     #[tokio::test]
     async fn superseding_keeps_the_access_count_and_the_rank() {
         let (store, old_id) = store_with_one_rule("probe").await;
         let (vector, mut old) = store.get("probe", &old_id).await.unwrap().unwrap();
-        old.metadata = serde_json::json!({ "access_count": 7, "governs": ["src/lib.rs"] });
+        old.metadata = serde_json::json!({ "access_count": 7, "governs": ["src"] });
         store.upsert("probe", &old_id, vector, old).await.unwrap();
 
         let sibling_id = uuid::Uuid::new_v4().to_string();
         let mut sibling = payload("prefer small commits");
-        sibling.metadata = serde_json::json!({ "access_count": 3, "governs": ["src/lib.rs"] });
+        sibling.metadata = serde_json::json!({ "access_count": 3, "governs": ["src"] });
         let sibling_vector = StubEmbedder.embed("prefer small commits").await.unwrap();
         store
             .upsert("probe", &sibling_id, sibling_vector, sibling)
