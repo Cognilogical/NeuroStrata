@@ -416,6 +416,33 @@ pub fn stage_task_transition_at(
 /// is the funnel invariant: the exact title and the assembled metadata are
 /// judged before any schema init or row write, so a creation path cannot be
 /// added that forgets the check.
+/// The exact payload `write_task_row` judges: title, assembled task and
+/// top-level metadata, and the persisted identity. Shared so callers that
+/// must refuse *before* any setup (namespace init, marker or plugin setup,
+/// an import batch's first write) judge the identical payload.
+fn scan_task_row_payload(
+    content: &str,
+    user_id: &str,
+    agent_name: Option<&str>,
+    task_meta: &Map<String, Value>,
+    top_level: &Map<String, Value>,
+    surface: &str,
+) -> Option<String> {
+    let mut scan_meta = task_meta.clone();
+    for (key, value) in top_level {
+        scan_meta.insert(key.clone(), value.clone());
+    }
+    // Identity is persisted on the row too: a caller-supplied user or agent
+    // carrying a secret must be judged before the schema init or the upsert,
+    // exactly like the title and task metadata around it.
+    scan_meta.insert("user_id".to_string(), json!(user_id));
+    if let Some(agent) = agent_name {
+        scan_meta.insert("agent_name".to_string(), json!(agent));
+    }
+    crate::secrets::scan_entry_point(content, &Value::Object(scan_meta), surface)
+        .map(|rejection| rejection.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn write_task_row(
     store: &Arc<dyn VectorStore>,
@@ -429,21 +456,10 @@ async fn write_task_row(
     top_level: Map<String, Value>,
     surface: &str,
 ) -> Result<MemoryPayload, String> {
-    let mut scan_meta = task_meta.clone();
-    for (key, value) in &top_level {
-        scan_meta.insert(key.clone(), value.clone());
-    }
-    // Identity is persisted on the row too: a caller-supplied user or agent
-    // carrying a secret must be judged before the schema init or the upsert,
-    // exactly like the title and task metadata around it.
-    scan_meta.insert("user_id".to_string(), json!(user_id));
-    if let Some(agent) = agent_name {
-        scan_meta.insert("agent_name".to_string(), json!(agent));
-    }
-    if let Some(rejection) =
-        crate::secrets::scan_entry_point(content, &Value::Object(scan_meta), surface)
-    {
-        return Err(rejection.to_string());
+    if let Some(rejection) = scan_task_row_payload(
+        content, user_id, agent_name, &task_meta, &top_level, surface,
+    ) {
+        return Err(rejection);
     }
 
     store
@@ -496,6 +512,13 @@ async fn store_new_task(
     top_level: Map<String, Value>,
     surface: &str,
 ) -> Result<(String, MemoryPayload), String> {
+    // Judge the assembled payload before the schema init below: a refused
+    // creation must not leave a freshly initialized namespace behind.
+    if let Some(rejection) = scan_task_row_payload(
+        content, user_id, agent_name, &task_meta, &top_level, surface,
+    ) {
+        return Err(rejection);
+    }
     // Listing is what finds id collisions, and listing needs the schema.
     store
         .init(namespace)
@@ -4435,6 +4458,18 @@ pub async fn handle_bootstrap(
         return e;
     }
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
+    // The description lands verbatim in the seeded task below, but marker
+    // and plugin setup run first: judge it before either, so a refused
+    // bootstrap leaves no setup state behind.
+    if let Some(desc) = &project_description {
+        let mut scan_meta = Map::new();
+        scan_meta.insert("description".to_string(), json!(desc));
+        if let Some(rejection) =
+            crate::secrets::scan_entry_point("", &Value::Object(scan_meta), "task_bootstrap")
+        {
+            return rejection.to_string();
+        }
+    }
     let checked = match checked_marker_root(project_root) {
         Ok(root) => root,
         Err(e) => return e,
