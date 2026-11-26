@@ -11814,13 +11814,24 @@ impl VectorStore for LadybugStore {
                 safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
             );
 
-            // #409: record the store's embedding identity before the first
-            // vector MERGE. The marker and the vector share this writer's
-            // turn, so a marker failure leaves the store with zero vectors
-            // from this write.
-            first_write_marker.ensure_written_before_first_vector(conn)?;
-
-            conn.query(&insert_query)?;
+            // #409: the marker and the first vector are one unit. Wrapping
+            // them in a transaction means a vector MERGE failure cannot leave
+            // a marker behind in a store that holds no vector from this write.
+            conn.query("BEGIN TRANSACTION")?;
+            let write = (|| -> Result<()> {
+                first_write_marker.ensure_written_before_first_vector(conn)?;
+                conn.query(&insert_query)?;
+                Ok(())
+            })();
+            match write {
+                Ok(()) => {
+                    conn.query("COMMIT")?;
+                }
+                Err(error) => {
+                    let _ = conn.query("ROLLBACK");
+                    return Err(error);
+                }
+            }
 
             // The core MERGE has landed, so this write's data is in the
             // store: record the first-data transition here, in the
@@ -37281,9 +37292,14 @@ impl LadybugStore {
                     // #409: record the store's embedding identity inside this
                     // writer's turn, before the first vector lands. A marker
                     // failure aborts the transaction with zero rows written,
-                    // matching the single-row upsert's contract.
-                    first_write_marker.ensure_written_before_first_vector(conn)
-                        .map_err(|e| ActionError::Storage(e.to_string()))?;
+                    // matching the single-row upsert's contract. An edge-only
+                    // or otherwise empty batch writes no vector and must not
+                    // pin the store to this process's embedder.
+                    if !writes.is_empty() {
+                        first_write_marker
+                            .ensure_written_before_first_vector(conn)
+                            .map_err(|e| ActionError::Storage(e.to_string()))?;
+                    }
                     for w in &writes {
                         if w.payload.memory_type == "thesis" || w.payload.memory_type == "concept" {
                             touches_taxonomy = true;
