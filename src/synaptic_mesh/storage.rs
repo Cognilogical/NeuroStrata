@@ -446,8 +446,11 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
     let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
     let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    // Builder::spawn, not thread::spawn: a failed reader spawn must not
+    // panic past the child — the already-spawned git is killed and reaped
+    // (bounded) before the error returns, never left running unowned.
     let stdout_sink = std::sync::Arc::clone(&stdout_buf);
-    std::thread::spawn(move || {
+    if let Err(error) = std::thread::Builder::new().spawn(move || {
         let mut chunk = [0u8; 16 * 1024];
         loop {
             match child_stdout.read(&mut chunk) {
@@ -459,9 +462,14 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
             }
         }
         let _ = stdout_tx.send(());
-    });
+    }) {
+        kill_child(&mut child);
+        reap_within(&mut child, GIT_DRAIN_GRACE);
+        return Err(error)
+            .with_context(|| format!("git {display} could not start its stdout reader"));
+    }
     let stderr_sink = std::sync::Arc::clone(&stderr_buf);
-    std::thread::spawn(move || {
+    if let Err(error) = std::thread::Builder::new().spawn(move || {
         let mut chunk = [0u8; 16 * 1024];
         loop {
             match child_stderr.read(&mut chunk) {
@@ -473,7 +481,12 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
             }
         }
         let _ = stderr_tx.send(());
-    });
+    }) {
+        kill_child(&mut child);
+        reap_within(&mut child, GIT_DRAIN_GRACE);
+        return Err(error)
+            .with_context(|| format!("git {display} could not start its stderr reader"));
+    }
 
     // Elapsed-based deadline, never `Instant::now() + timeout`: a huge
     // configured bound (e.g. NEUROSTRATA_GIT_TIMEOUT_SECS=u64::MAX) overflows
