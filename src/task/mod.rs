@@ -2627,6 +2627,25 @@ async fn resolve_task_scope(
     (chosen_root, scope)
 }
 
+/// A resolved scope is persisted exactly like an explicit one, so the
+/// derived branch/worktree (from the registry root or the daemon's git
+/// state) is judged before it is stamped: an explicit-args-only scan
+/// leaves that write surface open.
+fn scan_resolved_scope(scope: &gate::GateScope, surface: &str) -> Option<String> {
+    let mut payload = Map::new();
+    if let Some(branch) = &scope.branch {
+        payload.insert("branch".to_string(), json!(branch));
+    }
+    if let Some(worktree) = &scope.worktree {
+        payload.insert("worktree".to_string(), json!(worktree));
+    }
+    if payload.is_empty() {
+        return None;
+    }
+    crate::secrets::scan_entry_point("", &Value::Object(payload), surface)
+        .map(|rejection| rejection.to_string())
+}
+
 pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> String {
     let id = match required_str(&args, "id") {
         Ok(v) => v.to_string(),
@@ -2715,6 +2734,9 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             // strict gate can judge them, persist it, and leave already
             // attributed rows exactly as they are.
             let (_, scope) = resolve_task_scope(&args, &store, &namespace).await;
+            if let Some(rejection) = scan_resolved_scope(&scope, "task_claim") {
+                return rejection;
+            }
             let obj = task_obj_mut(&mut task.payload);
             let branch_missing = obj
                 .get("branch")
@@ -2817,6 +2839,9 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     };
     task = claimed;
     let (scope_root, scope) = resolve_task_scope(&args, &store, &namespace).await;
+    if let Some(rejection) = scan_resolved_scope(&scope, "task_claim") {
+        return rejection;
+    }
     {
         let obj = task_obj_mut(&mut task.payload);
         obj.insert("assignee".to_string(), json!(assignee));
@@ -3135,6 +3160,9 @@ pub async fn handle_task_update(
                     }
                     if new_claim {
                         let (_, scope) = resolve_task_scope(&args, &store, &namespace).await;
+                        if let Some(rejection) = scan_resolved_scope(&scope, "task_update") {
+                            return rejection;
+                        }
                         obj.insert("branch".to_string(), json!(scope.branch));
                         obj.insert("worktree".to_string(), json!(scope.worktree));
                     }
