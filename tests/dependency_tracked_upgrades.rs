@@ -267,6 +267,16 @@ fn oxiri_pin_matches_the_spareval_dependency_edge() {
 
     let requirement = root_oxiri_requirement();
     let pin_band = requirement_band(&requirement);
+    // The recorded band itself is part of the gate: a coordinated move of
+    // both the root pin and the spareval edge to a new band must fail here
+    // until this test and the decision record are updated together (#339).
+    assert_eq!(
+        pin_band,
+        (0, 2),
+        "Cargo.toml pins {OXIRI} = {requirement:?} (band {}.{}), but the decision record holds the pin at band 0.2; \
+         a coordinated band move is the tracked upgrade itself and must update this gate and the record in the same change",
+        pin_band.0, pin_band.1
+    );
 
     // Duplicate oxiri packages are a split only within the pinned band.
     // A different band legitimately coexists through the separate rudof_*
@@ -345,6 +355,12 @@ fn oxiri_pin_matches_the_spareval_dependency_edge() {
             );
 
             let edge_band = (edge_parsed.major, edge_parsed.minor);
+            assert_eq!(
+                edge_band,
+                (0, 2),
+                "{SPAREVAL} {spareval_version} depends on {OXIRI} {edge_version} (band {}.{}), but the decision record holds the spareval edge at band 0.2 (#339)",
+                edge_band.0, edge_band.1
+            );
             assert_eq!(
                 edge_band, pin_band,
                 "{SPAREVAL} {spareval_version} depends on {OXIRI} {edge_version} (band {}.{}), but Cargo.toml pins {OXIRI} = {requirement:?} (band {}.{}). \
