@@ -135,6 +135,45 @@ fn redact_into(text: &str, found: &mut Vec<&'static str>) -> String {
     scrubbed
 }
 
+/// A caller's title, redacted and checked. It is refused only when it is over
+/// the limit both as written and redacted: a pasted secret can make it too
+/// long, and a marker longer than a short secret must not make it too long.
+fn check_title_redacted(title: &str, found: &mut Vec<&'static str>) -> Result<String, String> {
+    let redacted = redact_into(title, found);
+    match check_title(&redacted) {
+        Ok(t) => Ok(t),
+        Err(e) if check_title(title).is_err() => Err(e),
+        Err(_) => Ok(redacted.trim().to_string()),
+    }
+}
+
+/// Every place a task row is written runs this, so task text from any path
+/// (bootstrap, imports, staged actions, notes that quote an older title) is
+/// stored redacted. The tools redact first to name the categories in their
+/// replies; running it again here changes nothing.
+fn redact_task_payload(payload: &mut MemoryPayload) {
+    payload.content = crate::secrets::redact(&payload.content).0;
+    let Some(task) = payload
+        .metadata
+        .get_mut("task")
+        .and_then(|t| t.as_object_mut())
+    else {
+        return;
+    };
+    for key in ["description", "close_reason"] {
+        if let Some(Value::String(text)) = task.get_mut(key) {
+            *text = crate::secrets::redact(text).0;
+        }
+    }
+    if let Some(history) = task.get_mut("history").and_then(|h| h.as_array_mut()) {
+        for entry in history {
+            if let Some(Value::String(note)) = entry.get_mut("note") {
+                *note = crate::secrets::redact(note).0;
+            }
+        }
+    }
+}
+
 /// The `redactions` reply field: one `{"category": ...}` per secret replaced,
 /// empty when none. Never the secret itself.
 fn redactions_json(found: &[&'static str]) -> Value {
@@ -322,8 +361,9 @@ async fn save_task(
     namespace: &str,
     id: &str,
     vector: Vec<f32>,
-    payload: MemoryPayload,
+    mut payload: MemoryPayload,
 ) -> Result<(), String> {
+    redact_task_payload(&mut payload);
     store
         .init(namespace)
         .await
@@ -376,7 +416,7 @@ pub fn stage_task_transition_at(
         }
     }
     let ctx = machine::Ctx {
-        reason: note.to_string(),
+        reason: crate::secrets::redact(note).0,
         extraction_edge_exists: false,
         actor: actor.to_string(),
         session: session.to_string(),
@@ -429,6 +469,7 @@ async fn write_task_row(
         .init(namespace)
         .await
         .map_err(|_| "Failed to initialize table.".to_string())?;
+    let content = &crate::secrets::redact(content).0;
     let vector = emb
         .embed(content)
         .await
@@ -446,7 +487,7 @@ async fn write_task_row(
         metadata.insert(key, value);
     }
 
-    let payload = MemoryPayload {
+    let mut payload = MemoryPayload {
         content: content.to_string(),
         user_id: user_id.to_string(),
         memory_type: "task".to_string(),
@@ -455,6 +496,7 @@ async fn write_task_row(
         location_lines: String::new(),
         metadata: Value::Object(metadata),
     };
+    redact_task_payload(&mut payload);
     store
         .upsert(namespace, id, vector, payload.clone())
         .await
@@ -2310,7 +2352,7 @@ pub async fn handle_task_create(
     };
     let mut redactions = Vec::new();
     let title = match arg_str(&args, "title") {
-        Some(t) => match check_title(&redact_into(t, &mut redactions)) {
+        Some(t) => match check_title_redacted(t, &mut redactions) {
             Ok(v) => v,
             Err(e) => return e,
         },
@@ -2890,10 +2932,10 @@ pub async fn handle_task_update(
     // rewriting content AND re-embedding: a title is what search_memory reads.
     let new_title = match args.get("title") {
         None => None,
-        Some(_) => match check_title(&redact_into(
+        Some(_) => match check_title_redacted(
             arg_str(&args, "title").unwrap_or_default(),
             &mut redactions,
-        )) {
+        ) {
             Ok(t) => Some(t),
             Err(e) => return e,
         },
@@ -2941,7 +2983,11 @@ pub async fn handle_task_update(
     let rename_note = new_title
         .as_ref()
         .filter(|t| **t != task.payload.content)
-        .map(|t| format!("renamed: '{}' -> '{}'", task.payload.content, t));
+        // A title stored before redaction existed may still hold a secret.
+        .map(|t| {
+            let old_title = crate::secrets::redact(&task.payload.content).0;
+            format!("renamed: '{old_title}' -> '{t}'")
+        });
 
     let ctx = Ctx {
         reason: note.clone().unwrap_or_default(),
@@ -3404,7 +3450,7 @@ pub async fn handle_task_complete(
                     return Err(format!("ERROR: follow_up_tasks[{}] must be an object.", i));
                 }
                 let title = match item.get("title").and_then(|t| t.as_str()) {
-                    Some(t) => match check_title(&redact_into(t, &mut redactions)) {
+                    Some(t) => match check_title_redacted(t, &mut redactions) {
                         Ok(v) => v,
                         Err(e) => {
                             return Err(format!("ERROR: follow_up_tasks[{}].title: {}", i, e))
@@ -10488,6 +10534,20 @@ exit 0
         let row = stored(id.clone()).await;
         assert!(!row.contains(key) && !row.contains("hunter22"), "{row}");
         assert!(row.contains("rotate [REDACTED:github_pat]"), "{row}");
+        assert!(row.contains("then set password=[REDACTED:password] everywhere"), "{row}");
+
+        // A title within the limit as written is not refused because its
+        // marker is longer than the secret it replaced.
+        let near_limit = format!("{} password=hunter22", "x".repeat(180));
+        assert!(near_limit.chars().count() <= MAX_TITLE);
+        let reply = handle_task_create(
+            json!({ "namespace": "MyProj", "title": near_limit }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
+        assert_eq!(parsed["redactions"], json!([{ "category": "password" }]));
 
         // A title over the limit only because of its secret is not refused:
         // the length is checked on the redacted title.
@@ -10560,6 +10620,50 @@ exit 0
         let follow_up = parsed["follow_up_tasks_created"][0].as_str().unwrap().to_string();
         let row = stored(follow_up).await;
         assert!(row.contains("check [REDACTED:github_pat]") && !row.contains(key), "{row}");
+    }
+
+    /// Task text that reaches the store without passing the three tools is
+    /// redacted too: the bootstrap description, a note staged by an action,
+    /// and the rename note that quotes a title stored before redaction.
+    #[tokio::test]
+    async fn every_task_write_path_stores_text_redacted() {
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let store = temp_store().await;
+        let reply = handle_bootstrap(
+            json!({
+                "namespace": "MyProj",
+                "project_root": "/tmp",
+                "project_description": format!("deploys with {key}"),
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
+        let first_id = parsed["first_task"]["id"].as_str().unwrap().to_string();
+        let (_, first) = store.get("MyProj", &first_id).await.unwrap().unwrap();
+        let row = first.metadata.to_string();
+        assert!(row.contains("deploys with [REDACTED:github_pat]") && !row.contains(key), "{row}");
+
+        let (_, _, staged) =
+            stage_task_transition_at(&first_id, &first, "open", &format!("use {key}"), "a", "s", 1)
+                .expect("staged");
+        let row = staged.metadata.to_string();
+        assert!(row.contains("use [REDACTED:github_pat]") && !row.contains(key), "{row}");
+
+        let (vector, mut legacy) = store.get("MyProj", &first_id).await.unwrap().unwrap();
+        legacy.content = format!("old title {key}");
+        store.upsert("MyProj", &first_id, vector, legacy).await.unwrap();
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": first_id, "title": "new title" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.contains(key), "{reply}");
+        let (_, renamed) = store.get("MyProj", &first_id).await.unwrap().unwrap();
+        let row = format!("{} {}", renamed.content, renamed.metadata);
+        assert!(!row.contains(key), "{row}");
     }
 
     #[test]
