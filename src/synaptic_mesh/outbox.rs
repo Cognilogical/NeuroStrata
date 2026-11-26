@@ -103,6 +103,18 @@ pub const OUTBOX_FILE_NAME: &str = "outbox.wal";
 /// The signed MeshFrame log file inside the outbox directory for cursor catch-up.
 pub const FRAME_WAL_FILE_NAME: &str = "frames.wal";
 
+/// The sidecar remembering `bus_seq`s whose entries were committed (drained)
+/// before the event bus advanced its durable offset. A replay after a crash
+/// must still be recognised as a duplicate even though the entry is no longer
+/// pending in the WAL.
+pub const COMMITTED_SEQ_FILE_NAME: &str = "outbox.committed.json";
+
+/// How many committed `bus_seq`s the sidecar remembers. The set is a safety
+/// window, not history: a replay older than the window is re-applied, and the
+/// mesh worker's record-level idempotency (`stable_op_id`) still keeps it a
+/// no-op.
+const MAX_COMMITTED_SEQS: usize = 4096;
+
 /// Op tags. The WAL is internal, so the op is a string field rather than a
 /// tagged enum: it survives a format reader that predates a new op, and the
 /// worker matches these constants (an unknown op is skipped, not a crash).
@@ -168,6 +180,13 @@ pub struct OutboxEntry {
 /// entry an append landed mid-flight (see module docs' "Concurrency").
 static OUTBOX_LOCK: Mutex<()> = Mutex::new(());
 
+/// The committed-sequence sidecar's shape (see [`COMMITTED_SEQ_FILE_NAME`]).
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CommittedSeqs {
+    #[serde(default)]
+    seqs: Vec<u64>,
+}
+
 /// The outbox directory for a mesh checkout: `<mesh_dir>.outbox`, a sibling of
 /// the repo so `git add -A` never stages it.
 pub fn outbox_dir_for(mesh_dir: &Path) -> PathBuf {
@@ -209,6 +228,18 @@ impl Outbox {
         let _guard = OUTBOX_LOCK
             .lock()
             .map_err(|_| "outbox lock poisoned".to_string())?;
+        // Idempotency across a commit: the worker may have drained this
+        // sequence (and recorded it in the committed sidecar) before the bus
+        // wrote its offset. Re-appending would duplicate the mesh record.
+        if let Some(seq) = entry.bus_seq {
+            if self.is_bus_seq_committed(seq)? {
+                tracing::debug!(
+                    seq,
+                    "mesh outbox: skipping an append for an already-committed bus sequence"
+                );
+                return Ok(());
+            }
+        }
         let mut line = serde_json::to_string(entry)
             .map_err(|e| format!("outbox entry could not be serialised: {e}"))?;
         line.push('\n');
@@ -222,6 +253,76 @@ impl Outbox {
             .map_err(|e| format!("outbox WAL append failed: {e}"))?;
         file.sync_all()
             .map_err(|e| format!("outbox WAL sync failed: {e}"))?;
+        Ok(())
+    }
+
+    /// The committed `bus_seq` window, read tolerantly: a missing or corrupt
+    /// sidecar reads as empty, which falls back to `pending` dedup and the
+    /// worker's record-level idempotency rather than failing the write.
+    fn read_committed_seqs(&self) -> Vec<u64> {
+        let path = self.dir.join(COMMITTED_SEQ_FILE_NAME);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(
+                    "outbox committed-seq file {} unreadable ({e}); treating the window as empty",
+                    path.display()
+                );
+                return Vec::new();
+            }
+        };
+        match serde_json::from_str::<CommittedSeqs>(&text) {
+            Ok(committed) => committed.seqs,
+            Err(e) => {
+                tracing::warn!(
+                    "outbox committed-seq file {} unparseable ({e}); treating the window as empty",
+                    path.display()
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Whether `seq` was committed (drained) by the worker. The subscriber
+    /// checks this in addition to [`Outbox::pending`]: an entry committed
+    /// before the bus advanced its offset is no longer pending, but a replay
+    /// must still not append it again.
+    pub fn is_bus_seq_committed(&self, seq: u64) -> Result<bool, String> {
+        Ok(self.read_committed_seqs().contains(&seq))
+    }
+
+    /// Record committed `bus_seq`s durably. The caller holds [`OUTBOX_LOCK`].
+    /// The window is sorted, deduplicated, and capped to the most recent
+    /// [`MAX_COMMITTED_SEQS`].
+    fn record_committed_locked(&self, seqs: &[u64]) -> Result<(), String> {
+        if seqs.is_empty() {
+            return Ok(());
+        }
+        let mut all = self.read_committed_seqs();
+        all.extend_from_slice(seqs);
+        all.sort_unstable();
+        all.dedup();
+        if all.len() > MAX_COMMITTED_SEQS {
+            all.drain(0..all.len() - MAX_COMMITTED_SEQS);
+        }
+        let payload = serde_json::to_string(&CommittedSeqs { seqs: all })
+            .map_err(|e| format!("outbox committed-seq encoding failed: {e}"))?;
+        let tmp = self.dir.join(format!("{COMMITTED_SEQ_FILE_NAME}.tmp"));
+        {
+            let mut file = std::fs::File::create(&tmp).map_err(|e| {
+                format!(
+                    "outbox committed-seq tmp {} could not be created: {e}",
+                    tmp.display()
+                )
+            })?;
+            file.write_all(payload.as_bytes())
+                .map_err(|e| format!("outbox committed-seq write failed: {e}"))?;
+            file.sync_all()
+                .map_err(|e| format!("outbox committed-seq sync failed: {e}"))?;
+        }
+        std::fs::rename(&tmp, self.dir.join(COMMITTED_SEQ_FILE_NAME))
+            .map_err(|e| format!("outbox committed-seq rename failed: {e}"))?;
         Ok(())
     }
 
@@ -279,6 +380,13 @@ impl Outbox {
     /// (tmp-write + rename) and stable-ordered. Called by the worker *after*
     /// the git commit succeeds; a crash before this line leaves the entries
     /// pending and the worker's idempotent apply makes the retry a no-op.
+    ///
+    /// The removed entries' `bus_seq`s are recorded in the committed sidecar
+    /// *before* the WAL rewrite: a crash in between leaves them pending (the
+    /// subscriber's pending dedup still covers that), while a marker without
+    /// removal is harmless. This is what keeps a bus replay from re-appending
+    /// an entry the worker already committed but the event bus had not yet
+    /// acknowledged.
     pub fn mark_committed(&self, ids: &[Uuid]) -> Result<(), String> {
         if ids.is_empty() {
             return Ok(());
@@ -286,8 +394,14 @@ impl Outbox {
         let _guard = OUTBOX_LOCK
             .lock()
             .map_err(|_| "outbox lock poisoned".to_string())?;
-        let remaining: Vec<OutboxEntry> = self
-            .pending()?
+        let pending = self.pending()?;
+        let committed_seqs: Vec<u64> = pending
+            .iter()
+            .filter(|e| ids.contains(&e.stable_op_id))
+            .filter_map(|e| e.bus_seq)
+            .collect();
+        self.record_committed_locked(&committed_seqs)?;
+        let remaining: Vec<OutboxEntry> = pending
             .into_iter()
             .filter(|e| !ids.contains(&e.stable_op_id))
             .collect();

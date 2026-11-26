@@ -106,6 +106,20 @@ impl MemorySubscriber for MeshOutbox {
             bus_seq,
         };
         if let Some(seq) = bus_seq {
+            // A committed (drained) entry is no longer pending, but a replay
+            // can still arrive after a crash between the worker's commit and
+            // the bus offset write. The committed sidecar is that memory.
+            if self
+                .outbox
+                .is_bus_seq_committed(seq)
+                .map_err(anyhow::Error::msg)?
+            {
+                tracing::debug!(
+                    seq,
+                    "mesh outbox: skipping a durable delivery already committed to the mesh"
+                );
+                return Ok(());
+            }
             let already_pending = self
                 .outbox
                 .pending()
@@ -717,6 +731,75 @@ mod tests {
             pending[0].bus_seq,
             Some(7),
             "the entry records the sequence it was captured for"
+        );
+    }
+
+    /// The judge's commit-before-bus-ack proof: the worker committed (drained)
+    /// the captured entry, so it is no longer pending. A replay of the same
+    /// durable `bus_seq` must *still* be recognised as a duplicate, because
+    /// the bus offset had not advanced when the process crashed.
+    #[tokio::test]
+    async fn a_replayed_delivery_is_deduped_after_its_entry_was_committed() {
+        use crate::events::outbox::{DurableDelivery, EventClass};
+
+        let dir = scratch("replay-after-commit");
+        let outbox_dir = dir.join("mesh");
+        let store = LadybugStore::for_testing(dir.join("db.lbug"), TEST_DIMENSIONS)
+            .expect("open temp store");
+        store.init("ns").await.expect("ns table");
+        let sub =
+            MeshOutbox::new(outbox_dir.clone(), Arc::new(Notify::new()), 1).expect("outbox opens");
+
+        let id = uuid::Uuid::now_v7().to_string();
+        store
+            .upsert(
+                "ns",
+                &id,
+                vec![0.0; TEST_DIMENSIONS],
+                payload("rule", serde_json::json!({ "eligibility": "shareable" })),
+            )
+            .await
+            .unwrap();
+        let pulse = ThalamicPulse::Created {
+            id: id.clone(),
+            namespace: "ns".to_string(),
+            kind: "rule".to_string(),
+        };
+        let ctx = SubscriberContext {
+            store: &store,
+            namespace: "ns",
+            ts: 1,
+            delivery: Some(DurableDelivery {
+                class: EventClass::Mesh,
+                seq: 7,
+            }),
+        };
+
+        sub.handle(&pulse, &RecursionToken::new(), &ctx)
+            .await
+            .expect("first capture");
+
+        // The worker drains the outbox and marks the entry committed *before*
+        // the bus writes its durable offset.
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "one capture landed");
+        let committed: Vec<uuid::Uuid> = pending.iter().map(|e| e.stable_op_id).collect();
+        outbox.mark_committed(&committed).unwrap();
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "the worker committed (drained) the entry"
+        );
+
+        // The bus replays the same sequence after a crash.
+        sub.handle(&pulse, &RecursionToken::new(), &ctx)
+            .await
+            .expect("the replayed capture is a no-op");
+
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "a committed bus_seq must not be re-appended, even though it is no longer pending"
         );
     }
 }

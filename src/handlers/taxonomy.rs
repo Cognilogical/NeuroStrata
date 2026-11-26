@@ -266,7 +266,20 @@ pub async fn handle_taxonomy_with_auth_and_bus(
             };
             if let Some(pulse) = pulse_opt {
                 if let Some(ref b) = bus {
-                    b.emit(pulse, &RecursionToken::root());
+                    // Class M (Wave 3): a taxonomy mutation's mesh sync
+                    // record goes through `emit_checked`, matching the other
+                    // memory-write paths. A failed durable append fails the
+                    // request instead of reporting a success the mesh never
+                    // hears about.
+                    if let Err(err) = b.emit_checked(pulse, &RecursionToken::root()) {
+                        return json!({
+                            "ok": false,
+                            "error": format!(
+                                "taxonomy mutation recorded, but its durable event record failed: {err}"
+                            )
+                        })
+                        .to_string();
+                    }
                 } else {
                     let project_root = crate::daemon::resolve_project_root();
                     tee_taxonomy_pulse_to_project_outbox(
