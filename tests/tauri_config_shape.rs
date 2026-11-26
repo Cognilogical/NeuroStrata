@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// The exact CSP the visualizer ships: script and style are same-origin only
 /// (inline styles are the single retained exception), images may be data URLs,
 /// and the only permitted network target is the loopback daemon.
-const EXPECTED_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343; form-action 'self'";
+const EXPECTED_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343 ipc: http://ipc.localhost; form-action 'self'";
 
 /// URL patterns the scoped `shell:allow-open` capability may allow. These map
 /// one-to-one to the schemes `open_external` accepts in `src-tauri/src/main.rs`.
@@ -196,10 +196,19 @@ fn daemon_connect_src_is_loopback_only() {
     let policy = csp();
     let mut tokens = directive_tokens(&policy, "connect-src");
     tokens.sort();
-    let mut expected = vec!["'self'".to_string(), "http://127.0.0.1:34343".to_string()];
+    // `ipc:` / `http://ipc.localhost` are Tauri's local IPC transport
+    // endpoints (the official Tauri CSP example lists both in
+    // `connect-src`): without them the webview rejects `invoke` calls and
+    // every command-backed feature fails. Neither is a remote host.
+    let mut expected = vec![
+        "'self'".to_string(),
+        "http://127.0.0.1:34343".to_string(),
+        "ipc:".to_string(),
+        "http://ipc.localhost".to_string(),
+    ];
     expected.sort();
     assert_eq!(
         tokens, expected,
-        "connect-src must allow only same-origin and the loopback daemon"
+        "connect-src must allow only same-origin, the loopback daemon, and the local Tauri IPC transport"
     );
 }

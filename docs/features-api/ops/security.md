@@ -64,13 +64,13 @@ The Tauri desktop shell renders graph content that originates from ingested repo
 `src-tauri/tauri.conf.json` pins exactly six directives:
 
 ```text
-default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343; form-action 'self'
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343 ipc: http://ipc.localhost; form-action 'self'
 ```
 
 - `default-src 'self'` and `script-src 'self'` deny remote and inline scripts, so injected memory text cannot execute as code.
 - `style-src 'self' 'unsafe-inline'` is the single retained relaxation: the bundled UI applies computed inline styles (graph highlighting and layout), which do not execute script.
 - `img-src 'self' data:` permits bundled art and inline `data:` images while rejecting remote image beacons.
-- `connect-src 'self' http://127.0.0.1:34343` is deliberately loopback-only: the only network peer the webview may reach is the local NeuroStrata daemon, so a compromised renderer cannot exfiltrate graph or memory data to a remote host.
+- `connect-src 'self' http://127.0.0.1:34343 ipc: http://ipc.localhost` is deliberately loopback/local-only: the only network peer the webview may reach is the local NeuroStrata daemon, so a compromised renderer cannot exfiltrate graph or memory data to a remote host. `ipc:` and `http://ipc.localhost` are Tauri's local IPC transport endpoints (both appear in Tauri's own CSP example); without them the webview rejects `invoke` requests and every command-backed UI feature fails. Neither reaches a remote host.
 - `form-action 'self'` restricts form submissions to the app's own origin. It is stated explicitly because `form-action` does not fall back to `default-src`: without it, form submissions to remote endpoints would be unrestricted despite the loopback-only `connect-src`.
 
 `tests/tauri_config_shape.rs` pins the policy byte-for-byte (including the `connect-src` token set), so a future edit that widens the CSP fails CI instead of silently shipping.
