@@ -1497,6 +1497,8 @@ impl OpenProvenance {
 
 pub struct LadybugStore {
     local_path: PathBuf,
+    /// Resolved hard cap on the store's bytes (#414); 0 means no cap.
+    max_db_bytes: u64,
     dimensions: usize,
     db: Arc<Database>,
     dirty: Dirty,
@@ -1841,99 +1843,248 @@ impl Dirty {
     }
 }
 
-/// Normal open: checksums on, and replay failures throw. The throw is the whole
-/// point -- with it off the engine swallows a failed verification, opens anyway
-/// and silently drops every record it could not authenticate, which is exactly
-/// the outcome this code exists to make visible.
-fn verifying_config() -> SystemConfig {
-    with_buffer_pool(SystemConfig::default().throw_on_wal_replay_failure(true))
+/// Byte-denominated limits resolved once from `store.*` in the config and the
+/// environment (#414). 0 means no cap for `max_db_bytes` and engine sizing for
+/// `buffer_pool_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StoreLimits {
+    pub buffer_pool_bytes: u64,
+    pub max_db_bytes: u64,
 }
+
+/// Default pool: measured on a copy of a 739 MB store, three passes over every
+/// namespace, 384 MB queries ran as fast as the engine default (within
+/// run-to-run noise) and cut peak memory by about 15%; 256 MB was 15 to 30%
+/// slower and 192 MB about 50% slower.
+pub(crate) const DEFAULT_BUFFER_POOL_BYTES: u64 = 384 * 1024 * 1024;
 
 /// Smallest buffer pool the daemon will run with. Measured on a copy of a
 /// 705 MB store: 96 MB and up completed every query, 64 MB failed 8 of 12
 /// with "Unable to allocate memory! The buffer pool is full". The floor sits
 /// above the last size that worked because the largest query depends on the
 /// data, which grows.
-const MIN_BUFFER_POOL_MB: u64 = 128;
+pub(crate) const MIN_BUFFER_POOL_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The pool size in force, for the error message that tells a caller what to
 /// change. 0 means the engine sized it.
-static BUFFER_POOL_MB_IN_USE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BUFFER_POOL_BYTES_IN_USE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
-/// What size, in MB, to give the buffer pool, and what to say about it.
-/// `configured` is `storage_hygiene.buffer_pool_mb`; `env` is
-/// `NEUROSTRATA_BUFFER_POOL_MB`, which wins when it parses. 0 means "let the
-/// engine decide". Anything else below the floor is raised to it.
-fn resolve_buffer_pool_mb(configured: u64, env: Option<&str>) -> (u64, Option<String>) {
-    let mut note = None;
-    let wanted = match env.map(str::trim).filter(|v| !v.is_empty()) {
-        Some(v) => match v.parse::<u64>() {
-            Ok(n) => n,
+/// Resolve `store.buffer_pool_bytes` and `store.max_db_bytes` with the
+/// environment overrides applied (#414). `NEUROSTRATA_BUFFER_POOL_BYTES` and
+/// `NEUROSTRATA_MAX_DB_BYTES` win when they parse; an unparseable value warns
+/// and falls back to the config. Pool 0 and cap 0 both mean "no bound".
+fn resolve_store_limits(
+    configured_pool_bytes: Option<u64>,
+    configured_max_db_bytes: Option<u64>,
+    env_pool: Option<&str>,
+    env_cap: Option<&str>,
+) -> (StoreLimits, Vec<String>) {
+    let mut notes = Vec::new();
+
+    let configured_pool = configured_pool_bytes.unwrap_or(DEFAULT_BUFFER_POOL_BYTES);
+    let mut pool = match env_pool.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(value) => match value.parse::<u64>() {
+            Ok(bytes) => bytes,
             Err(_) => {
-                note = Some(format!(
-                    "NEUROSTRATA_BUFFER_POOL_MB={v:?} is not a number of megabytes; using {configured} from the config"
+                notes.push(format!(
+                    "NEUROSTRATA_BUFFER_POOL_BYTES={value:?} is not a number of bytes; using {configured_pool} from the config"
                 ));
-                configured
+                configured_pool
             }
         },
-        None => configured,
+        None => configured_pool,
     };
-    if wanted == 0 {
-        return (0, note);
-    }
-    if wanted < MIN_BUFFER_POOL_MB {
-        note = Some(format!(
-            "a buffer pool of {wanted} MB is below the {MIN_BUFFER_POOL_MB} MB floor (queries fail under it); using {MIN_BUFFER_POOL_MB} MB"
+    if pool != 0 && pool < MIN_BUFFER_POOL_BYTES {
+        notes.push(format!(
+            "a buffer pool of {pool} bytes is below the {MIN_BUFFER_POOL_BYTES} byte floor \
+             (queries fail under it); using {MIN_BUFFER_POOL_BYTES} bytes"
         ));
-        return (MIN_BUFFER_POOL_MB, note);
+        pool = MIN_BUFFER_POOL_BYTES;
     }
-    (wanted, note)
+
+    let configured_cap = configured_max_db_bytes.unwrap_or(0);
+    let cap = match env_cap.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(value) => match value.parse::<u64>() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                notes.push(format!(
+                    "NEUROSTRATA_MAX_DB_BYTES={value:?} is not a number of bytes; using {configured_cap} from the config"
+                ));
+                configured_cap
+            }
+        },
+        None => configured_cap,
+    };
+
+    (
+        StoreLimits {
+            buffer_pool_bytes: pool,
+            max_db_bytes: cap,
+        },
+        notes,
+    )
 }
 
-/// Caps the engine's buffer pool per `storage_hygiene.buffer_pool_mb` and
-/// `NEUROSTRATA_BUFFER_POOL_MB`. Said once per process, so the log shows what
-/// the daemon is running with.
-fn with_buffer_pool(cfg: SystemConfig) -> SystemConfig {
-    static SAID: std::sync::Once = std::sync::Once::new();
-    // `load`, not `from_default_path`: opening a store must not create a config
-    // file as a side effect. A missing file is the normal case and says nothing.
-    let default_mb = crate::storage::StorageHygieneConfig::default().buffer_pool_mb;
-    let configured = match crate::config::Config::default_path() {
-        Ok(path) if !path.exists() => default_mb,
+/// The configured byte limits. A missing config file is the normal case and
+/// says nothing; an unreadable one warns and leaves the defaults in force.
+fn configured_store_limits() -> (Option<u64>, Option<u64>) {
+    match crate::config::Config::default_path() {
+        Ok(path) if !path.exists() => (None, None),
         _ => match crate::config::Config::load() {
-            Ok(c) => c.storage_hygiene.buffer_pool_mb,
+            Ok(config) => (config.store.buffer_pool_bytes, config.store.max_db_bytes),
             Err(e) => {
-                tracing::warn!(
-                    "could not read the config for buffer_pool_mb, using {default_mb}: {e}"
-                );
-                default_mb
+                tracing::warn!("could not read the config for store limits, using defaults: {e}");
+                (None, None)
             }
         },
-    };
-    let env = std::env::var("NEUROSTRATA_BUFFER_POOL_MB").ok();
-    let (mb, note) = resolve_buffer_pool_mb(configured, env.as_deref());
-    BUFFER_POOL_MB_IN_USE.store(mb, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Resolve the limits from config plus environment, recording the pool in use
+/// for error messages and saying the effective settings once per process.
+fn resolved_store_limits() -> StoreLimits {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    let (configured_pool, configured_cap) = configured_store_limits();
+    let env_pool = std::env::var("NEUROSTRATA_BUFFER_POOL_BYTES").ok();
+    let env_cap = std::env::var("NEUROSTRATA_MAX_DB_BYTES").ok();
+    let (limits, notes) = resolve_store_limits(
+        configured_pool,
+        configured_cap,
+        env_pool.as_deref(),
+        env_cap.as_deref(),
+    );
+    BUFFER_POOL_BYTES_IN_USE.store(
+        limits.buffer_pool_bytes,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     SAID.call_once(|| {
-        if let Some(n) = &note {
-            eprintln!("WARNING: {n}");
+        for note in &notes {
+            eprintln!("WARNING: {note}");
         }
-        if mb == 0 {
-            eprintln!("Buffer pool: sized by the engine (storage_hygiene.buffer_pool_mb = 0)");
+        if limits.buffer_pool_bytes == 0 {
+            eprintln!("Buffer pool: sized by the engine (store.buffer_pool_bytes = 0)");
         } else {
-            eprintln!("Buffer pool: capped at {mb} MB");
+            eprintln!("Buffer pool: capped at {} bytes", limits.buffer_pool_bytes);
+        }
+        if limits.max_db_bytes == 0 {
+            eprintln!("Store size cap: none (store.max_db_bytes = 0)");
+        } else {
+            eprintln!("Store size cap: {} bytes", limits.max_db_bytes);
         }
     });
-    if mb == 0 {
-        cfg
-    } else {
-        cfg.buffer_pool_size(buffer_pool_bytes(mb))
-    }
+    limits
 }
 
-/// Convert MB to the engine's byte count without wrapping. An absurd configured
-/// value saturates; it must never wrap to 0 and silently disable the cap.
-fn buffer_pool_bytes(mb: u64) -> u64 {
-    mb.saturating_mul(1024 * 1024)
+/// The engine refuses a `max_db_size` below 8 MiB, so the backstop never goes
+/// under this even when the cap does.
+const ENGINE_MIN_DB_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The engine's `max_db_size` backstop: a store that is already above a newly
+/// lowered cap must still open so it can be read, archived, and pruned. A cap
+/// of 0 leaves the engine's own default alone.
+fn size_cap_backstop(cap: u64, current_store_bytes: u64) -> Option<u64> {
+    (cap != 0).then(|| cap.max(current_store_bytes).max(ENGINE_MIN_DB_BYTES))
+}
+
+/// Apply the resolved limits to a `SystemConfig`. Separation from
+/// [`resolved_store_limits`] keeps the policy testable without touching the
+/// process environment.
+fn with_limits_on(
+    mut cfg: SystemConfig,
+    limits: StoreLimits,
+    current_store_bytes: u64,
+) -> SystemConfig {
+    if limits.buffer_pool_bytes > 0 {
+        cfg = cfg.buffer_pool_size(limits.buffer_pool_bytes);
+    }
+    if let Some(backstop) = size_cap_backstop(limits.max_db_bytes, current_store_bytes) {
+        cfg = cfg.max_db_size(backstop);
+    }
+    cfg
+}
+
+/// Normal open: checksums on, and replay failures throw. The throw is the whole
+/// point -- with it off the engine swallows a failed verification, opens anyway
+/// and silently drops every record it could not authenticate, which is exactly
+/// the outcome this code exists to make visible.
+fn verifying_config() -> SystemConfig {
+    engine_config_for(resolved_store_limits(), 0)
+}
+
+/// The production open's config: like [`verifying_config`], but the size-cap
+/// backstop knows the store's current bytes so an over-cap store still opens.
+fn verifying_config_for(local_path: &std::path::Path) -> SystemConfig {
+    engine_config_for(resolved_store_limits(), current_store_bytes_at(local_path))
+}
+
+fn with_store_limits_at(cfg: SystemConfig, current_store_bytes: u64) -> SystemConfig {
+    with_limits_on(cfg, resolved_store_limits(), current_store_bytes)
+}
+
+/// The engine config a store is opened with for explicit [`StoreLimits`].
+/// Production passes the resolved limits; tests pass explicit ones so the two
+/// enforcement layers can be exercised without process-global config or
+/// environment.
+fn engine_config_for(limits: StoreLimits, current_store_bytes: u64) -> SystemConfig {
+    with_limits_on(
+        SystemConfig::default().throw_on_wal_replay_failure(true),
+        limits,
+        current_store_bytes,
+    )
+}
+
+/// The store's current on-disk footprint: the database plus both write-ahead
+/// log sides, measured from the filesystem so an uncheckpointed write counts.
+fn current_store_bytes_at(local_path: &std::path::Path) -> u64 {
+    let db_bytes = std::fs::metadata(local_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let (active, frozen) = wal_pair_sizes(local_path);
+    db_bytes.saturating_add(active).saturating_add(frozen)
+}
+
+/// Inclusive boundary: a write that lands exactly on the cap fits; one byte
+/// past it does not. A cap of 0 never refuses.
+fn would_exceed_cap(current: u64, incoming: u64, cap: u64) -> bool {
+    cap != 0 && current.saturating_add(incoming) > cap
+}
+
+/// Refuse before any write, naming both the current size and the cap so the
+/// operator can archive, prune, or raise the cap deliberately.
+fn store_full_error(current: u64, incoming: u64, cap: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ERROR [STORE_FULL]: the store holds {current} bytes and this write needs about \
+         {incoming} more, past the {cap} byte max_db_bytes cap; archive or prune memories, or \
+         raise store.max_db_bytes (NEUROSTRATA_MAX_DB_BYTES) and restart"
+    )
+}
+
+/// Conservative row-size estimate for the pre-write check: the vector's floats,
+/// the row's text fields, and its serialized metadata, plus a small fixed
+/// overhead for engine bookkeeping.
+fn estimate_memory_write_bytes(vector_len: usize, payload: &MemoryPayload) -> u64 {
+    const ROW_OVERHEAD_BYTES: u64 = 256;
+    let vector = (vector_len as u64).saturating_mul(4);
+    let content = payload.content.len() as u64;
+    let location = payload.location.len() as u64 + payload.location_lines.len() as u64;
+    let metadata = serde_json::to_vec(&payload.metadata)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0);
+    vector
+        .saturating_add(content)
+        .saturating_add(location)
+        .saturating_add(metadata)
+        .saturating_add(ROW_OVERHEAD_BYTES)
+}
+
+fn estimate_action_write_bytes(writes: &[crate::rdf::action::StagedMemoryWrite]) -> u64 {
+    writes.iter().fold(0u64, |total, write| {
+        total.saturating_add(estimate_memory_write_bytes(
+            write.vector.len(),
+            &write.payload,
+        ))
+    })
 }
 
 /// An engine error that says the buffer pool was too small, with what to do
@@ -1943,11 +2094,16 @@ fn explain_engine_error(e: anyhow::Error) -> anyhow::Error {
     if !text.contains("buffer pool is full") {
         return e;
     }
-    let mb = BUFFER_POOL_MB_IN_USE.load(std::sync::atomic::Ordering::Relaxed);
+    let bytes = BUFFER_POOL_BYTES_IN_USE.load(std::sync::atomic::Ordering::Relaxed);
+    let in_use = if bytes == 0 {
+        "engine-sized".to_string()
+    } else {
+        format!("{bytes} bytes")
+    };
     anyhow::anyhow!(
-        "{text} -- the database engine's buffer pool ({mb} MB) is too small for this query. \
-         Raise storage_hygiene.buffer_pool_mb in ~/.config/neurostrata/config.json, or set \
-         NEUROSTRATA_BUFFER_POOL_MB; 0 lets the engine size it, at the cost of memory."
+        "{text} -- the database engine's buffer pool ({in_use}) is too small for this query. \
+         Raise store.buffer_pool_bytes in ~/.config/neurostrata/config.json, or set \
+         NEUROSTRATA_BUFFER_POOL_BYTES; 0 lets the engine size it, at the cost of memory."
     )
 }
 
@@ -2064,7 +2220,7 @@ fn stop_checkpoints_after_pool_failure(
          ladybug.db, so checkpoints are off until one succeeds or the process restarts; writes \
          still reach the write-ahead log, which is why storage status now reports \
          checkpoints_stopped and counts skipped checkpoints in checkpoint_skips. Raise \
-         NEUROSTRATA_BUFFER_POOL_MB (or storage_hygiene.buffer_pool_mb; 0 lets the engine size it) \
+         NEUROSTRATA_BUFFER_POOL_BYTES (or store.buffer_pool_bytes; 0 lets the engine size it) \
          and restart to checkpoint them. See docs/ops/checkpoint-latch.md."
     );
 }
@@ -2129,69 +2285,94 @@ fn guarded_checkpoint(conn: &Connection, latch: &CheckpointLatch) -> CheckpointR
 }
 
 #[cfg(test)]
-mod buffer_pool_tests {
+mod store_limits_tests {
     use super::*;
 
-    #[test]
-    fn a_huge_value_saturates_instead_of_wrapping_to_zero() {
-        assert_eq!(buffer_pool_bytes(384), 384 * 1024 * 1024);
-        assert_eq!(buffer_pool_bytes(u64::MAX), u64::MAX);
-        assert_ne!(buffer_pool_bytes(u64::MAX), 0);
-    }
+    const MIB: u64 = 1024 * 1024;
 
-    #[test]
-    fn the_config_value_is_used_when_the_environment_says_nothing() {
-        assert_eq!(resolve_buffer_pool_mb(384, None), (384, None));
-        assert_eq!(resolve_buffer_pool_mb(384, Some("  ")), (384, None));
+    fn limits(pool: Option<u64>, cap: Option<u64>) -> (StoreLimits, Vec<String>) {
+        resolve_store_limits(pool, cap, None, None)
     }
 
     #[test]
     fn the_environment_wins_over_the_config() {
-        assert_eq!(resolve_buffer_pool_mb(384, Some("512")), (512, None));
-        assert_eq!(resolve_buffer_pool_mb(384, Some(" 640 ")), (640, None));
+        let (resolved, notes) = resolve_store_limits(
+            Some(512 * MIB),
+            Some(1024 * MIB),
+            Some("805306368"),
+            Some("2147483648"),
+        );
+        assert_eq!(resolved.buffer_pool_bytes, 768 * MIB);
+        assert_eq!(resolved.max_db_bytes, 2048 * MIB);
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let (resolved, notes) =
+            resolve_store_limits(Some(512 * MIB), None, Some(" 671088640 "), Some(""));
+        assert_eq!(resolved.buffer_pool_bytes, 640 * MIB);
+        assert_eq!(resolved.max_db_bytes, 0);
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     #[test]
-    fn zero_hands_the_sizing_back_to_the_engine() {
-        assert_eq!(resolve_buffer_pool_mb(0, None), (0, None));
-        assert_eq!(resolve_buffer_pool_mb(384, Some("0")), (0, None));
-    }
-
-    #[test]
-    fn a_value_below_the_floor_is_raised_and_said_so() {
-        let (mb, note) = resolve_buffer_pool_mb(64, None);
-        assert_eq!(mb, MIN_BUFFER_POOL_MB);
-        assert!(note.unwrap().contains("floor"));
-        let (mb, _) = resolve_buffer_pool_mb(384, Some("96"));
-        assert_eq!(mb, MIN_BUFFER_POOL_MB);
-        assert_eq!(
-            resolve_buffer_pool_mb(MIN_BUFFER_POOL_MB, None),
-            (MIN_BUFFER_POOL_MB, None)
+    fn an_unparseable_environment_value_falls_back_to_the_config() {
+        let (resolved, notes) = resolve_store_limits(
+            Some(512 * MIB),
+            Some(1024 * MIB),
+            Some("lots"),
+            Some("2GiB"),
+        );
+        assert_eq!(resolved.buffer_pool_bytes, 512 * MIB);
+        assert_eq!(resolved.max_db_bytes, 1024 * MIB);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("NEUROSTRATA_BUFFER_POOL_BYTES")),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("NEUROSTRATA_MAX_DB_BYTES")),
+            "{notes:?}"
         );
     }
 
     #[test]
-    fn an_environment_value_that_is_not_a_number_falls_back_to_the_config() {
-        let (mb, note) = resolve_buffer_pool_mb(384, Some("lots"));
-        assert_eq!(mb, 384);
-        assert!(note.unwrap().contains("NEUROSTRATA_BUFFER_POOL_MB"));
+    fn zero_means_no_cap_and_the_default_pool_is_bytes() {
+        let (resolved, notes) = limits(None, None);
+        assert_eq!(resolved.buffer_pool_bytes, DEFAULT_BUFFER_POOL_BYTES);
+        assert_eq!(DEFAULT_BUFFER_POOL_BYTES, 384 * MIB);
+        assert_eq!(resolved.max_db_bytes, 0);
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let (resolved, notes) =
+            resolve_store_limits(Some(1024 * MIB), Some(1024 * MIB), Some("0"), Some("0"));
+        assert_eq!(
+            resolved.buffer_pool_bytes, 0,
+            "0 hands the pool to the engine"
+        );
+        assert_eq!(resolved.max_db_bytes, 0, "0 means no cap");
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     #[test]
-    fn the_default_is_above_the_floor() {
-        let default_mb = crate::storage::StorageHygieneConfig::default().buffer_pool_mb;
-        assert!(default_mb >= MIN_BUFFER_POOL_MB, "{default_mb}");
+    fn a_pool_below_the_floor_is_raised_and_said_so() {
+        let (resolved, notes) = limits(Some(64 * MIB), None);
+        assert_eq!(resolved.buffer_pool_bytes, MIN_BUFFER_POOL_BYTES);
+        assert_eq!(MIN_BUFFER_POOL_BYTES, 128 * MIB);
+        assert!(notes.iter().any(|n| n.contains("floor")), "{notes:?}");
+
+        let (resolved, notes) = limits(Some(MIN_BUFFER_POOL_BYTES), None);
+        assert_eq!(resolved.buffer_pool_bytes, MIN_BUFFER_POOL_BYTES);
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     #[test]
     fn an_older_config_without_the_key_gets_the_default() {
-        let cfg: crate::storage::StorageHygieneConfig =
-            serde_json::from_str(r#"{"checkpoint_interval_secs": 5}"#).unwrap();
-        assert_eq!(cfg.checkpoint_interval_secs, 5);
-        assert_eq!(
-            cfg.buffer_pool_mb,
-            crate::storage::StorageHygieneConfig::default().buffer_pool_mb
-        );
+        let config: crate::config::Config =
+            serde_json::from_str(r#"{"db_path":"test.db"}"#).unwrap();
+        assert_eq!(config.store, crate::config::StoreConfig::default());
+        let (resolved, _) = limits(config.store.buffer_pool_bytes, config.store.max_db_bytes);
+        assert_eq!(resolved.buffer_pool_bytes, DEFAULT_BUFFER_POOL_BYTES);
+        assert_eq!(resolved.max_db_bytes, 0);
     }
 
     #[test]
@@ -2201,52 +2382,65 @@ mod buffer_pool_tests {
         );
         let text = explain_engine_error(full).to_string();
         assert!(text.contains("The buffer pool is full"), "{text}");
-        assert!(text.contains("storage_hygiene.buffer_pool_mb"), "{text}");
-        assert!(text.contains("NEUROSTRATA_BUFFER_POOL_MB"), "{text}");
+        assert!(text.contains("store.buffer_pool_bytes"), "{text}");
+        assert!(text.contains("NEUROSTRATA_BUFFER_POOL_BYTES"), "{text}");
 
         let other = explain_engine_error(anyhow::anyhow!("Parser exception: nope")).to_string();
         assert_eq!(other, "Parser exception: nope");
     }
 
-    /// A pool far under the floor must fail with the explained error, not
-    /// silently return nothing. Needs a COPY of a database (never the live one):
-    ///   NS_PROBE_DB=<dir with a copy of ladybug.db> cargo test --release \
-    ///   --bin neurostrata-mcp a_pool_too_small_for_the_data_fails_with_advice -- --ignored
-    #[tokio::test]
-    #[ignore]
-    async fn a_pool_too_small_for_the_data_fails_with_advice() {
-        use crate::traits::VectorStore;
-        let dir = std::path::PathBuf::from(std::env::var("NS_PROBE_DB").expect("NS_PROBE_DB"));
-        let cfg = SystemConfig::default()
-            .buffer_pool_size(64 * 1024 * 1024)
-            .throw_on_wal_replay_failure(true);
-        let store =
-            LadybugStore::with_system_config(&dir.join("ladybug.db"), 768, cfg).expect("open");
-        let namespaces = store.list_namespaces().await.expect("namespaces");
-        let mut advised = 0;
-        for ns in &namespaces {
-            if let Err(e) = store.search(ns, vec![0.05; 768], 5, false, false).await {
-                let text = e.to_string();
-                if text.contains("storage_hygiene.buffer_pool_mb") {
-                    advised += 1;
-                }
-            }
-        }
+    #[test]
+    fn the_legacy_megabyte_key_is_read_once_with_a_warning() {
+        let raw: serde_json::Value = serde_json::from_str(
+            r#"{"db_path":"test.db","storage_hygiene":{"buffer_pool_mb":768}}"#,
+        )
+        .unwrap();
+        let (bytes, warning) =
+            crate::config::legacy_buffer_pool_migration(&raw).expect("legacy key is read");
+        assert_eq!(bytes, 768 * MIB);
+        assert!(warning.contains("deprecated"), "{warning}");
         assert!(
-            advised > 0,
-            "no search failed with the advice; the pool may be big enough here"
+            warning.contains("storage_hygiene.buffer_pool_mb"),
+            "{warning}"
         );
+        assert!(warning.contains("store.buffer_pool_bytes"), "{warning}");
+
+        // The new key wins; the legacy one is not read a second time.
+        let explicit: serde_json::Value = serde_json::from_str(
+            r#"{"store":{"buffer_pool_bytes":123},"storage_hygiene":{"buffer_pool_mb":768}}"#,
+        )
+        .unwrap();
+        assert!(crate::config::legacy_buffer_pool_migration(&explicit).is_none());
+
+        // A real load applies the conversion before resolution sees it.
+        let dir = std::env::temp_dir().join(format!("ns-store-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"db_path":"test.db","storage_hygiene":{"buffer_pool_mb":768}}"#,
+        )
+        .unwrap();
+        let loaded = crate::config::Config::load_from(&path).unwrap();
+        assert_eq!(loaded.store.buffer_pool_bytes, Some(768 * MIB));
+        let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[cfg(test)]
+mod checkpoint_latch_tests {
+    use super::*;
 
     /// A WAL too large for the pool to checkpoint, as one big relink leaves it:
     /// without the stop, each write's post-commit checkpoint and each periodic
     /// checkpoint failed again and grew the file each time.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_checkpoint_out_of_pool_is_not_retried() {
         use crate::traits::VectorStore;
         // `checkpoint_failures` is process-global, and the latch tests assert
         // it does not move for a skip (#211).
-        let _guard = super::checkpoint_latch_tests::counter_lock();
+        let _guard = counter_lock();
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("ladybug.db");
         let pool = |mb: u64| {
@@ -2345,11 +2539,6 @@ mod buffer_pool_tests {
         eprintln!("close changed ladybug.db by {on_close} bytes");
         assert_eq!(on_close, 0, "closing the store retried the checkpoint");
     }
-}
-
-#[cfg(test)]
-mod checkpoint_latch_tests {
-    use super::*;
 
     /// `checkpoint_failures` is process-global, so a test that reads it must
     /// not run beside the one test that deliberately fails checkpoints. A
@@ -2692,10 +2881,11 @@ fn unverified_replay_checksums_for(local_path: &std::path::Path) -> bool {
 /// semantic deserialization failure hidden behind the initial `checkWALHeader`
 /// mismatch still surfaces before a lenient retry can consume a frozen WAL.
 fn wal_header_checksums_config_for(local_path: &std::path::Path) -> SystemConfig {
-    with_buffer_pool(
+    with_store_limits_at(
         SystemConfig::default()
             .throw_on_wal_replay_failure(true)
             .enable_checksums(unverified_replay_checksums_for(local_path)),
+        current_store_bytes_at(local_path),
     )
 }
 
@@ -2707,10 +2897,11 @@ fn wal_header_checksums_config_for(local_path: &std::path::Path) -> SystemConfig
 /// engine's `Deserializer` to mis-parse the 8-byte checksum framing after the
 /// header and discard every record.
 fn unverified_replay_config_for(local_path: &std::path::Path) -> SystemConfig {
-    with_buffer_pool(
+    with_store_limits_at(
         SystemConfig::default()
             .throw_on_wal_replay_failure(false)
             .enable_checksums(unverified_replay_checksums_for(local_path)),
+        current_store_bytes_at(local_path),
     )
 }
 
@@ -4438,8 +4629,8 @@ impl Drop for LadybugStore {
                 "WARNING: closing with checkpoints stopped after a buffer-pool failure. The writes \
                  stay in the write-ahead log, so the next open replays them and reports an unclean \
                  shutdown. That report is expected here: restart with a larger pool \
-                 (NEUROSTRATA_BUFFER_POOL_MB or storage_hygiene.buffer_pool_mb; 0 lets the engine \
-                 size it) and the log is checkpointed. See docs/ops/checkpoint-latch.md."
+                 (NEUROSTRATA_BUFFER_POOL_BYTES or store.buffer_pool_bytes; 0 lets the \
+                 engine size it) and the log is checkpointed. See docs/ops/checkpoint-latch.md."
             );
             return;
         }
@@ -4836,7 +5027,18 @@ impl LadybugStore {
             .max_db_size(max_db_size)
             .buffer_pool_size(buffer_pool_size)
             .throw_on_wal_replay_failure(true);
-        Self::with_system_config(local_path, dimensions, cfg)
+        // Keep the test harness's explicit, small footprint: the production
+        // store limits (including the 384 MiB default pool) deliberately do
+        // not apply here.
+        Self::with_system_config_and_limits(
+            local_path,
+            dimensions,
+            cfg,
+            StoreLimits {
+                buffer_pool_bytes: 0,
+                max_db_bytes: 0,
+            },
+        )
     }
 
     /// Test-only: replace a row's metadata exactly as given, bypassing the
@@ -4871,7 +5073,9 @@ impl LadybugStore {
         if std::env::var("NEUROSTRATA_TEST_DB_CONFIG").is_ok() {
             return Self::for_testing(local_path, dimensions);
         }
-        Self::with_system_config(local_path, dimensions, verifying_config())
+        let local_path = local_path.into();
+        let initial_config = verifying_config_for(&local_path);
+        Self::with_system_config(local_path, dimensions, initial_config)
     }
 
     /// Open the database with a custom `SystemConfig`. Production paths go
@@ -4883,6 +5087,20 @@ impl LadybugStore {
         local_path: impl Into<PathBuf>,
         dimensions: usize,
         initial_config: SystemConfig,
+    ) -> Result<Self> {
+        Self::with_system_config_and_limits(
+            local_path,
+            dimensions,
+            initial_config,
+            resolved_store_limits(),
+        )
+    }
+
+    fn with_system_config_and_limits(
+        local_path: impl Into<PathBuf>,
+        dimensions: usize,
+        initial_config: SystemConfig,
+        limits: StoreLimits,
     ) -> Result<Self> {
         let local_path = local_path.into();
 
@@ -4920,9 +5138,9 @@ impl LadybugStore {
             eprintln!(
                 "If that process logged `checkpoints_stopped` or a checkpoint running out of \
                  buffer pool, it stopped checkpointing on purpose and this log is what it left. \
-                 Restart with a larger pool (NEUROSTRATA_BUFFER_POOL_MB or \
-                 storage_hygiene.buffer_pool_mb; 0 lets the engine size it) so the replay is \
-                 checkpointed; see docs/ops/checkpoint-latch.md."
+                 Restart with a larger pool (NEUROSTRATA_BUFFER_POOL_BYTES or \
+                 store.buffer_pool_bytes; 0 lets the engine size it) so the replay is \
+                 checkpointed; see docs/features-api/ops/checkpoint-latch.md."
             );
         }
         let pre = (
@@ -4958,6 +5176,7 @@ impl LadybugStore {
         let checkpoints = CheckpointLatch::new(local_path.clone());
         Ok(Self {
             local_path,
+            max_db_bytes: limits.max_db_bytes,
             dimensions,
             db: Arc::new(db),
             dirty: Dirty::default(),
@@ -9038,6 +9257,21 @@ impl LadybugStore {
         &self.local_path
     }
 
+    /// The store's current on-disk footprint (database plus both WAL sides).
+    pub fn current_store_bytes(&self) -> u64 {
+        current_store_bytes_at(&self.local_path)
+    }
+
+    /// Refuse before any write when the incoming row would carry the store
+    /// past `max_db_bytes` (#414). A cap of 0 never refuses.
+    fn ensure_store_has_room(&self, incoming_bytes: u64) -> Result<()> {
+        let current = self.current_store_bytes();
+        if would_exceed_cap(current, incoming_bytes, self.max_db_bytes) {
+            return Err(store_full_error(current, incoming_bytes, self.max_db_bytes));
+        }
+        Ok(())
+    }
+
     pub fn metrics(&self) -> &crate::time_series::TimeSeriesStore {
         &self.metrics
     }
@@ -10601,6 +10835,9 @@ impl VectorStore for LadybugStore {
         if namespace.trim().is_empty() {
             anyhow::bail!("namespace must be non-empty");
         }
+        // #414: refuse before any engine write when this row would carry the
+        // store past max_db_bytes, so a refused upsert lands nothing.
+        self.ensure_store_has_room(estimate_memory_write_bytes(vector.len(), &payload))?;
         // First-write race guard: on a pristine store, refuse the first
         // write if the configured model changed since this process
         // recorded the store's descriptor (a setup pick landed while the
@@ -11960,7 +12197,7 @@ impl VectorStore for LadybugStore {
             CheckpointRun::Skipped => {
                 anyhow::bail!(
                     "checkpoint skipped: an earlier one ran out of buffer pool and a retry would \
-                     grow ladybug.db; raise NEUROSTRATA_BUFFER_POOL_MB and restart"
+                     grow ladybug.db; raise NEUROSTRATA_BUFFER_POOL_BYTES and restart"
                 );
             }
             CheckpointRun::Attempted(result) => {
@@ -11999,7 +12236,7 @@ impl VectorStore for LadybugStore {
                 }
                 anyhow::bail!(
                     "checkpoint skipped: an earlier one ran out of buffer pool and a retry would \
-                     grow ladybug.db; raise NEUROSTRATA_BUFFER_POOL_MB and restart"
+                     grow ladybug.db; raise NEUROSTRATA_BUFFER_POOL_BYTES and restart"
                 );
             }
             Ok(CheckpointRun::Attempted(result)) => {
@@ -17816,6 +18053,214 @@ eurostrata\src\daemon.rs",
             location_lines: String::new(),
             metadata,
         }
+    }
+
+    // --- Issue #414: store size cap -------------------------------------
+
+    fn cap_test_limits(max_db_bytes: u64) -> StoreLimits {
+        StoreLimits {
+            buffer_pool_bytes: 64 * 1024 * 1024,
+            max_db_bytes,
+        }
+    }
+
+    async fn capped_test_store(path: &std::path::Path, max_db_bytes: u64) -> LadybugStore {
+        let limits = cap_test_limits(max_db_bytes);
+        let cfg = engine_config_for(limits, current_store_bytes_at(path));
+        let store =
+            LadybugStore::with_system_config_and_limits(path, 4, cfg, limits).expect("open store");
+        store.init("probe").await.expect("create the schema");
+        store
+    }
+
+    /// The pre-write check is inclusive at the boundary: a write that lands
+    /// exactly on the cap is allowed, one byte past it is refused.
+    #[test]
+    fn a_write_exactly_at_the_cap_is_allowed_and_one_byte_over_is_not() {
+        assert!(!would_exceed_cap(100, 50, 150), "exactly at the cap");
+        assert!(would_exceed_cap(100, 51, 150), "one byte past the cap");
+        assert!(!would_exceed_cap(100, 50, 0), "0 is no cap");
+        assert!(would_exceed_cap(200, 1, 150), "already over the cap");
+    }
+
+    /// Two layers: the engine gets `cap.max(current)` so an over-cap store
+    /// still opens, while a cap of 0 leaves the engine's own default alone.
+    #[test]
+    fn the_engine_config_carries_the_size_cap_backstop() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            size_cap_backstop(0, 4096),
+            None,
+            "0 leaves the engine alone"
+        );
+        assert_eq!(
+            size_cap_backstop(16 * MIB, 4096),
+            Some(16 * MIB),
+            "a cap above the store is the backstop"
+        );
+        assert_eq!(
+            size_cap_backstop(32 * MIB, 64 * MIB),
+            Some(64 * MIB),
+            "an over-cap store still opens"
+        );
+        assert_eq!(
+            size_cap_backstop(1024, 4096),
+            Some(ENGINE_MIN_DB_BYTES),
+            "the engine refuses max_db_size below 8 MiB"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_that_would_pass_the_cap_is_refused_and_lands_nothing() {
+        use crate::traits::VectorStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("capped.db");
+        let seed = capped_test_store(&path, 0).await;
+        seed.upsert(
+            "probe",
+            "seed-row",
+            vec![0.0; 4],
+            retired_test_payload("fact", "agent", json!({})),
+        )
+        .await
+        .expect("uncapped seed write");
+        drop(seed);
+
+        let cap = current_store_bytes_at(&path);
+        let store = capped_test_store(&path, cap).await;
+        let before = store.current_store_bytes();
+        let err = store
+            .upsert(
+                "probe",
+                "refused-row",
+                vec![0.1; 4],
+                retired_test_payload("fact", "agent", json!({"note": "would pass the cap"})),
+            )
+            .await
+            .expect_err("a write past the cap must be refused");
+        let text = err.to_string();
+        assert!(text.contains("STORE_FULL"), "{text}");
+        assert!(text.contains(&cap.to_string()), "cap not named: {text}");
+        assert!(
+            text.contains(&before.to_string()),
+            "current size not named: {text}"
+        );
+        assert!(
+            store.get("probe", "refused-row").await.unwrap().is_none(),
+            "the refused write landed a row"
+        );
+        assert_eq!(
+            store.current_store_bytes(),
+            before,
+            "the refused write changed the store's bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_single_payload_is_refused_before_the_engine_write() {
+        use crate::traits::VectorStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("oversized.db");
+        let seed = capped_test_store(&path, 0).await;
+        seed.upsert(
+            "probe",
+            "seed-row",
+            vec![0.0; 4],
+            retired_test_payload("fact", "agent", json!({})),
+        )
+        .await
+        .expect("uncapped seed write");
+        drop(seed);
+
+        let cap = current_store_bytes_at(&path) + 4096;
+        let store = capped_test_store(&path, cap).await;
+        let before = store.current_store_bytes();
+        let oversized = "x".repeat(4 * 1024 * 1024);
+        let err = store
+            .upsert(
+                "probe",
+                "oversized-row",
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({"body": oversized})),
+            )
+            .await
+            .expect_err("a payload larger than the remaining room must be refused");
+        let text = err.to_string();
+        assert!(text.contains("STORE_FULL"), "{text}");
+        assert!(store.get("probe", "oversized-row").await.unwrap().is_none());
+        assert_eq!(store.current_store_bytes(), before);
+    }
+
+    #[tokio::test]
+    async fn an_action_batch_that_would_pass_the_cap_lands_nothing() {
+        use crate::traits::VectorStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("batch.db");
+        let seed = capped_test_store(&path, 0).await;
+        seed.upsert(
+            "probe",
+            "seed-row",
+            vec![0.0; 4],
+            retired_test_payload("fact", "agent", json!({})),
+        )
+        .await
+        .expect("uncapped seed write");
+        drop(seed);
+
+        let cap = current_store_bytes_at(&path) + 4096;
+        let store = capped_test_store(&path, cap).await;
+        let before = store.current_store_bytes();
+        let batch = crate::rdf::action::ActionWriteSet {
+            expected_heads: Vec::new(),
+            writes: vec![crate::rdf::action::StagedMemoryWrite {
+                id: "batch-refused".to_string(),
+                vector: vec![0.0; 4],
+                payload: retired_test_payload("fact", "agent", json!({"body": "y".repeat(8192)})),
+            }],
+            edge_deltas: Vec::new(),
+        };
+        let err = store
+            .commit_action_batch("probe", batch)
+            .await
+            .expect_err("a batch past the cap must be refused");
+        let text = err.to_string();
+        assert!(text.contains("STORE_FULL"), "{text}");
+        assert!(store.get("probe", "batch-refused").await.unwrap().is_none());
+        assert_eq!(store.current_store_bytes(), before);
+    }
+
+    #[tokio::test]
+    async fn an_over_cap_store_still_opens_and_reads() {
+        use crate::traits::VectorStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("over-cap.db");
+        let seed = capped_test_store(&path, 0).await;
+        seed.upsert(
+            "probe",
+            "seed-row",
+            vec![0.0; 4],
+            retired_test_payload("fact", "agent", json!({"kept": true})),
+        )
+        .await
+        .expect("uncapped seed write");
+        drop(seed);
+
+        let current = current_store_bytes_at(&path);
+        let cap = current / 2;
+        let limits = cap_test_limits(cap);
+        let cfg = engine_config_for(limits, current);
+        let store = LadybugStore::with_system_config_and_limits(&path, 4, cfg, limits)
+            .expect("a store above a lowered cap must still open");
+        store.init("probe").await.expect("init over-cap store");
+        assert_eq!(store.max_db_bytes, cap);
+        assert!(
+            store.get("probe", "seed-row").await.unwrap().is_some(),
+            "an over-cap store must still serve reads"
+        );
     }
 
     /// Task 2: TaskStore and OntologyStore round-trip against a temporary
@@ -36084,6 +36529,9 @@ impl LadybugStore {
                 "namespace must be non-empty".to_string(),
             ));
         }
+        // #414: the batch is judged as one write, before any transaction opens.
+        self.ensure_store_has_room(estimate_action_write_bytes(&batch.writes))
+            .map_err(|e| ActionError::Storage(e.to_string()))?;
         self.guard_first_write()
             .map_err(|e| ActionError::Storage(e.to_string()))?;
         self.check_data_bearing_identity()

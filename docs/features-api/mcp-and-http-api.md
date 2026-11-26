@@ -105,6 +105,8 @@ On the daemon side, a task's stamped `worktree` is compared with the caller's ro
 
 All endpoints are served by the **neurostrata-mcp daemon** on `127.0.0.1:34343`. Tauri acts as a lightweight HTTP client; Cursor MCP integration proxies stdio JSON-RPC requests.
 
+When `store.max_db_bytes` (or `NEUROSTRATA_MAX_DB_BYTES`) is set, a write that would carry the store past the cap is refused before it reaches the engine. The tool call fails with `ERROR [STORE_FULL]` naming the current size and the cap, and the store's contents are unchanged; the daemon-memory advisory points buffer-pool failures at `NEUROSTRATA_BUFFER_POOL_BYTES` / `store.buffer_pool_bytes`. An over-cap store still opens so it can be read, archived, and pruned.
+
 At startup the daemon refreshes the harness plugin files in its startup root and in every configured project (the folder that holds the project's `.NeuroStrata` folder). Each harness keeps the namespace its own config already names, looked up in the folder itself first, then in its checkout and the main checkout; configs that disagree are left as they are. A harness with no config, or whose config cannot be read, gets its plugin files only, so the daemon never writes an empty or made-up namespace into a harness config (see `namespace resolve` in the CLI reference).
 
 `POST /mcp` follows JSON-RPC 2.0: a method the server does not implement gets error `-32601` (method not found) with the request's `id`, `ping` gets an empty result, and a notification (no `id`) gets `202 Accepted` with an empty body. For an unknown method, an explicit `"id": null` is a request id, not a notification: it receives the `-32601` response above with `"id": null`; only an omitted `id` suppresses the reply.

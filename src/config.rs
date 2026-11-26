@@ -91,6 +91,48 @@ impl Default for DeduplicationConfig {
     }
 }
 
+/// Byte-denominated store settings (#414). Both values are in bytes so the
+/// buffer pool and the size cap are commensurable and there is no second,
+/// megabyte-denominated pool knob.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct StoreConfig {
+    /// Cap on the engine's buffer pool. `None` uses the 384 MiB default and
+    /// `Some(0)` hands sizing back to the engine. Values below the 128 MiB
+    /// floor are raised to it in `store::ladybug`.
+    pub buffer_pool_bytes: Option<u64>,
+    /// Hard cap on the store's on-disk bytes (database plus write-ahead log).
+    /// `None` or `Some(0)` means no cap.
+    pub max_db_bytes: Option<u64>,
+}
+
+/// Read the deprecated `storage_hygiene.buffer_pool_mb` key once from raw JSON
+/// and convert it to bytes (#414). The new `store.buffer_pool_bytes` key wins,
+/// so a config that names both is not read twice; the caller logs the returned
+/// warning.
+pub(crate) fn legacy_buffer_pool_migration(raw: &serde_json::Value) -> Option<(u64, String)> {
+    let mb = raw
+        .get("storage_hygiene")?
+        .get("buffer_pool_mb")?
+        .as_u64()?;
+    if raw
+        .get("store")
+        .and_then(|store| store.get("buffer_pool_bytes"))
+        .is_some()
+    {
+        return None;
+    }
+    let bytes = mb.saturating_mul(1024 * 1024);
+    Some((
+        bytes,
+        format!(
+            "storage_hygiene.buffer_pool_mb is deprecated and was read once as {bytes} bytes; \
+             move the setting to store.buffer_pool_bytes (the megabyte key is removed in a \
+             future release)"
+        ),
+    ))
+}
+
 #[derive(Debug, Deserialize, serde::Serialize)]
 pub struct Config {
     #[serde(default)]
@@ -121,6 +163,9 @@ pub struct Config {
 
     #[serde(default)]
     pub storage_hygiene: crate::storage::snapshot::StorageHygieneConfig,
+
+    #[serde(default)]
+    pub store: StoreConfig,
 
     #[serde(default)]
     pub rag_chat: crate::rag_chat::RagChatConfig,
@@ -194,6 +239,7 @@ impl Config {
                 lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
                 hybrid_weights: default_hybrid_weights(),
                 storage_hygiene: crate::storage::snapshot::StorageHygieneConfig::default(),
+                store: StoreConfig::default(),
                 rag_chat: crate::rag_chat::RagChatConfig::default(),
                 multimodal: crate::multimodal::MultimodalConfig::default(),
                 federation_allowed_hosts: Vec::new(),
@@ -230,6 +276,15 @@ impl Config {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Could not read config at {}", path.display()))?;
         let mut config: Config = serde_json::from_str(&content)?;
+        // One release of compatibility: honour the old megabyte knob from the
+        // raw JSON (the typed config no longer has the field) before the
+        // byte-denominated resolution runs.
+        let raw: serde_json::Value = serde_json::from_str(&content)?;
+        if let Some((bytes, warning)) = legacy_buffer_pool_migration(&raw) {
+            config.store.buffer_pool_bytes = Some(bytes);
+            static LEGACY_POOL_WARNED: std::sync::Once = std::sync::Once::new();
+            LEGACY_POOL_WARNED.call_once(|| tracing::warn!("{warning}"));
+        }
 
         if config.db_path.is_dir() {
             config.db_path = config.db_path.join("ladybug.db");
@@ -689,6 +744,24 @@ mod tests {
         dir
     }
 
+    /// Issue #414: the byte-denominated store settings parse from the
+    /// `store` object, and a config that predates them gets `None` for both
+    /// (resolution then applies the defaults).
+    #[test]
+    fn store_limits_parse_from_json() {
+        let config: Config = serde_json::from_str(
+            r#"{"db_path":"test.db","store":{"buffer_pool_bytes":536870912,"max_db_bytes":1073741824}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.store.buffer_pool_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(config.store.max_db_bytes, Some(1024 * 1024 * 1024));
+
+        let bare: Config = serde_json::from_str(r#"{"db_path":"test.db"}"#).unwrap();
+        assert_eq!(bare.store, StoreConfig::default());
+        assert!(bare.store.buffer_pool_bytes.is_none());
+        assert!(bare.store.max_db_bytes.is_none());
+    }
+
     #[test]
     fn config_without_project_contexts_deserializes_empty_registry() {
         let config: Config = serde_json::from_str(r#"{"db_path":"db"}"#).unwrap();
@@ -848,6 +921,7 @@ mod tests {
             lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
             hybrid_weights: default_hybrid_weights(),
             storage_hygiene: crate::storage::StorageHygieneConfig::default(),
+            store: StoreConfig::default(),
             rag_chat: crate::rag_chat::RagChatConfig::default(),
             multimodal: crate::multimodal::MultimodalConfig::default(),
             federation_allowed_hosts: Vec::new(),
