@@ -1499,7 +1499,7 @@ pub struct LadybugStore {
     local_path: PathBuf,
     dimensions: usize,
     db: Arc<Database>,
-    dirty: Dirty,
+    dirty: Arc<Dirty>,
     /// Set by `stop_checkpoints_after_pool_failure`; no checkpoint runs after
     /// it except one standalone probe (#198, #211).
     checkpoints: CheckpointLatch,
@@ -1838,6 +1838,22 @@ impl Dirty {
 
     fn take(&self) -> bool {
         self.0.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
+/// Marks the store dirty when a blocking write ends, whatever the outcome.
+///
+/// Constructed inside the blocking task immediately before the statement runs,
+/// so a caller that gives up after dispatch still leaves the flag set, while a
+/// caller that gives up while still queued marks nothing: no statement was
+/// started, so there is nothing a checkpoint could flush.
+struct MarkDirtyOnDrop {
+    dirty: Arc<Dirty>,
+}
+
+impl Drop for MarkDirtyOnDrop {
+    fn drop(&mut self) {
+        self.dirty.mark();
     }
 }
 
@@ -4960,7 +4976,7 @@ impl LadybugStore {
             local_path,
             dimensions,
             db: Arc::new(db),
-            dirty: Dirty::default(),
+            dirty: Arc::new(Dirty::default()),
             checkpoints,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
@@ -5582,8 +5598,14 @@ impl LadybugStore {
         let write_lock = Arc::clone(&self.write_lock);
         let db = self.db.clone();
         let latch = self.checkpoints.clone();
+        let dirty = Arc::clone(&self.dirty);
 
-        let outcome = bounded(what, write_timeout(), async move {
+        // One deadline covers both the wait for the writer's turn and the
+        // statement itself. A caller that cannot get the turn hears that the
+        // store is busy; a caller that gives up after the statement was
+        // dispatched still leaves the dirty mark behind, because the mark is
+        // owned by the blocking task rather than by this future.
+        let outcome = bounded(what, write_turn_budget(), async move {
             // One writer at a time, because the engine refuses the second
             // rather than making it wait. The deadline covers this queue too:
             // a caller stuck behind a stalled write hears that the database is
@@ -5598,8 +5620,14 @@ impl LadybugStore {
             // handing the caller a failure it can do nothing about.
             let mut attempt = 0;
             loop {
-                let (returned, result) =
-                    Self::write_owning_turn(db.clone(), latch.clone(), turn, f.clone()).await?;
+                let (returned, result) = Self::write_owning_turn(
+                    db.clone(),
+                    latch.clone(),
+                    Some(Arc::clone(&dirty)),
+                    turn,
+                    f.clone(),
+                )
+                .await?;
                 turn = returned;
 
                 match result {
@@ -5620,6 +5648,9 @@ impl LadybugStore {
 
         if outcome.is_err() {
             WRITES_ABANDONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(message) = outcome.as_ref().err().and_then(store_busy_message) {
+                tracing::debug!("write turn ended busy: {message}");
+            }
             eprintln!(
                 "DIAGNOSTIC: gave up waiting on {} -- engine: {}",
                 what,
@@ -5627,10 +5658,6 @@ impl LadybugStore {
             );
         }
 
-        // Marked whatever the outcome: a write that timed out may still land,
-        // and an unnecessary checkpoint attempt costs nothing next to a write
-        // that never reaches disk.
-        self.dirty.mark();
         outcome
     }
 
@@ -5644,6 +5671,7 @@ impl LadybugStore {
     async fn write_owning_turn<T, F>(
         db: Arc<Database>,
         latch: CheckpointLatch,
+        dirty: Option<Arc<Dirty>>,
         turn: tokio::sync::OwnedMutexGuard<()>,
         f: F,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Result<T>)>
@@ -5664,6 +5692,10 @@ impl LadybugStore {
             }
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
+                // Owned by the statement from here on: normal return, error,
+                // panic, and a caller that gave up after dispatch all mark
+                // dirty; a caller that gave up while queued never got here.
+                let _dirty = dirty.map(|dirty| MarkDirtyOnDrop { dirty });
                 let result = f(&conn);
                 if let Err(e) = &result {
                     stop_checkpoints_after_pool_failure(&conn, &latch, e, false);
@@ -5678,19 +5710,37 @@ impl LadybugStore {
         .map_err(|e| anyhow::anyhow!("the database thread did not finish: {}", e))
     }
 
-    /// Runs one piece of database work on a blocking thread.
+    /// Waits for the one store turn with a bounded budget.
     ///
-    /// Every lbug call is synchronous FFI. Called straight from an async handler
-    /// it occupies a tokio worker for as long as the engine takes, and a handful
-    /// of concurrent queries can therefore starve the runtime outright: during a
-    /// write burst even /health -- an async closure returning a constant -- had
-    /// no thread to run on, which is what made the daemon look dead while it was
-    /// still listening (bead neurostrata-3fi.6).
+    /// A caller that cannot get the turn hears that the store is busy with a
+    /// typed [`StoreBusy`] instead of waiting behind a stalled statement
+    /// forever. Nothing is dispatched here, so giving up leaks nothing.
+    async fn acquire_write_turn_within(
+        &self,
+        what: &'static str,
+        budget: std::time::Duration,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let write_lock = Arc::clone(&self.write_lock);
+        bounded(
+            what,
+            budget,
+            async move { Ok(write_lock.lock_owned().await) },
+        )
+        .await
+    }
+
+    /// Runs one read with a bounded wait for the turn.
     ///
-    /// The connection is opened inside the closure on purpose. It borrows the
-    /// Database and is not Send, so it must never be created here and moved, nor
-    /// held across an await.
-    pub(crate) async fn with_conn<T, F>(&self, f: F) -> Result<T>
+    /// Only the wait is bounded. Once the turn is acquired the engine call
+    /// runs with the same rules as [`Self::with_conn`], which is this method
+    /// with [`READ_TURN_BUDGET`]: a slow query is allowed to finish, but a
+    /// reader is never left waiting indefinitely behind a held turn.
+    async fn read_with_turn_within<T, F>(
+        &self,
+        what: &'static str,
+        budget: std::time::Duration,
+        f: F,
+    ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
@@ -5704,7 +5754,7 @@ impl LadybugStore {
         // writer holds the turn. As in `write_owning_turn`, the guard lives
         // inside the blocking task, so a dropped await cannot release it
         // while a statement is still running.
-        let turn = Arc::clone(&self.write_lock).lock_owned().await;
+        let turn = self.acquire_write_turn_within(what, budget).await?;
         ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
             let _turn = turn;
@@ -5730,6 +5780,27 @@ impl LadybugStore {
         })
         .await
         .map_err(|e| anyhow::anyhow!("the database thread did not finish: {}", e))?
+    }
+
+    /// Runs one piece of database work on a blocking thread.
+    ///
+    /// Every lbug call is synchronous FFI. Called straight from an async handler
+    /// it occupies a tokio worker for as long as the engine takes, and a handful
+    /// of concurrent queries can therefore starve the runtime outright: during a
+    /// write burst even /health -- an async closure returning a constant -- had
+    /// no thread to run on, which is what made the daemon look dead while it was
+    /// still listening (bead neurostrata-3fi.6).
+    ///
+    /// The connection is opened inside the closure on purpose. It borrows the
+    /// Database and is not Send, so it must never be created here and moved, nor
+    /// held across an await.
+    pub(crate) async fn with_conn<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        self.read_with_turn_within("reading the database", READ_TURN_BUDGET, f)
+            .await
     }
 }
 
@@ -7841,19 +7912,18 @@ impl LadybugStore {
     pub async fn active_generations_public(
         &self,
         namespace: &str,
-    ) -> std::collections::HashSet<u64> {
-        let ns_label = namespace.to_string();
+    ) -> Result<std::collections::HashSet<u64>> {
         let namespace = namespace.to_string();
-        self.with_conn(move |conn| {
-            Ok(crate::store::ladybug::active_generations_of(
-                conn, &namespace,
-            ))
-        })
+        self.read_with_turn_within(
+            "reading active generations",
+            READ_TURN_BUDGET,
+            move |conn| {
+                Ok(crate::store::ladybug::active_generations_of(
+                    conn, &namespace,
+                ))
+            },
+        )
         .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("active generations query failed for '{ns_label}': {e}");
-            Default::default()
-        })
     }
 
     /// Delete every row of one superseded generation in `namespace`.
@@ -8094,15 +8164,9 @@ impl LadybugStore {
         Ok(deleted)
     }
 
-    pub async fn symbol_ids(&self, namespace: &str) -> Vec<String> {
-        let gens = self.active_generations_public(namespace).await;
-        let memories = self
-            .list(namespace, Some("auto-ingestor"), None)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("symbol_ids memory list failed for '{namespace}': {e}");
-                Default::default()
-            });
+    pub async fn symbol_ids(&self, namespace: &str) -> Result<Vec<String>> {
+        let gens = self.active_generations_public(namespace).await?;
+        let memories = self.list(namespace, Some("auto-ingestor"), None).await?;
         let mut out = Vec::new();
         for m in memories {
             let mt = m.payload.memory_type.as_str();
@@ -8126,23 +8190,25 @@ impl LadybugStore {
             }
             out.push(m.id);
         }
-        out
+        Ok(out)
     }
 
-    pub async fn mention_symbol_ids(&self, namespace: &str) -> std::sync::Arc<Vec<String>> {
-        let gens = self.active_generations_public(namespace).await;
+    pub async fn mention_symbol_ids(&self, namespace: &str) -> Result<std::sync::Arc<Vec<String>>> {
+        let gens = self.active_generations_public(namespace).await?;
         {
             let guard = self.mention_symbol_ids.read().await;
             if let Some((cached_gens, vec)) = guard.get(namespace) {
                 if *cached_gens == gens {
-                    return vec.clone();
+                    return Ok(vec.clone());
                 }
             }
         }
-        let vec = std::sync::Arc::new(self.symbol_ids(namespace).await);
+        // Only a complete list is cached: a busy read must not replace a good
+        // cache entry with an empty one.
+        let vec = std::sync::Arc::new(self.symbol_ids(namespace).await?);
         let mut guard = self.mention_symbol_ids.write().await;
         guard.insert(namespace.to_string(), (gens, vec.clone()));
-        vec
+        Ok(vec)
     }
 
     pub async fn dangling_edges(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
@@ -8662,14 +8728,8 @@ impl LadybugStore {
     }
 
     /// Advisory shape warnings for every row in the namespace (F18). Never blocks.
-    pub async fn shape_warnings(&self, namespace: &str) -> Vec<serde_json::Value> {
-        let rows = match self.list(namespace, None, None).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::warn!("shape_warnings list failed for '{namespace}': {e}");
-                Vec::new()
-            }
-        };
+    pub async fn shape_warnings(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
+        let rows = self.list(namespace, None, None).await?;
         let mut out = Vec::new();
         for r in rows {
             // shacl validate
@@ -8725,7 +8785,7 @@ impl LadybugStore {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Advisory ontology warnings for a namespace (F21). Never blocks.
@@ -10665,7 +10725,7 @@ impl VectorStore for LadybugStore {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if has_unqualified_edge_target && !exact_edge_targets {
-            let ids = self.mention_symbol_ids(&namespace).await;
+            let ids = self.mention_symbol_ids(&namespace).await?;
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
             for key in [
                 "related_to",
@@ -10866,7 +10926,7 @@ impl VectorStore for LadybugStore {
         if payload.user_id != "auto-ingestor" {
             let ids = match cached_symbol_ids {
                 Some(ids) => ids,
-                None => self.mention_symbol_ids(&namespace).await,
+                None => self.mention_symbol_ids(&namespace).await?,
             };
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
             let mut mentions =
@@ -11948,7 +12008,7 @@ impl VectorStore for LadybugStore {
         let latch = self.checkpoints.clone();
         let checkpoint_run: CheckpointRun = {
             let (returned, outcome) =
-                Self::write_owning_turn(self.db.clone(), latch.clone(), turn, move |conn| {
+                Self::write_owning_turn(self.db.clone(), latch.clone(), None, turn, move |conn| {
                     Ok(guarded_checkpoint(conn, &latch))
                 })
                 .await?;
@@ -16456,6 +16516,19 @@ pub fn engine_stats() -> String {
     )
 }
 
+/// How long a read may wait for the store's one turn before it is told the
+/// database is busy. Reads are milliseconds once they hold the turn, so a
+/// quarter second of queueing means a statement is genuinely stuck; waiting
+/// longer turns a recoverable condition into a hang.
+const READ_TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long a write may wait for the turn and run its statement. One budget
+/// covers both, so a caller cannot spend the whole deadline queueing and then
+/// be told the statement is fine.
+fn write_turn_budget() -> std::time::Duration {
+    write_timeout()
+}
+
 /// How long a write may wait before the caller is told the database is busy.
 /// Override with NEUROSTRATA_WRITE_TIMEOUT_SECS where an unusually large
 /// database makes the default too tight.
@@ -16589,8 +16662,49 @@ fn resolve_target_on_write(
     pick_declared_target(namespace, active_gen, declared, &found)
 }
 
-/// Fails a future that outstays its deadline, with a message that says what was
-/// waiting and admits the work may still be running.
+/// The typed "could not get the store turn in time" condition.
+///
+/// A caller can tell this apart from a real query failure with
+/// [`is_store_busy`], so a busy store is retried while a broken one is not.
+/// The `Display` text deliberately keeps the pre-`#407` wording: existing
+/// operators and logs already recognise it, and it still admits that a
+/// statement dispatched before the deadline may land later.
+#[derive(Debug, Clone)]
+pub struct StoreBusy {
+    operation: String,
+    budget: std::time::Duration,
+}
+
+impl std::fmt::Display for StoreBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the database is busy: {} did not finish within {}s. The statement may still be running, so read the record back before retrying.",
+            self.operation,
+            self.budget.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for StoreBusy {}
+
+/// Whether this error is the recoverable "store turn was busy" condition.
+pub fn is_store_busy(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<StoreBusy>().is_some())
+}
+
+/// The busy message when this error carries [`StoreBusy`].
+pub fn store_busy_message(err: &anyhow::Error) -> Option<String> {
+    if !is_store_busy(err) {
+        return None;
+    }
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<StoreBusy>().map(ToString::to_string))
+}
+
+/// Fails a future that outstays its deadline, with a typed error that says
+/// what was waiting and admits the work may still be running.
 async fn bounded<T>(
     what: &str,
     limit: std::time::Duration,
@@ -16598,11 +16712,11 @@ async fn bounded<T>(
 ) -> Result<T> {
     match tokio::time::timeout(limit, fut).await {
         Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "the database is busy: {} did not finish within {}s. The statement may still be running, so read the record back before retrying.",
-            what,
-            limit.as_secs()
-        )),
+        Err(_) => Err(StoreBusy {
+            operation: what.to_string(),
+            budget: limit,
+        }
+        .into()),
     }
 }
 
@@ -21467,8 +21581,8 @@ eurostrata\src\daemon.rs",
                 .unwrap();
         }
 
-        let first = store.mention_symbol_ids("probe").await;
-        let second = store.mention_symbol_ids("other").await;
+        let first = store.mention_symbol_ids("probe").await.unwrap();
+        let second = store.mention_symbol_ids("other").await.unwrap();
 
         assert_eq!(
             first.as_slice(),
@@ -25466,7 +25580,7 @@ eurostrata\src\daemon.rs",
             "resolved valid-target must not be in dangling_edges"
         );
 
-        let warnings = store.shape_warnings("probe").await;
+        let warnings = store.shape_warnings("probe").await.unwrap();
         assert!(
             warnings.iter().any(|w| w
                 .get("why")
@@ -33347,6 +33461,304 @@ eurostrata\src\daemon.rs",
             "slot reservation must preserve the 1-hop GOVERNS rule in top-10 despite 10 structural code_ast hits: {:?}",
             result_ids(&top10)
         );
+    }
+
+    /// `#407` Wave 3 Step 2: a store turn is a bounded, typed, recoverable
+    /// wait. A caller that cannot get the turn is told the store is busy
+    /// instead of waiting forever, and a write that was dispatched before its
+    /// caller gave up still leaves the dirty flag set so the next checkpoint
+    /// flushes it.
+    mod store_busy {
+        use super::super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        async fn fresh_store() -> (tempfile::TempDir, LadybugStore) {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let store =
+                LadybugStore::for_testing(dir.path().join("db"), 4).expect("open temp database");
+            (dir, store)
+        }
+
+        fn expected_busy_message(operation: &str) -> String {
+            format!(
+                "the database is busy: {operation} did not finish within 0s. The statement may still be running, so read the record back before retrying."
+            )
+        }
+
+        async fn wait_until(mut condition: impl FnMut() -> bool, limit: Duration) {
+            let deadline = std::time::Instant::now() + limit;
+            while !condition() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "condition did not become true within {limit:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn a_turn_wait_past_its_budget_returns_typed_store_busy() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let err = match store
+                .acquire_write_turn_within("writing a memory", Duration::from_millis(20))
+                .await
+            {
+                Ok(_) => panic!("a held turn must not be acquired within 20ms"),
+                Err(e) => e,
+            };
+
+            assert!(is_store_busy(&err), "{err:?}");
+            assert_eq!(
+                store_busy_message(&err),
+                Some(expected_busy_message("writing a memory"))
+            );
+            assert!(err.to_string().contains("the database is busy"), "{err}");
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn store_busy_is_recoverable_in_under_five_seconds() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let busy = match store
+                .read_with_turn_within("reading a memory", Duration::from_millis(20), |_| Ok(7u8))
+                .await
+            {
+                Ok(_) => panic!("a held turn must not be read within 20ms"),
+                Err(e) => e,
+            };
+            assert!(is_store_busy(&busy), "{busy:?}");
+
+            // The same caller succeeds once the turn is free: busy is a wait,
+            // not a failure of the store.
+            drop(held);
+            let started = std::time::Instant::now();
+            let value = store
+                .read_with_turn_within("reading a memory", Duration::from_secs(5), |_| Ok(7u8))
+                .await
+                .expect("the read recovers");
+            assert_eq!(value, 7);
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "recovery took {:?}",
+                started.elapsed()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_read_behind_a_held_turn_reports_busy_not_empty() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let err = match store
+                .read_with_turn_within("reading a memory", Duration::from_millis(20), |_| {
+                    Ok(Vec::<u8>::new())
+                })
+                .await
+            {
+                Ok(empty) => panic!("a read behind a held turn returned {empty:?}"),
+                Err(e) => e,
+            };
+
+            assert!(is_store_busy(&err), "{err:?}");
+            assert!(
+                store_busy_message(&err)
+                    .as_deref()
+                    .is_some_and(|m| m.contains("reading a memory")),
+                "{err}"
+            );
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn active_generations_behind_a_held_turn_report_busy() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let err = match store.active_generations_public("probe").await {
+                Ok(gens) => panic!("a held turn returned generations {gens:?}"),
+                Err(e) => e,
+            };
+
+            assert!(is_store_busy(&err), "{err:?}");
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn mention_symbol_ids_behind_a_held_turn_report_busy() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let err = match store.mention_symbol_ids("probe").await {
+                Ok(ids) => panic!("a held turn returned symbol ids {ids:?}"),
+                Err(e) => e,
+            };
+
+            assert!(is_store_busy(&err), "{err:?}");
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn shape_warnings_behind_a_held_turn_report_busy() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let err = match store.shape_warnings("probe").await {
+                Ok(warnings) => panic!("a held turn returned shape warnings {warnings:?}"),
+                Err(e) => e,
+            };
+
+            assert!(is_store_busy(&err), "{err:?}");
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn reads_recover_once_the_turn_is_released() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let busy = match store
+                .read_with_turn_within("reading a memory", Duration::from_millis(20), |_| Ok(42u64))
+                .await
+            {
+                Ok(value) => panic!("a held turn returned {value}"),
+                Err(e) => e,
+            };
+            assert!(is_store_busy(&busy), "{busy:?}");
+
+            drop(held);
+            let value = store
+                .read_with_turn_within("reading a memory", READ_TURN_BUDGET, |_| Ok(42u64))
+                .await
+                .expect("the read recovers once the turn is released");
+            assert_eq!(value, 42);
+        }
+
+        /// Runs `write_with_deadline` until its blocking statement has started,
+        /// then drops the caller future while the statement is still blocked.
+        async fn cancel_after_dispatch(
+            store: &LadybugStore,
+            started: Arc<tokio::sync::Notify>,
+            release_rx: Arc<std::sync::Mutex<mpsc::Receiver<()>>>,
+        ) {
+            let statement = {
+                let started = Arc::clone(&started);
+                move |_conn: &Connection| {
+                    started.notify_one();
+                    let _ = release_rx
+                        .lock()
+                        .expect("release channel lock")
+                        .recv_timeout(Duration::from_secs(5));
+                    Ok(())
+                }
+            };
+            let mut write = Box::pin(store.write_with_deadline("writing a memory", statement));
+            tokio::select! {
+                result = &mut write => panic!("the write finished before it could be cancelled: {result:?}"),
+                _ = started.notified() => {}
+            }
+            drop(write);
+        }
+
+        #[tokio::test]
+        async fn a_dispatched_write_marks_dirty_when_its_caller_is_cancelled() {
+            let (_dir, store) = fresh_store().await;
+            let started = Arc::new(tokio::sync::Notify::new());
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+
+            cancel_after_dispatch(&store, Arc::clone(&started), release_rx).await;
+            release_tx.send(()).expect("release the statement");
+
+            wait_until(|| store.dirty.is_set(), Duration::from_secs(2)).await;
+            assert!(
+                store.dirty.is_set(),
+                "a write dispatched before its caller gave up must still mark dirty"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_write_error_after_mutation_keeps_the_dirty_flag() {
+            let (_dir, store) = fresh_store().await;
+
+            let outcome = store
+                .write_with_deadline("writing a memory", |conn| -> Result<()> {
+                    conn.query("CREATE NODE TABLE StoreBusyProbe(id INT64, PRIMARY KEY(id))")?;
+                    conn.query("CREATE (:StoreBusyProbe {id: 1})")?;
+                    anyhow::bail!("simulated failure after the row landed")
+                })
+                .await;
+
+            assert!(outcome.is_err(), "{outcome:?}");
+            assert!(
+                store.dirty.is_set(),
+                "a write that mutated before failing must keep the dirty flag"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_write_cancelled_before_dispatch_neither_dispatches_nor_marks_dirty() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+            let dispatched = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&dispatched);
+
+            let mut write = Box::pin(store.write_with_deadline("writing a memory", move |_| {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+            let queued = tokio::time::timeout(Duration::from_millis(100), &mut write).await;
+            assert!(
+                queued.is_err(),
+                "the write must still be queued behind the held turn"
+            );
+            drop(write);
+            drop(held);
+
+            // No statement was dispatched, so nothing may run or mark itself.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !dispatched.load(Ordering::SeqCst),
+                "a cancelled queued write must not dispatch"
+            );
+            assert!(
+                !store.dirty.is_set(),
+                "a cancelled queued write must not mark dirty"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_cancelled_write_leaves_the_turn_free_once_the_statement_ends() {
+            let (_dir, store) = fresh_store().await;
+            let started = Arc::new(tokio::sync::Notify::new());
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+
+            cancel_after_dispatch(&store, Arc::clone(&started), release_rx).await;
+
+            // The caller is gone, but the statement is still running and must
+            // keep the turn until it actually finishes.
+            assert!(
+                Arc::clone(&store.write_lock).try_lock().is_err(),
+                "the turn was released while the statement was still running"
+            );
+
+            release_tx.send(()).expect("release the statement");
+            wait_until(
+                || Arc::clone(&store.write_lock).try_lock().is_ok(),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                Arc::clone(&store.write_lock).try_lock().is_ok(),
+                "the turn is free once the statement has ended"
+            );
+        }
     }
 }
 

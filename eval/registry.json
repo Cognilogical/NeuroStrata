@@ -603,6 +603,27 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "store-write-turn": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::store_busy -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::tests::store_busy::a_turn_wait_past_its_budget_returns_typed_store_busy",
+        "store::ladybug::tests::store_busy::store_busy_is_recoverable_in_under_five_seconds",
+        "store::ladybug::tests::store_busy::a_read_behind_a_held_turn_reports_busy_not_empty",
+        "store::ladybug::tests::store_busy::active_generations_behind_a_held_turn_report_busy",
+        "store::ladybug::tests::store_busy::mention_symbol_ids_behind_a_held_turn_report_busy",
+        "store::ladybug::tests::store_busy::shape_warnings_behind_a_held_turn_report_busy",
+        "store::ladybug::tests::store_busy::reads_recover_once_the_turn_is_released",
+        "store::ladybug::tests::store_busy::a_dispatched_write_marks_dirty_when_its_caller_is_cancelled",
+        "store::ladybug::tests::store_busy::a_write_error_after_mutation_keeps_the_dirty_flag",
+        "store::ladybug::tests::store_busy::a_write_cancelled_before_dispatch_neither_dispatches_nor_marks_dirty",
+        "store::ladybug::tests::store_busy::a_cancelled_write_leaves_the_turn_free_once_the_statement_ends"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }
