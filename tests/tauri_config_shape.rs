@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// The exact CSP the visualizer ships: script and style are same-origin only
 /// (inline styles are the single retained exception), images may be data URLs,
 /// and the only permitted network target is the loopback daemon.
-const EXPECTED_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343";
+const EXPECTED_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343; form-action 'self'";
 
 /// URL patterns the scoped `shell:allow-open` capability may allow. These map
 /// one-to-one to the schemes `open_external` accepts in `src-tauri/src/main.rs`.
@@ -103,8 +103,18 @@ fn csp_is_set_and_strict() {
         .collect();
     assert_eq!(
         directives.len(),
-        5,
-        "the CSP must contain exactly five directives: {actual}"
+        6,
+        "the CSP must contain exactly six directives: {actual}"
+    );
+
+    // `form-action` never falls back to `default-src` (CSP spec / MDN:
+    // "Not setting this allows anything"), so it must be pinned explicitly
+    // or a compromised renderer could submit form data to a remote host
+    // despite the loopback-only `connect-src`.
+    assert_eq!(
+        directive_tokens(&actual, "form-action"),
+        vec!["'self'".to_string()],
+        "form-action must be 'self'"
     );
 }
 
