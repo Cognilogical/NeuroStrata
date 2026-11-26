@@ -8,9 +8,10 @@ use tracing::{info, warn};
 
 /// The SHA-256 digest of the multi-arch `alpine:3.21` OCI index, resolved
 /// from the Docker Hub registry (`Docker-Content-Digest` on the manifest
-/// `HEAD`) and cross-checked against `docker pull alpine:3.21`'s
-/// `RepoDigests` on 2026-11-25. `SANDBOX_IMAGE` composes the digest into the
-/// `alpine@sha256:<digest>` reference below; the two must stay in sync (the
+/// `HEAD`) and cross-checked against `podman pull alpine:3.21`'s
+/// `RepoDigests` (via `podman inspect`) on 2026-11-25. `SANDBOX_IMAGE`
+/// composes the digest into the `alpine@sha256:<digest>` reference below;
+/// the two must stay in sync (the
 /// `sandbox_image_is_digest_pinned_and_never_latest` test enforces it).
 // `pub` in a binary crate is not externally reachable, so non-test builds
 // would otherwise flag this digest-only constant as dead code.

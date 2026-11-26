@@ -62,7 +62,7 @@ When `use_sandbox: true` evaluates a `bash` or `script` action, the payload runs
 alpine@sha256:bc21487101ae47172509130ee1092cc273a831968d64b617776d1f69c81e42ab
 ```
 
-The digest is the multi-arch `alpine:3.21` OCI index, resolved on 2026-11-25 from the Docker Hub registry (`Docker-Content-Digest` on the manifest `HEAD` for `library/alpine:3.21`) and cross-checked against `docker pull alpine:3.21`'s `RepoDigests`. A tag such as `alpine:3.21` can be re-pushed, which would silently change the code the guard executes; the digest cannot.
+The digest is the multi-arch `alpine:3.21` OCI index, resolved on 2026-11-25 from the Docker Hub registry (`Docker-Content-Digest` on the manifest `HEAD` for `library/alpine:3.21`) and cross-checked against `podman pull alpine:3.21`'s `RepoDigests` (via `podman inspect`). A tag such as `alpine:3.21` can be re-pushed, which would silently change the code the guard executes; the digest cannot.
 
 Every run pins this hardening set in `sandbox_run_args` (`src/guard/sandbox.rs`):
 
