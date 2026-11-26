@@ -159,6 +159,26 @@ fn capability_has_no_file_or_root_open_patterns() {
         patterns, expected,
         "scoped shell:allow-open patterns must be exactly the schemes the web-ui emits"
     );
+
+    // The capability above is the ACL; `plugins.shell.open` is the separate
+    // plugin switch that decides whether plugin-shell's own `open` command
+    // exists at all. `open_external` (src-tauri/src/main.rs) is the enforced
+    // allowlist the web-ui actually calls, so leaving the plugin switch on only
+    // widens the surface. `false` must be explicit: an absent key deserializes
+    // to `ShellAllowlistOpen::Unset`, which tauri-plugin-shell treats like
+    // `true` (it installs a default URL regex), so removing the key would
+    // silently re-enable the opener.
+    let tauri_conf = read_json("src-tauri/tauri.conf.json");
+    match tauri_conf.pointer("/plugins/shell/open") {
+        Some(Value::Bool(false)) => {}
+        other => panic!(
+            "src-tauri/tauri.conf.json must set plugins.shell.open to false \
+             (external URLs go through open_external; absence re-enables the opener), got: {}",
+            other
+                .map(Value::to_string)
+                .unwrap_or_else(|| "missing".to_string())
+        ),
+    }
 }
 
 #[test]

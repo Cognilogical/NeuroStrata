@@ -88,6 +88,8 @@ default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src
 
 These are the only schemes the web UI emits when handing a file or link to an editor or browser, matching the allowlist in `open_external` (`src-tauri/src/main.rs`). The previously duplicated bare `"shell:allow-open"` entry and the `^file://.*`, `^/.*`, and `^obsidian://.*` patterns are removed: they turned the opener into an arbitrary local-file or executable launcher reachable from untrusted node content. `src-tauri/gen/schemas/capabilities.json` mirrors this capability and is kept in sync.
 
+`plugins.shell.open` is `false` in `src-tauri/tauri.conf.json`: external URLs go through `open_external`, whose Rust allowlist is the enforced gate, so plugin-shell's own `open` command stays disabled and `tests/tauri_config_shape.rs` pins the key to `false` (absence would be read as `true` by tauri-plugin-shell).
+
 ### 6.3 Port override and dev-mode caveats
 
 - **`NEUROSTRATA_DAEMON_PORT`:** the CSP hardcodes the default daemon origin `http://127.0.0.1:34343`. If the daemon port is overridden through `NEUROSTRATA_DAEMON_PORT`, the webview's `connect-src` will block the overridden origin; update the CSP and `tests/tauri_config_shape.rs` together, or keep the daemon on `34343` for the desktop app.
