@@ -1918,16 +1918,23 @@ mod tests {
     #[test]
     fn a_prefix_with_parent_components_keeps_its_literal_spelling() {
         // A prefix that names the root through `..`, as a memory may carry it.
+        // Forms are compared as stored, with `/` separators on every platform.
+        let keeps = |forms: &[String], raw: &str| {
+            let want = crate::parser::ingest::normalize_node_path(raw);
+            forms
+                .iter()
+                .any(|f| crate::parser::ingest::normalize_node_path(f) == want)
+        };
         let (_tmp, root, _) = project_with_worktree();
         let raw = s(&root.join("src").join(".."));
         let forms = prefix_lookup_forms(&raw, Some(&s(&root)), None).unwrap();
         assert_eq!(forms[0], ".");
-        assert!(forms.contains(&raw), "{forms:?}");
+        assert!(keeps(&forms, &raw), "{forms:?}");
         // As a directory filter, the literal spelling matches what is under
         // it, not a sibling reached through another `..`.
         let raw = s(&root.join("src").join("..").join("src"));
         let forms = prefix_lookup_forms(&raw, Some(&s(&root)), None).unwrap();
-        assert!(forms.contains(&raw), "{forms:?}");
+        assert!(keeps(&forms, &raw), "{forms:?}");
         let under = s(&Path::new(&raw).join("lib.rs"));
         let sibling = s(&Path::new(&raw).join("..").join("Cargo.toml"));
         assert!(crate::search::path_prefix_forms_match(&under, &forms));
