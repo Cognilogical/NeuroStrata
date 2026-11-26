@@ -465,11 +465,15 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
         let _ = stderr_tx.send(());
     });
 
-    let deadline = Instant::now() + timeout;
+    // Elapsed-based deadline, never `Instant::now() + timeout`: a huge
+    // configured bound (e.g. NEUROSTRATA_GIT_TIMEOUT_SECS=u64::MAX) overflows
+    // the representable Instant range and the addition panics, orphaning the
+    // spawned git. Comparing elapsed time cannot overflow.
+    let started = Instant::now();
     let status: ExitStatus = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(GIT_POLL_INTERVAL),
+            Ok(None) if started.elapsed() < timeout => std::thread::sleep(GIT_POLL_INTERVAL),
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1350,6 +1354,30 @@ mod tests {
                 "NEUROSTRATA_GIT_TIMEOUT_SECS={raw:?} must fall back to the default"
             );
         }
+    }
+
+    /// A bound too large for the platform's Instant range must not panic:
+    /// the deadline is tracked as elapsed time, so a fast git still succeeds
+    /// under an absurd configured timeout instead of crashing the caller and
+    /// orphaning the child.
+    #[cfg(unix)]
+    #[test]
+    fn git_huge_timeout_does_not_panic() {
+        use super::git_test_support::EnvRestore;
+
+        let _env = crate::daemon::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _timeout = EnvRestore::set("NEUROSTRATA_GIT_TIMEOUT_SECS", u64::MAX.to_string());
+        let root = scratch("git-huge-timeout");
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "scratch repo init");
+        run(&root, &["rev-parse", "--git-dir"])
+            .expect("a huge configured timeout must not panic the bounded runner");
     }
 
     /// A valid value is honoured per call (no caching, no restart).
