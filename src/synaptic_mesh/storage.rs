@@ -420,13 +420,23 @@ pub(crate) fn git_timeout() -> Duration {
 pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
     let timeout = git_timeout();
     let display = args.join(" ");
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // The child leads its own process group, so a timeout kill reaches git's
+    // helpers/descendants (transports, pagers, hooks) too — killing only the
+    // direct child leaves them running and holding the inherited pipes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("git {display} could not be executed"))?;
 
@@ -475,7 +485,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() < timeout => std::thread::sleep(GIT_POLL_INTERVAL),
             Ok(None) => {
-                let _ = child.kill();
+                kill_child(&mut child);
                 reap_within(&mut child, GIT_DRAIN_GRACE);
                 // Detach rather than block forever on a pipe a grandchild may
                 // still hold: the drain threads exit on their own once the
@@ -487,7 +497,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
                 );
             }
             Err(error) => {
-                let _ = child.kill();
+                kill_child(&mut child);
                 reap_within(&mut child, GIT_DRAIN_GRACE);
                 drain_within(&stdout_rx, &stderr_rx, &stdout_buf, &stderr_buf);
                 return Err(error).with_context(|| format!("git {display} could not be waited on"));
@@ -505,6 +515,26 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
         stdout,
         stderr,
     })
+}
+
+/// Terminate the child and, on unix, its whole process group: git's
+/// helpers inherit the pipes and can outlive a direct-child-only kill,
+/// continuing work after the call has already timed out. The group was
+/// created for this child at spawn (`process_group(0)`), so the group kill
+/// cannot reach unrelated processes.
+fn kill_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as libc::pid_t;
+        if pgid > 0 {
+            // SAFETY: killpg on the child's own group; a dead group is a
+            // no-op error we deliberately ignore before the direct kill.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
 }
 
 /// Reap a killed child, but only within `bound`: a child stuck in
@@ -615,6 +645,10 @@ pub(crate) mod git_test_support {
     /// - `.grandchild-git` leaves a background grandchild (`sleep 30`)
     ///   holding both inherited pipes and exits 0 immediately, which is how
     ///   the normal-exit test proves EOF is not a precondition for return.
+    /// - `.hangtree-git` hangs like `.hang-git` but first spawns a
+    ///   `sleep 60` descendant in the same process group (its pid lands in
+    ///   `git-grandchild.pid` next to the pid file), which is how the
+    ///   timeout test proves the kill reaches the whole tree.
     pub(crate) struct GitShim {
         dir: PathBuf,
     }
@@ -656,8 +690,15 @@ pub(crate) mod git_test_support {
                  \tsleep 30 &\n\
                  \texit 0\n\
                  fi\n\
+                 if [ -f \"$target/.hangtree-git\" ]; then\n\
+                 \tsleep 60 &\n\
+                 \tprintf '%s\\n' \"$!\" > '{gpid}'\n\
+                 \tprintf '%s\\n' \"$$\" > '{pid}'\n\
+                 \texec sleep 60\n\
+                 fi\n\
                  exec '{real}' \"$@\"\n",
                 pid = pid_file.display(),
+                gpid = pid_file.with_file_name("git-grandchild.pid").display(),
                 real = real,
             );
             let path = dir.join("git");
@@ -1169,6 +1210,52 @@ mod tests {
         );
 
         assert_reaped(read_pid(&pid_file));
+    }
+
+    /// A timed-out git's descendants must die with it: the child leads its
+    /// own process group and the timeout kill targets the group, so a helper
+    /// holding the inherited pipes cannot outlive the call.
+    #[cfg(unix)]
+    #[test]
+    fn git_timeout_kills_descendants_too() {
+        use super::git_test_support::{read_pid, EnvRestore, GitShim};
+        use std::time::{Duration, Instant};
+
+        let _env = crate::daemon::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = scratch("git-hangtree");
+        let pid_file = root.join("git.pid");
+        let shim = GitShim::install("hangtree", &pid_file);
+        let _path = shim.activate();
+        let _timeout = EnvRestore::set("NEUROSTRATA_GIT_TIMEOUT_SECS", "1");
+        std::fs::write(root.join(".hangtree-git"), b"").unwrap();
+
+        run_ok(&root, &["rev-parse", "--verify", "HEAD"])
+            .expect_err("a hung git tree must be killed, not awaited");
+
+        let grandchild_pid = read_pid(&root.join("git-grandchild.pid"));
+        // Group-kill delivery is asynchronous: poll briefly for the
+        // descendant to disappear (kill -0 also sees zombies, and the
+        // orphan is reaped by init once dead).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let alive = Command::new("kill")
+                .arg("-0")
+                .arg(grandchild_pid.to_string())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid {grandchild_pid} outlived the timed-out git call"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Large output past any OS pipe buffer must not deadlock: both streams
