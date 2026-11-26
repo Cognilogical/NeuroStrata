@@ -3570,6 +3570,14 @@ pub async fn handle_task_complete(
     if let Some(mem) = &memory {
         complete_scan.insert("memory".to_string(), mem.clone());
     }
+    // Follow-up specs are parsed and re-scanned below, but that is after
+    // the precheck: judge the raw specs here too, so a secret follow-up
+    // refuses before normalization can rewrite any row.
+    if let Some(follow_ups) = args.get("follow_up_tasks") {
+        if !follow_ups.is_null() {
+            complete_scan.insert("follow_up_tasks".to_string(), follow_ups.clone());
+        }
+    }
     if let Some(rejection) =
         crate::secrets::scan_entry_point("", &Value::Object(complete_scan), "task_complete")
     {
