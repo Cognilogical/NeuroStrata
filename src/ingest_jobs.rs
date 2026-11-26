@@ -276,6 +276,14 @@ impl IngestJobs {
             Ok(jobs) => jobs.values().cloned().collect(),
             Err(error) => {
                 tracing::error!("IngestJobs::wait_idle: jobs registry mutex is poisoned: {error}");
+                // A poisoned registry cannot confirm idleness, but returning
+                // at once would shortcut the caller's shutdown budget to
+                // zero and drop a detached walk that might still finish in
+                // that window (the walk owns its progress channel; only the
+                // registry snapshot is lost). Wait the budget out, then
+                // report not-idle: the caller warns and proceeds exactly as
+                // it does for a walk that outlives its limit.
+                tokio::time::sleep(limit).await;
                 return false;
             }
         };
@@ -445,9 +453,16 @@ mod tests {
             error.to_string().contains("poisoned"),
             "run error must name poisoning: {error}"
         );
+        let wait_started = std::time::Instant::now();
         assert!(
-            !jobs.wait_idle(std::time::Duration::from_millis(10)).await,
+            !jobs.wait_idle(std::time::Duration::from_millis(50)).await,
             "wait_idle must degrade to false on a poisoned registry"
+        );
+        assert!(
+            wait_started.elapsed() >= std::time::Duration::from_millis(40),
+            "wait_idle on a poisoned registry must wait out the caller's \
+             budget, not shortcut shutdown to zero: {:?}",
+            wait_started.elapsed()
         );
     }
 }
