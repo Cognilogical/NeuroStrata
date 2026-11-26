@@ -1982,9 +1982,14 @@ const ENGINE_MIN_DB_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The engine's `max_db_size` backstop: a store that is already above a newly
 /// lowered cap must still open so it can be read, archived, and pruned. A cap
-/// of 0 leaves the engine's own default alone.
+/// of 0 leaves the engine's own default alone. The engine rejects a
+/// `max_db_size` that is not a power of two, so the chosen size is rounded up.
 fn size_cap_backstop(cap: u64, current_store_bytes: u64) -> Option<u64> {
-    (cap != 0).then(|| cap.max(current_store_bytes).max(ENGINE_MIN_DB_BYTES))
+    (cap != 0).then(|| {
+        cap.max(current_store_bytes)
+            .max(ENGINE_MIN_DB_BYTES)
+            .next_power_of_two()
+    })
 }
 
 /// Apply the resolved limits to a `SystemConfig`. Separation from
@@ -2063,27 +2068,59 @@ fn store_full_error(current: u64, incoming: u64, cap: u64) -> anyhow::Error {
 /// Conservative row-size estimate for the pre-write check: the vector's floats,
 /// the row's text fields, and its serialized metadata, plus a small fixed
 /// overhead for engine bookkeeping.
-fn estimate_memory_write_bytes(vector_len: usize, payload: &MemoryPayload) -> u64 {
+fn estimate_memory_write_bytes(
+    vector_len: usize,
+    id: &str,
+    namespace: &str,
+    payload: &MemoryPayload,
+) -> u64 {
     const ROW_OVERHEAD_BYTES: u64 = 256;
     let vector = (vector_len as u64).saturating_mul(4);
+    let id = id.len() as u64;
+    let namespace = namespace.len() as u64;
     let content = payload.content.len() as u64;
+    let user_id = payload.user_id.len() as u64;
+    let memory_type = payload.memory_type.len() as u64;
+    let agent_name = payload
+        .agent_name
+        .as_deref()
+        .map_or(0, |name| name.len() as u64);
     let location = payload.location.len() as u64 + payload.location_lines.len() as u64;
     let metadata = serde_json::to_vec(&payload.metadata)
         .map(|bytes| bytes.len() as u64)
         .unwrap_or(0);
     vector
+        .saturating_add(id)
+        .saturating_add(namespace)
         .saturating_add(content)
+        .saturating_add(user_id)
+        .saturating_add(memory_type)
+        .saturating_add(agent_name)
         .saturating_add(location)
         .saturating_add(metadata)
         .saturating_add(ROW_OVERHEAD_BYTES)
 }
 
-fn estimate_action_write_bytes(writes: &[crate::rdf::action::StagedMemoryWrite]) -> u64 {
-    writes.iter().fold(0u64, |total, write| {
+fn estimate_action_write_bytes(
+    writes: &[crate::rdf::action::StagedMemoryWrite],
+    edge_deltas: &[crate::rdf::action::EdgeDelta],
+    namespace: &str,
+) -> u64 {
+    const EDGE_OVERHEAD_BYTES: u64 = 64;
+    let rows = writes.iter().fold(0u64, |total, write| {
         total.saturating_add(estimate_memory_write_bytes(
             write.vector.len(),
+            &write.id,
+            namespace,
             &write.payload,
         ))
+    });
+    edge_deltas.iter().fold(rows, |total, edge| {
+        total
+            .saturating_add(edge.source.len() as u64)
+            .saturating_add(edge.relation.len() as u64)
+            .saturating_add(edge.target.len() as u64)
+            .saturating_add(EDGE_OVERHEAD_BYTES)
     })
 }
 
@@ -4258,7 +4295,12 @@ fn open_in_mode(mode: ArmMode, request: &ArmRequest) -> Result<Database> {
             .unwrap_or_else(verifying_config),
         ArmMode::WalHeaderChecksums => wal_header_checksums_config_for(request.local_path),
         ArmMode::LenientTail => unverified_replay_config_for(request.local_path),
-        ArmMode::VerifiedReopen | ArmMode::QuarantineReopen => verifying_config(),
+        // The reopen must know the store's real current bytes, not 0: an
+        // over-cap store still has to open so it can be read and pruned, and
+        // a backstop sized from 0 would refuse it (#414 Fix 2A).
+        ArmMode::VerifiedReopen | ArmMode::QuarantineReopen => {
+            verifying_config_for(request.local_path)
+        }
     };
     Ok(Database::new(request.local_path, config)?)
 }
@@ -5798,9 +5840,34 @@ impl LadybugStore {
         T: Send + 'static,
         F: Fn(&Connection) -> Result<T> + Clone + Send + 'static,
     {
+        self.write_with_deadline_within_cap(what, None, f).await
+    }
+
+    /// [`Self::write_with_deadline`] with the `max_db_bytes` admission check
+    /// taken inside the *same* exclusive writer turn as the write itself.
+    ///
+    /// Checking before the turn (as a plain pre-flight does) lets two
+    /// concurrent writers each observe the same headroom and both proceed,
+    /// overshooting the cap (#414 Fix 2B). Here the second writer cannot read
+    /// the store's size until the first writer's turn is released, so the
+    /// serialized check sees the bytes the first write left behind.
+    async fn write_with_deadline_within_cap<T, F>(
+        &self,
+        what: &'static str,
+        incoming_bytes: Option<u64>,
+        f: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Fn(&Connection) -> Result<T> + Clone + Send + 'static,
+    {
         let write_lock = Arc::clone(&self.write_lock);
         let db = self.db.clone();
         let latch = self.checkpoints.clone();
+        let local_path = self.local_path.clone();
+        let max_db_bytes = self.max_db_bytes;
+        let cap_refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refused_flag = Arc::clone(&cap_refused);
 
         let outcome = bounded(what, write_timeout(), async move {
             // One writer at a time, because the engine refuses the second
@@ -5810,6 +5877,17 @@ impl LadybugStore {
             // while merely waiting for the turn leaks nothing -- no statement
             // has been started yet.
             let mut turn = write_lock.lock_owned().await;
+
+            // The authoritative cap check: this turn is exclusive, so the
+            // current bytes cannot change between the check and the write
+            // below because of another writer of this process.
+            if let Some(incoming) = incoming_bytes {
+                let current = current_store_bytes_at(&local_path);
+                if would_exceed_cap(current, incoming, max_db_bytes) {
+                    refused_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(store_full_error(current, incoming, max_db_bytes));
+                }
+            }
 
             // The turn orders our own writers; the background checkpoint and
             // any other process are outside it, so a refusal can still arrive.
@@ -5837,7 +5915,8 @@ impl LadybugStore {
         })
         .await;
 
-        if outcome.is_err() {
+        let refused = cap_refused.load(std::sync::atomic::Ordering::Relaxed);
+        if outcome.is_err() && !refused {
             WRITES_ABANDONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             eprintln!(
                 "DIAGNOSTIC: gave up waiting on {} -- engine: {}",
@@ -5848,8 +5927,11 @@ impl LadybugStore {
 
         // Marked whatever the outcome: a write that timed out may still land,
         // and an unnecessary checkpoint attempt costs nothing next to a write
-        // that never reaches disk.
-        self.dirty.mark();
+        // that never reaches disk. A cap refusal is the one exception: nothing
+        // entered the engine, so nothing needs a checkpoint.
+        if !refused {
+            self.dirty.mark();
+        }
         outcome
     }
 
@@ -10836,8 +10918,11 @@ impl VectorStore for LadybugStore {
             anyhow::bail!("namespace must be non-empty");
         }
         // #414: refuse before any engine write when this row would carry the
-        // store past max_db_bytes, so a refused upsert lands nothing.
-        self.ensure_store_has_room(estimate_memory_write_bytes(vector.len(), &payload))?;
+        // store past max_db_bytes, so a refused upsert lands nothing. This
+        // early check is advisory; the authoritative one runs inside the
+        // writer turn below (Fix 2B).
+        let incoming_bytes = estimate_memory_write_bytes(vector.len(), id, &namespace, &payload);
+        self.ensure_store_has_room(incoming_bytes)?;
         // First-write race guard: on a pristine store, refuse the first
         // write if the configured model changed since this process
         // recorded the store's descriptor (a setup pick landed while the
@@ -11192,7 +11277,8 @@ impl VectorStore for LadybugStore {
                 );
             }
         }
-        let outcome = self.write_with_deadline("writing a memory", move |conn| {
+        let outcome =
+            self.write_with_deadline_within_cap("writing a memory", Some(incoming_bytes), move |conn| {
 
             let safe_id = escape_ladybug_string(&id);
             let safe_ns = escape_ladybug_string(&namespace);
@@ -18083,6 +18169,47 @@ eurostrata\src\daemon.rs",
         assert!(would_exceed_cap(200, 1, 150), "already over the cap");
     }
 
+    /// #414 Fix 2D: the estimate is a refusal guarantee, so every field the
+    /// row persists (including the id/namespace columns and the edge strings)
+    /// has to count. Under-counting lets a write through the cap check and
+    /// only then past the cap.
+    #[test]
+    fn estimates_count_every_persisted_field_and_edge() {
+        use crate::rdf::action::{EdgeDelta, EdgeMutationOp, StagedMemoryWrite};
+
+        let payload = retired_test_payload("fact", "agent", json!({}));
+        let base = estimate_memory_write_bytes(4, "id", "ns", &payload);
+        let mut wide = payload.clone();
+        wide.user_id = "u".repeat(1000);
+        wide.agent_name = Some("a".repeat(1000));
+        wide.memory_type = "m".repeat(1000);
+        let wide_estimate =
+            estimate_memory_write_bytes(4, &"i".repeat(1000), &"n".repeat(1000), &wide);
+        assert!(
+            wide_estimate >= base + 4900,
+            "id, namespace, user_id, agent_name, and memory_type must count: {base} -> {wide_estimate}"
+        );
+
+        let write = StagedMemoryWrite {
+            id: "edge-owner".to_string(),
+            vector: vec![0.0; 4],
+            payload,
+        };
+        let without_edges = estimate_action_write_bytes(std::slice::from_ref(&write), &[], "ns");
+        let edge = EdgeDelta {
+            source: "s".repeat(1000),
+            relation: "r".repeat(1000),
+            target: "t".repeat(1000),
+            existed_before: false,
+            op: EdgeMutationOp::EnsurePresent,
+        };
+        let with_edge = estimate_action_write_bytes(std::slice::from_ref(&write), &[edge], "ns");
+        assert!(
+            with_edge >= without_edges + 3000,
+            "edge source, relation, and target must count: {without_edges} -> {with_edge}"
+        );
+    }
+
     /// Two layers: the engine gets `cap.max(current)` so an over-cap store
     /// still opens, while a cap of 0 leaves the engine's own default alone.
     #[test]
@@ -18107,6 +18234,11 @@ eurostrata\src\daemon.rs",
             size_cap_backstop(1024, 4096),
             Some(ENGINE_MIN_DB_BYTES),
             "the engine refuses max_db_size below 8 MiB"
+        );
+        assert_eq!(
+            size_cap_backstop(16 * MIB, 20 * MIB + 1),
+            Some(32 * MIB),
+            "the engine requires a power of two, so a real over-cap byte count rounds up"
         );
     }
 
@@ -18260,6 +18392,223 @@ eurostrata\src\daemon.rs",
         assert!(
             store.get("probe", "seed-row").await.unwrap().is_some(),
             "an over-cap store must still serve reads"
+        );
+    }
+
+    /// #414 Fix 2A: WAL recovery must finish on an over-cap store. The
+    /// verified-reopen arm builds its size-cap backstop from the store's real
+    /// current bytes; a backstop sized from 0 stays at the engine's 8 MiB
+    /// floor, which is below this fixture's database, and the reopen is
+    /// refused.
+    #[tokio::test]
+    async fn an_over_cap_store_recovers_its_wal_and_verified_reopens() {
+        use crate::traits::VectorStore;
+
+        let _env_guard = WAL_ENV_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("over-cap-recovery.lbug");
+
+        let creator_limits = StoreLimits {
+            buffer_pool_bytes: 512 * 1024 * 1024,
+            max_db_bytes: 0,
+        };
+        let creator_cfg = engine_config_for(creator_limits, current_store_bytes_at(&db));
+        let creator =
+            LadybugStore::with_system_config_and_limits(&db, 8, creator_cfg, creator_limits)
+                .expect("open the seed store");
+        creator.init("probe").await.expect("init");
+        // Several incompressible rows rather than one huge one: enough
+        // on-disk bytes to clear the engine's 8 MiB floor without asking a
+        // single statement for an outsized buffer-pool allocation.
+        for index in 0..24u64 {
+            let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ index;
+            let body: String = (0..1024 * 1024)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    const ALPHABET: &[u8] =
+                        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
+                    ALPHABET[(seed as usize) % ALPHABET.len()] as char
+                })
+                .collect();
+            creator
+                .upsert(
+                    "probe",
+                    &format!("big-row-{index}"),
+                    vec![0.0; 8],
+                    retired_test_payload("fact", "agent", json!({ "body": body })),
+                )
+                .await
+                .expect("write the rows that put the store above the engine minimum");
+        }
+        drop(creator);
+        assert!(
+            current_store_bytes_at(&db) > ENGINE_MIN_DB_BYTES,
+            "the fixture must exceed the engine's 8 MiB floor, got {}",
+            current_store_bytes_at(&db)
+        );
+
+        plant_recoverable_wal_with_corrupted_tail(&db, 2);
+
+        let previous_wal = allow_unverified_wal_recovery();
+        let previous_cap = std::env::var("NEUROSTRATA_MAX_DB_BYTES").ok();
+        std::env::set_var(
+            "NEUROSTRATA_MAX_DB_BYTES",
+            (ENGINE_MIN_DB_BYTES / 2).to_string(),
+        );
+
+        let reopen_limits = StoreLimits {
+            buffer_pool_bytes: 512 * 1024 * 1024,
+            max_db_bytes: 0,
+        };
+        let reopen_cfg = engine_config_for(reopen_limits, current_store_bytes_at(&db));
+        let store = LadybugStore::with_system_config_and_limits(&db, 8, reopen_cfg, reopen_limits)
+            .expect("an over-cap store must recover its WAL and reopen verified");
+        assert_eq!(
+            store.open_provenance(),
+            OpenProvenance::UnverifiedWalReplay,
+            "the corrupted tail recovers through the unverified replay arm"
+        );
+        let recovered: i64 = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (m:Memory) WHERE m.id STARTS WITH 'wal-only-' RETURN count(m);",
+                )?;
+                match rows.next() {
+                    Some(row) => match row.first() {
+                        Some(lbug::Value::Int64(n)) => Ok(*n),
+                        other => anyhow::bail!("unexpected count cell: {other:?}"),
+                    },
+                    None => Ok(0),
+                }
+            })
+            .await
+            .expect("count recovered rows");
+        assert_eq!(recovered, 2, "the committed WAL rows must be recovered");
+        drop(store);
+
+        match previous_cap {
+            Some(value) => std::env::set_var("NEUROSTRATA_MAX_DB_BYTES", value),
+            None => std::env::remove_var("NEUROSTRATA_MAX_DB_BYTES"),
+        }
+        restore_wal_env(previous_wal);
+    }
+
+    /// #414 Fix 2B: the cap admission shares the writer turn with the write.
+    /// Two writers started together each fit alone; without the serialized
+    /// check both observe the same headroom and both land, overshooting the
+    /// cap. With it, the second writer sees the first one's bytes and is
+    /// refused.
+    #[tokio::test]
+    async fn concurrent_writers_cannot_both_pass_the_cap() {
+        use crate::traits::VectorStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("concurrent.db");
+        let seed = capped_test_store(&path, 0).await;
+        seed.upsert(
+            "probe",
+            "seed-row",
+            vec![0.0; 4],
+            retired_test_payload("fact", "agent", json!({})),
+        )
+        .await
+        .expect("uncapped seed write");
+        drop(seed);
+
+        // Room for one of the two rows below, not both.
+        let cap = current_store_bytes_at(&path) + 80 * 1024;
+        let store = capped_test_store(&path, cap).await;
+
+        let first = store.upsert(
+            "probe",
+            "concurrent-a",
+            vec![0.0; 4],
+            retired_test_payload("fact", "agent", json!({"body": "a".repeat(64 * 1024)})),
+        );
+        let second = store.upsert(
+            "probe",
+            "concurrent-b",
+            vec![0.0; 4],
+            retired_test_payload("fact", "agent", json!({"body": "b".repeat(64 * 1024)})),
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        let results = [first, second];
+        let admitted = results.iter().filter(|result| result.is_ok()).count();
+        let refused = results
+            .iter()
+            .filter(|result| {
+                result
+                    .as_ref()
+                    .err()
+                    .map(|e| e.to_string().contains("STORE_FULL"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            admitted, 1,
+            "exactly one concurrent writer may pass the cap"
+        );
+        assert_eq!(
+            refused, 1,
+            "the second writer must see the first writer's bytes and refuse"
+        );
+
+        let rows = [
+            store.get("probe", "concurrent-a").await.unwrap().is_some(),
+            store.get("probe", "concurrent-b").await.unwrap().is_some(),
+        ];
+        assert_eq!(
+            rows.iter().filter(|present| **present).count(),
+            1,
+            "only the admitted row may persist: {rows:?}"
+        );
+    }
+
+    /// #414 Fix 2E: a real write admitted under a configured cap must land.
+    /// The refusal tests alone would also pass a store that refused
+    /// everything, so pin the success side end to end.
+    #[tokio::test]
+    async fn a_write_within_the_cap_succeeds_and_persists() {
+        use crate::traits::VectorStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("admitted.db");
+        let seed = capped_test_store(&path, 0).await;
+        seed.upsert(
+            "probe",
+            "seed-row",
+            vec![0.0; 4],
+            retired_test_payload("fact", "agent", json!({})),
+        )
+        .await
+        .expect("uncapped seed write");
+        drop(seed);
+
+        let cap = current_store_bytes_at(&path) + 256 * 1024;
+        let store = capped_test_store(&path, cap).await;
+
+        store
+            .upsert(
+                "probe",
+                "admitted-row",
+                vec![0.5; 4],
+                retired_test_payload("fact", "agent", json!({"note": "fits under the cap"})),
+            )
+            .await
+            .expect("a write inside the configured cap must be admitted");
+
+        let row = store
+            .get("probe", "admitted-row")
+            .await
+            .unwrap()
+            .expect("the admitted row must persist");
+        assert_eq!(row.1.memory_type, "fact");
+        assert!(
+            store.current_store_bytes() <= cap,
+            "the admitted write left the store above its cap"
         );
     }
 
@@ -36529,9 +36878,9 @@ impl LadybugStore {
                 "namespace must be non-empty".to_string(),
             ));
         }
-        // #414: the batch is judged as one write, before any transaction opens.
-        self.ensure_store_has_room(estimate_action_write_bytes(&batch.writes))
-            .map_err(|e| ActionError::Storage(e.to_string()))?;
+        // #414: the batch is judged as one write. The authoritative check runs
+        // inside the writer turn below (Fix 2B); this path used to check here,
+        // before the turn, where two writers could both see the same headroom.
         self.guard_first_write()
             .map_err(|e| ActionError::Storage(e.to_string()))?;
         self.check_data_bearing_identity()
@@ -36571,9 +36920,13 @@ impl LadybugStore {
         let expected_heads = batch.expected_heads;
         let writes = batch.writes;
         let edge_deltas = batch.edge_deltas;
+        let incoming_bytes = estimate_action_write_bytes(&writes, &edge_deltas, &ns);
 
         let tx_outcome = self
-            .write_with_deadline("committing a kinetic action batch", move |conn| {
+            .write_with_deadline_within_cap(
+                "committing a kinetic action batch",
+                Some(incoming_bytes),
+                move |conn| {
                 conn.query("BEGIN TRANSACTION")?;
 
                 let inner: std::result::Result<(), ActionError> = (|| {

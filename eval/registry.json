@@ -368,7 +368,7 @@
         "store::ladybug::checkpoint_latch_tests::a_successful_checkpoint_after_the_latch_reenables_the_engine",
         "store::ladybug::checkpoint_latch_tests::a_repeated_out_of_pool_failure_keeps_the_latch",
         "store::ladybug::checkpoint_latch_tests::a_clean_close_after_the_re_enable_leaves_no_write_ahead_log",
-        "store::ladybug::buffer_pool_tests::a_checkpoint_out_of_pool_is_not_retried"
+        "store::ladybug::checkpoint_latch_tests::a_checkpoint_out_of_pool_is_not_retried"
       ],
       "thresholds": {
         "ignored": 0,
@@ -598,7 +598,11 @@
         "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_write_that_would_pass_the_cap_is_refused_and_lands_nothing -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_oversized_single_payload_is_refused_before_the_engine_write -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_action_batch_that_would_pass_the_cap_lands_nothing -- --test-threads=1",
-        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_over_cap_store_still_opens_and_reads -- --test-threads=1"
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_over_cap_store_still_opens_and_reads -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_over_cap_store_recovers_its_wal_and_verified_reopens -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::concurrent_writers_cannot_both_pass_the_cap -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_write_within_the_cap_succeeds_and_persists -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::estimates_count_every_persisted_field_and_edge -- --test-threads=1"
       ],
       "tests": [
         "config::tests::store_limits_parse_from_json",
@@ -612,7 +616,11 @@
         "store::ladybug::tests::a_write_that_would_pass_the_cap_is_refused_and_lands_nothing",
         "store::ladybug::tests::an_oversized_single_payload_is_refused_before_the_engine_write",
         "store::ladybug::tests::an_action_batch_that_would_pass_the_cap_lands_nothing",
-        "store::ladybug::tests::an_over_cap_store_still_opens_and_reads"
+        "store::ladybug::tests::an_over_cap_store_still_opens_and_reads",
+        "store::ladybug::tests::an_over_cap_store_recovers_its_wal_and_verified_reopens",
+        "store::ladybug::tests::concurrent_writers_cannot_both_pass_the_cap",
+        "store::ladybug::tests::a_write_within_the_cap_succeeds_and_persists",
+        "store::ladybug::tests::estimates_count_every_persisted_field_and_edge"
       ],
       "thresholds": {
         "ignored": 0
