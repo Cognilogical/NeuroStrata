@@ -249,57 +249,94 @@ fn oxiri_pin_matches_the_spareval_dependency_edge() {
     let lock = cargo_lock();
     let packages = lock_packages(&lock);
 
-    let spareval = packages
-        .iter()
-        .find(|package| package_name(package) == SPAREVAL)
-        .unwrap_or_else(|| panic!("Cargo.lock has no {SPAREVAL} package"));
-    let spareval_version = package_version(spareval).to_owned();
-
-    let dependencies = spareval
-        .get("dependencies")
-        .and_then(|value| value.as_array())
-        .unwrap_or_else(|| panic!("{SPAREVAL} {spareval_version} has no dependencies array"));
-    let edge = dependencies
-        .iter()
-        .filter_map(|dependency| dependency.as_str())
-        .find(|dependency| *dependency == OXIRI || dependency.starts_with("oxiri "))
-        .unwrap_or_else(|| panic!("{SPAREVAL} {spareval_version} has no {OXIRI} dependency edge"));
-
-    let edge_version = if edge == OXIRI {
-        let mut versions: Vec<&str> = packages
-            .iter()
-            .filter(|package| package_name(package) == OXIRI)
-            .map(package_version)
-            .collect();
-        versions.sort_unstable();
-        assert_eq!(
-            versions.len(),
-            1,
-            "Cargo.lock has an unversioned {OXIRI} edge from {SPAREVAL} but {} {OXIRI} packages: {versions:?}",
-            versions.len()
-        );
-        versions[0].to_owned()
-    } else {
-        edge.trim_start_matches(OXIRI).trim().to_owned()
-    };
-    let edge_parsed = Version::parse(&edge_version);
-
-    assert!(
-        packages
-            .iter()
-            .any(|package| package_name(package) == OXIRI && package_version(package) == edge_version),
-        "{SPAREVAL} {spareval_version} names {OXIRI} {edge_version}, but Cargo.lock has no such {OXIRI} package"
-    );
-
     let requirement = root_oxiri_requirement();
     let pin_band = requirement_band(&requirement);
-    let edge_band = (edge_parsed.major, edge_parsed.minor);
+
+    // Duplicate oxiri packages are a split only within the pinned band.
+    // A different band legitimately coexists through the separate rudof_*
+    // graph (decision record section 2), so duplicates are counted per band.
+    let pinned_band_packages: Vec<&str> = packages
+        .iter()
+        .filter(|package| package_name(package) == OXIRI)
+        .map(package_version)
+        .filter(|version| {
+            let parsed = Version::parse(version);
+            (parsed.major, parsed.minor) == pin_band
+        })
+        .collect();
     assert_eq!(
-        edge_band, pin_band,
-        "{SPAREVAL} {spareval_version} depends on {OXIRI} {edge_version} (band {}.{}), but Cargo.toml pins {OXIRI} = {requirement:?} (band {}.{}). \
-         The spareval edge moved out of the pinned band; update the root pin and this gate together before upgrading (#339).",
-        edge_band.0, edge_band.1, pin_band.0, pin_band.1
+        pinned_band_packages.len(),
+        1,
+        "Cargo.lock has {} {OXIRI} packages in the pinned band {}.{}: {pinned_band_packages:?}; \
+         exactly one is allowed — a second one is the duplicate-version split #339 blocks",
+        pinned_band_packages.len(),
+        pin_band.0,
+        pin_band.1
     );
+
+    // Inspect every spareval entry and every oxiri edge it declares, not
+    // just the first of each.
+    let sparevals: Vec<&toml::Value> = packages
+        .iter()
+        .filter(|package| package_name(package) == SPAREVAL)
+        .collect();
+    assert!(
+        !sparevals.is_empty(),
+        "Cargo.lock has no {SPAREVAL} package"
+    );
+
+    for spareval in sparevals {
+        let spareval_version = package_version(spareval).to_owned();
+        let dependencies = spareval
+            .get("dependencies")
+            .and_then(|value| value.as_array())
+            .unwrap_or_else(|| panic!("{SPAREVAL} {spareval_version} has no dependencies array"));
+        let edges: Vec<&str> = dependencies
+            .iter()
+            .filter_map(|dependency| dependency.as_str())
+            .filter(|dependency| *dependency == OXIRI || dependency.starts_with("oxiri "))
+            .collect();
+        assert!(
+            !edges.is_empty(),
+            "{SPAREVAL} {spareval_version} has no {OXIRI} dependency edge"
+        );
+
+        for edge in edges {
+            let edge_version = if edge == OXIRI {
+                let mut versions: Vec<&str> = packages
+                    .iter()
+                    .filter(|package| package_name(package) == OXIRI)
+                    .map(package_version)
+                    .collect();
+                versions.sort_unstable();
+                assert_eq!(
+                    versions.len(),
+                    1,
+                    "Cargo.lock has an unversioned {OXIRI} edge from {SPAREVAL} but {} {OXIRI} packages: {versions:?}",
+                    versions.len()
+                );
+                versions[0].to_owned()
+            } else {
+                edge.trim_start_matches(OXIRI).trim().to_owned()
+            };
+            let edge_parsed = Version::parse(&edge_version);
+
+            assert!(
+                packages.iter().any(|package| {
+                    package_name(package) == OXIRI && package_version(package) == edge_version
+                }),
+                "{SPAREVAL} {spareval_version} names {OXIRI} {edge_version}, but Cargo.lock has no such {OXIRI} package"
+            );
+
+            let edge_band = (edge_parsed.major, edge_parsed.minor);
+            assert_eq!(
+                edge_band, pin_band,
+                "{SPAREVAL} {spareval_version} depends on {OXIRI} {edge_version} (band {}.{}), but Cargo.toml pins {OXIRI} = {requirement:?} (band {}.{}). \
+                 The spareval edge moved out of the pinned band; update the root pin and this gate together before upgrading (#339).",
+                edge_band.0, edge_band.1, pin_band.0, pin_band.1
+            );
+        }
+    }
 }
 
 #[test]
