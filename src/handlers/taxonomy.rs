@@ -94,6 +94,7 @@ pub async fn tee_taxonomy_pulse_to_project_outbox(
         store,
         namespace,
         ts: chrono::Utc::now().timestamp(),
+        delivery: None,
     };
     let _ = sub.handle(pulse, &RecursionToken::root(), &ctx).await;
 }

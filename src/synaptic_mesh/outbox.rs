@@ -153,6 +153,15 @@ pub struct OutboxEntry {
     /// quarantined rather than auto-replayed at an unknown birth epoch.
     #[serde(default)]
     pub epoch: u32,
+    /// The ThalamicBus event-outbox sequence that produced this entry, when
+    /// the pulse arrived over the durable delivery path. `MeshOutbox` skips an
+    /// entry whose sequence is already pending, so a redelivery after a crash
+    /// between the capture and the bus offset write does not append a
+    /// duplicate. `#[serde(default)]` reads a WAL line written before this
+    /// field existed as `None` (no dedup basis, applied idempotently as
+    /// before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus_seq: Option<u64>,
 }
 
 /// Serialises `append` and `mark_committed` so a compaction can never lose an
@@ -415,6 +424,7 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
         }
     }
 

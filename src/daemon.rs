@@ -1,5 +1,8 @@
 use crate::config::{DedupProviderMode, DeduplicationConfig};
-use crate::events::{EpisodicPointerEcho, ExportFreshnessDirty, GuardEventLog, ThalamicBus};
+use crate::events::{
+    EpisodicPointerEcho, EventOutbox, ExportFreshnessDirty, GuardEventLog, OutboxConfig,
+    ThalamicBus,
+};
 use crate::judgment::DeduplicationChecker;
 use crate::traits::{Embedder, VectorStore};
 use axum::{
@@ -545,12 +548,32 @@ pub(crate) const BUS_CAPACITY: usize = 10_000;
 /// `project_root` anchors `EpisodicPointerEcho`'s buffer. The production
 /// caller is [`daemon_bus`], which resolves it from the environment rather
 /// than guessing from the process's directory; tests pass a scratch root.
+///
+/// The durable event outbox is opened from [`event_outbox_dir`] and attached
+/// here, before any subscriber registers, so startup replay is queued ahead of
+/// every live pulse. If it cannot open the bus still starts: audit and mesh
+/// events fall back to the lossy queue and the failure is logged at `ERROR`
+/// rather than taking the daemon down.
 pub(crate) fn build_thalamic_bus(
     vector_store: Arc<dyn VectorStore>,
     dimensions: usize,
     project_root: impl Into<PathBuf>,
 ) -> Arc<ThalamicBus> {
-    let bus = Arc::new(ThalamicBus::new(BUS_CAPACITY));
+    let outbox_dir = event_outbox_dir();
+    let bus = match EventOutbox::open(&outbox_dir) {
+        Ok(outbox) => Arc::new(ThalamicBus::with_outbox(
+            BUS_CAPACITY,
+            outbox,
+            OutboxConfig::default(),
+        )),
+        Err(err) => {
+            tracing::error!(
+                "event outbox could not open at {}: {err}; audit and mesh events stay on the lossy bounded queue",
+                outbox_dir.display()
+            );
+            Arc::new(ThalamicBus::new(BUS_CAPACITY))
+        }
+    };
     bus.attach_store(vector_store);
     bus.register(Box::new(EpisodicPointerEcho::new(project_root)));
     bus.register(Box::new(ExportFreshnessDirty::new(dimensions)));
@@ -559,6 +582,46 @@ pub(crate) fn build_thalamic_bus(
         crate::events::subscribers::PostIngestNormalize::new(),
     ));
     bus
+}
+
+/// Env var naming the event outbox directory.
+const EVENT_OUTBOX_DIR_ENV: &str = "NEUROSTRATA_EVENT_OUTBOX_DIR";
+
+/// Where the durable event outbox lives: a sibling of the database, by
+/// default, so it shares the database's backup and retention story and is
+/// excluded from DB snapshots by construction (it is outside the DB file).
+/// `NEUROSTRATA_EVENT_OUTBOX_DIR` overrides it for operators and tests.
+///
+/// Under `cargo test` an unset variable yields a fresh process-scoped temp
+/// directory per bus, so a test binary never reads or writes the operator's
+/// real outbox and parallel tests cannot replay each other's entries.
+fn event_outbox_dir() -> PathBuf {
+    if let Ok(val) = std::env::var(EVENT_OUTBOX_DIR_ENV) {
+        if !val.trim().is_empty() {
+            return PathBuf::from(val);
+        }
+    }
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join(format!(
+            "neurostrata-test-event-outbox-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ))
+    }
+    #[cfg(not(test))]
+    {
+        if let Ok(config) = crate::config::Config::from_default_path() {
+            if let Some(parent) = config.db_path.parent() {
+                return parent.join("event-outbox");
+            }
+        }
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".config")
+            .join("neurostrata")
+            .join("event-outbox")
+    }
 }
 
 /// Env var naming the project the daemon serves.

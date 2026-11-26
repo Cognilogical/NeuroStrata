@@ -603,6 +603,37 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "event-outbox": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp events::outbox::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp events::bus::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp events::event::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp events::subscribers::mesh_outbox::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "events::outbox::tests::a_torn_tail_is_repaired_at_open",
+        "events::outbox::tests::an_invalid_utf8_line_is_skipped_at_open",
+        "events::outbox::tests::a_failed_append_rolls_back_the_partial_write",
+        "events::outbox::tests::a_failed_rollback_poisons_the_outbox",
+        "events::outbox::tests::compaction_runs_when_the_file_exceeds_the_configured_cap",
+        "events::outbox::tests::compaction_runs_when_over_half_the_entries_are_past_both_offsets",
+        "events::outbox::tests::the_sequence_base_never_restarts_at_one",
+        "events::bus::tests::audit_and_mesh_events_survive_overflow_and_crash",
+        "events::bus::tests::a_class_offset_advances_only_after_the_subscriber_returns",
+        "events::bus::tests::a_crash_between_the_effect_and_the_offset_redelivers",
+        "events::bus::tests::unreplayed_entries_are_replayed_at_startup",
+        "events::bus::tests::non_qualified_classes_stay_lossy_drop_oldest",
+        "events::bus::tests::a_mesh_append_failure_fails_the_operation",
+        "events::bus::tests::an_audit_append_failure_alerts_and_falls_back_to_the_queue",
+        "events::bus::tests::a_durable_pulse_carries_its_delivery_identity_to_the_subscriber",
+        "events::bus::tests::a_durable_emit_survives_a_full_queue",
+        "events::event::tests::every_variant_round_trips_through_its_tagged_wire_form",
+        "events::subscribers::mesh_outbox::tests::a_replayed_durable_delivery_does_not_append_a_duplicate_entry"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }

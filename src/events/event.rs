@@ -9,8 +9,13 @@
 /// `#[non_exhaustive]` because a new event kind should be an addition here and
 /// a matched-and-ignored arm everywhere, never a breaking change to every
 /// subscriber already written.
+/// `Serialize`/`Deserialize` because the durable outbox (`outbox.rs`) keeps a
+/// pulse on disk: the wire form is tagged by variant so an entry written by
+/// this build stays readable after a new variant is added, and a variant a
+/// reader does not know is a skipped line rather than a panic.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThalamicPulse {
     /// A memory was written for the first time. `kind` is its `memory_type`.
     ///
@@ -142,6 +147,43 @@ mod tests {
                 assert_eq!(namespace, "n");
             }
             _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn every_variant_round_trips_through_its_tagged_wire_form() {
+        let pulses = vec![
+            ThalamicPulse::Created {
+                id: "x".into(),
+                namespace: "n".into(),
+                kind: "task".into(),
+            },
+            ThalamicPulse::Superseded {
+                old_id: "a".into(),
+                new_id: "b".into(),
+                namespace: "n".into(),
+            },
+            ThalamicPulse::Archived {
+                id: "x".into(),
+                namespace: "n".into(),
+            },
+            ThalamicPulse::GuardedActionFired {
+                trace_id: "t".into(),
+                action_type: "shell".into(),
+                payload_hash: 7,
+                verdict: "deny".into(),
+                rule_ids_triggered: vec!["r1".into()],
+                namespace: "n".into(),
+            },
+        ];
+        for pulse in pulses {
+            let json = serde_json::to_string(&pulse).expect("a pulse serializes");
+            assert!(
+                json.contains("\"type\":"),
+                "the wire form is tagged by variant: {json}"
+            );
+            let back: ThalamicPulse = serde_json::from_str(&json).expect("a pulse deserializes");
+            assert_eq!(format!("{back:?}"), format!("{pulse:?}"));
         }
     }
 }

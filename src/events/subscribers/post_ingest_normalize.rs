@@ -161,6 +161,7 @@ mod tests {
             store: store_ref,
             namespace: "global",
             ts: 0,
+            delivery: None,
         };
         let token = RecursionToken::new();
 

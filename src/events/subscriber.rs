@@ -1,3 +1,4 @@
+use super::DurableDelivery;
 use super::ThalamicPulse;
 use crate::traits::VectorStore;
 use async_trait::async_trait;
@@ -110,6 +111,12 @@ pub struct SubscriberContext<'a> {
     pub store: &'a dyn VectorStore,
     pub namespace: &'a str,
     pub ts: i64,
+    /// Set when the invocation is a durable outbox delivery rather than a
+    /// live queue delivery: which class's acknowledgment it earns and at
+    /// which sequence. A consumer that can be redelivered (the mesh outbox)
+    /// keys its deduplication on this identity; every other subscriber sees
+    /// `None`.
+    pub delivery: Option<DurableDelivery>,
 }
 
 /// A consumer of thalamic pulses.
@@ -205,6 +212,15 @@ pub struct BusMetrics {
     /// Subscriber invocations that returned `Err` to the dispatcher: logged,
     /// counted, and never propagated to the caller of the storage write.
     pub subscriber_failures: u64,
+    /// Audit appends that failed at the durable outbox and fell back to the
+    /// ordinary bounded queue. A non-zero value means the audit trail is
+    /// temporarily lossy; the failure is also logged at `ERROR`.
+    pub audit_append_failures: u64,
+    /// Whether a durable event outbox is attached to this bus.
+    pub outbox_attached: bool,
+    /// Unacknowledged outbox entries replayed into the queue when the bus was
+    /// constructed. These are handled in addition to `events_emitted`.
+    pub outbox_replayed: u64,
 }
 
 #[cfg(test)]

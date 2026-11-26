@@ -105,6 +105,12 @@ On the daemon side, a task's stamped `worktree` is compared with the caller's ro
 
 All endpoints are served by the **neurostrata-mcp daemon** on `127.0.0.1:34343`. Tauri acts as a lightweight HTTP client; Cursor MCP integration proxies stdio JSON-RPC requests.
 
+### Durable event outbox
+
+`POST /bus/metrics` reports the thalamic bus counters. Two of them belong to the durable event outbox: `audit_append_failures` counts audit pulses whose outbox append failed and fell back to the bounded queue, and `outbox_replayed` counts unacknowledged entries replayed at startup; `outbox_attached` says whether the daemon is running with an outbox at all.
+
+The outbox gives **Audit** and **Mesh** pulses at-least-once delivery: a guard verdict and a shareable memory mutation are appended to `event-outbox.jsonl` beside the database (`NEUROSTRATA_EVENT_OUTBOX_DIR` overrides the directory) before they are dispatched, and `event-outbox.offsets.json` records each class's acknowledged high-water mark. A class offset advances only after the subscribers return, so a crash between a subscriber's effect and the offset write redelivers the entry on the next start; consumers absorb the duplicate by identity (the mesh outbox keys on the delivery sequence). Every other pulse class keeps the bus's bounded drop-oldest behavior. A mesh-publish append failure fails the memory operation rather than reporting a success the mesh never heard about; an audit append failure is logged at `ERROR`, counted in `audit_append_failures`, and degrades to ordinary queue delivery.
+
 At startup the daemon refreshes the harness plugin files in its startup root and in every configured project (the folder that holds the project's `.NeuroStrata` folder). Each harness keeps the namespace its own config already names, looked up in the folder itself first, then in its checkout and the main checkout; configs that disagree are left as they are. A harness with no config, or whose config cannot be read, gets its plugin files only, so the daemon never writes an empty or made-up namespace into a harness config (see `namespace resolve` in the CLI reference).
 
 `POST /mcp` follows JSON-RPC 2.0: a method the server does not implement gets error `-32601` (method not found) with the request's `id`, `ping` gets an empty result, and a notification (no `id`) gets `202 Accepted` with an empty body. For an unknown method, an explicit `"id": null` is a request id, not a notification: it receives the `-32601` response above with `"id": null`; only an omitted `id` suppresses the reply.

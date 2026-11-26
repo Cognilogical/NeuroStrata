@@ -1141,6 +1141,7 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
         }
     }
 
@@ -1335,6 +1336,7 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
         };
         outbox.append(&entry).unwrap();
 
@@ -1516,6 +1518,7 @@ mod tests {
             superseded_by: Some(new_id.to_string()),
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
         };
         outbox.append(&entry).unwrap();
 
@@ -1546,6 +1549,7 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
         };
         outbox.append(&entry).unwrap();
 
@@ -1646,6 +1650,7 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_100,
             epoch: 1,
+            bus_seq: None,
         };
         outbox.append(&archive).unwrap();
         drain_once(&outbox, &mesh, "node-author").unwrap();
@@ -1977,6 +1982,7 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_100,
             epoch: 1,
+            bus_seq: None,
         };
         outbox.append(&archive).unwrap();
         drain_once(&outbox, &mesh, "node-other").unwrap();
@@ -2036,6 +2042,7 @@ mod tests {
             superseded_by: Some(successor.to_string()),
             ts: 1_700_000_100,
             epoch: 2,
+            bus_seq: None,
         };
         outbox.append(&supersede).unwrap();
         drain_once(&outbox, &mesh, "node-author").unwrap();
@@ -2154,6 +2161,7 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_100,
             epoch: 2,
+            bus_seq: None,
         };
         outbox.append(&archive).unwrap();
         drain_once(&outbox, &mesh, "node-other").unwrap();
@@ -2664,6 +2672,7 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
         };
         outbox.append(&entry_a).unwrap();
         let rep_a = drain_once(&outbox, &mesh, "node-a").unwrap();
@@ -2684,6 +2693,7 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_100,
             epoch: 1,
+            bus_seq: None,
         };
         outbox.append(&entry_b).unwrap();
         let rep_b = drain_once(&outbox, &mesh, "node-b").unwrap();

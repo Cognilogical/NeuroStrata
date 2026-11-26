@@ -33,6 +33,10 @@ having looked at the wrong directory is worse than no run at all.
 | Incremental caches | Directories under `<repo>/target/debug/incremental` older than the cache threshold. |
 | Podman | Exited containers and dangling (`<none>`) image layers. |
 
+## The daemon's durable event outbox
+
+The daemon keeps the at-least-once event outbox in an `event-outbox/` directory beside the database (`~/.config/NeuroStrata/data/db/event-outbox/` by default; `NEUROSTRATA_EVENT_OUTBOX_DIR` overrides it). It holds `event-outbox.jsonl` (the append-only entries) and `event-outbox.offsets.json` (per-class acknowledgments). It is outside the database file, so it is not part of a database snapshot, and this script never deletes it: it is the replay source for audit and mesh events that had not been delivered when the daemon stopped. It compacts itself at startup — keeping only unacknowledged entries — once the entries file passes 8 MiB, so it does not grow without bound. Removing it by hand discards undelivered audit and mesh events; do that only when that loss is understood.
+
 In the **main checkout**, Cargo's dependency artifacts
 (`<repo>/target/debug/deps`) are deliberately left alone. Cargo owns that
 directory; deleting files from it turns the next build into a full rebuild

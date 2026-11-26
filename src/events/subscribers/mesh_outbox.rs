@@ -43,6 +43,15 @@ fn is_derived_metadata(meta: &JsonValue) -> bool {
         .unwrap_or(false)
 }
 
+/// The per-capture facts shared by every entry one pulse produces: the
+/// dispatcher's timestamp and the durable bus sequence being acknowledged
+/// (if this delivery came from the durable path).
+#[derive(Clone, Copy)]
+struct CaptureStamp {
+    ts: i64,
+    bus_seq: Option<u64>,
+}
+
 /// Tees shareable mutations into the outbox and wakes the worker.
 pub struct MeshOutbox {
     outbox: Outbox,
@@ -84,12 +93,38 @@ impl MemorySubscriber for MeshOutbox {
         _token: &RecursionToken,
         ctx: &SubscriberContext<'_>,
     ) -> Result<(), SubscriberError> {
+        // A durable delivery carries the bus outbox sequence that produced it.
+        // If this sequence is still pending in the mesh outbox, a previous
+        // attempt's append landed and only the bus offset write was lost: a
+        // replay must not append a second copy.
+        let bus_seq = ctx
+            .delivery
+            .filter(|delivery| delivery.class == crate::events::EventClass::Mesh)
+            .map(|delivery| delivery.seq);
+        let stamp = CaptureStamp {
+            ts: ctx.ts,
+            bus_seq,
+        };
+        if let Some(seq) = bus_seq {
+            let already_pending = self
+                .outbox
+                .pending()
+                .map_err(anyhow::Error::msg)?
+                .iter()
+                .any(|entry| entry.bus_seq == Some(seq));
+            if already_pending {
+                tracing::debug!(
+                    seq,
+                    "mesh outbox: skipping an already-captured durable delivery"
+                );
+                return Ok(());
+            }
+        }
         let mut entries: Vec<OutboxEntry> = Vec::new();
         match event {
             ThalamicPulse::Created { id, namespace, .. } => {
                 if let Some(payload) = self.read(ctx, namespace, id).await? {
-                    if let Some(entry) =
-                        self.entry(OP_CREATED, id, namespace, payload, None, ctx.ts)
+                    if let Some(entry) = self.entry(OP_CREATED, id, namespace, payload, None, stamp)
                     {
                         entries.push(entry);
                     }
@@ -110,14 +145,14 @@ impl MemorySubscriber for MeshOutbox {
                         namespace,
                         payload,
                         Some(new_id.clone()),
-                        ctx.ts,
+                        stamp,
                     ) {
                         entries.push(entry);
                     }
                 }
                 if let Some(payload) = self.read(ctx, namespace, new_id).await? {
                     if let Some(entry) =
-                        self.entry(OP_CREATED, new_id, namespace, payload, None, ctx.ts)
+                        self.entry(OP_CREATED, new_id, namespace, payload, None, stamp)
                     {
                         entries.push(entry);
                     }
@@ -126,7 +161,7 @@ impl MemorySubscriber for MeshOutbox {
             ThalamicPulse::Archived { id, namespace } => {
                 if let Some(payload) = self.read(ctx, namespace, id).await? {
                     if let Some(entry) =
-                        self.entry(OP_ARCHIVED, id, namespace, payload, None, ctx.ts)
+                        self.entry(OP_ARCHIVED, id, namespace, payload, None, stamp)
                     {
                         entries.push(entry);
                     }
@@ -173,7 +208,7 @@ impl MeshOutbox {
         namespace: &str,
         payload: MemoryPayload,
         superseded_by: Option<String>,
-        ts: i64,
+        stamp: CaptureStamp,
     ) -> Option<OutboxEntry> {
         // Structural rows are strictly local (spec §"Sharing boundary"),
         // mirroring the exclusion `server::set_metadata` applies: AST-ingest
@@ -211,8 +246,9 @@ impl MeshOutbox {
             content: payload.content,
             metadata: payload.metadata,
             superseded_by,
-            ts,
+            ts: stamp.ts,
             epoch: self.epoch,
+            bus_seq: stamp.bus_seq,
         })
     }
 }
@@ -626,6 +662,63 @@ mod tests {
         let outbox = outbox_dir_for(&dir);
         assert!(!outbox.starts_with(&dir));
     }
+
+    /// A durable delivery that is replayed (a crash between the capture and
+    /// the bus offset write) must not append a second copy: the entry already
+    /// pending under that bus sequence is the previous attempt's effect.
+    #[tokio::test]
+    async fn a_replayed_durable_delivery_does_not_append_a_duplicate_entry() {
+        use crate::events::outbox::{DurableDelivery, EventClass};
+
+        let dir = scratch("replay-dedup");
+        let outbox_dir = dir.join("mesh");
+        let store = LadybugStore::for_testing(dir.join("db.lbug"), TEST_DIMENSIONS)
+            .expect("open temp store");
+        store.init("ns").await.expect("ns table");
+        let sub =
+            MeshOutbox::new(outbox_dir.clone(), Arc::new(Notify::new()), 1).expect("outbox opens");
+
+        let id = uuid::Uuid::now_v7().to_string();
+        store
+            .upsert(
+                "ns",
+                &id,
+                vec![0.0; TEST_DIMENSIONS],
+                payload("rule", serde_json::json!({ "eligibility": "shareable" })),
+            )
+            .await
+            .unwrap();
+        let pulse = ThalamicPulse::Created {
+            id: id.clone(),
+            namespace: "ns".to_string(),
+            kind: "rule".to_string(),
+        };
+        let ctx = SubscriberContext {
+            store: &store,
+            namespace: "ns",
+            ts: 1,
+            delivery: Some(DurableDelivery {
+                class: EventClass::Mesh,
+                seq: 7,
+            }),
+        };
+
+        sub.handle(&pulse, &RecursionToken::new(), &ctx)
+            .await
+            .expect("first capture");
+        sub.handle(&pulse, &RecursionToken::new(), &ctx)
+            .await
+            .expect("replayed capture is a no-op");
+
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1, "the replay appends no duplicate");
+        assert_eq!(
+            pending[0].bus_seq,
+            Some(7),
+            "the entry records the sequence it was captured for"
+        );
+    }
 }
 
 impl MeshOutbox {
@@ -706,6 +799,9 @@ impl MeshOutbox {
                     superseded_by: None,
                     ts: chrono::Utc::now().timestamp(),
                     epoch,
+                    // Reconciliation is not a bus delivery: its idempotency
+                    // basis is the existing mesh file, not a sequence.
+                    bus_seq: None,
                 };
                 outbox.append(&entry).map_err(|e| format!("{}", e))?;
                 re_emitted += 1;

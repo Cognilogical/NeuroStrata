@@ -6,10 +6,24 @@
 //! dispatcher task walks the queue and invokes every registered subscriber in
 //! order, each under a 250ms timeout, each panic caught at the dispatcher join
 //! point. Nothing a subscriber does can reach back into the caller's write.
+//!
+//! ## Durable classes (Wave 3, step 1)
+//!
+//! A bus built with [`ThalamicBus::with_outbox`] qualifies two classes of
+//! pulse for at-least-once delivery: Audit (`GuardedActionFired`, consumed by
+//! `guard_event_log`) and Mesh (the three storage mutations, consumed by
+//! `mesh_outbox`). A qualified pulse is appended to the durable outbox
+//! (`outbox.rs`) before it is queued; a queued pulse carries its
+//! [`DurableDelivery`] identity into the subscriber's context, and the class
+//! offset advances only after every subscriber returned `Ok`. An unadvanced
+//! entry is replayed at the next start. Qualified pulses are exempt from
+//! drop-oldest (the outbox is their backstop); every other pulse keeps the
+//! original lossy behavior.
 
+use super::outbox::EventOutbox;
 use super::{
-    BackpressureEvent, BusMetrics, MemorySubscriber, RecursionToken, SubscriberContext,
-    ThalamicPulse,
+    BackpressureEvent, BusMetrics, DurableDelivery, EventClass, EventOutboxError, MemorySubscriber,
+    RecursionToken, SubscriberContext, ThalamicPulse,
 };
 use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult, VectorStore};
 use anyhow::anyhow;
@@ -43,6 +57,10 @@ struct AtomicMetrics {
     subscriber_timeouts: AtomicU64,
     recursion_blocks: AtomicU64,
     subscriber_failures: AtomicU64,
+    /// Audit appends that failed and fell back to the lossy queue.
+    audit_append_failures: AtomicU64,
+    /// Unacknowledged entries replayed into the queue at construction.
+    outbox_replayed: AtomicU64,
 }
 
 /// The daemon's store, once attached. Until then the dispatcher substitutes an
@@ -154,6 +172,14 @@ impl crate::traits::AsAny for StoreNotAttached {
     }
 }
 
+/// One queued pulse, plus the durable identity it will acknowledge when (and
+/// only when) every subscriber returns `Ok`. `None` is an ordinary lossy
+/// pulse.
+struct QueuedPulse {
+    event: ThalamicPulse,
+    delivery: Option<DurableDelivery>,
+}
+
 /// The bounded pulse queue.
 ///
 /// A `VecDeque` under a plain `std::sync::Mutex` rather than an mpsc channel,
@@ -171,24 +197,30 @@ impl crate::traits::AsAny for StoreNotAttached {
 /// dispatcher is not parked, so a push that lands between the dispatcher's
 /// failed pop and its `notified().await` is never lost.
 struct Queue {
-    items: Mutex<VecDeque<ThalamicPulse>>,
+    items: Mutex<VecDeque<QueuedPulse>>,
     notify: Notify,
 }
 
 impl Queue {
-    /// Push one pulse, trimming the oldest when the push puts the queue over
-    /// `capacity`. Returns whether a pulse was evicted: at capacity 0 the
-    /// pulse just pushed is also the oldest, and goes. The caller counts an
-    /// eviction as a drop.
-    fn push(&self, event: ThalamicPulse, capacity: usize) -> bool {
+    /// Push one pulse, trimming the oldest lossy pulse when the lossy part of
+    /// the queue is over `capacity`. Durable pulses are exempt from the bound:
+    /// the outbox already holds them, and dropping one from the queue would
+    /// defer its delivery to the next start for no reason. Returns whether a
+    /// pulse was evicted: at capacity 0 the pulse just pushed (if lossy) is
+    /// also the oldest, and goes. The caller counts an eviction as a drop.
+    fn push(&self, pulse: QueuedPulse, capacity: usize) -> bool {
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        items.push_back(event);
-        let evicted = if items.len() > capacity {
-            items.pop_front();
-            true
-        } else {
-            false
-        };
+        items.push_back(pulse);
+        let mut evicted = false;
+        while items.len() > capacity {
+            let Some(pos) = items.iter().position(|queued| queued.delivery.is_none()) else {
+                // Only durable pulses remain: they may exceed the lossy
+                // bound until the dispatcher drains them.
+                break;
+            };
+            items.remove(pos);
+            evicted = true;
+        }
         // Release before waking: the waker only needs the edge, and it takes
         // the lock itself to pop.
         drop(items);
@@ -196,7 +228,7 @@ impl Queue {
         evicted
     }
 
-    fn pop(&self) -> Option<ThalamicPulse> {
+    fn pop(&self) -> Option<QueuedPulse> {
         self.items
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -205,6 +237,24 @@ impl Queue {
 
     fn len(&self) -> usize {
         self.items.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+/// Tunables for the durable delivery path.
+#[derive(Debug, Clone, Copy)]
+pub struct OutboxConfig {
+    /// Upper bound on unacknowledged entries replayed into the queue at
+    /// construction, per class. Anything past it stays durable and replays on
+    /// a later start; the cap exists so an unexpectedly large outbox cannot
+    /// balloon startup memory in one go.
+    pub replay_limit: usize,
+}
+
+impl Default for OutboxConfig {
+    fn default() -> Self {
+        Self {
+            replay_limit: usize::MAX,
+        }
     }
 }
 
@@ -219,6 +269,14 @@ pub struct ThalamicBus {
     /// Stated capacity, kept so `emit` can trim without a second lookup.
     capacity: usize,
     store: Arc<OnceLock<Arc<dyn VectorStore>>>,
+    /// The durable event outbox, when one was attached at construction.
+    /// `None` is the bus every non-daemon consumer runs: bounded queue
+    /// semantics exactly as before.
+    outbox: Option<Arc<EventOutbox>>,
+    /// Wakes a dispatcher holding a durable entry whose class has no
+    /// subscriber yet, so registration is observed immediately instead of
+    /// polled for.
+    subs_notify: Arc<Notify>,
 }
 
 impl ThalamicBus {
@@ -229,6 +287,46 @@ impl ThalamicBus {
     /// and then drop oldest at capacity, exactly as they would with a
     /// dispatcher that died.
     pub fn new(capacity: usize) -> Self {
+        let bus = Self::assemble(capacity, None);
+        bus.start_dispatcher();
+        bus
+    }
+
+    /// Construct a bus whose Audit and Mesh pulses are durable: every
+    /// qualified pulse is appended to `outbox` before it is queued, and its
+    /// class offset advances only after the subscribers return `Ok`.
+    ///
+    /// The queue is seeded with whatever a previous run left unacknowledged --
+    /// `pending(Audit)` in sequence order, then `pending(Mesh)` -- *before* the
+    /// dispatcher starts, so replay is ahead of every live pulse and a replayed
+    /// entry keeps its original place in the class's sequence.
+    pub fn with_outbox(capacity: usize, outbox: EventOutbox, config: OutboxConfig) -> Self {
+        let outbox = Arc::new(outbox);
+        let bus = Self::assemble(capacity, Some(outbox.clone()));
+        let mut replayed = 0u64;
+        for class in EventClass::all() {
+            for entry in outbox.pending(class).into_iter().take(config.replay_limit) {
+                bus.queue.push(
+                    QueuedPulse {
+                        event: entry.pulse,
+                        delivery: Some(DurableDelivery {
+                            class,
+                            seq: entry.seq,
+                        }),
+                    },
+                    capacity,
+                );
+                replayed += 1;
+            }
+        }
+        bus.metrics
+            .outbox_replayed
+            .fetch_add(replayed, Ordering::Relaxed);
+        bus.start_dispatcher();
+        bus
+    }
+
+    fn assemble(capacity: usize, outbox: Option<Arc<EventOutbox>>) -> Self {
         // `Idle` is the seed: a consumer that reads before the first event
         // must not mistake a zero-count drop for real backpressure.
         let (bp_tx, _) = watch::channel(BackpressureEvent::Idle);
@@ -239,22 +337,6 @@ impl ThalamicBus {
         let subs: Arc<Mutex<Vec<Arc<dyn MemorySubscriber>>>> = Arc::new(Mutex::new(Vec::new()));
         let metrics = Arc::new(AtomicMetrics::default());
         let store = Arc::new(OnceLock::<Arc<dyn VectorStore>>::new());
-
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(dispatch(
-                    queue.clone(),
-                    subs.clone(),
-                    metrics.clone(),
-                    bp_tx.clone(),
-                    store.clone(),
-                ));
-            }
-            Err(_) => tracing::warn!(
-                "ThalamicBus constructed outside a Tokio runtime; no dispatcher started, emitted pulses will queue and then drop oldest at capacity"
-            ),
-        }
-
         Self {
             queue,
             subs,
@@ -262,6 +344,93 @@ impl ThalamicBus {
             bp_tx,
             capacity,
             store,
+            outbox,
+            subs_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn start_dispatcher(&self) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(dispatch(
+                    self.queue.clone(),
+                    self.subs.clone(),
+                    self.metrics.clone(),
+                    self.bp_tx.clone(),
+                    self.store.clone(),
+                    self.outbox.clone(),
+                    self.subs_notify.clone(),
+                ));
+            }
+            Err(_) => tracing::warn!(
+                "ThalamicBus constructed outside a Tokio runtime; no dispatcher started, emitted pulses will queue and then drop oldest at capacity"
+            ),
+        }
+    }
+
+    /// The attached outbox, if any. Tests use it to observe the durable state
+    /// the bus shares with them.
+    #[cfg(test)]
+    pub fn outbox(&self) -> Option<Arc<EventOutbox>> {
+        self.outbox.clone()
+    }
+
+    /// The classes `event` is durability-qualified for *right now*: a class
+    /// qualifies iff an outbox is attached, its named subscriber is
+    /// registered, and the class is interested in the pulse. Follows the
+    /// subscription registry -- never a hardcoded list of event kinds.
+    fn qualified_classes(&self, event: &ThalamicPulse) -> Vec<EventClass> {
+        if self.outbox.is_none() {
+            return Vec::new();
+        }
+        let subs = self.subs.lock().unwrap_or_else(|e| e.into_inner());
+        EventClass::all()
+            .into_iter()
+            .filter(|class| {
+                class.interested_in(event)
+                    && subs
+                        .iter()
+                        .any(|sub| EventClass::class_of_subscriber(sub.name()) == Some(*class))
+            })
+            .collect()
+    }
+
+    /// Durably append `event` for the class it qualifies for, before queue
+    /// dispatch. An Audit append failure is counted and logged here and the
+    /// pulse falls back to the ordinary queue (the guarded operation already
+    /// happened; its audit record cannot fail it retroactively). A Mesh
+    /// append failure is returned: the caller that must fail its operation
+    /// uses [`ThalamicBus::emit_checked`].
+    fn append_qualified(
+        &self,
+        event: &ThalamicPulse,
+    ) -> Result<Option<DurableDelivery>, EventOutboxError> {
+        let Some(outbox) = self.outbox.as_ref() else {
+            return Ok(None);
+        };
+        let mut mesh_error = None;
+        for class in self.qualified_classes(event) {
+            match outbox.append(class, event) {
+                Ok(seq) => return Ok(Some(DurableDelivery { class, seq })),
+                Err(err) => match class {
+                    EventClass::Audit => {
+                        self.metrics
+                            .audit_append_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            "durable audit append failed; the pulse falls back to the lossy queue: {err}"
+                        );
+                    }
+                    EventClass::Mesh => {
+                        tracing::error!("durable mesh append failed: {err}");
+                        mesh_error = Some(err);
+                    }
+                },
+            }
+        }
+        match mesh_error {
+            Some(err) => Err(err),
+            None => Ok(None),
         }
     }
 
@@ -280,28 +449,84 @@ impl ThalamicBus {
     pub fn register(&self, sub: Box<dyn MemorySubscriber>) -> SubscriberId {
         let mut subs = self.subs.lock().unwrap_or_else(|e| e.into_inner());
         subs.push(Arc::from(sub));
-        subs.len() - 1
+        let id = subs.len() - 1;
+        drop(subs);
+        // A durable entry whose class was not yet registered may be held by
+        // the dispatcher; wake it now rather than making it wait out its
+        // bounded sleep.
+        self.subs_notify.notify_one();
+        id
     }
 
     /// Publish one pulse. Never blocks and never fails the caller's storage
     /// write. The recursion guard is checked here, at the bus boundary: a
     /// caller holding a token at depth ≥ 1 (a subscriber mid-invocation) is
     /// refused, the refusal is counted and published, and the pulse never
-    /// reaches the queue. A full queue drops its oldest member to make room:
-    /// the pulse that arrives is accepted, and whatever the push left behind
-    /// capacity is what `drops_oldest` counts.
+    /// reaches the queue. A full queue drops its oldest lossy member to make
+    /// room: the pulse that arrives is accepted, and whatever the push left
+    /// behind capacity is what `drops_oldest` counts.
+    ///
+    /// A durability-qualified pulse is appended to the outbox first. An Audit
+    /// append failure is counted and logged, and the pulse takes the ordinary
+    /// queue path; a Mesh append failure cannot fail this call (there is no
+    /// error to return) and is logged, with the pulse falling back to the
+    /// queue. A mesh publisher that must fail its operation uses
+    /// [`ThalamicBus::emit_checked`].
     pub fn emit(&self, event: ThalamicPulse, token: &RecursionToken) {
         if !token.allows_emit() {
-            self.metrics
-                .recursion_blocks
-                .fetch_add(1, Ordering::Relaxed);
-            let _ = self.bp_tx.send(BackpressureEvent::RecursionRefused {
-                token_allows_emit: false,
-            });
-            tracing::debug!("pulse refused: caller holds a recursion token at depth >= 1");
+            self.refuse_recursion();
             return;
         }
-        let evicted = self.queue.push(event, self.capacity);
+        let delivery = match self.append_qualified(&event) {
+            Ok(delivery) => delivery,
+            Err(err) => {
+                tracing::error!(
+                    "durable mesh append failed in emit; falling back to the lossy queue: {err}"
+                );
+                None
+            }
+        };
+        self.enqueue(event, delivery);
+    }
+
+    /// Publish one pulse whose durability the caller must know about -- the
+    /// mesh-state publishers on memory-write paths. These pulses *are* the
+    /// sync record, so a failed durable append fails the operation: the error
+    /// returns before the pulse enters the queue, and a write that cannot be
+    /// durably recorded does not report success.
+    ///
+    /// On a bus without an outbox (every test and non-daemon consumer) this is
+    /// `emit` with a receipt: `Ok(())`. A recursion refusal is an error here
+    /// too (counted and published exactly as in `emit`), rather than a silent
+    /// drop the caller cannot see.
+    pub fn emit_checked(
+        &self,
+        event: ThalamicPulse,
+        token: &RecursionToken,
+    ) -> Result<(), EventOutboxError> {
+        if !token.allows_emit() {
+            self.refuse_recursion();
+            return Err(EventOutboxError::RecursionRefused);
+        }
+        let delivery = self.append_qualified(&event)?;
+        self.enqueue(event, delivery);
+        Ok(())
+    }
+
+    fn refuse_recursion(&self) {
+        self.metrics
+            .recursion_blocks
+            .fetch_add(1, Ordering::Relaxed);
+        let _ = self.bp_tx.send(BackpressureEvent::RecursionRefused {
+            token_allows_emit: false,
+        });
+        tracing::debug!("pulse refused: caller holds a recursion token at depth >= 1");
+    }
+
+    fn enqueue(&self, event: ThalamicPulse, delivery: Option<DurableDelivery>) {
+        let evicted = self
+            .queue
+            .push(QueuedPulse { event, delivery }, self.capacity);
         self.metrics.events_emitted.fetch_add(1, Ordering::Relaxed);
         if evicted {
             self.note_drop();
@@ -329,8 +554,9 @@ impl ThalamicBus {
 
     /// A point-in-time snapshot of what the bus has done, for
     /// `POST /bus/metrics`. While the dispatcher is idle between pulses the
-    /// snapshot satisfies `events_emitted == dispatcher_handled + queue_depth
-    /// + drops_oldest`.
+    /// snapshot satisfies `events_emitted + outbox_replayed ==
+    /// dispatcher_handled + queue_depth + drops_oldest` (the replayed term is
+    /// zero on a bus without an outbox).
     pub fn metrics(&self) -> BusMetrics {
         BusMetrics {
             events_emitted: self.metrics.events_emitted.load(Ordering::Relaxed),
@@ -342,6 +568,9 @@ impl ThalamicBus {
             subscriber_timeouts: self.metrics.subscriber_timeouts.load(Ordering::Relaxed),
             recursion_blocks: self.metrics.recursion_blocks.load(Ordering::Relaxed),
             subscriber_failures: self.metrics.subscriber_failures.load(Ordering::Relaxed),
+            audit_append_failures: self.metrics.audit_append_failures.load(Ordering::Relaxed),
+            outbox_attached: self.outbox.is_some(),
+            outbox_replayed: self.metrics.outbox_replayed.load(Ordering::Relaxed),
         }
     }
 }
@@ -408,10 +637,12 @@ async fn dispatch(
     metrics: Arc<AtomicMetrics>,
     bp_tx: watch::Sender<BackpressureEvent>,
     store: Arc<OnceLock<Arc<dyn VectorStore>>>,
+    outbox: Option<Arc<EventOutbox>>,
+    subs_notify: Arc<Notify>,
 ) {
     loop {
-        let event = match queue.pop() {
-            Some(event) => event,
+        let queued = match queue.pop() {
+            Some(queued) => queued,
             None => {
                 // Park until the next push. `notify_one`'s stored permit means
                 // a push between the failed pop and this await is not missed.
@@ -419,6 +650,35 @@ async fn dispatch(
                 continue;
             }
         };
+        let QueuedPulse { event, delivery } = queued;
+
+        // A durable entry is delivered only when its class's subscriber is
+        // registered. Construction enqueues replay before the daemon has had a
+        // chance to register anything, and acknowledging an entry because an
+        // empty registry "returned Ok" would silently discard it. Hold the
+        // entry in the queue until its consumer exists; a class that is never
+        // wired stays unacknowledged and replays on the next start.
+        if let Some(identity) = delivery {
+            let class_subscribed = subs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|sub| EventClass::class_of_subscriber(sub.name()) == Some(identity.class));
+            if !class_subscribed {
+                queue.push(
+                    QueuedPulse {
+                        event,
+                        delivery: Some(identity),
+                    },
+                    0,
+                );
+                // Park until a registration (or a bounded backstop) rather
+                // than polling: a class that is never wired costs one wakeup
+                // per backstop, not a spin.
+                let _ = tokio::time::timeout(Duration::from_secs(5), subs_notify.notified()).await;
+                continue;
+            }
+        }
 
         let namespace = namespace_of(&event);
         let ts = chrono::Utc::now().timestamp();
@@ -430,10 +690,12 @@ async fn dispatch(
             store: store.as_ref(),
             namespace,
             ts,
+            delivery,
         };
 
         let registered: Vec<Arc<dyn MemorySubscriber>> =
             subs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut all_ok = true;
         for sub in registered.iter() {
             // A fresh depth-1 token per subscriber: the token exists to refuse
             // a subscriber emitting from inside its own invocation.
@@ -449,10 +711,12 @@ async fn dispatch(
             match outcome {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(err))) => {
+                    all_ok = false;
                     metrics.subscriber_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(subscriber = sub.name(), "subscriber failed: {err:#}");
                 }
                 Ok(Err(payload)) => {
+                    all_ok = false;
                     metrics.subscriber_panics.fetch_add(1, Ordering::Relaxed);
                     let text = panic_text(payload.as_ref());
                     // Redacted snippet onto the audit path; full text stays in
@@ -465,6 +729,7 @@ async fn dispatch(
                     tracing::warn!(subscriber = sub.name(), "subscriber panicked: {text}");
                 }
                 Err(_elapsed) => {
+                    all_ok = false;
                     metrics.subscriber_timeouts.fetch_add(1, Ordering::Relaxed);
                     let name = sub.name().to_string();
                     let _ = bp_tx.send(BackpressureEvent::SubscriberTimeout { name: sub.name() });
@@ -482,13 +747,13 @@ async fn dispatch(
                         let metrics = metrics.clone();
                         let store = store.clone();
                         let ns = namespace.to_string();
-                        let ts = ts;
                         let name = name.clone();
                         tokio::spawn(async move {
                             let ctx = SubscriberContext {
                                 store: store.as_ref(),
                                 namespace: &ns,
                                 ts,
+                                delivery: None,
                             };
                             let retry = tokio::time::timeout(
                                 SUBSCRIBER_TIMEOUT * 4,
@@ -524,6 +789,26 @@ async fn dispatch(
                         });
                     }
                 }
+            }
+        }
+        if let (Some(identity), Some(outbox)) = (delivery, outbox.as_ref()) {
+            if all_ok {
+                if let Err(err) = outbox.advance(identity.class, identity.seq) {
+                    // The side effect landed but the acknowledgment did not:
+                    // the entry *will* be redelivered, and the consumer's
+                    // idempotency basis absorbs the duplicate.
+                    tracing::error!(
+                        class = identity.class.as_str(),
+                        seq = identity.seq,
+                        "outbox offset advance failed: {err}; the entry will be redelivered"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    class = identity.class.as_str(),
+                    seq = identity.seq,
+                    "durable delivery did not succeed; the entry stays unacknowledged for replay"
+                );
             }
         }
         // The pulse is done: every registered subscriber got an invocation or
@@ -1277,6 +1562,544 @@ mod tests {
             1,
             "the dispatcher reaches the next subscriber after a failure"
         );
+    }
+
+    // ---- durable outbox tests (Wave 3, step 1) ----
+
+    use crate::events::outbox::{DurableDelivery, EventClass, EventOutbox};
+    use std::path::PathBuf;
+    use tokio::sync::Semaphore;
+
+    /// One durable-path observation: which pulse, and the delivery identity
+    /// the bus stamped into the subscriber's context (if any).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DurableSeen {
+        id: String,
+        delivery: Option<DurableDelivery>,
+    }
+
+    /// A subscriber that stands in for one of the two durability-class
+    /// consumers (`guard_event_log`, `mesh_outbox`). It can block on a
+    /// semaphore (to observe a delivery mid-flight), sleep, and fail after
+    /// recording its effect (to simulate a crash between the effect and the
+    /// offset write).
+    struct DurableSpy {
+        name: &'static str,
+        seen: Arc<Mutex<Vec<DurableSeen>>>,
+        entered: Arc<AtomicBool>,
+        gate: Option<Arc<Semaphore>>,
+        delay: Duration,
+        fail: bool,
+    }
+
+    impl DurableSpy {
+        fn new(name: &'static str, seen: Arc<Mutex<Vec<DurableSeen>>>) -> Self {
+            Self {
+                name,
+                seen,
+                entered: Arc::new(AtomicBool::new(false)),
+                gate: None,
+                delay: Duration::from_millis(0),
+                fail: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MemorySubscriber for DurableSpy {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn handle(
+            &self,
+            event: &ThalamicPulse,
+            _token: &RecursionToken,
+            ctx: &SubscriberContext<'_>,
+        ) -> Result<(), SubscriberError> {
+            // Model the named consumer: a class subscriber acts only on the
+            // variants its class is interested in (the real `GuardEventLog`
+            // and `MeshOutbox` no-op the rest). A durable entry is delivered
+            // to every subscriber, so each spy must ignore the other class.
+            if let Some(class) = EventClass::class_of_subscriber(self.name) {
+                if !class.interested_in(event) {
+                    return Ok(());
+                }
+            }
+            self.entered.store(true, Ordering::Release);
+            if let Some(gate) = &self.gate {
+                let _ = gate.acquire().await;
+            }
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            let id = match event {
+                ThalamicPulse::Created { id, .. } => id.clone(),
+                ThalamicPulse::Superseded { new_id, .. } => new_id.clone(),
+                ThalamicPulse::Archived { id, .. } => id.clone(),
+                ThalamicPulse::GuardedActionFired { trace_id, .. } => trace_id.clone(),
+            };
+            self.seen
+                .lock()
+                .expect("durable spy log poisoned")
+                .push(DurableSeen {
+                    id,
+                    delivery: ctx.delivery,
+                });
+            if self.fail {
+                return Err(anyhow!("simulated subscriber failure after its effect"));
+            }
+            Ok(())
+        }
+    }
+
+    fn outbox_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "neurostrata-bus-outbox-test-{}-{}-{}",
+            std::process::id(),
+            tag,
+            uuid::Uuid::now_v7()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn seeded_outbox(dir: &std::path::Path) -> EventOutbox {
+        EventOutbox::open(dir).expect("the outbox opens")
+    }
+
+    fn seen_ids(seen: &Arc<Mutex<Vec<DurableSeen>>>) -> Vec<String> {
+        seen.lock()
+            .expect("durable spy log poisoned")
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect()
+    }
+
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_and_mesh_events_survive_overflow_and_crash() {
+        let dir = outbox_dir("overflow-crash");
+        let gate = Arc::new(Semaphore::new(0));
+        let bus = ThalamicBus::with_outbox(1, seeded_outbox(&dir), OutboxConfig::default());
+        let audit_seen = Arc::new(Mutex::new(Vec::new()));
+        let mesh_seen = Arc::new(Mutex::new(Vec::new()));
+        let mut audit_spy = DurableSpy::new("guard_event_log", audit_seen.clone());
+        audit_spy.gate = Some(gate.clone());
+        let mut mesh_spy = DurableSpy::new("mesh_outbox", mesh_seen.clone());
+        mesh_spy.gate = Some(gate.clone());
+        bus.register(Box::new(audit_spy));
+        bus.register(Box::new(mesh_spy));
+
+        let token = RecursionToken::root();
+        for n in 0..8 {
+            bus.emit(
+                ThalamicPulse::GuardedActionFired {
+                    trace_id: format!("audit-{n}"),
+                    action_type: "shell".into(),
+                    payload_hash: n,
+                    verdict: "deny".into(),
+                    rule_ids_triggered: vec![],
+                    namespace: "n".into(),
+                },
+                &token,
+            );
+            bus.emit(
+                ThalamicPulse::Created {
+                    id: format!("mesh-{n}"),
+                    namespace: "n".into(),
+                    kind: "fact".into(),
+                },
+                &token,
+            );
+        }
+
+        // Overflow: the lossy capacity is 1, yet the durable entries are
+        // exempt from drop-oldest and wait in the queue above capacity.
+        assert_eq!(bus.metrics().drops_oldest, 0);
+        assert!(
+            bus.metrics().queue_depth > 1,
+            "the durable entries queue above the lossy capacity: {:?}",
+            bus.metrics()
+        );
+        let attached = bus.outbox().expect("outbox attached");
+        assert_eq!(attached.offset(EventClass::Audit), 0);
+        assert_eq!(attached.offset(EventClass::Mesh), 0);
+        assert_eq!(attached.pending(EventClass::Audit).len(), 8);
+        assert_eq!(attached.pending(EventClass::Mesh).len(), 8);
+
+        // Crash: nothing was acknowledged, so a fresh bus over the same
+        // directory replays every entry in sequence order.
+        let replay = ThalamicBus::with_outbox(4, seeded_outbox(&dir), OutboxConfig::default());
+        let replay_audit = Arc::new(Mutex::new(Vec::new()));
+        let replay_mesh = Arc::new(Mutex::new(Vec::new()));
+        replay.register(Box::new(DurableSpy::new(
+            "guard_event_log",
+            replay_audit.clone(),
+        )));
+        replay.register(Box::new(DurableSpy::new(
+            "mesh_outbox",
+            replay_mesh.clone(),
+        )));
+        wait_until("every audit entry to replay", || {
+            seen_ids(&replay_audit).len() == 8
+        })
+        .await;
+        wait_until("every mesh entry to replay", || {
+            seen_ids(&replay_mesh).len() == 8
+        })
+        .await;
+        assert_eq!(
+            seen_ids(&replay_audit),
+            (0..8).map(|n| format!("audit-{n}")).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            seen_ids(&replay_mesh),
+            (0..8).map(|n| format!("mesh-{n}")).collect::<Vec<_>>()
+        );
+        let replayed = replay.outbox().expect("outbox attached");
+        assert_eq!(
+            replayed.offset(EventClass::Audit),
+            15,
+            "audit entries occupy the odd positions of the shared sequence"
+        );
+        assert_eq!(replayed.offset(EventClass::Mesh), 16);
+        assert!(replayed.pending(EventClass::Audit).is_empty());
+        assert!(replayed.pending(EventClass::Mesh).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_class_offset_advances_only_after_the_subscriber_returns() {
+        let dir = outbox_dir("offset-after-return");
+        let gate = Arc::new(Semaphore::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let bus = ThalamicBus::with_outbox(8, seeded_outbox(&dir), OutboxConfig::default());
+        let mut spy = DurableSpy::new("mesh_outbox", seen.clone());
+        spy.gate = Some(gate.clone());
+        let entered = spy.entered.clone();
+        bus.register(Box::new(spy));
+
+        bus.emit_checked(
+            ThalamicPulse::Created {
+                id: "m1".into(),
+                namespace: "n".into(),
+                kind: "fact".into(),
+            },
+            &RecursionToken::root(),
+        )
+        .expect("durable append succeeds");
+        wait_until("the subscriber to enter", || {
+            entered.load(Ordering::Acquire)
+        })
+        .await;
+
+        let outbox = bus.outbox().expect("outbox attached");
+        assert_eq!(
+            outbox.offset(EventClass::Mesh),
+            0,
+            "the offset must not move while the subscriber is still running"
+        );
+        assert_eq!(outbox.pending(EventClass::Mesh).len(), 1);
+
+        gate.add_permits(1);
+        wait_until("the offset to advance", || {
+            outbox.offset(EventClass::Mesh) == 1
+        })
+        .await;
+        assert_eq!(seen_ids(&seen), vec!["m1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_the_effect_and_the_offset_redelivers() {
+        let dir = outbox_dir("redeliver");
+        let first_seen = Arc::new(Mutex::new(Vec::new()));
+        let bus = ThalamicBus::with_outbox(8, seeded_outbox(&dir), OutboxConfig::default());
+        let mut spy = DurableSpy::new("mesh_outbox", first_seen.clone());
+        spy.fail = true;
+        bus.register(Box::new(spy));
+
+        bus.emit_checked(
+            ThalamicPulse::Created {
+                id: "m1".into(),
+                namespace: "n".into(),
+                kind: "fact".into(),
+            },
+            &RecursionToken::root(),
+        )
+        .expect("durable append succeeds");
+        wait_until("the failing subscriber's effect", || {
+            seen_ids(&first_seen).len() == 1
+        })
+        .await;
+        assert_eq!(
+            bus.outbox()
+                .expect("outbox attached")
+                .offset(EventClass::Mesh),
+            0,
+            "the subscriber failed, so the entry stays unacknowledged"
+        );
+
+        // Crash before the offset write: the next start redelivers the
+        // entry, and an id-keyed consumer absorbs the duplicate.
+        let second_seen = Arc::new(Mutex::new(Vec::new()));
+        let restarted = ThalamicBus::with_outbox(8, seeded_outbox(&dir), OutboxConfig::default());
+        restarted.register(Box::new(DurableSpy::new(
+            "mesh_outbox",
+            second_seen.clone(),
+        )));
+        wait_until("the redelivery", || seen_ids(&second_seen).len() == 1).await;
+        assert_eq!(seen_ids(&second_seen), vec!["m1".to_string()]);
+        assert_eq!(
+            restarted
+                .outbox()
+                .expect("outbox attached")
+                .offset(EventClass::Mesh),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unreplayed_entries_are_replayed_at_startup() {
+        let dir = outbox_dir("startup-replay");
+        let seeded = seeded_outbox(&dir);
+        seeded
+            .append(
+                EventClass::Audit,
+                &ThalamicPulse::GuardedActionFired {
+                    trace_id: "a1".into(),
+                    action_type: "shell".into(),
+                    payload_hash: 1,
+                    verdict: "allow".into(),
+                    rule_ids_triggered: vec![],
+                    namespace: "n".into(),
+                },
+            )
+            .expect("append a1");
+        seeded
+            .append(
+                EventClass::Mesh,
+                &ThalamicPulse::Created {
+                    id: "m1".into(),
+                    namespace: "n".into(),
+                    kind: "fact".into(),
+                },
+            )
+            .expect("append m1");
+        let last_audit = seeded
+            .append(
+                EventClass::Audit,
+                &ThalamicPulse::GuardedActionFired {
+                    trace_id: "a2".into(),
+                    action_type: "shell".into(),
+                    payload_hash: 2,
+                    verdict: "deny".into(),
+                    rule_ids_triggered: vec![],
+                    namespace: "n".into(),
+                },
+            )
+            .expect("append a2");
+        assert_eq!(last_audit, 3);
+        seeded.advance(EventClass::Audit, 1).expect("advance audit");
+        drop(seeded);
+
+        let audit_seen = Arc::new(Mutex::new(Vec::new()));
+        let mesh_seen = Arc::new(Mutex::new(Vec::new()));
+        let bus = ThalamicBus::with_outbox(8, seeded_outbox(&dir), OutboxConfig::default());
+        bus.register(Box::new(DurableSpy::new(
+            "guard_event_log",
+            audit_seen.clone(),
+        )));
+        bus.register(Box::new(DurableSpy::new("mesh_outbox", mesh_seen.clone())));
+        wait_until("the audit replay", || seen_ids(&audit_seen).len() == 1).await;
+        wait_until("the mesh replay", || seen_ids(&mesh_seen).len() == 1).await;
+        assert_eq!(
+            seen_ids(&audit_seen),
+            vec!["a2".to_string()],
+            "the acknowledged a1 entry is not replayed"
+        );
+        assert_eq!(seen_ids(&mesh_seen), vec!["m1".to_string()]);
+        assert_eq!(
+            seen_ids(&audit_seen),
+            vec!["a2".to_string()],
+            "startup replay must not duplicate an entry"
+        );
+        let outbox = bus.outbox().expect("outbox attached");
+        assert_eq!(outbox.offset(EventClass::Audit), 3);
+        assert_eq!(outbox.offset(EventClass::Mesh), 2);
+    }
+
+    #[tokio::test]
+    async fn non_qualified_classes_stay_lossy_drop_oldest() {
+        let dir = outbox_dir("lossy");
+        let bus = ThalamicBus::with_outbox(2, seeded_outbox(&dir), OutboxConfig::default());
+        // No `guard_event_log` subscriber: audit pulses are not qualified.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        bus.register(Box::new(SlowSubscriber {
+            log,
+            delay: Duration::from_millis(100),
+        }));
+        for n in 0..5 {
+            bus.emit(
+                ThalamicPulse::GuardedActionFired {
+                    trace_id: format!("a{n}"),
+                    action_type: "shell".into(),
+                    payload_hash: n,
+                    verdict: "deny".into(),
+                    rule_ids_triggered: vec![],
+                    namespace: "n".into(),
+                },
+                &RecursionToken::root(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let metrics = bus.metrics();
+        assert_eq!(metrics.drops_oldest, 3, "lossy traffic keeps drop-oldest");
+        assert_eq!(metrics.dispatcher_handled, 2);
+        assert!(
+            bus.outbox()
+                .expect("outbox attached")
+                .pending(EventClass::Audit)
+                .is_empty(),
+            "a non-qualified class is never appended to the outbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mesh_append_failure_fails_the_operation() {
+        let dir = outbox_dir("mesh-append-fails");
+        let bus = ThalamicBus::with_outbox(8, seeded_outbox(&dir), OutboxConfig::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        bus.register(Box::new(DurableSpy::new("mesh_outbox", seen.clone())));
+        // Pull the directory out from under the outbox: every append now
+        // fails with an io error.
+        std::fs::remove_dir_all(&dir).expect("remove outbox dir");
+
+        let err = bus
+            .emit_checked(
+                ThalamicPulse::Created {
+                    id: "m1".into(),
+                    namespace: "n".into(),
+                    kind: "fact".into(),
+                },
+                &RecursionToken::root(),
+            )
+            .expect_err("a mesh append failure must fail the operation");
+        assert!(
+            matches!(err, crate::events::outbox::EventOutboxError::Io(_)),
+            "the failure surfaces as an io error: {err:?}"
+        );
+        assert_eq!(
+            bus.metrics().queue_depth,
+            0,
+            "a failed checked emit never reaches the queue"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(seen_ids(&seen).is_empty());
+        assert_eq!(bus.metrics().dispatcher_handled, 0);
+    }
+
+    #[tokio::test]
+    async fn an_audit_append_failure_alerts_and_falls_back_to_the_queue() {
+        let dir = outbox_dir("audit-append-fails");
+        let bus = ThalamicBus::with_outbox(8, seeded_outbox(&dir), OutboxConfig::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        bus.register(Box::new(DurableSpy::new("guard_event_log", seen.clone())));
+        std::fs::remove_dir_all(&dir).expect("remove outbox dir");
+
+        bus.emit(
+            ThalamicPulse::GuardedActionFired {
+                trace_id: "a1".into(),
+                action_type: "shell".into(),
+                payload_hash: 1,
+                verdict: "deny".into(),
+                rule_ids_triggered: vec![],
+                namespace: "n".into(),
+            },
+            &RecursionToken::root(),
+        );
+        wait_until("the fallback queue delivery", || seen_ids(&seen).len() == 1).await;
+        assert_eq!(
+            bus.metrics().audit_append_failures,
+            1,
+            "a failed audit append is counted"
+        );
+        let observed = seen.lock().expect("durable spy log poisoned");
+        assert_eq!(
+            observed[0].delivery, None,
+            "the fallback delivery carries no durable identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_durable_pulse_carries_its_delivery_identity_to_the_subscriber() {
+        let dir = outbox_dir("delivery-identity");
+        let bus = ThalamicBus::with_outbox(8, seeded_outbox(&dir), OutboxConfig::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        bus.register(Box::new(DurableSpy::new("mesh_outbox", seen.clone())));
+        bus.emit_checked(
+            ThalamicPulse::Created {
+                id: "m1".into(),
+                namespace: "n".into(),
+                kind: "fact".into(),
+            },
+            &RecursionToken::root(),
+        )
+        .expect("durable append succeeds");
+        wait_until("the durable delivery", || seen_ids(&seen).len() == 1).await;
+        let observed = seen.lock().expect("durable spy log poisoned");
+        assert_eq!(
+            observed[0].delivery,
+            Some(DurableDelivery {
+                class: EventClass::Mesh,
+                seq: 1,
+            }),
+            "the subscriber can key on and deduplicate a replayed delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_durable_emit_survives_a_full_queue() {
+        let dir = outbox_dir("full-queue");
+        let bus = ThalamicBus::with_outbox(1, seeded_outbox(&dir), OutboxConfig::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut spy = DurableSpy::new("mesh_outbox", seen.clone());
+        spy.delay = Duration::from_millis(20);
+        bus.register(Box::new(spy));
+
+        for n in 0..8 {
+            bus.emit_checked(
+                ThalamicPulse::Created {
+                    id: format!("m{n}"),
+                    namespace: "n".into(),
+                    kind: "fact".into(),
+                },
+                &RecursionToken::root(),
+            )
+            .expect("durable append succeeds");
+        }
+        wait_until("every durable emit to be delivered", || {
+            seen_ids(&seen).len() == 8
+        })
+        .await;
+        assert_eq!(
+            seen_ids(&seen),
+            (0..8).map(|n| format!("m{n}")).collect::<Vec<_>>(),
+            "a full lossy queue must not drop a durable pulse"
+        );
+        assert_eq!(bus.metrics().drops_oldest, 0);
+        let outbox = bus.outbox().expect("outbox attached");
+        assert_eq!(outbox.offset(EventClass::Mesh), 8);
+        assert!(outbox.pending(EventClass::Mesh).is_empty());
     }
 
     /// The spec's degenerate bus: capacity 0 accepts nothing -- every pulse
