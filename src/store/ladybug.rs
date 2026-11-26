@@ -9365,17 +9365,25 @@ impl LadybugStore {
         } else {
             Some(active.active_generations_u64())
         };
-        let mut candidates = Vec::new();
         let hydration_options = LexicalHydrationOptions {
             include_tasks,
             include_archived,
             include_code_ast,
             principal,
         };
+        let matches_domains = |result: &crate::traits::SearchResult| {
+            if domains.is_empty() {
+                return true;
+            }
+            let row_domains = crate::domain::domain_keys(&result.payload.metadata);
+            domains.iter().any(|d| row_domains.contains(d))
+        };
         // Keep the historical `limit * 4` first fetch as the floor, then
         // double only when hydration drops enough hits to shorten the page.
         let mut window = limit.max(1).saturating_mul(4).min(MAX_LEXICAL_SCAN_ROWS);
-        let mut hydrated = 0usize;
+        let mut attempted: HashSet<String> = HashSet::new();
+        let mut hydrated_by_id: HashMap<String, crate::traits::SearchResult> = HashMap::new();
+        let mut candidates: Vec<crate::traits::SearchResult> = Vec::new();
         loop {
             let hits = {
                 let guard = self
@@ -9394,52 +9402,47 @@ impl LadybugStore {
                     include_code_ast,
                 )?
             };
-            // The index returns a stable `(score, id)` prefix, so only hydrate
-            // hits this window added. Re-hydrating the prefix on every
-            // doubling would repeat store reads for no gain.
-            if hits.len() > hydrated {
-                candidates.extend(
-                    self.hydrate_lexical_hits(
-                        namespace,
-                        &hits[hydrated..],
-                        &active,
-                        &hydration_options,
-                    )
-                    .await?,
-                );
-                hydrated = hits.len();
+            // Hydrate by id, not by prefix position. Widening a window can
+            // shift tied hits across the old boundary; a positional slice
+            // then re-hydrates a displaced row and skips the row that moved
+            // into the prefix. `attempted` also keeps dropped hits from being
+            // re-queried on every widening.
+            let new_hits: Vec<_> = hits
+                .iter()
+                .filter(|hit| attempted.insert(hit.id.clone()))
+                .cloned()
+                .collect();
+            if !new_hits.is_empty() {
+                for result in self
+                    .hydrate_lexical_hits(namespace, &new_hits, &active, &hydration_options)
+                    .await?
+                {
+                    hydrated_by_id.insert(result.id.clone(), result);
+                }
             }
+            candidates = hits
+                .iter()
+                .filter_map(|hit| hydrated_by_id.get(&hit.id).cloned())
+                .collect();
             // A short window means the index had nothing more to offer; a full
-            // one may still hide visible rows behind dropped hits, so widen.
+            // one may still hide visible rows behind dropped or filtered hits,
+            // so widen. The stop condition counts rows that survive the domain
+            // filter, never the raw candidates.
+            let matching = candidates.iter().filter(|r| matches_domains(r)).count();
             let exhausted = hits.len() < window;
-            if candidates.len() >= limit || exhausted || window >= MAX_LEXICAL_SCAN_ROWS {
+            if matching >= limit || exhausted || window >= MAX_LEXICAL_SCAN_ROWS {
                 break;
             }
             window = (window * 2).min(MAX_LEXICAL_SCAN_ROWS);
         }
-        let mut domain_filter_applied = false;
-        let mut results = if !domains.is_empty() {
-            let filtered: Vec<_> = candidates
-                .iter()
-                .filter(|r| {
-                    let row_domains = crate::domain::domain_keys(&r.payload.metadata);
-                    domains.iter().any(|d| row_domains.contains(d))
-                })
-                .cloned()
-                .collect();
-            if !filtered.is_empty() {
-                domain_filter_applied = true;
-                filtered
-            } else {
-                candidates
-            }
-        } else {
-            candidates
-        };
+        let mut results: Vec<_> = candidates
+            .into_iter()
+            .filter(|r| matches_domains(r))
+            .collect();
         results.truncate(limit);
         Ok(crate::traits::LexicalSearchOutcome {
             results,
-            domain_filter_applied,
+            domain_filter_applied: !domains.is_empty(),
         })
     }
 
@@ -32636,6 +32639,60 @@ eurostrata\src\daemon.rs",
         assert!(
             ids.iter().all(|id| id.starts_with("clean-")),
             "only clean rows may fill the page, got {ids:?}"
+        );
+    }
+
+    /// #404: a domain-filtered page must keep widening past non-matching
+    /// rows. The first window can be entirely other domains; stopping at
+    /// `limit` raw candidates, or falling back to them, returns rows the
+    /// caller excluded.
+    #[tokio::test]
+    async fn tantivy_domain_filter_widens_past_nonmatching_hits() {
+        let store = retired_test_store().await;
+        for i in 0..6 {
+            store
+                .upsert(
+                    "probe",
+                    &format!("other-{i:02}"),
+                    vec![0.0; 4],
+                    tantivy_exclusion_payload(
+                        "domainfilterneedle domainfilterneedle domainfilterneedle domainfilterneedle",
+                        json!({"domain": "other"}),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "wanted-00",
+                vec![0.0; 4],
+                tantivy_exclusion_payload(
+                    "domainfilterneedle diluted by a long tail of unrelated filler words",
+                    json!({"domain": "wanted"}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let outcome = store
+            .search_tantivy_lexical(
+                "probe",
+                "domainfilterneedle",
+                1,
+                false,
+                false,
+                &["wanted".to_string()],
+                "tester",
+            )
+            .await
+            .unwrap();
+        assert!(outcome.domain_filter_applied);
+        assert_eq!(
+            result_ids(&outcome.results),
+            vec!["wanted-00".to_string()],
+            "the filtered page must widen past other-domain hits, not fall back to them"
         );
     }
 
