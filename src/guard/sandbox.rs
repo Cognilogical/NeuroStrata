@@ -36,7 +36,7 @@ const SANDBOX_TIMEOUT: Duration = Duration::from_secs(5);
 /// would be exposed to the evaluated payload. `/` (the filesystem root) is
 /// handled separately because every absolute path starts with it.
 const FORBIDDEN_WORKING_DIRECTORIES: &[&str] = &[
-    "/etc", "/var/run", "/run", "/private/var/run", "/root", "/sys", "/dev", "/proc", "/boot",
+    "/etc", "/home", "/var/run", "/run", "/private/var/run", "/root", "/sys", "/dev", "/proc", "/boot",
 ];
 
 /// Sensitive directories directly under a user's home. A checkout under the
@@ -199,10 +199,11 @@ pub(crate) enum RunOutcome {
 /// paths while `/etc` and `/home/user/project` are not. Returns the offending
 /// forbidden path for the rejection message.
 ///
-/// The current user's exact home directory is refused as well: mounting it
-/// would expose `.ssh`, `.aws`, shell history and every sibling project. Only
-/// the directory itself is refused, never its descendants, so a checkout at
-/// `~/project` stays a valid sandbox working directory.
+/// The current user's exact home directory, its ancestors, and its sensitive
+/// credential children are refused as well: mounting them would expose
+/// `.ssh`, `.aws`, shell history and every sibling project. `/home` remains
+/// refused as a whole because #410's acceptance criteria name
+/// `/home/user/project` explicitly.
 pub(crate) fn working_directory_refusal(cwd: &str) -> Option<String> {
     let home = dirs::home_dir();
     // `evaluate` canonicalizes the cwd before calling this; canonicalize the
@@ -446,10 +447,15 @@ async fn run_child_with_timeout_named(
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
-                    .status()
-                    .await;
-                if let Err(e) = removal {
-                    warn!("Sandbox timeout: failed to remove container {name}: {e}");
+                    .status();
+                match tokio::time::timeout(Duration::from_secs(2), removal).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        warn!("Sandbox timeout: failed to remove container {name}: {e}");
+                    }
+                    Err(_) => {
+                        warn!("Sandbox timeout: container cleanup for {name} exceeded 2s");
+                    }
                 }
             }
             stdout_task.abort();
@@ -562,6 +568,8 @@ mod tests {
         for cwd in [
             "/",
             "/etc",
+            "/home",
+            "/home/user/project",
             "/run",
             "/private/var/run",
             "/var/run/docker.sock",
@@ -582,7 +590,6 @@ mod tests {
         for cwd in [
             "/etcetera",
             "/homework",
-            "/home/user/project",
             "/work/project",
         ] {
             assert_eq!(
