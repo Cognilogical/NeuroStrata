@@ -540,13 +540,35 @@ async fn store_new_task(
 }
 
 /// Removes follow-up rows a failed completion created, so a mid-loop error
-/// leaves zero partial children behind. Best-effort: a delete failure is
-/// logged and never masks the error that triggered the rollback.
-async fn rollback_follow_up_tasks(store: &Arc<dyn VectorStore>, namespace: &str, ids: &[String]) {
+/// leaves zero partial children behind. Returns the ids whose deletion
+/// failed: the caller surfaces them in its error, because a swallowed
+/// rollback failure would report a clean refusal while partial follow-up
+/// rows remain visible.
+async fn rollback_follow_up_tasks(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    ids: &[String],
+) -> Vec<String> {
+    let mut failed = Vec::new();
     for id in ids {
         if let Err(e) = store.delete(namespace, id).await {
             tracing::warn!("failed to roll back follow-up task {}: {}", id, e);
+            failed.push(id.clone());
         }
+    }
+    failed
+}
+
+/// Appends the rollback-failure notice to a completion error, when any.
+fn with_rollback_failures(error: String, failed: &[String]) -> String {
+    if failed.is_empty() {
+        error
+    } else {
+        format!(
+            "{} (rollback incomplete: follow-up task(s) {} could not be deleted and remain visible)",
+            error,
+            failed.join(", ")
+        )
     }
 }
 
@@ -4060,18 +4082,19 @@ pub async fn handle_task_complete(
         {
             Ok((new_id, _payload)) => follow_up_created_ids.push(new_id),
             Err(e) => {
-                rollback_follow_up_tasks(&store, &namespace, &follow_up_created_ids).await;
+                let failed =
+                    rollback_follow_up_tasks(&store, &namespace, &follow_up_created_ids).await;
                 rollback_completion_extraction(&store, &namespace, &linked_before, &inline_created)
                     .await;
-                return Err(e);
+                return Err(with_rollback_failures(e, &failed));
             }
         }
     }
 
     if let Err(e) = save_task(&store, &namespace, &id, vector, completed.payload.clone()).await {
-        rollback_follow_up_tasks(&store, &namespace, &follow_up_created_ids).await;
+        let failed = rollback_follow_up_tasks(&store, &namespace, &follow_up_created_ids).await;
         rollback_completion_extraction(&store, &namespace, &linked_before, &inline_created).await;
-        return Err(e);
+        return Err(with_rollback_failures(e, &failed));
     }
     // Emit site 3 (see the note above the gate): only now, with the parent
     // saved as done, has the task actually given way to the lesson.
