@@ -311,9 +311,11 @@ fn threshold_mb_uncached() -> u64 {
     match parse_threshold(raw.as_deref()) {
         Ok(value) => value,
         Err(warning) => {
-            // The binary installs no tracing subscriber, so `tracing::warn!`
-            // would vanish; operator diagnostics go to stderr. Warn once per
-            // bad value so a hot loop does not spam.
+            // Operator diagnostics on this path go directly to stderr via
+            // `eprintln!`, so they are visible regardless of the tracing
+            // subscriber state (the binary's global subscriber installed by
+            // `init_tracing` also writes to stderr). Warn once per bad
+            // value so a hot loop does not spam.
             if should_warn_invalid_threshold(raw.as_deref().unwrap_or("")) {
                 eprintln!("warning: {warning}");
             }
