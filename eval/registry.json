@@ -602,7 +602,13 @@
         "store::ladybug::store_identity::an_adopted_marker_survives_sidecar_loss",
         "store::ladybug::store_identity::row_identity_audit_reports_a_scoped_id_under_the_wrong_namespace",
         "store::ladybug::store_identity::row_identity_audit_reports_an_unqualified_ingested_row",
-        "store::ladybug::store_identity::audit_at_init_never_blocks_open"
+        "store::ladybug::store_identity::audit_at_init_never_blocks_open",
+        "store::ladybug::store_identity::the_first_batched_vector_write_records_the_marker",
+        "store::ladybug::store_identity::a_mismatched_marker_refuses_commit_action_batch_without_writing",
+        "store::ladybug::store_identity::absent_sidecar_legacy_adoption_records_no_provenance",
+        "store::ladybug::store_identity::a_lost_sidecar_and_wrong_model_does_not_synthesize_a_false_identity",
+        "store::ladybug::store_identity::an_unverified_recovery_open_skips_adoption",
+        "store::ladybug::store_identity::a_failed_adoption_is_non_fatal_and_retried"
       ],
       "thresholds": {
         "ignored": 0

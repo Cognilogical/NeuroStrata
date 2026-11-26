@@ -4967,6 +4967,8 @@ struct StoreIdentityAdoption {
     serving: Option<crate::traits::EmbeddingDescriptor>,
     embed_config_dir: PathBuf,
     dimensions: usize,
+    #[cfg(test)]
+    fail_write: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StoreIdentityAdoption {
@@ -5043,6 +5045,10 @@ impl StoreIdentityAdoption {
             );
             return Ok(false);
         };
+        #[cfg(test)]
+        if self.fail_write.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("injected StoreIdentity marker write failure");
+        }
         write_store_identity_marker(conn, &marker)?;
         tracing::info!(
             "adopted the store's embedding identity as model '{}' (provider '{}', {} dims); adopted_from_model={:?}",
@@ -5386,6 +5392,29 @@ impl LockedUnknownMigration {
         };
         if rows == 0 || physical != self.dimensions {
             return Ok(false);
+        }
+        // #409: the store's own persisted marker outranks anything this
+        // open could synthesize. If a marker already exists and disagrees
+        // with the serving descriptor, writing a `has_data: true` sidecar
+        // here would fabricate a false identity for the store — and the
+        // next open would see a marker/sidecar disagreement that refuses
+        // every vector operation. Leave the sidecar exactly as found and
+        // keep the marker, so reopening with the model that actually
+        // produced the vectors still identifies the store.
+        if let Some(marker) = read_store_identity_marker(conn)? {
+            let persisted = marker.descriptor();
+            if !persisted.compatible(&self.serving) {
+                tracing::warn!(
+                    "not recording a data-bearing store-state sidecar: the store's persisted embedding marker records model '{}' (provider '{}', {} dims), but this process serves model '{}' (provider '{}', {} dims); the marker is preserved so an open under the recorded model can still identify the store",
+                    persisted.model,
+                    persisted.provider,
+                    persisted.dims,
+                    self.serving.model,
+                    self.serving.provider,
+                    self.serving.dims
+                );
+                return Ok(false);
+            }
         }
         let state = crate::model_choice::StoreState::new(true, self.serving.clone());
         match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
@@ -5748,6 +5777,8 @@ impl LadybugStore {
             serving: self.serving_descriptor(),
             embed_config_dir: self.embed_config_dir.clone(),
             dimensions: self.dimensions,
+            #[cfg(test)]
+            fail_write: Arc::clone(&self.store_identity_write_failure),
         };
         self.write_with_deadline("adopting the store's embedding marker", move |conn| {
             adoption.adopt(conn)
@@ -10980,16 +11011,19 @@ impl VectorStore for LadybugStore {
             // store enters Recorded identity protection from this
             // open rather than never. The migration re-checks every
             // gate itself, so this is a cheap no-op otherwise.
-            if let Err(e) = self.migrate_locked_unknown_data_bearing_store_state().await {
-                tracing::warn!("data-bearing LockedUnknown migration failed during init: {e}");
-            }
             // #409: a data-bearing legacy store lacking the in-store
-            // marker records its adopted identity. Errors are logged and
+            // marker records its adopted identity. This runs before the
+            // #77 migration so an absent-sidecar legacy store is adopted
+            // from its real pre-synthesis state (NULL provenance), never
+            // from a sidecar this open fabricated. Errors are logged and
             // retried on the next open; they never block this one.
             if let Err(e) = self.adopt_store_identity_marker().await {
                 tracing::warn!(
                     "embedding-marker adoption failed; it will be retried on the next open: {e}"
                 );
+            }
+            if let Err(e) = self.migrate_locked_unknown_data_bearing_store_state().await {
+                tracing::warn!("data-bearing LockedUnknown migration failed during init: {e}");
             }
             return Ok(());
         }
@@ -11283,21 +11317,25 @@ impl VectorStore for LadybugStore {
             // matching the configuration, width, and row count), so
             // this is a no-op after a successful empty upgrade and
             // on every ineligible open.
+            // #409: a data-bearing legacy store lacking the in-store marker
+            // records its adopted identity (from the sidecar when parseable,
+            // with NULL provenance otherwise). This runs BEFORE the #77
+            // migration below, which synthesizes a sidecar: an absent-sidecar
+            // legacy store must be adopted from its real pre-synthesis state
+            // (LockedUnknown, so NULL provenance) rather than from a sidecar
+            // this open fabricated. Best effort: logged and retried on the
+            // next open, never fatal.
+            if let Err(e) = self.adopt_store_identity_marker().await {
+                tracing::warn!(
+                    "embedding-marker adoption failed; it will be retried on the next open: {e}"
+                );
+            }
             if let Err(e) = self.migrate_locked_unknown_data_bearing_store_state().await {
                 tracing::warn!("data-bearing LockedUnknown migration failed during init: {e}");
             }
             // First successful init: record the store's pristine state
             // (or adopt a new configured descriptor while pristine).
             self.maintain_store_state();
-            // #409: a data-bearing legacy store lacking the in-store marker
-            // records its adopted identity (from the sidecar when parseable,
-            // with NULL provenance otherwise). Best effort: logged and
-            // retried on the next open, never fatal.
-            if let Err(e) = self.adopt_store_identity_marker().await {
-                tracing::warn!(
-                    "embedding-marker adoption failed; it will be retried on the next open: {e}"
-                );
-            }
             // #409: bounded, report-only row-identity audit on the first
             // init. It never blocks or undoes the open.
             self.audit_row_identity_at_init().await;
@@ -36837,8 +36875,16 @@ impl LadybugStore {
             .map_err(|e| ActionError::Storage(e.to_string()))?;
         self.check_data_bearing_identity()
             .map_err(|e| ActionError::Storage(e.to_string()))?;
+        // #409: the batched path writes vector-carrying `Memory` rows too, so
+        // it owes the store the same marker identity gate as the single-row
+        // upsert: a store whose persisted marker names a different embedding
+        // space must refuse before the transaction opens.
+        self.check_embedding_marker_identity()
+            .await
+            .map_err(|e| ActionError::Storage(e.to_string()))?;
 
         let first_write_flip = self.first_write_flip();
+        let first_write_marker = self.first_write_marker();
         let now_ts = crate::rdf::action::current_action_timestamp();
         let ontology = self.get_ontology(&ns);
 
@@ -37191,6 +37237,12 @@ impl LadybugStore {
                     // 3. Apply staged memory writes inside the transaction.
                     let mut writes_done = 0usize;
                     let mut touches_taxonomy = false;
+                    // #409: record the store's embedding identity inside this
+                    // writer's turn, before the first vector lands. A marker
+                    // failure aborts the transaction with zero rows written,
+                    // matching the single-row upsert's contract.
+                    first_write_marker.ensure_written_before_first_vector(conn)
+                        .map_err(|e| ActionError::Storage(e.to_string()))?;
                     for w in &writes {
                         if w.payload.memory_type == "thesis" || w.payload.memory_type == "concept" {
                             touches_taxonomy = true;
@@ -37475,18 +37527,22 @@ mod store_identity {
         }
     }
 
-    /// The serving descriptor a process that loaded `model` at the fixture
+    /// The serving descriptor a process that loaded `model` at the given
     /// width binds (`FastEmbedder::embedding_descriptor`'s local shape).
-    fn serving(model: &str) -> EmbeddingDescriptor {
+    fn serving_with_dims(model: &str, dims: usize) -> EmbeddingDescriptor {
         EmbeddingDescriptor {
             provider: "fastembed".into(),
             model: model.into(),
             revision: "onnx".into(),
-            dims: 4,
+            dims,
             normalization: "unknown".into(),
             preprocessing: "unknown".into(),
             distance_metric: "cosine".into(),
         }
+    }
+
+    fn serving(model: &str) -> EmbeddingDescriptor {
+        serving_with_dims(model, 4)
     }
 
     fn open(fx: &Fixture, model: &str) -> LadybugStore {
@@ -37494,6 +37550,23 @@ mod store_identity {
             .expect("open temp database")
             .with_embed_config_dir(&fx.config_dir)
             .with_serving_descriptor(Some(serving(model)))
+    }
+
+    fn open_with_dims(fx: &Fixture, model: &str, dims: usize) -> LadybugStore {
+        LadybugStore::for_testing(&fx.db, dims)
+            .expect("open temp database")
+            .with_embed_config_dir(&fx.config_dir)
+            .with_serving_descriptor(Some(serving_with_dims(model, dims)))
+    }
+
+    /// Rewrite the fixture's configured model (the setup pick this process
+    /// re-reads), keeping it serving-comparable.
+    fn write_embedders(fx: &Fixture, model: &str, dimensions: usize) {
+        std::fs::write(
+            fx.config_dir.join("embedders.json"),
+            format!("[{{\"model_name\":\"{model}\",\"dimensions\":{dimensions}}}]"),
+        )
+        .expect("rewrite fixture embedders.json");
     }
 
     fn payload(user_id: &str) -> MemoryPayload {
@@ -37831,5 +37904,275 @@ mod store_identity {
         );
         assert!(!audit.truncated, "a small store fits the audit budget");
         assert!(audit.elapsed_ms <= 2_000, "the audit stays bounded");
+    }
+
+    /// A minimal one-row kinetic write set: exactly the shape
+    /// `commit_action_batch` commits, no expected heads required.
+    fn one_row_batch(id: &str) -> crate::rdf::action::ActionWriteSet {
+        crate::rdf::action::ActionWriteSet {
+            expected_heads: Vec::new(),
+            writes: vec![crate::rdf::action::StagedMemoryWrite {
+                id: id.to_string(),
+                vector: vector(),
+                payload: payload("owner"),
+            }],
+            edge_deltas: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_batched_vector_write_records_the_marker() {
+        let fx = fixture("batch-marker");
+        let store = open(&fx, "BGESmallENV15");
+        store.init("probe").await.expect("init");
+        assert!(
+            store
+                .read_store_identity_marker()
+                .await
+                .expect("read marker before the batch")
+                .is_none(),
+            "init alone records no marker; the batched vector write must"
+        );
+
+        store
+            .commit_action_batch("probe", one_row_batch("batch-m1"))
+            .await
+            .expect("first batched commit");
+
+        let marker = store
+            .read_store_identity_marker()
+            .await
+            .expect("read marker after the batch")
+            .expect("the first batched vector records the store's embedding marker");
+        assert_eq!(marker.marker_version, STORE_IDENTITY_MARKER_VERSION);
+        assert_eq!(marker.descriptor(), serving("BGESmallENV15"));
+        assert!(
+            marker.adopted_from_model.is_none() && marker.adopted_at.is_none(),
+            "the batched first write records its own identity, not an adoption"
+        );
+        assert_eq!(row_count(&store).await, 1, "the batched row landed");
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_marker_refuses_commit_action_batch_without_writing() {
+        let fx = fixture("batch-marker-mismatch");
+        seeded_store(&fx, "m1", "owner").await;
+        std::fs::remove_file(crate::model_choice::store_state_path(&fx.db))
+            .expect("remove the sidecar so the marker alone carries identity");
+
+        let store = open(&fx, "NomicEmbedTextV15");
+        store
+            .init("probe")
+            .await
+            .expect("a marker mismatch never blocks the open");
+        let before = row_count(&store).await;
+
+        let error = store
+            .commit_action_batch("probe", one_row_batch("batch-m2"))
+            .await
+            .expect_err("a different embedding space refuses the action batch");
+        assert!(
+            format!("{error:?}").contains("persisted embedding marker"),
+            "the batched refusal names the persisted marker: {error:?}"
+        );
+        assert_eq!(
+            row_count(&store).await,
+            before,
+            "a refused batched write lands zero rows"
+        );
+        assert!(
+            store
+                .get("probe", "batch-m2")
+                .await
+                .expect("read the refused row")
+                .is_none(),
+            "no row from the refused batch exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_sidecar_legacy_adoption_records_no_provenance() {
+        let fx = fixture("legacy-absent-sidecar");
+        seeded_store(&fx, "m1", "owner").await;
+        strip_marker_row(&fx).await;
+        std::fs::remove_file(crate::model_choice::store_state_path(&fx.db))
+            .expect("lose the sidecar so the legacy store records nothing");
+
+        let store = open(&fx, "BGESmallENV15");
+        store.init("probe").await.expect("verified open adopts");
+
+        let marker = store
+            .read_store_identity_marker()
+            .await
+            .expect("read adopted marker")
+            .expect("a data-bearing legacy store records its adopted identity");
+        assert_eq!(marker.descriptor(), serving("BGESmallENV15"));
+        assert_eq!(
+            marker.adopted_from_provider, None,
+            "adoption with no sidecar must not fabricate provenance"
+        );
+        assert_eq!(marker.adopted_from_model, None);
+        assert_eq!(marker.adopted_from_dims, None);
+        assert!(
+            marker.adopted_at.is_some(),
+            "the adoption is still stamped with when it was recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_sidecar_and_wrong_model_does_not_synthesize_a_false_identity() {
+        let fx = fixture("lost-sidecar-wrong-model");
+        seeded_store(&fx, "m1", "owner").await;
+        std::fs::remove_file(crate::model_choice::store_state_path(&fx.db))
+            .expect("lose the sidecar");
+
+        // Open as model B: configured and serving both B, so every gate that
+        // only compares serving to configuration is satisfied and the #77
+        // migration would happily stamp a `has_data: true` sidecar for B.
+        write_embedders(&fx, "NomicEmbedTextV15", 4);
+        {
+            let wrong = open(&fx, "NomicEmbedTextV15");
+            wrong
+                .init("probe")
+                .await
+                .expect("a marker mismatch never blocks the open");
+            assert!(
+                !crate::model_choice::store_state_path(&fx.db).exists(),
+                "the wrong model must not synthesize a false data-bearing sidecar"
+            );
+            let marker = wrong
+                .read_store_identity_marker()
+                .await
+                .expect("read marker")
+                .expect("the real marker survives");
+            assert_eq!(
+                marker.model, "BGESmallENV15",
+                "the DB marker keeps naming the model that produced the vectors"
+            );
+        }
+
+        // Reopening with the real model A still identifies the store: the
+        // sidecar is synthesized from the preserved marker, not from B.
+        write_embedders(&fx, "BGESmallENV15", 4);
+        let store = open(&fx, "BGESmallENV15");
+        store
+            .init("probe")
+            .await
+            .expect("the real model reopens the store");
+        let sidecar = crate::model_choice::read_store_state(&fx.db);
+        assert!(
+            matches!(sidecar, crate::model_choice::StoreStateRead::Recorded(_)),
+            "the real model's open records the store's data-bearing identity"
+        );
+        store
+            .search("probe", vector(), 5, false, false)
+            .await
+            .expect("the real model searches the store it produced");
+    }
+
+    #[tokio::test]
+    async fn an_unverified_recovery_open_skips_adoption() {
+        let fx = fixture("recovery-skips-adoption");
+        write_embedders(&fx, "BGESmallENV15", 8);
+
+        // A data-bearing legacy store: an 8-wide row, a sidecar recording its
+        // identity, and no in-store marker — exactly the store a verified
+        // open would adopt from the sidecar.
+        {
+            let seeder = open_with_dims(&fx, "BGESmallENV15", 8);
+            seeder.init("probe").await.expect("init the seeding store");
+            seeder
+                .upsert("probe", "legacy-1", vec![0.2; 8], payload("owner"))
+                .await
+                .expect("seed a data-bearing legacy row");
+            seeder
+                .with_conn(|conn| {
+                    conn.query("MATCH (s:StoreIdentity) DELETE s")?;
+                    Ok(())
+                })
+                .await
+                .expect("strip the marker row to make the store legacy");
+        }
+        assert!(
+            crate::model_choice::store_state_path(&fx.db).exists(),
+            "precondition: the sidecar records the data-bearing identity"
+        );
+
+        let _wal_env_serial = super::tests::WAL_ENV_LOCK.lock().await;
+        super::tests::plant_corrupted_uncheckpointed_wal(&fx.db, 6, false);
+        let previous_wal = super::tests::allow_unverified_wal_recovery();
+        {
+            let recovered = open_with_dims(&fx, "BGESmallENV15", 8);
+            recovered
+                .init("probe")
+                .await
+                .expect("the recovery open succeeds");
+            assert_eq!(
+                recovered.open_provenance(),
+                OpenProvenance::UnverifiedWalReplay,
+                "the fixture must drive an unverified recovery open"
+            );
+            assert!(
+                recovered
+                    .read_store_identity_marker()
+                    .await
+                    .expect("read marker")
+                    .is_none(),
+                "an unverified recovery open must not adopt an embedding identity"
+            );
+        }
+
+        // The skip is per-open: a later verified open retries and adopts.
+        let verified = open_with_dims(&fx, "BGESmallENV15", 8);
+        verified
+            .init("probe")
+            .await
+            .expect("the verified reopen succeeds");
+        let marker = verified
+            .read_store_identity_marker()
+            .await
+            .expect("read marker after the verified reopen")
+            .expect("a verified open adopts the legacy identity");
+        assert_eq!(marker.adopted_from_model.as_deref(), Some("BGESmallENV15"));
+
+        drop(verified);
+        super::tests::restore_wal_env(previous_wal);
+    }
+
+    #[tokio::test]
+    async fn a_failed_adoption_is_non_fatal_and_retried() {
+        let fx = fixture("adoption-retry");
+        seeded_store(&fx, "m1", "owner").await;
+        strip_marker_row(&fx).await;
+
+        {
+            let failing = open(&fx, "BGESmallENV15");
+            failing.fail_store_identity_write_for_test();
+            failing
+                .init("probe")
+                .await
+                .expect("a failed adoption is logged, never fatal to the open");
+            assert!(
+                failing
+                    .read_store_identity_marker()
+                    .await
+                    .expect("read marker after the failed adoption")
+                    .is_none(),
+                "the failed adoption records no marker"
+            );
+        }
+
+        let store = open(&fx, "BGESmallENV15");
+        store
+            .init("probe")
+            .await
+            .expect("the next open retries the adoption");
+        let marker = store
+            .read_store_identity_marker()
+            .await
+            .expect("read marker after the retry")
+            .expect("the retried adoption records the marker");
+        assert_eq!(marker.descriptor(), serving("BGESmallENV15"));
+        assert_eq!(marker.adopted_from_model.as_deref(), Some("BGESmallENV15"));
     }
 }
