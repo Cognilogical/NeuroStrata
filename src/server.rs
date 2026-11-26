@@ -10822,14 +10822,13 @@ async fn handle_supersede_memory(
         // rank the corrected text below siblings the old row outranked, in
         // memories_for_file (access_count is a sort key) and in search (usage
         // boost).
-        let inherited_access_count = old_payload
-            .metadata
-            .get("access_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
         obj.insert(
             "access_count".to_string(),
-            serde_json::json!(inherited_access_count),
+            old_payload
+                .metadata
+                .get("access_count")
+                .cloned()
+                .unwrap_or(serde_json::json!(0)),
         );
         obj.insert("supersedes".to_string(), serde_json::json!(id));
         // Transfer a scheduled future expiry to the replacement so the
