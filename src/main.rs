@@ -7843,6 +7843,20 @@ mod tests {
         );
         std::fs::write(root.join("restore-installed-release"), b"go").unwrap();
 
+        // Phase 3: verification is about to run (the store open and the
+        // namespace listing). The lock must still be held at this phase
+        // boundary: a restore that released the lock after installation
+        // but before verification would let a concurrent opener observe
+        // the store mid-verification, and this probe is what catches it.
+        await_restore_barrier(&root.join("restore-verifying-entered"));
+        assert!(
+            try_take_store_lock(&target)
+                .expect("the lock file can be probed")
+                .is_none(),
+            "the restore still owns the lock while verification is in progress"
+        );
+        std::fs::write(root.join("restore-verifying-release"), b"go").unwrap();
+
         let outcome = restore.join().expect("the restore thread does not panic");
         assert!(
             outcome.is_err(),
@@ -8417,6 +8431,13 @@ async fn restore_snapshot_into(
     copy_snapshot_into_place(dir, target)?;
     #[cfg(test)]
     restore_test_barrier::hit(target, "installed");
+
+    // The verification window opens here: the lock must still be held when
+    // the verification open and namespace listing run below, not only at
+    // the moment the copy finished. The barrier lets the test probe the
+    // lock at exactly this phase boundary.
+    #[cfg(test)]
+    restore_test_barrier::hit(target, "verifying");
 
     // Opened only after the copy, to verify the restored store reads back and
     // to report what it holds, all while the lock is still held.
