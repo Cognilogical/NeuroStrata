@@ -2809,6 +2809,7 @@ function wsCloneState(state: WorkingSetState): WorkingSetState {
     roots: state.roots.map(cloneNode),
     young_gen: state.young_gen.map(cloneNode),
     evicted_stubs: state.evicted_stubs.map(cloneStub),
+    edges: (state.edges ?? []).map((edge) => ({ ...edge })),
     tool_output_stubs: state.tool_output_stubs.map((stub) => ({
       ...stub,
       governing_ids: [...stub.governing_ids]
@@ -2986,7 +2987,7 @@ export function sweepWorkingSet(stateInput: WorkingSetState): WorkingSetState {
     )
   )
   state.edges = state.edges
-    .filter((edge) => liveIds.has(edge.from))
+    .filter((edge) => liveIds.has(edge.from) && liveIds.has(edge.to))
     .sort(wsEdgeCompare)
     .slice(0, WORKING_SET_MAX_EDGES)
   wsSortAndCap(state)
@@ -3003,7 +3004,7 @@ export function recordWorkingSetEdges(
   const state = wsCloneState(stateInput)
   const seen = new Set<string>()
   const collected: WorkingSetEdge[] = []
-  for (const edge of edges) {
+  for (const edge of [...edges, ...(state.edges ?? [])]) {
     if (!wsCanonicalNodeId(edge.from) || !wsCanonicalNodeId(edge.to)) continue
     if (!EDGE_KINDS.has(edge.kind)) continue
     const weight = wsU32(edge.weight_bps) ? (edge.weight_bps as number) : 10000
@@ -3860,7 +3861,7 @@ export function renderWorkingSetTier0Prefix(
       Buffer.byteLength(open + body + close) > WORKING_SET_TIER0_MAX_BYTES &&
       body.length > 0
     )
-      body = body.slice(0, -1)
+      body = wsTruncateUtf8(body, Buffer.byteLength(body) - 1)
   }
   const text = open + body + close
   return { text, usedBytes: Buffer.byteLength(text), fingerprint: wsSha(text) }
@@ -3876,14 +3877,10 @@ export function renderWorkingSetDeltaFrame(
   const close = `${WORKING_SET_FRAME_CLOSE}\n`
   const header = `${WORKING_SET_FRAME_OPEN} Namespace: ${wsHeaderValue(parent.namespace ?? state.namespace, 128)} | Active Task: ${wsHeaderValue(parent.task_id ?? parent.active_task_id, 128)} [${wsHeaderValue(parent.status, 32)}] | Epoch: ${state.epoch} | Turn: ${state.turn_seq}\n`
   const tier0Bytes = renderWorkingSetTier0Prefix(state, activeSession).usedBytes
-  const budget = Math.max(
-    Buffer.byteLength(header + close),
-    Math.min(
-      wsU32(options?.maxBytes)
-        ? (options!.maxBytes as number)
-        : WORKING_SET_MAX_FRAME_BYTES,
-      WORKING_SET_MAX_FRAME_BYTES - tier0Bytes
-    )
+  const maxAllowed = Math.max(0, WORKING_SET_MAX_FRAME_BYTES - tier0Bytes)
+  const budget = Math.min(
+    wsU32(options?.maxBytes) ? (options!.maxBytes as number) : maxAllowed,
+    maxAllowed
   )
   const goldenHeading = '[NeuroStrata Golden Rules — ALWAYS ENFORCED]\n'
   const workingHeading = '[NeuroStrata Working Set]\n'
@@ -3932,8 +3929,10 @@ export function renderWorkingSetDeltaFrame(
     workingHeading +
     workingLines.join('') +
     close
-  if (Buffer.byteLength(text) > budget)
+  if (Buffer.byteLength(text) > budget) {
     text = `${header}${workingHeading}${close}`
+    if (Buffer.byteLength(text) > budget) text = wsTruncateUtf8(text, budget)
+  }
   return { text, usedBytes: Buffer.byteLength(text), fingerprint: wsSha(text) }
 }
 
@@ -4010,7 +4009,8 @@ export function projectWorkingSetMessages(
     hotTailCount,
     stride
   )
-  if (frontier === 0) return { messages, quantizedFrontier: 0, foldedCount: 0 }
+  if (frontier === 0)
+    return { messages: [...messages], quantizedFrontier: 0, foldedCount: 0 }
   const roots = state.roots.length
   const stubs = state.evicted_stubs.length + state.tool_output_stubs.length
   const projected: unknown[] = []
@@ -4573,7 +4573,7 @@ export async function runWorkingSetPromptCycle(input: {
     scope.namespace,
     scope.sessionId,
     scope.projectRoot,
-    [...touches, ...activation.touches],
+    touches,
     wsExpansion
   )
   if (newTurn) state.active_turn_id = input.turnId!

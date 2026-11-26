@@ -7825,7 +7825,8 @@ describe('Task 5: typed edges and spreading activation', () => {
       wsParent(root, state)
       assert.equal((await core.loadWorkingSet(scope)).edges.length, 3)
 
-      const deduped = core.recordWorkingSetEdges(state, [
+      const fresh = wsState(scope)
+      const deduped = core.recordWorkingSetEdges(fresh, [
         { from: 'file:a', kind: 'GOVERNS', to: 'mem:1' },
         { from: 'file:a', kind: 'GOVERNS', to: 'mem:1' },
         { from: 'file:a', kind: 'CALLS', to: 'file:b' }
@@ -7835,12 +7836,39 @@ describe('Task 5: typed edges and spreading activation', () => {
         deduped.edges.map((edge) => `${edge.from}|${edge.kind}|${edge.to}`),
         ['file:a|CALLS|file:b', 'file:a|GOVERNS|mem:1']
       )
-      assert.equal(deduped.edges[0].last_touched_turn, state.turn_seq)
+      assert.equal(deduped.edges[0].last_touched_turn, fresh.turn_seq)
+
+      const merged = core.recordWorkingSetEdges(state, [
+        { from: 'file:a', kind: 'GOVERNS', to: 'mem:1' },
+        { from: 'file:b', kind: 'CALLS', to: 'file:a' }
+      ])
+      assert.equal(merged.edges.length, 5)
+      assert.ok(
+        merged.edges.some(
+          (edge) =>
+            edge.from === 'symbol:src/a.ts#f' &&
+            edge.kind === 'CONCEPTUAL_BRIDGE'
+        )
+      )
+      const overridden = core.recordWorkingSetEdges(merged, [
+        {
+          from: 'file:a',
+          kind: 'GOVERNS',
+          to: 'mem:1',
+          weight_bps: 1,
+          last_touched_turn: 7
+        }
+      ])
+      assert.equal(overridden.edges.length, 5)
+      assert.equal(
+        overridden.edges.find((edge) => edge.from === 'file:a').weight_bps,
+        1
+      )
 
       const many = Array.from({ length: 200 }, (_, i) =>
         wsEdge(`file:f${i}`, 'GOVERNS', `mem:m${i}`, 0, 10000)
       )
-      const capped = core.recordWorkingSetEdges(state, many)
+      const capped = core.recordWorkingSetEdges(fresh, many)
       assert.equal(capped.edges.length, 128)
     } finally {
       rmSync(root, { recursive: true, force: true })
@@ -7852,15 +7880,55 @@ describe('Task 5: typed edges and spreading activation', () => {
     const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-prune-')))
     const state = wsState(scope, {
       roots: [wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })],
+      young_gen: [wsNode('mem:alive', 'memory')],
       edges: wsSortedEdges(
         wsEdge('file:src/a.ts', 'GOVERNS', 'mem:alive', 1, 10000),
-        wsEdge('mem:gone', 'GOVERNS', 'mem:other', 1, 10000)
+        wsEdge('mem:gone', 'GOVERNS', 'mem:alive', 1, 10000),
+        wsEdge('file:src/a.ts', 'GOVERNS', 'mem:missing', 1, 10000)
       )
     })
     const swept = core.sweepWorkingSet(state)
     assert.equal(swept.edges.length, 1)
     assert.equal(swept.edges[0].from, 'file:src/a.ts')
+    assert.equal(swept.edges[0].to, 'mem:alive')
     rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('never mutates input edge objects across edge cycles', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-immutable-'))
+    try {
+      const scope = wsScope(root)
+      const edge = wsEdge(
+        'file:src/a.ts',
+        'GOVERNS',
+        'mem:r1',
+        0xffffffff,
+        10000
+      )
+      const state = wsState(scope, {
+        turn_seq: 0xffffffff,
+        roots: [wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })],
+        young_gen: [wsNode('mem:r1', 'memory')],
+        edges: [edge]
+      })
+      const snapshot = { ...edge }
+      core.recordWorkingSetEdges(state, [
+        { from: 'file:src/a.ts', kind: 'CALLS', to: 'mem:r1' }
+      ])
+      core.sweepWorkingSet(state)
+      await core.advanceWorkingSetTurn(
+        state,
+        scope.namespace,
+        scope.sessionId,
+        scope.projectRoot,
+        [],
+        async () => null
+      )
+      assert.deepEqual(state.edges[0], snapshot)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   it('activates 1-hop and 2-hop neighbors and terminates on cycles', async () => {
@@ -7994,6 +8062,40 @@ describe('Task 5: tier 0 / tier 2 split rendering', () => {
     rmSync(scope.projectRoot, { recursive: true, force: true })
   })
 
+  it('honors a tiny maxBytes without exceeding the combined frame budget', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-budget-')))
+    const state = goldenState(scope)
+    const parent = {
+      namespace: scope.namespace,
+      task_id: 'task-5',
+      status: 'in_progress'
+    }
+    const tier0 = core.renderWorkingSetTier0Prefix(state, parent)
+    const delta = core.renderWorkingSetDeltaFrame(state, parent, {
+      omitImmortalRules: true,
+      maxBytes: 32
+    })
+    assert.ok(delta.usedBytes <= 32)
+    assert.ok(tier0.usedBytes + delta.usedBytes <= 4096)
+    const multibyte = core.renderWorkingSetTier0Prefix(
+      wsState(scope, {
+        roots: [
+          wsNode('rule:multi', 'golden_rule', {
+            summary: '🧠🧠🧠🧠'.repeat(300)
+          })
+        ]
+      }),
+      parent
+    )
+    assert.equal(
+      Buffer.from(multibyte.text, 'utf8').toString('utf8'),
+      multibyte.text
+    )
+    assert.ok(multibyte.usedBytes <= 2048)
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
   it('renders a deterministic bounded compaction summary', async () => {
     const core = await import('./dist/index.js')
     const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-compact-')))
@@ -8050,6 +8152,10 @@ describe('Task 5: quantized stride window projection', () => {
     assert.equal(p35.quantizedFrontier, 16)
     assert.deepEqual(p28.messages.slice(0, 2), p35.messages.slice(0, 2))
     assert.deepEqual(p28.messages.slice(-12), messagesOf(28).slice(16))
+    const below = messagesOf(8)
+    const projectedBelow = core.projectWorkingSetMessages(below, state)
+    assert.notStrictEqual(projectedBelow.messages, below)
+    assert.deepEqual(projectedBelow.messages, below)
     rmSync(scope.projectRoot, { recursive: true, force: true })
   })
 
@@ -8117,6 +8223,44 @@ describe('Task 5: pre-turn prompt activation', () => {
         persisted.young_gen.find((node) => node.id === 'mem:r1')
           .last_touched_turn,
         1
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('stops spreading at two hops before the model call', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-3hop-'))
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        roots: [
+          wsNode('file:a', 'file', { path: 'a' }),
+          wsNode('file:b', 'file', { path: 'b' }),
+          wsNode('file:c', 'file', { path: 'c' })
+        ],
+        young_gen: [wsNode('mem:r3', 'memory')],
+        edges: wsSortedEdges(
+          wsEdge('file:a', 'GOVERNS', 'file:b', 0, 10000),
+          wsEdge('file:b', 'CALLS', 'file:c', 0, 5000),
+          wsEdge('file:c', 'GOVERNS', 'mem:r3', 0, 10000),
+          wsEdge('file:c', 'CALLS', 'file:b', 0, 5000)
+        )
+      })
+      wsParent(root, state)
+      const result = await core.runWorkingSetPromptCycle({
+        scope,
+        promptText: 'inspect file:a',
+        turnId: 'prompt-3hop'
+      })
+      assert.ok(result.activatedIds.includes('file:b'))
+      assert.ok(!result.activatedIds.includes('mem:r3'))
+      const persisted = await core.loadWorkingSet(scope)
+      assert.equal(
+        persisted.young_gen.find((node) => node.id === 'mem:r3')
+          .last_touched_turn,
+        0
       )
     } finally {
       rmSync(root, { recursive: true, force: true })
