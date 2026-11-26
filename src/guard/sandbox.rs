@@ -152,6 +152,22 @@ impl SandboxEvaluator {
             std::fs::canonicalize(cwd).map_err(|_| anyhow::anyhow!("Invalid cwd path"))?;
         let cwd_str = canonical_cwd.to_string_lossy().to_string();
 
+        // We only sandbox bash or known script commands for now. Any other
+        // action type needs no container: it already passed the deterministic
+        // and semantic rule checks, so the guard approves with a warning
+        // rather than rejecting action types the sandbox was never meant to
+        // run. This gate comes first: no mount ever occurs for a non-sandboxed
+        // action type, so the mount-oriented working-directory refusal below
+        // must not reject it either.
+        if action_type != "bash" && action_type != "script" {
+            return Ok(ValidateVerdict::ApprovedFailOpen {
+                warning: format!(
+                    "Sandbox execution not applicable for action_type '{}'; approved after deterministic and semantic rule checks",
+                    action_type
+                ),
+            });
+        }
+
         if let Some(refused) = working_directory_refusal(&cwd_str) {
             return Ok(ValidateVerdict::DeterministicReject {
                 reasons: vec![format!(
@@ -162,20 +178,6 @@ impl SandboxEvaluator {
                     "Never attempt to interact with or mount sensitive host system paths."
                         .to_string(),
                 ],
-            });
-        }
-
-        // We only sandbox bash or known script commands for now. Any other
-        // action type needs no container: it already passed the deterministic
-        // and semantic rule checks, so the guard approves with a warning
-        // rather than rejecting action types the sandbox was never meant to
-        // run.
-        if action_type != "bash" && action_type != "script" {
-            return Ok(ValidateVerdict::ApprovedFailOpen {
-                warning: format!(
-                    "Sandbox execution not applicable for action_type '{}'; approved after deterministic and semantic rule checks",
-                    action_type
-                ),
             });
         }
 
