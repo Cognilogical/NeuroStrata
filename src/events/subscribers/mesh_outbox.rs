@@ -138,7 +138,16 @@ impl MemorySubscriber for MeshOutbox {
         match event {
             ThalamicPulse::Created { id, namespace, .. } => {
                 if let Some(payload) = self.read(ctx, namespace, id).await? {
-                    if let Some(entry) = self.entry(OP_CREATED, id, namespace, payload, None, stamp)
+                    // A replayed `Created` can arrive after the row was
+                    // archived or retired. Exporting it as a creation would
+                    // make the mesh worker overwrite the newer lifecycle, so
+                    // replay the state the payload actually records.
+                    let op = if payload_is_retired(&payload.metadata) {
+                        OP_ARCHIVED
+                    } else {
+                        OP_CREATED
+                    };
+                    if let Some(entry) = self.entry(op, id, namespace, payload, None, stamp)
                     {
                         entries.push(entry);
                     }
@@ -165,9 +174,12 @@ impl MemorySubscriber for MeshOutbox {
                     }
                 }
                 if let Some(payload) = self.read(ctx, namespace, new_id).await? {
-                    if let Some(entry) =
-                        self.entry(OP_CREATED, new_id, namespace, payload, None, stamp)
-                    {
+                    let op = if payload_is_retired(&payload.metadata) {
+                        OP_ARCHIVED
+                    } else {
+                        OP_CREATED
+                    };
+                    if let Some(entry) = self.entry(op, new_id, namespace, payload, None, stamp) {
                         entries.push(entry);
                     }
                 }
@@ -264,6 +276,31 @@ impl MeshOutbox {
             epoch: self.epoch,
             bus_seq: stamp.bus_seq,
         })
+    }
+}
+
+/// Whether a captured payload already records a retired/archived lifecycle.
+/// A replayed creation must not export an `Active` lifecycle over it.
+fn payload_is_retired(metadata: &serde_json::Value) -> bool {
+    let archived = match metadata.get("archived") {
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::Number(value)) => value.as_i64().unwrap_or(0) != 0,
+        Some(serde_json::Value::String(value)) => {
+            matches!(value.as_str(), "1" | "true" | "TRUE" | "True")
+        }
+        _ => false,
+    };
+    if archived {
+        return true;
+    }
+    match metadata.get("valid_to") {
+        Some(serde_json::Value::Number(value)) => value
+            .as_i64()
+            .is_some_and(|ts| ts > 0 && ts <= chrono::Utc::now().timestamp()),
+        Some(serde_json::Value::String(value)) => value
+            .parse::<i64>()
+            .is_ok_and(|ts| ts > 0 && ts <= chrono::Utc::now().timestamp()),
+        _ => false,
     }
 }
 
@@ -370,6 +407,46 @@ mod tests {
         assert_eq!(
             pending[0].metadata["eligibility"],
             serde_json::json!("shareable")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_created_pulse_for_a_retired_row_captures_the_archive() {
+        let dir = scratch("replayed-created-retired");
+        let outbox_dir = dir.join("mesh");
+        let wake = Arc::new(Notify::new());
+        let (bus, store) = wired("replayed-created-retired-db", outbox_dir.clone(), wake).await;
+
+        let id = uuid::Uuid::now_v7().to_string();
+        store
+            .upsert(
+                "ns",
+                &id,
+                vec![0.0; TEST_DIMENSIONS],
+                payload(
+                    "fact",
+                    serde_json::json!({ "eligibility": "shareable", "archived": 1 }),
+                ),
+            )
+            .await
+            .unwrap();
+
+        bus.emit(
+            ThalamicPulse::Created {
+                id: id.clone(),
+                namespace: "ns".to_string(),
+                kind: "fact".to_string(),
+            },
+            &RecursionToken::root(),
+        );
+        tokio::time::sleep(DISPATCH_WAIT).await;
+
+        let outbox = Outbox::open(&outbox_dir).unwrap();
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].op, OP_ARCHIVED,
+            "a replay must export the row's current retired lifecycle, not resurrect it as Created"
         );
     }
 
