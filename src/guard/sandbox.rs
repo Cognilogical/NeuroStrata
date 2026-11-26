@@ -455,9 +455,21 @@ async fn run_child_with_timeout_named(
             if let Err(e) = child.start_kill() {
                 warn!("Sandbox timeout: failed to kill child: {}", e);
             }
-            // Reap the killed child so no zombie survives the verdict.
-            if let Err(e) = child.wait().await {
-                warn!("Sandbox timeout: failed to reap child: {}", e);
+            // Reap the killed child so no zombie survives the verdict. The
+            // reap itself is bounded: if the kill failed or the child will
+            // not die, an unbounded `wait()` would defeat the timeout, so
+            // after the bound the TimedOut verdict is returned regardless.
+            const POST_KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+            match timeout(POST_KILL_WAIT_TIMEOUT, child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!("Sandbox timeout: failed to reap child: {}", e);
+                }
+                Err(_) => {
+                    warn!(
+                        "Sandbox timeout: child did not exit within {POST_KILL_WAIT_TIMEOUT:?} after kill; returning TimedOut without reaping"
+                    );
+                }
             }
             // Killing the `podman run` client does not stop the container it
             // created. Remove it by the name passed to `--name`.
