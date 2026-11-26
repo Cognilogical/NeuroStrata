@@ -305,13 +305,34 @@ fn oxiri_pin_matches_the_spareval_dependency_edge() {
 #[test]
 fn dockerfile_base_stays_on_ubuntu_24_04_lts() {
     let dockerfile = read_relative("Dockerfile.base");
-    assert!(
-        dockerfile.contains("FROM ubuntu:24.04"),
-        "Dockerfile.base must stay on Ubuntu 24.04 LTS until the 26.04 LTS migration in #339 is unblocked"
+    // Only active (non-comment) directives count: stale strings left in a
+    // comment or an unused stage must not satisfy the gate.
+    let active: Vec<&str> = dockerfile
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+
+    let from_image = active
+        .iter()
+        .find(|line| line.starts_with("FROM "))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_else(|| panic!("Dockerfile.base has no active FROM directive: {active:?}"));
+    assert_eq!(
+        from_image, "ubuntu:24.04",
+        "Dockerfile.base must stay on Ubuntu 24.04 LTS until the 26.04 LTS migration in #339 is unblocked; active FROM is {from_image:?}"
     );
+
+    let installs_libicu74 = active.iter().any(|line| {
+        line.starts_with("RUN ")
+            && (line.contains("apt-get install") || line.contains("apt install"))
+            && line
+                .split(|character: char| character.is_whitespace() || character == '&')
+                .any(|token| token == "libicu74")
+    });
     assert!(
-        dockerfile.contains("libicu74"),
-        "Dockerfile.base must install libicu74, the ICU package shipped by Ubuntu 24.04; a different package means the base image moved"
+        installs_libicu74,
+        "Dockerfile.base must install libicu74 in its active RUN/apt directive, the ICU package shipped by Ubuntu 24.04; a different package means the base image moved"
     );
 }
 
