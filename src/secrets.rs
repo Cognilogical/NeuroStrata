@@ -1407,12 +1407,19 @@ mod tests {
     #[test]
     fn redact_keeps_a_secret_whole_across_a_block_cut() {
         let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
-        let next_line = format!("{}\npassword=\nhunter22", "x".repeat(MAX_SCAN_BYTES - 11));
-        let one_line = format!("{} {key} done", "x ".repeat((MAX_SCAN_BYTES - 20) / 2));
-        for text in [next_line, one_line] {
+        let filler = "x".repeat(MAX_SCAN_BYTES - 11);
+        let next_line = format!("{filler}\npassword=\nhunter22");
+        let words = "x ".repeat((MAX_SCAN_BYTES - 20) / 2);
+        let one_line = format!("{words} {key} done");
+        // Only the secret is replaced: the text around it is kept whole.
+        let expected = [
+            format!("{filler}\npassword=\n[REDACTED:password]"),
+            format!("{words} [REDACTED:github_pat] done"),
+        ];
+        for (text, expected) in [next_line, one_line].into_iter().zip(expected) {
             let (scrubbed, found) = redact(&text);
-            assert!(!scrubbed.contains("hunter22") && !scrubbed.contains(key), "{found:?}");
             assert_eq!(found.len(), 1, "{found:?}");
+            assert!(scrubbed == expected, "{found:?}");
             assert_eq!(redact(&scrubbed), (scrubbed.clone(), vec![]));
         }
     }
