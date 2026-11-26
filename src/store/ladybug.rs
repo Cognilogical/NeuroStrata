@@ -4933,9 +4933,14 @@ impl FirstWriteMarker {
                 );
             }
             let persisted = existing.descriptor();
-            if let Some(descriptor) = self.descriptor() {
-                if !persisted.compatible(&descriptor) {
-                    return Err(persisted_marker_refusal(&persisted, &descriptor));
+            // Only a bound serving descriptor can establish that this write's
+            // vectors belong to the persisted space. An unbound process can
+            // recycle a store-read vector (which is already in the recorded
+            // space) without embedding anything, so comparing it against the
+            // *configured* model would refuse a write that mixes no spaces.
+            if let Some(descriptor) = &self.serving {
+                if !persisted.compatible(descriptor) {
+                    return Err(persisted_marker_refusal(&persisted, descriptor));
                 }
             }
             return Ok(());
@@ -5000,21 +5005,26 @@ impl StoreIdentityAdoption {
         if read_store_identity_marker(conn)?.is_some() {
             return Ok(false);
         }
-        let rows = match conn.query("MATCH (m:Memory) RETURN count(m)") {
-            Ok(mut result) => match result.next().and_then(|row| row.first().cloned()) {
-                Some(lbug::Value::Int64(rows)) => rows,
-                _ => return Ok(false),
-            },
+        let facts = match inspect_memory_embedding_and_count(conn) {
+            Ok(facts) => facts,
             Err(e) => {
-                tracing::debug!("embedding-marker adoption skipped: row count unavailable ({e})");
+                tracing::debug!("embedding-marker adoption skipped: catalog unavailable ({e})");
                 return Ok(false);
             }
         };
+        let rows = facts.row_count().unwrap_or(0);
         if rows <= 0 {
             // A store with no data has no producer to record yet: the first
             // vector's writer turn writes the marker.
             return Ok(false);
         }
+        let Some(physical_width) = facts.physical_width() else {
+            // No attested vector width means the store cannot prove which
+            // space its rows came from. Recording a guess here would pin a
+            // false marker and refuse the later correct model.
+            tracing::debug!("embedding-marker adoption skipped: the store attests no embedding width");
+            return Ok(false);
+        };
         let adopted_at = chrono::Utc::now().to_rfc3339();
         let marker = match self.cached_store_state() {
             CachedStoreState::Recorded(recorded) => Some(
@@ -5045,6 +5055,14 @@ impl StoreIdentityAdoption {
             );
             return Ok(false);
         };
+        if marker.dims != physical_width {
+            tracing::debug!(
+                "embedding-marker adoption skipped: the store's FLOAT[{}] rows do not match the recorded identity's {} dimensions",
+                physical_width,
+                marker.dims
+            );
+            return Ok(false);
+        }
         #[cfg(test)]
         if self.fail_write.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("injected StoreIdentity marker write failure");
@@ -5908,13 +5926,36 @@ impl LadybugStore {
     /// AC-F1/SA-F2). The gate lives here, inside the function, so
     /// both `init` call sites (the schema-ready fast path and the
     /// post-closure call) are covered.
-    fn maintain_store_state(&self) {
+    async fn maintain_store_state(&self) {
+        let marker = match self.with_conn(|conn| read_store_identity_marker(conn)).await {
+            Ok(marker) => marker,
+            Err(error) => {
+                // Without the marker we cannot tell whether rewriting the
+                // sidecar would create a marker/sidecar disagreement. Leave
+                // both records exactly as found; a later verified open retries.
+                tracing::warn!(
+                    "store-state sidecar maintenance skipped: the identity marker is unreadable: {error}"
+                );
+                return;
+            }
+        };
         match self.cached_store_state() {
             CachedStoreState::Recorded(recorded)
                 if !recorded.has_data && self.open_provenance.is_verified() =>
             {
                 if let Some(serving) = self.serving_descriptor() {
-                    if serving != recorded.descriptor && self.serving_matches_configured(&serving) {
+                    // A persisted marker already names the vectors' producer.
+                    // Rewriting a pristine sidecar to a different serving
+                    // model here would poison the store: the write gate then
+                    // sees marker != sidecar and refuses every later write,
+                    // including a reopen under the marker's own model.
+                    let marker_disagrees = marker
+                        .as_ref()
+                        .is_some_and(|marker| !marker.descriptor().compatible(&serving));
+                    if serving != recorded.descriptor
+                        && self.serving_matches_configured(&serving)
+                        && !marker_disagrees
+                    {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
                         match crate::model_choice::write_store_state_identity(
                             &self.local_path,
@@ -10981,7 +11022,7 @@ impl VectorStore for LadybugStore {
         if self.schema_ready.load(std::sync::atomic::Ordering::Acquire) {
             // A previous init in this process already succeeded; the
             // sidecar maintenance is cached and idempotent.
-            self.maintain_store_state();
+            self.maintain_store_state().await;
             // #91, #81: a LockedUnknown store whose first init ran
             // before `serving` was bound, or suffered a transient
             // sidecar write error, would stay unrecorded forever
@@ -11335,7 +11376,7 @@ impl VectorStore for LadybugStore {
             }
             // First successful init: record the store's pristine state
             // (or adopt a new configured descriptor while pristine).
-            self.maintain_store_state();
+            self.maintain_store_state().await;
             // #409: bounded, report-only row-identity audit on the first
             // init. It never blocks or undoes the open.
             self.audit_row_identity_at_init().await;
