@@ -22,8 +22,10 @@ impl std::error::Error for LockPoisoned {}
 
 /// Acquires `m`, mapping poisoning to the typed [`LockPoisoned`] error.
 ///
-/// This is the one acquisition policy for the daemon: never panic, never
-/// silently recover the guarded payload.
+/// This is the acquisition policy for the subsystems converted under #415
+/// (blob store, recall metrics, ingest jobs, event bus): never panic, never
+/// silently recover the guarded payload. Other shared-state locks in the
+/// daemon still recover via `into_inner()` and are not covered by it yet.
 pub fn lock_or_err<T>(m: &Mutex<T>) -> Result<MutexGuard<'_, T>, LockPoisoned> {
     m.lock().map_err(|_| LockPoisoned)
 }
