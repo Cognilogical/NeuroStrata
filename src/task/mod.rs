@@ -2314,6 +2314,11 @@ pub async fn handle_task_create(
         Ok(n) => n,
         Err(e) => return e,
     };
+    // Format validation must precede any store access: resolve_namespace lists
+    // the catalog, so a rejected namespace would otherwise reach the store.
+    if let Err(e) = check_namespace(namespace) {
+        return e;
+    }
     let title = match arg_str(&args, "title") {
         Some(t) => match check_title(t) {
             Ok(v) => v,
@@ -2324,9 +2329,6 @@ pub async fn handle_task_create(
         }
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
-        return e;
-    }
 
     // A typo'd namespace would silently fork the stratum. New projects seed
     // their first task through neurostrata_bootstrap instead.
@@ -13037,6 +13039,24 @@ exit 0
                 "{illegal:?} reached the store"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn handle_task_create_refuses_illegal_namespace_before_any_store_access() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_create(
+            json!({ "namespace": "team:proj", "title": "probe task" }),
+            emb(),
+            store,
+        )
+        .await;
+        assert!(reply.starts_with("ERROR [NAMESPACE]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "format validation must run before resolve_namespace consults the store"
+        );
     }
 
     #[tokio::test]

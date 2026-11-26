@@ -14,6 +14,7 @@ use crate::traits::{
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// One stored row: the namespace it belongs to, its id, its vector, its payload.
@@ -38,6 +39,9 @@ pub struct MockStore {
     get_fails: Mutex<bool>,
     /// Track which (namespace, id) pairs have had increment_access_count called.
     incremented_ids: Mutex<Vec<(String, String)>>,
+    /// How many times `list_namespaces` was called. Handlers that must reject
+    /// caller input before touching the store assert this stays zero.
+    list_namespaces_calls: AtomicUsize,
 }
 
 impl MockStore {
@@ -47,7 +51,13 @@ impl MockStore {
             search_fails: Mutex::new(false),
             get_fails: Mutex::new(false),
             incremented_ids: Mutex::new(Vec::new()),
+            list_namespaces_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// The number of `list_namespaces` calls this store has served.
+    pub fn list_namespaces_calls(&self) -> usize {
+        self.list_namespaces_calls.load(Ordering::SeqCst)
     }
 
     /// The `hit_count` the store holds for a row, exactly as it is persisted.
@@ -344,6 +354,7 @@ impl VectorStore for MockStore {
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>> {
+        self.list_namespaces_calls.fetch_add(1, Ordering::SeqCst);
         let rows = self.rows.lock().expect("mock store lock");
         let mut names: Vec<String> = Vec::new();
         for r in rows.iter() {

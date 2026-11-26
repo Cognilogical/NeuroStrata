@@ -5292,12 +5292,18 @@ async fn handle_add_memory(
         Some(n) => n,
         None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace. NEVER default to 'global' unless instructed.".to_string(),
     };
-    let namespace = resolve_namespace(&store, namespace).await;
-    let namespace = namespace.as_str();
-
+    // Format validation must precede any store access: resolve_namespace lists
+    // the catalog, so a rejected namespace would otherwise reach the store.
     if let Err(e) = crate::domain::validate_namespace(namespace) {
         return e.to_string();
     }
+    if let Some(id) = arguments.get("id").and_then(|v| v.as_str()) {
+        if let Err(e) = crate::domain::validate_id(id) {
+            return e.to_string();
+        }
+    }
+    let namespace = resolve_namespace(&store, namespace).await;
+    let namespace = namespace.as_str();
 
     if namespace != "global" {
         if let Some(project_root) = arguments.get("project_root").and_then(|r| r.as_str()) {
@@ -16995,6 +17001,47 @@ mod tests {
         )
         .await;
         assert!(text.starts_with("ERROR [NAMESPACE]"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn handle_get_memory_refuses_illegal_namespace_before_any_store_access() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let text = crate::handlers::memory::handle_get_memory(
+            serde_json::json!({ "id": "mem-1", "namespace": "team:proj" }),
+            store,
+        )
+        .await;
+        assert!(text.starts_with("ERROR [NAMESPACE]"), "{text}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "format validation must run before resolve_namespace consults the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_add_memory_refuses_illegal_namespace_before_any_store_access() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_add_memory(
+            serde_json::json!({
+                "content": "a memory that must never be written",
+                "namespace": "team:proj",
+                "project_root": "/tmp",
+            }),
+            Arc::new(StubEmbedder),
+            store,
+            None,
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.starts_with("ERROR [NAMESPACE]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "format validation must run before resolve_namespace consults the store"
+        );
     }
 
     // ── Capability C remediation: production presentation surfaces ────────

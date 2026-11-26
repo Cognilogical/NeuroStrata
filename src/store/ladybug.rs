@@ -19160,6 +19160,15 @@ eurostrata\src\daemon.rs",
             .await
             .expect_err("an illegal namespace must be refused");
         assert!(err.to_string().starts_with("ERROR [NAMESPACE]"), "{err}");
+        let namespaces = store.list_namespaces().await.unwrap();
+        assert!(
+            !namespaces.iter().any(|ns| ns == "bad/ns"),
+            "an illegal namespace must never be catalogued: {namespaces:?}"
+        );
+        assert!(
+            store.list("bad/ns", None, None).await.unwrap().is_empty(),
+            "an illegal namespace must hold no rows"
+        );
         assert!(store.list("probe", None, None).await.unwrap().is_empty());
     }
 
