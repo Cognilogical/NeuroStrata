@@ -400,13 +400,26 @@ fn artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned() {
         let text = read_path(&path);
         for (index, line) in text.lines().enumerate() {
             let trimmed = line.trim();
-            let Some(rest) = trimmed.strip_prefix("uses:") else {
+            // A step is a YAML sequence entry: `- uses: ...`. Strip the
+            // sequence marker first, or every unnamed step is skipped.
+            let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+            // The key may be quoted (`"uses": ...` / `'uses': ...`).
+            let trimmed_owned = trimmed
+                .replace("\"uses\"", "uses")
+                .replace("'uses'", "uses");
+            let trimmed = trimmed_owned.as_str();
+            let Some(rest) = trimmed
+                .strip_prefix("uses:")
+                .or_else(|| trimmed.strip_prefix("uses :"))
+            else {
                 continue;
             };
             let rest = rest.trim();
-            let Some(target) = rest.split_whitespace().next() else {
+            let Some(raw_target) = rest.split_whitespace().next() else {
                 continue;
             };
+            // The value may be quoted (`uses: "actions/checkout@..."`).
+            let target = raw_target.trim_matches(['"', '\'']);
             let Some((action, reference)) = target.split_once('@') else {
                 continue;
             };
@@ -423,7 +436,7 @@ fn artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned() {
                 index + 1
             );
 
-            let comment = rest[target.len()..].trim();
+            let comment = rest[raw_target.len()..].trim();
             let version_token = comment
                 .split_whitespace()
                 .find(|token| token.starts_with('v') || token.starts_with('V'))
