@@ -1980,15 +1980,22 @@ fn resolved_store_limits() -> StoreLimits {
 /// under this even when the cap does.
 const ENGINE_MIN_DB_BYTES: u64 = 8 * 1024 * 1024;
 
+/// The largest power of two a `u64` can hold. `u64::next_power_of_two` panics
+/// above `1 << 63`, so the backstop's round-up saturates here.
+const MAX_POWER_OF_TWO_U64: u64 = 1 << 63;
+
 /// The engine's `max_db_size` backstop: a store that is already above a newly
 /// lowered cap must still open so it can be read, archived, and pruned. A cap
 /// of 0 leaves the engine's own default alone. The engine rejects a
 /// `max_db_size` that is not a power of two, so the chosen size is rounded up.
+/// `next_power_of_two` panics above `1 << 63`, so the round-up saturates at
+/// that largest power-of-two `u64` instead of overflowing on a wild byte count.
 fn size_cap_backstop(cap: u64, current_store_bytes: u64) -> Option<u64> {
     (cap != 0).then(|| {
         cap.max(current_store_bytes)
             .max(ENGINE_MIN_DB_BYTES)
-            .next_power_of_two()
+            .checked_next_power_of_two()
+            .unwrap_or(MAX_POWER_OF_TWO_U64)
     })
 }
 
@@ -18239,6 +18246,23 @@ eurostrata\src\daemon.rs",
             size_cap_backstop(16 * MIB, 20 * MIB + 1),
             Some(32 * MIB),
             "the engine requires a power of two, so a real over-cap byte count rounds up"
+        );
+        // `next_power_of_two` panics above `1 << 63`; the round-up must instead
+        // saturate at the largest power-of-two `u64`.
+        assert_eq!(
+            size_cap_backstop(u64::MAX, 0),
+            Some(MAX_POWER_OF_TWO_U64),
+            "a wild cap must saturate instead of panicking"
+        );
+        assert_eq!(
+            size_cap_backstop((1u64 << 63) + 1, 0),
+            Some(MAX_POWER_OF_TWO_U64),
+            "one byte over the largest power of two must saturate, not panic"
+        );
+        assert_eq!(
+            size_cap_backstop(0, u64::MAX),
+            None,
+            "0 still leaves the engine alone even with a wild store size"
         );
     }
 
