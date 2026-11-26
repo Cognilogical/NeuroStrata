@@ -12,6 +12,7 @@ use super::{
     ThalamicPulse,
 };
 use crate::traits::{MemoryPayload, RelocateOutcome, SearchResult, VectorStore};
+use crate::util::lock_or_err;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -181,7 +182,15 @@ impl Queue {
     /// pulse just pushed is also the oldest, and goes. The caller counts an
     /// eviction as a drop.
     fn push(&self, event: ThalamicPulse, capacity: usize) -> bool {
-        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        let mut items = match lock_or_err(&self.items) {
+            Ok(items) => items,
+            Err(error) => {
+                tracing::error!(
+                    "events::bus::Queue::push: queue mutex is poisoned; dropping pulse: {error}"
+                );
+                return true;
+            }
+        };
         items.push_back(event);
         let evicted = if items.len() > capacity {
             items.pop_front();
@@ -197,14 +206,27 @@ impl Queue {
     }
 
     fn pop(&self) -> Option<ThalamicPulse> {
-        self.items
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop_front()
+        match lock_or_err(&self.items) {
+            Ok(mut items) => items.pop_front(),
+            Err(error) => {
+                tracing::error!(
+                    "events::bus::Queue::pop: queue mutex is poisoned; reporting empty: {error}"
+                );
+                None
+            }
+        }
     }
 
     fn len(&self) -> usize {
-        self.items.lock().unwrap_or_else(|e| e.into_inner()).len()
+        match lock_or_err(&self.items) {
+            Ok(items) => items.len(),
+            Err(error) => {
+                tracing::error!(
+                    "events::bus::Queue::len: queue mutex is poisoned; reporting depth 0: {error}"
+                );
+                0
+            }
+        }
     }
 }
 
@@ -278,7 +300,15 @@ impl ThalamicBus {
     /// registry is append-only: ids are stable, and dispatch always sees the
     /// full list as of the pulse it is handling.
     pub fn register(&self, sub: Box<dyn MemorySubscriber>) -> SubscriberId {
-        let mut subs = self.subs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut subs = match lock_or_err(&self.subs) {
+            Ok(subs) => subs,
+            Err(error) => {
+                tracing::error!(
+                    "events::bus::ThalamicBus::register: subscriber registry is poisoned; refusing subscriber: {error}"
+                );
+                return SubscriberId::MAX;
+            }
+        };
         subs.push(Arc::from(sub));
         subs.len() - 1
     }
@@ -332,10 +362,19 @@ impl ThalamicBus {
     /// snapshot satisfies `events_emitted == dispatcher_handled + queue_depth
     /// + drops_oldest`.
     pub fn metrics(&self) -> BusMetrics {
+        let subscribers = match lock_or_err(&self.subs) {
+            Ok(subs) => subs.len(),
+            Err(error) => {
+                tracing::error!(
+                    "events::bus::ThalamicBus::metrics: subscriber registry is poisoned; reporting none: {error}"
+                );
+                0
+            }
+        };
         BusMetrics {
             events_emitted: self.metrics.events_emitted.load(Ordering::Relaxed),
             dispatcher_handled: self.metrics.dispatcher_handled.load(Ordering::Relaxed),
-            subscribers: self.subs.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            subscribers,
             queue_depth: self.queue.len(),
             drops_oldest: self.metrics.drops_oldest.load(Ordering::Relaxed),
             subscriber_panics: self.metrics.subscriber_panics.load(Ordering::Relaxed),
@@ -432,8 +471,18 @@ async fn dispatch(
             ts,
         };
 
-        let registered: Vec<Arc<dyn MemorySubscriber>> =
-            subs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let registered: Vec<Arc<dyn MemorySubscriber>> = match lock_or_err(&subs) {
+            Ok(subs) => subs.clone(),
+            Err(error) => {
+                tracing::error!(
+                    "events::bus::dispatch: subscriber registry is poisoned; skipping pulse: {error}"
+                );
+                // One pulse skipped, not the dispatcher: keep the loop alive
+                // and keep the handled accounting invariant intact.
+                metrics.dispatcher_handled.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        };
         for sub in registered.iter() {
             // A fresh depth-1 token per subscriber: the token exists to refuse
             // a subscriber emitting from inside its own invocation.
@@ -1299,5 +1348,112 @@ mod tests {
         assert_eq!(m.drops_oldest, 1);
         assert_eq!(m.queue_depth, 0);
         assert_eq!(*bp.borrow(), BackpressureEvent::Dropped { count: 1 });
+    }
+
+    /// Poison `mutex` from a thread that panics while holding its guard.
+    fn poison<T: Send + 'static>(mutex: Arc<Mutex<T>>) {
+        let handle = std::thread::spawn(move || {
+            let _guard = mutex.lock().expect("poison target lock");
+            panic!("poison the lock on purpose");
+        });
+        assert!(handle.join().is_err(), "the poisoner must unwind");
+    }
+
+    /// A poisoned queue must drop the incoming pulse (counted as a drop),
+    /// report empty, and report depth 0 -- never recover the half-mutated
+    /// deque.
+    #[test]
+    fn poisoned_queue_degrades_not_panics() {
+        let queue = Arc::new(Queue {
+            items: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+        });
+        let poisoner = Arc::clone(&queue);
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.items.lock().expect("queue lock");
+            panic!("poison the queue on purpose");
+        });
+        assert!(handle.join().is_err(), "the poisoner must unwind");
+
+        let pulse = ThalamicPulse::Archived {
+            id: "poisoned".into(),
+            namespace: "n".into(),
+        };
+        assert!(
+            queue.push(pulse, 16),
+            "a poisoned push must count the incoming pulse as dropped"
+        );
+        assert!(
+            queue.pop().is_none(),
+            "a poisoned pop must report empty rather than recover the deque"
+        );
+        assert_eq!(queue.len(), 0, "a poisoned queue must report depth 0");
+    }
+
+    /// `register` must refuse the subscriber and `metrics` must report none:
+    /// appending to a recovered registry would silently mutate state a
+    /// panicking thread left mid-operation.
+    #[tokio::test]
+    async fn poisoned_registry_degrades_not_panics() {
+        let bus = ThalamicBus::new(16);
+        poison(Arc::clone(&bus.subs));
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            bus.register(Box::new(CountingSubscriber { counter })),
+            SubscriberId::MAX,
+            "a poisoned register must refuse the subscriber, not append to a recovered list"
+        );
+        assert_eq!(
+            bus.metrics().subscribers,
+            0,
+            "a poisoned registry must report no subscribers instead of its recovered contents"
+        );
+    }
+
+    /// The dispatcher's per-pulse registry snapshot must skip that pulse and
+    /// keep looping. Recovering the registry would invoke subscribers that
+    /// were registered before the poison, which is exactly the silent
+    /// adoption this policy forbids.
+    #[tokio::test]
+    async fn poisoned_registry_snapshot_skips_one_pulse_not_the_dispatcher() {
+        let bus = ThalamicBus::new(16);
+        let counter = Arc::new(AtomicUsize::new(0));
+        bus.register(Box::new(CountingSubscriber {
+            counter: Arc::clone(&counter),
+        }));
+        poison(Arc::clone(&bus.subs));
+
+        for id in ["first", "second"] {
+            bus.emit(
+                ThalamicPulse::Created {
+                    id: id.into(),
+                    namespace: "n".into(),
+                    kind: "task".into(),
+                },
+                &RecursionToken::root(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let m = bus.metrics();
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            0,
+            "a poisoned snapshot must skip the pulse instead of invoking recovered subscribers"
+        );
+        assert_eq!(m.events_emitted, 2);
+        assert_eq!(
+            m.queue_depth, 0,
+            "the dispatcher must keep draining after a poisoned snapshot: {m:?}"
+        );
+        assert_eq!(
+            m.dispatcher_handled, 2,
+            "every skipped pulse is still accounted: {m:?}"
+        );
+        assert_eq!(
+            m.subscribers, 0,
+            "the poisoned registry reports no subscribers: {m:?}"
+        );
     }
 }

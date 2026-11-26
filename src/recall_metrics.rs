@@ -9,6 +9,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use crate::util::lock_or_err;
+
 #[cfg(test)]
 use std::sync::MutexGuard;
 
@@ -117,7 +119,15 @@ pub fn record_recall(namespace: &str, ids: &[String]) {
         // An empty recall response does not count toward the rate.
         return;
     }
-    let mut guard = RECENTLY_RECALLED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = match lock_or_err(&RECENTLY_RECALLED) {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::error!(
+                "recall_metrics::record_recall: recently-recalled registry is poisoned: {error}"
+            );
+            return;
+        }
+    };
     let map = guard.get_or_insert_with(HashMap::new);
     let deque = map.entry(namespace.to_string()).or_default();
     for id in ids {
@@ -133,7 +143,15 @@ pub fn record_recall(namespace: &str, ids: &[String]) {
 pub fn record_promotion(namespace: &str, id: &str) -> bool {
     #[cfg(test)]
     let _lock = maybe_acquire();
-    let mut guard = RECENTLY_RECALLED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = match lock_or_err(&RECENTLY_RECALLED) {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::error!(
+                "recall_metrics::record_promotion: recently-recalled registry is poisoned: {error}"
+            );
+            return false;
+        }
+    };
     let found = if let Some(map) = guard.as_mut() {
         if let Some(deque) = map.get_mut(namespace) {
             let before = deque.len();
@@ -161,8 +179,11 @@ pub fn reset_counters_for_tests() {
     SINGLE_DOMAIN_BYPASSES.store(0, Ordering::Relaxed);
     RECALL_RESPONSES.store(0, Ordering::Relaxed);
     RECALL_PROMOTIONS.store(0, Ordering::Relaxed);
-    if let Ok(mut g) = RECENTLY_RECALLED.lock() {
-        *g = None;
+    match lock_or_err(&RECENTLY_RECALLED) {
+        Ok(mut guard) => *guard = None,
+        Err(error) => tracing::error!(
+            "recall_metrics::reset_counters_for_tests: recently-recalled registry is poisoned: {error}"
+        ),
     }
 }
 
@@ -215,5 +236,48 @@ mod tests {
             ns,
             &format!("bounded-id-{}", RECENTLY_RECALLED_CAP + 4)
         ));
+    }
+
+    /// The recall registry is a process-global static, so poisoning it in the
+    /// test process would corrupt every sibling test. The scenario therefore
+    /// runs in a child process: poison there, prove the counter is skipped
+    /// rather than recovered, and let the child exit.
+    #[test]
+    fn poisoned_lock_returns_error_not_panic() {
+        const CHILD_ENV: &str = "NEUROSTRATA_RECALL_POISON_CHILD";
+        const TEST_NAME: &str = "recall_metrics::tests::poisoned_lock_returns_error_not_panic";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let poisoner = std::thread::spawn(|| {
+                let _guard = RECENTLY_RECALLED.lock().expect("recall registry lock");
+                panic!("poison the recall registry on purpose");
+            });
+            assert!(poisoner.join().is_err(), "the poisoner must unwind");
+
+            record_recall("poisoned-ns", &["id-1".to_string()]);
+            assert_eq!(
+                recall_snapshot()["recall_responses"].as_u64(),
+                Some(0),
+                "a poisoned registry must skip recording, not recover the payload"
+            );
+            assert!(
+                !record_promotion("poisoned-ns", "id-1"),
+                "a poisoned promotion check must degrade to false"
+            );
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("current test binary");
+        let output = std::process::Command::new(exe)
+            .args([TEST_NAME, "--exact", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("spawn recall poison child");
+        assert!(
+            output.status.success(),
+            "the child process must exit cleanly; poisoning a process-global static must not leak into sibling tests\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

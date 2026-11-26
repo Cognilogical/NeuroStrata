@@ -3,9 +3,10 @@
 //! The crate ships a binary target only (`src/main.rs`), so an integration
 //! test cannot import the module tree. The recall-closure state (the join
 //! between a recall and its later promotion — the completeness half of R12)
-//! lives in `src/recall_metrics.rs`, a module deliberately free of `crate::`
-//! dependencies, and is compiled here from its real path: the behavior under
-//! test is the file the binary ships, not a transcription.
+//! lives in `src/recall_metrics.rs`, compiled here from its real path: the
+//! behavior under test is the file the binary ships, not a transcription. The
+//! shared lock-poisoning helper it acquires mutexes through is compiled from
+//! its real path too.
 //!
 //! The exact-identifier/raw-distance SQL lane itself drives the real
 //! LadybugDB store, so it is exercised by store-level unit tests; this target
@@ -15,6 +16,8 @@
 
 #![allow(dead_code)]
 
+#[path = "../src/util.rs"]
+mod util;
 #[path = "../src/recall_metrics.rs"]
 mod recall_metrics;
 // The upgraded-search filter module is also deliberately `crate::`-free, so

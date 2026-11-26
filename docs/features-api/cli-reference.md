@@ -340,6 +340,14 @@ neurostrata-mcp doc-gate [--root <path>] [--json]
 - **Exit `1`:** Manifest violation (missing required files, prohibited substrings, surface-diff failures).
 - `--json`: Machine-readable report for CI integration.
 
+#### Poisoned-lock policy
+
+Shared process state is acquired through `lock_or_err` in `src/util.rs`. A poisoned lock (a thread
+panicked while holding it) never panics the daemon and never adopts the half-mutated payload:
+`Result`-returning operations fail with `LockPoisoned`, and non-`Result` operations degrade that one
+operation (for example, a poisoned event-bus registry snapshot skips one pulse while the dispatcher
+keeps running). Every poison emits `tracing::error!` naming the site.
+
 ### `workflow`
 
 Queries and manipulates the pluggable workflow lifecycle state machine and connector (`GitWorkflowConnector`, `ManifestWorkflowConnector`).
