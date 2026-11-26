@@ -387,9 +387,10 @@ pub(crate) const GIT_COMMAND_TIMEOUT_SECS: u64 = 30;
 /// How often the bounded wait polls the child for exit.
 const GIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// After killing a timed-out child, how long the drain threads are given to
-/// reach EOF. A grandchild that inherited the pipes (a remote helper, an ssh
-/// transport) can outlive the killed parent; the bound must not depend on it.
+/// After the child exits (normally, or killed on timeout), how long **each**
+/// drained stream is given to reach EOF. A grandchild that inherited the pipes
+/// (a remote helper, an ssh transport) can outlive the direct child; the bound
+/// must not depend on it.
 const GIT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// The per-call bound for mesh git subprocesses. `NEUROSTRATA_GIT_TIMEOUT_SECS`
@@ -413,7 +414,9 @@ pub(crate) fn git_timeout() -> Duration {
 /// a chatty git cannot deadlock on a full OS pipe buffer. The child is polled
 /// until it exits or the deadline passes; on expiry it is killed, reaped with
 /// `wait` (no zombie survives this call), and the error names the subcommand
-/// and the bound.
+/// and the bound. Either way the drain is bounded: a grandchild that inherited
+/// the pipes cannot hold the caller past [`GIT_DRAIN_GRACE`] per stream, and
+/// whatever the drain threads delivered is returned in full.
 pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
     let timeout = git_timeout();
     let display = args.join(" ");
@@ -468,22 +471,29 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
         }
     };
 
+    // The child exited cleanly, but EOF is not guaranteed: a grandchild may
+    // still hold the inherited pipes. Drain bounded (never a bare recv()) so a
+    // normal exit cannot hang, while a closed pipe still yields the full
+    // captured bytes.
+    let (stdout, stderr) = drain_within(&stdout_rx, &stderr_rx);
     Ok(Output {
         status,
-        stdout: stdout_rx.recv().unwrap_or_default(),
-        stderr: stderr_rx.recv().unwrap_or_default(),
+        stdout,
+        stderr,
     })
 }
 
-/// Wait at most [`GIT_DRAIN_GRACE`] in total for both drained streams to
-/// reach EOF (their threads keep running if they do not).
+/// Wait at most [`GIT_DRAIN_GRACE`] for **each** drained stream to reach EOF
+/// (their threads keep running if they do not) and return whatever arrived.
+/// A per-stream budget keeps a grandchild holding stdout from starving the
+/// stderr capture, and vice versa.
 fn drain_within(
     stdout_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
     stderr_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
-) {
-    let deadline = Instant::now() + GIT_DRAIN_GRACE;
-    let _ = stdout_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
-    let _ = stderr_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+) -> (Vec<u8>, Vec<u8>) {
+    let stdout = stdout_rx.recv_timeout(GIT_DRAIN_GRACE).unwrap_or_default();
+    let stderr = stderr_rx.recv_timeout(GIT_DRAIN_GRACE).unwrap_or_default();
+    (stdout, stderr)
 }
 
 pub(crate) fn run_ok(root: &Path, args: &[&str]) -> Result<Output> {
@@ -548,6 +558,9 @@ pub(crate) mod git_test_support {
     ///   stuck git), which is how the watchdog tests prove kill + reap;
     /// - `.flood-git` writes 2 MiB to stdout and 1 MiB to stderr, far past
     ///   any OS pipe buffer, which is how the drain test proves no deadlock.
+    /// - `.grandchild-git` leaves a background grandchild (`sleep 30`)
+    ///   holding both inherited pipes and exits 0 immediately, which is how
+    ///   the normal-exit test proves EOF is not a precondition for return.
     pub(crate) struct GitShim {
         dir: PathBuf,
     }
@@ -582,6 +595,10 @@ pub(crate) mod git_test_support {
                  if [ -f \"$target/.flood-git\" ]; then\n\
                  \thead -c 2097152 /dev/zero\n\
                  \thead -c 1048576 /dev/zero >&2\n\
+                 \texit 0\n\
+                 fi\n\
+                 if [ -f \"$target/.grandchild-git\" ]; then\n\
+                 \tsleep 30 &\n\
                  \texit 0\n\
                  fi\n\
                  exec '{real}' \"$@\"\n",
@@ -1135,6 +1152,54 @@ mod tests {
             out.stderr.len(),
             1024 * 1024,
             "stderr must be captured in full"
+        );
+    }
+
+    /// A direct child that exits 0 while a grandchild still holds the
+    /// inherited pipes must not hang the caller: the normal-exit path is
+    /// bounded exactly like the timeout path, and full output is still
+    /// captured whenever the writers do reach EOF.
+    #[cfg(unix)]
+    #[test]
+    fn git_normal_exit_with_grandchild_holding_pipes_returns_bounded() {
+        use super::git_test_support::{EnvRestore, GitShim};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let _env = crate::daemon::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = scratch("git-grandchild");
+        let pid_file = root.join("git.pid");
+        let shim = GitShim::install("grandchild", &pid_file);
+        let _path = shim.activate();
+        // Generous bound: the direct child exits at once, so the deadline must
+        // play no part. Only the drain grace may keep the caller waiting.
+        let _timeout = EnvRestore::set("NEUROSTRATA_GIT_TIMEOUT_SECS", "30");
+        std::fs::write(root.join(".grandchild-git"), b"").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let thread_root = root.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = run(&thread_root, &["log", "--oneline"]);
+            let _ = tx.send((result, started.elapsed()));
+        });
+
+        let (result, elapsed) = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "run() must return once the direct child exits 0 even when a grandchild still \
+                 holds stdout/stderr; waiting for EOF is the issue #416 hang",
+        );
+        let out = result.expect("a clean exit must be Ok even with a grandchild holding the pipes");
+
+        assert!(
+            out.status.success(),
+            "the shim exited 0, got {:?}",
+            out.status
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a normal exit must be bounded by the drain grace, took {elapsed:?}"
         );
     }
 

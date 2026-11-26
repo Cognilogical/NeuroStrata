@@ -613,6 +613,7 @@
       "tests": [
         "synaptic_mesh::storage::tests::git_hang_times_out_and_kills",
         "synaptic_mesh::storage::tests::git_large_output_does_not_deadlock",
+        "synaptic_mesh::storage::tests::git_normal_exit_with_grandchild_holding_pipes_returns_bounded",
         "synaptic_mesh::storage::tests::git_failure_surfaces_stderr",
         "synaptic_mesh::storage::tests::git_success_path_unchanged",
         "synaptic_mesh::storage::tests::git_timeout_defaults_for_unset_zero_and_unparsable_values",
