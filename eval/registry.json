@@ -589,6 +589,27 @@
         "ignored": 0
       }
     },
+    "daemon-logging": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp tests::tracing_output_reaches_stderr -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::stdout_carries_no_log_output -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::rust_log_filter_is_honored -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::unparsable_rust_log_falls_back_to_info -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::final_checkpoint_report_is_the_exit_report_whole_content -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::restore_holds_target_open_lock_until_database_and_provenance_are_installed -- --exact --test-threads=1"
+      ],
+      "tests": [
+        "tests::tracing_output_reaches_stderr",
+        "tests::stdout_carries_no_log_output",
+        "tests::rust_log_filter_is_honored",
+        "tests::unparsable_rust_log_falls_back_to_info",
+        "tests::final_checkpoint_report_is_the_exit_report_whole_content",
+        "tests::restore_holds_target_open_lock_until_database_and_provenance_are_installed"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "dependency-advisory": {
       "commands": [
         "cargo test --locked --test dependency_integrity -- --test-threads=1"
