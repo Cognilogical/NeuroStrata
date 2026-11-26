@@ -82,11 +82,23 @@ impl Version {
 /// bands even though both share major version 0.
 fn requirement_band(requirement: &str) -> (u64, u64) {
     let trimmed = requirement.trim();
-    let core = trimmed.trim_start_matches(|character: char| {
-        matches!(character, '^' | '~' | '=' | '>' | '<' | ' ')
-    });
+    // Only a plain, caret, tilde, or exact requirement naming a full
+    // major.minor is confined to one band. Comparison ranges (`>=`, `>`),
+    // wildcards, and multi-clause ranges can permit versions outside the
+    // band even when their first number sits inside it, so reject them
+    // instead of collapsing them onto that first number.
     assert!(
-        !core.is_empty() && !core.starts_with('*'),
+        !trimmed.contains([',', '*', '>', '<']),
+        "oxiri requirement {requirement:?} is a range or wildcard that can permit versions outside a single band; \
+         #339 requires a plain/caret/tilde/exact pin confined to the recorded band"
+    );
+    let core = trimmed
+        .strip_prefix('^')
+        .or_else(|| trimmed.strip_prefix('~'))
+        .or_else(|| trimmed.strip_prefix('='))
+        .unwrap_or(trimmed);
+    assert!(
+        !core.is_empty() && core.chars().next().is_some_and(|c| c.is_ascii_digit()),
         "oxiri requirement {requirement:?} does not name a concrete version band"
     );
     let core = core
@@ -104,7 +116,11 @@ fn requirement_band(requirement: &str) -> (u64, u64) {
         .unwrap_or_else(|_| panic!("oxiri requirement {requirement:?} has a non-numeric major"));
     let minor = components
         .next()
-        .unwrap_or("0")
+        .unwrap_or_else(|| {
+            panic!(
+                "oxiri requirement {requirement:?} names no minor component; a major-only requirement is not confined to one band"
+            )
+        })
         .parse::<u64>()
         .unwrap_or_else(|_| panic!("oxiri requirement {requirement:?} has a non-numeric minor"));
     (major, minor)
