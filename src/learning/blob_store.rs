@@ -90,6 +90,25 @@ mod tests {
     #[test]
     fn poisoned_lock_returns_error_not_panic() {
         let store = Arc::new(BlobStore::new().expect("create store"));
+        // Seed an entry BEFORE poisoning and read it back healthy: the
+        // poisoned assertions below are only discriminating if the cache
+        // provably held a value a guard-recovering `get` would return.
+        let seeded = MemoryPayload {
+            content: "seeded before poisoning".to_string(),
+            user_id: "u".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: "test".to_string(),
+            location_lines: "1".to_string(),
+            metadata: json!({}),
+        };
+        let seeded_hash = store.put(&seeded).expect("seed put");
+        assert_eq!(
+            store.get(&seeded_hash).as_deref(),
+            Some(seeded.content.as_bytes()),
+            "the seeded entry must be readable before poisoning"
+        );
+
         let poisoner = Arc::clone(&store);
         let handle = std::thread::spawn(move || {
             let _guard = poisoner.cache.lock().expect("cache lock");
@@ -114,9 +133,10 @@ mod tests {
             "put error must name poisoning: {error}"
         );
         assert_eq!(
-            store.get(&PayloadHash("sha256:any".to_string())),
+            store.get(&seeded_hash),
             None,
-            "get must degrade to None rather than adopt the recovered map"
+            "get must not return the seeded entry from a poisoned cache: \
+             recovering the guard would hand it back"
         );
     }
 }

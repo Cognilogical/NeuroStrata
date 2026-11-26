@@ -1377,6 +1377,21 @@ mod tests {
             notify: Notify::new(),
             poison_reported: AtomicBool::new(false),
         });
+        // Seed a pulse BEFORE poisoning: the assertions below are only
+        // discriminating if the deque provably held a pulse a
+        // guard-recovering `pop`/`len` would expose.
+        assert!(
+            !queue.push(
+                ThalamicPulse::Archived {
+                    id: "seeded".into(),
+                    namespace: "n".into(),
+                },
+                16
+            ),
+            "seeding a healthy queue evicts nothing"
+        );
+        assert_eq!(queue.len(), 1, "the seeded pulse must be queued");
+
         let poisoner = Arc::clone(&queue);
         let handle = std::thread::spawn(move || {
             let _guard = poisoner.items.lock().expect("queue lock");
@@ -1394,9 +1409,14 @@ mod tests {
         );
         assert!(
             queue.pop().is_none(),
-            "a poisoned pop must report empty rather than recover the deque"
+            "a poisoned pop must report empty rather than recover the deque \
+             and hand back the seeded pulse"
         );
-        assert_eq!(queue.len(), 0, "a poisoned queue must report depth 0");
+        assert_eq!(
+            queue.len(),
+            0,
+            "a poisoned queue must report depth 0, not the seeded pulse's depth"
+        );
         assert!(
             queue.poison_reported.load(Ordering::Relaxed),
             "the first poisoned acquisition must mark the queue's poison as reported, so later ones stay out of the log"
