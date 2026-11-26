@@ -182,15 +182,45 @@ pub(crate) enum RunOutcome {
 /// `Path::starts_with`, so `/etcetera` and `/homework` are ordinary project
 /// paths while `/etc` and `/home/user/project` are not. Returns the offending
 /// forbidden path for the rejection message.
-pub(crate) fn working_directory_refusal(cwd: &str) -> Option<&'static str> {
+///
+/// The current user's exact home directory is refused as well: mounting it
+/// would expose `.ssh`, `.aws`, shell history and every sibling project. Only
+/// the directory itself is refused, never its descendants, so a checkout at
+/// `~/project` stays a valid sandbox working directory.
+pub(crate) fn working_directory_refusal(cwd: &str) -> Option<String> {
+    let home = dirs::home_dir();
+    // `evaluate` canonicalizes the cwd before calling this; canonicalize the
+    // home too where possible so a symlinked home still compares equal.
+    let home = home.as_deref().map(|h| {
+        std::fs::canonicalize(h)
+            .ok()
+            .unwrap_or_else(|| h.to_path_buf())
+    });
+    working_directory_refusal_with_home(cwd, home.as_deref())
+}
+
+/// Pure core of [`working_directory_refusal`]: takes the home directory as a
+/// parameter so tests can exercise exact-home refusal without depending on
+/// the host's real home path.
+pub(crate) fn working_directory_refusal_with_home(
+    cwd: &str,
+    home: Option<&Path>,
+) -> Option<String> {
     let cwd = Path::new(cwd);
     if cwd == Path::new("/") {
-        return Some("/");
+        return Some("/".to_string());
     }
-    FORBIDDEN_WORKING_DIRECTORIES
+    if let Some(dir) = FORBIDDEN_WORKING_DIRECTORIES
         .iter()
         .copied()
         .find(|dir| cwd.starts_with(dir))
+    {
+        return Some(dir.to_string());
+    }
+    // Only the home directory itself is refused, never a descendant: a
+    // checkout at `~/project` must stay mountable.
+    home.filter(|home| cwd == *home)
+        .map(|home| home.to_string_lossy().into_owned())
 }
 
 /// Evaluate a payload in the sandbox, mapping a timeout to a rejection only
@@ -308,26 +338,36 @@ pub(crate) fn sandbox_run_args(cwd: &str) -> Vec<String> {
 /// Write the payload to the child's stdin, run the child under `limit`, and
 /// always leave no child behind: on timeout the child is killed and then
 /// reaped with `wait()` (a bare `start_kill` leaves a zombie and the pid
-/// stays visible to `kill -0`). Completed output is collected concurrently
-/// so a chatty payload cannot fill a pipe and deadlock the wait.
+/// stays visible to `kill -0`).
+///
+/// The stdout/stderr drains start before stdin is touched, and the stdin
+/// write plus `wait()` share one `limit` deadline. Either ordering mistake
+/// deadlocks: a child that writes more than a pipe buffer to stdout while we
+/// are still feeding stdin blocks on a full pipe, and a child that never
+/// reads stdin (`sleep 60`) blocks `write_all` forever, letting the sandbox
+/// outlive its timeout.
 pub(crate) async fn run_child_with_timeout(
     mut child: tokio::process::Child,
     payload: &str,
     limit: Duration,
 ) -> std::io::Result<RunOutcome> {
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        let bytes = payload.as_bytes();
-        if stdin.write_all(bytes).await.is_ok() && !bytes.ends_with(b"\n") {
-            let _ = stdin.write_all(b"\n").await;
-        }
-        let _ = stdin.shutdown().await;
-    }
-
     let stdout_task = tokio::spawn(read_pipe(child.stdout.take()));
     let stderr_task = tokio::spawn(read_pipe(child.stderr.take()));
 
-    match timeout(limit, child.wait()).await {
+    let wait = timeout(limit, async {
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let bytes = payload.as_bytes();
+            if stdin.write_all(bytes).await.is_ok() && !bytes.ends_with(b"\n") {
+                let _ = stdin.write_all(b"\n").await;
+            }
+            let _ = stdin.shutdown().await;
+        }
+        child.wait().await
+    })
+    .await;
+
+    match wait {
         Ok(status) => {
             let status = status?;
             let stdout = stdout_task.await.unwrap_or_default();
@@ -466,6 +506,47 @@ mod tests {
     }
 
     #[test]
+    fn exact_home_directory_is_refused_but_descendants_are_allowed() {
+        let home = Path::new("/Users/alice");
+        assert_eq!(
+            working_directory_refusal_with_home("/Users/alice", Some(home)).as_deref(),
+            Some("/Users/alice"),
+            "mounting the exact home directory would expose ~/.ssh and every sibling project"
+        );
+        assert_eq!(
+            working_directory_refusal_with_home("/Users/alice/", Some(home)).as_deref(),
+            Some("/Users/alice"),
+            "a trailing separator still names the home directory"
+        );
+        assert_eq!(
+            working_directory_refusal_with_home("/Users/alice/project/sub", Some(home)),
+            None,
+            "a project checkout under home stays a valid working directory"
+        );
+        // No home known (e.g. HOME/USERPROFILE unset): the exact-home rule
+        // cannot fire, but the forbidden list still does.
+        assert_eq!(
+            working_directory_refusal_with_home("/Users/alice", None),
+            None
+        );
+        assert_eq!(
+            working_directory_refusal_with_home("/etc", Some(home)).as_deref(),
+            Some("/etc")
+        );
+        // A different user's home is an ordinary path; `/Users` itself is not
+        // blanket-refused on macOS.
+        assert_eq!(
+            working_directory_refusal_with_home("/Users/bob/project", Some(home)),
+            None
+        );
+        assert_eq!(
+            working_directory_refusal_with_home("/Users/alice2", Some(home)),
+            None,
+            "component equality, not a string prefix"
+        );
+    }
+
+    #[test]
     fn a_project_working_directory_is_allowed() {
         for cwd in [
             "/work/project",
@@ -503,6 +584,49 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the run returns promptly after the limit"
+        );
+
+        let status = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0");
+        assert!(
+            !status.success(),
+            "timed-out child {pid} must be killed and reaped, not left running or zombie"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_large_payload_to_a_child_that_never_reads_stdin_times_out_and_reaps() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("child pid");
+
+        // >128 KiB exceeds the 64 KiB pipe buffer, so `write_all` blocks until
+        // the child reads. `sleep 60` never reads stdin: the write itself must
+        // be bounded by the same limit as `wait`, or the sandbox outlives it.
+        let payload = "x".repeat(128 * 1024);
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_child_with_timeout(child, &payload, Duration::from_secs(1)),
+        )
+        .await
+        .expect("a blocked stdin write must be bounded by the run limit, not hang")
+        .expect("run child");
+        assert_eq!(outcome, RunOutcome::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the blocked stdin write returns promptly after the limit"
         );
 
         let status = std::process::Command::new("kill")

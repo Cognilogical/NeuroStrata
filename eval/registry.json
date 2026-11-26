@@ -612,8 +612,10 @@
         "guard::sandbox::tests::sandbox_image_is_digest_pinned_and_never_latest",
         "guard::sandbox::tests::sandbox_args_pin_the_hardening_set",
         "guard::sandbox::tests::forbidden_working_directories_are_refused",
+        "guard::sandbox::tests::exact_home_directory_is_refused_but_descendants_are_allowed",
         "guard::sandbox::tests::a_project_working_directory_is_allowed",
-        "guard::sandbox::tests::a_timed_out_run_kills_and_reaps_its_child"
+        "guard::sandbox::tests::a_timed_out_run_kills_and_reaps_its_child",
+        "guard::sandbox::tests::a_large_payload_to_a_child_that_never_reads_stdin_times_out_and_reaps"
       ],
       "thresholds": {
         "ignored": 0
