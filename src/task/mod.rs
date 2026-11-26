@@ -3478,7 +3478,7 @@ pub async fn handle_task_complete(
     // partial normalisation, extraction, receipt, or follow-up behind.
     let mut complete_scan = Map::new();
     complete_scan.insert("reason".to_string(), json!(&reason));
-    for key in ["event_id", "user_id", "agent_name"] {
+    for key in ["event_id", "user_id", "agent_name", "session_id"] {
         if let Some(value) = arg_str(&args, key) {
             complete_scan.insert(key.to_string(), json!(value));
         }
@@ -12520,6 +12520,30 @@ exit 0
             store.list("MyProj", None, None).await.unwrap().len(),
             before
         );
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
+    }
+
+    #[tokio::test]
+    async fn secret_in_task_complete_session_id_is_refused() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+        let token = scanner_fixture();
+        let err = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "session_id": token,
+                "memory": { "content": "a clean lesson worth keeping" },
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("a secret session_id must refuse before any write");
+        assert_security_refusal(&err);
         assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
     }
 
