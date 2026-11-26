@@ -591,6 +591,19 @@ async fn _with_watch(
                         }
                     },
                     {
+                        "name": "neurostrata_task_get",
+                        "description": "Read one task without claiming it: status, holder (assignee, session_id), branch, worktree, blockers and its latest notes, plus history_count. include_history: true returns every note. Use it to check a task another session holds, a finished task, or a blocker; a claim is a write and cannot stand in for a read.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "The task id, e.g. 'myproj-x7q2'." },
+                                "namespace": { "type": "string", "description": "The exact project name." },
+                                "include_history": { "type": "boolean", "description": "Return every note in the task's history instead of the latest five." }
+                            },
+                            "required": ["id", "namespace"]
+                        }
+                    },
+                    {
                         "name": "neurostrata_task_list",
                         "description": "List tasks in a namespace. ready: true is the actionable backlog (open and every blocker done); done tasks are hidden unless include_done; retired rows (superseded or expired) are history and hidden unless include_retired. Each row gives the number of notes in its history as history_count; include_history: true returns the notes themselves.",
                         "inputSchema": {
@@ -1777,6 +1790,10 @@ async fn _with_watch(
                                 store.clone(),
                             )
                             .await;
+                        }
+                        "neurostrata_task_get" => {
+                            result_text =
+                                crate::task::handle_task_get(arguments, store.clone()).await;
                         }
                         "neurostrata_task_list" => {
                             result_text =
@@ -21568,6 +21585,7 @@ mod tests {
                 "neurostrata_task_create",
                 "neurostrata_task_claim",
                 "neurostrata_task_update",
+                "neurostrata_task_get",
                 "neurostrata_task_list",
                 "neurostrata_task_complete",
                 "neurostrata_task_validate",
