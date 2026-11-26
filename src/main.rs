@@ -6598,6 +6598,31 @@ mod tests {
     }
 
     #[test]
+    fn restore_copy_rejects_bytes_changed_after_verification() {
+        // Verification passes, then the snapshot member changes before the
+        // copy stages it: the staged copy must be re-hashed against the
+        // verified checksums and the changed bytes must not be installed.
+        let (root, snapshot_dir) = restore_verify_fixture("toctou");
+        ensure_snapshot_verified(&snapshot_dir).expect("a valid snapshot verifies");
+        std::fs::write(snapshot_dir.join("ladybug.store"), b"changed-db!").unwrap();
+
+        let target = root.join("target").join("ladybug.store");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let err = copy_snapshot_into_place(&snapshot_dir, &target)
+            .expect_err("bytes changed after verification are refused");
+        assert!(
+            err.to_string().contains("unverified bytes")
+                || err.to_string().contains("does not match"),
+            "the refusal names the checksum mismatch: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "the unverified bytes are not installed at the target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn restore_verify_rejects_missing_manifest() {
         let (root, snapshot_dir) = restore_verify_fixture("no-manifest");
         std::fs::remove_file(snapshot_dir.join("manifest.json")).unwrap();
@@ -8216,6 +8241,7 @@ fn copy_snapshot_into_place(
 
     // Step A: stage every member the snapshot carries beside the target.
     let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let mut staged_from: Vec<std::path::PathBuf> = Vec::new();
     for (index, (from, to)) in members.iter().enumerate() {
         if index > 0 && !from.exists() {
             continue;
@@ -8229,6 +8255,58 @@ fn copy_snapshot_into_place(
             return Err(e.into());
         }
         staged.push((to.clone(), stage));
+        staged_from.push(from.clone());
+    }
+
+    // Step A1: re-hash the staged copies against the verified checksums
+    // before anything is committed. `ensure_snapshot_verified` ran before
+    // the copy, so a member changed (or swapped) between verification and
+    // staging would otherwise be installed as bytes that were never
+    // verified. A snapshot with no `checksums.json` has no verified set to
+    // compare against (the real restore path refuses such a snapshot in
+    // `ensure_snapshot_verified`); direct callers with no checksum file
+    // keep the previous behaviour.
+    let checksums_path = snapshot_dir.join("checksums.json");
+    if checksums_path.exists() {
+        let staged_check = (|| -> anyhow::Result<()> {
+            let raw = std::fs::read_to_string(&checksums_path)?;
+            let checksums: crate::storage::snapshot::SnapshotChecksums =
+                serde_json::from_str(&raw)?;
+            for (from, (_, stage)) in staged_from.iter().zip(staged.iter()) {
+                let name = from
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let expected: Option<&String> = match name.as_str() {
+                    "ladybug.store" => Some(&checksums.ladybug_store_sha256),
+                    "ladybug.store.wal" => checksums.wal_sha256.as_ref(),
+                    "ladybug.store.wal.checkpoint" => checksums.wal_checkpoint_sha256.as_ref(),
+                    "ladybug.store.store-state.json" => checksums.store_state_sha256.as_ref(),
+                    "ladybug.store.shadow" => checksums.shadow_sha256.as_ref(),
+                    "ladybug.store.pinned.tmp" => checksums.pinned_sha256.as_ref(),
+                    _ => None,
+                };
+                let Some(expected) = expected else {
+                    return Err(anyhow::anyhow!(
+                        "the staged {name} has no recorded checksum to verify against; a snapshot member with no verified checksum must not be installed"
+                    ));
+                };
+                let actual = crate::storage::snapshot::sha256_file(stage)
+                    .map_err(|e| anyhow::anyhow!("could not hash the staged {name}: {e}"))?;
+                if actual != *expected {
+                    return Err(anyhow::anyhow!(
+                        "the staged {name} does not match the verified snapshot checksum (expected {expected}, got {actual}); the snapshot member changed after verification, refusing to install unverified bytes"
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = staged_check {
+            for (_, staged_path) in &staged {
+                let _ = std::fs::remove_file(staged_path);
+            }
+            return Err(e);
+        }
     }
 
     // Step A2: stash any pre-existing companion aside so the commit can
