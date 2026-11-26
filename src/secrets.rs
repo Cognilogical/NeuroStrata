@@ -422,13 +422,19 @@ impl SecretScanner {
                 category: "oversized_input",
             });
         }
+        self.find_first(text).map(|(category, _)| Rejection {
+            location: location.to_string(),
+            category,
+        })
+    }
 
+    /// The first secret in `text` (at most `MAX_SCAN_BYTES`) as its category
+    /// and byte span. Rejection and redaction share this one detector order,
+    /// so they always agree on what is a secret.
+    fn find_first(&self, text: &str) -> Option<(&'static str, std::ops::Range<usize>)> {
         // --- JWT detection ---
-        if let Some(cat) = self.detect_jwt(text) {
-            return Some(Rejection {
-                location: location.to_string(),
-                category: cat,
-            });
+        if let Some(found) = self.detect_jwt_span(text) {
+            return Some(found);
         }
 
         // --- Provider token form detection ---
@@ -438,10 +444,7 @@ impl SecretScanner {
             let candidate = mat.as_str();
             if let Some(cat) = self.validate_provider_form(candidate) {
                 if !is_placeholder(&candidate.to_ascii_lowercase()) {
-                    return Some(Rejection {
-                        location: location.to_string(),
-                        category: cat,
-                    });
+                    return Some((cat, mat.range()));
                 }
             }
         }
@@ -453,14 +456,14 @@ impl SecretScanner {
         // fall through to the weak-password check below.
         for cap in self.he_re.captures_iter(text) {
             let token = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            if is_placeholder(&token.to_ascii_lowercase()) {
+            if is_placeholder(&token.to_ascii_lowercase()) || is_redaction_marker(text, &cap, 1) {
                 continue;
             }
             if meets_high_entropy(token) {
-                return Some(Rejection {
-                    location: location.to_string(),
-                    category: "high_entropy_secret",
-                });
+                return Some((
+                    "high_entropy_secret",
+                    cap.get(1).map_or(0..0, |m| whole_value_span(text, m.range())),
+                ));
             }
         }
 
@@ -469,7 +472,7 @@ impl SecretScanner {
             let value = cap.get(2).map(|m| m.as_str()).unwrap_or("");
             let value_lower = value.to_ascii_lowercase();
 
-            if is_placeholder(&value_lower) {
+            if is_placeholder(&value_lower) || is_redaction_marker(text, &cap, 2) {
                 continue;
             }
 
@@ -514,10 +517,10 @@ impl SecretScanner {
                     .chars()
                     .all(|c| c == value.chars().next().unwrap_or('x'))
             {
-                return Some(Rejection {
-                    location: location.to_string(),
-                    category: "password",
-                });
+                return Some((
+                    "password",
+                    cap.get(2).map_or(0..0, |m| whole_value_span(text, m.range())),
+                ));
             }
         }
 
@@ -586,7 +589,13 @@ impl SecretScanner {
     /// Detect a JWT-shaped token: three base64url segments where segment 1
     /// decodes to a JSON object containing `alg` and `typ` (case-sensitive
     /// bytes).
+    #[cfg(test)]
     fn detect_jwt(&self, text: &str) -> Option<&'static str> {
+        self.detect_jwt_span(text).map(|(category, _)| category)
+    }
+
+    /// `detect_jwt` with the token's byte span.
+    fn detect_jwt_span(&self, text: &str) -> Option<(&'static str, std::ops::Range<usize>)> {
         // Find all dot-separated triplets that look base64url.
         // We look for the pattern: non-dot+ . non-dot+ . non-dot+
         for mat in self.jwt_re.find_iter(text) {
@@ -594,7 +603,7 @@ impl SecretScanner {
             // Validate it's actually a JWT by decoding segment 1.
             if let Some(dots) = find_jwt_segments(jwt_str) {
                 if is_valid_jwt_header(dots.0) {
-                    return Some("jwt");
+                    return Some(("jwt", mat.range()));
                 }
             }
         }
@@ -691,6 +700,49 @@ fn shannon_entropy_bits_per_char(s: &str) -> Option<f64> {
             })
             .sum(),
     )
+}
+
+/// The whole value an assignment pattern matched the start of. The patterns
+/// stop at characters such as `;`, `,`, `}` or `/` even inside quotes, so
+/// redacting only the match would keep the rest of the secret: a quoted value
+/// runs to its closing quote, across lines (a pasted key block), or to the end
+/// of the line when it has none; a backslash-escaped quote does not close it.
+/// An unquoted value runs to the next whitespace.
+fn whole_value_span(text: &str, matched: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let after = &text[matched.end..];
+    let line_end = after.find(['\n', '\r']).unwrap_or(after.len());
+    let end = match text[..matched.start].chars().last() {
+        Some(quote @ ('"' | '\'')) => {
+            let backslashes = text[..matched.end].len()
+                - text[..matched.end].trim_end_matches('\\').len();
+            let mut escaped = backslashes % 2 == 1;
+            after
+                .char_indices()
+                .find(|&(_, c)| {
+                    let closes = c == quote && !escaped;
+                    escaped = c == '\\' && !escaped;
+                    closes
+                })
+                .map_or(line_end, |(i, _)| i)
+        }
+        _ => after.find(char::is_whitespace).unwrap_or(after.len()),
+    };
+    matched.start..matched.end + end
+}
+
+/// Whether an assignment's whole value (capture group `group`, extended by
+/// `whole_value_span`) is exactly a marker `redact` wrote, so scrubbed text
+/// scrubs to itself. Only the scanner's own categories count, and only the
+/// whole value: `[REDACTED:jwt]tail` is still scanned as a secret.
+fn is_redaction_marker(text: &str, cap: &regex::Captures, group: usize) -> bool {
+    let Some(value) = cap.get(group) else {
+        return false;
+    };
+    let whole = text[whole_value_span(text, value.range())].to_ascii_lowercase();
+    whole
+        .strip_prefix("[redacted:")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|category| REDACTION_CATEGORIES.contains(&category))
 }
 
 /// Whether the (lowercased) text matches known placeholder/documentation
@@ -821,6 +873,77 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     }
 
     Some(output)
+}
+
+/// The categories `find_first` reports, which a redaction marker may name.
+const REDACTION_CATEGORIES: &[&str] = &[
+    "jwt",
+    "github_pat",
+    "anthropic_token",
+    "openai_project_key",
+    "openai_key",
+    "slack_token",
+    "aws_access_key",
+    "provider_token",
+    "high_entropy_secret",
+    "password",
+    "truncated",
+];
+
+/// Upper bound on secrets replaced one by one in a text, so a pathological
+/// input cannot loop for long. Past it, the whole block being scrubbed (up to
+/// 256 KB) is replaced by one `[REDACTED:truncated]`, never kept unscanned.
+const MAX_REDACTIONS: usize = 256;
+
+/// Replaces every secret the scanner finds in `text` with
+/// `[REDACTED:<category>]` and returns the scrubbed text and the categories
+/// replaced, in order. The same detectors as `scan_entry_point`, for text
+/// that must be kept rather than refused (a task note). Text longer than the
+/// scanner's limit is scrubbed line block by line block.
+pub fn redact(text: &str) -> (String, Vec<&'static str>) {
+    let scanner = SecretScanner::instance();
+    let mut found = Vec::new();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut end = rest.len().min(MAX_SCAN_BYTES);
+        while end < rest.len() && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end < rest.len() {
+            // Blocks are scrubbed one by one, so a secret must not straddle a
+            // cut. End the block before the last whole line, so a `key =` and
+            // its value on the next line stay together; with no line break,
+            // end it at whitespace, which no token or unquoted value contains.
+            if let Some(nl) = rest[..end].rfind('\n') {
+                end = rest[..nl].rfind('\n').map_or(nl + 1, |prev| prev + 1);
+            } else if let Some((ws, c)) = rest[..end]
+                .char_indices()
+                .rev()
+                .find(|&(_, c)| c.is_whitespace())
+            {
+                end = ws + c.len_utf8();
+            }
+        }
+        let mut block = rest[..end].to_string();
+        while let Some((category, span)) = scanner.find_first(&block) {
+            if span.is_empty() || found.len() >= MAX_REDACTIONS {
+                // Findings come in detector order, not text order, so any
+                // part of this block may still hold a secret: drop it all.
+                // Later blocks are still scrubbed: one with no secret is
+                // kept, and one with a secret is dropped the same way.
+                block.clear();
+                block.push_str("[REDACTED:truncated]");
+                found.push("truncated");
+                break;
+            }
+            block.replace_range(span, &format!("[REDACTED:{category}]"));
+            found.push(category);
+        }
+        out.push_str(&block);
+        rest = &rest[end..];
+    }
+    (out, found)
 }
 
 /// Scan user-controlled content + metadata at an entry point.
@@ -1212,6 +1335,104 @@ mod tests {
             let r = scan_entry_point(dirty_content, &clean_meta, entry);
             assert!(r.is_some(), "{} should reject secret", entry);
         }
+    }
+
+    /// `redact` replaces every finding with a marker naming its category,
+    /// keeps the rest, passes clean text through, and is idempotent: the
+    /// scrubbed text scans clean and scrubs to itself.
+    #[test]
+    fn redact_replaces_each_secret_with_its_category() {
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let text = format!("Handoff: push with {key}, then password=hunter22 and go.");
+        let (scrubbed, found) = redact(&text);
+        assert_eq!(found, vec!["github_pat", "password"]);
+        assert_eq!(
+            scrubbed,
+            "Handoff: push with [REDACTED:github_pat], then password=[REDACTED:password] and go."
+        );
+        assert!(scan_entry_point(&scrubbed, &json!({}), "note").is_none());
+        assert_eq!(redact(&scrubbed), (scrubbed.clone(), vec![]));
+        assert_eq!(
+            redact("run the suite, then push"),
+            ("run the suite, then push".to_string(), vec![])
+        );
+    }
+
+    /// The value patterns stop at `;`, `,`, `}`, `]` or `/`, so `redact`
+    /// replaces the whole value: a quoted one up to its closing quote, an
+    /// unquoted one up to the next whitespace. No part of it is kept.
+    #[test]
+    fn redact_replaces_the_whole_value_not_only_the_matched_start() {
+        for (text, kept) in [
+            (r#"set password="abcd;efgh ij" now"#, r#"set password="[REDACTED:password]" now"#),
+            (r#"set password="abcd\"e;f" now"#, r#"set password="[REDACTED:password]" now"#),
+            (r#"set password="abcd\\" now"#, r#"set password="[REDACTED:password]" now"#),
+            ("set password=\"abcd\nefgh\r\nijkl\" now", "set password=\"[REDACTED:password]\" now"),
+            ("set password=\"abcd;ef\nnext line", "set password=\"[REDACTED:password]\nnext line"),
+            ("set password='wxyz,12}' now", "set password='[REDACTED:password]' now"),
+            ("set password=abcd;efgh now", "set password=[REDACTED:password] now"),
+        ] {
+            let (scrubbed, found) = redact(text);
+            assert_eq!(scrubbed, kept, "{text}");
+            assert_eq!(found, vec!["password"], "{text}");
+            assert_eq!(redact(&scrubbed), (scrubbed.clone(), vec![]), "{text}");
+        }
+        let secret = "Zq8vR2mXw4Lp9Tn6Ks3Hd7Fb";
+        let (scrubbed, found) = redact(&format!("api_key={secret}/Yc5Gj1Qa"));
+        assert_eq!(found, vec!["high_entropy_secret"]);
+        assert_eq!(scrubbed, "api_key=[REDACTED:high_entropy_secret]");
+    }
+
+    /// Past the replacement cap, the block still being scrubbed becomes one
+    /// `[REDACTED:truncated]`: findings come in detector order, so any part of
+    /// it may still hold a secret, and nothing is kept unscanned.
+    #[test]
+    fn redact_past_the_cap_truncates_instead_of_keeping_secrets() {
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let text = (0..MAX_REDACTIONS + 3)
+            .map(|i| format!("password=hunter{i:04}"))
+            .chain([format!("push with {key}")])
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (scrubbed, found) = redact(&text);
+        assert_eq!(found.len(), MAX_REDACTIONS + 1);
+        assert_eq!(found.last(), Some(&"truncated"));
+        assert_eq!(scrubbed, "[REDACTED:truncated]");
+        assert_eq!(redact(&scrubbed), (scrubbed.clone(), vec![]));
+    }
+
+    /// A text over the scan limit is scrubbed in blocks, and no cut splits a
+    /// key from its value on the next line or a token on a line with no
+    /// line break.
+    #[test]
+    fn redact_keeps_a_secret_whole_across_a_block_cut() {
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let filler = "x".repeat(MAX_SCAN_BYTES - 11);
+        let next_line = format!("{filler}\npassword=\nhunter22");
+        let words = "x ".repeat((MAX_SCAN_BYTES - 20) / 2);
+        let one_line = format!("{words} {key} done");
+        // Only the secret is replaced: the text around it is kept whole.
+        let expected = [
+            format!("{filler}\npassword=\n[REDACTED:password]"),
+            format!("{words} [REDACTED:github_pat] done"),
+        ];
+        for (text, expected) in [next_line, one_line].into_iter().zip(expected) {
+            let (scrubbed, found) = redact(&text);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(scrubbed == expected, "{found:?}");
+            assert_eq!(redact(&scrubbed), (scrubbed.clone(), vec![]));
+        }
+    }
+
+    /// A marker counts as already scrubbed only when it is the whole value:
+    /// text glued to it is still a secret, for `add_memory` as for `redact`.
+    #[test]
+    fn a_marker_with_text_after_it_is_still_a_secret() {
+        let glued = "password=[REDACTED:jwt]hunter22";
+        assert!(scan_entry_point(glued, &json!({}), "add_memory").is_some());
+        let (scrubbed, found) = redact(glued);
+        assert_eq!(found, vec!["password"]);
+        assert_eq!(scrubbed, "password=[REDACTED:password]");
     }
 
     #[test]
