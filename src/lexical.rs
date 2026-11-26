@@ -185,6 +185,20 @@ pub fn code_text_analyzer() -> tantivy::tokenizer::TextAnalyzer {
         .build()
 }
 
+/// Read the archive tombstone from payload metadata as an index flag.
+///
+/// The tombstone producer (`handlers::archive_memory`) writes a boolean
+/// `true`, while older rows may carry an integer flag; accept both shapes:
+/// 1 when `archived` is boolean `true` or an integer != 0, else 0.
+fn archived_flag(metadata: &serde_json::Value) -> i64 {
+    match metadata.get("archived") {
+        Some(v) if v.as_bool() == Some(true) => 1,
+        Some(v) if v.as_i64().map(|n| n != 0).unwrap_or(false) => 1,
+        Some(_) => 0,
+        None => 0,
+    }
+}
+
 /// Code-aware pre-tokenization for Tantivy (whitespace-separated sub-tokens + full lowercased text).
 pub fn detect_task_intent(text: &str) -> Vec<crate::task::intent::TaskIntentSignal> {
     crate::task::intent::detect_task_intents(text)
@@ -575,18 +589,7 @@ impl TantivyLexicalIndex {
             0
         };
         doc.add_i64(self.has_valid_to_f, has_valid_to);
-        let archived: i64 = if payload
-            .metadata
-            .get("archived")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            != 0
-        {
-            1
-        } else {
-            0
-        };
-        doc.add_i64(self.archived_f, archived);
+        doc.add_i64(self.archived_f, archived_flag(&payload.metadata));
         doc.add_i64(self.generation_f, Self::generation_of_id(id));
 
         if let Some(w) = self
@@ -709,18 +712,7 @@ impl TantivyLexicalIndex {
                     0
                 };
                 doc.add_i64(self.has_valid_to_f, has_valid_to);
-                let archived: i64 = if payload
-                    .metadata
-                    .get("archived")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-                    != 0
-                {
-                    1
-                } else {
-                    0
-                };
-                doc.add_i64(self.archived_f, archived);
+                doc.add_i64(self.archived_f, archived_flag(&payload.metadata));
                 doc.add_i64(self.generation_f, Self::generation_of_id(id));
                 w.add_document(doc)?;
                 indexed += 1;
