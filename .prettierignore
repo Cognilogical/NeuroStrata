@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# Tauri-generated ACL artifacts (tauri-build owns their exact format).
+src-tauri/gen/
 *.canvas
 .env
 .DS_Store

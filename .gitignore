@@ -48,6 +48,10 @@ proofs/.lake/
 binaries/
 downloads/
 web-ui/public/graph.json
+# Generated Tauri ACL artifact: byte-identical to desktop-schema.json, written
+# on macOS builds only, so it is platform-local rather than tracked.
+src-tauri/gen/schemas/macOS-schema.json
+
 # Generated plugin build artifacts (rebuilt by npm run build)
 plugins/core/node_modules/
 plugins/core/package-lock.json

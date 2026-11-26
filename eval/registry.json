@@ -603,6 +603,19 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "tauri-config-shape": {
+      "commands": [
+        "cargo test --locked --test tauri_config_shape -- --test-threads=1"
+      ],
+      "tests": [
+        "csp_is_set_and_strict",
+        "capability_has_no_file_or_root_open_patterns",
+        "daemon_connect_src_is_loopback_only"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }
