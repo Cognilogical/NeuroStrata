@@ -969,7 +969,7 @@ fn persist_active_session_file_with_home(
         // No task is in progress: drop the fields a finished (completed or
         // released) task left behind, or the session-start hook keeps
         // announcing it as the active task.
-        for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+        for key in ["task_id", "active_task_id", "status", "session_id", "subagent_prompt_injection"] {
             active.remove(key);
         }
         active.insert("updated_at".to_string(), json!(machine::timestamp()));
@@ -1119,10 +1119,17 @@ fn session_file_task_id(project_root: &std::path::Path) -> Option<(String, Optio
 }
 
 /// Whether a session file's claim is still the task row's claim: the same
-/// session holds it. A task another session has taken over (from another
-/// worktree) no longer belongs in this file.
-fn file_names_current_claim(file_session: Option<&str>, task: &Task) -> bool {
+/// session holds it, in the worktree of the file at `root`. A task another
+/// session has taken over, or the same session has claimed again from another
+/// worktree, no longer belongs in this file. A claim with no recorded
+/// worktree (written before worktrees were recorded) counts for any root.
+fn file_names_current_claim(file_session: Option<&str>, task: &Task, root: &std::path::Path) -> bool {
     file_session == task.task_field("session_id").and_then(|v| v.as_str())
+        && task
+            .task_field("worktree")
+            .and_then(|v| v.as_str())
+            .filter(|w| !w.is_empty())
+            .is_none_or(|w| crate::paths::same_location(w, &root.to_string_lossy()))
 }
 
 /// The row of task `id` read fresh: `Ok(Some)` when it is in progress and a
@@ -1155,10 +1162,11 @@ async fn in_progress_task(
 
 /// [`persist_active_session_file`] under [`SESSION_FILE_LOCK`]. `claimed` is
 /// the row a claim has just saved, written as is. Otherwise a task is named
-/// only when its row is in progress at write time: `candidate` (the task the
-/// snapshot found), else the task the file already names (a claim that landed
-/// after the snapshot listed the tasks), else none. If a row cannot be read,
-/// the file is left as it is.
+/// only when its row is in progress at write time and its claim is in this
+/// worktree: the task the file already names (a claim that may have landed
+/// after the snapshot listed the tasks), else `candidate` (the task the
+/// snapshot found), else none. If a row cannot be read, the file is left as
+/// it is.
 pub(crate) async fn refresh_active_session_file(
     store: &Arc<dyn VectorStore>,
     project_root: &std::path::Path,
@@ -1184,15 +1192,17 @@ pub(crate) async fn refresh_active_session_file(
             .is_some_and(|w| !w.is_empty() && crate::paths::same_location(w, &root))
     };
     let named = session_file_task_id(project_root);
-    let candidates = candidate
-        .map(|id| (id.to_string(), None))
+    // The file's own task comes first: a claim in this worktree that landed
+    // after the snapshot listed the tasks is newer than the snapshot's pick.
+    let candidates = named
+        .map(|(id, session)| (id, Some(session)))
         .into_iter()
-        .chain(named.map(|(id, session)| (id, Some(session))));
+        .chain(candidate.map(|id| (id.to_string(), None)));
     for (id, file_session) in candidates {
         match in_progress_task(store, namespace, &id).await {
             Ok(Some(task))
                 if match file_session.as_ref() {
-                    Some(session) => file_names_current_claim(session.as_deref(), &task),
+                    Some(session) => file_names_current_claim(session.as_deref(), &task, project_root),
                     None => claimed_here(&task),
                 } =>
             {
@@ -1272,10 +1282,10 @@ pub(crate) async fn clear_finished_task_from_session_file(
         let file_session = active.get("session_id").and_then(|v| v.as_str());
         match row.as_ref() {
             Some(Err(())) => return,
-            Some(Ok(Some(task))) if file_names_current_claim(file_session, task) => continue,
+            Some(Ok(Some(task))) if file_names_current_claim(file_session, task, root) => continue,
             _ => {}
         }
-        for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+        for key in ["task_id", "active_task_id", "status", "session_id", "subagent_prompt_injection"] {
             active.remove(key);
         }
         active.insert("updated_at".to_string(), json!(machine::timestamp()));
@@ -11366,6 +11376,37 @@ exit 0
         // In its own worktree the same candidate is still written.
         refresh_active_session_file(&store, new.path(), "MyProj", &[], None, Some(&id)).await;
         assert_eq!(session(&new)["task_id"], json!(id), "{}", session(&new));
+
+        // The same session's claim moving to the old worktree (a release and
+        // a fresh claim there, before this file was cleaned): the new
+        // worktree's file no longer names it on a refresh.
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["task"]["worktree"] = json!(old.path().to_string_lossy());
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+        refresh_active_session_file(&store, new.path(), "MyProj", &[], None, None).await;
+        let new_file = session(&new);
+        assert!(new_file.get("task_id").is_none(), "{}", new_file);
+    }
+
+    /// Cleanup also drops the legacy `active_task_id` key, which the plugin
+    /// still reads as the active task.
+    #[tokio::test]
+    async fn session_file_cleanup_drops_the_legacy_active_task_id() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".NeuroStrata").join("active_session.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            json!({ "namespace": "MyProj", "task_id": id, "active_task_id": id }).to_string(),
+        )
+        .unwrap();
+        // The task is open, not in progress: the file's claim is stale.
+        clear_finished_task_from_session_file(&store, "MyProj", &id, &[dir.path().to_path_buf()])
+            .await;
+        let file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(file.get("task_id").is_none() && file.get("active_task_id").is_none(), "{file}");
     }
 
     #[tokio::test]
