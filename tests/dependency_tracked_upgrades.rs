@@ -390,10 +390,28 @@ fn typescript_pins_are_6_0_3_across_plugins_and_web_ui() {
 #[test]
 fn artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned() {
     let mut seen = [0_usize; 3];
+    // Exact SHA <-> version pairs recorded in the decision record
+    // (tracked-upgrade dispositions, section 5). Any other SHA, even on the
+    // same major line, is an unrecorded revision and must fail the gate.
     let actions = [
-        ("actions/upload-artifact", 7_usize),
-        ("actions/download-artifact", 8_usize),
-        ("actions/checkout", 7_usize),
+        (
+            "actions/upload-artifact",
+            7_usize,
+            "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+            "v7.0.2",
+        ),
+        (
+            "actions/download-artifact",
+            8_usize,
+            "9000827ccba6bdab643e8b6fd33ac0654aef8333",
+            "v8.0.2",
+        ),
+        (
+            "actions/checkout",
+            7_usize,
+            "3d3c42e5aac5ba805825da76410c181273ba90b1",
+            "v7.0.1",
+        ),
     ];
 
     for path in workflow_paths() {
@@ -423,8 +441,8 @@ fn artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned() {
             let Some((action, reference)) = target.split_once('@') else {
                 continue;
             };
-            let Some((_, expected_major)) =
-                actions.iter().find(|(candidate, _)| *candidate == action)
+            let Some((_, expected_major, expected_sha, expected_version)) =
+                actions.iter().find(|(candidate, ..)| *candidate == action)
             else {
                 continue;
             };
@@ -432,6 +450,14 @@ fn artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned() {
             assert!(
                 is_full_sha(reference),
                 "{}:{}: {action} uses floating ref {reference:?}; every artifact/checkout action must be pinned to a full 40-character SHA (#339)",
+                relative(&path),
+                index + 1
+            );
+            assert_eq!(
+                reference,
+                *expected_sha,
+                "{}:{}: {action} is pinned to SHA {reference}, but the decision record pins {expected_version} at {expected_sha}; \
+                 an unrecorded action revision must not pass the gate (#339)",
                 relative(&path),
                 index + 1
             );
@@ -457,16 +483,23 @@ fn artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned() {
                 relative(&path),
                 index + 1
             );
+            assert_eq!(
+                version_token.trim_start_matches(['v', 'V']),
+                expected_version.trim_start_matches('v'),
+                "{}:{}: {action} is annotated {version_token}; the decision record pins exactly {expected_version} for SHA {expected_sha} (#339)",
+                relative(&path),
+                index + 1
+            );
 
             let slot = actions
                 .iter()
-                .position(|(candidate, _)| *candidate == action)
+                .position(|(candidate, ..)| *candidate == action)
                 .unwrap();
             seen[slot] += 1;
         }
     }
 
-    for (index, (action, major)) in actions.iter().enumerate() {
+    for (index, (action, major, ..)) in actions.iter().enumerate() {
         assert!(
             seen[index] > 0,
             "no {action} step found in .github/workflows/*.yml; #339 expects at least one SHA-pinned v{major} reference"
