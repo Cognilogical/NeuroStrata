@@ -429,7 +429,7 @@ fn dockerfile_base_has_no_ci_consumer() {
 
 #[test]
 fn typescript_pins_are_6_0_3_across_plugins_and_web_ui() {
-    const MANIFESTS: [&str; 8] = [
+    const KNOWN_MANIFESTS: [&str; 8] = [
         "plugins/core/package.json",
         "plugins/claude/package.json",
         "plugins/codex/package.json",
@@ -441,7 +441,42 @@ fn typescript_pins_are_6_0_3_across_plugins_and_web_ui() {
     ];
     const PIN: &str = "~6.0.3";
 
-    for manifest in MANIFESTS {
+    // The known eight must still exist — a deleted manifest fails here —
+    // but the checked set is discovered from the repository, so a newly
+    // added plugins/*/package.json is gated too instead of escaping.
+    for manifest in KNOWN_MANIFESTS {
+        assert!(
+            repo_path(manifest).is_file(),
+            "known TypeScript manifest {manifest} is missing; #339 pins all eight manifests to {PIN}"
+        );
+    }
+    let mut manifests: Vec<String> = KNOWN_MANIFESTS
+        .iter()
+        .map(|manifest| (*manifest).to_owned())
+        .collect();
+    let plugins_dir = repo_path("plugins");
+    let mut plugin_entries: Vec<PathBuf> = fs::read_dir(&plugins_dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", plugins_dir.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| panic!("read entry in {}: {error}", plugins_dir.display()))
+                .path()
+        })
+        .collect();
+    plugin_entries.sort();
+    for entry in plugin_entries {
+        let candidate = entry.join("package.json");
+        if candidate.is_file() {
+            let discovered = relative(&candidate).replace('\\', "/");
+            if !manifests.contains(&discovered) {
+                manifests.push(discovered);
+            }
+        }
+    }
+    manifests.sort();
+
+    for manifest in &manifests {
+        let manifest = manifest.as_str();
         let path = repo_path(manifest);
         let raw = read_relative(manifest);
         let document: serde_json::Value = serde_json::from_str(&raw)
@@ -457,7 +492,7 @@ fn typescript_pins_are_6_0_3_across_plugins_and_web_ui() {
             .and_then(|version| version.as_str())
             .unwrap_or_else(|| {
                 panic!(
-                    "{} has no typescript dependency; #339 pins all eight manifests to {PIN}",
+                    "{} has no typescript dependency; #339 pins every plugin and web-ui manifest to {PIN}",
                     path.display()
                 )
             });
@@ -465,7 +500,7 @@ fn typescript_pins_are_6_0_3_across_plugins_and_web_ui() {
         assert_eq!(
             typescript.trim(),
             PIN,
-            "{} pins TypeScript {typescript:?}; #339 requires {PIN} across all eight manifests",
+            "{} pins TypeScript {typescript:?}; #339 requires {PIN} across every plugin and web-ui manifest",
             path.display()
         );
         let parsed = Version::parse(typescript.trim().trim_start_matches('~'));
