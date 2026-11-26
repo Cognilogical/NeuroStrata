@@ -1119,17 +1119,12 @@ fn session_file_task_id(project_root: &std::path::Path) -> Option<(String, Optio
 }
 
 /// Whether a session file's claim is still the task row's claim: the same
-/// session holds it, in the worktree of the file at `root`. A task another
-/// session has taken over, or the same session has claimed again from another
-/// worktree, no longer belongs in this file. A claim with no recorded
-/// worktree (written before worktrees were recorded) counts for any root.
-fn file_names_current_claim(file_session: Option<&str>, task: &Task, root: &std::path::Path) -> bool {
+/// session holds it. A task another session has taken over (from another
+/// worktree) no longer belongs in this file. The claim's recorded worktree is
+/// not compared: a claim in a folder that is not a git checkout records the
+/// daemon's checkout while its session file is in the project folder.
+fn file_names_current_claim(file_session: Option<&str>, task: &Task) -> bool {
     file_session == task.task_field("session_id").and_then(|v| v.as_str())
-        && task
-            .task_field("worktree")
-            .and_then(|v| v.as_str())
-            .filter(|w| !w.is_empty())
-            .is_none_or(|w| crate::paths::same_location(w, &root.to_string_lossy()))
 }
 
 /// The row of task `id` read fresh: `Ok(Some)` when it is in progress and a
@@ -1202,7 +1197,7 @@ pub(crate) async fn refresh_active_session_file(
         match in_progress_task(store, namespace, &id).await {
             Ok(Some(task))
                 if match file_session.as_ref() {
-                    Some(session) => file_names_current_claim(session.as_deref(), &task, project_root),
+                    Some(session) => file_names_current_claim(session.as_deref(), &task),
                     None => claimed_here(&task),
                 } =>
             {
@@ -1282,7 +1277,7 @@ pub(crate) async fn clear_finished_task_from_session_file(
         let file_session = active.get("session_id").and_then(|v| v.as_str());
         match row.as_ref() {
             Some(Err(())) => return,
-            Some(Ok(Some(task))) if file_names_current_claim(file_session, task, root) => continue,
+            Some(Ok(Some(task))) if file_names_current_claim(file_session, task) => continue,
             _ => {}
         }
         for key in ["task_id", "active_task_id", "status", "session_id", "subagent_prompt_injection"] {
@@ -11376,16 +11371,6 @@ exit 0
         // In its own worktree the same candidate is still written.
         refresh_active_session_file(&store, new.path(), "MyProj", &[], None, Some(&id)).await;
         assert_eq!(session(&new)["task_id"], json!(id), "{}", session(&new));
-
-        // The same session's claim moving to the old worktree (a release and
-        // a fresh claim there, before this file was cleaned): the new
-        // worktree's file no longer names it on a refresh.
-        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        payload.metadata["task"]["worktree"] = json!(old.path().to_string_lossy());
-        store.upsert("MyProj", &id, vector, payload).await.unwrap();
-        refresh_active_session_file(&store, new.path(), "MyProj", &[], None, None).await;
-        let new_file = session(&new);
-        assert!(new_file.get("task_id").is_none(), "{}", new_file);
     }
 
     /// Cleanup also drops the legacy `active_task_id` key, which the plugin
