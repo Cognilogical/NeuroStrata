@@ -603,6 +603,22 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "tracked-upgrades": {
+      "commands": [
+        "cargo test --locked --test dependency_tracked_upgrades -- --test-threads=1"
+      ],
+      "tests": [
+        "tracked_upgrades_decision_record_names_all_four",
+        "oxiri_pin_matches_the_spareval_dependency_edge",
+        "dockerfile_base_stays_on_ubuntu_24_04_lts",
+        "dockerfile_base_has_no_ci_consumer",
+        "typescript_pins_are_6_0_3_across_plugins_and_web_ui",
+        "artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }
