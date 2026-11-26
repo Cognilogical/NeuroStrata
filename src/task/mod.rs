@@ -12625,6 +12625,8 @@ exit 0
         let before = store.list("MyProj", None, None).await.unwrap().len();
         let token = scanner_fixture();
 
+        let history_before =
+            store.get("MyProj", &id).await.unwrap().unwrap().1.metadata["task"]["history"].clone();
         let err = handle_task_complete(
             json!({
                 "namespace": "MyProj",
@@ -12646,6 +12648,18 @@ exit 0
             before
         );
         assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
+        // Row count and status alone would miss a partial write that only
+        // appended the secret reason to the existing row's history.
+        let history_after =
+            store.get("MyProj", &id).await.unwrap().unwrap().1.metadata["task"]["history"].clone();
+        assert_eq!(
+            history_after, history_before,
+            "a refused completion leaves the parent's history unchanged"
+        );
+        assert!(
+            !history_after.to_string().contains(&token),
+            "no history entry carries the supplied reason"
+        );
     }
 
     #[tokio::test]
