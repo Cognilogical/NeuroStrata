@@ -6413,17 +6413,16 @@ pub async fn import_beads(
         allocations.push(Some(id));
     }
 
-    store
-        .init(namespace)
-        .await
-        .map_err(|e| format!("ERROR: could not initialize '{}': {}", namespace, e))?;
-
+    // Assemble every new row first, then judge all of them before the
+    // schema init or the first write: a secret anywhere in the batch
+    // refuses the whole import, so no clean prefix is persisted and no
+    // row's blocked_by can point at an id a rejected retry re-allocates.
+    let mut assembled: Vec<Option<Map<String, Value>>> = Vec::with_capacity(pending.len());
     for (p, allocation) in pending.iter().zip(allocations.iter()) {
-        let id = match allocation {
-            Some(id) => id,
-            None => continue,
-        };
-
+        if allocation.is_none() {
+            assembled.push(None);
+            continue;
+        }
         let mut task_meta = Map::new();
         task_meta.insert(
             "status".to_string(),
@@ -6466,7 +6465,37 @@ pub async fn import_beads(
                 .unwrap_or_else(|| "closed in beads".to_string());
             task_meta.insert("close_reason".to_string(), json!(reason));
         }
+        assembled.push(Some(task_meta));
+    }
 
+    // Preflight: judge every assembled row before any write.
+    for (p, task_meta) in pending.iter().zip(assembled.iter()) {
+        let Some(task_meta) = task_meta else { continue };
+        if let Some(rejection) = scan_task_row_payload(
+            &p.title,
+            p.created_by.as_deref().unwrap_or("unknown"),
+            Some("beads-import"),
+            task_meta,
+            &Map::new(),
+            "task_import",
+        ) {
+            return Err(rejection);
+        }
+    }
+
+    store
+        .init(namespace)
+        .await
+        .map_err(|e| format!("ERROR: could not initialize '{}': {}", namespace, e))?;
+
+    for ((p, allocation), task_meta) in pending
+        .iter()
+        .zip(allocations.iter())
+        .zip(assembled.into_iter())
+    {
+        let (Some(id), Some(task_meta)) = (allocation, task_meta) else {
+            continue;
+        };
         write_task_row(
             &store,
             &emb,
@@ -14113,6 +14142,26 @@ exit 0
             .expect("import succeeds");
         std::fs::remove_file(&path).ok();
         summary
+    }
+
+    #[tokio::test]
+    async fn import_with_a_secret_in_a_later_row_writes_no_rows() {
+        let store = store_with_namespace("proj").await;
+        let token = scanner_fixture();
+        let fixture = format!(
+            "{{\"_type\":\"issue\",\"id\":\"clean-1\",\"title\":\"Clean first\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"dependencies\":[{{\"issue_id\":\"clean-1\",\"depends_on_id\":\"bad-2\",\"type\":\"blocks\"}}]}}\n{{\"_type\":\"issue\",\"id\":\"bad-2\",\"title\":\"Bad second {token}\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\"}}\n"
+        );
+        let path = std::env::temp_dir().join(format!("beads-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&path, fixture).unwrap();
+        let result = import_beads(store.clone(), emb(), "proj", &path.to_string_lossy()).await;
+        std::fs::remove_file(&path).ok();
+        let err = result.expect_err("a secret anywhere in the batch refuses the import");
+        assert_security_refusal(&err);
+        let rows = store.list("proj", None, None).await.unwrap();
+        assert!(
+            rows.iter().all(|r| r.payload.memory_type != "task"),
+            "no partial batch: the clean first row must not be persisted"
+        );
     }
 
     #[tokio::test]
