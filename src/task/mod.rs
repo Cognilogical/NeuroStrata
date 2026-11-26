@@ -550,6 +550,30 @@ async fn rollback_follow_up_tasks(store: &Arc<dyn VectorStore>, namespace: &str,
     }
 }
 
+/// Undoes a completion's extraction write after a later step failed:
+/// deletes a row the inline path created, restores a linked row's
+/// before-image. Best-effort, like the follow-up rollback it accompanies.
+async fn rollback_completion_extraction(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    linked_before: &Option<(String, Vec<f32>, MemoryPayload)>,
+    inline_created: &Option<String>,
+) {
+    if let Some(created_id) = inline_created {
+        if let Err(e) = store.delete(namespace, created_id).await {
+            tracing::warn!("failed to roll back extraction {}: {}", created_id, e);
+        }
+    }
+    if let Some((link_id, vector, payload)) = linked_before {
+        if let Err(e) = store
+            .upsert(namespace, link_id, vector.clone(), payload.clone())
+            .await
+        {
+            tracing::warn!("failed to restore linked memory {}: {}", link_id, e);
+        }
+    }
+}
+
 /// Memory types treated as normative (governing constraints) for reserved slots.
 const NORMATIVE_MEMORY_TYPES: &[&str] =
     &["rule", "fact", "decision", "procedure", "thesis", "concept"];
@@ -3704,6 +3728,14 @@ pub async fn handle_task_complete(
     let mut memories = list_now().await?;
     let mut edge = gate::extraction_exists(&memories, &id, now);
 
+    // Undo state for Paths 2/3: an extraction written by this call is part
+    // of the completion, so a later failure (follow-up creation, parent
+    // save) rolls it back instead of leaving it behind an unfinished task.
+    // Path 2 restores the linked row's before-image; Path 3 deletes the
+    // row it created (a dedup-linked pre-existing row is never deleted).
+    let mut linked_before: Option<(String, Vec<f32>, MemoryPayload)> = None;
+    let mut inline_created: Option<String> = None;
+
     // Path 2: bind an already-written memory. Its existing vector is reused
     // verbatim -- linking must never change what the memory ranks for.
     if !edge {
@@ -3730,6 +3762,7 @@ pub async fn handle_task_complete(
                     link_id
                 ));
             }
+            linked_before = Some((link_id.clone(), existing_vector.clone(), payload.clone()));
             let declared = payload.metadata.get("extracted_from").cloned();
             let mut arr: Vec<Value> = match declared {
                 None => Vec::new(),
@@ -3942,6 +3975,9 @@ pub async fn handle_task_complete(
                 .map(|u| u.id.clone())
                 .or(report.linked_existing_id.clone())
                 .filter(|s| !s.is_empty());
+            if let Some(upsert) = &report.upsert {
+                inline_created = Some(upsert.id.clone());
+            }
             inline_lesson = lesson_id;
         }
     }
@@ -4033,6 +4069,8 @@ pub async fn handle_task_complete(
             Ok((new_id, _payload)) => follow_up_created_ids.push(new_id),
             Err(e) => {
                 rollback_follow_up_tasks(&store, &namespace, &follow_up_created_ids).await;
+                rollback_completion_extraction(&store, &namespace, &linked_before, &inline_created)
+                    .await;
                 return Err(e);
             }
         }
@@ -4040,6 +4078,7 @@ pub async fn handle_task_complete(
 
     if let Err(e) = save_task(&store, &namespace, &id, vector, completed.payload.clone()).await {
         rollback_follow_up_tasks(&store, &namespace, &follow_up_created_ids).await;
+        rollback_completion_extraction(&store, &namespace, &linked_before, &inline_created).await;
         return Err(e);
     }
     let event_id = arg_str(&args, "event_id")
