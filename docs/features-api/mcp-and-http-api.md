@@ -5,7 +5,7 @@
 - `neurostrata_add_memory` — store an architectural rule, project pattern, or task insight. For a `rule`, an omitted or blank `metadata.source` is backfilled with the resolver's project-relative spelling when a root places the location (`project_root`, else the registered root, else the nearest `.git`), otherwise exactly `"agent"`. An explicit caller-supplied source is never overwritten. Because `source` is published to mesh peers and exported, this implicit source never holds an absolute local path that names the author's machine.
 - `neurostrata_search_memory` — query memory contents via vector + graph RAG (accepts optional `project_root` alongside `path_prefix` for multi-form relative/absolute prefix resolution, including root-equal prefixes that match in-root relative and absolute paths).
 - `neurostrata_get_snapshot` — fetch current task state snapshot (<=800 chars).
-- `neurostrata_supersede_memory` — replace active version with new one atomically.
+- `neurostrata_supersede_memory` — replace active version with new one atomically. The replacement keeps the old memory's `access_count`, so a correction ranks where the memory it replaces did.
 - `neurostrata_memories_for_file` — inspect governing memories for a given path/file.
 - `neurostrata_related` — find related entities (`CONTAINS`, `GOVERNS`; accepts optional `project_root`, resolves multi-form file seeds to one canonical in-namespace file node before single traversal, and returns additive `resolved_seed` metadata).
 - `neurostrata_diff_tour` — diff tour between versions (separates caller-facing display paths from internal multi-form lookup paths and records canonical project-relative paths in the Graph-First session ledger).
