@@ -911,8 +911,18 @@ pub fn redact(text: &str) -> (String, Vec<&'static str>) {
             end -= 1;
         }
         if end < rest.len() {
+            // Blocks are scrubbed one by one, so a secret must not straddle a
+            // cut. End the block before the last whole line, so a `key =` and
+            // its value on the next line stay together; with no line break,
+            // end it at whitespace, which no token or unquoted value contains.
             if let Some(nl) = rest[..end].rfind('\n') {
-                end = nl + 1;
+                end = rest[..nl].rfind('\n').map_or(nl + 1, |prev| prev + 1);
+            } else if let Some((ws, c)) = rest[..end]
+                .char_indices()
+                .rev()
+                .find(|&(_, c)| c.is_whitespace())
+            {
+                end = ws + c.len_utf8();
             }
         }
         let mut block = rest[..end].to_string();
@@ -1389,6 +1399,22 @@ mod tests {
         assert_eq!(found.last(), Some(&"truncated"));
         assert_eq!(scrubbed, "[REDACTED:truncated]");
         assert_eq!(redact(&scrubbed), (scrubbed.clone(), vec![]));
+    }
+
+    /// A text over the scan limit is scrubbed in blocks, and no cut splits a
+    /// key from its value on the next line or a token on a line with no
+    /// line break.
+    #[test]
+    fn redact_keeps_a_secret_whole_across_a_block_cut() {
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let next_line = format!("{}\npassword=\nhunter22", "x".repeat(MAX_SCAN_BYTES - 11));
+        let one_line = format!("{} {key} done", "x ".repeat((MAX_SCAN_BYTES - 20) / 2));
+        for text in [next_line, one_line] {
+            let (scrubbed, found) = redact(&text);
+            assert!(!scrubbed.contains("hunter22") && !scrubbed.contains(key), "{found:?}");
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(redact(&scrubbed), (scrubbed.clone(), vec![]));
+        }
     }
 
     /// A marker counts as already scrubbed only when it is the whole value:
