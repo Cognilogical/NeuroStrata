@@ -58,11 +58,19 @@ impl LayaOnnxProvider {
         let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
             .map_err(|e| anyhow!(format!("Bad manifest JSON: {e}")))?;
 
-        let model_version = manifest
-            .get("model_version")
-            .or(manifest.get("version"))
-            .and_then(|x| x.as_str())
-            .unwrap_or("v0.1.0-local")
+        // A version must be declared and non-empty after trimming: a
+        // serving provider must never mint a fabricated model identity
+        // for an unversioned bundle.
+        let non_empty = |key: &str| {
+            manifest
+                .get(key)
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        let model_version = non_empty("model_version")
+            .or_else(|| non_empty("version"))
+            .ok_or_else(|| anyhow!("Bundle manifest declares no model_version or version"))?
             .to_string();
 
         let temperature = manifest
@@ -570,6 +578,34 @@ mod tests {
                                                               // Manifest fields must be stored, not discarded.
             assert_eq!(p.model_version(), "v1");
             assert_eq!(p.embedder_id(), "laya");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn laya_load_rejects_unversioned_manifest() {
+        for (label, manifest) in [
+            ("noversion", serde_json::json!({"embedder_id": "laya"})),
+            (
+                "blankversion",
+                serde_json::json!({"embedder_id": "laya", "model_version": "   "}),
+            ),
+        ] {
+            let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+            let dir =
+                std::env::temp_dir().join(format!("ns-laya-{label}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("manifest.json"),
+                serde_json::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
+            let res = LayaOnnxProvider::load(&dir, sem);
+            assert!(
+                res.is_err(),
+                "manifest {manifest} must be refused, not served under a fabricated version"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
