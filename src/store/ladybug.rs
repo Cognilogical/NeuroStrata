@@ -7856,6 +7856,22 @@ impl LadybugStore {
         })
     }
 
+    /// Test-only read of the live staging markers of a namespace, so an
+    /// ingest rollback test can assert that a failed generation left no
+    /// orphaned `StagingGeneration` row behind (issue #417).
+    #[cfg(test)]
+    pub(crate) async fn staging_generations_for_test(&self, namespace: &str) -> Result<Vec<u64>> {
+        let namespace = namespace.to_string();
+        self.with_conn(move |conn| {
+            let mut generations: Vec<u64> = staging_generations_of(conn, &namespace)?
+                .into_iter()
+                .collect();
+            generations.sort_unstable();
+            Ok(generations)
+        })
+        .await
+    }
+
     /// Delete every row of one superseded generation in `namespace`.
     ///
     /// # Rollback constraint

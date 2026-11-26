@@ -39,7 +39,10 @@ pub const INTERNAL_INGEST_STAGE_PREFIX: &str = "__neurostrata_ingest_stage__";
 /// Prefix matching covers both the bare staging namespace and every
 /// generation-suffixed variant the store creates from it.
 pub fn is_reserved_ingest_destination(namespace: &str) -> bool {
-    namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX)
+    namespace
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with(INTERNAL_INGEST_STAGE_PREFIX)
 }
 
 /// Represents a stored memory payload
@@ -1177,5 +1180,27 @@ mod tests {
         ] {
             assert!(has_source(&real), "real source is provenance: {}", real);
         }
+    }
+
+    /// The reserved prefix is matched after trimming surrounding whitespace and
+    /// folding ASCII case, so padding or an upper-cased spelling cannot smuggle
+    /// an operator ingest into the staging machinery (issue #417).
+    #[test]
+    fn reserved_ingest_destination_normalizes_whitespace_and_case() {
+        assert!(is_reserved_ingest_destination(INTERNAL_INGEST_STAGE_PREFIX));
+        assert!(is_reserved_ingest_destination(
+            "__neurostrata_ingest_stage__probe"
+        ));
+        assert!(is_reserved_ingest_destination(
+            " __neurostrata_ingest_stage__x"
+        ));
+        assert!(is_reserved_ingest_destination(
+            "__NEUROSTRATA_INGEST_STAGE__x"
+        ));
+        assert!(is_reserved_ingest_destination(
+            "\t__NeuroStrata_Ingest_Stage__x\n"
+        ));
+        assert!(!is_reserved_ingest_destination("__neurostrata_ingest_stag"));
+        assert!(!is_reserved_ingest_destination("project__neurostrata"));
     }
 }

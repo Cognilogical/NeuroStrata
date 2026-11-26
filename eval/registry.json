@@ -42,12 +42,22 @@
         "cargo test --locked --bin neurostrata-mcp parser::ingest::tests::reserved_ingest_destinations_are_rejected_before_staging_or_embedding -- --exact --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp ingest_jobs::tests::reserved_destination_is_rejected_before_directory_or_job_registry_work -- --exact --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp parser::ingest::tests::a_failed_relink_rolls_back_to_the_previous_generation -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests::a_failed_relink_on_the_first_ingest_leaves_no_generation_active -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests::a_failed_relink_on_an_unchanged_ingest_leaves_it_active_and_no_staging -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests::a_failed_relink_reports_the_rollback_failures_too -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp traits::tests::reserved_ingest_destination_normalizes_whitespace_and_case -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::cli_ingest_dry_run_refuses_reserved_destination_before_reading_the_tree -- --exact --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::process_crash_during_publication_recovers_old_or_committed_generation -- --exact --test-threads=1"
       ],
       "tests": [
         "parser::ingest::tests::reserved_ingest_destinations_are_rejected_before_staging_or_embedding",
         "ingest_jobs::tests::reserved_destination_is_rejected_before_directory_or_job_registry_work",
         "parser::ingest::tests::a_failed_relink_rolls_back_to_the_previous_generation",
+        "parser::ingest::tests::a_failed_relink_on_the_first_ingest_leaves_no_generation_active",
+        "parser::ingest::tests::a_failed_relink_on_an_unchanged_ingest_leaves_it_active_and_no_staging",
+        "parser::ingest::tests::a_failed_relink_reports_the_rollback_failures_too",
+        "traits::tests::reserved_ingest_destination_normalizes_whitespace_and_case",
+        "tests::cli_ingest_dry_run_refuses_reserved_destination_before_reading_the_tree",
         "store::ladybug::tests::process_crash_during_publication_recovers_old_or_committed_generation"
       ],
       "thresholds": {

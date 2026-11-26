@@ -2705,11 +2705,17 @@ pub async fn ingest_directory(
     // Capture the rollback target before publication flips the pointer. If
     // `relink_edges` then fails, the freshly published generation has no rule
     // edges and must not stay live: the previous generation is restored.
+    //
+    // `None` covers both a first ingest and an unchanged ingest, which differ
+    // after a relink failure: an unchanged ingest never moves the pointer (its
+    // staging generation was already discarded), while a first ingest
+    // published generation 1 and has no earlier generation to restore.
     let previous_generation = if unchanged {
-        0
+        None
     } else {
         match vector_store.active_generation(namespace, &source_key).await {
-            Ok(previous) => previous,
+            Ok(previous) if previous > 0 => Some(previous),
+            Ok(_) => None,
             Err(e) => {
                 // Without the target there is nothing safe to roll back to,
                 // so publishing would be an unrecoverable risk. Clean up the
@@ -2774,33 +2780,77 @@ pub async fn ingest_directory(
         Ok(linked) => linked,
         Err(relink_error) => {
             if unchanged {
+                // The pointer never moved and the unchanged active generation
+                // still serves the tree. The staging generation was discarded
+                // when `unchanged` was detected; repeat the abort so a failed
+                // first discard cannot leak its rows or its staging marker.
+                let cleanup = vector_store
+                    .abort_generation(namespace, &source_key, generation)
+                    .await;
+                let cleanup_note = match cleanup {
+                    Ok(()) => format!("discarded staging generation {generation}"),
+                    Err(e) => format!("could not discard staging generation {generation}: {e}"),
+                };
                 return Err(anyhow::anyhow!(
-                    "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; ingest again to retry: {}",
+                    "namespace {} is unchanged since active generation {prev_gen} but could not relink the edges its memories declare, so rules do not reach their code; the unchanged active generation {prev_gen} is untouched and its staging generation was never published; cleanup: {}; relink error: {}",
                     namespace,
+                    cleanup_note,
                     relink_error
                 ));
             }
-            let restore = vector_store
-                .publish_generation(namespace, &source_key, previous_generation)
-                .await;
-            let abort = vector_store
-                .abort_generation(namespace, &source_key, generation)
-                .await;
-            let restore_note = match restore {
-                Ok(()) => format!("restored generation {previous_generation}"),
-                Err(e) => format!("could not restore generation {previous_generation}: {e}"),
-            };
-            let abort_note = match abort {
-                Ok(()) => format!("aborted generation {generation}"),
-                Err(e) => format!("could not abort generation {generation}: {e}"),
-            };
-            return Err(anyhow::anyhow!(
-                "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; rollback: {}; {}; relink error: {}",
-                namespace,
-                restore_note,
-                abort_note,
-                relink_error
-            ));
+            match previous_generation {
+                Some(previous_generation) => {
+                    let restore = vector_store
+                        .publish_generation(namespace, &source_key, previous_generation)
+                        .await;
+                    let abort = vector_store
+                        .abort_generation(namespace, &source_key, generation)
+                        .await;
+                    let restore_note = match restore {
+                        Ok(()) => format!("restored generation {previous_generation}"),
+                        Err(e) => {
+                            format!("could not restore generation {previous_generation}: {e}")
+                        }
+                    };
+                    let abort_note = match abort {
+                        Ok(()) => format!("aborted generation {generation}"),
+                        Err(e) => format!("could not abort generation {generation}: {e}"),
+                    };
+                    return Err(anyhow::anyhow!(
+                        "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; rollback: {}; {}; relink error: {}",
+                        namespace,
+                        restore_note,
+                        abort_note,
+                        relink_error
+                    ));
+                }
+                None => {
+                    // No prior generation (a first ingest, or a namespace an
+                    // earlier failed first ingest emptied): there is nothing
+                    // to restore. Abort the generation just published, which
+                    // also clears the pointer, so the documented post-failure
+                    // state is "no active generation (0) and no nodes from
+                    // the failed generation" -- never a live tree without
+                    // edges.
+                    let abort = vector_store
+                        .abort_generation(namespace, &source_key, generation)
+                        .await;
+                    let abort_note = match abort {
+                        Ok(()) => format!(
+                            "aborted generation {generation}; no previous generation existed, so the namespace has no active generation (0) and none of generation {generation}'s nodes remain"
+                        ),
+                        Err(e) => format!(
+                            "could not abort generation {generation}: {e}; the namespace may still serve generation {generation} without its rule edges"
+                        ),
+                    };
+                    return Err(anyhow::anyhow!(
+                        "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; rollback with no prior generation to restore: {}; relink error: {}",
+                        namespace,
+                        abort_note,
+                        relink_error
+                    ));
+                }
+            }
         }
     };
     println!(
@@ -5968,6 +6018,192 @@ use super::x;"#;
         }
     }
 
+    /// Delegating store double for the worst relink-rollback case: the
+    /// post-publication relink fails, the restore of the previous generation
+    /// fails, and the abort of the failed generation fails too (issue #417).
+    ///
+    /// The poison targets are fixed deliberately: the driver publishes
+    /// generation 1 before arming, so the failed generation is 2 and the
+    /// restore target is 1.
+    struct RelinkAndRollbackFailingStore {
+        inner: Arc<dyn VectorStore>,
+        fail_relink: std::sync::atomic::AtomicBool,
+        fail_restore: std::sync::atomic::AtomicBool,
+        fail_abort: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::traits::AsAny for RelinkAndRollbackFailingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VectorStore for RelinkAndRollbackFailingStore {
+        async fn init(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.init(namespace).await
+        }
+
+        async fn upsert(
+            &self,
+            namespace: &str,
+            id: &str,
+            vector: Vec<f32>,
+            payload: MemoryPayload,
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
+            self.inner.upsert(namespace, id, vector, payload).await
+        }
+
+        async fn search(
+            &self,
+            namespace: &str,
+            vector: Vec<f32>,
+            limit: usize,
+            include_tasks: bool,
+            include_archived: bool,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner
+                .search(namespace, vector, limit, include_tasks, include_archived)
+                .await
+        }
+
+        async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(namespace, id).await
+        }
+
+        async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(namespace).await
+        }
+
+        async fn relink_edges(&self, namespace: &str, source_key: &str) -> anyhow::Result<usize> {
+            if self
+                .fail_relink
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("injected relink failure (test double)");
+            }
+            self.inner.relink_edges(namespace, source_key).await
+        }
+
+        async fn begin_generation(&self, namespace: &str, source_key: &str) -> anyhow::Result<u64> {
+            self.inner.begin_generation(namespace, source_key).await
+        }
+
+        async fn publish_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            // Generation 1 is only ever published as the rollback restore
+            // here: generation 1's original publication happened before the
+            // double was armed.
+            if generation == 1 && self.fail_restore.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("injected rollback restore failure (test double)");
+            }
+            self.inner
+                .publish_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn abort_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            if generation == 2 && self.fail_abort.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("injected rollback abort failure (test double)");
+            }
+            self.inner
+                .abort_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn active_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+        ) -> anyhow::Result<u64> {
+            self.inner.active_generation(namespace, source_key).await
+        }
+
+        async fn generation_nodes(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<String>> {
+            self.inner.generation_nodes(namespace, generation).await
+        }
+
+        async fn list(
+            &self,
+            namespace: &str,
+            user_id: Option<&str>,
+            memory_type: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner.list(namespace, user_id, memory_type).await
+        }
+
+        async fn generation_summary(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<crate::traits::GenerationRow>> {
+            self.inner.generation_summary(namespace, generation).await
+        }
+
+        async fn get(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
+            self.inner.get(namespace, id).await
+        }
+
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+
+        async fn export_graph(
+            &self,
+            include_retired: bool,
+            include_archived: bool,
+            project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+            anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner
+                .export_graph(
+                    include_retired,
+                    include_archived,
+                    project_contexts,
+                    anchor_override,
+                )
+                .await
+        }
+
+        async fn increment_access_count(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(namespace, id).await
+        }
+
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+    }
+
     /// A relink failure happens after publication. Without a rollback the new
     /// generation stays active with none of its rule edges; the previous
     /// generation, which the store still holds, is the safe thing to restore.
@@ -6055,6 +6291,288 @@ use super::x;"#;
                 .expect("read")
                 .is_some(),
             "the restored generation is still reachable"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// On a first ingest there is no earlier generation to restore. The
+    /// documented post-failure state is a clean empty namespace: no active
+    /// generation and none of generation 1's rows or staging marker left
+    /// behind, so a retry starts from zero rather than half a tree (#417).
+    #[tokio::test]
+    async fn a_failed_relink_on_the_first_ingest_leaves_no_generation_active() {
+        let db = std::env::temp_dir().join(format!("ns-relink-first-db-{}", uuid::Uuid::new_v4()));
+        let concrete =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        let inner: Arc<dyn VectorStore> = concrete.clone();
+        let failing = Arc::new(RelinkFailingStore {
+            inner: inner.clone(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn VectorStore> = failing.clone();
+        store
+            .init("relink-first-ns")
+            .await
+            .expect("create the schema");
+
+        let dir = std::env::temp_dir().join(format!("ns-relink-first-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("hello.rs"), "fn hello() {}").expect("write file");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+
+        // Armed for the first ingest: generation 1 publishes, then relink
+        // fails with no previous generation to fall back to.
+        failing
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "relink-first-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect_err("a failed relink fails the first ingest");
+
+        let text = format!("{error}");
+        assert!(
+            text.contains("no prior generation"),
+            "the error documents the no-prior-generation rollback state: {text}"
+        );
+        assert!(
+            text.contains("injected relink failure"),
+            "the error keeps the relink failure: {text}"
+        );
+        assert_eq!(
+            inner
+                .active_generation("relink-first-ns", &source_key_for(&dir))
+                .await
+                .expect("read"),
+            0,
+            "a first ingest whose relink fails leaves no active generation"
+        );
+        assert!(
+            inner
+                .generation_nodes("relink-first-ns", 1)
+                .await
+                .expect("read")
+                .is_empty(),
+            "none of the failed generation's nodes remain reachable"
+        );
+        assert!(
+            inner
+                .get(
+                    "relink-first-ns",
+                    &generation_scoped_id("relink-first-ns", 1, "hello.rs")
+                )
+                .await
+                .expect("read")
+                .is_none(),
+            "the failed generation's rows are gone, not merely unreferenced"
+        );
+        assert!(
+            concrete
+                .staging_generations_for_test("relink-first-ns")
+                .await
+                .expect("read staging markers")
+                .is_empty(),
+            "the failed generation's staging marker is removed"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// An unchanged ingest never moves the pointer: its staging generation is
+    /// discarded before publication. When relink then fails, the previously
+    /// active generation must stay active and the discarded generation must
+    /// leave no staging marker behind (#417).
+    #[tokio::test]
+    async fn a_failed_relink_on_an_unchanged_ingest_leaves_it_active_and_no_staging() {
+        let db = std::env::temp_dir().join(format!("ns-relink-same-db-{}", uuid::Uuid::new_v4()));
+        let concrete =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        let inner: Arc<dyn VectorStore> = concrete.clone();
+        let failing = Arc::new(RelinkFailingStore {
+            inner: inner.clone(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn VectorStore> = failing.clone();
+        store
+            .init("relink-same-ns")
+            .await
+            .expect("create the schema");
+
+        let dir = std::env::temp_dir().join(format!("ns-relink-same-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("hello.rs"), "fn hello() {}").expect("write file");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+
+        ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "relink-same-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("first ingest publishes generation 1");
+        let source_key = source_key_for(&dir);
+
+        // No file changes: the second ingest stages nothing, discards its
+        // generation, and then hits the injected relink failure.
+        failing
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "relink-same-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect_err("a failed relink fails the unchanged ingest");
+
+        let text = format!("{error}");
+        assert!(
+            text.contains("unchanged") && text.contains("active generation 1"),
+            "the error documents the unchanged-generation state: {text}"
+        );
+        assert!(
+            text.contains("injected relink failure"),
+            "the error keeps the relink failure: {text}"
+        );
+        assert_eq!(
+            inner
+                .active_generation("relink-same-ns", &source_key)
+                .await
+                .expect("read"),
+            1,
+            "the unchanged active generation is not rolled back"
+        );
+        assert!(
+            inner
+                .generation_nodes("relink-same-ns", 2)
+                .await
+                .expect("read")
+                .is_empty(),
+            "the discarded generation has no rows"
+        );
+        assert!(
+            concrete
+                .staging_generations_for_test("relink-same-ns")
+                .await
+                .expect("read staging markers")
+                .is_empty(),
+            "the discarded generation leaks no staging marker"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
+    }
+
+    /// When the rollback itself fails, the error must name both the relink
+    /// failure and every rollback failure, so the operator knows the store was
+    /// left on the unrelinked generation instead of a restored one (#417).
+    #[tokio::test]
+    async fn a_failed_relink_reports_the_rollback_failures_too() {
+        let db =
+            std::env::temp_dir().join(format!("ns-relink-combined-db-{}", uuid::Uuid::new_v4()));
+        let inner: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        let failing = Arc::new(RelinkAndRollbackFailingStore {
+            inner: inner.clone(),
+            fail_relink: std::sync::atomic::AtomicBool::new(false),
+            fail_restore: std::sync::atomic::AtomicBool::new(false),
+            fail_abort: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn VectorStore> = failing.clone();
+        store
+            .init("relink-combined-ns")
+            .await
+            .expect("create the schema");
+
+        let dir = std::env::temp_dir().join(format!("ns-relink-combined-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("hello.rs"), "fn hello() {}").expect("write file");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let source_key = source_key_for(&dir);
+
+        ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "relink-combined-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("first ingest publishes generation 1");
+
+        std::fs::write(dir.join("hello.rs"), "fn hello_again() {}").expect("change file");
+        failing
+            .fail_relink
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        failing
+            .fail_restore
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        failing
+            .fail_abort
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "relink-combined-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect_err("a failed relink with a failed rollback fails the ingest");
+
+        let text = format!("{error}");
+        for expected in [
+            "injected relink failure",
+            "could not restore generation 1",
+            "injected rollback restore failure",
+            "could not abort generation 2",
+            "injected rollback abort failure",
+        ] {
+            assert!(
+                text.contains(expected),
+                "the combined error names {expected:?}: {text}"
+            );
+        }
+        assert_eq!(
+            inner
+                .active_generation("relink-combined-ns", &source_key)
+                .await
+                .expect("read"),
+            2,
+            "with both rollback steps failing the unrelinked generation stays active"
+        );
+        assert!(
+            !inner
+                .generation_nodes("relink-combined-ns", 2)
+                .await
+                .expect("read")
+                .is_empty(),
+            "the failed abort also leaves generation 2's rows in place"
         );
 
         std::fs::remove_dir_all(&dir).ok();
