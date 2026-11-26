@@ -1277,7 +1277,11 @@ pub fn taxonomy_namespace_token(namespace: &str) -> String {
             b'-' if !is_double_dash => out.push('-'),
             _ => {
                 use std::fmt::Write;
-                let _ = write!(&mut out, "~{:02x}", b);
+                // DR-2-safe escape: `~` is not in the bare-id charset, so a
+                // dotted namespace (`team.proj` -> `team-2e-proj`) must not
+                // produce an id the store rejects. Hexadecimal escapes stay
+                // injective without the tilde.
+                let _ = write!(&mut out, "-{:02x}-", b);
             }
         }
     }
@@ -3773,6 +3777,24 @@ mod tests {
         ActionSecurityContext {
             authenticated_principal: principal.to_string(),
             requested_principal: Some(principal.to_string()),
+        }
+    }
+
+    #[test]
+    fn taxonomy_tokens_are_valid_bare_ids_for_dotted_and_double_hyphen_namespaces() {
+        for namespace in ["team.proj", "team--proj", "a.b-c..d"] {
+            let token = taxonomy_namespace_token(namespace);
+            assert!(
+                !token.contains('~'),
+                "the token must not use a character DR-2 rejects: {token}"
+            );
+            crate::domain::validate_id(&thesis_row_id(namespace, 1)).unwrap_or_else(|error| {
+                panic!("namespace {namespace:?} produced an invalid thesis id: {error}")
+            });
+            crate::domain::validate_id(&concept_row_id(namespace, "core-concept", 1))
+                .unwrap_or_else(|error| {
+                    panic!("namespace {namespace:?} produced an invalid concept id: {error}")
+                });
         }
     }
 

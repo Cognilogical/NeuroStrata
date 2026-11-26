@@ -141,10 +141,10 @@ fn bare_id_rule_reason(id: &str) -> Option<String> {
     }
     if let Some(ch) = id
         .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')))
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-' | '~')))
     {
         return Some(format!(
-            "contains disallowed character {:?}; allowed: A-Z a-z 0-9 . _ : -",
+            "contains disallowed character {:?}; allowed: A-Z a-z 0-9 . _ : - ~",
             ch
         ));
     }
