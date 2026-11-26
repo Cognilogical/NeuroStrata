@@ -120,13 +120,12 @@ impl From<std::io::Error> for MarkerError {
     }
 }
 
-/// `[A-Za-z0-9][A-Za-z0-9_.:-]*`, the schema's `namespace` pattern. The
-/// leading letter or digit keeps a namespace from reading as an option
-/// (`-x`) or a path step (`.`).
+/// The DR-1 namespace rule, shared with every other entry point. The leading
+/// letter or digit keeps a namespace from reading as an option (`-x`) or a
+/// path step (`.`), and `:` is banned so `<namespace>::<path>` ids parse
+/// unambiguously.
 pub fn is_valid_namespace(ns: &str) -> bool {
-    let mut chars = ns.chars();
-    chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-'))
+    crate::domain::validate_namespace(ns).is_ok()
 }
 
 /// What [`read_marker`] answers for a marker that resolves outside its folder.
@@ -1413,7 +1412,7 @@ pub async fn ensure_marker_with(
     };
     if !is_valid_namespace(&namespace) {
         return SetupMarker::Refused(
-            "the namespace does not fit .NeuroStrata/config.json (letters, digits, '_', '.', ':' and '-', starting with a letter or digit)",
+            "the namespace does not fit .NeuroStrata/config.json (1-64 letters, digits, '_', '.' and '-', starting with a letter or digit)",
         );
     }
     let cached = match usable_cached_root(registry, &namespace).await {
@@ -1609,7 +1608,7 @@ pub(crate) async fn root_set_with(
     }
     if !is_valid_namespace(ns) {
         return Err(format!(
-            "'{ns}' is not a valid namespace (letters, digits, '_', '.', ':' and '-', starting with a letter or digit)"
+            "'{ns}' is not a valid namespace (1-64 letters, digits, '_', '.' and '-', starting with a letter or digit)"
         ));
     }
     let dir = dunce::canonicalize(&args.dir).unwrap_or_else(|_| args.dir.clone());
@@ -2068,15 +2067,36 @@ mod tests {
 
     #[test]
     fn namespace_charset() {
-        for ok in ["team:proj", "example-project", "a", "A1_b.c:d-e"] {
+        for ok in ["example-project", "a", "A1_b.c-d", "global"] {
             assert!(is_valid_namespace(ok), "{ok}");
         }
-        for bad in ["-x", "", ".x", "_x", "a b", "a/b", "a$b", "é"] {
+        let too_long = "n".repeat(65);
+        for bad in [
+            "-x",
+            "",
+            ".x",
+            "_x",
+            "team:proj",
+            "a:b",
+            "a b",
+            "a/b",
+            "a$b",
+            "é",
+            too_long.as_str(),
+        ] {
             assert!(!is_valid_namespace(bad), "{bad}");
         }
         let tmp = tempfile::tempdir().unwrap();
-        write_raw(tmp.path(), br#"{"version":1,"namespace":"team:proj"}"#);
+        write_raw(
+            tmp.path(),
+            br#"{"version":1,"namespace":"example-project"}"#,
+        );
         assert!(matches!(read_marker(tmp.path()), MarkerRead::Valid(_)));
+        write_raw(tmp.path(), br#"{"version":1,"namespace":"team:proj"}"#);
+        assert!(matches!(
+            read_marker(tmp.path()),
+            MarkerRead::Unreadable { .. }
+        ));
         write_raw(tmp.path(), br#"{"version":1,"namespace":"-x"}"#);
         assert!(matches!(
             read_marker(tmp.path()),
@@ -3155,12 +3175,12 @@ mod tests {
         layout(&base, r#"["example-project git-dir"]"#);
         let repo = base.join("example-project");
         let (store, emb) = mock();
-        let got = ensure_marker_for_setup(&store, Some(&emb), &repo, Some("team:proj")).await;
+        let got = ensure_marker_for_setup(&store, Some(&emb), &repo, Some("team-proj")).await;
         assert_eq!(got, SetupMarker::Written(repo.clone()));
         let MarkerRead::Valid(cfg) = read_marker(&repo) else {
             panic!()
         };
-        assert_eq!(cfg.namespace, "team:proj");
+        assert_eq!(cfg.namespace, "team-proj");
 
         // One explicit source is enough without the flag.
         let tmp = tempfile::tempdir().unwrap();

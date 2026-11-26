@@ -7526,7 +7526,7 @@ fn norm_path(
         .collect()
 }
 
-fn escape_ladybug_string(s: &str) -> String {
+pub(crate) fn escape_ladybug_string(s: &str) -> String {
     s.replace("\\", "\\\\").replace("'", "\\'")
 }
 
@@ -10596,11 +10596,11 @@ impl VectorStore for LadybugStore {
         // Fetch known symbol ids for this namespace and rewrite unqualified edge
         // targets in payload.metadata to their qualified (resolved) form when
         // unambiguous. Qualified targets are left untouched.
+        // DR-1/DR-2 before any store access: a malformed address is refused
+        // here even when a caller bypassed the server or task surface.
+        crate::domain::validate_namespace(namespace)?;
+        crate::domain::validate_id(id)?;
         let namespace = namespace.to_string();
-        // R14: reject empty/whitespace namespaces before hitting the store.
-        if namespace.trim().is_empty() {
-            anyhow::bail!("namespace must be non-empty");
-        }
         // First-write race guard: on a pristine store, refuse the first
         // write if the configured model changed since this process
         // recorded the store's descriptor (a setup pick landed while the
@@ -11867,6 +11867,11 @@ impl VectorStore for LadybugStore {
     }
 
     async fn relocate(&self, id: &str, from: &str, to: &str) -> Result<RelocateOutcome> {
+        // Source, destination and id are validated before the row is read or
+        // moved, so a malformed destination cannot half-apply a relocation.
+        crate::domain::validate_id(id)?;
+        crate::domain::validate_namespace(from)?;
+        crate::domain::validate_namespace(to)?;
         if from == to {
             return Ok(RelocateOutcome::SameNamespace);
         }
@@ -19140,6 +19145,86 @@ eurostrata\src\daemon.rs",
         // The original row stays intact in ns-a.
         let original = store.get("ns-a", "shared-id").await.expect("read ns-a row");
         assert!(original.is_some(), "original row must remain untouched");
+    }
+
+    #[tokio::test]
+    async fn upsert_refuses_an_illegal_namespace_before_any_write() {
+        let store = retired_test_store().await;
+        let err = store
+            .upsert(
+                "bad/ns",
+                "rule-1",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .expect_err("an illegal namespace must be refused");
+        assert!(err.to_string().starts_with("ERROR [NAMESPACE]"), "{err}");
+        assert!(store.list("probe", None, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upsert_refuses_an_illegal_id_before_any_write() {
+        let store = retired_test_store().await;
+        let err = store
+            .upsert(
+                "probe",
+                "bad row id",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .expect_err("an illegal id must be refused");
+        assert!(err.to_string().starts_with("ERROR [ID]"), "{err}");
+        assert!(store.list("probe", None, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn relocate_refuses_an_illegal_destination() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "rule",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        let err = store
+            .relocate("rule", "probe", "bad/ns")
+            .await
+            .expect_err("an illegal destination namespace must be refused");
+        assert!(err.to_string().starts_with("ERROR [NAMESPACE]"), "{err}");
+        assert!(
+            store.get("probe", "rule").await.unwrap().is_some(),
+            "the row stays where it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_batch_refuses_an_illegal_row() {
+        let store = retired_test_store().await;
+        let err = store
+            .commit_action_batch(
+                "probe",
+                crate::rdf::action::ActionWriteSet {
+                    expected_heads: Vec::new(),
+                    writes: vec![crate::rdf::action::StagedMemoryWrite {
+                        id: "bad row id".to_string(),
+                        vector: vec![0.0; 4],
+                        payload: retired_test_payload("rule", "agent", json!({})),
+                    }],
+                    edge_deltas: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("an illegal row id must be refused");
+        assert!(
+            matches!(err, crate::rdf::action::ActionError::Storage(ref m) if m.starts_with("ERROR [ID]")),
+            "{err}"
+        );
+        assert!(store.list("probe", None, None).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -36078,12 +36163,14 @@ impl LadybugStore {
     ) -> std::result::Result<(), crate::rdf::action::ActionError> {
         use crate::rdf::action::{ActionError, EdgeMutationOp, ExpectedHead};
 
-        let ns = namespace.to_string();
-        if ns.trim().is_empty() {
-            return Err(ActionError::Storage(
-                "namespace must be non-empty".to_string(),
-            ));
+        // DR-1/DR-2 before any write turn: one illegal row refuses the whole
+        // batch, so a transaction never begins with a malformed address.
+        crate::domain::validate_namespace(namespace)
+            .map_err(|e| ActionError::Storage(e.to_string()))?;
+        for w in &batch.writes {
+            crate::domain::validate_id(&w.id).map_err(|e| ActionError::Storage(e.to_string()))?;
         }
+        let ns = namespace.to_string();
         self.guard_first_write()
             .map_err(|e| ActionError::Storage(e.to_string()))?;
         self.check_data_bearing_identity()

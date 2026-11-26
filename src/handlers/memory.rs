@@ -23,8 +23,11 @@ pub async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) ->
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
-    if namespace.contains('/') || namespace.contains('\\') {
-        return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
+    if let Err(e) = crate::domain::validate_namespace(namespace) {
+        return e.to_string();
+    }
+    if let Err(e) = crate::domain::validate_id(id) {
+        return e.to_string();
     }
 
     match store.get(namespace, id).await {

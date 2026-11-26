@@ -603,6 +603,39 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "namespace-id-validation": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp domain::tests::valid_ -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp domain::tests::invalid_ -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp domain::tests::qualified_ids_validate_compositively -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp site_refuses_illegal_namespace -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::upsert_refuses_an_illegal -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::relocate_refuses_an_illegal_destination -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::action_batch_refuses_an_illegal_row -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp root_marker::tests::namespace_charset -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp task::harness_plugins::tests::colon_namespace_is_usable -- --test-threads=1"
+      ],
+      "tests": [
+        "domain::tests::valid_namespaces_accepted",
+        "domain::tests::valid_ids_accepted",
+        "domain::tests::invalid_namespaces_rejected",
+        "domain::tests::invalid_ids_rejected",
+        "domain::tests::qualified_ids_validate_compositively",
+        "task::tests::site_refuses_illegal_namespace",
+        "server::tests::site_refuses_illegal_namespace_guard",
+        "server::tests::site_refuses_illegal_namespace_get_memory",
+        "synaptic_mesh::import::tests::site_refuses_illegal_namespace",
+        "store::ladybug::tests::upsert_refuses_an_illegal_namespace_before_any_write",
+        "store::ladybug::tests::upsert_refuses_an_illegal_id_before_any_write",
+        "store::ladybug::tests::relocate_refuses_an_illegal_destination",
+        "store::ladybug::tests::action_batch_refuses_an_illegal_row",
+        "root_marker::tests::namespace_charset",
+        "task::harness_plugins::tests::colon_namespace_is_usable"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }

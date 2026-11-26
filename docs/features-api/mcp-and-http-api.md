@@ -2,6 +2,8 @@
 
 ## Core Memory & Graph Retrieval Tools
 
+Every `namespace` and memory `id` is validated by the one canonical rule set in `src/domain.rs` before the handler touches the store. A namespace (DR-1) is 1–64 ASCII characters from `[A-Za-z0-9._-]`, starts with a letter or digit, and never contains `:`. A bare id (DR-2) is 1–128 ASCII characters from `[A-Za-z0-9._:-]`; a qualified id `<namespace>::<path>` validates its prefix as DR-1 and requires a non-empty path with no quotes, backslashes, or control characters (spaces and `/` stay legal for file paths). Refusals are typed and name the value and rule as `ERROR [NAMESPACE]: …` or `ERROR [ID]: …`. The MCP server, task tools, memory handlers, store write boundaries (`upsert`, `relocate`, `commit_action_batch`), and SynapticMesh import all share this validator, so a malformed address refused at one surface is refused at every surface.
+
 - `neurostrata_add_memory` — store an architectural rule, project pattern, or task insight. For a `rule`, an omitted or blank `metadata.source` is backfilled with the resolver's project-relative spelling when a root places the location (`project_root`, else the registered root, else the nearest `.git`), otherwise exactly `"agent"`. An explicit caller-supplied source is never overwritten. Because `source` is published to mesh peers and exported, this implicit source never holds an absolute local path that names the author's machine.
 - `neurostrata_search_memory` — query memory contents via vector + graph RAG (accepts optional `project_root` alongside `path_prefix` for multi-form relative/absolute prefix resolution, including root-equal prefixes that match in-root relative and absolute paths).
 - `neurostrata_get_snapshot` — fetch current task state snapshot (<=800 chars).

@@ -872,6 +872,9 @@ fn validate_parsed_record(
             record.schema_version, MESH_RECORD_SCHEMA_VERSION
         ));
     }
+    // DR-1 first: a malformed namespace is refused even when the caller lists
+    // it as served, so parity can never launder an illegal address.
+    crate::domain::validate_namespace(&record.namespace).map_err(|e| e.to_string())?;
     if !served.iter().any(|s| s == &record.namespace) {
         return Err(format!(
             "record namespace {} is not served (served: {})",
@@ -3892,6 +3895,25 @@ mod tests {
             0,
             "nothing reached the store"
         );
+    }
+
+    /// A record may not smuggle a malformed namespace past the served-list
+    /// parity check: the shared validator runs first and names the rule, so an
+    /// illegal namespace is refused even when the caller lists it as served.
+    #[test]
+    fn site_refuses_illegal_namespace() {
+        let record = bundle_record(record_value(
+            "synaptic-mesh-record/v1",
+            Uuid::new_v4(),
+            "bad/ns",
+            "rule",
+            "active",
+            None,
+            json!({"text": "probe"}),
+        ));
+        let err = validate_bundle_record(record, &["bad/ns".to_string()])
+            .expect_err("an illegal namespace must be refused");
+        assert!(err.starts_with("ERROR [NAMESPACE]"), "{err}");
     }
 
     /// The per-record byte cap is part of the portable validation

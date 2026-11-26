@@ -60,6 +60,141 @@ pub fn domain_keys(metadata: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// The DR-1 namespace cap: 1 to 64 ASCII characters.
+pub const MAX_NAMESPACE_CHARS: usize = 64;
+
+/// The DR-2 bare-id cap: 1 to 128 ASCII characters.
+pub const MAX_ID_CHARS: usize = 128;
+
+/// The separator between a namespace and the path it qualifies.
+pub const NAMESPACE_SEPARATOR: &str = "::";
+
+/// A namespace or id refused by the shared DR-1/DR-2 rules.
+///
+/// The payload names the rejected value and the rule it broke; `Display`
+/// renders the `ERROR [NAMESPACE]: …` / `ERROR [ID]: …` shape every entry
+/// point surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationError {
+    Namespace(String),
+    Id(String),
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValidationError::Namespace(detail) => write!(f, "ERROR [NAMESPACE]: {detail}"),
+            ValidationError::Id(detail) => write!(f, "ERROR [ID]: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
+fn namespace_rule_reason(ns: &str) -> Option<String> {
+    let len = ns.chars().count();
+    if !(1..=MAX_NAMESPACE_CHARS).contains(&len) {
+        return Some(format!(
+            "must be 1 to {MAX_NAMESPACE_CHARS} characters (got {len})"
+        ));
+    }
+    if !ns.is_ascii() {
+        return Some("must contain only ASCII characters".to_string());
+    }
+    let first = ns.chars().next().expect("length checked above");
+    if !first.is_ascii_alphanumeric() {
+        return Some("must start with an ASCII letter or digit".to_string());
+    }
+    if let Some(ch) = ns
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+    {
+        return Some(format!(
+            "contains disallowed character {:?}; allowed: A-Z a-z 0-9 . _ -",
+            ch
+        ));
+    }
+    None
+}
+
+/// Validate a namespace under DR-1: 1 to 64 ASCII characters from
+/// `[A-Za-z0-9._-]`, starting with an ASCII letter or digit. `:` is banned so
+/// a `<namespace>::<path>` id always splits unambiguously, and a leading
+/// digit-or-letter keeps a namespace from being read as a CLI option (`-x`)
+/// or a path step (`.`, `..`).
+pub fn validate_namespace(ns: &str) -> Result<(), ValidationError> {
+    match namespace_rule_reason(ns) {
+        None => Ok(()),
+        Some(reason) => Err(ValidationError::Namespace(format!(
+            "'{}' is not a valid namespace: {reason}",
+            ns.escape_debug()
+        ))),
+    }
+}
+
+fn bare_id_rule_reason(id: &str) -> Option<String> {
+    let len = id.chars().count();
+    if !(1..=MAX_ID_CHARS).contains(&len) {
+        return Some(format!(
+            "must be 1 to {MAX_ID_CHARS} characters (got {len})"
+        ));
+    }
+    if let Some(ch) = id
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')))
+    {
+        return Some(format!(
+            "contains disallowed character {:?}; allowed: A-Z a-z 0-9 . _ : -",
+            ch
+        ));
+    }
+    None
+}
+
+/// Validate an id under DR-2.
+///
+/// A bare id is 1 to 128 ASCII characters from `[A-Za-z0-9._:-]`. A qualified
+/// id `<namespace>::<path>` validates compositely: the prefix passes DR-1, the
+/// path is non-empty, and the path carries no quotes, backslashes or control
+/// characters. Spaces and `/` stay legal in the path, as file paths need them.
+pub fn validate_id(id: &str) -> Result<(), ValidationError> {
+    if let Some(pos) = id.find(NAMESPACE_SEPARATOR) {
+        let (prefix, qualified) = id.split_at(pos);
+        let path = &qualified[NAMESPACE_SEPARATOR.len()..];
+        if let Some(reason) = namespace_rule_reason(prefix) {
+            return Err(ValidationError::Id(format!(
+                "'{}' is not a valid qualified id: namespace prefix '{}' {reason}",
+                id.escape_debug(),
+                prefix.escape_debug()
+            )));
+        }
+        if path.is_empty() {
+            return Err(ValidationError::Id(format!(
+                "'{}' is not a valid qualified id: the path after '{}' must be non-empty",
+                id.escape_debug(),
+                NAMESPACE_SEPARATOR
+            )));
+        }
+        if path
+            .chars()
+            .any(|c| matches!(c, '\'' | '"' | '\\') || c.is_control())
+        {
+            return Err(ValidationError::Id(format!(
+                "'{}' is not a valid qualified id: the path must not contain quotes, backslashes or control characters",
+                id.escape_debug()
+            )));
+        }
+        return Ok(());
+    }
+    match bare_id_rule_reason(id) {
+        None => Ok(()),
+        Some(reason) => Err(ValidationError::Id(format!(
+            "'{}' is not a valid id: {reason}",
+            id.escape_debug()
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +240,97 @@ mod tests {
             domain_key(&serde_json::json!({"domain": "Database Access"})).as_deref(),
             Some("database-access")
         );
+    }
+
+    #[test]
+    fn valid_namespaces_accepted() {
+        let longest = "n".repeat(64);
+        for ok in ["a", "A1_b.c-d", "global", "NeuroStrata", longest.as_str()] {
+            assert!(validate_namespace(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_namespaces_rejected() {
+        for bad in [
+            "",
+            " ",
+            &"n".repeat(65),
+            ".abc",
+            "-abc",
+            "_abc",
+            "a:b",
+            "team:proj",
+            "a b",
+            "a/b",
+            "a\\b",
+            "é",
+            "a$b",
+            "a\nb",
+        ] {
+            let err = validate_namespace(bad).expect_err(bad);
+            assert!(
+                err.to_string().starts_with("ERROR [NAMESPACE]:"),
+                "{bad:?}: {err}"
+            );
+        }
+        let too_long = "n".repeat(65);
+        let err = validate_namespace(&too_long).expect_err("65 chars must be refused");
+        assert!(err.to_string().contains("64"), "{err}");
+    }
+
+    #[test]
+    fn valid_ids_accepted() {
+        let longest = "i".repeat(128);
+        for ok in [
+            "a",
+            "memory-1",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "a:b",
+            longest.as_str(),
+            "probe::src/a.rs",
+            "probe::src/with space.rs",
+            "probe::generation::src/a.rs",
+        ] {
+            assert!(validate_id(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_ids_rejected() {
+        let too_long = "i".repeat(129);
+        for bad in [
+            "",
+            too_long.as_str(),
+            "a b",
+            "a/b",
+            "a$b",
+            "é",
+            "a\nb",
+            "::src/a.rs",
+            "probe::",
+            "bad/ns::src/a.rs",
+            "team:proj::src/a.rs",
+            "probe::src/a'b.rs",
+            "probe::src/a\"b.rs",
+            "probe::src/a\\b.rs",
+            "probe::src/a\nb.rs",
+        ] {
+            let err = validate_id(bad).expect_err(bad);
+            assert!(err.to_string().starts_with("ERROR [ID]:"), "{bad:?}: {err}");
+        }
+        let err = validate_id(&too_long).expect_err("129 chars must be refused");
+        assert!(err.to_string().contains("128"), "{err}");
+    }
+
+    #[test]
+    fn qualified_ids_validate_compositively() {
+        assert!(validate_id("probe::src/a.rs").is_ok());
+        assert!(validate_id("probe::generation::src/a.rs").is_ok());
+        let err = validate_id("bad/ns::src/a.rs").expect_err("bad prefix must be refused");
+        assert!(err.to_string().contains("namespace prefix"), "{err}");
+        let err = validate_id("probe::").expect_err("empty path must be refused");
+        assert!(err.to_string().contains("non-empty"), "{err}");
     }
 
     #[test]

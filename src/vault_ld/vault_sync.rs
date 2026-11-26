@@ -1714,6 +1714,29 @@ mod tests {
         }
     }
 
+    /// Seed a row the public write gate now refuses: export sanitization must
+    /// still handle legacy rows whose ids predate DR-2, so the test writes the
+    /// row directly instead of weakening `upsert`.
+    async fn seed_legacy_row(
+        store: &crate::store::ladybug::LadybugStore,
+        namespace: &str,
+        id: &str,
+    ) {
+        let query = format!(
+            "CREATE (:Memory {{id: '{}', namespace: '{}', content: '{}', memory_type: 'fact', location: '', metadata: '{{}}'}})",
+            crate::store::ladybug::escape_ladybug_string(id),
+            crate::store::ladybug::escape_ladybug_string(namespace),
+            crate::store::ladybug::escape_ladybug_string(&format!("body of {id}")),
+        );
+        store
+            .with_conn(move |conn| {
+                conn.query(&query)?;
+                Ok(())
+            })
+            .await
+            .expect("seed legacy row");
+    }
+
     #[test]
     fn unresolved_wiki_targets_are_deduplicated_and_deterministic() {
         let notes = vec![
@@ -2899,13 +2922,15 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ns-col-{}", uuid::Uuid::new_v4()));
         let vault = root.join("vault");
         std::fs::create_dir_all(&vault).expect("create vault");
-        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+        let store = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
                 .expect("temp store"),
         );
         let ns = "vault_collision";
         store.init(ns).await.expect("init");
-        for id in ["a/b", "a:b", r"a\b"] {
+        // Three distinct DR-2-valid qualified ids whose `:` and `/` path
+        // separators flatten to the same `a__x_y_z.md` filename.
+        for id in ["a::x/y/z", "a::x/y:z", "a::x:y/z"] {
             store
                 .upsert(
                     ns,
@@ -2944,7 +2969,7 @@ mod tests {
             result.errors
         );
         assert!(
-            result.errors.iter().any(|e| e.contains("a_b.md")),
+            result.errors.iter().any(|e| e.contains("a__x_y_z.md")),
             "{:?}",
             result.errors
         );
@@ -2958,7 +2983,7 @@ mod tests {
         // Re-import into a fresh store + namespace: count must match export.
         let fresh_ns = "vault_collision_reimport";
         let fresh_store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&root.join("db2"), 4)
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db2"), 4)
                 .expect("fresh temp store"),
         );
         fresh_store
@@ -2995,29 +3020,13 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ns-exp-{}", uuid::Uuid::new_v4()));
         let vault = root.join("vault");
         std::fs::create_dir_all(&vault).expect("create vault");
-        let store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
-            crate::store::ladybug::LadybugStore::for_testing(&root.join("db"), 4)
+        let store = std::sync::Arc::new(
+            crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
                 .expect("temp store"),
         );
         let ns = "vault_exp";
         store.init(ns).await.expect("init");
-        store
-            .upsert(
-                ns,
-                r"..\..\outside\victim",
-                vec![0.0; 4],
-                crate::traits::MemoryPayload {
-                    content: "hostile".to_string(),
-                    user_id: "default".to_string(),
-                    memory_type: "fact".to_string(),
-                    agent_name: None,
-                    location: String::new(),
-                    location_lines: String::new(),
-                    metadata: serde_json::json!({}),
-                },
-            )
-            .await
-            .expect("seed hostile id");
+        seed_legacy_row(&store, ns, r"..\..\outside\victim").await;
         let config = VaultSyncConfig {
             namespace: ns.to_string(),
             vault_path: vault.clone(),

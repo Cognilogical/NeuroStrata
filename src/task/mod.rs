@@ -69,13 +69,9 @@ pub const DONE_FUNNEL_MESSAGE: &str =
     "ERROR: done is reachable only via neurostrata_task_complete, which requires memory extraction (Lock 2).";
 
 fn check_namespace(namespace: &str) -> Result<(), String> {
-    if namespace.contains('/') || namespace.contains('\\') {
-        return Err(
-            "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes."
-                .to_string(),
-        );
-    }
-    Ok(())
+    // One canonical rule at every task entry point: a namespace refused here
+    // is refused identically by the server, store and mesh-import surfaces.
+    crate::domain::validate_namespace(namespace).map_err(|e| e.to_string())
 }
 
 fn encode(body: &Value) -> String {
@@ -6449,8 +6445,10 @@ mod tests {
             "  - fact-live -> src/a.rs -> rule-live",
             "- Mandatory Graph-First Lookup Rule: ...",
         ]
-        .join("
-");
+        .join(
+            "
+",
+        );
         task.metadata["task"]["subagent_prompt_injection"] = json!(only_retired_entries);
         let current = task_payload_without_retired_entries(&store, "probe", &task).await;
         assert_eq!(
@@ -6461,8 +6459,10 @@ mod tests {
                 "  - fact-live -> src/a.rs -> rule-live",
                 "- Mandatory Graph-First Lookup Rule: ...",
             ]
-            .join("
-"))
+            .join(
+                "
+"
+            ))
         );
 
         task.metadata["task"]["subagent_prompt_injection"] = json!(block);
@@ -9978,7 +9978,10 @@ exit 0
             metadata: json!({ "task": { "status": "open" } }),
         };
         assert_eq!(task_summary("t", &payload, true)["history"], json!([]));
-        assert_eq!(task_summary("t", &payload, false)["history_count"], json!(0));
+        assert_eq!(
+            task_summary("t", &payload, false)["history_count"],
+            json!(0)
+        );
     }
 
     #[tokio::test]
@@ -12771,12 +12774,7 @@ exit 0
 
         // The verbatim spelling a claim stores matches the caller's plain root,
         // and beats an unstamped claim listed earlier.
-        let rows = [
-            open_mine.clone(),
-            other.clone(),
-            unstamped.clone(),
-            mine,
-        ];
+        let rows = [open_mine.clone(), other.clone(), unstamped.clone(), mine];
         assert_eq!(pick(&rows, r"C:\repo\mine").as_deref(), Some("t-mine"));
         // A task claimed in another worktree, or with no worktree stamped
         // (it may come from any folder of the namespace), is never named.
@@ -13018,6 +13016,27 @@ exit 0
             1,
             "exactly one gate-point task for a non-git project"
         );
+    }
+
+    #[tokio::test]
+    async fn site_refuses_illegal_namespace() {
+        for illegal in ["--help", "team:proj", "a b", ".hidden"] {
+            let store = temp_store().await;
+            let reply = handle_task_create(
+                json!({ "namespace": illegal, "title": "probe task" }),
+                emb(),
+                store.clone(),
+            )
+            .await;
+            assert!(
+                reply.starts_with("ERROR [NAMESPACE]"),
+                "{illegal:?} was not refused: {reply}"
+            );
+            assert!(
+                store.list_namespaces().await.unwrap().is_empty(),
+                "{illegal:?} reached the store"
+            );
+        }
     }
 
     #[tokio::test]

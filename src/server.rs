@@ -5295,8 +5295,8 @@ async fn handle_add_memory(
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
-    if namespace.contains('/') || namespace.contains('\\') {
-        return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
+    if let Err(e) = crate::domain::validate_namespace(namespace) {
+        return e.to_string();
     }
 
     if namespace != "global" {
@@ -12833,14 +12833,9 @@ async fn build_guard_validator(
         .and_then(|v| v.as_str())
         .unwrap_or("global");
     // Validate namespace shape the same way handle_get_memory does, so the
-    // guard surface inherits the same project-vs-path rejection contract.
-    if namespace.contains('/') || namespace.contains('\\') || namespace.is_empty() {
-        return Err(format!(
-            "ERROR [NAMESPACE]: '{}' is not a valid namespace for guard_{}. \
-             Namespaces are exact project names (e.g., 'NeuroStrata') or 'global'.",
-            namespace, what
-        ));
-    }
+    // guard surface inherits the same DR-1 rejection contract.
+    crate::domain::validate_namespace(namespace)
+        .map_err(|e| format!("{} (requested by guard_{})", e, what))?;
     let validator = GuardValidator::new(store, embedder, namespace).await;
     Ok((validator, namespace.to_string()))
 }
@@ -16974,6 +16969,34 @@ mod tests {
         (store, id)
     }
 
+    #[tokio::test]
+    async fn site_refuses_illegal_namespace_guard() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let err = match build_guard_validator(
+            &serde_json::json!({ "namespace": "team:proj" }),
+            store,
+            Arc::new(StubEmbedder),
+            "validate",
+        )
+        .await
+        {
+            Ok(_) => panic!("the guard surface must refuse an illegal namespace"),
+            Err(e) => e,
+        };
+        assert!(err.starts_with("ERROR [NAMESPACE]"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn site_refuses_illegal_namespace_get_memory() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let text = crate::handlers::memory::handle_get_memory(
+            serde_json::json!({ "id": "mem-1", "namespace": "team:proj" }),
+            store,
+        )
+        .await;
+        assert!(text.starts_with("ERROR [NAMESPACE]"), "{text}");
+    }
+
     // ── Capability C remediation: production presentation surfaces ────────
     async fn store_with_deprecated_rule(namespace: &str) -> (Arc<dyn VectorStore>, String) {
         let dir = std::env::temp_dir().join(format!("ns-capc-{}", uuid::Uuid::new_v4()));
@@ -17136,7 +17159,7 @@ mod tests {
         p.agent_name = Some("a".to_string());
         p.metadata = serde_json::json!({"locations":[{"path":"src/lib.rs"}]});
         store
-            .upsert("ns", "file:src/lib.rs", vec![0.0; 4], p)
+            .upsert("ns", "ns::file:src/lib.rs", vec![0.0; 4], p)
             .await
             .expect("seed file node");
 
@@ -17178,8 +17201,14 @@ mod tests {
         assert!(rel_v.get("error").is_none(), "{rel_v}");
         assert!(abs_v.get("error").is_none(), "{abs_v}");
         assert_eq!(abs_v["seed"], serde_json::json!(abs_seed));
-        assert_eq!(abs_v["resolved_seed"], serde_json::json!("file:src/lib.rs"));
-        assert_eq!(rel_v["resolved_seed"], serde_json::json!("file:src/lib.rs"));
+        assert_eq!(
+            abs_v["resolved_seed"],
+            serde_json::json!("ns::file:src/lib.rs")
+        );
+        assert_eq!(
+            rel_v["resolved_seed"],
+            serde_json::json!("ns::file:src/lib.rs")
+        );
         assert!(
             !rel_v["nodes"].as_array().unwrap().is_empty(),
             "relative seed must reach the file node: {rel_v}"
@@ -18344,7 +18373,7 @@ mod tests {
         store
             .upsert(
                 "probe",
-                "file:sub/a.rs",
+                "probe::file:sub/a.rs",
                 vec![0.0; 4],
                 seed_file("sub/a.rs"),
             )
@@ -18354,16 +18383,20 @@ mod tests {
             serde_json::from_str(&handle_related(args.clone(), store.clone()).await).unwrap();
         assert_eq!(
             v["resolved_seed"],
-            serde_json::json!("file:sub/a.rs"),
+            serde_json::json!("probe::file:sub/a.rs"),
             "{v}"
         );
         // Both stored: today's spelling (below the caller's root) still wins.
         store
-            .upsert("probe", "file:a.rs", vec![0.0; 4], seed_file("a.rs"))
+            .upsert("probe", "probe::file:a.rs", vec![0.0; 4], seed_file("a.rs"))
             .await
             .expect("seed");
         let v: Value = serde_json::from_str(&handle_related(args, store.clone()).await).unwrap();
-        assert_eq!(v["resolved_seed"], serde_json::json!("file:a.rs"), "{v}");
+        assert_eq!(
+            v["resolved_seed"],
+            serde_json::json!("probe::file:a.rs"),
+            "{v}"
+        );
     }
 
     #[test]

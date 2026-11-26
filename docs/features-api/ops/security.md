@@ -15,6 +15,15 @@
 | **Destructive Agent Hallucinations** | Zero destructive MCP tools: `delete`, `move`, and `restore` do not exist on the MCP JSON-RPC surface and can only be invoked by an operator via the CLI. | `src/server.rs`, `src/main.rs` |
 | **Unsafe Shell / Action Execution** | Prefrontal Cortex intercepts candidate actions via `neurostrata_guard_validate`, evaluates semantic guard rules, and supports Podman-sandboxed verification. | `src/guard/` |
 
+### 1.1 Canonical Namespace & ID Validation (DR-1 / DR-2)
+
+Namespaces and memory ids are the store's addressing scheme, so one validator in `src/domain.rs` guards every entry point instead of each surface testing its own shape.
+
+- **DR-1 namespaces:** 1–64 ASCII characters from `[A-Za-z0-9._-]`, starting with an ASCII letter or digit. `:` is banned so a qualified id always splits at its first `::`, and a leading letter or digit prevents CLI-option injection (`-x`, `--help`) and path-step spellings (`.`, `..`).
+- **DR-2 ids:** a bare id is 1–128 ASCII characters from `[A-Za-z0-9._:-]`. A qualified id `<namespace>::<path>` validates compositely: the prefix passes DR-1, the path is non-empty, and the path contains no single quote, double quote, backslash, or control character. Spaces and `/` remain valid in the path because file-path ids need them.
+- **Typed refusals:** `ValidationError::Namespace` and `ValidationError::Id` render `ERROR [NAMESPACE]: …` and `ERROR [ID]: …`, naming both the rejected value and the rule it broke.
+- **Uniform enforcement:** the MCP server, `neurostrata_get_memory`, the task tools, `LadybugStore::{upsert, relocate, commit_action_batch}`, and SynapticMesh import run the same checks before any store access or write. The project root marker and harness-plugin namespace checks delegate to the same rule, and `src/schemas/root-config.schema.json` mirrors it.
+
 ---
 
 ## 2. Loopback Daemon & Bearer Token Authentication
