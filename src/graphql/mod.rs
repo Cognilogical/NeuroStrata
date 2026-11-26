@@ -282,10 +282,10 @@ fn is_mesh_conflicting(metadata: &Value) -> bool {
 }
 
 fn is_archived(metadata: &Value) -> bool {
-    metadata
-        .get("archived")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    // #404: the write/API predicate stays strict (`metadata.archived == true`),
+    // but every read surface shares the wider search-visibility predicate so
+    // the legacy integer tombstone cannot leak through GraphQL either.
+    crate::lexical::archived_flag(metadata)
 }
 
 fn is_retired_at(metadata: &Value, now: i64) -> bool {
