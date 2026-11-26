@@ -272,10 +272,20 @@ impl IngestJobs {
     /// and exited mid-walk, and the runtime dropped the walk after it had
     /// cleared the namespace but before it had rebuilt or relinked it.
     pub async fn wait_idle(&self, limit: std::time::Duration) -> bool {
-        let receivers: Vec<watch::Receiver<IngestProgress>> = match lock_or_err(&self.jobs) {
-            Ok(jobs) => jobs.values().cloned().collect(),
+        // Snapshot into owned values in a finished statement: the jobs
+        // guard is !Send, so it must be dropped before any await below,
+        // otherwise this future cannot be sent to `tokio::spawn` callers.
+        let receivers: Option<Vec<watch::Receiver<IngestProgress>>> = match lock_or_err(&self.jobs)
+        {
+            Ok(jobs) => Some(jobs.values().cloned().collect()),
             Err(error) => {
                 tracing::error!("IngestJobs::wait_idle: jobs registry mutex is poisoned: {error}");
+                None
+            }
+        };
+        let receivers = match receivers {
+            Some(receivers) => receivers,
+            None => {
                 // A poisoned registry cannot confirm idleness, but returning
                 // at once would shortcut the caller's shutdown budget to
                 // zero and drop a detached walk that might still finish in
