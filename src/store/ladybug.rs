@@ -25189,6 +25189,54 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    async fn refresh_ontology_keeps_the_cached_index_when_the_store_is_busy() {
+        let dir =
+            std::env::temp_dir().join(format!("ns-ontology-busy-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let entries = vec![
+            serde_json::json!({"slug":"auth","parent":null,"aliases":["authentication"],"concept_iri":null}),
+            serde_json::json!({"slug":"tls","parent":"auth","aliases":["ssl"],"concept_iri":null}),
+        ];
+        let registry_id = crate::registry::registry_row_id("probe");
+        let payload = MemoryPayload {
+            content: crate::registry::registry_content("probe"),
+            user_id: "system".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: crate::registry::registry_metadata_v2(&entries),
+        };
+        store
+            .upsert("probe", &registry_id, vec![1.1, 0.0, 0.0, 0.0], payload)
+            .await
+            .unwrap();
+        store.refresh_ontology("probe").await;
+        assert_eq!(
+            store.get_ontology("probe").canonical_slug("authentication"),
+            Some("auth".to_string()),
+            "the successful refresh seeds the cache"
+        );
+
+        let held = Arc::clone(&store.write_lock).lock_owned().await;
+        store.refresh_ontology("probe").await;
+        drop(held);
+
+        let idx = store.get_ontology("probe");
+        assert_eq!(
+            idx.canonical_slug("authentication"),
+            Some("auth".to_string()),
+            "a busy refresh must keep the last good index, not replace it with a default"
+        );
+        assert!(
+            idx.expand_domain("auth").contains(&"tls".to_string()),
+            "a busy refresh must keep the seeded domain tree"
+        );
+    }
+
+    #[tokio::test]
     async fn test_f1_exact_name_recall_five_identifier_classes() {
         let dir = std::env::temp_dir().join(format!("ns-f1-exact-{}", uuid::Uuid::new_v4()));
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
@@ -26800,7 +26848,24 @@ eurostrata\src\daemon.rs",
             flipped,
             "the committing task must flip has_data after its write lands, even though the caller timed out"
         );
-        let landed = store.get("probe", "m1").await.expect("get");
+        // The committing task still owns the write turn while it resolves the
+        // edge backlog, so a read can legitimately report StoreBusy. Poll the
+        // record view until the turn is released instead of asserting that a
+        // 250 ms read budget was enough.
+        let read_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut landed = None;
+        while std::time::Instant::now() < read_deadline {
+            match store.get("probe", "m1").await {
+                Ok(row) => {
+                    landed = row;
+                    break;
+                }
+                Err(error) if is_store_busy(&error) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("get failed after the write landed: {error}"),
+            }
+        }
         assert!(landed.is_some(), "the timed-out write actually landed");
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
@@ -36344,7 +36409,7 @@ impl LadybugStore {
 impl LadybugStore {
     pub async fn refresh_ontology(&self, namespace: &str) {
         let namespace_owned = namespace.to_string();
-        let (metadata, action_rows, concept_rows) = self
+        let loaded = self
             .with_conn(
                 move |conn: &Connection| -> Result<(
                     Option<serde_json::Value>,
@@ -36445,9 +36510,22 @@ impl LadybugStore {
                     Ok((reg_meta, actions, concepts))
                 },
             )
-            .await
-            .ok()
-            .unwrap_or((None, Vec::new(), Vec::new()));
+            .await;
+        let (metadata, action_rows, concept_rows) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                // A busy or failed read must leave the last good index in
+                // place. Replacing it with a default index would silently drop
+                // custom action types, SHACL shapes, and domains until the
+                // next successful refresh.
+                tracing::warn!(
+                    "keeping the cached ontology for namespace '{}': refresh read failed: {}",
+                    namespace,
+                    error
+                );
+                return;
+            }
+        };
         let mut idx = metadata
             .as_ref()
             .map(|m| crate::rdf::OntologyIndex::from_registry_metadata(m))
