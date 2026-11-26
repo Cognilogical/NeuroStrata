@@ -240,7 +240,13 @@ fn is_ready(payload: &MemoryPayload, statuses: &HashMap<String, Status>) -> bool
 }
 
 /// The base record every tool returns alongside its own fields.
-pub fn task_summary(id: &str, payload: &MemoryPayload) -> Value {
+///
+/// The note history is the crash-recovery read: a fresh claim (a new
+/// session, or one taking over a stale claim) gets it whole to see where the
+/// work stopped (`with_history`). Every other reply goes to the session that
+/// wrote that history -- claims are exclusive per session -- so it carries
+/// only `history_count`; task_list returns the history on request.
+pub fn task_summary(id: &str, payload: &MemoryPayload, with_history: bool) -> Value {
     let task = payload.metadata.get("task");
     let field = |key: &str| {
         task.and_then(|t| t.get(key))
@@ -252,7 +258,7 @@ pub fn task_summary(id: &str, payload: &MemoryPayload) -> Value {
         .and_then(|s| s.as_str())
         .and_then(Status::parse)
         .unwrap_or(Status::Open);
-    json!({
+    let mut summary = json!({
         "id": id,
         "title": payload.content,
         "status": status.as_str(),
@@ -268,8 +274,20 @@ pub fn task_summary(id: &str, payload: &MemoryPayload) -> Value {
         "close_reason": field("close_reason"),
         "created_at": field("created_at"),
         "updated_at": field("updated_at"),
-        "history": field("history"),
-    })
+    });
+    let history = field("history");
+    if with_history {
+        // A task with no notes yet has no history field: an empty list, as
+        // its history_count of 0 says.
+        summary["history"] = if history.is_null() {
+            json!([])
+        } else {
+            history
+        };
+    } else {
+        summary["history_count"] = json!(history.as_array().map_or(0, Vec::len));
+    }
+    summary
 }
 
 async fn load_task(
@@ -649,6 +667,18 @@ pub fn format_golden_rules_section(golden_rules: &[SearchResult]) -> String {
         ));
     }
     out
+}
+
+/// The in_progress task claimed in the worktree at `root`. A task claimed in
+/// another worktree, or with no worktree stamped, is never named, or its
+/// Breath note would land in this session.
+pub fn active_task_for_root<'a>(
+    rows: &'a [SearchResult],
+    root: &str,
+    is_active: impl Fn(&SearchResult) -> bool,
+) -> Option<&'a SearchResult> {
+    rows.iter()
+        .find(|r| is_active(r) && gate::task_in_worktree(r, root))
 }
 
 /// The line that opens the memory entries in a rendered task block.
@@ -2244,13 +2274,13 @@ pub async fn record_tool_receipt(
             let session = (!session.is_empty()).then_some(session);
             let worktree = caller_root.map(str::trim).filter(|w| !w.is_empty());
             let attributed = match (session, worktree) {
-                (Some(s), Some(w)) => pick(&|r| {
-                    task_meta(r, "session_id") == Some(s) && task_meta(r, "worktree") == Some(w)
-                })
-                .or_else(|| pick(&|r| task_meta(r, "session_id") == Some(s)))
-                .or_else(|| pick(&|r| task_meta(r, "worktree") == Some(w))),
+                (Some(s), Some(w)) => {
+                    pick(&|r| task_meta(r, "session_id") == Some(s) && gate::task_in_worktree(r, w))
+                        .or_else(|| pick(&|r| task_meta(r, "session_id") == Some(s)))
+                        .or_else(|| pick(&|r| gate::task_in_worktree(r, w)))
+                }
                 (Some(s), None) => pick(&|r| task_meta(r, "session_id") == Some(s)),
-                (None, Some(w)) => pick(&|r| task_meta(r, "worktree") == Some(w)),
+                (None, Some(w)) => pick(&|r| gate::task_in_worktree(r, w)),
                 (None, None) => None,
             }
             .or_else(|| pick(&|_| true));
@@ -2436,7 +2466,7 @@ pub async fn handle_task_create(
             encode(&json!({
                 "id": id,
                 "namespace": namespace,
-                "task": task_summary(&id, &payload),
+                "task": task_summary(&id, &payload, false),
                 "auto_retrieved_context": hits_json,
                 "subagent_prompt_injection": subagent_prompt,
             }))
@@ -2647,7 +2677,7 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
                 "status": from.as_str(),
                 "claimed": true,
                 "note": "already claimed by this session",
-                "task": task_summary(&id, &task.payload),
+                "task": task_summary(&id, &task.payload, false),
             });
             return encode(&body);
         }
@@ -2802,13 +2832,14 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     } else {
         trimmed_graph_context(&hits_json)
     };
+    // A fresh claim is the crash-recovery read: it carries the whole history.
     let mut reply = json!({
         "id": id,
         "namespace": namespace,
         "status": task.status().as_str(),
         "claimed": true,
         "transition": { "from": from.as_str(), "to": "in_progress" },
-        "task": task_summary(&id, &task.payload),
+        "task": task_summary(&id, &task.payload, true),
         "auto_retrieved_context": hits_json,
         "subagent_prompt_injection": subagent_prompt,
     });
@@ -2905,6 +2936,10 @@ pub async fn handle_task_update(
         Err(e) => return e,
     };
     let from = task.status();
+    let history_before = task
+        .task_field("history")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
 
     // A rename is history, not a transition: without a caller's note the
     // history entry says what the title became, so Working Memory keeps the
@@ -3103,13 +3138,22 @@ pub async fn handle_task_update(
         .and_then(|t| t.get("graph_queries_count"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
+    // Only the entry this call wrote comes back (null when it wrote none,
+    // e.g. a priority change); task_list include_history returns the rest.
+    let appended = task
+        .task_field("history")
+        .and_then(Value::as_array)
+        .filter(|h| h.len() > history_before)
+        .and_then(|h| h.last())
+        .cloned();
     encode(&json!({
         "id": id,
         "namespace": namespace,
         "status": task.status().as_str(),
         "transition": transition,
         "renamed": rename_note,
-        "task": task_summary(&id, &task.payload),
+        "appended": appended,
+        "task": task_summary(&id, &task.payload, false),
         "graph_queries_count": graph_queries_count,
         "graph_lookup_nudge": Value::Null,
     }))
@@ -3164,7 +3208,7 @@ pub async fn handle_task_get(args: Value, store: Arc<dyn VectorStore>) -> String
         Ok((task, _)) => task,
         Err(e) => return e,
     };
-    let mut summary = task_summary(&task.id, &task.payload);
+    let mut summary = task_summary(&task.id, &task.payload, true);
     let notes = summary
         .get("history")
         .and_then(|h| h.as_array())
@@ -3217,6 +3261,10 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
     // not either. The opt-in shows them, labelled, for the audit.
     let include_retired = args
         .get("include_retired")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let include_history = args
+        .get("include_history")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
@@ -3277,7 +3325,7 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
             let retired = gate::is_retired(&m.payload.metadata, now);
             let ready =
                 gate::task_status(m) == Status::Open && !retired && is_ready(&m.payload, &statuses);
-            let mut summary = task_summary(&m.id, &m.payload);
+            let mut summary = task_summary(&m.id, &m.payload, include_history);
             if let Some(obj) = summary.as_object_mut() {
                 obj.insert("ready".to_string(), json!(ready));
             }
@@ -3940,7 +3988,7 @@ pub async fn handle_task_complete(
     .await;
 
     let mut reply = json!({
-        "task": task_summary(&id, &completed.payload),
+        "task": task_summary(&id, &completed.payload, false),
         "extracted_memory_ids": extracted,
         "follow_up_tasks_created": follow_up_created_ids,
         "task_intent_signals": signals,
@@ -9975,9 +10023,25 @@ exit 0
                 }
             }),
         };
-        let summary = task_summary("neurostrata-test", &payload);
+        let summary = task_summary("neurostrata-test", &payload, false);
         assert_eq!(summary["branch"], json!("feature/scope"));
         assert_eq!(summary["worktree"], json!("/wt/scope"));
+    }
+
+    /// With the history asked for, a task that has none gets `[]`, not null.
+    #[test]
+    fn task_summary_gives_an_empty_history_when_the_task_has_none() {
+        let payload = MemoryPayload {
+            content: "no notes yet".to_string(),
+            user_id: "kenton".to_string(),
+            memory_type: "task".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({ "task": { "status": "open" } }),
+        };
+        assert_eq!(task_summary("t", &payload, true)["history"], json!([]));
+        assert_eq!(task_summary("t", &payload, false)["history_count"], json!(0));
     }
 
     #[tokio::test]
@@ -11015,6 +11079,199 @@ exit 0
             "the release says why: {:?}",
             history[1]["note"]
         );
+    }
+
+    /// Claims are exclusive per session, so the session holding a task wrote
+    /// its note history and already has it. Only a fresh claim (the
+    /// crash-recovery read) and task_list include_history return it whole;
+    /// every other reply carries history_count. Sizes are measured on 45
+    /// notes of about 1 KB, which real tasks reach.
+    #[tokio::test]
+    async fn task_replies_carry_the_history_only_where_the_caller_lacks_it() {
+        // The size a reply had when task_summary carried the whole history.
+        fn size_with_history(reply: &Value, history: &Value) -> usize {
+            let mut old = reply.clone();
+            let task = old["task"].as_object_mut().expect("task object");
+            task.remove("history_count");
+            task.insert("history".to_string(), history.clone());
+            encode(&old).len()
+        }
+        let store = store_with_namespace("MyProj").await;
+        let created: Value = serde_json::from_str(
+            &handle_task_create(
+                json!({ "namespace": "MyProj", "title": "long running work" }),
+                emb(),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert!(created["task"].get("history").is_none(), "{created}");
+        assert_eq!(created["task"]["history_count"], json!(0));
+        let id = created["id"].as_str().unwrap().to_string();
+        let holder = json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" });
+        handle_task_claim(holder.clone(), store.clone()).await;
+        let note = "Checked the parser against the fixture; the writer is next. ".repeat(17);
+        for step in 0..44 {
+            handle_task_update(
+                json!({ "namespace": "MyProj", "id": id, "note": format!("{step}: {note}") }),
+                emb(),
+                store.clone(),
+            )
+            .await;
+        }
+        let stored_history = |store: Arc<dyn VectorStore>, id: String| async move {
+            let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+            payload.metadata["task"]["history"].clone()
+        };
+
+        // task_update: the entry it wrote, and the count.
+        let text = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "note": format!("44: {note}") }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let update: Value = serde_json::from_str(&text).unwrap();
+        let history = stored_history(store.clone(), id.clone()).await;
+        assert_eq!(history.as_array().unwrap().len(), 46, "claim + 45 notes");
+        assert!(update["task"].get("history").is_none(), "{text}");
+        assert_eq!(update["task"]["history_count"], json!(46));
+        assert_eq!(update["appended"], history[45]);
+        let update_sizes = (text.len(), size_with_history(&update, &history));
+
+        // A repeat claim by the holder: the count.
+        let text = handle_task_claim(holder.clone(), store.clone()).await;
+        let again: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(again["note"], json!("already claimed by this session"));
+        assert!(again["task"].get("history").is_none(), "{text}");
+        assert_eq!(again["task"]["history_count"], json!(46));
+        let repeat_claim_sizes = (text.len(), size_with_history(&again, &history));
+
+        // task_list: the count per row, the notes on request.
+        let text = handle_task_list(json!({ "namespace": "MyProj" }), store.clone()).await;
+        let list: Value = serde_json::from_str(&text).unwrap();
+        assert!(list["tasks"][0].get("history").is_none(), "{text}");
+        assert_eq!(list["tasks"][0]["history_count"], json!(46));
+        let full_text = handle_task_list(
+            json!({ "namespace": "MyProj", "include_history": true }),
+            store.clone(),
+        )
+        .await;
+        let full: Value = serde_json::from_str(&full_text).unwrap();
+        assert_eq!(full["tasks"][0]["history"], history);
+        assert!(full["tasks"][0].get("history_count").is_none());
+        let list_sizes = (text.len(), full_text.len());
+
+        // A fresh claim by a new session after the holder went stale: whole.
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["task"]["updated_at"] = json!("2020-01-01T00:00:00Z");
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+        let text = handle_task_claim(
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-b", "session_id": "ses_b" }),
+            store.clone(),
+        )
+        .await;
+        let fresh: Value = serde_json::from_str(&text).unwrap();
+        let history = stored_history(store.clone(), id.clone()).await;
+        assert_eq!(history.as_array().unwrap().len(), 48, "+ release + claim");
+        assert_eq!(fresh["task"]["history"], history, "{text}");
+        assert!(fresh["task"].get("history_count").is_none());
+        let fresh_claim_size = text.len();
+
+        // task_complete: the count.
+        let vector = StubEmbedder.embed("the lesson").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &uuid::Uuid::new_v4().to_string(),
+                vector,
+                MemoryPayload {
+                    content: "the lesson".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "extracted_from": [id.as_str()] }),
+                },
+            )
+            .await
+            .unwrap();
+        let text = handle_task_complete(
+            json!({ "namespace": "MyProj", "id": id, "reason": "lesson extracted" }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect("the edge exists");
+        let done: Value = serde_json::from_str(&text).unwrap();
+        let history = stored_history(store.clone(), id.clone()).await;
+        assert!(done["task"].get("history").is_none(), "{text}");
+        assert_eq!(done["task"]["history_count"], json!(49));
+        let complete_sizes = (text.len(), size_with_history(&done, &history));
+
+        println!(
+            "reply bytes, now vs with the whole history (46-49 notes of ~1 KB): \
+             update {update_sizes:?}, repeat claim {repeat_claim_sizes:?}, \
+             task_list {list_sizes:?}, complete {complete_sizes:?}; \
+             fresh claim {fresh_claim_size} (unchanged)"
+        );
+        for (name, (now, before)) in [
+            ("update", update_sizes),
+            ("repeat claim", repeat_claim_sizes),
+            ("task_list", list_sizes),
+            ("complete", complete_sizes),
+        ] {
+            assert!(now * 5 < before, "{name}: {now} bytes vs {before}");
+        }
+    }
+
+    #[tokio::test]
+    async fn task_update_returns_the_history_entry_it_wrote() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        handle_task_claim(
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
+            store.clone(),
+        )
+        .await;
+        let update = |args: Value| {
+            let store = store.clone();
+            async move {
+                let text = handle_task_update(args, emb(), store).await;
+                serde_json::from_str::<Value>(&text)
+                    .unwrap_or_else(|e| panic!("json reply: {text} -- {e}"))
+            }
+        };
+
+        let noted =
+            update(json!({ "namespace": "MyProj", "id": id, "note": "3 of 5: parser done" })).await;
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        let history = payload.metadata["task"]["history"].as_array().unwrap();
+        assert_eq!(noted["appended"], history[1], "the stored entry: {noted}");
+        assert_eq!(noted["appended"]["note"], json!("3 of 5: parser done"));
+        assert_eq!(noted["task"]["history_count"], json!(2));
+
+        // A transition writes one entry too.
+        let blocked = update(json!({
+            "namespace": "MyProj", "id": id, "status": "blocked", "note": "waiting on review"
+        }))
+        .await;
+        assert_eq!(blocked["appended"]["from"], json!("in_progress"));
+        assert_eq!(blocked["appended"]["to"], json!("blocked"));
+        assert_eq!(blocked["appended"]["note"], json!("waiting on review"));
+        assert_eq!(blocked["task"]["history_count"], json!(3));
+
+        // A change that writes no history entry says so.
+        let reprioritized = update(json!({ "namespace": "MyProj", "id": id, "priority": 0 })).await;
+        assert!(
+            reprioritized.get("appended") == Some(&Value::Null),
+            "{reprioritized}"
+        );
+        assert_eq!(reprioritized["task"]["history_count"], json!(3));
     }
 
     #[tokio::test]
@@ -12693,6 +12950,43 @@ exit 0
             },
             evidence: None,
         }
+    }
+
+    #[test]
+    fn active_task_for_root_names_this_worktree_only() {
+        let in_progress = |r: &SearchResult| gate::task_status(r) == Status::InProgress;
+        let other = task_row(
+            "t-other",
+            json!({ "status": "in_progress", "worktree": r"\\?\C:\repo\other" }),
+        );
+        let mine = task_row(
+            "t-mine",
+            json!({ "status": "in_progress", "worktree": r"\\?\C:\repo\mine" }),
+        );
+        let unstamped = task_row("t-unstamped", json!({ "status": "in_progress" }));
+        let open_mine = task_row(
+            "t-open",
+            json!({ "status": "open", "worktree": r"C:\repo\mine" }),
+        );
+        let pick = |rows: &[SearchResult], root: &str| {
+            active_task_for_root(rows, root, in_progress).map(|r| r.id.clone())
+        };
+
+        // The verbatim spelling a claim stores matches the caller's plain root,
+        // and beats an unstamped claim listed earlier.
+        let rows = [
+            open_mine.clone(),
+            other.clone(),
+            unstamped.clone(),
+            mine,
+        ];
+        assert_eq!(pick(&rows, r"C:\repo\mine").as_deref(), Some("t-mine"));
+        // A task claimed in another worktree, or with no worktree stamped
+        // (it may come from any folder of the namespace), is never named.
+        let rows = [other, unstamped, open_mine];
+        assert_eq!(pick(&rows, r"C:\repo\mine"), None);
+        let outside_git = tempfile::tempdir().unwrap();
+        assert_eq!(pick(&rows, &outside_git.path().to_string_lossy()), None);
     }
 
     #[test]

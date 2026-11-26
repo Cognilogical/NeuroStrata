@@ -1013,15 +1013,27 @@ const SESSION_SCOPED_TOOLS = [
     'neurostrata_get_snapshot'
 ];
 /**
+ * The bare `neurostrata_<tool>` name of a NeuroStrata MCP tool, however a
+ * host spells it (`mcp__<server>__neurostrata_task_claim`,
+ * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`); any
+ * other name unchanged. A copy of core's `canonicalToolName`.
+ */
+export function canonicalToolName(toolName) {
+    const name = String(toolName ?? '');
+    // The last `neurostrata_` that starts the name or follows a separator. A
+    // string search, not a backtracking regex: the name comes from the host.
+    const at = name.lastIndexOf('neurostrata_');
+    if (at < 0 || (at > 0 && !'_.:'.includes(name[at - 1])))
+        return name;
+    const bare = name.slice(at);
+    return /^neurostrata_[A-Za-z0-9]\w*$/.test(bare) ? bare : name;
+}
+/**
  * Whether `toolName` is one of SESSION_SCOPED_TOOLS, bare or as a host
- * spells an MCP tool (`mcp__<server>__neurostrata_task_claim`,
- * `<server>_neurostrata_task_claim`, `<server>.neurostrata_task_claim`).
- * A copy of core's `isSessionScopedTool`.
+ * spells an MCP tool. A copy of core's `isSessionScopedTool`.
  */
 export function isSessionScopedTool(toolName) {
-    const name = String(toolName ?? '');
-    return SESSION_SCOPED_TOOLS.some((tool) => name === tool ||
-        (name.endsWith(tool) && /[_.:]$/.test(name.slice(0, -tool.length))));
+    return SESSION_SCOPED_TOOLS.includes(canonicalToolName(toolName));
 }
 /**
  * Claim scope from a linked worktree (design 6.5): passes the session's
@@ -1079,7 +1091,7 @@ export async function initialize(ctx) {
     // Hermes Agent tool names support (without @opencode/plugin import)
     // Register via ctx?.tool?.hook?.("execute.before", ...) for pre-tool hook
     async function runBeforeTool(input) {
-        const toolName = input?.tool;
+        const toolName = canonicalToolName(input?.tool);
         addSessionWorktree(toolName, firstRecord(input?.input, input?.args), sessionProjectDir);
         // File-touch recall (§4.5): on read/write/edit touching a file
         const hermesFileTools = [
