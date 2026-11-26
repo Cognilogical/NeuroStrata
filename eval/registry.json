@@ -204,6 +204,23 @@
         "ignored": 0
       }
     },
+    "store-open-migration": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::store_migration -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::store_migration::a_legacy_row_without_namespace_is_recovered_from_its_metadata",
+        "store::ladybug::store_migration::a_row_with_no_recoverable_namespace_is_quarantined",
+        "store::ladybug::store_migration::neither_null_namespace_recovery_nor_quarantine_blocks_the_open",
+        "store::ladybug::store_migration::a_primary_key_backfill_fails_loud_instead_of_half_migrating",
+        "store::ladybug::store_migration::a_legacy_bare_id_is_found_by_identity_after_migration_not_duplicated",
+        "store::ladybug::store_migration::migration_is_skipped_on_an_unverified_recovery_open",
+        "store::ladybug::store_migration::migration_is_idempotent_across_two_opens"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "wal-zero-record": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp wal_accounting -- --test-threads=1",

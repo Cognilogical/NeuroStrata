@@ -18,6 +18,37 @@ After upgrading to a build with the project marker, run `neurostrata-mcp hooks i
 
 ## How automatic upgrades work
 
+## Store-open migration for legacy rows
+
+Every open of an existing store runs one migration inside the schema turn. It
+never blocks the open on its own account, and it never deletes a row or an
+edge.
+
+- **Primary key.** `CALL table_info('Memory')` must report `id` as the primary
+  key. If an older table's key is a different column, the open fails loudly with
+  `LegacyPrimaryKeyMigrationError` and leaves the original table untouched: the
+  pinned `lbug` engine has no `ALTER` that adds or changes a primary key, so a
+  half-migrated rebuild is refused rather than attempted.
+- **NULL namespaces.** A row with a `NULL` namespace is recovered from, in
+  order, `metadata.namespace`, a generation-scoped id
+  (`namespace::generation::path`), or the single qualified row that shares its
+  logical path in exactly one namespace. A row with no recoverable owner moves
+  to the `_quarantine` namespace with `metadata.quarantine` recorded; it is
+  still there, just out of ordinary reads.
+- **Legacy ids.** Rows an older binary wrote as bare ids are recorded in
+  `LegacyIdAlias (id, namespace, canonical_id)`. A later re-ingest of the
+  qualified id resolves through that alias and updates the existing row in
+  place, so edges stay attached and no duplicate row appears.
+- **Recovery opens.** An unverified recovery open (checksum-config mismatch,
+  unverified WAL replay, or a discarded unreadable WAL) skips the migration
+  entirely and reports `skipped_reason = "unverified_open"`; a later verified
+  open performs it.
+
+The report is available from the store's last open (`MigrationReport`:
+`run`, `pk_rebuilt`, `null_namespace_recovered`, `quarantined`,
+`aliases_recorded`, `skipped_reason`). Re-running an open over an already
+migrated store reports zero changes, so the migration is idempotent.
+
 ## How Zero-Touch Upgrades Work
 
 1. **Replace or rebuild the binary:**

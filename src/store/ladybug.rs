@@ -1602,6 +1602,16 @@ pub struct LadybugStore {
     /// use. The sidecar is the setup-time model choice's lock record:
     /// see `crate::model_choice::store_has_data`.
     store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+    /// In-memory `LegacyIdAlias` map (`#408`): a generation-agnostic canonical
+    /// identity (`<namespace>::<logical path>`) to the stored row id an older
+    /// binary wrote. Loaded lazily before the first `upsert`, so re-ingesting a
+    /// qualified id merges onto the legacy row instead of duplicating it.
+    legacy_aliases: std::sync::RwLock<HashMap<String, String>>,
+    /// Whether `legacy_aliases` has been read from the store this process.
+    legacy_aliases_loaded: std::sync::atomic::AtomicBool,
+    /// The report of this process's store-open migration (`#408`), retained
+    /// after `init` so callers and tests can inspect what the open did.
+    migration_report: Arc<std::sync::Mutex<Option<MigrationReport>>>,
     /// The number of `linked_files` census queries this store has run.
     ///
     /// The census used to cost one query per 128 hit ids, so the total work
@@ -4986,6 +4996,9 @@ impl LadybugStore {
             db_preexisting,
             open_provenance,
             store_state: Arc::new(std::sync::Mutex::new(None)),
+            legacy_aliases: std::sync::RwLock::new(HashMap::new()),
+            legacy_aliases_loaded: std::sync::atomic::AtomicBool::new(false),
+            migration_report: Arc::new(std::sync::Mutex::new(None)),
             census_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             form_scans: Arc::default(),
@@ -5041,6 +5054,89 @@ impl LadybugStore {
     /// on [`OpenProvenance::is_verified`].
     pub fn open_provenance(&self) -> OpenProvenance {
         self.open_provenance
+    }
+
+    /// What this process's store-open migration did, if `init` has run
+    /// (`#408`). `None` before the first successful or refused open.
+    pub fn last_migration_report(&self) -> Option<MigrationReport> {
+        self.migration_report
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Test-only: force the open provenance so the unverified-recovery skip
+    /// can be exercised without manufacturing a damaged WAL.
+    #[cfg(test)]
+    pub(crate) fn with_open_provenance_for_test(mut self, open_provenance: OpenProvenance) -> Self {
+        self.open_provenance = open_provenance;
+        self
+    }
+
+    /// Resolve `requested_id` to the legacy row that already owns its logical
+    /// path in `namespace` (`#408`), if any.
+    async fn resolve_legacy_alias(&self, namespace: &str, requested_id: &str) -> Option<String> {
+        let canonical_id = crate::parser::ingest::qualified_id(
+            namespace,
+            crate::parser::generation::logical_path_of(requested_id),
+        );
+        if !self
+            .legacy_aliases_loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.load_legacy_aliases().await;
+        }
+        let aliases = self
+            .legacy_aliases
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        aliases
+            .get(&canonical_id)
+            .cloned()
+            .filter(|stored_id| stored_id != requested_id)
+    }
+
+    /// Load the `LegacyIdAlias` table into memory once per process. A missing
+    /// table (fresh store, skipped migration) is an empty map, never an error.
+    async fn load_legacy_aliases(&self) {
+        let loaded = self
+            .with_conn(|conn| {
+                let mut aliases = HashMap::new();
+                match conn.query("MATCH (a:LegacyIdAlias) RETURN a.canonical_id, a.id") {
+                    Ok(rows) => {
+                        for row in rows {
+                            match (row.get(0), row.get(1)) {
+                                (
+                                    Some(lbug::Value::String(canonical_id)),
+                                    Some(lbug::Value::String(id)),
+                                ) => {
+                                    aliases.insert(canonical_id.clone(), id.clone());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string().to_lowercase();
+                        if !message.contains("does not exist") && !message.contains("not found") {
+                            tracing::warn!("legacy id alias load skipped: {error}");
+                        }
+                    }
+                }
+                Ok(aliases)
+            })
+            .await;
+        match loaded {
+            Ok(aliases) => {
+                *self
+                    .legacy_aliases
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = aliases;
+            }
+            Err(error) => tracing::warn!("legacy id alias load failed: {error}"),
+        }
+        self.legacy_aliases_loaded
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Bind (or replace) the serving descriptor after construction,
@@ -9624,6 +9720,347 @@ fn memory_table_ddl(dimensions: usize) -> (String, [&'static str; 5]) {
     )
 }
 
+/// The namespace a row with no recoverable owner is moved into (`#408`).
+///
+/// Quarantine is a namespace, not a separate table: the row keeps its id,
+/// content and edges, and every ordinary read stays scoped away from it. No
+/// row is ever deleted by the store-open migration.
+pub const QUARANTINE_NAMESPACE: &str = "_quarantine";
+
+/// One column as `CALL table_info('Memory')` reports it (`#408`).
+///
+/// The engine's own cell 4 is the primary-key flag; the migration decision is
+/// expressed over this shape so it can be pinned without a PK-less table,
+/// which lbug 0.22.3 refuses to create at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub is_primary_key: bool,
+}
+
+/// Whether a `Memory` catalog needs the primary-key leg of the store-open
+/// migration (`#408`): `id` must exist and be the table's primary key.
+pub fn needs_primary_key_rebuild(columns: &[ColumnInfo]) -> bool {
+    !columns
+        .iter()
+        .any(|column| column.name == "id" && column.is_primary_key)
+}
+
+/// The loud failure a pre-primary-key `Memory` table produces at open (`#408`).
+///
+/// lbug 0.22.3 cannot add or change a primary key through `ALTER TABLE`
+/// (verified in the Task 0 spike: `ALTER TABLE ... ADD PRIMARY KEY` is a parser
+/// error), and every node table the engine creates must have a primary key.
+/// A table whose key is not `id` is therefore not rebuildable through DDL the
+/// engine exposes. The migration refuses the open instead of leaving a
+/// half-migrated store behind; the original table is never touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyPrimaryKeyMigrationError {
+    pub detail: String,
+}
+
+impl std::fmt::Display for LegacyPrimaryKeyMigrationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "legacy store migration refused the open: {}",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for LegacyPrimaryKeyMigrationError {}
+
+/// What the store-open migration did (`#408`).
+///
+/// `run` is false only when the migration was skipped before touching the
+/// store (no pre-existing table, or an unverified recovery open). Every count
+/// is the number of rows/aliases changed by this open, so a second open over
+/// the same store reports zeroes while still reporting `run = true`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MigrationReport {
+    pub run: bool,
+    pub pk_rebuilt: bool,
+    pub null_namespace_recovered: usize,
+    pub quarantined: usize,
+    pub aliases_recorded: usize,
+    pub skipped_reason: Option<String>,
+}
+
+/// The Memory columns `CALL table_info('Memory')` reports.
+fn inspect_memory_columns(conn: &Connection) -> Result<Vec<ColumnInfo>> {
+    let mut columns = Vec::new();
+    for row in conn.query("CALL table_info('Memory') RETURN *")? {
+        let Some(lbug::Value::String(name)) = row.get(1) else {
+            continue;
+        };
+        columns.push(ColumnInfo {
+            name: name.clone(),
+            is_primary_key: matches!(row.get(4), Some(lbug::Value::Bool(true))),
+        });
+    }
+    Ok(columns)
+}
+
+fn migration_value_string(value: Option<&lbug::Value>) -> Option<String> {
+    match value {
+        Some(lbug::Value::String(text)) if !text.is_empty() => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn namespace_from_metadata(raw: &str) -> Option<String> {
+    let metadata: Value = serde_json::from_str(raw).ok()?;
+    metadata
+        .get("namespace")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|namespace| !namespace.is_empty())
+        .map(str::to_string)
+}
+
+/// The one namespace that unambiguously owns `bare_id`, when exactly one other
+/// row's qualified id carries the same logical path (`#408`).
+fn unique_namespace_for_bare_id(id: &str, rows: &[(String, Option<String>)]) -> Option<String> {
+    let logical_path = crate::parser::generation::logical_path_of(id);
+    let mut namespaces: HashSet<&str> = HashSet::new();
+    for (other_id, namespace) in rows {
+        if other_id == id {
+            continue;
+        }
+        let Some(namespace) = namespace else {
+            continue;
+        };
+        if crate::parser::ingest::is_qualified(namespace, other_id)
+            && crate::parser::generation::logical_path_of(other_id) == logical_path
+        {
+            namespaces.insert(namespace.as_str());
+        }
+    }
+    if namespaces.len() == 1 {
+        namespaces.into_iter().next().map(str::to_string)
+    } else {
+        None
+    }
+}
+
+fn set_memory_namespace(conn: &Connection, id: &str, namespace: &str) -> Result<()> {
+    conn.query(&format!(
+        "MATCH (m:Memory {{id: '{}'}}) SET m.namespace = '{}'",
+        escape_ladybug_string(id),
+        escape_ladybug_string(namespace)
+    ))?;
+    Ok(())
+}
+
+fn set_memory_metadata(conn: &Connection, id: &str, metadata: &str) -> Result<()> {
+    conn.query(&format!(
+        "MATCH (m:Memory {{id: '{}'}}) SET m.metadata = '{}'",
+        escape_ladybug_string(id),
+        escape_ladybug_string(metadata)
+    ))?;
+    Ok(())
+}
+
+fn quarantined_metadata(raw: Option<&str>, id: &str) -> String {
+    let mut metadata = raw
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !metadata.is_object() {
+        metadata = serde_json::json!({ "original_metadata": metadata });
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "quarantine".to_string(),
+            serde_json::json!({
+                "reason": "unrecoverable_namespace",
+                "original_id": id,
+            }),
+        );
+    }
+    metadata.to_string()
+}
+
+/// Recover every `NULL` namespace in the spec's order (`#408`):
+/// `metadata.namespace`, then a generation-scoped id, then a unique qualified
+/// match, then `_quarantine`. Rows and edges are never deleted.
+fn migrate_null_namespaces(conn: &Connection) -> Result<(usize, usize)> {
+    let columns = inspect_memory_columns(conn)?;
+    let has_metadata = columns.iter().any(|column| column.name == "metadata");
+    if !columns.iter().any(|column| column.name == "namespace") {
+        conn.query("ALTER TABLE Memory ADD namespace STRING")?;
+    }
+
+    let null_query = if has_metadata {
+        "MATCH (m:Memory) WHERE m.namespace IS NULL RETURN m.id, m.metadata"
+    } else {
+        "MATCH (m:Memory) WHERE m.namespace IS NULL RETURN m.id, ''"
+    };
+    let mut pending: Vec<(String, Option<String>)> = Vec::new();
+    for row in conn.query(null_query)? {
+        let Some(id) = migration_value_string(row.first()) else {
+            continue;
+        };
+        pending.push((id, migration_value_string(row.get(1))));
+    }
+    if pending.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // The unique-qualified-match step is the only one that needs every row's
+    // namespace, so it is read only when a NULL actually survived the first
+    // two steps.
+    let mut all_rows: Vec<(String, Option<String>)> = Vec::new();
+    for row in conn.query("MATCH (m:Memory) RETURN m.id, m.namespace")? {
+        let Some(id) = migration_value_string(row.first()) else {
+            continue;
+        };
+        all_rows.push((id, migration_value_string(row.get(1))));
+    }
+
+    let mut recovered = 0usize;
+    let mut quarantined = 0usize;
+    for (id, metadata) in pending {
+        let resolved = metadata
+            .as_deref()
+            .and_then(namespace_from_metadata)
+            .or_else(|| split_scoped_id(&id).map(|(namespace, _, _)| namespace))
+            .or_else(|| unique_namespace_for_bare_id(&id, &all_rows));
+        match resolved {
+            Some(namespace) => {
+                set_memory_namespace(conn, &id, &namespace)?;
+                recovered += 1;
+            }
+            None => {
+                set_memory_namespace(conn, &id, QUARANTINE_NAMESPACE)?;
+                if has_metadata {
+                    let metadata = quarantined_metadata(metadata.as_deref(), &id);
+                    set_memory_metadata(conn, &id, &metadata)?;
+                }
+                quarantined += 1;
+            }
+        }
+    }
+    Ok((recovered, quarantined))
+}
+
+/// `LegacyIdAlias (id, namespace, canonical_id)` (`#408`): the canonical,
+/// generation-agnostic identity (`<namespace>::<logical path>`) of a row an
+/// older binary wrote as a bare id. `id` is that stored row -- keeping it is
+/// what preserves the row's edges -- and `upsert` resolves a qualified request
+/// through this map before its `MERGE`.
+fn migrate_legacy_id_aliases(conn: &Connection) -> Result<usize> {
+    if let Err(error) = conn.query(
+        "CREATE NODE TABLE LegacyIdAlias (id STRING, namespace STRING, canonical_id STRING, PRIMARY KEY (canonical_id))",
+    ) {
+        if !format!("{error}").to_lowercase().contains("already exists") {
+            return Err(error.into());
+        }
+    }
+
+    let mut existing: HashSet<String> = HashSet::new();
+    for row in conn.query("MATCH (a:LegacyIdAlias) RETURN a.canonical_id")? {
+        if let Some(canonical_id) = migration_value_string(row.first()) {
+            existing.insert(canonical_id);
+        }
+    }
+
+    let mut rows: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    for row in conn.query("MATCH (m:Memory) RETURN m.id, m.namespace, m.user_id")? {
+        let Some(id) = migration_value_string(row.first()) else {
+            continue;
+        };
+        rows.push((
+            id,
+            migration_value_string(row.get(1)),
+            migration_value_string(row.get(2)),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut recorded = 0usize;
+    for (id, namespace, user_id) in rows {
+        let Some(namespace) = namespace else {
+            continue;
+        };
+        if namespace == QUARANTINE_NAMESPACE {
+            continue;
+        }
+        // Only ingested rows are re-ingested by identity; an agent-written
+        // memory carries its own stable id and needs no alias.
+        if user_id.as_deref() != Some("auto-ingestor") {
+            continue;
+        }
+        // A generation-scoped id is already a current-binary identity.
+        if split_scoped_id(&id).is_some() {
+            continue;
+        }
+        let canonical_id = crate::parser::ingest::qualified_id(
+            &namespace,
+            crate::parser::generation::logical_path_of(&id),
+        );
+        if canonical_id == id || existing.contains(&canonical_id) {
+            continue;
+        }
+        conn.query(&format!(
+            "MERGE (a:LegacyIdAlias {{canonical_id: '{}'}}) ON CREATE SET a.id = '{}', a.namespace = '{}'",
+            escape_ladybug_string(&canonical_id),
+            escape_ladybug_string(&id),
+            escape_ladybug_string(&namespace)
+        ))?;
+        existing.insert(canonical_id);
+        recorded += 1;
+    }
+    Ok(recorded)
+}
+
+/// Run the store-open migration once for this open (`#408`).
+///
+/// The primary-key leg is fatal and typed: a table that cannot be migrated is
+/// refused loudly, with the original table untouched. The namespace and alias
+/// legs are recovery work, so their failures are reported in
+/// `skipped_reason` and never brick the open.
+fn migrate_legacy_store(conn: &Connection) -> Result<MigrationReport> {
+    let columns = inspect_memory_columns(conn)?;
+    if needs_primary_key_rebuild(&columns) {
+        let primary_key = columns
+            .iter()
+            .find(|column| column.is_primary_key)
+            .map(|column| column.name.clone());
+        return Err(anyhow::Error::new(LegacyPrimaryKeyMigrationError {
+            detail: format!(
+                "Memory.id is not the primary key (found {:?}); lbug 0.22.3 exposes no ALTER that adds or changes a primary key, so the store is refused rather than half-migrated",
+                primary_key
+            ),
+        }));
+    }
+
+    let mut report = MigrationReport {
+        run: true,
+        ..MigrationReport::default()
+    };
+    match migrate_null_namespaces(conn) {
+        Ok((recovered, quarantined)) => {
+            report.null_namespace_recovered = recovered;
+            report.quarantined = quarantined;
+        }
+        Err(error) => {
+            report.skipped_reason = Some(format!("namespace_recovery_failed: {error}"));
+        }
+    }
+    match migrate_legacy_id_aliases(conn) {
+        Ok(recorded) => report.aliases_recorded = recorded,
+        Err(error) => {
+            let reason = format!("alias_recording_failed: {error}");
+            report.skipped_reason = Some(match report.skipped_reason.take() {
+                Some(existing) => format!("{existing}; {reason}"),
+                None => reason,
+            });
+        }
+    }
+    Ok(report)
+}
+
 /// The raw catalog facts the two width reconciliations consult
 /// (#83): exactly what the engine returned. `embedding` is the
 /// `embedding` property's catalog type cell (None when the table has
@@ -10341,16 +10778,68 @@ impl VectorStore for LadybugStore {
         let locked_unknown_attested_empty =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let locked_unknown_attested_flag = locked_unknown_attested_empty.clone();
+        // `#408`: the store-open migration runs once, inside the schema
+        // turn, and only when this open found a pre-existing Memory table.
+        // An unverified recovery open skips it completely: its view of the
+        // rows is unauthenticated, so migrating from it could rewrite rows
+        // the WAL has not replayed yet.
+        let migration_report_slot = Arc::clone(&self.migration_report);
+        let migration_open_verified = self.open_provenance.is_verified();
         // Use write_with_deadline so the write lock is held INSIDE the
         // spawn_blocking closure (see R5). Holding an async lock across
         // with_conn releases it on timeout while the C++ call is still running.
         let outcome = self.write_with_deadline("initializing schema", move |conn| {
 
             let (create_node_table, create_rel_tables) = memory_table_ddl(dimensions);
+            let mut memory_table_preexisting = false;
             if let Err(e) = conn.query(&create_node_table) {
                 if !e.to_string().contains("already exists") {
                     return Err(e.into());
                 }
+                memory_table_preexisting = true;
+            }
+
+            if memory_table_preexisting {
+                let report = if migration_open_verified {
+                    match migrate_legacy_store(conn) {
+                        Ok(report) => report,
+                        Err(error) => {
+                            if let Some(primary_key) =
+                                error.downcast_ref::<LegacyPrimaryKeyMigrationError>()
+                            {
+                                *migration_report_slot
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    Some(MigrationReport {
+                                        run: true,
+                                        skipped_reason: Some(format!(
+                                            "primary_key: {}",
+                                            primary_key.detail
+                                        )),
+                                        ..MigrationReport::default()
+                                    });
+                            }
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    MigrationReport {
+                        run: false,
+                        skipped_reason: Some("unverified_open".to_string()),
+                        ..MigrationReport::default()
+                    }
+                };
+                *migration_report_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(report);
+            } else {
+                *migration_report_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MigrationReport {
+                    run: false,
+                    skipped_reason: Some("memory_table_created".to_string()),
+                    ..MigrationReport::default()
+                });
             }
 
             for ddl in create_rel_tables {
@@ -10629,7 +11118,19 @@ impl VectorStore for LadybugStore {
             1.0,
             std::collections::BTreeMap::new(),
         );
-        let id = id.to_string();
+        let mut id = id.to_string();
+        // `#408`: a qualified id from a re-ingest must land on the row an
+        // older binary wrote as a bare id, not create a second row. The
+        // alias table is consulted before any read or `MERGE` below so the
+        // whole write path sees the legacy row's stored identity.
+        if let Some(stored_id) = self.resolve_legacy_alias(&namespace, &id).await {
+            tracing::debug!(
+                "store-open migration resolved memory id '{}' to legacy row '{}'",
+                id,
+                stored_id
+            );
+            id = stored_id;
+        }
         // Parse shape warnings from the ORIGINAL payload before the write.
         let mut payload = payload;
         // AC3: canonicalize resolvable (unqualified) edge targets at write time.
@@ -36686,4 +37187,513 @@ fn conn_upsert_action_row(
         }
     }
     Ok(())
+}
+
+/// Store-open migration contract (`#408`, Wave 3 Step 3).
+///
+/// These tests pin the legacy-store behaviour at open: a NULL namespace is
+/// recovered (or quarantined), a table whose `id` is not the primary key fails
+/// loudly instead of half-migrating, a bare-id row is found by identity rather
+/// than duplicated, unverified recovery opens skip migration entirely, and a
+/// second open changes nothing.
+#[cfg(test)]
+mod store_migration {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+
+    const DIMS: usize = 4;
+
+    fn seed_config() -> SystemConfig {
+        SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true)
+    }
+
+    /// Create the legacy database exactly as an older binary would have left
+    /// it: raw DDL, raw rows, no store-open migration involved.
+    fn seed(path: &Path, ddl: &str, statements: &[&str]) {
+        let db = Database::new(path, seed_config()).expect("seed database opens");
+        let conn = Connection::new(&db).expect("seed connection opens");
+        conn.query(ddl).expect("seed schema");
+        for statement in statements {
+            conn.query(statement).expect("seed statement");
+        }
+        drop(conn);
+        drop(db);
+    }
+
+    fn memory_ddl(primary_key: &str) -> String {
+        format!(
+            "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{DIMS}], name STRING, PRIMARY KEY({primary_key}))"
+        )
+    }
+
+    fn memory_ddl_without_namespace() -> String {
+        format!(
+            "CREATE NODE TABLE Memory (id STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{DIMS}], name STRING, PRIMARY KEY(id))"
+        )
+    }
+
+    fn rel_table_ddl() -> &'static str {
+        "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)"
+    }
+
+    fn insert_row(id: &str, namespace: Option<&str>, metadata: &str) -> String {
+        let namespace = namespace
+            .map(|ns| format!(", namespace: '{}'", escape_ladybug_string(ns)))
+            .unwrap_or_default();
+        format!(
+            "CREATE (:Memory {{id: '{}'{namespace}, content: 'content-{}', user_id: 'auto-ingestor', memory_type: 'file', agent_name: 'unknown', location: '{}', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0], name: 'n-{}'}})",
+            escape_ladybug_string(id),
+            escape_ladybug_string(id),
+            escape_ladybug_string(id),
+            escape_ladybug_string(metadata),
+            escape_ladybug_string(id),
+        )
+    }
+
+    fn open(path: &Path) -> LadybugStore {
+        LadybugStore::for_testing(path, DIMS).expect("legacy store opens")
+    }
+    async fn count_memory(store: &LadybugStore, predicate: &str) -> i64 {
+        let query = format!("MATCH (m:Memory) WHERE {predicate} RETURN count(m)");
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&query)?;
+                Ok(rows
+                    .next()
+                    .and_then(|row| match row.first() {
+                        Some(lbug::Value::Int64(n)) => Some(*n),
+                        _ => None,
+                    })
+                    .unwrap_or(-1))
+            })
+            .await
+            .expect("count query")
+    }
+
+    async fn stored_namespace(store: &LadybugStore, id: &str) -> Option<String> {
+        let id = id.to_string();
+        store
+            .with_conn(move |conn| {
+                let query = format!(
+                    "MATCH (m:Memory) WHERE m.id = '{}' RETURN m.namespace",
+                    escape_ladybug_string(&id)
+                );
+                let mut rows = conn.query(&query)?;
+                Ok(rows.next().and_then(|row| match row.first() {
+                    Some(lbug::Value::String(ns)) => Some(ns.clone()),
+                    _ => None,
+                }))
+            })
+            .await
+            .expect("namespace query")
+    }
+
+    async fn edge_count(store: &LadybugStore) -> i64 {
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query("MATCH ()-[r:RELATES_TO]->() RETURN count(r)")?;
+                Ok(rows
+                    .next()
+                    .and_then(|row| match row.first() {
+                        Some(lbug::Value::Int64(n)) => Some(*n),
+                        _ => None,
+                    })
+                    .unwrap_or(-1))
+            })
+            .await
+            .expect("edge count query")
+    }
+
+    async fn alias_target(store: &LadybugStore, canonical_id: &str) -> Option<String> {
+        let canonical_id = canonical_id.to_string();
+        store
+            .with_conn(move |conn| {
+                let query = format!(
+                    "MATCH (a:LegacyIdAlias {{canonical_id: '{}'}}) RETURN a.id",
+                    escape_ladybug_string(&canonical_id)
+                );
+                let mut rows = conn.query(&query)?;
+                Ok(rows.next().and_then(|row| match row.first() {
+                    Some(lbug::Value::String(id)) => Some(id.clone()),
+                    _ => None,
+                }))
+            })
+            .await
+            .expect("alias query")
+    }
+
+    async fn table_exists(store: &LadybugStore, table: &'static str) -> bool {
+        store
+            .with_conn(move |conn| {
+                Ok(conn
+                    .query(&format!("CALL table_info('{table}') RETURN *"))
+                    .is_ok())
+            })
+            .await
+            .expect("table_info query")
+    }
+
+    fn row_payload(content: &str) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "auto-ingestor".to_string(),
+            memory_type: "file".to_string(),
+            agent_name: Some("unknown".to_string()),
+            location: "src/main.rs".to_string(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        }
+    }
+
+    #[test]
+    fn the_primary_key_decision_reads_the_id_flag() {
+        let keyed_on_id = vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                is_primary_key: true,
+            },
+            ColumnInfo {
+                name: "namespace".to_string(),
+                is_primary_key: false,
+            },
+        ];
+        assert!(!needs_primary_key_rebuild(&keyed_on_id));
+        assert!(needs_primary_key_rebuild(&[
+            ColumnInfo {
+                name: "id".to_string(),
+                is_primary_key: false,
+            },
+            ColumnInfo {
+                name: "name".to_string(),
+                is_primary_key: true,
+            },
+        ]));
+        assert!(needs_primary_key_rebuild(&[ColumnInfo {
+            name: "name".to_string(),
+            is_primary_key: true,
+        }]));
+    }
+
+    #[tokio::test]
+    async fn a_legacy_row_without_namespace_is_recovered_from_its_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row(
+                "legacy-file",
+                None,
+                r#"{"namespace":"alpha","kept":"yes"}"#,
+            )],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("a legacy store opens");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.run);
+        assert!(!report.pk_rebuilt);
+        assert_eq!(report.null_namespace_recovered, 1);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(report.skipped_reason, None);
+
+        let (_, payload) = store
+            .get("alpha", "legacy-file")
+            .await
+            .expect("row lookup")
+            .expect("row recovered into the metadata namespace");
+        assert_eq!(payload.metadata["namespace"], json!("alpha"));
+        assert_eq!(payload.metadata["kept"], json!("yes"));
+    }
+
+    #[tokio::test]
+    async fn a_row_with_no_recoverable_namespace_is_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("orphan-row", None, r#"{"kept":1}"#)],
+        );
+
+        let store = open(&db);
+        store
+            .init("alpha")
+            .await
+            .expect("quarantine never blocks open");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.run);
+        assert_eq!(report.null_namespace_recovered, 0);
+        assert_eq!(report.quarantined, 1);
+
+        assert_eq!(
+            stored_namespace(&store, "orphan-row").await.as_deref(),
+            Some(QUARANTINE_NAMESPACE)
+        );
+        let (_, payload) = store
+            .get(QUARANTINE_NAMESPACE, "orphan-row")
+            .await
+            .expect("quarantined row lookup")
+            .expect("quarantined row still exists");
+        assert_eq!(payload.metadata["kept"], json!(1));
+        assert_eq!(
+            payload.metadata["quarantine"]["reason"],
+            json!("unrecoverable_namespace")
+        );
+    }
+
+    #[tokio::test]
+    async fn neither_null_namespace_recovery_nor_quarantine_blocks_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("recoverable", None, r#"{"namespace":"beta"}"#),
+                &insert_row("orphan-row", None, "{}"),
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("open completes");
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 1);
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(report.skipped_reason, None);
+
+        assert_eq!(count_memory(&store, "m.namespace IS NOT NULL").await, 2);
+        assert_eq!(count_memory(&store, "m.namespace = 'beta'").await, 1);
+        assert_eq!(
+            count_memory(&store, &format!("m.namespace = '{QUARANTINE_NAMESPACE}'")).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_primary_key_backfill_fails_loud_instead_of_half_migrating() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[&insert_row("legacy-file", Some("alpha"), "{}")],
+        );
+
+        let store = open(&db);
+        let error = store
+            .init("alpha")
+            .await
+            .expect_err("a pre-primary-key table must fail loudly");
+        let typed = error
+            .downcast_ref::<LegacyPrimaryKeyMigrationError>()
+            .expect("the failure is the typed migration error");
+        assert!(typed.detail.contains("id"));
+        let report = store.last_migration_report().expect("migration report");
+        assert!(
+            report
+                .skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("primary_key"),
+            "report must name the loud failure: {:?}",
+            report
+        );
+        drop(store);
+
+        // The original table is untouched: same row, same primary key.
+        let db = Database::new(&db, seed_config()).expect("reopen the original store");
+        let conn = Connection::new(&db).expect("connection");
+        let mut pk_columns = Vec::new();
+        for row in conn
+            .query("CALL table_info('Memory') RETURN *")
+            .expect("table_info")
+        {
+            let name = match row.get(1) {
+                Some(lbug::Value::String(name)) => name.clone(),
+                _ => continue,
+            };
+            let is_pk = matches!(row.get(4), Some(lbug::Value::Bool(true)));
+            if is_pk {
+                pk_columns.push(name);
+            }
+        }
+        assert_eq!(pk_columns, vec!["name".to_string()]);
+        let mut count = conn
+            .query("MATCH (m:Memory) RETURN count(m)")
+            .expect("count");
+        let row_count = count.next().and_then(|row| match row.first() {
+            Some(lbug::Value::Int64(n)) => Some(*n),
+            _ => None,
+        });
+        assert_eq!(row_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_legacy_bare_id_is_found_by_identity_after_migration_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                rel_table_ddl(),
+                &insert_row("src/main.rs", Some("alpha"), "{}"),
+                &insert_row("src/lib.rs", Some("alpha"), "{}"),
+                "MATCH (a:Memory {id: 'src/main.rs'}), (b:Memory {id: 'src/lib.rs'}) CREATE (a)-[:RELATES_TO {source: 'alpha'}]->(b)",
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.aliases_recorded, 2);
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs")
+        );
+
+        store
+            .upsert(
+                "alpha",
+                "alpha::7::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("updated"),
+            )
+            .await
+            .expect("re-ingesting the qualified id updates the legacy row");
+
+        assert_eq!(
+            count_memory(&store, "m.namespace = 'alpha'").await,
+            2,
+            "the qualified id must not create a duplicate row"
+        );
+        let (_, payload) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("legacy row lookup")
+            .expect("the legacy row is updated in place");
+        assert_eq!(payload.content, "updated");
+        assert!(
+            store
+                .get("alpha", "alpha::7::src/main.rs")
+                .await
+                .expect("qualified lookup")
+                .is_none(),
+            "the alias must not materialise a second row"
+        );
+        assert_eq!(edge_count(&store).await, 1, "edges survive the migration");
+    }
+
+    #[tokio::test]
+    async fn migration_is_skipped_on_an_unverified_recovery_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("orphan-row", None, "{}")],
+        );
+
+        let store = open(&db).with_open_provenance_for_test(OpenProvenance::ChecksumConfigMismatch);
+        store
+            .init("alpha")
+            .await
+            .expect("recovery open still opens");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert!(!report.run);
+        assert_eq!(report.skipped_reason.as_deref(), Some("unverified_open"));
+        assert_eq!(stored_namespace(&store, "orphan-row").await, None);
+        assert!(!table_exists(&store, "LegacyIdAlias").await);
+    }
+
+    #[tokio::test]
+    async fn a_missing_namespace_column_is_added_and_a_scoped_id_recovers_its_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl_without_namespace(),
+            &["CREATE (:Memory {id: 'gamma::3::src/lib.rs', content: 'c', user_id: 'auto-ingestor', memory_type: 'file', agent_name: 'unknown', location: 'src/lib.rs', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0], name: 'n'})"],
+        );
+
+        let store = open(&db);
+        store.init("gamma").await.expect("open adds the column");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 1);
+        assert_eq!(
+            stored_namespace(&store, "gamma::3::src/lib.rs")
+                .await
+                .as_deref(),
+            Some("gamma")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_unique_qualified_match_recovers_a_bare_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("src/lib.rs", None, "{}"),
+                &insert_row("delta::9::src/lib.rs", Some("delta"), "{}"),
+            ],
+        );
+
+        let store = open(&db);
+        store.init("delta").await.expect("unique match recovers");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 1);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(
+            stored_namespace(&store, "src/lib.rs").await.as_deref(),
+            Some("delta")
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_is_idempotent_across_two_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("recoverable", None, r#"{"namespace":"alpha"}"#),
+                &insert_row("bare-id", Some("alpha"), "{}"),
+            ],
+        );
+
+        let first = open(&db);
+        first.init("alpha").await.expect("first open migrates");
+        let first_report = first.last_migration_report().expect("first report");
+        assert_eq!(first_report.null_namespace_recovered, 1);
+        assert_eq!(first_report.aliases_recorded, 2);
+        drop(first);
+
+        let second = open(&db);
+        second
+            .init("alpha")
+            .await
+            .expect("second open re-runs safely");
+        let second_report = second.last_migration_report().expect("second report");
+        assert!(second_report.run);
+        assert_eq!(second_report.null_namespace_recovered, 0);
+        assert_eq!(second_report.quarantined, 0);
+        assert_eq!(second_report.aliases_recorded, 0);
+        assert_eq!(second_report.skipped_reason, None);
+        assert_eq!(count_memory(&second, "m.namespace IS NOT NULL").await, 2);
+        assert_eq!(count_memory(&second, "m.namespace = 'alpha'").await, 2);
+    }
 }
