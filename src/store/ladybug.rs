@@ -11509,6 +11509,16 @@ impl VectorStore for LadybugStore {
             ) {
                 continue;
             }
+            // Backstop, composed with the generation-reachability check
+            // above: the fts query verdict trusted the index doc; a
+            // stale/corrupt index doc must not surface a row the stored
+            // payload excludes. Re-derive the doc from the hydrated
+            // payload through the store's own conversion and apply the
+            // query path's own verdict function under the same options.
+            let derived = Self::lexical_doc(namespace, &hit.id, &payload);
+            if !crate::fts::doc_visible(&derived, &options) {
+                continue;
+            }
             results.push(SearchResult {
                 id: hit.id,
                 score: hit.score,
