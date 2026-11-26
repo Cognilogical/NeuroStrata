@@ -19,7 +19,7 @@ use futures::FutureExt;
 use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{watch, Notify};
@@ -174,9 +174,22 @@ impl crate::traits::AsAny for StoreNotAttached {
 struct Queue {
     items: Mutex<VecDeque<ThalamicPulse>>,
     notify: Notify,
+    /// Set on the first poisoned acquisition: poisoning is permanent for a
+    /// mutex, so re-logging it on every push/pop/len would let sustained
+    /// traffic after one panic flood the log unboundedly (review, PR #447).
+    poison_reported: AtomicBool,
 }
 
 impl Queue {
+    /// Log a poisoned acquisition once per queue, however many operations
+    /// hit the poisoned lock afterwards. The degradation itself (drop /
+    /// empty / depth 0) happens on every call; only the log is once-only.
+    fn note_poison(&self, site: &str, error: crate::util::LockPoisoned) {
+        if !self.poison_reported.swap(true, Ordering::Relaxed) {
+            tracing::error!("{site}: queue mutex is poisoned; further poison errors from this queue are suppressed: {error}");
+        }
+    }
+
     /// Push one pulse, trimming the oldest when the push puts the queue over
     /// `capacity`. Returns whether a pulse was evicted: at capacity 0 the
     /// pulse just pushed is also the oldest, and goes. The caller counts an
@@ -185,9 +198,7 @@ impl Queue {
         let mut items = match lock_or_err(&self.items) {
             Ok(items) => items,
             Err(error) => {
-                tracing::error!(
-                    "events::bus::Queue::push: queue mutex is poisoned; dropping pulse: {error}"
-                );
+                self.note_poison("events::bus::Queue::push: dropping pulse", error);
                 return true;
             }
         };
@@ -209,9 +220,7 @@ impl Queue {
         match lock_or_err(&self.items) {
             Ok(mut items) => items.pop_front(),
             Err(error) => {
-                tracing::error!(
-                    "events::bus::Queue::pop: queue mutex is poisoned; reporting empty: {error}"
-                );
+                self.note_poison("events::bus::Queue::pop: reporting empty", error);
                 None
             }
         }
@@ -221,9 +230,7 @@ impl Queue {
         match lock_or_err(&self.items) {
             Ok(items) => items.len(),
             Err(error) => {
-                tracing::error!(
-                    "events::bus::Queue::len: queue mutex is poisoned; reporting depth 0: {error}"
-                );
+                self.note_poison("events::bus::Queue::len: reporting depth 0", error);
                 0
             }
         }
@@ -257,6 +264,7 @@ impl ThalamicBus {
         let queue = Arc::new(Queue {
             items: Mutex::new(VecDeque::new()),
             notify: Notify::new(),
+            poison_reported: AtomicBool::new(false),
         });
         let subs: Arc<Mutex<Vec<Arc<dyn MemorySubscriber>>>> = Arc::new(Mutex::new(Vec::new()));
         let metrics = Arc::new(AtomicMetrics::default());
@@ -1367,6 +1375,7 @@ mod tests {
         let queue = Arc::new(Queue {
             items: Mutex::new(VecDeque::new()),
             notify: Notify::new(),
+            poison_reported: AtomicBool::new(false),
         });
         let poisoner = Arc::clone(&queue);
         let handle = std::thread::spawn(move || {
@@ -1388,6 +1397,10 @@ mod tests {
             "a poisoned pop must report empty rather than recover the deque"
         );
         assert_eq!(queue.len(), 0, "a poisoned queue must report depth 0");
+        assert!(
+            queue.poison_reported.load(Ordering::Relaxed),
+            "the first poisoned acquisition must mark the queue's poison as reported, so later ones stay out of the log"
+        );
     }
 
     /// `register` must refuse the subscriber and `metrics` must report none:
