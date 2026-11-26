@@ -2198,6 +2198,30 @@ async fn probe_daemon() -> DaemonProbe {
 /// process exits -- cleanly, killed or crashed -- so a held lock proves the
 /// daemon is still there, and a free one proves it is gone.
 fn daemon_lock_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    // Canonicalize the parent directory so equivalent spellings of the
+    // same store (`a/../a/ladybug.store`, a symlinked directory, a `.`
+    // component) derive one lock file: flock is per-file, so two
+    // spellings of the lock path would be two different locks and a
+    // daemon could open the store while a restore holds its lock. The
+    // store file itself need not exist yet (a restore takes the lock
+    // before installing it), so only the parent is canonicalized and
+    // the file name is carried over verbatim. A parent that cannot be
+    // canonicalized yet (it does not exist) falls back to the verbatim
+    // spelling; `open_daemon_lock` creates that parent, and later
+    // callers canonicalize it once it exists.
+    if let Some(file_name) = db_path.file_name() {
+        let mut lock_name = file_name.to_owned();
+        lock_name.push(".daemon.lock");
+        let parent = db_path.parent().unwrap_or_else(|| std::path::Path::new(""));
+        let parent = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            return canonical_parent.join(std::path::PathBuf::from(lock_name));
+        }
+    }
     let mut path = db_path.as_os_str().to_owned();
     path.push(".daemon.lock");
     std::path::PathBuf::from(path)
@@ -4322,6 +4346,41 @@ mod tests {
             }
             other => panic!("expected Run, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn equivalent_store_spellings_share_one_daemon_lock_path() {
+        let root = std::env::temp_dir().join(format!("ns-lock-canon-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("store")).unwrap();
+        let direct = root.join("store").join("ladybug.db");
+        let dotted = root.join(".").join("store").join("ladybug.db");
+        let detoured = root
+            .join("store")
+            .join("..")
+            .join("store")
+            .join("ladybug.db");
+        assert_eq!(
+            daemon_lock_path(&direct),
+            daemon_lock_path(&dotted),
+            "a `.` spelling derives the same lock file"
+        );
+        assert_eq!(
+            daemon_lock_path(&direct),
+            daemon_lock_path(&detoured),
+            "a `..` spelling derives the same lock file"
+        );
+        // The lock for one spelling excludes a holder through another.
+        let held = try_take_store_lock(&direct)
+            .expect("the lock file can be opened")
+            .expect("the first holder takes the lock");
+        assert!(
+            try_take_store_lock(&detoured)
+                .expect("the lock file can be probed")
+                .is_none(),
+            "the detoured spelling probes the same, held lock"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
