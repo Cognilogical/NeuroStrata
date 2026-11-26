@@ -1270,13 +1270,25 @@ pub async fn execute_taxonomy(
 pub fn taxonomy_namespace_token(namespace: &str) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(namespace.len());
-    for &b in namespace.as_bytes() {
+    let bytes = namespace.as_bytes();
+    let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    for (i, &b) in bytes.iter().enumerate() {
         match b {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' => out.push(b as char),
-            // Escape every hyphen, not only the second of a pair. Escaping
-            // only some hyphens makes `a.b` and the literal namespace
-            // `a-2e-b` encode identically.
-            b'-' => out.push_str("-2d-"),
+            b'-' => {
+                // A literal `-xx-` (lowercase hex) is indistinguishable from
+                // our escape for a non-charset byte. Escape only that shape;
+                // ordinary single hyphens keep the ids earlier releases wrote.
+                let looks_like_escape = i + 3 < bytes.len()
+                    && lower_hex(bytes[i + 1])
+                    && lower_hex(bytes[i + 2])
+                    && bytes[i + 3] == b'-';
+                if looks_like_escape {
+                    out.push_str("-2d-");
+                } else {
+                    out.push('-');
+                }
+            }
             _ => {
                 let _ = write!(&mut out, "-{:02x}-", b);
             }
