@@ -63,6 +63,15 @@ pub struct EvaluationReport {
     pub suites: Vec<SuiteReport>,
 }
 
+impl Default for EvaluationReport {
+    fn default() -> Self {
+        Self {
+            candidate: "bridge-placeholder".to_string(),
+            suites: Vec::new(),
+        }
+    }
+}
+
 impl EvaluationReport {
     /// Compute gold metric (mean of suite metrics) — real, not fabricated.
     /// Returns None only if no suites have numeric metrics.
@@ -255,11 +264,11 @@ impl Trainer {
             )?;
             return Ok(());
         }
-        return Err(anyhow!(
+        Err(anyhow!(
             "Laya training runtime unavailable (python: {}, laya-train: {})",
             self.runtime.python.display(),
             self.runtime.laya_train.display()
-        ));
+        ))
     }
 
     /// Transition job state through the validated machine.
@@ -482,6 +491,13 @@ mod tests {
     }
 
     #[test]
+    fn default_evaluation_report_names_its_placeholder() {
+        let report = EvaluationReport::default();
+        assert_eq!(report.candidate, "bridge-placeholder");
+        assert!(report.suites.is_empty());
+    }
+
+    #[test]
     fn evaluation_refuses_empty_metrics() {
         let report = EvaluationReport {
             candidate: "v0".to_string(),
@@ -604,9 +620,11 @@ mod tests {
 
     #[test]
     fn rollback_preserves_previous() {
-        let mut manifest = ActiveManifest::default();
-        manifest.active_version = Some("good".to_string());
-        manifest.previous_good_version = Some("prev".to_string());
+        let mut manifest = ActiveManifest {
+            active_version: Some("good".to_string()),
+            previous_good_version: Some("prev".to_string()),
+            ..ActiveManifest::default()
+        };
         let t = Trainer::new(Arc::new(LocalTrainingRuntime {
             python: PathBuf::from("python"),
             laya_train: PathBuf::from("laya-train"),
@@ -685,6 +703,6 @@ mod tests {
         assert!(judgments.iter().any(|j| j
             .reason
             .as_ref()
-            .map_or(false, |r| r.contains("laya-onnx-model-logit"))));
+            .is_some_and(|r| r.contains("laya-onnx-model-logit"))));
     }
 }

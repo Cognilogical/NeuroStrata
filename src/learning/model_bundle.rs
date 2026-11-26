@@ -17,69 +17,65 @@ pub struct ModelBundle {
 }
 
 impl ModelBundle {
-    /// Load a bundle from `bundle_dir` and validate its manifest, paths,
-    /// and identity against the configured embedder.
+    /// Load a bundle from `bundle_dir`, reading its `manifest.json`.
+    ///
+    /// The bundle's version is the one its manifest declares
+    /// (`bundle_version`, falling back to `model_version`) — never a string
+    /// minted by this loader. A bundle whose manifest is missing,
+    /// unparsable, or declares no version is refused.
     pub fn load(bundle_dir: &Path, embedder_id: &str) -> Result<Self> {
         let root = bundle_dir.to_path_buf();
         let manifest_path = root.join("manifest.json");
-        let mut version = "v0.0.0-bridge".to_string();
+        let manifest_text = std::fs::read_to_string(&manifest_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Cannot read bundle manifest {}: {e}",
+                manifest_path.display()
+            )
+        })?;
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
+            .map_err(|e| anyhow::anyhow!("Bad bundle manifest JSON: {e}"))?;
+        let version = manifest["bundle_version"]
+            .as_str()
+            .or_else(|| manifest["model_version"].as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Bundle manifest declares no bundle_version or model_version")
+            })?
+            .to_string();
         let mut calibration_tier = crate::judgment::CalibrationTier::ProxyInternal;
-        let mut manifest_embedder: Option<String> = None;
 
-        if manifest_path.exists() {
-            let text = std::fs::read_to_string(&manifest_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read manifest: {}", e))?;
-            let manifest: serde_json::Value = serde_json::from_str(&text)
-                .map_err(|e| anyhow::anyhow!("Bad manifest JSON: {}", e))?;
-
-            // version
-            if let Some(v) = manifest.get("model_version").and_then(|x| x.as_str()) {
-                version = v.to_string();
-            } else if let Some(v) = manifest.get("version").and_then(|x| x.as_str()) {
-                version = v.to_string();
-            }
-
-            // embedder_id check
-            if let Some(e) = manifest.get("embedder_id").and_then(|x| x.as_str()) {
-                if !e.is_empty() {
-                    manifest_embedder = Some(e.to_string());
+        // calibration_tier
+        if let Some(t) = manifest.get("calibration_tier").and_then(|x| x.as_str()) {
+            calibration_tier = match t {
+                "gold" | "Gold" | "GoldShipped" => crate::judgment::CalibrationTier::Gold,
+                "proxy_internal" | "ProxyInternal" | "DatasetCalibrated" | "Uncalibrated" => {
+                    crate::judgment::CalibrationTier::ProxyInternal
                 }
-            }
+                other => {
+                    tracing::warn!(
+                        "unknown calibration_tier '{other}' in {}, defaulting to ProxyInternal",
+                        manifest_path.display()
+                    );
+                    crate::judgment::CalibrationTier::ProxyInternal
+                }
+            };
+        }
 
-            // calibration_tier
-            if let Some(t) = manifest.get("calibration_tier").and_then(|x| x.as_str()) {
-                calibration_tier = match t {
-                    "gold" | "Gold" | "GoldShipped" => crate::judgment::CalibrationTier::Gold,
-                    "proxy_internal" | "ProxyInternal" | "DatasetCalibrated" | "Uncalibrated" => {
-                        crate::judgment::CalibrationTier::ProxyInternal
-                    }
-                    other => {
-                        tracing::warn!(
-                            "unknown calibration_tier '{other}' in {}, defaulting to ProxyInternal",
-                            manifest_path.display()
-                        );
-                        crate::judgment::CalibrationTier::ProxyInternal
-                    }
-                };
-            }
-
-            // SHA-256 verification
-            if let Some(expected_sha) = manifest.get("model_sha256").and_then(|x| x.as_str()) {
-                if root.join("model.onnx").exists() {
-                    let verified = crate::gliner::verify_bundle_sha256(&root, expected_sha)?;
-                    if !verified {
-                        return Err(anyhow::anyhow!("Manifest SHA-256 mismatch for model.onnx"));
-                    }
+        // SHA-256 verification
+        if let Some(expected_sha) = manifest.get("model_sha256").and_then(|x| x.as_str()) {
+            if root.join("model.onnx").exists() {
+                let verified = crate::gliner::verify_bundle_sha256(&root, expected_sha)?;
+                if !verified {
+                    return Err(anyhow::anyhow!("Manifest SHA-256 mismatch for model.onnx"));
                 }
             }
         }
 
         // Embedder mismatch check
-        if let Some(manifest_emb) = manifest_embedder {
-            if !embedder_id.is_empty() && manifest_emb != embedder_id {
+        if let Some(e) = manifest.get("embedder_id").and_then(|x| x.as_str()) {
+            if !e.is_empty() && !embedder_id.is_empty() && e != embedder_id {
                 return Err(anyhow::anyhow!(
                     "Manifest embedder_id '{}' does not match expected '{}'",
-                    manifest_emb,
+                    e,
                     embedder_id
                 ));
             }
@@ -108,6 +104,52 @@ impl ModelBundle {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn temp_bundle_with_manifest(label: &str, manifest: Option<&str>) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ns-bundle-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(manifest) = manifest {
+            std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn bundle_version_is_not_fabricated() {
+        let dir = temp_bundle_with_manifest(
+            "version",
+            Some(
+                r#"{"bundle_version":"0.4.14-bridge","model_version":"v1.11.1","embedder_id":"test-embedder"}"#,
+            ),
+        );
+        let bundle = ModelBundle::load(&dir, "test-embedder").unwrap();
+        // The version must come from the bundle's own manifest, never from a
+        // hardcoded string minted by the loader.
+        assert_eq!(bundle.version, "0.4.14-bridge");
+    }
+
+    #[test]
+    fn bundle_version_falls_back_to_model_version() {
+        let dir = temp_bundle_with_manifest(
+            "modelversion",
+            Some(r#"{"model_version":"v9.9.9","embedder_id":"test-embedder"}"#),
+        );
+        let bundle = ModelBundle::load(&dir, "test-embedder").unwrap();
+        assert_eq!(bundle.version, "v9.9.9");
+    }
+
+    #[test]
+    fn bundle_load_fails_when_manifest_declares_no_version() {
+        let dir =
+            temp_bundle_with_manifest("noversion", Some(r#"{"embedder_id":"test-embedder"}"#));
+        assert!(ModelBundle::load(&dir, "test-embedder").is_err());
+    }
+
+    #[test]
+    fn bundle_load_fails_without_a_manifest() {
+        let dir = temp_bundle_with_manifest("nomanifest", None);
+        assert!(ModelBundle::load(&dir, "test-embedder").is_err());
+    }
 
     fn temp_bundle(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("ns-model-bundle-{}", name));
