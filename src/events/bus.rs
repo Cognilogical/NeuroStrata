@@ -246,6 +246,32 @@ impl Queue {
         self.notify.notify_one();
     }
 
+    /// Hold a durable pulse whose class has no subscriber without parking it
+    /// at the head of the queue. Other classes must keep draining; only this
+    /// class waits. The pulse goes after the last queued pulse of its own
+    /// class, so a class that later gains a subscriber still sees its entries
+    /// in sequence order.
+    fn hold_for_missing_class(&self, pulse: QueuedPulse) {
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        let class = pulse.delivery.as_ref().map(|delivery| delivery.class);
+        let insert_at = class
+            .and_then(|class| {
+                items
+                    .iter()
+                    .rposition(|queued| {
+                        queued
+                            .delivery
+                            .as_ref()
+                            .is_some_and(|delivery| delivery.class == class)
+                    })
+                    .map(|position| position + 1)
+            })
+            .unwrap_or(items.len());
+        items.insert(insert_at, pulse);
+        drop(items);
+        self.notify.notify_one();
+    }
+
     fn pop(&self) -> Option<QueuedPulse> {
         self.items
             .lock()
@@ -730,10 +756,10 @@ async fn dispatch(
                 .iter()
                 .any(|sub| EventClass::class_of_subscriber(sub.name()) == Some(identity.class));
             if !class_subscribed {
-                // Hold the entry where it was popped from: no trimming (this
-                // is not a new emit and must never evict an unrelated lossy
-                // pulse behind it) and no reordering within the class.
-                queue.push_front(QueuedPulse {
+                // Hold the entry without re-heading the queue: a class that is
+                // never wired must not starve every other class. It keeps its
+                // place in its own class's sequence and lets the rest drain.
+                queue.hold_for_missing_class(QueuedPulse {
                     event,
                     delivery: Some(identity),
                 });
