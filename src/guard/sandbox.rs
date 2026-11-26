@@ -423,8 +423,28 @@ async fn run_child_with_timeout_named(
     match wait {
         Ok(status) => {
             let status = status?;
-            let stdout = stdout_task.await.unwrap_or_default();
-            let stderr = stderr_task.await.unwrap_or_default();
+            // The child has exited, but a descendant that inherited stdout
+            // or stderr can hold a pipe open indefinitely, so EOF is not
+            // guaranteed. Bound each drain await and abandon (abort) a
+            // drain that outlives the bound instead of hanging the verdict
+            // past the run limit.
+            const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+            let stdout = match timeout(PIPE_DRAIN_TIMEOUT, &mut stdout_task).await {
+                Ok(joined) => joined.unwrap_or_default(),
+                Err(_) => {
+                    stdout_task.abort();
+                    warn!("Sandbox: stdout drain exceeded {PIPE_DRAIN_TIMEOUT:?} after child exit; abandoning captured stdout");
+                    Vec::new()
+                }
+            };
+            let stderr = match timeout(PIPE_DRAIN_TIMEOUT, &mut stderr_task).await {
+                Ok(joined) => joined.unwrap_or_default(),
+                Err(_) => {
+                    stderr_task.abort();
+                    warn!("Sandbox: stderr drain exceeded {PIPE_DRAIN_TIMEOUT:?} after child exit; abandoning captured stderr");
+                    Vec::new()
+                }
+            };
             Ok(RunOutcome::Completed(std::process::Output {
                 status,
                 stdout,
@@ -749,6 +769,38 @@ mod tests {
         assert!(
             !status.success(),
             "timed-out child {pid} must be killed and reaped, not left running or zombie"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_descendant_holding_a_pipe_does_not_hang_the_verdict() {
+        let child = Command::new("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh -s");
+
+        // The background subshell inherits stdout and keeps the pipe open
+        // for 30s after `sh` itself exits; the drain awaits must be bounded
+        // so the completed verdict returns promptly with the child status.
+        let started = std::time::Instant::now();
+        let outcome = run_child_with_timeout(
+            child,
+            "(sleep 30) &\nprintf 'parent-done'\nexit 0",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("run child");
+        let RunOutcome::Completed(output) = outcome else {
+            panic!("the parent shell completed; the run must not time out");
+        };
+        assert!(output.status.success());
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "a descendant holding a pipe must not hang the verdict past the drain bound"
         );
     }
 
