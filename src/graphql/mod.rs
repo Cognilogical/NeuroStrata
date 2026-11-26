@@ -295,8 +295,8 @@ fn is_retired_at(metadata: &Value, now: i64) -> bool {
     }
 }
 
-/// Parameters for `build_memory_node`, in the function's original
-/// parameter order.
+/// Grouped to replace `build_memory_node`'s 9-argument signature; field
+/// order preserves the original parameter order so the mirror stays aligned.
 struct BuildMemoryNodeParams<'a> {
     pub id: &'a str,
     pub namespace: &'a str,
