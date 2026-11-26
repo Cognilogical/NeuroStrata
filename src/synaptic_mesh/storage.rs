@@ -476,7 +476,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
             Ok(None) if started.elapsed() < timeout => std::thread::sleep(GIT_POLL_INTERVAL),
             Ok(None) => {
                 let _ = child.kill();
-                let _ = child.wait();
+                reap_within(&mut child, GIT_DRAIN_GRACE);
                 // Detach rather than block forever on a pipe a grandchild may
                 // still hold: the drain threads exit on their own once the
                 // last writer closes.
@@ -488,7 +488,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
             }
             Err(error) => {
                 let _ = child.kill();
-                let _ = child.wait();
+                reap_within(&mut child, GIT_DRAIN_GRACE);
                 drain_within(&stdout_rx, &stderr_rx, &stdout_buf, &stderr_buf);
                 return Err(error).with_context(|| format!("git {display} could not be waited on"));
             }
@@ -505,6 +505,23 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
         stdout,
         stderr,
     })
+}
+
+/// Reap a killed child, but only within `bound`: a child stuck in
+/// uninterruptible kernel I/O can ignore the kill for an unbounded time, and
+/// a bare `wait()` would hold the caller past the timeout the kill was meant
+/// to enforce. Returns false when the child is still unreaped at the bound;
+/// the caller proceeds anyway (the kill is already delivered, so the child
+/// is terminated as soon as the kernel lets it die).
+fn reap_within(child: &mut std::process::Child, bound: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if started.elapsed() < bound => std::thread::sleep(GIT_POLL_INTERVAL),
+            _ => return false,
+        }
+    }
 }
 
 /// Wait at most [`GIT_DRAIN_GRACE`] for **each** drained stream to reach EOF
