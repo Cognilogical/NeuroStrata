@@ -3995,17 +3995,9 @@ pub async fn handle_task_complete(
     // After the gate, not before it: the pulse claims the transition landed,
     // so a Lock 2 refusal above must leave the bus silent rather than send
     // every subscriber down a chain that does not exist. The ordering is the
-    // invariant -- nothing re-derives it from the adjacent check.
-    if let Some(lesson_id) = inline_lesson {
-        bus.emit(
-            crate::events::ThalamicPulse::Superseded {
-                old_id: id.clone(),
-                new_id: lesson_id,
-                namespace: namespace.clone(),
-            },
-            &crate::events::RecursionToken::root(),
-        );
-    }
+    // invariant -- nothing re-derives it from the adjacent check. The emit
+    // itself sits below, after the parent save: a follow-up failure or a
+    // failed save must not announce a supersede that never landed.
 
     // The completing session travels into the "done" history entry: without
     // it the claim/exclusivity trail stops at the finish line.
@@ -4080,6 +4072,18 @@ pub async fn handle_task_complete(
         rollback_follow_up_tasks(&store, &namespace, &follow_up_created_ids).await;
         rollback_completion_extraction(&store, &namespace, &linked_before, &inline_created).await;
         return Err(e);
+    }
+    // Emit site 3 (see the note above the gate): only now, with the parent
+    // saved as done, has the task actually given way to the lesson.
+    if let Some(lesson_id) = inline_lesson {
+        bus.emit(
+            crate::events::ThalamicPulse::Superseded {
+                old_id: id.clone(),
+                new_id: lesson_id,
+                namespace: namespace.clone(),
+            },
+            &crate::events::RecursionToken::root(),
+        );
     }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("complete-{}", id))
