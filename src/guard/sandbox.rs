@@ -36,7 +36,23 @@ const SANDBOX_TIMEOUT: Duration = Duration::from_secs(5);
 /// would be exposed to the evaluated payload. `/` (the filesystem root) is
 /// handled separately because every absolute path starts with it.
 const FORBIDDEN_WORKING_DIRECTORIES: &[&str] = &[
-    "/etc", "/home", "/var/run", "/root", "/sys", "/dev", "/proc", "/boot",
+    "/etc", "/var/run", "/run", "/private/var/run", "/root", "/sys", "/dev", "/proc", "/boot",
+];
+
+/// Sensitive directories directly under a user's home. A checkout under the
+/// home directory is a normal project; these are credentials and runtime
+/// state and must never be mounted at `/workspace`.
+const SENSITIVE_HOME_CHILDREN: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".config",
+    ".password-store",
+    ".local/share/keyrings",
+    "Library/Keychains",
+    "Library/Application Support",
 ];
 
 /// R26: whether a Podman engine is reachable, from a synchronous probe. Callers
@@ -217,10 +233,23 @@ pub(crate) fn working_directory_refusal_with_home(
     {
         return Some(dir.to_string());
     }
-    // Only the home directory itself is refused, never a descendant: a
-    // checkout at `~/project` must stay mountable.
-    home.filter(|home| cwd == *home)
-        .map(|home| home.to_string_lossy().into_owned())
+    if let Some(home) = home {
+        // The home directory itself, and any ancestor of it (for example
+        // `/Users`), would expose every sibling home and credential tree.
+        if cwd == home || home.starts_with(cwd) {
+            return Some(home.to_string_lossy().into_owned());
+        }
+        // A checkout under home stays mountable, but credential and runtime
+        // state under home does not. Match whole components after the home
+        // prefix so `.sshrc` remains an ordinary project file.
+        for child in SENSITIVE_HOME_CHILDREN {
+            let sensitive = home.join(child);
+            if cwd == sensitive || cwd.starts_with(&sensitive) {
+                return Some(sensitive.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
 }
 
 /// Evaluate a payload in the sandbox, mapping a timeout to a rejection only
@@ -232,8 +261,16 @@ async fn evaluate_with_timeout(
     limit: Duration,
 ) -> anyhow::Result<ValidateVerdict> {
     let start = std::time::Instant::now();
-    let child = sandbox_command(engine, cwd).spawn()?;
-    let outcome = match run_child_with_timeout(child, payload, limit).await {
+    let container = format!("neurostrata-sandbox-{}", uuid::Uuid::new_v4());
+    let child = sandbox_command(engine, cwd, &container).spawn()?;
+    let outcome = match run_child_with_timeout_named(
+        child,
+        payload,
+        limit,
+        Some((engine, container)),
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(e) => {
             warn!("Sandbox execution failed to run: {}", e);
@@ -299,9 +336,15 @@ async fn evaluate_with_timeout(
 /// The evaluation command: hardened `podman run` arguments with the payload
 /// streamed over stdin. `kill_on_drop` is a backstop for cancellation; the
 /// timeout path in `run_child_with_timeout` still kills and reaps explicitly.
-fn sandbox_command(engine: &str, cwd: &str) -> Command {
+fn sandbox_command(engine: &str, cwd: &str, container: &str) -> Command {
     let mut cmd = Command::new(engine);
-    cmd.args(sandbox_run_args(cwd))
+    let mut args = sandbox_run_args(cwd);
+    // A stable name lets the timeout path stop the container itself, not just
+    // the `podman run` client process. `--rm` only runs after the container
+    // exits.
+    args.insert(1, "--name".to_string());
+    args.insert(2, container.to_string());
+    cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -347,9 +390,18 @@ pub(crate) fn sandbox_run_args(cwd: &str) -> Vec<String> {
 /// reads stdin (`sleep 60`) blocks `write_all` forever, letting the sandbox
 /// outlive its timeout.
 pub(crate) async fn run_child_with_timeout(
+    child: tokio::process::Child,
+    payload: &str,
+    limit: Duration,
+) -> std::io::Result<RunOutcome> {
+    run_child_with_timeout_named(child, payload, limit, None).await
+}
+
+async fn run_child_with_timeout_named(
     mut child: tokio::process::Child,
     payload: &str,
     limit: Duration,
+    container: Option<(&str, String)>,
 ) -> std::io::Result<RunOutcome> {
     let stdout_task = tokio::spawn(read_pipe(child.stdout.take()));
     let stderr_task = tokio::spawn(read_pipe(child.stderr.take()));
@@ -386,6 +438,20 @@ pub(crate) async fn run_child_with_timeout(
             if let Err(e) = child.wait().await {
                 warn!("Sandbox timeout: failed to reap child: {}", e);
             }
+            // Killing the `podman run` client does not stop the container it
+            // created. Remove it by the name passed to `--name`.
+            if let Some((engine, name)) = container {
+                let removal = tokio::process::Command::new(engine)
+                    .args(["rm", "-f", &name])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+                if let Err(e) = removal {
+                    warn!("Sandbox timeout: failed to remove container {name}: {e}");
+                }
+            }
             stdout_task.abort();
             stderr_task.abort();
             Ok(RunOutcome::TimedOut)
@@ -397,12 +463,29 @@ async fn read_pipe<R>(pipe: Option<R>) -> Vec<u8>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut buf = Vec::new();
+    // Keep the tail bounded while still draining to EOF. `read_to_end` into a
+    // host Vec lets a payload that writes faster than the timeout grow the
+    // daemon's memory without limit; the verdict keeps only the last 500
+    // bytes anyway.
+    const CAPTURE_LIMIT: usize = 64 * 1024;
+    let mut buf = std::collections::VecDeque::with_capacity(CAPTURE_LIMIT);
     if let Some(mut pipe) = pipe {
         use tokio::io::AsyncReadExt;
-        let _ = pipe.read_to_end(&mut buf).await;
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match pipe.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    buf.extend(&chunk[..read]);
+                    if buf.len() > CAPTURE_LIMIT {
+                        let excess = buf.len() - CAPTURE_LIMIT;
+                        buf.drain(..excess);
+                    }
+                }
+            }
+        }
     }
-    buf
+    buf.into_iter().collect()
 }
 
 /// UTF-8-safe tail slice: never splits a multi-byte codepoint, so indexing
@@ -479,8 +562,8 @@ mod tests {
         for cwd in [
             "/",
             "/etc",
-            "/home",
-            "/home/user/project",
+            "/run",
+            "/private/var/run",
             "/var/run/docker.sock",
             "/var/run",
             "/root",
@@ -496,7 +579,12 @@ mod tests {
             );
         }
 
-        for cwd in ["/etcetera", "/homework", "/work/project"] {
+        for cwd in [
+            "/etcetera",
+            "/homework",
+            "/home/user/project",
+            "/work/project",
+        ] {
             assert_eq!(
                 working_directory_refusal(cwd),
                 None,
@@ -533,8 +621,24 @@ mod tests {
             working_directory_refusal_with_home("/etc", Some(home)).as_deref(),
             Some("/etc")
         );
-        // A different user's home is an ordinary path; `/Users` itself is not
-        // blanket-refused on macOS.
+        // An ancestor of home exposes every sibling home, so it is refused.
+        assert_eq!(
+            working_directory_refusal_with_home("/Users", Some(home)).as_deref(),
+            Some("/Users/alice")
+        );
+        // Credential trees under home are refused even when they are not home
+        // itself; ordinary project directories stay allowed.
+        for cwd in [
+            "/Users/alice/.ssh",
+            "/Users/alice/.ssh/id_ed25519",
+            "/Users/alice/.aws/credentials",
+            "/Users/alice/Library/Keychains/login.keychain-db",
+        ] {
+            assert!(
+                working_directory_refusal_with_home(cwd, Some(home)).is_some(),
+                "sensitive home path must be refused: {cwd}"
+            );
+        }
         assert_eq!(
             working_directory_refusal_with_home("/Users/bob/project", Some(home)),
             None
