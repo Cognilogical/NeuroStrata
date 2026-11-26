@@ -2451,12 +2451,10 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
             None if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            None => {
-                return Err(anyhow::anyhow!(
+            None => return Err(anyhow::anyhow!(
                 "Another NeuroStrata daemon, or a CLI command working on the store, holds {:?}.",
                 db_path
-            ))
-            }
+            )),
         }
     }
 }

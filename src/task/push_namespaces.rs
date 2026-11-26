@@ -975,11 +975,10 @@ mod tests {
         // A new branch with commits on no remote.
         namespaces_for_push_with(&runner, &dir, &new_branch(&tip, "feature")).unwrap();
         // An update of a remote tip known locally.
-        let update = format!(
-            "refs/heads/main {tip} refs/heads/main {base}
-"
-        );
-        namespaces_for_push_with(&runner, &dir, &parse_pre_push_stdin(&update).unwrap()).unwrap();
+        let update = format!("refs/heads/main {tip} refs/heads/main {base}
+");
+        namespaces_for_push_with(&runner, &dir, &parse_pre_push_stdin(&update).unwrap())
+            .unwrap();
         // A new branch whose commits are all on a remote-tracking ref.
         git(&dir, &["update-ref", "refs/remotes/origin/main", &tip]);
         namespaces_for_push_with(&runner, &dir, &new_branch(&tip, "other")).unwrap();

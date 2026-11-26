@@ -433,6 +433,13 @@ async fn write_task_row(
     for (key, value) in &top_level {
         scan_meta.insert(key.clone(), value.clone());
     }
+    // Identity is persisted on the row too: a caller-supplied user or agent
+    // carrying a secret must be judged before the schema init or the upsert,
+    // exactly like the title and task metadata around it.
+    scan_meta.insert("user_id".to_string(), json!(user_id));
+    if let Some(agent) = agent_name {
+        scan_meta.insert("agent_name".to_string(), json!(agent));
+    }
     if let Some(rejection) =
         crate::secrets::scan_entry_point(content, &Value::Object(scan_meta), surface)
     {
@@ -507,6 +514,17 @@ async fn store_new_task(
     )
     .await?;
     Ok((id, payload))
+}
+
+/// Removes follow-up rows a failed completion created, so a mid-loop error
+/// leaves zero partial children behind. Best-effort: a delete failure is
+/// logged and never masks the error that triggered the rollback.
+async fn rollback_follow_up_tasks(store: &Arc<dyn VectorStore>, namespace: &str, ids: &[String]) {
+    for id in ids {
+        if let Err(e) = store.delete(namespace, id).await {
+            tracing::warn!("failed to roll back follow-up task {}: {}", id, e);
+        }
+    }
 }
 
 /// Memory types treated as normative (governing constraints) for reserved slots.
@@ -2609,14 +2627,21 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
 
     let assignee = arg_str(&args, "assignee").unwrap_or("unknown").to_string();
 
-    // The two caller-controlled fields a claim stamps are scanned before the
-    // claim lock, the load, or any write: a refused claim leaves the task
-    // open and its state untouched.
-    if let Some(rejection) = crate::secrets::scan_entry_point(
-        "",
-        &json!({ "assignee": &assignee, "session_id": &session }),
-        "task_claim",
-    ) {
+    // Every caller-controlled field a claim stamps -- identity, explicit
+    // branch/worktree scope, and the receipt's event id -- is scanned before
+    // the claim lock, the load, or any write: a refused claim leaves the task
+    // open, its state untouched, and no receipt behind.
+    let mut claim_scan = Map::new();
+    claim_scan.insert("assignee".to_string(), json!(&assignee));
+    claim_scan.insert("session_id".to_string(), json!(&session));
+    for key in ["branch", "worktree", "project_root", "cwd", "event_id"] {
+        if let Some(value) = arg_str(&args, key) {
+            claim_scan.insert(key.to_string(), json!(value));
+        }
+    }
+    if let Some(rejection) =
+        crate::secrets::scan_entry_point("", &Value::Object(claim_scan), "task_claim")
+    {
         return rejection.to_string();
     }
 
@@ -2982,6 +3007,14 @@ pub async fn handle_task_update(
         }
         if let Some(s) = arg_str(&args, "session_id") {
             payload.insert("session_id".to_string(), json!(s));
+        }
+        // Scope and receipt metadata the update can stamp or record: an
+        // explicit branch/worktree rides onto a claiming transition, and
+        // event_id keys the receipt this call writes.
+        for key in ["branch", "worktree", "project_root", "cwd", "event_id"] {
+            if let Some(value) = arg_str(&args, key) {
+                payload.insert(key.to_string(), json!(value));
+            }
         }
         if let Some(rejection) =
             crate::secrets::scan_entry_point("", &Value::Object(payload), "task_update")
@@ -3415,11 +3448,20 @@ pub async fn handle_task_complete(
     let link_memory_id = arg_str(&args, "link_memory_id").map(|s| s.to_string());
     let memory = args.get("memory").cloned();
 
-    // The completion reason becomes `close_reason` and a history entry, so it
-    // is a write surface of its own. Scanned before the namespace precheck so
-    // a refusal cannot leave a partial normalisation behind either.
+    // The completion reason becomes `close_reason` and a history entry, its
+    // caller identity is persisted on the extraction and every follow-up, and
+    // event_id keys the completion receipt. All are write surfaces of their
+    // own, scanned before the namespace precheck so a refusal cannot leave a
+    // partial normalisation, extraction, receipt, or follow-up behind.
+    let mut complete_scan = Map::new();
+    complete_scan.insert("reason".to_string(), json!(&reason));
+    for key in ["event_id", "user_id", "agent_name"] {
+        if let Some(value) = arg_str(&args, key) {
+            complete_scan.insert(key.to_string(), json!(value));
+        }
+    }
     if let Some(rejection) =
-        crate::secrets::scan_entry_point("", &json!({ "reason": &reason }), "task_complete")
+        crate::secrets::scan_entry_point("", &Value::Object(complete_scan), "task_complete")
     {
         return Err(rejection.to_string());
     }
@@ -3890,7 +3932,52 @@ pub async fn handle_task_complete(
             }
         }
     }
-    save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
+
+    // M3: spawn follow-up tasks before the parent is marked done, so a
+    // mid-loop failure leaves the parent unfinished and no partial children
+    // behind. Each inherits the caller's user/agent defaults and carries
+    // spawned_from + related_to. A later parent-save failure rolls them back.
+    let follow_user_id = arg_str(&args, "user_id").unwrap_or("unknown").to_string();
+    let follow_agent = arg_str(&args, "agent_name").map(|s| s.to_string());
+    let mut follow_up_created_ids: Vec<String> = Vec::new();
+    for (title, description, task_type, priority, labels) in &follow_up_specs {
+        let mut task_meta = Map::new();
+        task_meta.insert("priority".to_string(), json!(*priority));
+        task_meta.insert("task_type".to_string(), json!(task_type));
+        task_meta.insert("spawned_from".to_string(), json!(id.as_str()));
+        if !labels.is_empty() {
+            task_meta.insert("labels".to_string(), json!(labels));
+        }
+        if let Some(d) = description {
+            task_meta.insert("description".to_string(), json!(d));
+        }
+        let mut top_level = Map::new();
+        top_level.insert("related_to".to_string(), json!([id.as_str()]));
+        match store_new_task(
+            &store,
+            &emb,
+            &namespace,
+            title,
+            &follow_user_id,
+            follow_agent.as_deref(),
+            task_meta,
+            top_level,
+            "task_follow_up",
+        )
+        .await
+        {
+            Ok((new_id, _payload)) => follow_up_created_ids.push(new_id),
+            Err(e) => {
+                rollback_follow_up_tasks(&store, &namespace, &follow_up_created_ids).await;
+                return Err(e);
+            }
+        }
+    }
+
+    if let Err(e) = save_task(&store, &namespace, &id, vector, completed.payload.clone()).await {
+        rollback_follow_up_tasks(&store, &namespace, &follow_up_created_ids).await;
+        return Err(e);
+    }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("complete-{}", id))
         .to_string();
@@ -3928,42 +4015,6 @@ pub async fn handle_task_complete(
         );
         if !retention_ok {
             tracing::warn!("AC5 receipt retention check failed for task {}", id);
-        }
-    }
-
-    // M3: spawn follow-up tasks now that the parent is done. Each inherits
-    // the caller's user/agent defaults and carries spawned_from + related_to.
-    let follow_user_id = arg_str(&args, "user_id").unwrap_or("unknown").to_string();
-    let follow_agent = arg_str(&args, "agent_name").map(|s| s.to_string());
-    let mut follow_up_created_ids: Vec<String> = Vec::new();
-    for (title, description, task_type, priority, labels) in &follow_up_specs {
-        let mut task_meta = Map::new();
-        task_meta.insert("priority".to_string(), json!(*priority));
-        task_meta.insert("task_type".to_string(), json!(task_type));
-        task_meta.insert("spawned_from".to_string(), json!(id.as_str()));
-        if !labels.is_empty() {
-            task_meta.insert("labels".to_string(), json!(labels));
-        }
-        if let Some(d) = description {
-            task_meta.insert("description".to_string(), json!(d));
-        }
-        let mut top_level = Map::new();
-        top_level.insert("related_to".to_string(), json!([id.as_str()]));
-        match store_new_task(
-            &store,
-            &emb,
-            &namespace,
-            title,
-            &follow_user_id,
-            follow_agent.as_deref(),
-            task_meta,
-            top_level,
-            "task_follow_up",
-        )
-        .await
-        {
-            Ok((new_id, _payload)) => follow_up_created_ids.push(new_id),
-            Err(e) => return Err(e),
         }
     }
 
@@ -12525,6 +12576,401 @@ exit 0
                 .and_then(|v| v.as_str())
                 == Some(id.as_str())),
             "the clean follow-up is created"
+        );
+    }
+
+    fn receipt_present(session: &str, task: &str, event: &str) -> bool {
+        super::TASK_RECEIPTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session, task, event)
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn secret_in_task_create_identity_is_refused() {
+        let store = store_with_namespace("MyProj").await;
+        let before = store.list("MyProj", None, None).await.unwrap().len();
+        let token = scanner_fixture();
+
+        for field in ["user_id", "agent_name"] {
+            let mut args = json!({
+                "namespace": "MyProj",
+                "title": "wire the release",
+            });
+            args[field] = json!(token);
+            let reply = handle_task_create(args, emb(), store.clone()).await;
+            assert_security_refusal(&reply);
+            assert_eq!(
+                store.list("MyProj", None, None).await.unwrap().len(),
+                before,
+                "a secret in {} writes no row",
+                field
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_in_task_claim_scope_is_refused() {
+        let store = store_with_namespace("MyProj").await;
+        let token = scanner_fixture();
+        let session = "ses_scope";
+
+        // branch
+        let id = create_task(&store, "MyProj", "branch scope", 2).await;
+        let before = store.list("MyProj", None, None).await.unwrap().len();
+        let reply = handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": session,
+                "branch": token,
+            }),
+            store.clone(),
+        )
+        .await;
+        assert_security_refusal(&reply);
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::Open);
+        assert!(!receipt_present(session, &id, &format!("claim-{}", id)));
+        assert_eq!(
+            store.list("MyProj", None, None).await.unwrap().len(),
+            before
+        );
+
+        // worktree
+        let id = create_task(&store, "MyProj", "worktree scope", 2).await;
+        let before = store.list("MyProj", None, None).await.unwrap().len();
+        let reply = handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": session,
+                "worktree": token,
+            }),
+            store.clone(),
+        )
+        .await;
+        assert_security_refusal(&reply);
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::Open);
+        assert!(!receipt_present(session, &id, &format!("claim-{}", id)));
+        assert_eq!(
+            store.list("MyProj", None, None).await.unwrap().len(),
+            before
+        );
+
+        // event_id (persisted on the claim receipt)
+        let id = create_task(&store, "MyProj", "event scope", 2).await;
+        let before = store.list("MyProj", None, None).await.unwrap().len();
+        let reply = handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": session,
+                "event_id": token,
+            }),
+            store.clone(),
+        )
+        .await;
+        assert_security_refusal(&reply);
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::Open);
+        assert!(
+            !receipt_present(session, &id, &token),
+            "a refused claim records no receipt"
+        );
+        assert_eq!(
+            store.list("MyProj", None, None).await.unwrap().len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_in_task_update_scope_is_refused() {
+        let store = store_with_namespace("MyProj").await;
+        let token = scanner_fixture();
+        let session = "ses_upd";
+
+        // branch (persisted when the update claims the task)
+        let id = create_task(&store, "MyProj", "branch update", 2).await;
+        let before = store.list("MyProj", None, None).await.unwrap().len();
+        let reply = handle_task_update(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "session_id": session,
+                "status": "in_progress",
+                "branch": token,
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert_security_refusal(&reply);
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::Open);
+        assert!(!receipt_present(session, &id, &format!("update-{}", id)));
+        assert_eq!(
+            store.list("MyProj", None, None).await.unwrap().len(),
+            before
+        );
+
+        // worktree (persisted when the update claims the task)
+        let id = create_task(&store, "MyProj", "worktree update", 2).await;
+        let before = store.list("MyProj", None, None).await.unwrap().len();
+        let reply = handle_task_update(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "session_id": session,
+                "status": "in_progress",
+                "worktree": token,
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert_security_refusal(&reply);
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::Open);
+        assert!(!receipt_present(session, &id, &format!("update-{}", id)));
+        assert_eq!(
+            store.list("MyProj", None, None).await.unwrap().len(),
+            before
+        );
+
+        // event_id (persisted on the update receipt)
+        let id = create_task(&store, "MyProj", "event update", 2).await;
+        let before = store.list("MyProj", None, None).await.unwrap().len();
+        let reply = handle_task_update(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "session_id": session,
+                "note": "clean progress note",
+                "event_id": token,
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert_security_refusal(&reply);
+        assert!(!receipt_present(session, &id, &token));
+        assert_eq!(
+            store.list("MyProj", None, None).await.unwrap().len(),
+            before
+        );
+        let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        let history = payload
+            .metadata
+            .get("task")
+            .and_then(|t| t.get("history"))
+            .and_then(|h| h.as_array())
+            .map_or(0, Vec::len);
+        assert_eq!(history, 0, "a refused update appends no history");
+    }
+
+    #[tokio::test]
+    async fn secret_in_task_complete_identity_is_refused() {
+        let store = store_with_namespace("MyProj").await;
+        let token = scanner_fixture();
+
+        for field in ["user_id", "agent_name"] {
+            let id = create_task(&store, "MyProj", "complete identity", 2).await;
+            claim(&store, &id).await;
+            let before = store.list("MyProj", None, None).await.unwrap().len();
+            let mut args = json!({
+                "namespace": "MyProj",
+                "id": id,
+                "memory": { "content": "a clean lesson worth keeping" },
+            });
+            args[field] = json!(token);
+
+            let err = handle_task_complete(args, emb(), store.clone(), None, quiet_bus())
+                .await
+                .expect_err("a secret identity must refuse the whole completion");
+
+            assert_security_refusal(&err);
+            assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
+            assert_eq!(
+                store.list("MyProj", None, None).await.unwrap().len(),
+                before,
+                "a refused completion writes no extraction and no follow-up"
+            );
+            assert!(
+                !receipt_present("ses_a", &id, &format!("complete-{}", id)),
+                "a refused completion records no receipt"
+            );
+        }
+    }
+
+    /// Wraps a real store and fails the upsert of one follow-up row, so a
+    /// mid-loop failure can be injected deterministically.
+    struct FollowUpFailingStore {
+        inner: Arc<dyn VectorStore>,
+        fail_title: String,
+    }
+
+    #[async_trait::async_trait]
+    impl VectorStore for FollowUpFailingStore {
+        async fn init(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.init(namespace).await
+        }
+        async fn upsert(
+            &self,
+            namespace: &str,
+            id: &str,
+            vector: Vec<f32>,
+            payload: MemoryPayload,
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
+            let is_follow_up = payload
+                .metadata
+                .get("task")
+                .and_then(|t| t.get("spawned_from"))
+                .is_some();
+            if is_follow_up && payload.content == self.fail_title {
+                anyhow::bail!("injected follow-up write failure");
+            }
+            self.inner.upsert(namespace, id, vector, payload).await
+        }
+        async fn search(
+            &self,
+            namespace: &str,
+            vector: Vec<f32>,
+            limit: usize,
+            include_tasks: bool,
+            include_archived: bool,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            self.inner
+                .search(namespace, vector, limit, include_tasks, include_archived)
+                .await
+        }
+        async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(namespace, id).await
+        }
+        async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(namespace).await
+        }
+        async fn relink_edges(&self, namespace: &str, source_key: &str) -> anyhow::Result<usize> {
+            self.inner.relink_edges(namespace, source_key).await
+        }
+        async fn list(
+            &self,
+            namespace: &str,
+            user_id: Option<&str>,
+            memory_type: Option<&str>,
+        ) -> anyhow::Result<Vec<SearchResult>> {
+            self.inner.list(namespace, user_id, memory_type).await
+        }
+        async fn get(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
+            self.inner.get(namespace, id).await
+        }
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+        async fn export_graph(
+            &self,
+            include_retired: bool,
+            include_archived: bool,
+            project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+            anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner
+                .export_graph(
+                    include_retired,
+                    include_archived,
+                    project_contexts,
+                    anchor_override,
+                )
+                .await
+        }
+        async fn increment_access_count(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(namespace, id).await
+        }
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl crate::traits::AsAny for FollowUpFailingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn task_complete_rolls_back_partial_follow_ups() {
+        let inner = store_with_namespace("MyProj").await;
+        let id = create_task(&inner, "MyProj", "the work", 2).await;
+        claim(&inner, &id).await;
+        let store: Arc<dyn VectorStore> = Arc::new(FollowUpFailingStore {
+            inner: inner.clone(),
+            fail_title: "explode child".to_string(),
+        });
+
+        let err = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "memory": { "content": "a clean lesson worth keeping" },
+                "follow_up_tasks": [
+                    { "title": "clean child" },
+                    { "title": "explode child" },
+                ],
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("the injected follow-up failure aborts the completion");
+
+        assert!(
+            err.contains("injected follow-up write failure"),
+            "the original failure is reported: {}",
+            err
+        );
+        assert_eq!(
+            status_of(&inner, "MyProj", &id).await,
+            Status::InProgress,
+            "the parent is not marked done when a follow-up fails"
+        );
+        let rows = inner.list("MyProj", None, None).await.unwrap();
+        let partial: Vec<&str> = rows
+            .iter()
+            .filter(|r| {
+                r.payload
+                    .metadata
+                    .get("task")
+                    .and_then(|t| t.get("spawned_from"))
+                    .and_then(|v| v.as_str())
+                    == Some(id.as_str())
+            })
+            .map(|r| r.id.as_str())
+            .collect();
+        assert!(
+            partial.is_empty(),
+            "a mid-loop failure leaves zero partial follow-ups: {:?}",
+            partial
         );
     }
 
