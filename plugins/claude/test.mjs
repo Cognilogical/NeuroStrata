@@ -983,7 +983,9 @@ test('UserPromptSubmit activates typed-edge neighbors before the model call', ()
     )
     parent.working_set = {
       version: 1,
-      project_id: createHash('sha256').update(root).digest('hex'),
+      project_id: createHash('sha256')
+        .update(root.replace(/\\/g, '/').replace(/(?<=.)\/+$/u, ''), 'utf8')
+        .digest('hex'),
       namespace: 'gc-claude',
       session_id: 'ses-claude-gc',
       epoch: 0,

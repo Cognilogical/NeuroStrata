@@ -761,7 +761,9 @@ test('UserPromptSubmit preserves typed edges in the working set', () => {
     )
     parent.working_set = {
       version: 1,
-      project_id: createHash('sha256').update(root).digest('hex'),
+      project_id: createHash('sha256')
+        .update(root.replace(/\\/g, '/').replace(/(?<=.)\/+$/u, ''), 'utf8')
+        .digest('hex'),
       namespace: 'gc-codex',
       session_id: 'ses-codex-gc',
       epoch: 0,

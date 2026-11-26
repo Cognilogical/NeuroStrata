@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   existsSync,
   copyFileSync,
+  realpathSync,
   symlinkSync
 } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
@@ -5997,9 +5998,13 @@ describe('PR #400 namespace resolution regressions', () => {
 })
 
 const wsHash = (value) => createHash('sha256').update(value).digest('hex')
+const wsCanonicalRoot = (root) => {
+  const normalized = realpathSync.native(root).replace(/\\/g, '/')
+  return normalized.length > 1 ? normalized.replace(/\/+$/u, '') : normalized
+}
 const wsScope = (root, overrides = {}) => ({
   projectRoot: root,
-  projectId: wsHash(root),
+  projectId: wsHash(wsCanonicalRoot(root)),
   namespace: 'NeuroStrata',
   sessionId: 'session-ws',
   epoch: 0,
@@ -6181,6 +6186,9 @@ describe('working-set GC decision and strict state', () => {
       assert.equal(saved.working_set.turn_seq, 2)
       assert.deepEqual(saved.owner_field, { preserved: true })
       assert.equal(saved.task_id, 'task-parent')
+      const trailingScope = wsScope(`${root}/`)
+      assert.equal(trailingScope.projectId, scope.projectId)
+      assert.equal((await loadWorkingSet(trailingScope)).turn_seq, 2)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
