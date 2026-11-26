@@ -130,6 +130,8 @@ _Example:_
 neurostrata-mcp ingest ./src my-rust-project
 ```
 
+Namespaces that begin with `__neurostrata_ingest_stage__` are reserved for internal staging. The command refuses them before the directory is read, before the fallback store is prepared, and before `NEUROSTRATA_CLEAR_BEFORE_INGEST` can clear any stored rows.
+
 ### `project-context` & `export-graph`
 
 Binds stable source identifiers to `.NeuroStrata` project markers and exports the relational memory graph as JSON for the Web UI and Obsidian canvas.

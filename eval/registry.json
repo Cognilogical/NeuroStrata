@@ -37,6 +37,23 @@
         "ignored": 0
       }
     },
+    "ingest-hardening": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests::reserved_ingest_destinations_are_rejected_before_staging_or_embedding -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp ingest_jobs::tests::reserved_destination_is_rejected_before_directory_or_job_registry_work -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp parser::ingest::tests::a_failed_relink_rolls_back_to_the_previous_generation -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::process_crash_during_publication_recovers_old_or_committed_generation -- --exact --test-threads=1"
+      ],
+      "tests": [
+        "parser::ingest::tests::reserved_ingest_destinations_are_rejected_before_staging_or_embedding",
+        "ingest_jobs::tests::reserved_destination_is_rejected_before_directory_or_job_registry_work",
+        "parser::ingest::tests::a_failed_relink_rolls_back_to_the_previous_generation",
+        "store::ladybug::tests::process_crash_during_publication_recovers_old_or_committed_generation"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "lexical-generation": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp lexical::tests -- --test-threads=1",

@@ -10227,6 +10227,35 @@ impl LadybugStore {
     }
 }
 
+/// Test-only publication barrier used by the process-crash fixture.
+///
+/// When the parent arms a phase and a generation, the matching call writes a
+/// marker file and then blocks forever. The parent waits for the marker and
+/// `SIGKILL`s the child, so the store is reopened from a real crash at that
+/// exact point rather than from a simulated in-process failure. Compiled out
+/// of production builds.
+#[cfg(test)]
+fn publication_phase_barrier(phase: &str, generation: u64) {
+    let Ok(wanted_phase) = std::env::var("NEUROSTRATA_TEST_PUBLICATION_PHASE") else {
+        return;
+    };
+    if wanted_phase != phase {
+        return;
+    }
+    let wanted_generation = std::env::var("NEUROSTRATA_TEST_PUBLICATION_GENERATION")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    if wanted_generation != Some(generation) {
+        return;
+    }
+    if let Ok(marker) = std::env::var("NEUROSTRATA_TEST_PUBLICATION_MARKER") {
+        let _ = std::fs::write(marker, phase);
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, namespace: &str) -> Result<()> {
@@ -12671,6 +12700,8 @@ impl VectorStore for LadybugStore {
         source_key: &str,
         generation: u64,
     ) -> Result<()> {
+        #[cfg(test)]
+        publication_phase_barrier("staged", generation);
         let namespace = namespace.to_string();
         let refresh_ns = namespace.clone();
         let source_key = source_key.to_string();
@@ -12695,6 +12726,11 @@ impl VectorStore for LadybugStore {
                 .next()
                 .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64)
                 .unwrap_or(0);
+            // Crash-fixture barrier: after the rollback target is read and
+            // before the pointer is written, either outcome of a crash is a
+            // whole generation (the write below is atomic).
+            #[cfg(test)]
+            publication_phase_barrier("precommit", generation);
             let write = format!(
                 "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {generation}, g.previous_generation = {previous} ON MATCH SET g.active_generation = {generation}, g.previous_generation = {previous}"
             );
@@ -12708,7 +12744,15 @@ impl VectorStore for LadybugStore {
             Ok(())
         })
         .await?;
+        // Crash-fixture barrier: the pointer flip has committed, so recovery
+        // here must land on the committed generation.
+        #[cfg(test)]
+        publication_phase_barrier("after-flip", generation);
         self.refresh_lexical_after_pointer_change(&refresh_ns).await;
+        // Crash-fixture barrier: publication is complete, including the
+        // lexical refresh.
+        #[cfg(test)]
+        publication_phase_barrier("postcommit", generation);
         Ok(())
     }
 
@@ -32579,6 +32623,169 @@ eurostrata\src\daemon.rs",
                 result_ids(&inhouse),
                 result_ids(&tantivy),
                 "both lexical routes must agree for {principal}"
+            );
+        }
+    }
+
+    const CRASH_TEST_NAME: &str =
+        "store::ladybug::tests::process_crash_during_publication_recovers_old_or_committed_generation";
+    const CRASH_CHILD_VAR: &str = "NEUROSTRATA_TEST_PUBLICATION_CHILD";
+    const CRASH_PHASE_VAR: &str = "NEUROSTRATA_TEST_PUBLICATION_PHASE";
+    const CRASH_GENERATION_VAR: &str = "NEUROSTRATA_TEST_PUBLICATION_GENERATION";
+    const CRASH_MARKER_VAR: &str = "NEUROSTRATA_TEST_PUBLICATION_MARKER";
+    const CRASH_DB_VAR: &str = "NEUROSTRATA_TEST_PUBLICATION_DB";
+
+    /// Child half of the publication crash fixture: publish generation 1,
+    /// stage generation 2, then enter `publish_generation` with a phase barrier
+    /// armed. The parent kills this process at the barrier and reopens the
+    /// store, so the barrier is never released in-process.
+    async fn publication_crash_child() {
+        let db = std::env::var(CRASH_DB_VAR).expect("the child is given a database path");
+        let store = LadybugStore::for_testing(&db, 4).expect("open the child store");
+        store.init("crashprobe").await.expect("create the schema");
+
+        let first = publish_fixture_generation(
+            &store,
+            "crashprobe",
+            PROBE_SOURCE,
+            &[("src/a.rs", "first generation")],
+        )
+        .await;
+        assert_eq!(first, 1, "the fixture starts at generation 1");
+
+        let second = store
+            .begin_generation("crashprobe", PROBE_SOURCE)
+            .await
+            .expect("begin the staging generation");
+        for (path, content) in [
+            ("src/a.rs", "second generation"),
+            ("src/b.rs", "second file"),
+        ] {
+            let id = crate::parser::ingest::generation_scoped_id("crashprobe", second, path);
+            store
+                .upsert(
+                    "crashprobe",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload(content, PROBE_SOURCE, json!({})),
+                )
+                .await
+                .expect("stage the row");
+        }
+        store
+            .publish_generation("crashprobe", PROBE_SOURCE, second)
+            .await
+            .expect("publish unless a barrier kills the process");
+    }
+
+    /// A process killed during publication must reopen on either the previous
+    /// generation or the fully committed one -- never zero active generations
+    /// and never a mix of the two (issue #417).
+    #[tokio::test]
+    async fn process_crash_during_publication_recovers_old_or_committed_generation() {
+        if std::env::var(CRASH_CHILD_VAR).as_deref() == Ok("1") {
+            publication_crash_child().await;
+            // Reaching here means the barrier did not fire; the parent sees
+            // the child exit without a marker and fails the test.
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        for phase in ["staged", "precommit", "after-flip", "postcommit"] {
+            let root = tempfile::tempdir().expect("create the crash fixture directory");
+            let db = root.path().join("crash.lbug");
+            let marker = root.path().join(format!("reached-{phase}"));
+            let mut child = std::process::Command::new(&exe)
+                .arg("--exact")
+                .arg(CRASH_TEST_NAME)
+                .arg("--nocapture")
+                .env(CRASH_CHILD_VAR, "1")
+                .env(CRASH_PHASE_VAR, phase)
+                .env(CRASH_GENERATION_VAR, "2")
+                .env(CRASH_MARKER_VAR, &marker)
+                .env(CRASH_DB_VAR, &db)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start the crash child");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if marker.exists() {
+                    break;
+                }
+                if let Some(status) = child.try_wait().expect("wait on the crash child") {
+                    panic!("the child exited before the {phase} barrier: {status:?}");
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    panic!("the child did not reach the {phase} barrier within the deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            child.kill().expect("kill the child at the phase barrier");
+            let status = child.wait().expect("reap the killed child");
+            assert!(
+                !status.success(),
+                "the fixture must kill the child, not let it finish: {status:?}"
+            );
+
+            let reopened =
+                LadybugStore::for_testing(&db, 4).expect("reopen the store after the crash");
+            let active = reopened
+                .active_generation("crashprobe", PROBE_SOURCE)
+                .await
+                .expect("read the recovered active generation");
+            let expected = match phase {
+                "staged" | "precommit" => 1,
+                "after-flip" | "postcommit" => 2,
+                other => panic!("unknown crash phase {other}"),
+            };
+            assert_eq!(
+                active, expected,
+                "{phase}: the store must recover the previous or the committed generation, never a torn one"
+            );
+            assert_ne!(
+                active, 0,
+                "{phase}: recovery must never leave zero active generations"
+            );
+
+            let expected_row =
+                crate::parser::ingest::generation_scoped_id("crashprobe", active, "src/a.rs");
+            assert!(
+                reopened
+                    .get("crashprobe", &expected_row)
+                    .await
+                    .expect("read the recovered row")
+                    .is_some(),
+                "{phase}: the whole active generation is present, not a partial one"
+            );
+            let expected_nodes = if expected == 1 { 1 } else { 2 };
+            assert_eq!(
+                reopened
+                    .generation_nodes("crashprobe", active)
+                    .await
+                    .expect("list the active generation")
+                    .len(),
+                expected_nodes,
+                "{phase}: every row of the recovered generation is present"
+            );
+            let visible = reopened
+                .list("crashprobe", None, None)
+                .await
+                .expect("list the visible rows");
+            assert_eq!(
+                visible.len(),
+                expected_nodes,
+                "{phase}: the visible rows are exactly the recovered generation, not a mix"
+            );
+            assert!(
+                visible.iter().all(|row| {
+                    crate::parser::ingest::split_scoped_id(&row.id)
+                        .is_some_and(|(_, generation, _)| generation == active)
+                }),
+                "{phase}: every visible row belongs to the active generation"
             );
         }
     }

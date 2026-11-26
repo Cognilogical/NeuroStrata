@@ -29,6 +29,19 @@ pub fn memory_vocabulary() -> &'static serde_json::Value {
     })
 }
 
+/// Namespaces beginning with this prefix belong to the internal staging
+/// machinery, not to an operator's project. They are reserved so an ingest can
+/// never treat scratch space as a destination.
+pub const INTERNAL_INGEST_STAGE_PREFIX: &str = "__neurostrata_ingest_stage__";
+
+/// Whether `namespace` is reserved for internal ingest staging.
+///
+/// Prefix matching covers both the bare staging namespace and every
+/// generation-suffixed variant the store creates from it.
+pub fn is_reserved_ingest_destination(namespace: &str) -> bool {
+    namespace.starts_with(INTERNAL_INGEST_STAGE_PREFIX)
+}
+
 /// Represents a stored memory payload
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MemoryPayload {

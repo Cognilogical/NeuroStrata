@@ -2021,6 +2021,18 @@ pub async fn ingest_directory(
     observer: Option<Arc<dyn IngestObserver>>,
     node_set: &[String],
 ) -> anyhow::Result<()> {
+    // Reserved destinations are refused before anything else happens: before
+    // the node-set normalization, the directory probe, the previous-generation
+    // read, any embedding work, or `begin_generation`. A namespace that belongs
+    // to the internal staging machinery must never be treated as a project, and
+    // the ordering is what keeps the refusal free.
+    if crate::traits::is_reserved_ingest_destination(namespace) {
+        anyhow::bail!(
+            "ingest destination uses the reserved internal staging namespace '{}'; choose a different namespace",
+            namespace
+        );
+    }
+
     // Normalize node_set: sorted + deduped (C2 deterministic contract).
     let node_set: Vec<String> = {
         let mut v = node_set.to_vec();
@@ -2690,6 +2702,37 @@ pub async fn ingest_directory(
         .await;
     }
 
+    // Capture the rollback target before publication flips the pointer. If
+    // `relink_edges` then fails, the freshly published generation has no rule
+    // edges and must not stay live: the previous generation is restored.
+    let previous_generation = if unchanged {
+        0
+    } else {
+        match vector_store.active_generation(namespace, &source_key).await {
+            Ok(previous) => previous,
+            Err(e) => {
+                // Without the target there is nothing safe to roll back to,
+                // so publishing would be an unrecoverable risk. Clean up the
+                // staging generation exactly like a publish failure.
+                if let Err(abort) = vector_store
+                    .abort_generation(namespace, &source_key, generation)
+                    .await
+                {
+                    eprintln!(
+                        "Failed to abort staging generation {} of namespace {}: {}",
+                        generation, namespace, abort
+                    );
+                }
+                return Err(anyhow::anyhow!(
+                    "stored the nodes of namespace {} but could not read its previous active generation before publishing generation {}: {}",
+                    namespace,
+                    generation,
+                    e
+                ));
+            }
+        }
+    };
+
     // Atomically flip the active pointer onto this generation. Only now are its
     // nodes reachable; the previous generation remains as history.
     if let Err(e) = if unchanged {
@@ -2724,16 +2767,42 @@ pub async fn ingest_directory(
     //
     // A failure here fails the ingest rather than warning about it: reporting
     // success would hand back a graph whose rules reach none of their code.
-    let linked = vector_store
-        .relink_edges(namespace, &source_key)
-        .await
-        .map_err(|e| {
-        anyhow::anyhow!(
-            "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; ingest again to retry: {}",
-            namespace,
-            e
-        )
-    })?;
+    // The new generation is already live at this point, so failing loudly is
+    // not enough: roll the pointer back to the captured generation and abort
+    // the generation whose edges could not be rebuilt.
+    let linked = match vector_store.relink_edges(namespace, &source_key).await {
+        Ok(linked) => linked,
+        Err(relink_error) => {
+            if unchanged {
+                return Err(anyhow::anyhow!(
+                    "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; ingest again to retry: {}",
+                    namespace,
+                    relink_error
+                ));
+            }
+            let restore = vector_store
+                .publish_generation(namespace, &source_key, previous_generation)
+                .await;
+            let abort = vector_store
+                .abort_generation(namespace, &source_key, generation)
+                .await;
+            let restore_note = match restore {
+                Ok(()) => format!("restored generation {previous_generation}"),
+                Err(e) => format!("could not restore generation {previous_generation}: {e}"),
+            };
+            let abort_note = match abort {
+                Ok(()) => format!("aborted generation {generation}"),
+                Err(e) => format!("could not abort generation {generation}: {e}"),
+            };
+            return Err(anyhow::anyhow!(
+                "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; rollback: {}; {}; relink error: {}",
+                namespace,
+                restore_note,
+                abort_note,
+                relink_error
+            ));
+        }
+    };
     println!(
         "Relinked {} declared edges in namespace {}",
         linked, namespace
@@ -3063,6 +3132,24 @@ mod tests {
         }
     }
 
+    /// Counts embeddings so a test can prove a refused ingest never reached
+    /// the embedding stage.
+    struct CountingEmbedder {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for CountingEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![0.0; 4])
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
     struct FailingEmbedder;
 
     #[async_trait::async_trait]
@@ -3074,6 +3161,89 @@ mod tests {
         fn dimensions(&self) -> usize {
             4
         }
+    }
+
+    /// A namespace that belongs to the internal staging machinery is refused
+    /// as the very first thing ingest does: no walk, no embedding, no
+    /// generation, and no change to rows already in it (issue #417).
+    #[tokio::test]
+    async fn reserved_ingest_destinations_are_rejected_before_staging_or_embedding() {
+        let tmp = std::env::temp_dir().join(format!("ns-reserved-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("planted.rs"), "fn planted() {}").expect("write planted file");
+
+        let db = std::env::temp_dir().join(format!("ns-reserved-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        let reserved = "__neurostrata_ingest_stage__probe";
+        store.init(reserved).await.expect("create the schema");
+
+        let seed_id = qualified_id(reserved, "seeded.rs");
+        store
+            .upsert(
+                reserved,
+                &seed_id,
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "Path: seeded.rs".to_string(),
+                    user_id: "auto-ingestor".to_string(),
+                    memory_type: "file".to_string(),
+                    agent_name: None,
+                    location: "seeded.rs".to_string(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("seed a row in the reserved namespace");
+
+        let embedder = Arc::new(CountingEmbedder {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let error = ingest_directory(
+            &tmp,
+            &schema,
+            embedder.clone(),
+            store.clone(),
+            reserved,
+            None,
+            &[],
+        )
+        .await
+        .expect_err("a reserved destination is refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("ingest destination uses the reserved internal staging namespace"),
+            "the refusal names the reserved staging namespace: {error}"
+        );
+        assert_eq!(
+            embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "refusal happens before any embedding work"
+        );
+        assert_eq!(
+            store
+                .active_generation(reserved, &source_key_for(&tmp))
+                .await
+                .expect("read"),
+            0,
+            "refusal happens before a staging generation begins"
+        );
+        assert!(
+            store
+                .get(reserved, &seed_id)
+                .await
+                .expect("read seeded row")
+                .is_some(),
+            "the refusal leaves rows already in the namespace untouched"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
     }
 
     #[tokio::test]
@@ -5620,6 +5790,275 @@ use super::x;"#;
         async fn checkpoint(&self) -> anyhow::Result<()> {
             self.inner.checkpoint().await
         }
+    }
+
+    /// Delegating store double whose `relink_edges` fails while `fail` is
+    /// armed, so a test can break the pass that runs after publication and
+    /// prove the ingest rolls the pointer back instead of leaving a published
+    /// generation without its rule edges (issue #417).
+    struct RelinkFailingStore {
+        inner: Arc<dyn VectorStore>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl RelinkFailingStore {
+        fn armed(&self) -> bool {
+            self.fail.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::traits::AsAny for RelinkFailingStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VectorStore for RelinkFailingStore {
+        async fn init(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.init(namespace).await
+        }
+
+        async fn upsert(
+            &self,
+            namespace: &str,
+            id: &str,
+            vector: Vec<f32>,
+            payload: MemoryPayload,
+        ) -> anyhow::Result<crate::traits::UpsertReport> {
+            self.inner.upsert(namespace, id, vector, payload).await
+        }
+
+        async fn search(
+            &self,
+            namespace: &str,
+            vector: Vec<f32>,
+            limit: usize,
+            include_tasks: bool,
+            include_archived: bool,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner
+                .search(namespace, vector, limit, include_tasks, include_archived)
+                .await
+        }
+
+        async fn delete(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.delete(namespace, id).await
+        }
+
+        async fn clear_ingested(&self, namespace: &str) -> anyhow::Result<()> {
+            self.inner.clear_ingested(namespace).await
+        }
+
+        async fn relink_edges(&self, namespace: &str, source_key: &str) -> anyhow::Result<usize> {
+            if self.armed() {
+                self.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("injected relink failure (test double)");
+            }
+            self.inner.relink_edges(namespace, source_key).await
+        }
+
+        async fn begin_generation(&self, namespace: &str, source_key: &str) -> anyhow::Result<u64> {
+            self.inner.begin_generation(namespace, source_key).await
+        }
+
+        async fn publish_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .publish_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn abort_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            generation: u64,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .abort_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn active_generation(
+            &self,
+            namespace: &str,
+            source_key: &str,
+        ) -> anyhow::Result<u64> {
+            self.inner.active_generation(namespace, source_key).await
+        }
+
+        async fn generation_nodes(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<String>> {
+            self.inner.generation_nodes(namespace, generation).await
+        }
+
+        async fn list(
+            &self,
+            namespace: &str,
+            user_id: Option<&str>,
+            memory_type: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::traits::SearchResult>> {
+            self.inner.list(namespace, user_id, memory_type).await
+        }
+
+        async fn generation_summary(
+            &self,
+            namespace: &str,
+            generation: u64,
+        ) -> anyhow::Result<Vec<crate::traits::GenerationRow>> {
+            self.inner.generation_summary(namespace, generation).await
+        }
+
+        async fn get(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> anyhow::Result<Option<(Vec<f32>, MemoryPayload)>> {
+            self.inner.get(namespace, id).await
+        }
+
+        async fn relocate(
+            &self,
+            id: &str,
+            from: &str,
+            to: &str,
+        ) -> anyhow::Result<crate::traits::RelocateOutcome> {
+            self.inner.relocate(id, from, to).await
+        }
+
+        async fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+            self.inner.list_namespaces().await
+        }
+
+        async fn export_graph(
+            &self,
+            include_retired: bool,
+            include_archived: bool,
+            project_contexts: &std::collections::HashMap<String, std::path::PathBuf>,
+            anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.inner
+                .export_graph(
+                    include_retired,
+                    include_archived,
+                    project_contexts,
+                    anchor_override,
+                )
+                .await
+        }
+
+        async fn increment_access_count(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+            self.inner.increment_access_count(namespace, id).await
+        }
+
+        async fn export_database(&self, dir: &str) -> anyhow::Result<()> {
+            self.inner.export_database(dir).await
+        }
+
+        async fn checkpoint(&self) -> anyhow::Result<()> {
+            self.inner.checkpoint().await
+        }
+    }
+
+    /// A relink failure happens after publication. Without a rollback the new
+    /// generation stays active with none of its rule edges; the previous
+    /// generation, which the store still holds, is the safe thing to restore.
+    #[tokio::test]
+    async fn a_failed_relink_rolls_back_to_the_previous_generation() {
+        let db = std::env::temp_dir().join(format!("ns-relink-db-{}", uuid::Uuid::new_v4()));
+        let inner: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        let failing = Arc::new(RelinkFailingStore {
+            inner: inner.clone(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+        });
+        let store: Arc<dyn VectorStore> = failing.clone();
+        store.init("relink-ns").await.expect("create the schema");
+
+        let dir = std::env::temp_dir().join(format!("ns-relink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("hello.rs"), "fn hello() {}").expect("write file");
+        let schema =
+            ParserSchema::load(include_str!("../schema.json")).expect("shipped schema parses");
+        let source_key = source_key_for(&dir);
+
+        ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "relink-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("first ingest publishes generation 1");
+        assert_eq!(
+            inner
+                .active_generation("relink-ns", &source_key)
+                .await
+                .expect("read"),
+            1
+        );
+
+        // A changed file stages and publishes generation 2; the injected
+        // relink failure then hits before the rule edges are rebuilt.
+        std::fs::write(dir.join("hello.rs"), "fn hello_again() {}").expect("change file");
+        failing
+            .fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = ingest_directory(
+            &dir,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "relink-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect_err("a failed relink fails the ingest");
+
+        assert!(
+            format!("{error}").contains("relink"),
+            "the error names the relink failure: {error}"
+        );
+        assert_eq!(
+            inner
+                .active_generation("relink-ns", &source_key)
+                .await
+                .expect("read"),
+            1,
+            "the previous generation is restored after a failed relink"
+        );
+        assert!(
+            inner
+                .generation_nodes("relink-ns", 2)
+                .await
+                .expect("read")
+                .is_empty(),
+            "the generation that failed relink is aborted, not left staged"
+        );
+        let gen1_id = generation_scoped_id("relink-ns", 1, "hello.rs");
+        assert!(
+            inner
+                .get("relink-ns", &gen1_id)
+                .await
+                .expect("read")
+                .is_some(),
+            "the restored generation is still reachable"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&db).ok();
     }
 
     /// Shared driver for the carry-fault tests: publish generation 1 of a

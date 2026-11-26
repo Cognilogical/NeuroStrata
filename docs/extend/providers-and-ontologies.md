@@ -37,6 +37,10 @@ A second optional seam rebinds edges without rewriting the head:
 
 The default is again a no-op. `LadybugStore` creates edges under the same `extractor = 'upsert'` provenance as an upsert would, stamps each replacement edge's `metadata.edge_sources` entry through the same builder `upsert` uses (declaration index, declared and resolved targets, evidence id), and then runs `reconcile_declared_edges`. Content, identity metadata and history stay untouched; only the citation lists change. The vault importer uses it only for an unchanged declarer whose preferred exact target arrived in that import, so a byte-identical note can follow a newly named target without minting a content version and without losing the live edge's reference.
 
+### Reserved ingest namespaces
+
+A namespace whose name begins with `crate::traits::INTERNAL_INGEST_STAGE_PREFIX` (`__neurostrata_ingest_stage__`) belongs to the internal staging machinery. `is_reserved_ingest_destination(namespace)` reports whether a destination is reserved, and directory ingest refuses one before it normalizes a node set, probes the directory, embeds anything or opens a staging generation. The ingest-jobs layer applies the same predicate before it canonicalizes a path or registers a job, and the CLI applies it before it can clear stored rows. A staging namespace is therefore never a valid project destination, and refusing it early costs no work.
+
 Both traits are generic over storage backend. The default implementation uses a local in-memory store; custom implementations can target GPU-accelerated indexes or distributed stores.
 
 ## Custom `JudgmentProvider` Adapters

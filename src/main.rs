@@ -2451,10 +2451,12 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
             None if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            None => return Err(anyhow::anyhow!(
+            None => {
+                return Err(anyhow::anyhow!(
                 "Another NeuroStrata daemon, or a CLI command working on the store, holds {:?}.",
                 db_path
-            )),
+            ))
+            }
         }
     }
 }
@@ -10547,6 +10549,16 @@ async fn run() -> anyhow::Result<()> {
                         dry_run: _,
                         dry_run_mode: _,
                     } => {
+                        // Refuse a reserved staging destination before the
+                        // fallback store is prepared or `clear_ingested` can
+                        // run: clearing is destructive and must never touch a
+                        // namespace the operator was never allowed to name.
+                        if crate::traits::is_reserved_ingest_destination(&namespace) {
+                            anyhow::bail!(
+                                "ingest destination uses the reserved internal staging namespace '{}'; choose a different namespace",
+                                namespace
+                            );
+                        }
                         let embedder = build_embedder()?;
                         prepare_fallback_write_store(&vector_store, &embedder, &namespace)
                             .await?;
