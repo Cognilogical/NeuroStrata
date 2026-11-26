@@ -68,9 +68,12 @@ impl LayaOnnxProvider {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         };
-        let model_version = non_empty("model_version")
+        let model_version = non_empty("bundle_version")
+            .or_else(|| non_empty("model_version"))
             .or_else(|| non_empty("version"))
-            .ok_or_else(|| anyhow!("Bundle manifest declares no model_version or version"))?
+            .ok_or_else(|| {
+                anyhow!("Bundle manifest declares no bundle_version, model_version or version")
+            })?
             .to_string();
 
         let temperature = manifest
@@ -608,6 +611,29 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[tokio::test]
+    async fn laya_load_uses_declared_bundle_version() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let dir = std::env::temp_dir().join(format!("ns-laya-bundlever-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest =
+            serde_json::json!({"embedder_id": "laya", "bundle_version": "0.4.14-bridge"});
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
+        let p =
+            LayaOnnxProvider::load(&dir, sem).expect("bundle with declared bundle_version loads");
+        assert_eq!(
+            p.model_version(),
+            "0.4.14-bridge",
+            "serving must report the manifest's declared bundle_version, not a fabricated one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
