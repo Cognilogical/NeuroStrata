@@ -34,9 +34,18 @@ impl ModelBundle {
         })?;
         let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
             .map_err(|e| anyhow::anyhow!("Bad bundle manifest JSON: {e}"))?;
-        let version = manifest["bundle_version"]
-            .as_str()
-            .or_else(|| manifest["model_version"].as_str())
+        // A version must be non-empty after trimming: an empty or
+        // whitespace-only `bundle_version` is treated as absent so a
+        // non-empty `model_version` can be used, otherwise the bundle is
+        // refused.
+        let non_empty = |key: &str| {
+            manifest[key]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        let version = non_empty("bundle_version")
+            .or_else(|| non_empty("model_version"))
             .ok_or_else(|| {
                 anyhow::anyhow!("Bundle manifest declares no bundle_version or model_version")
             })?
@@ -143,6 +152,24 @@ mod tests {
         let dir =
             temp_bundle_with_manifest("noversion", Some(r#"{"embedder_id":"test-embedder"}"#));
         assert!(ModelBundle::load(&dir, "test-embedder").is_err());
+    }
+
+    #[test]
+    fn bundle_load_rejects_empty_or_whitespace_version() {
+        for (label, manifest) in [
+            ("empty-bundle-version", r#"{"bundle_version":""}"#),
+            ("blank-bundle-version", r#"{"bundle_version":"   "}"#),
+            ("blank-model-version", r#"{"model_version":" \t "}"#),
+        ] {
+            let dir = temp_bundle_with_manifest(label, Some(manifest));
+            let res = ModelBundle::load(&dir, "test-embedder");
+            assert!(
+                res.is_err(),
+                "manifest {manifest} must be refused, but load succeeded with version {:?}",
+                res.map(|b| b.version)
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
