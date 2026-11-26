@@ -1609,6 +1609,11 @@ pub struct LadybugStore {
     legacy_aliases: std::sync::RwLock<HashMap<String, String>>,
     /// Whether `legacy_aliases` has been read from the store this process.
     legacy_aliases_loaded: std::sync::atomic::AtomicBool,
+    /// Test-only: number of `load_legacy_aliases` calls that must pretend to
+    /// fail transiently. Proves the failed load leaves `legacy_aliases_loaded`
+    /// false so the next upsert retries instead of caching an empty map.
+    #[cfg(test)]
+    legacy_alias_load_failures: std::sync::atomic::AtomicUsize,
     /// The report of this process's store-open migration (`#408`), retained
     /// after `init` so callers and tests can inspect what the open did.
     migration_report: Arc<std::sync::Mutex<Option<MigrationReport>>>,
@@ -4998,6 +5003,8 @@ impl LadybugStore {
             store_state: Arc::new(std::sync::Mutex::new(None)),
             legacy_aliases: std::sync::RwLock::new(HashMap::new()),
             legacy_aliases_loaded: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            legacy_alias_load_failures: std::sync::atomic::AtomicUsize::new(0),
             migration_report: Arc::new(std::sync::Mutex::new(None)),
             census_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
@@ -5075,7 +5082,21 @@ impl LadybugStore {
 
     /// Resolve `requested_id` to the legacy row that already owns its logical
     /// path in `namespace` (`#408`), if any.
+    ///
+    /// A generation-scoped id belonging to an in-flight staging generation is
+    /// never resolved: that row must keep its scoped id so `abort_generation`
+    /// can delete it without having mutated the live legacy bare row. Only a
+    /// non-staged qualified re-ingest collapses onto the legacy identity.
     async fn resolve_legacy_alias(&self, namespace: &str, requested_id: &str) -> Option<String> {
+        if let Some((scoped_namespace, generation, _)) =
+            crate::parser::generation::split_scoped_id(requested_id)
+        {
+            if scoped_namespace == namespace
+                && self.is_staging_generation(namespace, generation).await
+            {
+                return None;
+            }
+        }
         let canonical_id = crate::parser::ingest::qualified_id(
             namespace,
             crate::parser::generation::logical_path_of(requested_id),
@@ -5096,9 +5117,71 @@ impl LadybugStore {
             .filter(|stored_id| stored_id != requested_id)
     }
 
+    /// Whether `generation` of `namespace` is an in-flight staging generation
+    /// allocated by `begin_generation` and not yet published or aborted.
+    ///
+    /// An abandoned marker (older than [`STAGING_TTL_SECS`]) is ignored, as it
+    /// is elsewhere. If the check itself cannot answer, the id is treated as
+    /// staged: leaving a row isolated is recoverable by `abort_generation`,
+    /// while mutating the live bare row is not.
+    async fn is_staging_generation(&self, namespace: &str, generation: u64) -> bool {
+        let namespace = namespace.to_string();
+        let checked = self
+            .with_conn(move |conn| {
+                let query = format!(
+                    "MATCH (s:StagingGeneration) WHERE s.namespace = '{}' AND s.generation = {} RETURN s.created_at",
+                    escape_ladybug_string(&namespace),
+                    generation
+                );
+                match conn.query(&query) {
+                    Ok(rows) => {
+                        let now = chrono::Utc::now().timestamp();
+                        Ok(rows.into_iter().any(|row| {
+                            let created_at = format!("{}", row[0]).parse::<i64>().unwrap_or(0);
+                            now.saturating_sub(created_at) <= STAGING_TTL_SECS
+                        }))
+                    }
+                    Err(error) => {
+                        let message = error.to_string().to_lowercase();
+                        if message.contains("does not exist") || message.contains("not found") {
+                            // No staging table: this store cannot have an
+                            // in-flight staging generation.
+                            Ok(false)
+                        } else {
+                            Err(error.into())
+                        }
+                    }
+                }
+            })
+            .await;
+        match checked {
+            Ok(staged) => staged,
+            Err(error) => {
+                tracing::warn!("staging generation check failed, treating id as staged: {error}");
+                true
+            }
+        }
+    }
+
     /// Load the `LegacyIdAlias` table into memory once per process. A missing
     /// table (fresh store, skipped migration) is an empty map, never an error.
+    ///
+    /// The loaded flag is published only after a successful read (a missing
+    /// table counts as success): a transient query or connection error leaves
+    /// it false so the next upsert retries instead of permanently serving an
+    /// empty map and duplicating legacy rows.
     async fn load_legacy_aliases(&self) {
+        #[cfg(test)]
+        if self
+            .legacy_alias_load_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            self.legacy_alias_load_failures
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!("legacy id alias load failed (injected transient failure); will retry");
+            return;
+        }
         let loaded = self
             .with_conn(|conn| {
                 let mut aliases = HashMap::new();
@@ -5115,15 +5198,20 @@ impl LadybugStore {
                                 _ => {}
                             }
                         }
+                        Ok(aliases)
                     }
                     Err(error) => {
                         let message = error.to_string().to_lowercase();
-                        if !message.contains("does not exist") && !message.contains("not found") {
-                            tracing::warn!("legacy id alias load skipped: {error}");
+                        if message.contains("does not exist") || message.contains("not found") {
+                            // The migration never created the table: the store
+                            // has no legacy rows to resolve, which is a
+                            // successful empty load, not a failure.
+                            Ok(aliases)
+                        } else {
+                            Err(error.into())
                         }
                     }
                 }
-                Ok(aliases)
             })
             .await;
         match loaded {
@@ -5132,11 +5220,12 @@ impl LadybugStore {
                     .legacy_aliases
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = aliases;
+                self.legacy_aliases_loaded
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
-            Err(error) => tracing::warn!("legacy id alias load failed: {error}"),
+            // Leave `legacy_aliases_loaded` false: the next upsert retries.
+            Err(error) => tracing::warn!("legacy id alias load failed, will retry: {error}"),
         }
-        self.legacy_aliases_loaded
-            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Bind (or replace) the serving descriptor after construction,
@@ -9949,6 +10038,10 @@ fn migrate_null_namespaces(conn: &Connection) -> Result<(usize, usize)> {
 /// older binary wrote as a bare id. `id` is that stored row -- keeping it is
 /// what preserves the row's edges -- and `upsert` resolves a qualified request
 /// through this map before its `MERGE`.
+///
+/// A bare row is only aliased when no scoped/canonical row already owns the
+/// identity: with bare+scoped coexistence the scoped row is the current-binary
+/// target, and an alias on the bare row would divert writes away from it.
 fn migrate_legacy_id_aliases(conn: &Connection) -> Result<usize> {
     if let Err(error) = conn.query(
         "CREATE NODE TABLE LegacyIdAlias (id STRING, namespace STRING, canonical_id STRING, PRIMARY KEY (canonical_id))",
@@ -9978,6 +10071,30 @@ fn migrate_legacy_id_aliases(conn: &Connection) -> Result<usize> {
     }
     rows.sort_by(|left, right| left.0.cmp(&right.0));
 
+    // Canonical identities already owned by a scoped/canonical row: a
+    // generation-scoped (`ns::7::path`) or namespace-qualified (`ns::path`)
+    // id is a current-binary identity, and a bare row must not be recorded as
+    // its alias. Doing so would make a later qualified re-ingest resolve onto
+    // the bare row and leave the scoped row stale (bare+scoped coexistence).
+    let mut scoped_identities: HashSet<String> = HashSet::new();
+    for (id, namespace, _) in &rows {
+        let Some(namespace) = namespace else {
+            continue;
+        };
+        if namespace == QUARANTINE_NAMESPACE {
+            continue;
+        }
+        if crate::parser::generation::logical_path_of(id) == id {
+            // A legacy bare id derives its canonical identity below; it does
+            // not itself own a scoped identity.
+            continue;
+        }
+        scoped_identities.insert(crate::parser::ingest::qualified_id(
+            namespace,
+            crate::parser::generation::logical_path_of(id),
+        ));
+    }
+
     let mut recorded = 0usize;
     for (id, namespace, user_id) in rows {
         let Some(namespace) = namespace else {
@@ -10000,6 +10117,11 @@ fn migrate_legacy_id_aliases(conn: &Connection) -> Result<usize> {
             crate::parser::generation::logical_path_of(&id),
         );
         if canonical_id == id || existing.contains(&canonical_id) {
+            continue;
+        }
+        // A scoped/canonical row already owns this identity: recording the
+        // bare row as its alias would divert a later re-ingest away from it.
+        if scoped_identities.contains(&canonical_id) {
             continue;
         }
         conn.query(&format!(
@@ -37695,5 +37817,242 @@ mod store_migration {
         assert_eq!(second_report.skipped_reason, None);
         assert_eq!(count_memory(&second, "m.namespace IS NOT NULL").await, 2);
         assert_eq!(count_memory(&second, "m.namespace = 'alpha'").await, 2);
+    }
+
+    /// Fix 1 (`#408`): a staged generation's upsert keeps its generation-scoped
+    /// id even when the logical path was written by an older binary as a bare
+    /// id. Rewriting it to the live bare row would let `abort_generation` leave
+    /// the mutation behind, so the staged row must be its own row.
+    #[tokio::test]
+    async fn a_staged_generation_upsert_leaves_the_legacy_bare_row_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs"),
+            "the migration records the legacy row's canonical identity"
+        );
+
+        let generation = store.begin_generation("alpha", "docs").await.unwrap();
+        let staged_id =
+            crate::parser::ingest::generation_scoped_id("alpha", generation, "src/main.rs");
+        store
+            .upsert(
+                "alpha",
+                &staged_id,
+                vec![0.0; DIMS],
+                row_payload("staged write"),
+            )
+            .await
+            .expect("a staged upsert lands");
+
+        let (_, bare) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("bare lookup")
+            .expect("the legacy row still exists");
+        assert_eq!(
+            bare.content, "content-src/main.rs",
+            "a staged write must not mutate the live legacy bare row"
+        );
+        assert!(
+            store
+                .get("alpha", &staged_id)
+                .await
+                .expect("staged lookup")
+                .is_some(),
+            "the staged row keeps its generation-scoped id"
+        );
+
+        store
+            .abort_generation("alpha", "docs", generation)
+            .await
+            .expect("abort discards the staged generation");
+        assert!(
+            store
+                .get("alpha", &staged_id)
+                .await
+                .expect("post-abort lookup")
+                .is_none(),
+            "abort removes the staged row"
+        );
+        let (_, bare) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("bare lookup after abort")
+            .expect("the legacy row survives the abort");
+        assert_eq!(
+            bare.content, "content-src/main.rs",
+            "the live bare row is untouched by the whole staged cycle"
+        );
+    }
+
+    /// Fix 2 (`#408`): a transient alias-table read failure must not be cached
+    /// as an empty map. The next upsert retries the load and resolves the
+    /// legacy row instead of creating a duplicate.
+    #[tokio::test]
+    async fn a_transient_alias_load_failure_is_retried_on_the_next_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        store
+            .legacy_alias_load_failures
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+
+        store
+            .upsert(
+                "alpha",
+                "alpha::7::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("first attempt"),
+            )
+            .await
+            .expect("a failed alias load never fails the write");
+        let (_, bare) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("bare lookup")
+            .expect("the legacy row still exists");
+        assert_eq!(
+            bare.content, "content-src/main.rs",
+            "the failed load must not resolve the alias"
+        );
+        assert!(
+            store
+                .get("alpha", "alpha::7::src/main.rs")
+                .await
+                .expect("qualified lookup")
+                .is_some(),
+            "without the alias the write lands on its own qualified id"
+        );
+
+        store
+            .upsert(
+                "alpha",
+                "alpha::7::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("retried"),
+            )
+            .await
+            .expect("the retry loads the alias");
+        let (_, bare) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("bare lookup after retry")
+            .expect("the legacy row still exists");
+        assert_eq!(
+            bare.content, "retried",
+            "the retried load resolves the write onto the legacy row"
+        );
+    }
+
+    /// Fix 3 (`#408`): when a scoped/canonical counterpart already owns the
+    /// identity, recording the bare row as its alias would divert a later
+    /// qualified re-ingest away from the scoped row. The alias is skipped.
+    #[tokio::test]
+    async fn a_scoped_counterpart_suppresses_the_legacy_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("src/main.rs", Some("alpha"), "{}"),
+                &insert_row("alpha::src/main.rs", Some("alpha"), "{}"),
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert!(
+            alias_target(&store, "alpha::src/main.rs").await.is_none(),
+            "the scoped counterpart already owns the canonical identity"
+        );
+
+        store
+            .upsert(
+                "alpha",
+                "alpha::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("scoped update"),
+            )
+            .await
+            .expect("the qualified upsert lands");
+
+        let (_, scoped) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("scoped lookup")
+            .expect("the scoped row exists");
+        assert_eq!(scoped.content, "scoped update");
+        let (_, bare) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("bare lookup")
+            .expect("the bare row still exists");
+        assert_eq!(
+            bare.content, "content-src/main.rs",
+            "the bare row is not the alias target"
+        );
+        assert_eq!(
+            count_memory(&store, "m.namespace = 'alpha'").await,
+            2,
+            "the qualified re-ingest updates the scoped row, no duplicate"
+        );
+    }
+
+    /// Ambiguity quarantine (`#408`): a bare id whose only namespace evidence
+    /// is two different namespaces cannot be assigned to either, so it is
+    /// quarantined instead of guessed into one of them.
+    #[tokio::test]
+    async fn a_bare_id_matching_two_namespaces_is_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("src/main.rs", None, "{}"),
+                &insert_row("alpha::5::src/main.rs", Some("alpha"), "{}"),
+                &insert_row("beta::5::src/main.rs", Some("beta"), "{}"),
+            ],
+        );
+
+        let store = open(&db);
+        store
+            .init("alpha")
+            .await
+            .expect("an ambiguous bare id never blocks the open");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 0);
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(
+            stored_namespace(&store, "src/main.rs").await.as_deref(),
+            Some(QUARANTINE_NAMESPACE)
+        );
+        assert!(
+            store
+                .get(QUARANTINE_NAMESPACE, "src/main.rs")
+                .await
+                .expect("quarantined lookup")
+                .is_some(),
+            "the ambiguous row is still readable under quarantine"
+        );
     }
 }
