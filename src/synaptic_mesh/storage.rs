@@ -1270,7 +1270,7 @@ mod tests {
         let msg = format!("{err:#}");
 
         assert!(
-            elapsed < Duration::from_secs(20),
+            elapsed < Duration::from_secs(10),
             "NEUROSTRATA_GIT_TIMEOUT_SECS=1 must bound the call, took {elapsed:?}"
         );
         assert!(

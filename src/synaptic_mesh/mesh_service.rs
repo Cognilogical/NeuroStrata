@@ -1768,7 +1768,7 @@ mod tests {
 
         assert!(!exists, "a timed-out probe must answer false");
         assert!(
-            elapsed < Duration::from_secs(20),
+            elapsed < Duration::from_secs(10),
             "the shared bound must fire fast, took {elapsed:?}"
         );
         assert_reaped(read_pid(&pid_file));

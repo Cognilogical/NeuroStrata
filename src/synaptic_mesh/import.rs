@@ -7364,7 +7364,7 @@ mod tests {
         let msg = format!("{err:#}");
 
         assert!(
-            elapsed < Duration::from_secs(20),
+            elapsed < Duration::from_secs(10),
             "the bound must fire fast, took {elapsed:?}"
         );
         assert!(
