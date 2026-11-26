@@ -308,9 +308,34 @@ export declare const TOOL_GC_STUB_MAX_BYTES = 512;
 export declare const WORKING_SET_SUMMARY_MAX_BYTES = 512;
 export declare const WORKING_SET_FRAME_OPEN = "[NeuroStrata Active Context]";
 export declare const WORKING_SET_FRAME_CLOSE = "[NeuroStrata End Active Context]";
+export declare const WORKING_SET_TIER0_MAX_BYTES = 2048;
+export declare const WORKING_SET_MAX_EDGES = 128;
+export declare const WORKING_SET_STRIDE_MESSAGES = 8;
+export declare const WORKING_SET_HOT_TAIL_MESSAGES = 12;
+export declare const WORKING_SET_TIER0_OPEN = "[NeuroStrata Golden Rules \u2014 IMMORTAL PREFIX]";
+export declare const WORKING_SET_TIER0_CLOSE = "[NeuroStrata End Immortal Prefix]";
+export declare const WORKING_SET_STRIDE_MARKER = "[NeuroStrata Quantized History Stride ";
 export type WorkingSetNodeKind = 'task_header' | 'golden_rule' | 'file' | 'symbol' | 'memory' | 'ast_summary' | 'conceptual_bridge' | 'recall_text';
 export type WorkingSetTier = 'Immortal' | 'PinnedRoot' | 'YoungGen' | 'EvictedStub';
 export type WorkingSetGcAction = 'retain_full' | 'promote_to_young_gen' | 'demote_to_stub' | 'retain_stub';
+export type WorkingSetCacheTier = 'Tier0SystemPrefix' | 'Tier1QuantizedHistory' | 'Tier2TailDelta' | 'EvictedHeapStub';
+export type WorkingSetCacheTierTag = 'tier0_system_prefix' | 'tier1_quantized_history' | 'tier2_tail_delta' | 'evicted_heap_stub';
+export type WorkingSetStrideAction = 'retain_raw_message' | 'fold_into_quantized_stub' | 'invalid_message_index';
+export type WorkingSetEdgeKind = 'GOVERNS' | 'DEPENDS_ON' | 'CALLS' | 'IMPORTS' | 'CONCEPTUAL_BRIDGE' | 'EXTRACTED_FROM';
+export interface WorkingSetEdge {
+    from: string;
+    to: string;
+    kind: WorkingSetEdgeKind;
+    weight_bps: number;
+    last_touched_turn: number;
+}
+export interface WorkingSetStrideInput {
+    total_messages: number;
+    message_index: number;
+    hot_tail_count: number;
+    stride: number;
+    is_protected_system_or_pinned: boolean;
+}
 export interface WorkingSetScope {
     projectRoot: string;
     projectId: string;
@@ -394,6 +419,7 @@ export interface WorkingSetState {
     roots: WorkingSetNode[];
     young_gen: WorkingSetNode[];
     evicted_stubs: WorkingSetStub[];
+    edges: WorkingSetEdge[];
     tool_output_stubs: ToolOutputStub[];
     tool_output_digests: ToolOutputDigest[];
 }
@@ -420,6 +446,14 @@ export declare function evaluateWorkingSetEviction(input: {
     max_frame_bytes: number;
     is_re_referenced: boolean;
 }): WorkingSetGcAction;
+/** Rust `WorkingSetCacheTier::as_tag` mirror. */
+export declare function workingSetCacheTierAsTag(tier: WorkingSetCacheTier): WorkingSetCacheTierTag;
+/** Mirrors `evaluate_working_set_cache_tier` exactly. Tier 1 is state-only. */
+export declare function evaluateWorkingSetCacheTier(tier: WorkingSetTier, hasSystemChannel: boolean): WorkingSetCacheTier;
+/** Mirrors `compute_working_set_quantized_frontier` exactly. */
+export declare function computeWorkingSetQuantizedFrontier(totalMessages: number, hotTailCount: number, stride: number): number;
+/** Mirrors `evaluate_working_set_stride_fold` exactly (first match wins). */
+export declare function evaluateWorkingSetStrideFold(input: WorkingSetStrideInput): WorkingSetStrideAction;
 /** Load and strictly validate the reconstructible local L1 cache. */
 export declare function loadWorkingSet(scopeInput: WorkingSetScope): Promise<WorkingSetState>;
 /** Merge only working_set into a valid parent session file, best effort. */
@@ -442,6 +476,8 @@ export declare function isFileTouchTool(name: string): boolean;
 export declare function isMutatingTool(name: string): boolean;
 /** Apply TTL and deterministic pressure demotion without changing immortal nodes. */
 export declare function sweepWorkingSet(stateInput: WorkingSetState): WorkingSetState;
+/** Record typed graph edges with deterministic dedup, ordering, and cap. */
+export declare function recordWorkingSetEdges(stateInput: WorkingSetState, edges: Array<Partial<WorkingSetEdge> & Pick<WorkingSetEdge, 'from' | 'to' | 'kind'>>): WorkingSetState;
 /** Advance one deterministic turn, mark touches, and retry fitting page faults. */
 export declare function advanceWorkingSetTurn(stateInput: WorkingSetState, namespace: string, sessionId: string, projectRoot: string, touched: WorkingSetTouch[], expand: WorkingSetExpansion): Promise<WorkingSetState>;
 /** Pure size-based dehydration; duplicate history belongs to the scoped helper. */
@@ -462,6 +498,36 @@ export declare function renderWorkingSetFrame(state: WorkingSetState, activeSess
     usedBytes: number;
     fingerprint: string;
 };
+/** Tier 0: immortal Golden Rules only; zero volatile counters or task fields. */
+export declare function renderWorkingSetTier0Prefix(state: WorkingSetState, activeSession?: ActiveSessionState | null): {
+    text: string;
+    usedBytes: number;
+    fingerprint: string;
+};
+/** Tier 2: volatile task/roots/young/edges/stubs; never invalidates tier 0. */
+export declare function renderWorkingSetDeltaFrame(state: WorkingSetState, activeSession?: ActiveSessionState | null, options?: {
+    omitImmortalRules?: boolean;
+    maxBytes?: number;
+}): {
+    text: string;
+    usedBytes: number;
+    fingerprint: string;
+};
+/** Deterministic compaction checkpoint; replaces a lossy host LLM summary. */
+export declare function renderWorkingSetCompactionSummary(state: WorkingSetState, activeSession?: ActiveSessionState | null): string;
+/** Tier 1: fold pre-frontier history into stride-stable deterministic stubs. */
+export declare function projectWorkingSetMessages(messages: unknown[], state: WorkingSetState, options?: {
+    hotTailCount?: number;
+    stride?: number;
+}): {
+    messages: unknown[];
+    quantizedFrontier: number;
+    foldedCount: number;
+};
+/** Replace or append the immutable-prefix system part in place. */
+export declare function upsertWorkingSetSystemPrefix(system: unknown[], tier0Text: string): boolean;
+/** Attach or update the volatile delta on the tail without touching prefix. */
+export declare function upsertWorkingSetMessageTailDelta(messages: unknown[], deltaText: string): boolean;
 /** Upsert one mutable frame using context[], content, then additionalContext. */
 export declare function upsertWorkingSetFrame(sink: unknown, frame: string): boolean;
 export declare function wsSyncBridges(state: WorkingSetState, parent: Record<string, unknown>): void;
@@ -477,6 +543,18 @@ export declare function runWorkingSetContextCycle(scopeInput: WorkingSetScope, e
     frame: string;
     fingerprint: string;
     changed: boolean;
+}>;
+/** Pre-turn activation: mark anchors, spread edges, and persist L1 state. */
+export declare function runWorkingSetPromptCycle(input: {
+    scope: WorkingSetScope;
+    promptText: string;
+    turnId?: string;
+    eventId?: string;
+}): Promise<{
+    frame: string;
+    fingerprint: string;
+    changed: boolean;
+    activatedIds: string[];
 }>;
 /** Mark deterministic file/symbol/memory touches without advancing the turn. */
 export declare function markWorkingSetTouches(scopeInput: WorkingSetScope, touched: WorkingSetTouch[], eventId?: string): Promise<void>;
@@ -644,6 +722,11 @@ export declare function resetAllSessionEpochs(): void;
  * Same-epoch repeat calls leave the event untouched.
  */
 export declare function sessionContextHandler(event: any, config: ResolvedConfig): Promise<void>;
+/** `session.hook("prompt")` handler: activate anchors before the model call. */
+export declare function sessionPromptHandler(event: any, config: ResolvedConfig): Promise<{
+    changed: boolean;
+    activatedIds: string[];
+}>;
 /**
  * `session.hook("compaction")` handler. Increments the session epoch and
  * clears seen files, so the very next context hook re-injects the active

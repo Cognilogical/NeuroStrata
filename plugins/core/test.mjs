@@ -5876,6 +5876,7 @@ const wsState = (scope, overrides = {}) => ({
   roots: [],
   young_gen: [],
   evicted_stubs: [],
+  edges: [],
   tool_output_stubs: [],
   tool_output_digests: [],
   ...overrides
@@ -7683,5 +7684,465 @@ describe('PR #435 regression tests', () => {
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────────
+// Task 5: 3-tier KV-cache graph projection, typed edges, prompt activation
+// ──────────────────────────────────────────────────────────────────────
+
+describe('Task 5: three-tier KV-cache decision mirrors', () => {
+  it('exports the four fixed 3-tier budgets', async () => {
+    const core = await import('./dist/index.js')
+    assert.equal(core.WORKING_SET_TIER0_MAX_BYTES, 2048)
+    assert.equal(core.WORKING_SET_MAX_EDGES, 128)
+    assert.equal(core.WORKING_SET_STRIDE_MESSAGES, 8)
+    assert.equal(core.WORKING_SET_HOT_TAIL_MESSAGES, 12)
+  })
+
+  it('matches all 8 cache-tier rows and their Rust tags', async () => {
+    const core = await import('./dist/index.js')
+    const tags = [
+      'tier0_system_prefix',
+      'tier1_quantized_history',
+      'tier2_tail_delta',
+      'evicted_heap_stub'
+    ]
+    let rows = 0
+    for (const tier of ['Immortal', 'PinnedRoot', 'YoungGen', 'EvictedStub']) {
+      for (const hasSystemChannel of [false, true]) {
+        const actual = core.workingSetCacheTierAsTag(
+          core.evaluateWorkingSetCacheTier(tier, hasSystemChannel)
+        )
+        const expected =
+          tier === 'Immortal'
+            ? hasSystemChannel
+              ? 'tier0_system_prefix'
+              : 'tier2_tail_delta'
+            : tier === 'EvictedStub'
+              ? 'evicted_heap_stub'
+              : 'tier2_tail_delta'
+        assert.equal(actual, expected, `${tier}/${hasSystemChannel}`)
+        assert.ok(tags.includes(actual))
+        rows++
+      }
+    }
+    assert.equal(rows, 8)
+  })
+
+  it('matches all 128 stride-fold rows and frontier steps', async () => {
+    const core = await import('./dist/index.js')
+    let rows = 0
+    for (const total of [0, 12, 20, 28]) {
+      for (const index of [0, 7, 8, 19]) {
+        for (const hot of [0, 12]) {
+          for (const stride of [0, 8]) {
+            for (const protectedMessage of [false, true]) {
+              const input = {
+                total_messages: total,
+                message_index: index,
+                hot_tail_count: hot,
+                stride,
+                is_protected_system_or_pinned: protectedMessage
+              }
+              const frontier = core.computeWorkingSetQuantizedFrontier(
+                total,
+                hot,
+                stride
+              )
+              const expected =
+                index >= total
+                  ? 'invalid_message_index'
+                  : protectedMessage || stride === 0 || total <= hot
+                    ? 'retain_raw_message'
+                    : index < frontier
+                      ? 'fold_into_quantized_stub'
+                      : 'retain_raw_message'
+              assert.equal(
+                core.evaluateWorkingSetStrideFold(input),
+                expected,
+                JSON.stringify(input)
+              )
+              rows++
+            }
+          }
+        }
+      }
+    }
+    assert.equal(rows, 128)
+    assert.equal(core.computeWorkingSetQuantizedFrontier(19, 12, 8), 0)
+    assert.equal(core.computeWorkingSetQuantizedFrontier(20, 12, 8), 8)
+    assert.equal(core.computeWorkingSetQuantizedFrontier(27, 12, 8), 8)
+    assert.equal(core.computeWorkingSetQuantizedFrontier(28, 12, 8), 16)
+  })
+})
+
+const wsEdge = (from, kind, to, last = 0, weight = 5000) => ({
+  from,
+  to,
+  kind,
+  weight_bps: weight,
+  last_touched_turn: last
+})
+const wsSortedEdges = (...edges) =>
+  [...edges].sort(
+    (a, b) =>
+      b.last_touched_turn - a.last_touched_turn ||
+      b.weight_bps - a.weight_bps ||
+      (a.from < b.from ? -1 : a.from > b.from ? 1 : 0) ||
+      (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0) ||
+      (a.to < b.to ? -1 : a.to > b.to ? 1 : 0)
+  )
+const wsStub = (id, kind = 'memory', overrides = {}) => {
+  const expand =
+    kind === 'file' || kind === 'symbol'
+      ? 'neurostrata_memories_for_file'
+      : 'neurostrata_get_memory'
+  const pointer = `[GCStub ${id} | - | expand:${expand}]`
+  return {
+    id,
+    kind,
+    pointer,
+    byte_cost: Buffer.byteLength(`${pointer}\n`),
+    last_touched_turn: 0,
+    governing_ids: [],
+    ...overrides
+  }
+}
+
+describe('Task 5: typed edges and spreading activation', () => {
+  it('loads edges, defaults omitted v1 edges, and deduplicates/caps edges', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-edges-'))
+    try {
+      const scope = wsScope(root)
+      const edges = wsSortedEdges(
+        wsEdge('file:src/a.ts', 'GOVERNS', 'mem:r1', 1, 10000),
+        wsEdge('file:src/b.ts', 'CALLS', 'file:src/a.ts', 1, 5000),
+        wsEdge('symbol:src/a.ts#f', 'CONCEPTUAL_BRIDGE', 'mem:r2', 1, 7500)
+      )
+      const state = wsState(scope, { edges })
+      wsParent(root, state)
+      assert.equal((await core.loadWorkingSet(scope)).edges.length, 3)
+
+      const deduped = core.recordWorkingSetEdges(state, [
+        { from: 'file:a', kind: 'GOVERNS', to: 'mem:1' },
+        { from: 'file:a', kind: 'GOVERNS', to: 'mem:1' },
+        { from: 'file:a', kind: 'CALLS', to: 'file:b' }
+      ])
+      assert.equal(deduped.edges.length, 2)
+      assert.deepEqual(
+        deduped.edges.map((edge) => `${edge.from}|${edge.kind}|${edge.to}`),
+        ['file:a|CALLS|file:b', 'file:a|GOVERNS|mem:1']
+      )
+      assert.equal(deduped.edges[0].last_touched_turn, state.turn_seq)
+
+      const many = Array.from({ length: 200 }, (_, i) =>
+        wsEdge(`file:f${i}`, 'GOVERNS', `mem:m${i}`, 0, 10000)
+      )
+      const capped = core.recordWorkingSetEdges(state, many)
+      assert.equal(capped.edges.length, 128)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('prunes edges with missing endpoints in sweepWorkingSet', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-prune-')))
+    const state = wsState(scope, {
+      roots: [wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })],
+      edges: wsSortedEdges(
+        wsEdge('file:src/a.ts', 'GOVERNS', 'mem:alive', 1, 10000),
+        wsEdge('mem:gone', 'GOVERNS', 'mem:other', 1, 10000)
+      )
+    })
+    const swept = core.sweepWorkingSet(state)
+    assert.equal(swept.edges.length, 1)
+    assert.equal(swept.edges[0].from, 'file:src/a.ts')
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('activates 1-hop and 2-hop neighbors and terminates on cycles', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-activate-'))
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        turn_seq: 4,
+        roots: [
+          wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' }),
+          wsNode('file:src/b.ts', 'file', { path: 'src/b.ts' })
+        ],
+        young_gen: [wsNode('mem:r1', 'memory'), wsNode('mem:r2', 'memory')],
+        edges: wsSortedEdges(
+          wsEdge('file:src/a.ts', 'GOVERNS', 'mem:r1', 4, 10000),
+          wsEdge('mem:r1', 'GOVERNS', 'file:src/a.ts', 4, 10000),
+          wsEdge('file:src/a.ts', 'CALLS', 'file:src/b.ts', 4, 5000),
+          wsEdge('file:src/b.ts', 'GOVERNS', 'mem:r2', 4, 10000)
+        )
+      })
+      const expanded = await core.advanceWorkingSetTurn(
+        state,
+        scope.namespace,
+        scope.sessionId,
+        scope.projectRoot,
+        [{ id: 'file:src/a.ts', kind: 'file', path: 'src/a.ts' }],
+        async () => null
+      )
+      assert.equal(expanded.turn_seq, 5)
+      assert.equal(
+        expanded.young_gen.find((node) => node.id === 'mem:r1')
+          .last_touched_turn,
+        5
+      )
+      assert.equal(
+        expanded.young_gen.find((node) => node.id === 'mem:r2')
+          .last_touched_turn,
+        5
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('promotes page-faulted stub neighbors through the expansion callback', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-fault-'))
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        turn_seq: 1,
+        roots: [wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })],
+        evicted_stubs: [wsStub('mem:r3')],
+        edges: wsSortedEdges(
+          wsEdge('file:src/a.ts', 'EXTRACTED_FROM', 'mem:r3', 1, 10000)
+        )
+      })
+      const expanded = await core.advanceWorkingSetTurn(
+        state,
+        scope.namespace,
+        scope.sessionId,
+        scope.projectRoot,
+        [{ id: 'file:src/a.ts', kind: 'file', path: 'src/a.ts' }],
+        async (request) => {
+          assert.equal(request.id, 'mem:r3')
+          return wsNode('mem:r3', 'memory')
+        }
+      )
+      assert.ok(expanded.young_gen.some((node) => node.id === 'mem:r3'))
+      assert.ok(!expanded.evicted_stubs.some((stub) => stub.id === 'mem:r3'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Task 5: tier 0 / tier 2 split rendering', () => {
+  const goldenState = (scope) =>
+    wsState(scope, {
+      roots: [
+        wsNode('rule:abc', 'golden_rule', { summary: 'always claim first' })
+      ]
+    })
+
+  it('renders an invariant immortal system prefix with no volatile counters', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-tier0-')))
+    const first = core.renderWorkingSetTier0Prefix(goldenState(scope), null)
+    assert.match(first.text, /\[NeuroStrata Golden Rules — IMMORTAL PREFIX\]/)
+    assert.match(first.text, /\[NeuroStrata End Immortal Prefix\]/)
+    assert.match(first.text, /always claim first/)
+    assert.ok(!/Turn:/u.test(first.text))
+    assert.ok(!/Epoch:/u.test(first.text))
+    assert.equal(first.usedBytes, Buffer.byteLength(first.text))
+    const later = core.renderWorkingSetTier0Prefix(
+      { ...goldenState(scope), turn_seq: 9, epoch: 3 },
+      { task_id: 'task-changed', status: 'done' }
+    )
+    assert.equal(later.fingerprint, first.fingerprint)
+    assert.ok(first.usedBytes <= 2048)
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('renders a bounded delta frame with edge lines and omits golden rules', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-delta-')))
+    const state = wsState(scope, {
+      roots: [
+        wsNode('rule:abc', 'golden_rule', { summary: 'always claim first' }),
+        wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })
+      ],
+      edges: wsSortedEdges(
+        wsEdge('file:src/a.ts', 'GOVERNS', 'mem:r1', 0, 10000)
+      )
+    })
+    const parent = {
+      namespace: scope.namespace,
+      task_id: 'task-5',
+      status: 'in_progress',
+      golden_rules: ['always claim first']
+    }
+    const tier0 = core.renderWorkingSetTier0Prefix(state, parent)
+    const delta = core.renderWorkingSetDeltaFrame(state, parent, {
+      omitImmortalRules: true
+    })
+    assert.ok(!delta.text.includes('IMMORTAL PREFIX'))
+    assert.match(delta.text, /\[Edge\] file:src\/a\.ts -GOVERNS-> mem:r1/)
+    assert.ok(tier0.usedBytes + delta.usedBytes <= 4096)
+    assert.equal(delta.usedBytes, Buffer.byteLength(delta.text))
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('renders a deterministic bounded compaction summary', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-compact-')))
+    const state = wsState(scope, {
+      roots: [
+        wsNode('rule:abc', 'golden_rule', { summary: 'always claim first' }),
+        wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })
+      ],
+      edges: wsSortedEdges(
+        wsEdge('file:src/a.ts', 'GOVERNS', 'mem:r1', 0, 10000)
+      )
+    })
+    const summary = core.renderWorkingSetCompactionSummary(state, {
+      namespace: scope.namespace,
+      task_id: 'task-5',
+      status: 'in_progress'
+    })
+    assert.match(summary, /always claim first/)
+    assert.match(summary, /task-5/)
+    assert.match(summary, /GOVERNS/)
+    assert.ok(Buffer.byteLength(summary) <= 512)
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+})
+
+describe('Task 5: quantized stride window projection', () => {
+  const messagesOf = (count) =>
+    Array.from({ length: count }, (_, i) => ({
+      role: 'user',
+      content: `message ${i}`
+    }))
+
+  it('steps the frontier at stride boundaries and keeps bucket prefixes identical', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-stride-')))
+    const state = wsState(scope)
+    for (let count = 12; count <= 19; count++) {
+      assert.equal(
+        core.projectWorkingSetMessages(messagesOf(count), state)
+          .quantizedFrontier,
+        0
+      )
+    }
+    const p20 = core.projectWorkingSetMessages(messagesOf(20), state)
+    const p27 = core.projectWorkingSetMessages(messagesOf(27), state)
+    assert.equal(p20.quantizedFrontier, 8)
+    assert.equal(p27.quantizedFrontier, 8)
+    assert.deepEqual(p20.messages[0], p27.messages[0])
+    assert.equal(p20.foldedCount, 8)
+
+    const p28 = core.projectWorkingSetMessages(messagesOf(28), state)
+    const p35 = core.projectWorkingSetMessages(messagesOf(35), state)
+    assert.equal(p28.quantizedFrontier, 16)
+    assert.equal(p35.quantizedFrontier, 16)
+    assert.deepEqual(p28.messages.slice(0, 2), p35.messages.slice(0, 2))
+    assert.deepEqual(p28.messages.slice(-12), messagesOf(28).slice(16))
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('never folds protected system messages', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-protect-')))
+    const messages = messagesOf(20)
+    messages[0] = {
+      role: 'system',
+      content: '[NeuroStrata Golden Rules — IMMORTAL PREFIX] never fold me'
+    }
+    const projected = core.projectWorkingSetMessages(messages, wsState(scope))
+    assert.ok(
+      projected.messages.some(
+        (message) =>
+          typeof message.content === 'string' &&
+          message.content.includes('never fold me')
+      )
+    )
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('upserts the system prefix and message-tail delta in place', async () => {
+    const core = await import('./dist/index.js')
+    const system = []
+    const tier0 =
+      '[NeuroStrata Golden Rules — IMMORTAL PREFIX]\n[NeuroStrata End Immortal Prefix]\n'
+    assert.equal(core.upsertWorkingSetSystemPrefix(system, tier0), true)
+    assert.equal(system.length, 1)
+    assert.equal(core.upsertWorkingSetSystemPrefix(system, tier0), false)
+    const messages = [{ role: 'user', content: 'hello' }]
+    const delta = `${WORKING_SET_FRAME_OPEN} delta\n${WORKING_SET_FRAME_CLOSE}\n`
+    assert.equal(core.upsertWorkingSetMessageTailDelta(messages, delta), true)
+    assert.equal(messages.length, 2)
+    assert.equal(core.upsertWorkingSetMessageTailDelta(messages, delta), false)
+    assert.equal(messages.length, 2)
+  })
+})
+
+describe('Task 5: pre-turn prompt activation', () => {
+  it('extracts anchors, activates neighbors, and persists before the model call', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-prompt-'))
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        roots: [wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })],
+        young_gen: [wsNode('mem:r1', 'memory')],
+        edges: wsSortedEdges(
+          wsEdge('file:src/a.ts', 'GOVERNS', 'mem:r1', 0, 10000)
+        )
+      })
+      wsParent(root, state)
+      const result = await core.runWorkingSetPromptCycle({
+        scope,
+        promptText: 'inspect file:src/a.ts and mem:r1',
+        turnId: 'prompt-1'
+      })
+      assert.equal(result.changed, true)
+      assert.ok(result.activatedIds.includes('mem:r1'))
+      assert.match(result.frame, /task:task-parent/)
+      const persisted = await core.loadWorkingSet(scope)
+      assert.equal(persisted.turn_seq, 1)
+      assert.equal(
+        persisted.young_gen.find((node) => node.id === 'mem:r1')
+          .last_touched_turn,
+        1
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('registers a prompt session hook on createHarnessPlugin', async () => {
+    const core = await import('./dist/index.js')
+    const hooks = new Map()
+    const config = {
+      namespace: 'NeuroStrata',
+      endpoint: 'http://127.0.0.1:1/mcp',
+      bearerToken: null,
+      tokenFile: null,
+      strictMode: false,
+      requestTimeoutMs: 50,
+      intentDetection: { enabled: false, injectReminder: false }
+    }
+    const plugin = core.createHarnessPlugin('test-prompt', 'opencode')
+    await plugin.setup({
+      config,
+      location: { project: { root: process.cwd(), canonical: process.cwd() } },
+      session: { hook: (name, fn) => hooks.set(name, fn) }
+    })
+    assert.equal(typeof hooks.get('prompt'), 'function')
+    assert.equal(typeof hooks.get('context'), 'function')
+    assert.equal(typeof hooks.get('compaction'), 'function')
   })
 })

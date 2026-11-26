@@ -946,3 +946,69 @@ test('hook runner replies in the shape of the failing event (#400)', async () =>
     rmSync(base, { recursive: true, force: true })
   }
 })
+
+// ── Task 5: OpenCode V2 3-tier projection, prompt activation, compaction ──
+test('OpenCode V2 context projects tier 0 into system and tier 2 into message tail', async () => {
+  const root = canonicalTempDir('ns-opencode-v2-tier-')
+  try {
+    writeMarker(root, 'gc-opencode-v2')
+    mkdirSync(join(root, '.NeuroStrata'), { recursive: true })
+    writeFileSync(
+      join(root, '.NeuroStrata', 'active_session.json'),
+      JSON.stringify({
+        namespace: 'gc-opencode-v2',
+        session_id: 'ses-v2-tier',
+        task_id: 'task-v2-tier',
+        status: 'in_progress',
+        golden_rules: ['always claim first']
+      })
+    )
+    resetClientForTesting()
+    const sessionHooks = new Map()
+    await plugin.initialize({
+      location: { directory: root, project: { root, canonical: root } },
+      session: { hook: (name, fn) => sessionHooks.set(name, fn) },
+      tool: { hook() {} },
+      config: {
+        namespace: 'gc-opencode-v2',
+        endpoint: 'http://127.0.0.1:1/mcp',
+        requestTimeoutMs: 50,
+        intentDetection: { enabled: false, injectReminder: false }
+      }
+    })
+    assert.equal(typeof sessionHooks.get('prompt'), 'function')
+
+    const event = {
+      sessionID: 'ses-v2-tier',
+      system: [],
+      messages: [{ role: 'user', content: 'hello' }]
+    }
+    await sessionHooks.get('context')(event)
+    assert.equal(event.system.length, 1)
+    assert.match(
+      event.system[0].text,
+      /\[NeuroStrata Golden Rules — IMMORTAL PREFIX\]/
+    )
+    assert.ok(!/Turn:/u.test(event.system[0].text))
+    assert.ok(!/Epoch:/u.test(event.system[0].text))
+    assert.equal(event.messages[0].content, 'hello')
+    assert.equal(event.messages.length, 2)
+    assert.match(event.messages[1].content, /\[NeuroStrata Active Context\]/)
+    assert.match(event.messages[1].content, /task-v2-tier/)
+    assert.equal(event.additionalContext, undefined)
+
+    await sessionHooks.get('prompt')({
+      sessionID: 'ses-v2-tier',
+      prompt: 'inspect file:src/a.ts'
+    })
+
+    const compaction = { sessionID: 'ses-v2-tier' }
+    await sessionHooks.get('compaction')(compaction)
+    assert.equal(typeof compaction.result.summary, 'string')
+    assert.match(compaction.result.summary, /always claim first/)
+    assert.match(compaction.result.summary, /task-v2-tier/)
+  } finally {
+    resetModuleState()
+    rmSync(root, { recursive: true, force: true })
+  }
+})

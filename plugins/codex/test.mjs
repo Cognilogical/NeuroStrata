@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import {
   mkdtempSync,
@@ -719,6 +720,95 @@ test('working-set GC SessionStart UserPromptSubmit and Stop emit native shapes',
       ).reply,
       { continue: true }
     )
+  } finally {
+    resetModuleState()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('UserPromptSubmit preserves typed edges in the working set', () => {
+  const root = canonicalTempDir('ns-codex-ws-edges-')
+  try {
+    writeCodexWorkingSetParent(root)
+    const path = join(root, '.NeuroStrata', 'active_session.json')
+    const parent = JSON.parse(readFileSync(path, 'utf8'))
+    const rootNode = {
+      id: 'file:src/a.ts',
+      kind: 'file',
+      label: 'file:src/a.ts',
+      summary: 'a',
+      governing_ids: [],
+      byte_cost: 0,
+      last_touched_turn: 0,
+      expand_tool: 'neurostrata_memories_for_file',
+      path: 'src/a.ts'
+    }
+    rootNode.byte_cost = Buffer.byteLength(
+      `[Root] ${rootNode.id} | ${rootNode.summary} | expand:${rootNode.expand_tool}\n`
+    )
+    const young = {
+      id: 'mem:r1',
+      kind: 'memory',
+      label: 'mem:r1',
+      summary: 'r1',
+      governing_ids: [],
+      byte_cost: 0,
+      last_touched_turn: 0,
+      expand_tool: 'neurostrata_get_memory'
+    }
+    young.byte_cost = Buffer.byteLength(
+      `[Young] ${young.id} | ${young.summary} | expand:${young.expand_tool}\n`
+    )
+    parent.working_set = {
+      version: 1,
+      project_id: createHash('sha256').update(root).digest('hex'),
+      namespace: 'gc-codex',
+      session_id: 'ses-codex-gc',
+      epoch: 0,
+      turn_seq: 0,
+      active_turn_id: null,
+      recent_event_ids: [],
+      max_frame_bytes: 4096,
+      max_idle_turns: 3,
+      used_frame_bytes: 0,
+      frame_fingerprint: '0'.repeat(64),
+      last_injected_fingerprint: '0'.repeat(64),
+      roots: [rootNode],
+      young_gen: [young],
+      evicted_stubs: [],
+      edges: [
+        {
+          from: 'file:src/a.ts',
+          to: 'mem:r1',
+          kind: 'GOVERNS',
+          weight_bps: 10000,
+          last_touched_turn: 0
+        }
+      ],
+      tool_output_stubs: [],
+      tool_output_digests: []
+    }
+    writeFileSync(path, JSON.stringify(parent))
+    const reply = runCodexReply(
+      {
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'ses-codex-gc',
+        prompt: 'inspect file:src/a.ts',
+        cwd: root
+      },
+      root
+    ).reply
+    assert.equal(reply.hookSpecificOutput.hookEventName, 'UserPromptSubmit')
+    assert.match(
+      reply.hookSpecificOutput.additionalContext,
+      /task:task-codex-gc/
+    )
+    assert.deepEqual(Object.keys(reply.hookSpecificOutput).sort(), [
+      'additionalContext',
+      'hookEventName'
+    ])
+    const persisted = JSON.parse(readFileSync(path, 'utf8')).working_set
+    assert.deepEqual(persisted.edges, parent.working_set.edges)
   } finally {
     resetModuleState()
     rmSync(root, { recursive: true, force: true })

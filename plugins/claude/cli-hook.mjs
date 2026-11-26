@@ -11,6 +11,7 @@ import plugin, {
   readHarnessConfig,
   resolveHookProjectDir,
   runWorkingSetContextCycle,
+  runWorkingSetPromptCycle,
   runWorkingSetToolCycle,
   runWorkingSetTurnBoundary,
   usableNamespace
@@ -205,6 +206,25 @@ async function main() {
       name,
       event.event_id ?? event.eventId ?? event.id
     )
+  } else if (name === 'UserPromptSubmit') {
+    const scope = workingSetScope(projectDir, event)
+    const output = { hookSpecificOutput: { hookEventName: name } }
+    if (scope) {
+      const prompt = asString(event.prompt) ?? ''
+      const cycle = await runWorkingSetPromptCycle({
+        scope,
+        promptText: prompt,
+        turnId: asString(event.turn_id ?? event.turnId),
+        eventId: canonicalEventId(
+          name,
+          event.event_id ?? event.eventId ?? event.id
+        )
+      })
+      if (cycle.changed && cycle.frame) {
+        output.hookSpecificOutput.additionalContext = [cycle.frame]
+      }
+    }
+    out = output
   } else if (name === 'PostToolUse') {
     out = await postToolUseReply(projectDir, event)
   } else if (name === 'Stop') {
