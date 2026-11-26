@@ -3816,8 +3816,14 @@ pub async fn handle_task_complete(
                 crate::tools::procedure::stamp_local_trust(&mut meta);
             }
             // An extraction is an insertion: it meets the same scanner.
+            // memory_type is persisted as the row's own field, outside the
+            // metadata, so it joins the scanned payload explicitly.
+            let mut scan_meta = meta.clone();
+            if let Some(obj) = scan_meta.as_object_mut() {
+                obj.insert("memory_type".to_string(), json!(memory_type));
+            }
             if let Some(rejection) =
-                crate::secrets::scan_entry_point(&content, &meta, "task_complete")
+                crate::secrets::scan_entry_point(&content, &scan_meta, "task_complete")
             {
                 return Err(rejection.to_string());
             }
@@ -12544,6 +12550,35 @@ exit 0
         .await
         .expect_err("a secret session_id must refuse before any write");
         assert_security_refusal(&err);
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
+    }
+
+    #[tokio::test]
+    async fn secret_in_task_complete_memory_type_is_refused() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+        let before = store.list("MyProj", None, None).await.unwrap().len();
+        let token = scanner_fixture();
+        let err = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "memory": { "content": "a clean lesson worth keeping", "memory_type": token },
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("a secret memory_type must refuse before the row is written");
+        assert_security_refusal(&err);
+        assert_eq!(
+            store.list("MyProj", None, None).await.unwrap().len(),
+            before,
+            "no extraction row is written"
+        );
         assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
     }
 
