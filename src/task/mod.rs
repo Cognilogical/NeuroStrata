@@ -3483,6 +3483,13 @@ pub async fn handle_task_complete(
             complete_scan.insert(key.to_string(), json!(value));
         }
     }
+    // The inline memory is judged here too, before the namespace precheck
+    // normalizes (and may rewrite) rows and before intent detection can
+    // quote an excerpt of it back: a secret in its content or metadata
+    // gets the sanitized security refusal, and normalization never runs.
+    if let Some(mem) = &memory {
+        complete_scan.insert("memory".to_string(), mem.clone());
+    }
     if let Some(rejection) =
         crate::secrets::scan_entry_point("", &Value::Object(complete_scan), "task_complete")
     {
@@ -12578,6 +12585,34 @@ exit 0
             store.list("MyProj", None, None).await.unwrap().len(),
             before,
             "no extraction row is written"
+        );
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
+    }
+
+    #[tokio::test]
+    async fn secret_after_intent_marker_in_memory_gets_security_refusal_not_excerpt() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+        let token = scanner_fixture();
+        let err = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "memory": { "content": format!("TODO: follow up with {token}") },
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("a secret in inline memory must refuse before intent detection");
+        assert_security_refusal(&err);
+        assert!(
+            !err.contains(&token),
+            "the refusal must not echo the secret: {}",
+            err
         );
         assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
     }
