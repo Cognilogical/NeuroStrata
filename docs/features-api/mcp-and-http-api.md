@@ -54,6 +54,8 @@ On the daemon side, a task's stamped `worktree` is compared with the caller's ro
 
 `neurostrata_guard_validate` unwraps a JSON shell payload via its `command`/`cmd` field when deciding whether a shell command is a read-only/verification exemption. The proxy caller's `cwd` (or `workdir`) is propagated into the guard request, with `worktree` defaulting to that `cwd`, so scope checks use the caller's real working tree rather than the daemon process directory. The `is_mutating` flag on the wire is client-supplied and untrusted; the daemon recomputes shell mutability from the raw payload and never trusts it.
 
+When a task is completed, or `neurostrata_task_update` moves it out of `in_progress`, its task fields are removed from each session file that still names it: the one in the worktree the claim recorded, the one at the root the call names, and the one at the namespace's registered project root. When no task is in progress, `neurostrata_get_snapshot` also removes `task_id`, `status`, `session_id` and `subagent_prompt_injection` from `.NeuroStrata/active_session.json`, so session start stops announcing a task once it is completed or released. Other keys (namespace, golden rules) stay.
+
 ## Code Intelligence & SCIP Call-Graph Tools
 
 - `neurostrata_Export_scip` — export SCIP code graph data.

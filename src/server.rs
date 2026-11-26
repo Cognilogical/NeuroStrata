@@ -6403,23 +6403,18 @@ async fn handle_get_snapshot(
                     == Some("in_progress")
         };
         let active_task = crate::task::active_task_for_root(&all_memories, root_str, is_active)
-            .map(|m| (m.id.as_str(), &m.payload));
-        // The block cached at claim time, without the rules retired since.
-        let fresh_task = match active_task {
-            Some((tid, payload)) => Some((
-                tid.to_string(),
-                crate::task::task_payload_without_retired_entries(&store, namespace, payload).await,
-            )),
-            None => None,
-        };
-        crate::task::persist_active_session_file(
+            .map(|m| m.id.clone());
+        // Serialized with claims and with the cleanup after a task ends; a
+        // task is named only if its row is still in progress at write time.
+        crate::task::refresh_active_session_file(
+            &store,
             std::path::Path::new(root_str),
             namespace,
             &golden_rules,
-            fresh_task
-                .as_ref()
-                .map(|(tid, payload)| (tid.as_str(), payload)),
-        );
+            None,
+            active_task.as_deref(),
+        )
+        .await;
     }
     // F10: detect conflicts AFTER active-row filtering (valid_to, archived,
     // mesh-conflicting, registry) so expired rows never participate.
@@ -23805,6 +23800,412 @@ mod tests {
                 Some("domain")
             );
         }
+    }
+
+    /// How the claimed task stops being in progress before the next snapshot.
+    enum TaskEnd {
+        Complete,
+        Release,
+        Block,
+    }
+
+    /// `.NeuroStrata/active_session.json` is what the session-start hook
+    /// injects. Once the task is finished (completed or released), the next
+    /// snapshot must drop the task fields, or every new session is told to
+    /// work on a task that is no longer in progress. The golden rules stay.
+    async fn session_file_after_task_ends(end: TaskEnd) {
+        use crate::traits::MemoryPayload;
+        let (store, _) = store_with_one_rule("probe").await;
+        store
+            .upsert(
+                "probe",
+                "pinned-session-rule",
+                StubEmbedder.embed("pinned session rule").await.unwrap(),
+                MemoryPayload {
+                    content: "Always run the tests before pushing.".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: serde_json::json!({ "pinned": true }),
+                },
+            )
+            .await
+            .expect("seed the pinned rule");
+
+        let proj_root = std::env::temp_dir().join(format!("ns-session-file-{}", uuid::Uuid::new_v4()));
+        // A `.NeuroStrata` folder marks a project; the session file is written only there.
+        std::fs::create_dir_all(proj_root.join(".NeuroStrata")).unwrap();
+        let session_file = proj_root.join(".NeuroStrata").join("active_session.json");
+        let read_session = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(&session_file).expect("session file"))
+                .expect("session file is json")
+        };
+        let snapshot_args = serde_json::json!({
+            "namespace": "probe",
+            "project_root": proj_root.to_string_lossy(),
+        });
+        // The claim writes the session file only when the namespace's
+        // registry row knows the project root, as it does in a real project.
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&emb), "probe", &proj_root.to_string_lossy())
+            .await;
+        handle_get_snapshot(snapshot_args.clone(), store.clone())
+            .await
+            .expect("snapshot");
+        assert!(read_session().get("task_id").is_none(), "no task yet");
+
+        let created = crate::task::handle_task_create(
+            serde_json::json!({ "namespace": "probe", "title": "the work" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let created: Value = serde_json::from_str(&created).expect("create replies with json");
+        let id = created["id"].as_str().expect("id").to_string();
+        let claimed = crate::task::handle_task_claim(
+            serde_json::json!({
+                "namespace": "probe",
+                "id": id,
+                "assignee": "agent-a",
+                "session_id": "ses_a"
+            }),
+            store.clone(),
+        )
+        .await;
+        assert!(claimed.contains("in_progress"), "claim failed: {}", claimed);
+        let during = read_session();
+        assert_eq!(during["task_id"], serde_json::json!(id), "the claim writes the task: {during}");
+        assert_eq!(during["status"], serde_json::json!("in_progress"), "{during}");
+
+        match end {
+            TaskEnd::Complete => {
+                let lesson = uuid::Uuid::new_v4().to_string();
+                store
+                    .upsert(
+                        "probe",
+                        &lesson,
+                        StubEmbedder.embed("a lesson").await.unwrap(),
+                        MemoryPayload {
+                            content: "a lesson".to_string(),
+                            user_id: "kenton".to_string(),
+                            memory_type: "fact".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata: serde_json::json!({}),
+                        },
+                    )
+                    .await
+                    .expect("seed the lesson");
+                let (bus, _seen) = recording_bus();
+                crate::task::handle_task_complete(
+                    serde_json::json!({ "namespace": "probe", "id": id, "link_memory_id": lesson }),
+                    Arc::new(StubEmbedder),
+                    store.clone(),
+                    None,
+                    bus,
+                )
+                .await
+                .expect("the task completes");
+            }
+            TaskEnd::Release => {
+                let released = crate::task::handle_task_update(
+                    serde_json::json!({
+                        "namespace": "probe",
+                        "id": id,
+                        "status": "open",
+                        "session_id": "ses_a",
+                        "note": "release"
+                    }),
+                    Arc::new(StubEmbedder),
+                    store.clone(),
+                )
+                .await;
+                assert!(released.contains("\"open\""), "release failed: {}", released);
+            }
+            TaskEnd::Block => {
+                let blocked = crate::task::handle_task_update(
+                    serde_json::json!({
+                        "namespace": "probe",
+                        "id": id,
+                        "status": "blocked",
+                        "session_id": "ses_a",
+                        "note": "waiting on review"
+                    }),
+                    Arc::new(StubEmbedder),
+                    store.clone(),
+                )
+                .await;
+                assert!(blocked.contains("\"blocked\""), "block failed: {}", blocked);
+            }
+        }
+        // Ending the task already clears it, before any snapshot runs: a
+        // session that ends right after would otherwise leave it for the next.
+        let ended = read_session();
+        for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+            assert!(ended.get(key).is_none(), "'{key}' cleared when the task ended: {ended}");
+        }
+
+        // A cleanup that never ran (the process stopped first) leaves the
+        // claim's fields behind; the snapshot must drop them on its own.
+        std::fs::write(&session_file, serde_json::to_string_pretty(&during).unwrap())
+            .expect("restore the stale session file");
+        handle_get_snapshot(snapshot_args, store.clone())
+            .await
+            .expect("snapshot");
+        let after = read_session();
+        for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+            assert!(
+                after.get(key).is_none(),
+                "no task is in progress, so the session file must not carry '{key}': {after}"
+            );
+        }
+        assert_eq!(after["namespace"], serde_json::json!("probe"), "{after}");
+        let golden = after["golden_rules"].as_array().expect("golden_rules array");
+        assert!(
+            golden
+                .iter()
+                .any(|g| g.as_str().unwrap_or("").contains("Always run the tests before pushing.")),
+            "the golden rules stay: {after}"
+        );
+        let _ = std::fs::remove_dir_all(&proj_root);
+    }
+
+    #[tokio::test]
+    async fn the_session_file_drops_a_completed_task() {
+        session_file_after_task_ends(TaskEnd::Complete).await;
+    }
+
+    #[tokio::test]
+    async fn the_session_file_drops_a_released_task() {
+        session_file_after_task_ends(TaskEnd::Release).await;
+    }
+
+    #[tokio::test]
+    async fn the_session_file_drops_a_blocked_task() {
+        session_file_after_task_ends(TaskEnd::Block).await;
+    }
+
+    /// A claim made from a linked worktree writes the session file there, not
+    /// at the registered root. Ending the task must clear that file, also
+    /// when the call that ends it does not name the worktree, and also after
+    /// a release has dropped the worktree mark from the task row.
+    #[tokio::test]
+    async fn ending_a_task_clears_the_session_file_in_its_worktree() {
+        let _env_guard = crate::daemon::project_root_env_test_lock();
+        for release in [false, true] {
+            let (store, _) = store_with_one_rule("probe").await;
+            let registered = tempfile::tempdir().unwrap();
+            let worktree = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(worktree.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+            crate::registry::cache_project_root(
+                &store,
+                Some(&emb),
+                "probe",
+                &registered.path().to_string_lossy(),
+            )
+            .await;
+            let created = crate::task::handle_task_create(
+                serde_json::json!({ "namespace": "probe", "title": "the work" }),
+                Arc::new(StubEmbedder),
+                store.clone(),
+            )
+            .await;
+            let created: Value = serde_json::from_str(&created).expect("json");
+            let id = created["id"].as_str().expect("id").to_string();
+            let claimed = crate::task::handle_task_claim(
+                serde_json::json!({
+                    "namespace": "probe",
+                    "id": id,
+                    "assignee": "agent-a",
+                    "session_id": "ses_a",
+                    "worktree": worktree.path().to_string_lossy(),
+                }),
+                store.clone(),
+            )
+            .await;
+            assert!(claimed.contains("in_progress"), "claim failed: {claimed}");
+            let (_, row) = store.get("probe", &id).await.unwrap().unwrap();
+            let recorded = row.metadata["task"]["worktree"]
+                .as_str()
+                .expect("the claim records its worktree")
+                .to_string();
+            let session_file = std::path::Path::new(&recorded)
+                .join(".NeuroStrata")
+                .join("active_session.json");
+            let read = || -> Value {
+                serde_json::from_str(&std::fs::read_to_string(&session_file).expect("session file"))
+                    .expect("json")
+            };
+            assert_eq!(read()["task_id"], serde_json::json!(id), "{}", read());
+
+            if release {
+                let released = crate::task::handle_task_update(
+                    serde_json::json!({
+                        "namespace": "probe",
+                        "id": id,
+                        "status": "open",
+                        "session_id": "ses_a",
+                    }),
+                    Arc::new(StubEmbedder),
+                    store.clone(),
+                )
+                .await;
+                assert!(released.contains("\"open\""), "release failed: {released}");
+            } else {
+                let lesson = uuid::Uuid::new_v4().to_string();
+                store
+                    .upsert(
+                        "probe",
+                        &lesson,
+                        StubEmbedder.embed("a lesson").await.unwrap(),
+                        crate::traits::MemoryPayload {
+                            content: "a lesson".to_string(),
+                            user_id: "kenton".to_string(),
+                            memory_type: "fact".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata: serde_json::json!({}),
+                        },
+                    )
+                    .await
+                    .expect("seed the lesson");
+                let (bus, _seen) = recording_bus();
+                crate::task::handle_task_complete(
+                    serde_json::json!({ "namespace": "probe", "id": id, "link_memory_id": lesson }),
+                    Arc::new(StubEmbedder),
+                    store.clone(),
+                    None,
+                    bus,
+                )
+                .await
+                .expect("the task completes");
+            }
+            let after = read();
+            for key in ["task_id", "status", "session_id", "subagent_prompt_injection"] {
+                assert!(
+                    after.get(key).is_none(),
+                    "release={release}: the worktree's session file still has '{key}': {after}"
+                );
+            }
+        }
+    }
+
+    /// The cleanup after a release can run late, after another session has
+    /// claimed the same task again. It must leave that new claim in the
+    /// session file, and so must a snapshot that listed the tasks before the
+    /// claim landed.
+    #[tokio::test]
+    async fn a_late_cleanup_keeps_a_new_claim_of_the_same_task() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let proj_root = std::env::temp_dir().join(format!("ns-session-reclaim-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(proj_root.join(".NeuroStrata")).unwrap();
+        let session_file = proj_root.join(".NeuroStrata").join("active_session.json");
+        let read_session = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(&session_file).expect("session file"))
+                .expect("session file is json")
+        };
+        let emb: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+        crate::registry::cache_project_root(&store, Some(&emb), "probe", &proj_root.to_string_lossy())
+            .await;
+        let created = crate::task::handle_task_create(
+            serde_json::json!({ "namespace": "probe", "title": "the work" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let created: Value = serde_json::from_str(&created).expect("create replies with json");
+        let id = created["id"].as_str().expect("id").to_string();
+        let claim = |session: &'static str| {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                crate::task::handle_task_claim(
+                    serde_json::json!({
+                        "namespace": "probe", "id": id, "assignee": session, "session_id": session
+                    }),
+                    store,
+                )
+                .await
+            }
+        };
+        assert!(claim("ses_a").await.contains("in_progress"));
+        let released = crate::task::handle_task_update(
+            serde_json::json!({ "namespace": "probe", "id": id, "status": "open", "session_id": "ses_a" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        assert!(released.contains("\"open\""), "release failed: {}", released);
+        assert!(claim("ses_b").await.contains("in_progress"));
+        assert_eq!(read_session()["session_id"], serde_json::json!("ses_b"));
+
+        // The release's cleanup, arriving after the new claim.
+        crate::task::clear_finished_task_from_session_file(&store, "probe", &id, &[]).await;
+        let after = read_session();
+        assert_eq!(after["task_id"], serde_json::json!(id), "the new claim stays: {after}");
+        assert_eq!(after["session_id"], serde_json::json!("ses_b"), "{after}");
+
+        // A snapshot that saw no task in progress before the claim landed.
+        crate::task::refresh_active_session_file(&store, &proj_root, "probe", &[], None, None).await;
+        let after = read_session();
+        assert_eq!(after["task_id"], serde_json::json!(id), "the snapshot keeps it too: {after}");
+        assert_eq!(after["status"], serde_json::json!("in_progress"), "{after}");
+        let _ = std::fs::remove_dir_all(&proj_root);
+    }
+
+    /// A task another session has taken over no longer belongs in the old
+    /// worktree's session file: neither the cleanup nor a snapshot there
+    /// keeps it, though the row is still in progress.
+    #[tokio::test]
+    async fn a_task_taken_over_by_another_session_leaves_the_old_session_file() {
+        let (store, _) = store_with_one_rule("probe").await;
+        let created = crate::task::handle_task_create(
+            serde_json::json!({ "namespace": "probe", "title": "the work" }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+        )
+        .await;
+        let created: Value = serde_json::from_str(&created).expect("create replies with json");
+        let id = created["id"].as_str().expect("id").to_string();
+        let claimed = crate::task::handle_task_claim(
+            serde_json::json!({
+                "namespace": "probe", "id": id, "assignee": "ses_b", "session_id": "ses_b"
+            }),
+            store.clone(),
+        )
+        .await;
+        assert!(claimed.contains("in_progress"), "claim failed: {claimed}");
+
+        // The old worktree's file still names the task under its old session.
+        let old_root = std::env::temp_dir().join(format!("ns-session-takeover-{}", uuid::Uuid::new_v4()));
+        let session_file = old_root.join(".NeuroStrata").join("active_session.json");
+        std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        let stale = serde_json::json!({
+            "namespace": "probe", "task_id": id, "status": "in_progress", "session_id": "ses_a"
+        });
+        let read_session = || -> Value {
+            serde_json::from_str(&std::fs::read_to_string(&session_file).expect("session file"))
+                .expect("session file is json")
+        };
+
+        std::fs::write(&session_file, stale.to_string()).unwrap();
+        crate::task::clear_finished_task_from_session_file(&store, "probe", &id, &[old_root.clone()]).await;
+        assert!(read_session().get("task_id").is_none(), "cleanup: {}", read_session());
+
+        std::fs::write(&session_file, stale.to_string()).unwrap();
+        crate::task::refresh_active_session_file(&store, &old_root, "probe", &[], None, None).await;
+        assert!(read_session().get("task_id").is_none(), "snapshot: {}", read_session());
+        let _ = std::fs::remove_dir_all(&old_root);
     }
 
     /// The printed path carries the graph's own direction. The store's

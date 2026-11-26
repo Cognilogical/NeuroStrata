@@ -965,11 +965,19 @@ fn persist_active_session_file_with_home(
             active.insert("subagent_prompt_injection".to_string(), json!(inj));
         }
         active.insert("updated_at".to_string(), json!(machine::timestamp()));
+    } else {
+        // No task is in progress: drop the fields a finished (completed or
+        // released) task left behind, or the session-start hook keeps
+        // announcing it as the active task.
+        for key in ["task_id", "active_task_id", "status", "session_id", "subagent_prompt_injection"] {
+            active.remove(key);
+        }
+        active.insert("updated_at".to_string(), json!(machine::timestamp()));
     }
 
     if std::fs::create_dir_all(&ns_dir).is_ok() {
         if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
-            let _ = std::fs::write(&session_path, serialized);
+            let _ = harness_plugins::write_atomically(&session_path, &serialized);
         }
     }
 }
@@ -1092,6 +1100,215 @@ fn seed_expand_next_hops(namespace: &str, seeds: &[String], edges: &[Value]) -> 
         }
     }
     actions
+}
+
+/// Serializes every read-modify-write of `.NeuroStrata/active_session.json`
+/// (claim, snapshot, and the cleanup after a task ends), so a cleanup cannot
+/// clear the fields a concurrent claim has just written. One daemon process
+/// runs all of them (see [`claim_lock`]), so a process lock covers it.
+static SESSION_FILE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// The task id the session file at `project_root` currently names, if any,
+/// and the session id written with it.
+fn session_file_task_id(project_root: &std::path::Path) -> Option<(String, Option<String>)> {
+    let text = std::fs::read_to_string(project_root.join(".NeuroStrata").join("active_session.json")).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    let task_id = value.get("task_id").and_then(|v| v.as_str())?.to_string();
+    Some((task_id, value.get("session_id").and_then(|v| v.as_str()).map(String::from)))
+}
+
+/// Whether a session file's claim is still the task row's claim: the same
+/// session holds it. A task another session has taken over (from another
+/// worktree) no longer belongs in this file. The claim's recorded worktree is
+/// not compared: a claim in a folder that is not a git checkout records the
+/// daemon's checkout while its session file is in the project folder.
+fn file_names_current_claim(file_session: Option<&str>, task: &Task) -> bool {
+    file_session == task.task_field("session_id").and_then(|v| v.as_str())
+}
+
+/// The row of task `id` read fresh: `Ok(Some)` when it is in progress and a
+/// snapshot would show it (not archived, expired or mesh-conflicting),
+/// `Ok(None)` when it is not, `Err` when the store could not be read. A read
+/// error is never taken as "finished".
+async fn in_progress_task(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    id: &str,
+) -> Result<Option<Task>, ()> {
+    let payload = match store.get(namespace, id).await {
+        Ok(Some((_, payload))) => payload,
+        Ok(None) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let now = chrono::Utc::now().timestamp();
+    let expired = payload
+        .metadata
+        .get("valid_to")
+        .is_some_and(|v| !v.is_null() && v.as_i64().unwrap_or(0) <= now);
+    let task = Task { id: id.to_string(), payload };
+    let shown = task.payload.memory_type == "task"
+        && task.status() == Status::InProgress
+        && !expired
+        && !crate::handlers::archive_memory::is_archived(&task.payload)
+        && !crate::synaptic_mesh::conflict::is_conflicting(&task.payload);
+    Ok(shown.then_some(task))
+}
+
+/// [`persist_active_session_file`] under [`SESSION_FILE_LOCK`]. `claimed` is
+/// the row a claim has just saved, written as is. Otherwise a task is named
+/// only when its row is in progress at write time and its claim is in this
+/// worktree: the task the file already names (a claim that may have landed
+/// after the snapshot listed the tasks), else `candidate` (the task the
+/// snapshot found), else none. If a row cannot be read, the file is left as
+/// it is.
+pub(crate) async fn refresh_active_session_file(
+    store: &Arc<dyn VectorStore>,
+    project_root: &std::path::Path,
+    namespace: &str,
+    golden_rules: &[SearchResult],
+    claimed: Option<(&str, &MemoryPayload)>,
+    candidate: Option<&str>,
+) {
+    let _session_guard = SESSION_FILE_LOCK.lock().await;
+    if let Some(claimed) = claimed {
+        persist_active_session_file(project_root, namespace, golden_rules, Some(claimed));
+        return;
+    }
+    let mut active: Option<Task> = None;
+    // The task the file names counts only while the session that wrote it
+    // still holds the claim. The snapshot's candidate counts only while its
+    // claim is still in this worktree: another worktree may have taken it over
+    // between the snapshot's listing and this lock.
+    let root = project_root.to_string_lossy();
+    let claimed_here = |task: &Task| {
+        task.task_field("worktree")
+            .and_then(|v| v.as_str())
+            .is_some_and(|w| !w.is_empty() && crate::paths::same_location(w, &root))
+    };
+    let named = session_file_task_id(project_root);
+    // The file's own task comes first: a claim in this worktree that landed
+    // after the snapshot listed the tasks is newer than the snapshot's pick.
+    let candidates = named
+        .map(|(id, session)| (id, Some(session)))
+        .into_iter()
+        .chain(candidate.map(|id| (id.to_string(), None)));
+    for (id, file_session) in candidates {
+        match in_progress_task(store, namespace, &id).await {
+            Ok(Some(task))
+                if match file_session.as_ref() {
+                    Some(session) => file_names_current_claim(session.as_deref(), &task),
+                    None => claimed_here(&task),
+                } =>
+            {
+                active = Some(task);
+                break;
+            }
+            Ok(_) => {}
+            Err(()) => return,
+        }
+    }
+    // The block cached at claim time, without the rules retired since.
+    let fresh = match &active {
+        Some(task) => Some((
+            task.id.as_str(),
+            task_payload_without_retired_entries(store, namespace, &task.payload).await,
+        )),
+        None => None,
+    };
+    persist_active_session_file(
+        project_root,
+        namespace,
+        golden_rules,
+        fresh.as_ref().map(|(id, payload)| (*id, payload)),
+    );
+}
+
+/// When task `task_id` stops being in progress (completed, released, blocked),
+/// remove its fields from each session file `task_claim` may have written:
+/// the worktree the claim recorded, the caller's own root (see
+/// [`caller_session_root`]), and the namespace's registered project root. So
+/// the next session start does not announce a finished task. Only a file that still names this task is
+/// touched: another task claimed since keeps its fields, and so does this
+/// task when the same session has claimed it again meanwhile (its row is
+/// read again under the session file lock). Best effort.
+pub(crate) async fn clear_finished_task_from_session_file(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    task_id: &str,
+    roots: &[std::path::PathBuf],
+) {
+    let rid = crate::registry::registry_row_id(namespace);
+    let registry_root = match store.get(namespace, &rid).await {
+        Ok(Some((_, registry))) => registry
+            .metadata
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from),
+        _ => None,
+    };
+    let mut seen = HashSet::new();
+    let roots: Vec<&std::path::PathBuf> = roots
+        .iter()
+        .chain(registry_root.as_ref())
+        .filter(|root| seen.insert(root.join(".NeuroStrata")))
+        .collect();
+    let _session_guard = SESSION_FILE_LOCK.lock().await;
+    let mut row: Option<Result<Option<Task>, ()>> = None;
+    for root in roots {
+        let session_path = root.join(".NeuroStrata").join("active_session.json");
+        let Some(mut active) = std::fs::read_to_string(&session_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.as_object().cloned())
+        else {
+            continue;
+        };
+        if active.get("task_id").and_then(|v| v.as_str()) != Some(task_id) {
+            continue;
+        }
+        // Read the row once, under the lock: the same session may have
+        // claimed this task again meanwhile, or the read may fail. A file
+        // whose claim another session has since taken over is cleared.
+        if row.is_none() {
+            row = Some(in_progress_task(store, namespace, task_id).await);
+        }
+        let file_session = active.get("session_id").and_then(|v| v.as_str());
+        match row.as_ref() {
+            Some(Err(())) => return,
+            Some(Ok(Some(task))) if file_names_current_claim(file_session, task) => continue,
+            _ => {}
+        }
+        for key in ["task_id", "active_task_id", "status", "session_id", "subagent_prompt_injection"] {
+            active.remove(key);
+        }
+        active.insert("updated_at".to_string(), json!(machine::timestamp()));
+        if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
+            let _ = harness_plugins::write_atomically(&session_path, &serialized);
+        }
+    }
+}
+
+/// The session-file roots a task finishing now may have been written to:
+/// the worktree its claim recorded, and the root the caller names.
+fn session_file_roots_for(args: &Value, task: &Task) -> Vec<std::path::PathBuf> {
+    let recorded = task
+        .task_field("worktree")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from);
+    recorded.into_iter().chain(caller_session_root(args)).collect()
+}
+
+/// The root `task_claim` writes the session file into for a caller that names
+/// `worktree`, `project_root` or `cwd`: the enclosing worktree, else the
+/// nearest folder with `.git` or `.NeuroStrata`.
+fn caller_session_root(args: &Value) -> Option<std::path::PathBuf> {
+    let explicit = arg_str(args, "worktree")
+        .or_else(|| arg_str(args, "project_root"))
+        .or_else(|| arg_str(args, "cwd"))?;
+    Some(resolve_session_root_dir(std::path::Path::new(explicit)))
 }
 
 /// Auto-retrieve relevant governing rules, memories, code symbols, and 1-hop
@@ -2631,6 +2848,9 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             );
         }
     }
+    // The worktree a stale holder claimed in; its session file still names
+    // the task under the old session until it is cleared after this claim.
+    let mut taken_over_worktree: Option<std::path::PathBuf> = None;
     match evaluate_claim_decision(k_status, same_session, age, gate::STALE_AFTER_SECS) {
         KernelClaimDecision::IdempotentSameSession => {
             // Legacy rows written before attribution existed keep the holder
@@ -2714,6 +2934,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
                 Ok(released) => task = released,
                 Err(e) => return format!("ERROR: {}", e),
             }
+            taken_over_worktree = task
+                .task_field("worktree")
+                .and_then(|v| v.as_str())
+                .filter(|w| !w.trim().is_empty())
+                .map(std::path::PathBuf::from);
             {
                 let obj = task_obj_mut(&mut task.payload);
                 obj.remove("assignee");
@@ -2808,7 +3033,20 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     let hint_root = explicit_root.clone().or_else(|| session_root.clone());
     if let Some(root) = session_root {
         let golden = collect_golden_rules(&store, &namespace, None).await;
-        persist_active_session_file(&root, &namespace, &golden, Some((&id, &task.payload)));
+        refresh_active_session_file(
+            &store,
+            &root,
+            &namespace,
+            &golden,
+            Some((&id, &task.payload)),
+            None,
+        )
+        .await;
+    }
+    // After the new claim is written: a file there that names this task under
+    // the new session is kept.
+    if let Some(old) = taken_over_worktree {
+        clear_finished_task_from_session_file(&store, &namespace, &id, &[old]).await;
     }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("claim-{}", id))
@@ -2940,6 +3178,8 @@ pub async fn handle_task_update(
         .task_field("history")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
+    // Before an unclaim drops the worktree mark the claim recorded.
+    let session_roots = session_file_roots_for(&args, &task);
 
     // A rename is history, not a transition: without a caller's note the
     // history entry says what the title became, so Working Memory keeps the
@@ -3101,6 +3341,9 @@ pub async fn handle_task_update(
 
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
+    }
+    if from == Status::InProgress && task.status() != Status::InProgress {
+        clear_finished_task_from_session_file(&store, &namespace, &id, &session_roots).await;
     }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("update-{}", id))
@@ -3802,6 +4045,8 @@ pub async fn handle_task_complete(
         }
     }
     save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
+    let session_roots = session_file_roots_for(&args, &task);
+    clear_finished_task_from_session_file(&store, &namespace, &id, &session_roots).await;
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("complete-{}", id))
         .to_string();
@@ -11069,6 +11314,84 @@ exit 0
             "{reprioritized}"
         );
         assert_eq!(reprioritized["task"]["history_count"], json!(3));
+    }
+
+    /// A takeover clears the old holder's session file, so a session started
+    /// there before its first snapshot is not told to work on the task.
+    #[tokio::test]
+    async fn a_takeover_clears_the_old_holders_session_file() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let git_dir = || {
+            let dir = tempfile::tempdir().unwrap();
+            let init = std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg(dir.path())
+                .status()
+                .unwrap();
+            assert!(init.success());
+            dir
+        };
+        let (old, new) = (git_dir(), git_dir());
+        let session = |dir: &tempfile::TempDir| -> serde_json::Value {
+            let path = dir.path().join(".NeuroStrata").join("active_session.json");
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let claim = |session_id: &str, dir: &tempfile::TempDir| {
+            handle_task_claim(
+                json!({
+                    "namespace": "MyProj", "id": id, "assignee": session_id,
+                    "session_id": session_id, "worktree": dir.path().to_string_lossy()
+                }),
+                store.clone(),
+            )
+        };
+        claim("ses_a", &old).await;
+        assert_eq!(session(&old)["task_id"], json!(id), "{}", session(&old));
+
+        // Age the claim past the staleness window.
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["task"]["updated_at"] = json!("2020-01-01T00:00:00Z");
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+
+        let takeover = claim("ses_b", &new).await;
+        assert!(takeover.contains("in_progress"), "{}", takeover);
+        assert_eq!(session(&new)["session_id"], json!("ses_b"), "{}", session(&new));
+        let old_file = session(&old);
+        assert!(old_file.get("task_id").is_none(), "{}", old_file);
+        assert_eq!(old_file["namespace"], json!("MyProj"), "{}", old_file);
+
+        // A snapshot in the old worktree that listed the task before the
+        // takeover does not write it back: under the lock, its claim is now in
+        // the other worktree.
+        refresh_active_session_file(&store, old.path(), "MyProj", &[], None, Some(&id)).await;
+        let old_file = session(&old);
+        assert!(old_file.get("task_id").is_none(), "{}", old_file);
+        // In its own worktree the same candidate is still written.
+        refresh_active_session_file(&store, new.path(), "MyProj", &[], None, Some(&id)).await;
+        assert_eq!(session(&new)["task_id"], json!(id), "{}", session(&new));
+    }
+
+    /// Cleanup also drops the legacy `active_task_id` key, which the plugin
+    /// still reads as the active task.
+    #[tokio::test]
+    async fn session_file_cleanup_drops_the_legacy_active_task_id() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".NeuroStrata").join("active_session.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            json!({ "namespace": "MyProj", "task_id": id, "active_task_id": id }).to_string(),
+        )
+        .unwrap();
+        // The task is open, not in progress: the file's claim is stale.
+        clear_finished_task_from_session_file(&store, "MyProj", &id, &[dir.path().to_path_buf()])
+            .await;
+        let file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(file.get("task_id").is_none() && file.get("active_task_id").is_none(), "{file}");
     }
 
     #[tokio::test]
