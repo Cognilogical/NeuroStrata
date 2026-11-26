@@ -572,26 +572,75 @@ fn with_rollback_failures(error: String, failed: &[String]) -> String {
     }
 }
 
-/// Undoes a completion's extraction write after a later step failed:
-/// deletes a row the inline path created, restores a linked row's
-/// before-image. Best-effort, like the follow-up rollback it accompanies.
+/// Removes `parent_id` from a row's `extracted_from` edge list, in place.
+/// Returns true when other tasks' edges remain on the row.
+fn remove_extraction_edge(payload: &mut MemoryPayload, parent_id: &str) -> bool {
+    let Some(arr) = payload
+        .metadata
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut("extracted_from"))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    arr.retain(|v| v.as_str() != Some(parent_id));
+    !arr.is_empty()
+}
+
+/// Undoes a completion's extraction write after a later step failed,
+/// removing only this task's contribution: another task may have linked
+/// the same lesson and completed against it in the meantime, and its
+/// edge must survive this rollback. A row nobody else references is
+/// deleted (inline creation) or simply loses this task's edge (linked
+/// row). Best-effort, like the follow-up rollback it accompanies.
 async fn rollback_completion_extraction(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
+    parent_id: &str,
     linked_before: &Option<(String, Vec<f32>, MemoryPayload)>,
     inline_created: &Option<String>,
 ) {
     if let Some(created_id) = inline_created {
-        if let Err(e) = store.delete(namespace, created_id).await {
-            tracing::warn!("failed to roll back extraction {}: {}", created_id, e);
+        match store.get(namespace, created_id).await {
+            Ok(Some((vector, mut payload))) => {
+                if remove_extraction_edge(&mut payload, parent_id) {
+                    if let Err(e) = store.upsert(namespace, created_id, vector, payload).await {
+                        tracing::warn!(
+                            "failed to unlink rolled-back extraction {}: {}",
+                            created_id,
+                            e
+                        );
+                    }
+                } else if let Err(e) = store.delete(namespace, created_id).await {
+                    tracing::warn!("failed to roll back extraction {}: {}", created_id, e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "failed to read extraction {} for rollback: {}",
+                    created_id,
+                    e
+                )
+            }
         }
     }
-    if let Some((link_id, vector, payload)) = linked_before {
-        if let Err(e) = store
-            .upsert(namespace, link_id, vector.clone(), payload.clone())
-            .await
-        {
-            tracing::warn!("failed to restore linked memory {}: {}", link_id, e);
+    if let Some((link_id, _vector, _before)) = linked_before {
+        match store.get(namespace, link_id).await {
+            Ok(Some((vector, mut payload))) => {
+                remove_extraction_edge(&mut payload, parent_id);
+                if let Err(e) = store.upsert(namespace, link_id, vector, payload).await {
+                    tracing::warn!("failed to unlink linked memory {}: {}", link_id, e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "failed to read linked memory {} for rollback: {}",
+                    link_id,
+                    e
+                )
+            }
         }
     }
 }
@@ -4106,8 +4155,14 @@ pub async fn handle_task_complete(
             Err(e) => {
                 let failed =
                     rollback_follow_up_tasks(&store, &namespace, &follow_up_created_ids).await;
-                rollback_completion_extraction(&store, &namespace, &linked_before, &inline_created)
-                    .await;
+                rollback_completion_extraction(
+                    &store,
+                    &namespace,
+                    &id,
+                    &linked_before,
+                    &inline_created,
+                )
+                .await;
                 return Err(with_rollback_failures(e, &failed));
             }
         }
@@ -4115,7 +4170,8 @@ pub async fn handle_task_complete(
 
     if let Err(e) = save_task(&store, &namespace, &id, vector, completed.payload.clone()).await {
         let failed = rollback_follow_up_tasks(&store, &namespace, &follow_up_created_ids).await;
-        rollback_completion_extraction(&store, &namespace, &linked_before, &inline_created).await;
+        rollback_completion_extraction(&store, &namespace, &id, &linked_before, &inline_created)
+            .await;
         return Err(with_rollback_failures(e, &failed));
     }
     // Emit site 3 (see the note above the gate): only now, with the parent
