@@ -3117,6 +3117,12 @@ pub async fn handle_task_update(
         }
     }
 
+    // Same per-task serialization as claim and complete: the load ->
+    // mutate -> save sequence must not interleave with another mutation
+    // of this task and save a stale payload over it.
+    let update_lock = claim_lock(&id);
+    let _update_guard = update_lock.lock().await;
+
     let (mut task, mut vector) = match load_task(&store, &namespace, &id).await {
         Ok(found) => found,
         Err(e) => return e,
@@ -3569,6 +3575,14 @@ pub async fn handle_task_complete(
     {
         return Err(rejection.to_string());
     }
+
+    // Serialize the whole load -> extract -> follow-ups -> save sequence
+    // per task, on the same per-task lock claim and update hold: two
+    // concurrent completions can no longer both pass the done check and
+    // duplicate the follow-ups, and a completion cannot save a stale
+    // payload over a concurrent mutation.
+    let complete_lock = claim_lock(&id);
+    let _complete_guard = complete_lock.lock().await;
 
     precheck::normalize_and_precheck_namespace(&*store, &namespace).await?;
 
@@ -4179,6 +4193,10 @@ pub async fn handle_task_complete(
             })
         })
         .collect();
+
+    // The completion is committed; release the per-task lock before the
+    // post-commit hook so nothing it does can queue behind this call.
+    drop(_complete_guard);
 
     // Capability E: post-commit learning hook. Best-effort by design — a
     // mining/reflection failure is reported and logged, never allowed to roll
