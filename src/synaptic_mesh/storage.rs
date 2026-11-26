@@ -442,6 +442,16 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
 
     let mut child_stdout = child.stdout.take().expect("stdout is piped");
     let mut child_stderr = child.stderr.take().expect("stderr is piped");
+    // Nonblocking pipes + a cancel flag bound the reader threads' lifetime:
+    // a blocking read_to_end cannot be interrupted when a descendant holds
+    // the pipe open, so without this the drain grace expiring would leave
+    // both readers (and their descriptors) behind forever.
+    #[cfg(unix)]
+    {
+        set_nonblocking(&child_stdout);
+        set_nonblocking(&child_stderr);
+    }
+    let reader_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
@@ -450,11 +460,19 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
     // panic past the child — the already-spawned git is killed and reaped
     // (bounded) before the error returns, never left running unowned.
     let stdout_sink = std::sync::Arc::clone(&stdout_buf);
+    let stdout_cancel = std::sync::Arc::clone(&reader_cancel);
     if let Err(error) = std::thread::Builder::new().spawn(move || {
         let mut chunk = [0u8; 16 * 1024];
         loop {
+            if stdout_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             match child_stdout.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(GIT_POLL_INTERVAL)
+                }
+                Err(_) => break,
                 Ok(read) => stdout_sink
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -469,11 +487,19 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
             .with_context(|| format!("git {display} could not start its stdout reader"));
     }
     let stderr_sink = std::sync::Arc::clone(&stderr_buf);
+    let stderr_cancel = std::sync::Arc::clone(&reader_cancel);
     if let Err(error) = std::thread::Builder::new().spawn(move || {
         let mut chunk = [0u8; 16 * 1024];
         loop {
+            if stderr_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             match child_stderr.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(GIT_POLL_INTERVAL)
+                }
+                Err(_) => break,
                 Ok(read) => stderr_sink
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -482,6 +508,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
         }
         let _ = stderr_tx.send(());
     }) {
+        reader_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         kill_child(&mut child);
         reap_within(&mut child, GIT_DRAIN_GRACE);
         return Err(error)
@@ -503,7 +530,13 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
                 // Detach rather than block forever on a pipe a grandchild may
                 // still hold: the drain threads exit on their own once the
                 // last writer closes.
-                drain_within(&stdout_rx, &stderr_rx, &stdout_buf, &stderr_buf);
+                drain_within(
+                    &stdout_rx,
+                    &stderr_rx,
+                    &stdout_buf,
+                    &stderr_buf,
+                    &reader_cancel,
+                );
                 bail!(
                     "git {display} timed out after {}s: process killed (mesh git timeout; override with NEUROSTRATA_GIT_TIMEOUT_SECS)",
                     timeout.as_secs()
@@ -512,7 +545,13 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
             Err(error) => {
                 kill_child(&mut child);
                 reap_within(&mut child, GIT_DRAIN_GRACE);
-                drain_within(&stdout_rx, &stderr_rx, &stdout_buf, &stderr_buf);
+                drain_within(
+                    &stdout_rx,
+                    &stderr_rx,
+                    &stdout_buf,
+                    &stderr_buf,
+                    &reader_cancel,
+                );
                 return Err(error).with_context(|| format!("git {display} could not be waited on"));
             }
         }
@@ -522,12 +561,32 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
     // still hold the inherited pipes. Drain bounded (never a bare recv()) so a
     // normal exit cannot hang, while a closed pipe still yields the full
     // captured bytes.
-    let (stdout, stderr) = drain_within(&stdout_rx, &stderr_rx, &stdout_buf, &stderr_buf);
+    let (stdout, stderr) = drain_within(
+        &stdout_rx,
+        &stderr_rx,
+        &stdout_buf,
+        &stderr_buf,
+        &reader_cancel,
+    );
     Ok(Output {
         status,
         stdout,
         stderr,
     })
+}
+
+/// Put a pipe read-end into nonblocking mode so its reader thread can poll
+/// the cancel flag between reads instead of parking in `read` forever.
+#[cfg(unix)]
+fn set_nonblocking<Fd: std::os::fd::AsRawFd>(fd: &Fd) {
+    // SAFETY: fcntl on a descriptor this call owns; failure leaves the
+    // descriptor blocking, which degrades to the pre-fix drain behaviour.
+    unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
 }
 
 /// Terminate the child and, on unix, its whole process group: git's
@@ -576,12 +635,17 @@ fn drain_within(
     stderr_rx: &std::sync::mpsc::Receiver<()>,
     stdout_buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     stderr_buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    reader_cancel: &std::sync::atomic::AtomicBool,
 ) -> (Vec<u8>, Vec<u8>) {
     // Wait for EOF only within the grace, but never discard bytes already
     // read: a grandchild can hold the pipe open after the direct child has
     // written the output we need.
     let _ = stdout_rx.recv_timeout(GIT_DRAIN_GRACE);
     let _ = stderr_rx.recv_timeout(GIT_DRAIN_GRACE);
+    // The drain budget is spent: cancel any reader still blocked on a pipe a
+    // descendant holds open, so the threads exit and release their
+    // descriptors instead of accumulating across mesh attempts.
+    reader_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     let stdout = stdout_buf
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1361,6 +1425,50 @@ mod tests {
             "grandchild-payload",
             "output written before the grandchild held the pipe must survive the bounded drain"
         );
+    }
+
+    /// When the drain grace expires, the reader threads must be cancelled,
+    /// not left blocked on pipes a grandchild still holds: repeated bounded
+    /// calls must not accumulate open descriptors.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn git_drain_cancels_reader_threads_when_grace_expires() {
+        use super::git_test_support::{EnvRestore, GitShim};
+        use std::time::{Duration, Instant};
+
+        fn open_fds() -> usize {
+            std::fs::read_dir("/proc/self/fd").unwrap().count()
+        }
+
+        let _env = crate::daemon::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = scratch("git-drain-cancel");
+        let pid_file = root.join("git.pid");
+        let shim = GitShim::install("grandchild", &pid_file);
+        let _path = shim.activate();
+        let _timeout = EnvRestore::set("NEUROSTRATA_GIT_TIMEOUT_SECS", "30");
+        std::fs::write(root.join(".grandchild-git"), b"").unwrap();
+
+        let baseline = open_fds();
+        for _ in 0..3 {
+            let out = run(&root, &["log", "--oneline"]).expect("bounded run must succeed");
+            assert!(out.status.success());
+        }
+        // Cancelled readers exit promptly; leaked readers would hold two
+        // descriptors per run for the grandchild's whole 30s life.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let leaked = open_fds().saturating_sub(baseline);
+            if leaked <= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "reader threads leaked {leaked} descriptors after the drain grace expired"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]
