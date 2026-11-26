@@ -114,6 +114,13 @@ lets the web UI and the plugin SDK disagree about the compiler. TypeScript 7.1
 is the target because it is the first 7.x line the toolchain will adopt; 7.0 is
 deliberately skipped rather than tracked as an intermediate step.
 
+**Current blocker status:** adopting TypeScript 7 is blocked today. The
+unblock trigger below is not met: it requires TypeScript 7.1 to be released
+and the pinned `typescript-eslint`/`vite`/plugin build toolchain to support
+it, and this record does not record either condition as satisfied. Until both
+hold, there is no supported path to 7.x and all eight manifests stay on
+`~6.0.3`.
+
 **Unblock trigger (all must hold):**
 
 1. TypeScript 7.1 is released and the pinned `typescript-eslint`/`vite`/plugin
