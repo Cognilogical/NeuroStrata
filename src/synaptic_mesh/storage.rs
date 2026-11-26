@@ -7,7 +7,10 @@
 //! content-addressable tree *is* the snapshot, `git log` *is* the event log,
 //! and per-record files keep concurrent writers conflict-free.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use uuid::Uuid;
@@ -378,18 +381,112 @@ fn write_manifest(root: &Path, manifest: &MeshManifest) -> Result<()> {
     Ok(())
 }
 
+/// Default bound, in seconds, for one mesh git subprocess.
+pub(crate) const GIT_COMMAND_TIMEOUT_SECS: u64 = 30;
+
+/// How often the bounded wait polls the child for exit.
+const GIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// After killing a timed-out child, how long the drain threads are given to
+/// reach EOF. A grandchild that inherited the pipes (a remote helper, an ssh
+/// transport) can outlive the killed parent; the bound must not depend on it.
+const GIT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// The per-call bound for mesh git subprocesses. `NEUROSTRATA_GIT_TIMEOUT_SECS`
+/// is read per call so an operator can widen or tighten it without a restart;
+/// unset, zero, or unparsable values fall back to [`GIT_COMMAND_TIMEOUT_SECS`]
+/// rather than disabling the bound.
+pub(crate) fn git_timeout() -> Duration {
+    let secs = std::env::var("NEUROSTRATA_GIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs >= 1)
+        .unwrap_or(GIT_COMMAND_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
 /// Run one git subcommand non-interactively (`GIT_TERMINAL_PROMPT=0`: a
-/// credential prompt would wedge the daemon) inside the mesh checkout.
-fn run(root: &Path, args: &[&str]) -> Result<std::process::Output> {
-    std::process::Command::new("git")
+/// credential prompt would wedge the daemon) inside the mesh checkout, bounded
+/// by [`git_timeout`].
+///
+/// stdout and stderr are drained on dedicated threads while the child runs, so
+/// a chatty git cannot deadlock on a full OS pipe buffer. The child is polled
+/// until it exits or the deadline passes; on expiry it is killed, reaped with
+/// `wait` (no zombie survives this call), and the error names the subcommand
+/// and the bound.
+pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
+    let timeout = git_timeout();
+    let display = args.join(" ");
+    let mut child = Command::new("git")
         .args(args)
         .current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .with_context(|| format!("git {} could not be executed", args.join(" ")))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("git {display} could not be executed"))?;
+
+    let mut child_stdout = child.stdout.take().expect("stdout is piped");
+    let mut child_stderr = child.stderr.take().expect("stderr is piped");
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = child_stdout.read_to_end(&mut buf);
+        let _ = stdout_tx.send(buf);
+    });
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = child_stderr.read_to_end(&mut buf);
+        let _ = stderr_tx.send(buf);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status: ExitStatus = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(GIT_POLL_INTERVAL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // Detach rather than block forever on a pipe a grandchild may
+                // still hold: the drain threads exit on their own once the
+                // last writer closes.
+                drain_within(&stdout_rx, &stderr_rx);
+                bail!(
+                    "git {display} timed out after {}s: process killed (mesh git timeout; override with NEUROSTRATA_GIT_TIMEOUT_SECS)",
+                    timeout.as_secs()
+                );
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drain_within(&stdout_rx, &stderr_rx);
+                return Err(error).with_context(|| format!("git {display} could not be waited on"));
+            }
+        }
+    };
+
+    Ok(Output {
+        status,
+        stdout: stdout_rx.recv().unwrap_or_default(),
+        stderr: stderr_rx.recv().unwrap_or_default(),
+    })
 }
 
-fn run_ok(root: &Path, args: &[&str]) -> Result<std::process::Output> {
+/// Wait at most [`GIT_DRAIN_GRACE`] in total for both drained streams to
+/// reach EOF (their threads keep running if they do not).
+fn drain_within(
+    stdout_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    stderr_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let deadline = Instant::now() + GIT_DRAIN_GRACE;
+    let _ = stdout_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let _ = stderr_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+}
+
+pub(crate) fn run_ok(root: &Path, args: &[&str]) -> Result<Output> {
     let out = run(root, args)?;
     if out.status.success() {
         return Ok(out);
@@ -400,6 +497,139 @@ fn run_ok(root: &Path, args: &[&str]) -> Result<std::process::Output> {
         out.status,
         String::from_utf8_lossy(&out.stderr).trim()
     )
+}
+
+/// Test-only scaffolding shared by every module that feeds the mesh git
+/// funnel (`storage`, `import`, `mesh_service`): a PATH shim that intercepts
+/// `git` for scratch checkouts carrying a marker file, plus an env guard that
+/// restores the process environment on drop.
+#[cfg(all(test, unix))]
+pub(crate) mod git_test_support {
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// Set/unset one environment variable and restore the previous value when
+    /// dropped, so a panicking test cannot leak its value into the process.
+    pub(crate) struct EnvRestore {
+        key: &'static str,
+        prior: Option<OsString>,
+    }
+
+    impl EnvRestore {
+        pub(crate) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+
+        pub(crate) fn unset(key: &'static str) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// A shim `git` executable. It falls through to the real git for every
+    /// checkout that does not carry a marker file, so parallel tests that
+    /// also spawn git keep working while a test holds the PATH override:
+    ///
+    /// - `.hang-git` makes the shim record its pid and `exec sleep 60` (a
+    ///   stuck git), which is how the watchdog tests prove kill + reap;
+    /// - `.flood-git` writes 2 MiB to stdout and 1 MiB to stderr, far past
+    ///   any OS pipe buffer, which is how the drain test proves no deadlock.
+    pub(crate) struct GitShim {
+        dir: PathBuf,
+    }
+
+    impl GitShim {
+        pub(crate) fn install(tag: &str, pid_file: &Path) -> Self {
+            let real = Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|path| path.trim().to_string())
+                .filter(|path| !path.is_empty())
+                .expect("git must be on PATH to install the test shim");
+            let dir = std::env::temp_dir().join(format!(
+                "neurostrata-mesh-git-shim-{}-{}-{}",
+                std::process::id(),
+                tag,
+                uuid::Uuid::new_v4()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = format!(
+                "#!/bin/sh\n\
+                 target=.\n\
+                 if [ \"$1\" = \"-C\" ]; then target=\"$2\"; fi\n\
+                 if [ -f \"$target/.hang-git\" ]; then\n\
+                 \tprintf '%s\\n' \"$$\" > '{pid}'\n\
+                 \texec sleep 60\n\
+                 fi\n\
+                 if [ -f \"$target/.flood-git\" ]; then\n\
+                 \thead -c 2097152 /dev/zero\n\
+                 \thead -c 1048576 /dev/zero >&2\n\
+                 \texit 0\n\
+                 fi\n\
+                 exec '{real}' \"$@\"\n",
+                pid = pid_file.display(),
+                real = real,
+            );
+            let path = dir.join("git");
+            std::fs::write(&path, script).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            Self { dir }
+        }
+
+        /// Prepend the shim dir to PATH. Hold the returned guard for the
+        /// duration of the test; drop restores the original PATH.
+        pub(crate) fn activate(&self) -> EnvRestore {
+            let mut path = OsString::from(self.dir.as_os_str());
+            if let Some(existing) = std::env::var_os("PATH") {
+                path.push(":");
+                path.push(existing);
+            }
+            EnvRestore::set("PATH", path)
+        }
+    }
+
+    pub(crate) fn read_pid(pid_file: &Path) -> u32 {
+        std::fs::read_to_string(pid_file)
+            .expect("the shim must record its pid")
+            .trim()
+            .parse()
+            .expect("shim pid is a u32")
+    }
+
+    /// `kill -0` succeeds for a live OR zombie process, so it is exactly the
+    /// oracle for "the child was killed and then reaped by `wait`".
+    pub(crate) fn assert_reaped(pid: u32) {
+        let status = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("kill -0 must be runnable");
+        assert!(
+            !status.success(),
+            "child pid {pid} is gone only if it was killed AND reaped with wait (kill -0 still sees it)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -820,5 +1050,221 @@ mod tests {
             !tracked.lines().any(|l| l.ends_with(".bundle.zst")),
             "no bundle artifact may be tracked, ls-files: {tracked}"
         );
+    }
+
+    // --- git subprocess bound (issue #416) -------------------------------
+
+    /// A git that never returns must be killed at the configured bound, with
+    /// an error naming the subcommand — and the child must be reaped, never
+    /// left as a zombie waiting on a `wait` that never comes.
+    #[cfg(unix)]
+    #[test]
+    fn git_hang_times_out_and_kills() {
+        use super::git_test_support::{assert_reaped, read_pid, EnvRestore, GitShim};
+        use std::time::{Duration, Instant};
+
+        let _env = crate::daemon::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = scratch("git-hang");
+        let pid_file = root.join("git.pid");
+        let shim = GitShim::install("hang", &pid_file);
+        let _path = shim.activate();
+        let _timeout = EnvRestore::set("NEUROSTRATA_GIT_TIMEOUT_SECS", "1");
+        std::fs::write(root.join(".hang-git"), b"").unwrap();
+
+        let started = Instant::now();
+        let err = run_ok(&root, &["rev-parse", "--verify", "HEAD"])
+            .expect_err("a hung git must be killed, not awaited");
+        let elapsed = started.elapsed();
+        let msg = format!("{err:#}");
+
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "NEUROSTRATA_GIT_TIMEOUT_SECS=1 must bound the call, took {elapsed:?}"
+        );
+        assert!(
+            msg.contains("rev-parse --verify HEAD"),
+            "the error must name the subcommand, got: {msg}"
+        );
+        assert!(
+            msg.contains("timed out after 1s"),
+            "the error must name the bound, got: {msg}"
+        );
+        assert!(
+            msg.contains("NEUROSTRATA_GIT_TIMEOUT_SECS"),
+            "the error must name the override, got: {msg}"
+        );
+
+        assert_reaped(read_pid(&pid_file));
+    }
+
+    /// Large output past any OS pipe buffer must not deadlock: both streams
+    /// are drained concurrently while the child runs.
+    #[cfg(unix)]
+    #[test]
+    fn git_large_output_does_not_deadlock() {
+        use super::git_test_support::{EnvRestore, GitShim};
+        use std::time::{Duration, Instant};
+
+        let _env = crate::daemon::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = scratch("git-flood");
+        let pid_file = root.join("git.pid");
+        let shim = GitShim::install("flood", &pid_file);
+        let _path = shim.activate();
+        let _timeout = EnvRestore::set("NEUROSTRATA_GIT_TIMEOUT_SECS", "30");
+        std::fs::write(root.join(".flood-git"), b"").unwrap();
+
+        let started = Instant::now();
+        let out = run_ok(&root, &["log", "--oneline"])
+            .expect("a child flooding both pipes must still complete");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "draining 3 MiB must not approach the bound, took {elapsed:?}"
+        );
+        assert_eq!(
+            out.stdout.len(),
+            2 * 1024 * 1024,
+            "stdout must be captured in full"
+        );
+        assert_eq!(
+            out.stderr.len(),
+            1024 * 1024,
+            "stderr must be captured in full"
+        );
+    }
+
+    #[test]
+    fn git_failure_surfaces_stderr() {
+        let root = scratch("git-stderr");
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "scratch repo init: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let err = run_ok(&root, &["rev-parse", "--verify", "no-such-ref-416"])
+            .expect_err("a failing git must be an error");
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("rev-parse --verify no-such-ref-416"),
+            "the error must name the subcommand, got: {msg}"
+        );
+        assert!(
+            msg.contains("fatal:"),
+            "git's own stderr must be surfaced, got: {msg}"
+        );
+        assert!(
+            msg.contains("no-such-ref-416"),
+            "stderr must identify the missing ref, got: {msg}"
+        );
+    }
+
+    /// The success path is byte-for-byte what `Command::output()` produced:
+    /// same stdout bytes, empty stderr, exit status preserved.
+    #[test]
+    fn git_success_path_unchanged() {
+        let base = scratch("git-success");
+        let mesh = init_under(&base);
+
+        let out = run_ok(mesh.root(), &["rev-parse", "--is-inside-work-tree"])
+            .expect("a clean probe must succeed");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"true\n", "stdout must be unchanged");
+        assert!(out.stderr.is_empty(), "a quiet git writes no stderr");
+
+        // And a real push to a bare remote still lands its refs.
+        let remote = scratch("git-success-remote").join("team.git");
+        let init = Command::new("git")
+            .args(["init", "--bare", "-q", &remote.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "bare remote init: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let mesh = MeshStorage::init(
+            &base,
+            "node-abc123",
+            "stripe-api-team",
+            &["stripe-api".to_string()],
+            Some(remote.to_str().unwrap()),
+        )
+        .unwrap();
+        let memories = mesh.root().join("stripe-api").join("memories");
+        std::fs::create_dir_all(&memories).unwrap();
+        std::fs::write(memories.join("m1.json"), r#"{"id":"m1"}"#).unwrap();
+        assert!(mesh.commit_all("record", "node-abc123").unwrap());
+        mesh.push().expect("push through the bounded funnel");
+
+        let refs = Command::new("git")
+            .args(["ls-remote", "--refs", &remote.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(refs.status.success());
+        assert!(
+            !refs.stdout.is_empty(),
+            "a successful push must land a ref on the bare remote"
+        );
+    }
+
+    /// The bound's knob: unset, zero, empty, negative, or unparsable must
+    /// fall back to the default rather than disable the timeout (a zero
+    /// "no limit" reading would recreate the hang this issue closes).
+    #[cfg(unix)]
+    #[test]
+    fn git_timeout_defaults_for_unset_zero_and_unparsable_values() {
+        use super::git_test_support::EnvRestore;
+        use std::time::Duration;
+
+        let _env = crate::daemon::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(GIT_COMMAND_TIMEOUT_SECS, 30, "documented default");
+
+        {
+            let _unset = EnvRestore::unset("NEUROSTRATA_GIT_TIMEOUT_SECS");
+            assert_eq!(git_timeout(), Duration::from_secs(30));
+        }
+        for raw in ["0", "", "  ", "not-a-number", "-5", "1.5"] {
+            let _set = EnvRestore::set("NEUROSTRATA_GIT_TIMEOUT_SECS", raw);
+            assert_eq!(
+                git_timeout(),
+                Duration::from_secs(30),
+                "NEUROSTRATA_GIT_TIMEOUT_SECS={raw:?} must fall back to the default"
+            );
+        }
+    }
+
+    /// A valid value is honoured per call (no caching, no restart).
+    #[cfg(unix)]
+    #[test]
+    fn git_timeout_reads_configured_value() {
+        use super::git_test_support::EnvRestore;
+        use std::time::Duration;
+
+        let _env = crate::daemon::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (raw, secs) in [("1", 1), ("45", 45), (" 7 ", 7)] {
+            let _set = EnvRestore::set("NEUROSTRATA_GIT_TIMEOUT_SECS", raw);
+            assert_eq!(
+                git_timeout(),
+                Duration::from_secs(secs),
+                "NEUROSTRATA_GIT_TIMEOUT_SECS={raw:?}"
+            );
+        }
     }
 }

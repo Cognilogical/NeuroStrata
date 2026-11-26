@@ -71,44 +71,23 @@ pub fn resolve_node_id() -> String {
 /// Does this checkout have a commit yet? A fresh `init` has no HEAD until
 /// the first record lands, and `git push HEAD` on an unborn branch dies with
 /// a refspec stack trace that answers nothing. Cheap probe, empty-state
-/// courtesy only.
+/// courtesy only — and like every mesh git call it is bounded by the shared
+/// funnel (a hung git answers `false` at the timeout instead of wedging the
+/// caller).
 fn head_exists(root: &Path) -> bool {
-    std::process::Command::new("git")
-        .args([
-            "-C",
-            &root.to_string_lossy(),
-            "rev-parse",
-            "--verify",
-            "-q",
-            "HEAD",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
+    super::storage::run(root, &["rev-parse", "--verify", "-q", "HEAD"])
+        .map(|out| out.status.success())
         .unwrap_or(false)
 }
 
 /// Does the configured remote have refs yet? Three answers, not two:
 /// `Some(false)` = reachable but EMPTY (bare repo nobody pushed to — a
 /// normal "team inbox not yet filled" state); `Some(true)` = has refs;
-/// `None` = could not ask (unreachable/auth) — and an unreachable remote
-/// must fall through to the real fetch so the failure SURFACES, per the
-/// spec's fail-soft rule ("an unreachable remote reports the failure").
+/// `None` = could not ask (unreachable/auth/timeout) — and an unreachable
+/// remote must fall through to the real fetch so the failure SURFACES, per
+/// the spec's fail-soft rule ("an unreachable remote reports the failure").
 fn remote_refs_present(root: &Path) -> Option<bool> {
-    let out = std::process::Command::new("git")
-        .args([
-            "-C",
-            &root.to_string_lossy(),
-            "ls-remote",
-            "--refs",
-            "origin",
-            "HEAD",
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .ok()?;
+    let out = super::storage::run(root, &["ls-remote", "--refs", "origin", "HEAD"]).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -389,14 +368,11 @@ mod async_surface_tests {
 // --- slice 7 shared probes (status + recovery use the same truth) ----------
 
 /// Non-interactive git probe answering `None` when git could not be asked at
-/// all (the caller decides what omission means — usually a quiet skip).
+/// all or hit the shared timeout (the caller decides what omission means —
+/// usually a quiet skip). Delegates to the one bounded funnel in
+/// [`super::storage::run`].
 fn git(root: &Path, args: &[&str]) -> Option<std::process::Output> {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .ok()
+    super::storage::run(root, args).ok()
 }
 
 /// The checkout's dirty porcelain paths, mirroring import.rs's probe. The
@@ -1764,5 +1740,37 @@ mod tests {
         assert_eq!(age_of(60), "1m");
         assert_eq!(age_of(5400), "1h");
         assert_eq!(age_of(90000), "1d");
+    }
+
+    /// `head_exists` is a probe on the shared bounded funnel: a hung git
+    /// answers `false` after the timeout instead of wedging the caller.
+    #[cfg(unix)]
+    #[test]
+    fn head_exists_is_bounded_by_the_shared_git_timeout() {
+        use crate::synaptic_mesh::storage::git_test_support::{
+            assert_reaped, read_pid, EnvRestore, GitShim,
+        };
+        use std::time::{Duration, Instant};
+
+        let _env = crate::daemon::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = scratch("head-hang");
+        let pid_file = root.join("git.pid");
+        let shim = GitShim::install("head-hang", &pid_file);
+        let _path = shim.activate();
+        let _timeout = EnvRestore::set("NEUROSTRATA_GIT_TIMEOUT_SECS", "1");
+        std::fs::write(root.join(".hang-git"), b"").unwrap();
+
+        let started = Instant::now();
+        let exists = head_exists(&root);
+        let elapsed = started.elapsed();
+
+        assert!(!exists, "a timed-out probe must answer false");
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "the shared bound must fire fast, took {elapsed:?}"
+        );
+        assert_reaped(read_pid(&pid_file));
     }
 }

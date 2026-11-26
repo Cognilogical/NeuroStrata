@@ -603,6 +603,26 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "mesh-git-timeout": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp synaptic_mesh::storage::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp synaptic_mesh::import::tests::current_head_is_bounded_by_the_shared_git_timeout -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp synaptic_mesh::mesh_service::tests::head_exists_is_bounded_by_the_shared_git_timeout -- --test-threads=1"
+      ],
+      "tests": [
+        "synaptic_mesh::storage::tests::git_hang_times_out_and_kills",
+        "synaptic_mesh::storage::tests::git_large_output_does_not_deadlock",
+        "synaptic_mesh::storage::tests::git_failure_surfaces_stderr",
+        "synaptic_mesh::storage::tests::git_success_path_unchanged",
+        "synaptic_mesh::storage::tests::git_timeout_defaults_for_unset_zero_and_unparsable_values",
+        "synaptic_mesh::storage::tests::git_timeout_reads_configured_value",
+        "synaptic_mesh::import::tests::current_head_is_bounded_by_the_shared_git_timeout",
+        "synaptic_mesh::mesh_service::tests::head_exists_is_bounded_by_the_shared_git_timeout"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }
