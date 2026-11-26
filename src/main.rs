@@ -7600,6 +7600,26 @@ mod tests {
         }
     }
 
+    static GLOBAL_TRACING_CAPTURE: std::sync::OnceLock<CapturedLog> = std::sync::OnceLock::new();
+    static GLOBAL_TRACING_INIT: std::sync::Once = std::sync::Once::new();
+
+    /// The capture buffer behind the process-global subscriber installed
+    /// through the production path ([`init_tracing_with_writer`], the
+    /// function [`init_tracing`] delegates to with `std::io::stderr`).
+    /// The global default can only be installed once per process, so
+    /// every test that exercises it shares this one installation and
+    /// distinguishes its own events by a unique marker. Callers hold the
+    /// `RUST_LOG` lock (via `RustLogRestore`) so the filter installed is
+    /// the default `info` filter.
+    fn globally_installed_log_capture() -> &'static CapturedLog {
+        let captured = GLOBAL_TRACING_CAPTURE.get_or_init(CapturedLog::default);
+        GLOBAL_TRACING_INIT.call_once(|| {
+            let sink = captured.clone();
+            init_tracing_with_writer(move || sink.clone());
+        });
+        captured
+    }
+
     /// Serializes the tests that set `RUST_LOG` (the environment is
     /// process-global) and restores the caller's prior value on drop.
     struct RustLogRestore {
@@ -7630,19 +7650,24 @@ mod tests {
 
     #[test]
     fn tracing_output_reaches_stderr() {
-        // The production entry point itself runs, and running it twice in
-        // one process is not an error: a re-exec'd helper or an embedded
-        // caller must never panic on the one-shot global.
+        // Default filter: info (no `RUST_LOG` set).
+        let _env = RustLogRestore::set(None);
+        // The event below is emitted with no `with_default` wrapper: it
+        // dispatches to the subscriber installed globally through the
+        // production install path, whose writer slot production fills
+        // with `std::io::stderr`. If `init_tracing` failed to install
+        // the global subscriber, or installed it over the wrong writer
+        // or filter, this capture would not see the event.
+        let captured = globally_installed_log_capture();
+        // The production entry point itself also runs, and running it
+        // twice in one process is not an error: a re-exec'd helper or an
+        // embedded caller must never panic on the one-shot global. (Once
+        // a global is installed these are no-ops, so they cannot disturb
+        // the capture installed above.)
         init_tracing();
         init_tracing();
 
-        let _env = RustLogRestore::set(None); // default filter: info
-        let captured = CapturedLog::default();
-        let sink = captured.clone();
-        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::info!("tracing_output_reaches_stderr marker");
-        });
+        tracing::info!("tracing_output_reaches_stderr marker");
         let text = captured.text();
         assert!(
             text.contains("tracing_output_reaches_stderr marker"),
@@ -7661,18 +7686,17 @@ mod tests {
     #[test]
     fn stdout_carries_no_log_output() {
         let _env = RustLogRestore::set(None);
-        let captured = CapturedLog::default();
-        let sink = captured.clone();
-        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
-        // Stand-ins for the stdio mode's two channels: `captured` plays the
-        // stderr role (the writer production hands the fmt layer); a plain
-        // buffer plays stdout, written the way the stdio loop writes a
-        // protocol frame.
+        // The globally installed subscriber (production install path;
+        // its writer slot is the stderr slot production fills with
+        // `std::io::stderr`) is the only log writer in play: the event
+        // below is emitted bare, with no `with_default` wrapper, so it
+        // goes wherever the global subscriber sends it.
+        let captured = globally_installed_log_capture();
+        // A plain buffer plays stdout, written the way the stdio loop
+        // writes a protocol frame.
         let mut stdout_role: Vec<u8> = Vec::new();
-        tracing::subscriber::with_default(subscriber, || {
-            stdout_role.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1}\n");
-            tracing::info!("stdout_carries_no_log_output marker");
-        });
+        stdout_role.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1}\n");
+        tracing::info!("stdout_carries_no_log_output marker");
         assert_eq!(
             String::from_utf8(stdout_role).unwrap(),
             "{\"jsonrpc\":\"2.0\",\"id\":1}\n",
@@ -8569,7 +8593,21 @@ fn snapshot_version_and_wal_kind(
 /// install (an embedded caller, a re-exec'd helper) is a no-op rather than a
 /// panic.
 fn init_tracing() {
-    let subscriber = tracing_fmt_subscriber(std::io::stderr, tracing_env_filter());
+    init_tracing_with_writer(std::io::stderr);
+}
+
+/// Install the global subscriber over `writer`. Production passes
+/// `std::io::stderr` (see [`init_tracing`]); the tests pass a capture
+/// buffer in the same slot, so they exercise this global installation —
+/// the subscriber a bare `tracing::info!` in production code actually
+/// dispatches to — rather than a one-off `with_default` subscriber.
+/// A second install is a no-op rather than a panic: the global default
+/// can only be set once per process.
+fn init_tracing_with_writer<W>(writer: W)
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    let subscriber = tracing_fmt_subscriber(writer, tracing_env_filter());
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
