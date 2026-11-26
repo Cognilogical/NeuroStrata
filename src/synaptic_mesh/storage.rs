@@ -432,17 +432,37 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
 
     let mut child_stdout = child.stdout.take().expect("stdout is piped");
     let mut child_stderr = child.stderr.take().expect("stderr is piped");
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
     let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    let stdout_sink = std::sync::Arc::clone(&stdout_buf);
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = child_stdout.read_to_end(&mut buf);
-        let _ = stdout_tx.send(buf);
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match child_stdout.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => stdout_sink
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(&chunk[..read]),
+            }
+        }
+        let _ = stdout_tx.send(());
     });
+    let stderr_sink = std::sync::Arc::clone(&stderr_buf);
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = child_stderr.read_to_end(&mut buf);
-        let _ = stderr_tx.send(buf);
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match child_stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => stderr_sink
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(&chunk[..read]),
+            }
+        }
+        let _ = stderr_tx.send(());
     });
 
     let deadline = Instant::now() + timeout;
@@ -456,7 +476,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
                 // Detach rather than block forever on a pipe a grandchild may
                 // still hold: the drain threads exit on their own once the
                 // last writer closes.
-                drain_within(&stdout_rx, &stderr_rx);
+                drain_within(&stdout_rx, &stderr_rx, &stdout_buf, &stderr_buf);
                 bail!(
                     "git {display} timed out after {}s: process killed (mesh git timeout; override with NEUROSTRATA_GIT_TIMEOUT_SECS)",
                     timeout.as_secs()
@@ -465,7 +485,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                drain_within(&stdout_rx, &stderr_rx);
+                drain_within(&stdout_rx, &stderr_rx, &stdout_buf, &stderr_buf);
                 return Err(error).with_context(|| format!("git {display} could not be waited on"));
             }
         }
@@ -475,7 +495,7 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
     // still hold the inherited pipes. Drain bounded (never a bare recv()) so a
     // normal exit cannot hang, while a closed pipe still yields the full
     // captured bytes.
-    let (stdout, stderr) = drain_within(&stdout_rx, &stderr_rx);
+    let (stdout, stderr) = drain_within(&stdout_rx, &stderr_rx, &stdout_buf, &stderr_buf);
     Ok(Output {
         status,
         stdout,
@@ -488,11 +508,24 @@ pub(crate) fn run(root: &Path, args: &[&str]) -> Result<Output> {
 /// A per-stream budget keeps a grandchild holding stdout from starving the
 /// stderr capture, and vice versa.
 fn drain_within(
-    stdout_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
-    stderr_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    stdout_rx: &std::sync::mpsc::Receiver<()>,
+    stderr_rx: &std::sync::mpsc::Receiver<()>,
+    stdout_buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
 ) -> (Vec<u8>, Vec<u8>) {
-    let stdout = stdout_rx.recv_timeout(GIT_DRAIN_GRACE).unwrap_or_default();
-    let stderr = stderr_rx.recv_timeout(GIT_DRAIN_GRACE).unwrap_or_default();
+    // Wait for EOF only within the grace, but never discard bytes already
+    // read: a grandchild can hold the pipe open after the direct child has
+    // written the output we need.
+    let _ = stdout_rx.recv_timeout(GIT_DRAIN_GRACE);
+    let _ = stderr_rx.recv_timeout(GIT_DRAIN_GRACE);
+    let stdout = stdout_buf
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let stderr = stderr_buf
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     (stdout, stderr)
 }
 
@@ -598,6 +631,7 @@ pub(crate) mod git_test_support {
                  \texit 0\n\
                  fi\n\
                  if [ -f \"$target/.grandchild-git\" ]; then\n\
+                 \tprintf 'grandchild-payload\\n'\n\
                  \tsleep 30 &\n\
                  \texit 0\n\
                  fi\n\
@@ -1200,6 +1234,11 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "a normal exit must be bounded by the drain grace, took {elapsed:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "grandchild-payload",
+            "output written before the grandchild held the pipe must survive the bounded drain"
         );
     }
 
