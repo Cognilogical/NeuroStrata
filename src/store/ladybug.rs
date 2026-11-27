@@ -4801,29 +4801,52 @@ fn classify_row_identity(
 /// Page through `Memory` within `budget`, collecting rows whose id contradicts
 /// their namespace. Read-only and bounded: it stops at the budget boundary and
 /// reports `truncated` rather than overrunning the open.
-fn audit_row_identity(conn: &Connection, budget: std::time::Duration) -> Result<RowIdentityAudit> {
-    let started = std::time::Instant::now();
+fn audit_row_identity(
+    conn: &Connection,
+    started: std::time::Instant,
+    budget: std::time::Duration,
+) -> Result<RowIdentityAudit> {
     let started_at = chrono::Utc::now().to_rfc3339();
     let mut mismatches = Vec::new();
     let mut scanned = 0usize;
     let mut truncated = false;
-    let mut offset = 0usize;
+    // Keyset, not SKIP: a concurrent insert or delete before an offset would
+    // shift later pages and silently skip or repeat rows. The last id visited
+    // is a stable cursor under concurrent changes.
+    let mut after_id: Option<String> = None;
     loop {
         if started.elapsed() >= budget {
             truncated = true;
             break;
         }
-        let query = format!(
-            "MATCH (m:Memory) RETURN m.id, m.namespace, m.user_id \
-             ORDER BY m.id SKIP {offset} LIMIT {ROW_IDENTITY_AUDIT_PAGE_SIZE}"
-        );
+        let query = match &after_id {
+            Some(after) => format!(
+                "MATCH (m:Memory) WHERE m.id > '{}' RETURN m.id, m.namespace, m.user_id \
+                 ORDER BY m.id LIMIT {}",
+                escape_ladybug_string(after),
+                ROW_IDENTITY_AUDIT_PAGE_SIZE
+            ),
+            None => format!(
+                "MATCH (m:Memory) RETURN m.id, m.namespace, m.user_id \
+                 ORDER BY m.id LIMIT {}",
+                ROW_IDENTITY_AUDIT_PAGE_SIZE
+            ),
+        };
         let rows = conn.query(&query)?;
         let mut page = 0usize;
+        let mut last_id: Option<String> = None;
         for row in rows {
+            // The budget starts before the caller waits for its turn, so a
+            // long page query or row walk must not overrun it either.
+            if started.elapsed() >= budget {
+                truncated = true;
+                break;
+            }
             page += 1;
             let id = row_text(row.first());
             let namespace = row_text(row.get(1));
             let user_id = row_text(row.get(2));
+            last_id = Some(id.clone());
             if let Some(kind) = classify_row_identity(&id, &namespace, &user_id) {
                 mismatches.push(RowIdentityMismatch {
                     id,
@@ -4833,10 +4856,13 @@ fn audit_row_identity(conn: &Connection, budget: std::time::Duration) -> Result<
             }
         }
         scanned += page;
-        if page < ROW_IDENTITY_AUDIT_PAGE_SIZE {
+        if truncated || page < ROW_IDENTITY_AUDIT_PAGE_SIZE {
             break;
         }
-        offset += ROW_IDENTITY_AUDIT_PAGE_SIZE;
+        match last_id {
+            Some(id) => after_id = Some(id),
+            None => break,
+        }
     }
     Ok(RowIdentityAudit {
         started_at,
@@ -4924,6 +4950,15 @@ impl FirstWriteMarker {
     /// is written. A marker write failure propagates, so the upsert refuses
     /// with zero vectors landed.
     fn ensure_written_before_first_vector(&self, conn: &Connection) -> Result<()> {
+        // A direct upsert can target a store that predates this build and
+        // never ran `init`: its `Memory` table exists but `StoreIdentity`
+        // does not. Create the table before reading or MERGE-ing the marker
+        // so the write path works on older stores too (#409).
+        conn.query(&STORE_IDENTITY_DDL.replacen(
+            "CREATE NODE TABLE",
+            "CREATE NODE TABLE IF NOT EXISTS",
+            1,
+        ))?;
         if let Some(existing) = read_store_identity_marker(conn)? {
             if existing.marker_version != STORE_IDENTITY_MARKER_VERSION {
                 anyhow::bail!(
@@ -4951,6 +4986,21 @@ impl FirstWriteMarker {
         let Some(descriptor) = self.descriptor() else {
             return Ok(());
         };
+        // Rows without a marker belong to a legacy store, not to this first
+        // vector. Pinning the configured descriptor to them without physical
+        // width evidence would fabricate a producer and later refuse the real
+        // model; leave such a store unmarked for the verified-open adoption
+        // path instead (#409).
+        if let Ok(facts) = inspect_memory_embedding_and_count(conn) {
+            if facts.row_count().unwrap_or(0) > 0 {
+                let Some(width) = facts.physical_width() else {
+                    return Ok(());
+                };
+                if width != descriptor.dims {
+                    return Ok(());
+                }
+            }
+        }
         #[cfg(test)]
         if self.fail_write.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("injected StoreIdentity marker write failure");
@@ -5022,7 +5072,9 @@ impl StoreIdentityAdoption {
             // No attested vector width means the store cannot prove which
             // space its rows came from. Recording a guess here would pin a
             // false marker and refuse the later correct model.
-            tracing::debug!("embedding-marker adoption skipped: the store attests no embedding width");
+            tracing::debug!(
+                "embedding-marker adoption skipped: the store attests no embedding width"
+            );
             return Ok(false);
         };
         let adopted_at = chrono::Utc::now().to_rfc3339();
@@ -5080,8 +5132,19 @@ impl StoreIdentityAdoption {
 }
 
 /// Log one audit result, with a capped sample per mismatch kind. The audit
-/// reports; the caller never turns a finding into an error (#409).
+/// reports; the caller never turns a finding into an error (#409). A budgeted
+/// scan is logged as `partial: true` so a truncated walk is never mistaken for
+/// a full-table survey.
 fn log_row_identity_audit(audit: &RowIdentityAudit) {
+    if audit.truncated {
+        // A partial survey is a finding in its own right: rows after the
+        // cursor were not visited, so "no mismatch" would be a false all-clear.
+        tracing::warn!(
+            "row identity audit: partial: true — the {}ms budget expired after {} row(s); the rest of the table was not surveyed",
+            audit.budget_ms,
+            audit.scanned
+        );
+    }
     if audit.mismatches.is_empty() {
         tracing::debug!(
             "row identity audit: {} row(s) scanned in {}ms, no namespace mismatches",
@@ -5103,10 +5166,13 @@ fn log_row_identity_audit(audit: &RowIdentityAudit) {
         if matching.is_empty() {
             continue;
         }
-        let sample: Vec<&str> = matching
+        // An id comes from a caller-supplied row and can contain newlines or
+        // terminal control characters; escape them so a sampled id cannot
+        // forge additional log lines (#409).
+        let sample: Vec<String> = matching
             .iter()
             .take(ROW_IDENTITY_AUDIT_LOG_SAMPLE)
-            .map(|mismatch| mismatch.id.as_str())
+            .map(|mismatch| mismatch.id.escape_default().to_string())
             .collect();
         tracing::warn!(
             "row identity audit: {} row(s) report {} (sample of up to {}: {}). Reported only; the store opened unchanged.",
@@ -5766,7 +5832,8 @@ impl LadybugStore {
             );
         }
         let persisted = marker.descriptor();
-        if let CachedStoreState::Recorded(recorded) = self.cached_store_state() {
+        let cached = self.cached_store_state();
+        if let CachedStoreState::Recorded(recorded) = &cached {
             if !persisted.compatible(&recorded.descriptor) {
                 return Err(marker_sidecar_disagreement_refusal(
                     &self.local_path,
@@ -5778,6 +5845,21 @@ impl LadybugStore {
         if let Some(serving) = self.serving_descriptor() {
             if !persisted.compatible(&serving) {
                 return Err(persisted_marker_refusal(&persisted, &serving));
+            }
+        } else if matches!(&cached, CachedStoreState::LockedUnknown)
+            && self.embed_config_dir.join("embedders.json").is_file()
+        {
+            // No serving descriptor and no sidecar: after a sidecar loss the
+            // configured model is the only identity a vector operation could
+            // claim, so a changed configuration must not silently mix spaces
+            // (#409). Requiring an explicit config file keeps test/override
+            // stores (with no config directory) out of this comparison.
+            if let Ok(configured) =
+                configured_embedding_descriptor_in(&self.embed_config_dir, self.dimensions)
+            {
+                if !persisted.compatible(&configured) {
+                    return Err(persisted_marker_refusal(&persisted, &configured));
+                }
             }
         }
         Ok(())
@@ -5808,10 +5890,20 @@ impl LadybugStore {
     /// the first successful `init` (#409). Failures are logged; the open has
     /// already succeeded and is never undone by the audit.
     async fn audit_row_identity_at_init(&self) {
-        match self
-            .with_conn(|conn| audit_row_identity(conn, ROW_IDENTITY_AUDIT_BUDGET))
-            .await
-        {
+        // Start the clock before waiting for the store's single turn: time
+        // spent queued behind a writer is part of the audit budget, and the
+        // bounded wrapper releases this caller at the deadline. The audit
+        // closure sees the same start, so it stops with the time that remains.
+        let started = std::time::Instant::now();
+        let result = bounded(
+            "the row identity audit",
+            ROW_IDENTITY_AUDIT_BUDGET,
+            self.with_conn(move |conn| {
+                audit_row_identity(conn, started, ROW_IDENTITY_AUDIT_BUDGET)
+            }),
+        )
+        .await;
+        match result {
             Ok(audit) => {
                 log_row_identity_audit(&audit);
                 *self
@@ -5927,7 +6019,10 @@ impl LadybugStore {
     /// both `init` call sites (the schema-ready fast path and the
     /// post-closure call) are covered.
     async fn maintain_store_state(&self) {
-        let marker = match self.with_conn(|conn| read_store_identity_marker(conn)).await {
+        let marker = match self
+            .with_conn(|conn| read_store_identity_marker(conn))
+            .await
+        {
             Ok(marker) => marker,
             Err(error) => {
                 // Without the marker we cannot tell whether rewriting the
