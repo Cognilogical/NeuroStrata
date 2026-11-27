@@ -18,7 +18,9 @@ use crate::traits::MemoryPayload;
 
 // v3 switches `content`, `symbol`, and `location` to the `"code_text"` custom
 // code-aware sub-tokenizer analyzer (`neurostrata-5xjo`).
-pub const INDEX_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-tantivy-v3");
+// v4 re-encodes the archive tombstone as a nonzero i64; persisted v3 boolean
+// tombstones must be rebuilt on open.
+pub const INDEX_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-tantivy-v4");
 
 /// Custom Tantivy tokenizer that splits code identifiers on path/namespace
 /// separators, snake_case underscores, camelCase/PascalCase boundaries, and
@@ -183,6 +185,23 @@ pub fn code_text_analyzer() -> tantivy::tokenizer::TextAnalyzer {
         .filter(tantivy::tokenizer::RemoveLongFilter::limit(255))
         .filter(tantivy::tokenizer::LowerCaser)
         .build()
+}
+
+/// Read the archive tombstone from payload metadata as an index flag.
+///
+/// The tombstone producer (`handlers::archive_memory`) writes a boolean
+/// `true`, while older rows may carry an integer flag; accept both shapes:
+/// 1 when `archived` is boolean `true` or an integer != 0, else 0.
+fn archived_flag(metadata: &serde_json::Value) -> i64 {
+    match metadata.get("archived") {
+        Some(v) if v.as_bool() == Some(true) => 1,
+        Some(v) if v.as_i64().map(|n| n != 0).unwrap_or(false) => 1,
+        // serde_json keeps values above i64::MAX as u64; as_i64() alone reads
+        // them as zero and lets an archive tombstone index as a live row.
+        Some(v) if v.as_u64().map(|n| n != 0).unwrap_or(false) => 1,
+        Some(_) => 0,
+        None => 0,
+    }
 }
 
 /// Code-aware pre-tokenization for Tantivy (whitespace-separated sub-tokens + full lowercased text).
@@ -575,18 +594,7 @@ impl TantivyLexicalIndex {
             0
         };
         doc.add_i64(self.has_valid_to_f, has_valid_to);
-        let archived: i64 = if payload
-            .metadata
-            .get("archived")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            != 0
-        {
-            1
-        } else {
-            0
-        };
-        doc.add_i64(self.archived_f, archived);
+        doc.add_i64(self.archived_f, archived_flag(&payload.metadata));
         doc.add_i64(self.generation_f, Self::generation_of_id(id));
 
         if let Some(w) = self
@@ -709,18 +717,7 @@ impl TantivyLexicalIndex {
                     0
                 };
                 doc.add_i64(self.has_valid_to_f, has_valid_to);
-                let archived: i64 = if payload
-                    .metadata
-                    .get("archived")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-                    != 0
-                {
-                    1
-                } else {
-                    0
-                };
-                doc.add_i64(self.archived_f, archived);
+                doc.add_i64(self.archived_f, archived_flag(&payload.metadata));
                 doc.add_i64(self.generation_f, Self::generation_of_id(id));
                 w.add_document(doc)?;
                 indexed += 1;
@@ -1018,6 +1015,22 @@ mod tests {
     use super::*;
     use crate::traits::MemoryPayload;
     use serde_json::json;
+
+    #[test]
+    fn archived_flag_recognizes_unsigned_tombstone_beyond_i64() {
+        let unsigned = json!({"archived": u64::MAX});
+        assert_eq!(
+            archived_flag(&unsigned),
+            1,
+            "a nonzero unsigned archive flag above i64::MAX must stay a tombstone"
+        );
+    }
+
+    #[test]
+    fn archived_flag_keeps_zero_unsigned_flag_live() {
+        let unsigned = json!({"archived": 0_u64});
+        assert_eq!(archived_flag(&unsigned), 0);
+    }
 
     fn dummy_payload(content: &str, symbol: Option<&str>) -> MemoryPayload {
         MemoryPayload {
@@ -1683,5 +1696,472 @@ mod tests {
             ["rule-row".to_string()].into_iter().collect(),
             "include_code_ast=false must exclude code_ast and doc_section rows"
         );
+    }
+    fn payload_with_archived(content: &str, archived: serde_json::Value) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "test-user".to_string(),
+            memory_type: "memory".to_string(),
+            agent_name: None,
+            location: "/src/lib.rs".to_string(),
+            location_lines: "1-10".to_string(),
+            metadata: json!({"valid_from": 100, "archived": archived}),
+        }
+    }
+
+    fn payload_with_valid_to(content: &str, valid_to: i64) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "test-user".to_string(),
+            memory_type: "memory".to_string(),
+            agent_name: None,
+            location: "/src/lib.rs".to_string(),
+            location_lines: "1-10".to_string(),
+            metadata: json!({"valid_from": 100, "valid_to": valid_to, "archived": 0}),
+        }
+    }
+
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn mutex_payload() -> MemoryPayload {
+        dummy_payload("guarded by a mutex lock", Some("std::sync::Mutex"))
+    }
+
+    #[test]
+    fn test_search_generation_filter_applies_before_top_docs() {
+        // The old shape put competitors in namespace A and searched namespace B.
+        // The query already scopes by namespace, so A never entered TopDocs and
+        // the assertion could pass even if filtering happened after collection.
+        // Put the competitors in the SAME searched namespace and exclude them
+        // with the generation clause instead: a post-collection filter would
+        // let 24 higher-scoring rows exhaust the limit*8 window and starve the
+        // one eligible row.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        for i in 0..24 {
+            let p = payload_typed("sharedtoken sharedtoken sharedtoken", "memory");
+            idx.upsert_memory("ns", &format!("t::9::loser{i}"), &p)
+                .unwrap();
+        }
+        let kept = payload_typed(
+            "sharedtoken diluted by many unrelated filler words that lengthen this document considerably beyond the others",
+            "memory",
+        );
+        idx.upsert_memory("ns", "t::3::keep", &kept).unwrap();
+
+        let active = std::collections::HashSet::from([3_u64]);
+        let hits = idx
+            .search_with_active_generations(
+                "ns",
+                "sharedtoken",
+                2,
+                true,
+                true,
+                None,
+                Some(&active),
+                true,
+            )
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == "t::3::keep"),
+            "generation filter must run before TopDocs, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn archived_encoding_bumps_index_version_and_forces_rebuild() {
+        assert!(
+            INDEX_VERSION.ends_with("-tantivy-v4"),
+            "the archived-encoding change must invalidate v3 indexes, got: {INDEX_VERSION}"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "ns-lexical-version-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index_version.txt"), "0.0.0-tantivy-v3\n").unwrap();
+        std::fs::write(dir.join("stale-tombstone-marker"), b"v3").unwrap();
+        let idx = TantivyLexicalIndex::open_or_create(&dir).expect("reopened index");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("index_version.txt"))
+                .unwrap()
+                .trim(),
+            INDEX_VERSION,
+            "opening a stale index must rewrite the version marker"
+        );
+        assert!(
+            !dir.join("stale-tombstone-marker").exists(),
+            "a v3 index must be cleared so boolean tombstones are re-encoded"
+        );
+        drop(idx);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_search_task_filter_applies_before_top_docs() {
+        // Same starvation shape for the task filter: higher-scoring task
+        // rows must not consume the TopDocs window when tasks are excluded.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        for i in 0..24 {
+            let p = payload_typed("sharedtoken sharedtoken sharedtoken", "task");
+            idx.upsert_memory("ns", &format!("t{i}"), &p).unwrap();
+        }
+        let m = payload_typed(
+            "sharedtoken diluted by many unrelated filler words that lengthen this document considerably beyond the others",
+            "memory",
+        );
+        idx.upsert_memory("ns", "m1", &m).unwrap();
+
+        let hits = idx
+            .search("ns", "sharedtoken", 2, false, true, None)
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == "m1"),
+            "non-task match must be collected even when excluded tasks outscore it, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_bool_archived_tombstone_excluded_via_rebuild() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let rows = vec![(
+            "ns".to_string(),
+            "arch-bool-rebuild".to_string(),
+            payload_with_archived("bool tombstone rebuild token", json!(true)),
+        )];
+        let count = idx.rebuild(&rows).unwrap();
+        assert_eq!(count, 1);
+        let excluded = idx
+            .search("ns", "tombstone rebuild", 10, true, false, None)
+            .unwrap();
+        assert!(
+            !excluded.iter().any(|h| h.id == "arch-bool-rebuild"),
+            "boolean-archived row must be excluded when include_archived=false, got: {:?}",
+            excluded.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        let included = idx
+            .search("ns", "tombstone rebuild", 10, true, true, None)
+            .unwrap();
+        assert!(included.iter().any(|h| h.id == "arch-bool-rebuild"));
+    }
+
+    #[test]
+    fn test_bool_archived_tombstone_excluded_via_upsert() {
+        // archive_memory writes a boolean `true` tombstone; it must index as
+        // archived=1 so include_archived=false excludes the row.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = payload_with_archived("bool tombstone upsert token", json!(true));
+        idx.upsert_memory("ns", "arch-bool", &p).unwrap();
+        let excluded = idx
+            .search("ns", "tombstone upsert", 10, true, false, None)
+            .unwrap();
+        assert!(
+            !excluded.iter().any(|h| h.id == "arch-bool"),
+            "boolean-archived row must be excluded when include_archived=false, got: {:?}",
+            excluded.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        let included = idx
+            .search("ns", "tombstone upsert", 10, true, true, None)
+            .unwrap();
+        assert!(included.iter().any(|h| h.id == "arch-bool"));
+    }
+
+    #[test]
+    fn test_int_archived_flag_still_excluded() {
+        // Integer tombstones (legacy rows) keep working on both write paths.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = payload_with_archived("int tombstone upsert token", json!(1));
+        idx.upsert_memory("ns", "arch-int", &p).unwrap();
+        let excluded = idx
+            .search("ns", "tombstone upsert", 10, true, false, None)
+            .unwrap();
+        assert!(!excluded.iter().any(|h| h.id == "arch-int"));
+        let included = idx
+            .search("ns", "tombstone upsert", 10, true, true, None)
+            .unwrap();
+        assert!(included.iter().any(|h| h.id == "arch-int"));
+
+        let idx2 = TantivyLexicalIndex::open_in_ram().unwrap();
+        let rows = vec![(
+            "ns".to_string(),
+            "arch-int-rebuild".to_string(),
+            payload_with_archived("int tombstone rebuild token", json!(1)),
+        )];
+        idx2.rebuild(&rows).unwrap();
+        let excluded2 = idx2
+            .search("ns", "tombstone rebuild", 10, true, false, None)
+            .unwrap();
+        assert!(!excluded2.iter().any(|h| h.id == "arch-int-rebuild"));
+        let included2 = idx2
+            .search("ns", "tombstone rebuild", 10, true, true, None)
+            .unwrap();
+        assert!(included2.iter().any(|h| h.id == "arch-int-rebuild"));
+    }
+
+    #[test]
+    fn test_future_valid_to_stays_visible_until_it_expires() {
+        // A memory whose valid_to lies in the future has not retired yet: an
+        // ordinary search (as_of: None, as search_tantivy_lexical always
+        // passes) must return it, while an already-expired one must not.
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let now = now_unix();
+        let live = payload_with_valid_to("expiring token future row", now + 86_400);
+        idx.upsert_memory("ns", "expires-later", &live).unwrap();
+        let dead = payload_with_valid_to("expiring token past row", now - 86_400);
+        idx.upsert_memory("ns", "already-expired", &dead).unwrap();
+
+        let hits = idx
+            .search("ns", "expiring token", 10, true, true, None)
+            .unwrap();
+        assert!(
+            hits.iter().any(|h| h.id == "expires-later"),
+            "future valid_to must stay visible in an ordinary search, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            !hits.iter().any(|h| h.id == "already-expired"),
+            "past valid_to must be hidden in an ordinary search, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_rebuild_scoped_preserves_other_namespaces() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let seed = vec![
+            (
+                "A".to_string(),
+                "a1".to_string(),
+                dummy_payload("alpha oldtoken", None),
+            ),
+            (
+                "B".to_string(),
+                "b1".to_string(),
+                dummy_payload("bravo uniquetoken", None),
+            ),
+        ];
+        assert_eq!(idx.rebuild(&seed).unwrap(), 2);
+
+        // Scoped rebuild of A with a changed row set must not wipe B.
+        let new_a = vec![(
+            "A".to_string(),
+            "a2".to_string(),
+            dummy_payload("alpha newtoken", None),
+        )];
+        assert_eq!(idx.rebuild_scoped(&new_a, Some("A")).unwrap(), 1);
+
+        let b_hits = idx
+            .search("B", "uniquetoken", 10, true, true, None)
+            .unwrap();
+        assert!(
+            b_hits.iter().any(|h| h.id == "b1"),
+            "namespace B rows must survive a scoped rebuild of A, got: {:?}",
+            b_hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        let a_old = idx.search("A", "oldtoken", 10, true, true, None).unwrap();
+        assert!(
+            !a_old.iter().any(|h| h.id == "a1"),
+            "scoped rebuild must replace A's old rows"
+        );
+        let a_new = idx.search("A", "newtoken", 10, true, true, None).unwrap();
+        assert!(a_new.iter().any(|h| h.id == "a2"));
+    }
+
+    #[test]
+    fn test_rebuild_scoped_none_replaces_everything() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let seed = vec![
+            (
+                "A".to_string(),
+                "a1".to_string(),
+                dummy_payload("alpha oldtoken", None),
+            ),
+            (
+                "B".to_string(),
+                "b1".to_string(),
+                dummy_payload("bravo uniquetoken", None),
+            ),
+        ];
+        idx.rebuild(&seed).unwrap();
+
+        let only_c = vec![(
+            "C".to_string(),
+            "c1".to_string(),
+            dummy_payload("charlie fresh token", None),
+        )];
+        assert_eq!(idx.rebuild_scoped(&only_c, None).unwrap(), 1);
+
+        let b_hits = idx
+            .search("B", "uniquetoken", 10, true, true, None)
+            .unwrap();
+        assert!(
+            b_hits.is_empty(),
+            "unscoped rebuild must replace every namespace"
+        );
+        let a_hits = idx.search("A", "oldtoken", 10, true, true, None).unwrap();
+        assert!(
+            a_hits.is_empty(),
+            "unscoped rebuild must replace every namespace"
+        );
+        let c_hits = idx
+            .search("C", "charlie fresh", 10, true, true, None)
+            .unwrap();
+        assert!(c_hits.iter().any(|h| h.id == "c1"));
+    }
+
+    #[test]
+    fn test_search_parser_hostile_boolean_words_are_literal() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = dummy_payload("fish and chips or peas supper", None);
+        idx.upsert_memory("ns", "bool-row", &p).unwrap();
+        // Seed a row containing the literal word `or` plus one that does
+        // not, so a single-term `OR` query proves the word is indexed as
+        // text rather than consumed as empty query syntax.
+        idx.upsert_memory("ns", "or-row", &dummy_payload("or connective token", None))
+            .unwrap();
+        idx.upsert_memory("ns", "chips-row", &dummy_payload("chips only token", None))
+            .unwrap();
+        for q in ["AND", "chips OR peas"] {
+            let hits = idx
+                .search("ns", q, 10, true, true, None)
+                .unwrap_or_else(|e| panic!("query {q:?} must not error: {e}"));
+            assert!(
+                hits.iter().any(|h| h.id == "bool-row"),
+                "query {q:?} must return the seeded row, got: {:?}",
+                hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+            );
+        }
+        let hits = idx
+            .search("ns", "OR", 10, true, true, None)
+            .expect("a boolean word must parse as an ordinary literal term");
+        assert!(
+            hits.iter().any(|h| h.id == "or-row"),
+            "OR must match a row containing the literal word, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            !hits.iter().any(|h| h.id == "chips-row"),
+            "OR must not be consumed as an empty operator that matches every row, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_search_parser_hostile_leading_plus_minus_are_literal() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        // `mutex-row` carries `Mutex` in its symbol but never the text
+        // `+Mutex`, so matching it proves no must-match operator survived.
+        idx.upsert_memory("ns", "mutex-row", &mutex_payload())
+            .unwrap();
+        // Prove the neutralization itself: every token handed to Tantivy is
+        // quote-wrapped, so a leading `+`/`-` can never be read as syntax.
+        let neutralized = quote_tokenized_query(&tokenize_code_for_tantivy("+Mutex"));
+        assert!(
+            neutralized
+                .split_whitespace()
+                .all(|term| term.starts_with('"') && term.ends_with('"')),
+            "leading '+' must stay inside a quoted literal, got: {neutralized:?}"
+        );
+        for q in ["+Mutex", "-Mutex"] {
+            let hits = idx
+                .search("ns", q, 10, true, true, None)
+                .unwrap_or_else(|e| panic!("query {q:?} must not error: {e}"));
+            assert!(
+                hits.iter().any(|h| h.id == "mutex-row"),
+                "query {q:?} must be literal text and return the seeded row, got: {:?}",
+                hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_parser_hostile_path_token_with_colons() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = dummy_payload("path token target row", Some("foo::bar::Baz"));
+        idx.upsert_memory("ns", "path-row", &p).unwrap();
+        let hits = idx
+            .search("ns", "foo::bar::Baz", 10, true, true, None)
+            .expect("path-like token search must not error");
+        assert!(hits.iter().any(|h| h.id == "path-row"));
+    }
+
+    #[test]
+    fn test_search_parser_hostile_trailing_colon() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("ns", "mutex-row", &mutex_payload())
+            .unwrap();
+        let hits = idx
+            .search("ns", "Mutex:", 10, true, true, None)
+            .expect("trailing-colon search must not error");
+        assert!(hits.iter().any(|h| h.id == "mutex-row"));
+    }
+
+    #[test]
+    fn test_search_parser_hostile_unbalanced_paren() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("ns", "mutex-row", &mutex_payload())
+            .unwrap();
+        let hits = idx
+            .search("ns", "(Mutex", 10, true, true, None)
+            .expect("unbalanced-paren search must not error");
+        assert!(hits.iter().any(|h| h.id == "mutex-row"));
+    }
+
+    #[test]
+    fn test_search_parser_hostile_unbalanced_quote() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        let p = dummy_payload("say hello loudly", None);
+        idx.upsert_memory("ns", "quote-row", &p).unwrap();
+        let hits = idx
+            .search("ns", "say \"hello", 10, true, true, None)
+            .expect("unbalanced-quote search must not error");
+        assert!(hits.iter().any(|h| h.id == "quote-row"));
+    }
+
+    #[test]
+    fn test_search_qualified_symbol_with_colons_returns_seeded_row() {
+        // Regression: the exact qualified symbol must return Ok WITH the
+        // seeded row (an error-swallowing fix returning Ok(empty) fails
+        // this test).
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("ns", "mutex-row", &mutex_payload())
+            .unwrap();
+        let hits = idx
+            .search("ns", "std::sync::Mutex", 10, true, true, None)
+            .expect("qualified-symbol search must not error");
+        assert!(
+            hits.iter().any(|h| h.id == "mutex-row"),
+            "exact qualified symbol must return the seeded row, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_search_plain_multiword_query_result_set_pin() {
+        // Ordinary multi-word behaviour is unchanged by the fix (this
+        // test is green on the unmodified tree and must stay green).
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("ns", "p1", &dummy_payload("alpha beta gamma", None))
+            .unwrap();
+        idx.upsert_memory("ns", "p2", &dummy_payload("alpha beta delta", None))
+            .unwrap();
+        idx.upsert_memory("ns", "p3", &dummy_payload("unrelated omega", None))
+            .unwrap();
+        let hits = idx
+            .search("ns", "alpha beta", 10, true, true, None)
+            .unwrap();
+        let mut ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["p1", "p2"]);
     }
 }

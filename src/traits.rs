@@ -241,12 +241,38 @@ pub struct DomainSearchOutcome {
 }
 
 /// The outcome of an in-house lexical search.
+///
+/// `incomplete` and `next_offset` were added to make bounded scans honest.
+/// This is an intentional source-breaking addition to a binary-internal type;
+/// downstream constructors and exhaustive matches must migrate to
+/// [`LexicalSearchOutcome::new`] and a wildcard arm.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LexicalSearchOutcome {
     pub results: Vec<SearchResult>,
     /// True when a requested domain filter actually selected the rows.
     /// False covers both "no filter asked for" and the documented fallback.
     pub domain_filter_applied: bool,
+    /// True when the bounded candidate scan ended with a short page and more
+    /// matches may sit below the vetoed prefix. Callers must paginate.
+    pub incomplete: bool,
+    /// Cursor for the next page: the number of ranked candidates consumed at
+    /// or before this call's offset. Pass it back as the next `offset` to
+    /// continue below the vetoed prefix instead of re-scanning it.
+    pub next_offset: usize,
+}
+
+impl LexicalSearchOutcome {
+    /// Construct a complete, first-page outcome. Callers that detect a bounded
+    /// scan set [`Self::incomplete`] and [`Self::next_offset`] explicitly.
+    pub fn new(results: Vec<SearchResult>, domain_filter_applied: bool) -> Self {
+        Self {
+            results,
+            domain_filter_applied,
+            incomplete: false,
+            next_offset: 0,
+        }
+    }
 }
 
 /// What an attempt to move a memory between namespaces found.

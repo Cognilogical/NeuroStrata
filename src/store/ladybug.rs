@@ -7472,11 +7472,21 @@ const STRUCTURAL_MEMORY_TYPES: [&str; 10] = [
 /// These are applied BEFORE the candidate budget is spent.
 
 fn is_archived(metadata: &Value) -> bool {
-    metadata
-        .get("archived")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    // The archive tombstone is written as boolean `true`, but older rows
+    // carry an integer flag. Both mean archived; any other shape does not.
+    match metadata.get("archived") {
+        Some(value) => {
+            value.as_bool() == Some(true)
+                || value.as_i64().map(|n| n != 0).unwrap_or(false)
+                || value.as_u64().map(|n| n != 0).unwrap_or(false)
+        }
+        None => false,
+    }
 }
+
+/// Upper bound on hydrated lexical candidates. Widening stops here so a
+/// query whose hits are all rejected cannot scan the whole index.
+const MAX_LEXICAL_SCAN_ROWS: usize = 1024;
 
 /// Row-class predicates for filtering at the store seam.
 /// These are applied BEFORE the candidate budget is spent.
@@ -9238,7 +9248,38 @@ impl LadybugStore {
         principal: &str,
         include_code_ast: bool,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
+        self.search_tantivy_lexical_paged(
+            namespace,
+            query,
+            0,
+            limit,
+            include_tasks,
+            include_archived,
+            domains,
+            principal,
+            include_code_ast,
+        )
+        .await
+    }
+
+    /// Page a Tantivy lexical search. `offset` skips ranked candidates an
+    /// earlier truncated page already consumed; `next_offset` reports where
+    /// the next page resumes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_tantivy_lexical_paged(
+        &self,
+        namespace: &str,
+        query: &str,
+        offset: usize,
+        limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
+        domains: &[String],
+        principal: &str,
+        include_code_ast: bool,
+    ) -> Result<crate::traits::LexicalSearchOutcome> {
         self.init(namespace).await?;
+        let now = chrono::Utc::now().timestamp();
         if self
             .tantivy_lexical
             .read()
@@ -9262,6 +9303,8 @@ impl LadybugStore {
         } else {
             Some(active.active_generations_u64())
         };
+        let window = limit.max(1) * 4;
+        let fetch = offset.saturating_add(window);
         let hits = {
             let guard = self
                 .tantivy_lexical
@@ -9271,7 +9314,7 @@ impl LadybugStore {
             idx.search_with_active_generations(
                 namespace,
                 query,
-                limit.max(1) * 4,
+                fetch,
                 include_tasks,
                 include_archived,
                 None,
@@ -9279,8 +9322,11 @@ impl LadybugStore {
                 include_code_ast,
             )?
         };
+        // The caller's cursor skips candidates consumed by an earlier page;
+        // `consumed` is how far this call advanced through the ranked list.
+        let consumed = hits.len().saturating_sub(offset.min(hits.len()));
         let mut candidates = Vec::new();
-        for hit in hits {
+        for hit in hits.into_iter().skip(offset) {
             // Defense in depth: the index query already scopes to `namespace`,
             // but a hit whose stored namespace drifted (stale cross-namespace
             // row) must not surface outside its own namespace.
@@ -9309,17 +9355,11 @@ impl LadybugStore {
                 }
                 // Defense in depth: never surface an archived row when the
                 // caller excluded archived rows, even if its index entry
-                // predates the tombstone fix. Bool/int-tolerant, matching
-                // lexical::archived_flag (duplicated inline per convention).
-                if !include_archived {
-                    let archived = match payload.metadata.get("archived") {
-                        Some(v) if v.as_bool() == Some(true) => true,
-                        Some(v) => v.as_i64().map(|n| n != 0).unwrap_or(false),
-                        None => false,
-                    };
-                    if archived {
-                        continue;
-                    }
+                // predates the tombstone fix. Delegate to the canonical
+                // predicate so boolean, integer and unsigned tombstones are
+                // read identically everywhere.
+                if !include_archived && is_archived(&payload.metadata) {
+                    continue;
                 }
                 // Defense in depth: registry and mesh-conflicting rows are
                 // excluded at index time, but a stale index entry must not
@@ -9333,7 +9373,7 @@ impl LadybugStore {
                 // is_retired_at predicate defined in this module: a non-null
                 // valid_to that does not parse as an integer reads as 0,
                 // i.e. retired.
-                if is_retired_at(&payload.metadata, chrono::Utc::now().timestamp()) {
+                if is_retired_at(&payload.metadata, now) {
                     continue;
                 }
                 if !crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
@@ -9371,10 +9411,33 @@ impl LadybugStore {
         } else {
             candidates
         };
+        // A full candidate window that hydration whittled down to a short page
+        // is not a complete answer: eligible rows may sit just below it.
+        let incomplete = results.len() < limit && consumed >= window;
         results.truncate(limit);
+        // Re-read pointers and payloads at the seam so a concurrent archive or
+        // ACL revoke cannot survive into the response.
+        let recheck_ns = namespace.to_string();
+        let current = self
+            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &recheck_ns)))
+            .await?;
+        let results = revalidate_lexical_results(
+            self,
+            namespace,
+            results,
+            &current,
+            principal,
+            include_tasks,
+            include_archived,
+            include_code_ast,
+            now,
+        )
+        .await?;
         Ok(crate::traits::LexicalSearchOutcome {
             results,
             domain_filter_applied,
+            incomplete,
+            next_offset: offset.saturating_add(consumed),
         })
     }
 
@@ -10225,6 +10288,313 @@ impl LadybugStore {
         }
         Ok(())
     }
+}
+
+/// Hydrate one batch of lexical hits through every store-side veto.
+/// Returns accepted results plus the ids vetoed *only* by the hydrated
+/// payload domain predicate, so a stale index domain can trigger the
+/// documented unfiltered retry without re-admitting the stale rows.
+#[allow(clippy::too_many_arguments)]
+async fn hydrate_lexical_hits(
+    store: &LadybugStore,
+    namespace: &str,
+    hits: Vec<crate::fts::LexicalHit>,
+    options: &crate::fts::SearchOptions,
+    active: &ActiveGenerations,
+    check_domain: bool,
+    skip: &std::collections::HashSet<String>,
+    seen: &mut std::collections::HashSet<String>,
+    remaining: usize,
+) -> Result<(
+    Vec<crate::traits::SearchResult>,
+    std::collections::HashSet<String>,
+)> {
+    let mut accepted = Vec::new();
+    let mut domain_vetoed = std::collections::HashSet::new();
+    for hit in hits {
+        if accepted.len() >= remaining {
+            break;
+        }
+        if skip.contains(&hit.id) || !seen.insert(hit.id.clone()) {
+            continue;
+        }
+        let Some((_, payload)) = store.get(namespace, &hit.id).await? else {
+            continue;
+        };
+        if !active.reaches_source(
+            &hit.id,
+            namespace,
+            &payload.memory_type,
+            row_source_key(&payload.metadata),
+        ) {
+            continue;
+        }
+        // Backstop: re-derive the index doc from the hydrated payload and
+        // apply the query path's own verdict under the same options.
+        let derived = LadybugStore::lexical_doc(namespace, &hit.id, &payload);
+        if !crate::fts::doc_visible(&derived, options) {
+            continue;
+        }
+        if check_domain && !crate::fts::domain_matches(&derived, &options.domains) {
+            domain_vetoed.insert(hit.id);
+            continue;
+        }
+        accepted.push(crate::traits::SearchResult {
+            id: hit.id,
+            score: hit.score,
+            payload,
+            evidence: Some(vec![crate::traits::SearchEvidence {
+                kind: crate::traits::EvidenceKind::DirectMatch,
+                path: Vec::new(),
+                explanation: "This memory matched the lexical query.".to_string(),
+                derivation: vec!["lexical-inhouse".to_string()],
+            }]),
+        });
+    }
+    Ok((accepted, domain_vetoed))
+}
+
+/// Re-read pointers after the async hydration awaits and drop results a
+/// concurrent publish has superseded. Returns the number dropped.
+fn retain_reachable_lexical_results(
+    results: &mut Vec<crate::traits::SearchResult>,
+    active: &ActiveGenerations,
+    namespace: &str,
+) -> usize {
+    let before = results.len();
+    results.retain(|r| {
+        active.reaches_source(
+            &r.id,
+            namespace,
+            &r.payload.memory_type,
+            row_source_key(&r.payload.metadata),
+        )
+    });
+    before - results.len()
+}
+
+/// Final visibility gate: re-read every payload immediately before the search
+/// returns and re-apply the full store-side predicate set. A writer that
+/// archives a row or revokes its ACL between hydration and the response must
+/// not leave a revoked row in the page. Refreshed payloads are copied back so
+/// the response never carries pre-revocation metadata.
+async fn revalidate_lexical_results(
+    store: &LadybugStore,
+    namespace: &str,
+    results: Vec<crate::traits::SearchResult>,
+    active: &ActiveGenerations,
+    principal: &str,
+    include_tasks: bool,
+    include_archived: bool,
+    include_code_ast: bool,
+    now: i64,
+) -> Result<Vec<crate::traits::SearchResult>> {
+    let mut kept = Vec::with_capacity(results.len());
+    for mut result in results {
+        let Some((_, payload)) = store.get(namespace, &result.id).await? else {
+            continue;
+        };
+        if !active.reaches_source(
+            &result.id,
+            namespace,
+            &payload.memory_type,
+            row_source_key(&payload.metadata),
+        ) {
+            continue;
+        }
+        if !include_tasks && payload.memory_type == "task" {
+            continue;
+        }
+        if !include_code_ast
+            && (payload.memory_type == "code_ast" || payload.memory_type == "doc_section")
+        {
+            continue;
+        }
+        if !include_archived && is_archived(&payload.metadata) {
+            continue;
+        }
+        if is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
+            continue;
+        }
+        if is_retired_at(&payload.metadata, now) {
+            continue;
+        }
+        if !crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
+            continue;
+        }
+        result.payload = payload;
+        kept.push(result);
+    }
+    Ok(kept)
+}
+
+/// Page an in-house lexical search. `offset` skips ranked candidates an
+/// earlier truncated page already consumed; `next_offset` reports where the
+/// next page resumes. The caller's limit and the bounded scan cap stay
+/// separate so a capped page is never presented as complete.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn search_lexical_paged(
+    store: &LadybugStore,
+    namespace: &str,
+    query: &str,
+    offset: usize,
+    requested_limit: usize,
+    include_tasks: bool,
+    include_archived: bool,
+    domains: &[String],
+    principal: &str,
+    fuzzy_max_distance: usize,
+) -> Result<crate::traits::LexicalSearchOutcome> {
+    store.ensure_lexical_loaded(namespace).await?;
+    let limit = requested_limit.min(MAX_LEXICAL_SCAN_ROWS);
+    let cap_restricted = requested_limit > limit;
+    let ns_owned = namespace.to_string();
+    let mut active = store
+        .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &ns_owned)))
+        .await?;
+    store.refresh_ontology(namespace).await;
+    let ontology = store.get_ontology(namespace);
+    let mut expanded: Vec<String> = Vec::new();
+    for d in domains {
+        if let Some(slug) = ontology.canonical_slug(d) {
+            for e in ontology.expand_domain(&slug) {
+                expanded.push(e);
+            }
+        } else if let Some(s) = crate::domain::normalize_domain_slug(d) {
+            expanded.push(s);
+        }
+    }
+    let now = chrono::Utc::now().timestamp();
+    let mut options = crate::fts::SearchOptions {
+        now,
+        as_of: None,
+        include_tasks,
+        include_archived,
+        principal: principal.to_string(),
+        domains: expanded,
+        fuzzy_max_distance: fuzzy_max_distance.min(2),
+        limit,
+    };
+    // Hydration vetoes (generation reachability, ACL, retirement and the
+    // stale-index backstops) can drop hits after the index filled the page.
+    let cap = MAX_LEXICAL_SCAN_ROWS.max(limit);
+    let mut window = limit.saturating_mul(4).max(limit).min(cap);
+    let mut results = Vec::with_capacity(limit);
+    let mut seen = std::collections::HashSet::new();
+    let mut domain_vetoed = std::collections::HashSet::new();
+    let mut domain_filter_applied = false;
+    let mut last_fetched;
+    loop {
+        options.limit = window;
+        let outcome = store
+            .lexical
+            .read()
+            .expect("lexical index lock")
+            .search(namespace, query, &options);
+        last_fetched = outcome.hits.len();
+        domain_filter_applied = outcome.domain_filter_applied;
+        // Resume below the prefix consumed by an earlier page.
+        let page_hits: Vec<_> = outcome.hits.into_iter().skip(offset).collect();
+        // Honor the index's own verdict: when the fts layer fell back to an
+        // unfiltered search because no row matched the domain, hydration must
+        // not re-apply the veto that the fallback deliberately lifted.
+        let (batch, vetoed) = hydrate_lexical_hits(
+            store,
+            namespace,
+            page_hits,
+            &options,
+            &active,
+            domain_filter_applied,
+            &std::collections::HashSet::new(),
+            &mut seen,
+            limit - results.len(),
+        )
+        .await?;
+        results.extend(batch);
+        domain_vetoed.extend(vetoed);
+        // Revalidate pointers after the async awaits; a publish may have
+        // flipped an active generation in the meantime.
+        let recheck_ns = namespace.to_string();
+        let current = store
+            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &recheck_ns)))
+            .await?;
+        let removed = retain_reachable_lexical_results(&mut results, &current, namespace);
+        active = current;
+        if results.len() >= limit || window >= cap {
+            break;
+        }
+        // A publish race can drop a hit after hydration filled the page. Keep
+        // widening while either vetoes or that revalidation left eligible
+        // candidates below the examined prefix.
+        if last_fetched < window && removed == 0 {
+            break;
+        }
+        window = window.saturating_mul(2).min(cap);
+    }
+
+    let mut incomplete = results.len() < limit && window >= cap;
+    if results.is_empty() && !domain_vetoed.is_empty() && !options.domains.is_empty() {
+        // Stale index domain metadata selected hits whose hydrated payloads
+        // reject the domain: retry unfiltered, but never re-admit those ids.
+        let mut fallback_options = options.clone();
+        fallback_options.domains.clear();
+        fallback_options.limit = cap;
+        let fallback = store.lexical.read().expect("lexical index lock").search(
+            namespace,
+            query,
+            &fallback_options,
+        );
+        let fallback_fetched = fallback.hits.len();
+        let (mut fallback_results, _) = hydrate_lexical_hits(
+            store,
+            namespace,
+            fallback.hits,
+            &fallback_options,
+            &active,
+            false,
+            &domain_vetoed,
+            &mut seen,
+            limit,
+        )
+        .await?;
+        let recheck_ns = namespace.to_string();
+        let current = store
+            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &recheck_ns)))
+            .await?;
+        retain_reachable_lexical_results(&mut fallback_results, &current, namespace);
+        results = fallback_results;
+        active = current;
+        domain_filter_applied = false;
+        incomplete = results.len() < limit && fallback_fetched >= cap;
+    }
+    // A request larger than the scan cap cannot be satisfied even when the
+    // capped page is full: say so instead of implying completion.
+    incomplete |= cap_restricted && results.len() >= limit;
+
+    let recheck_ns = namespace.to_string();
+    let current = store
+        .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &recheck_ns)))
+        .await?;
+    let before_revalidation = results.len();
+    let results = revalidate_lexical_results(
+        store,
+        namespace,
+        results,
+        &current,
+        principal,
+        include_tasks,
+        include_archived,
+        true,
+        now,
+    )
+    .await?;
+    incomplete |= results.len() < before_revalidation;
+    Ok(crate::traits::LexicalSearchOutcome {
+        results,
+        domain_filter_applied,
+        incomplete,
+        next_offset: offset.saturating_add(seen.len()),
+    })
 }
 
 #[async_trait]
@@ -11457,75 +11827,19 @@ impl VectorStore for LadybugStore {
         principal: &str,
         fuzzy_max_distance: usize,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
-        self.ensure_lexical_loaded(namespace).await?;
-        // #149 C2.4: the in-memory partition is filtered at load, but a row
-        // staged after that load (or left by a failed refresh) is re-checked
-        // against the pointers on hydration.
-        let ns_owned = namespace.to_string();
-        let active = self
-            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &ns_owned)))
-            .await?;
-        self.refresh_ontology(namespace).await;
-        let ontology = self.get_ontology(namespace);
-        // Domain ontology expansion: expand domain slugs before filtering
-        // (mirrors search_with_domain at ladybug.rs:2895).
-        let mut expanded: Vec<String> = Vec::new();
-        for d in domains {
-            if let Some(slug) = ontology.canonical_slug(d) {
-                for e in ontology.expand_domain(&slug) {
-                    expanded.push(e);
-                }
-            } else if let Some(s) = crate::domain::normalize_domain_slug(d) {
-                expanded.push(s);
-            }
-        }
-        let expanded_domains: Vec<String> = expanded.into_iter().collect();
-        let options = crate::fts::SearchOptions {
-            now: chrono::Utc::now().timestamp(),
-            as_of: None,
+        search_lexical_paged(
+            self,
+            namespace,
+            query,
+            0,
+            limit,
             include_tasks,
             include_archived,
-            principal: principal.to_string(),
-            domains: expanded_domains,
-            fuzzy_max_distance: fuzzy_max_distance.min(2),
-            limit,
-        };
-        let outcome = self
-            .lexical
-            .read()
-            .expect("lexical index lock")
-            .search(namespace, query, &options);
-
-        let mut results = Vec::with_capacity(outcome.hits.len());
-        for hit in outcome.hits {
-            let Some((_, payload)) = self.get(namespace, &hit.id).await? else {
-                continue;
-            };
-            if !active.reaches_source(
-                &hit.id,
-                namespace,
-                &payload.memory_type,
-                row_source_key(&payload.metadata),
-            ) {
-                continue;
-            }
-            results.push(SearchResult {
-                id: hit.id,
-                score: hit.score,
-                payload,
-                evidence: Some(vec![crate::traits::SearchEvidence {
-                    kind: crate::traits::EvidenceKind::DirectMatch,
-                    path: Vec::new(),
-                    explanation: "This memory matched the lexical query.".to_string(),
-                    derivation: vec!["lexical-inhouse".to_string()],
-                }]),
-            });
-        }
-
-        Ok(crate::traits::LexicalSearchOutcome {
-            results,
-            domain_filter_applied: outcome.domain_filter_applied,
-        })
+            domains,
+            principal,
+            fuzzy_max_distance,
+        )
+        .await
     }
 
     async fn rebuild_lexical_index(&self, namespace: Option<&str>) -> Result<usize> {
@@ -33346,6 +33660,952 @@ eurostrata\src\daemon.rs",
             top10.iter().any(|r| r.id == "governing-rule"),
             "slot reservation must preserve the 1-hop GOVERNS rule in top-10 despite 10 structural code_ast hits: {:?}",
             result_ids(&top10)
+        );
+    }
+    // Index-corruption helper: the STORED row carries the true
+    // restriction for `class`; the in-house
+    // index doc is then doctored directly to the permissive value for that
+    // one class, so the fts query verdict alone would serve the row. Only a
+    // hydration backstop that re-derives the doc from the stored payload
+    // can drop it. Returns the ids search_lexical serves to bob.
+    async fn corrupted_index_search_ids(class: &str) -> Vec<String> {
+        let store = retired_test_store().await;
+        let (id, mut payload) = match class {
+            "visible_to" => (
+                "corrupt-visible-to",
+                retired_test_payload("fact", "owner", json!({"visible_to": ["alice"]})),
+            ),
+            "registry" => (
+                "corrupt-registry",
+                retired_test_payload(
+                    "fact",
+                    "owner",
+                    crate::registry::registry_metadata(&["auth".to_string()]),
+                ),
+            ),
+            "archived" => (
+                "corrupt-archived",
+                retired_test_payload("fact", "owner", json!({"archived": true})),
+            ),
+            "archived-int" => (
+                "corrupt-archived-int",
+                retired_test_payload("fact", "owner", json!({"archived": 1})),
+            ),
+            "valid_to" => (
+                "corrupt-valid-to",
+                retired_test_payload("fact", "owner", json!({"valid_to": 1})),
+            ),
+            "conflicting" => (
+                "corrupt-conflicting",
+                retired_test_payload("fact", "owner", json!({"mesh": {"conflict": true}})),
+            ),
+            "structural" => (
+                "corrupt-structural",
+                retired_test_payload("directory", "owner", json!({})),
+            ),
+            other => panic!("unknown corruption class {other}"),
+        };
+        payload.content = "corrupttoken corrupted row".to_string();
+        store
+            .upsert("probe", id, vec![0.0; 4], payload.clone())
+            .await
+            .unwrap();
+        // Force the namespace into the loaded set, then seed/replace the
+        // index doc directly (registry/conflicting/structural rows never
+        // enter via add/upsert, so the doctored doc is upserted here).
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let mut doctored = LadybugStore::lexical_doc("probe", id, &payload);
+        match class {
+            "visible_to" => doctored.visible_to = Vec::new(),
+            "registry" => doctored.registry = false,
+            "archived" | "archived-int" => doctored.archived = false,
+            "valid_to" => {
+                doctored.valid_to = Some(chrono::Utc::now().timestamp() + 3600);
+            }
+            "conflicting" => doctored.conflicting = false,
+            "structural" => doctored.structural = false,
+            _ => unreachable!(),
+        }
+        store
+            .lexical
+            .write()
+            .expect("lexical index lock")
+            .upsert(doctored);
+        // Pin the precondition: the doctored index doc must actually be
+        // matched by the raw lexical query. Without this assertion the
+        // backstop tests would pass vacuously if the query never reached
+        // the corrupted row at all.
+        let raw_options = crate::fts::SearchOptions {
+            principal: "admin".to_string(),
+            include_tasks: true,
+            include_archived: true,
+            limit: 10,
+            ..crate::fts::SearchOptions::default()
+        };
+        let raw_ids = store
+            .lexical
+            .read()
+            .expect("lexical index lock")
+            .search("probe", "corrupttoken", &raw_options)
+            .hits
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>();
+        assert!(
+            raw_ids.iter().any(|raw_id| raw_id == id),
+            "doctored index doc for class {class} must be matched by the raw query before the backstop can be tested, got: {raw_ids:?}"
+        );
+        let outcome = store
+            .search_lexical("probe", "corrupttoken", 10, false, false, &[], "bob", 2)
+            .await
+            .expect("lexical search as bob");
+        outcome.results.iter().map(|r| r.id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_archived_index_corruption() {
+        let ids = corrupted_index_search_ids("archived").await;
+        assert!(
+            ids.is_empty(),
+            "archived-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_conflicting_index_corruption() {
+        let ids = corrupted_index_search_ids("conflicting").await;
+        assert!(
+            ids.is_empty(),
+            "conflicting-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_registry_index_corruption() {
+        let ids = corrupted_index_search_ids("registry").await;
+        assert!(
+            ids.is_empty(),
+            "registry-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_structural_index_corruption() {
+        let ids = corrupted_index_search_ids("structural").await;
+        assert!(
+            ids.is_empty(),
+            "structural-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_valid_to_index_corruption() {
+        let ids = corrupted_index_search_ids("valid_to").await;
+        assert!(
+            ids.is_empty(),
+            "valid_to-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_visible_to_index_corruption() {
+        let ids = corrupted_index_search_ids("visible_to").await;
+        assert!(
+            ids.is_empty(),
+            "visible_to-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_integer_archived_index_corruption() {
+        let ids = corrupted_index_search_ids("archived-int").await;
+        assert!(
+            ids.is_empty(),
+            "integer-archived row must be an archived tombstone even when its index doc says otherwise, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_domain_index_corruption() {
+        let store = retired_test_store().await;
+        let id = "corrupt-domain";
+        let mut payload = retired_test_payload("fact", "owner", json!({"domain": "alpha"}));
+        payload.content = "domaincorrupttoken row".to_string();
+        store
+            .upsert("probe", id, vec![0.0; 4], payload.clone())
+            .await
+            .unwrap();
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let mut doctored = LadybugStore::lexical_doc("probe", id, &payload);
+        doctored.domains = vec!["beta".to_string()];
+        store
+            .lexical
+            .write()
+            .expect("lexical index lock")
+            .upsert(doctored);
+        let raw_options = crate::fts::SearchOptions {
+            domains: vec!["beta".to_string()],
+            limit: 10,
+            ..crate::fts::SearchOptions::default()
+        };
+        let raw_ids = store
+            .lexical
+            .read()
+            .expect("lexical index lock")
+            .search("probe", "domaincorrupttoken", &raw_options)
+            .hits
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>();
+        assert!(
+            raw_ids.iter().any(|raw_id| raw_id == id),
+            "doctored domain index doc must be matched by the raw query, got: {raw_ids:?}"
+        );
+        let outcome = store
+            .search_lexical(
+                "probe",
+                "domaincorrupttoken",
+                10,
+                false,
+                false,
+                &["beta".to_string()],
+                "admin",
+                2,
+            )
+            .await
+            .expect("lexical search as admin");
+        assert!(
+            outcome.results.is_empty(),
+            "row stored in domain alpha must not surface for a beta domain query, got: {:?}",
+            outcome
+                .results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_backfills_page_after_hydration_rejects() {
+        let store = retired_test_store().await;
+        for i in 0..8 {
+            let id = format!("overfetch-{i}");
+            let archived = i < 5;
+            let mut payload = retired_test_payload("fact", "owner", json!({"archived": archived}));
+            payload.content = "overfetchtoken candidate row".to_string();
+            store
+                .upsert("probe", &id, vec![0.0; 4], payload.clone())
+                .await
+                .unwrap();
+            store.ensure_lexical_loaded("probe").await.unwrap();
+            if archived {
+                let mut doctored = LadybugStore::lexical_doc("probe", &id, &payload);
+                doctored.archived = false;
+                store
+                    .lexical
+                    .write()
+                    .expect("lexical index lock")
+                    .upsert(doctored);
+            }
+        }
+        let outcome = store
+            .search_lexical("probe", "overfetchtoken", 2, false, false, &[], "admin", 2)
+            .await
+            .expect("lexical search as admin");
+        let ids = outcome
+            .results
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["overfetch-5".to_string(), "overfetch-6".to_string()],
+            "hydration rejects must backfill from the unarchived candidates, got: {ids:?}"
+        );
+        for result in &outcome.results {
+            assert!(
+                !is_archived(&result.payload.metadata),
+                "doctored archived row {} must never fill a page slot",
+                result.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn is_archived_recognizes_unsigned_tombstone_beyond_i64() {
+        assert!(is_archived(&json!({"archived": u64::MAX})));
+        assert!(!is_archived(&json!({"archived": 0_u64})));
+    }
+
+    #[tokio::test]
+    async fn lexical_search_clamps_oversized_limit() {
+        let store = retired_test_store().await;
+        for i in 0..3 {
+            let mut payload = retired_test_payload("fact", "owner", json!({}));
+            payload.content = "hugelimittoken candidate row".to_string();
+            store
+                .upsert("probe", &format!("huge-{i}"), vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let outcome = store
+            .search_lexical(
+                "probe",
+                "hugelimittoken",
+                usize::MAX,
+                false,
+                false,
+                &[],
+                "admin",
+                2,
+            )
+            .await
+            .expect("an oversized limit must be clamped, not panic");
+        assert_eq!(
+            outcome.results.len(),
+            3,
+            "clamping must still return every eligible row"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_retries_unfiltered_after_stale_domain_vetoes() {
+        let store = retired_test_store().await;
+        let stale = "domain-stale";
+        let mut stale_payload = retired_test_payload("fact", "owner", json!({"domain": "alpha"}));
+        stale_payload.content = "domainfallbacktoken candidate row".to_string();
+        store
+            .upsert("probe", stale, vec![0.0; 4], stale_payload.clone())
+            .await
+            .unwrap();
+        let outside = "domain-outside";
+        let mut outside_payload = retired_test_payload("fact", "owner", json!({"domain": "gamma"}));
+        outside_payload.content = "domainfallbacktoken candidate row".to_string();
+        store
+            .upsert("probe", outside, vec![0.0; 4], outside_payload)
+            .await
+            .unwrap();
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let mut doctored = LadybugStore::lexical_doc("probe", stale, &stale_payload);
+        doctored.domains = vec!["beta".to_string()];
+        store
+            .lexical
+            .write()
+            .expect("lexical index lock")
+            .upsert(doctored);
+        let outcome = store
+            .search_lexical(
+                "probe",
+                "domainfallbacktoken",
+                10,
+                false,
+                false,
+                &["beta".to_string()],
+                "admin",
+                2,
+            )
+            .await
+            .expect("lexical search as admin");
+        let ids = outcome
+            .results
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![outside.to_string()],
+            "stale-domain row must stay out while other matches surface via fallback"
+        );
+        assert!(
+            !outcome.domain_filter_applied,
+            "the fallback must report the domain filter as not applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_marks_truncation_after_vetoed_prefix() {
+        let store = retired_test_store().await;
+        for i in 0..1026 {
+            let id = format!("prefix-{i:04}");
+            let archived = i < 1024;
+            let mut payload = retired_test_payload("fact", "owner", json!({"archived": archived}));
+            payload.content = "prefixvetotoken candidate row".to_string();
+            store
+                .upsert("probe", &id, vec![0.0; 4], payload.clone())
+                .await
+                .unwrap();
+            store.ensure_lexical_loaded("probe").await.unwrap();
+            if archived {
+                let mut doctored = LadybugStore::lexical_doc("probe", &id, &payload);
+                doctored.archived = false;
+                store
+                    .lexical
+                    .write()
+                    .expect("lexical index lock")
+                    .upsert(doctored);
+            }
+        }
+        let outcome = store
+            .search_lexical("probe", "prefixvetotoken", 2, false, false, &[], "admin", 2)
+            .await
+            .expect("lexical search as admin");
+        assert!(
+            outcome.incomplete,
+            "a vetoed prefix that exhausts the candidate cap must be reported as truncated"
+        );
+        assert!(
+            outcome.results.is_empty(),
+            "rows beyond the cap must not be silently invented, got: {:?}",
+            outcome
+                .results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_domain_fallback_keeps_out_of_domain_hits() {
+        let store = retired_test_store().await;
+        for i in 0..3 {
+            let mut payload = retired_test_payload("fact", "owner", json!({"domain": "gamma"}));
+            payload.content = "domainmissfallbacktoken candidate row".to_string();
+            store
+                .upsert("probe", &format!("miss-{i}"), vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let outcome = store
+            .search_lexical(
+                "probe",
+                "domainmissfallbacktoken",
+                3,
+                false,
+                false,
+                &["beta".to_string()],
+                "admin",
+                2,
+            )
+            .await
+            .expect("lexical search as admin");
+        assert_eq!(
+            outcome.results.len(),
+            3,
+            "the documented no-domain-hits fallback must return unfiltered matches, got: {:?}",
+            outcome
+                .results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !outcome.domain_filter_applied,
+            "fallback must report the domain filter as not applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_reports_incomplete_when_request_exceeds_cap() {
+        let store = retired_test_store().await;
+        for i in 0..(MAX_LEXICAL_SCAN_ROWS + 2) {
+            let mut payload = retired_test_payload("fact", "owner", json!({}));
+            payload.content = "captrunctoken candidate row".to_string();
+            store
+                .upsert("probe", &format!("cap-{i:04}"), vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let outcome = store
+            .search_lexical(
+                "probe",
+                "captrunctoken",
+                MAX_LEXICAL_SCAN_ROWS + 4,
+                false,
+                false,
+                &[],
+                "admin",
+                2,
+            )
+            .await
+            .expect("lexical search as admin");
+        assert_eq!(
+            outcome.results.len(),
+            MAX_LEXICAL_SCAN_ROWS,
+            "the scan cap bounds the page"
+        );
+        assert!(
+            outcome.incomplete,
+            "a request larger than the scan cap must be reported as truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_paged_offset_continues_below_consumed_prefix() {
+        let store = retired_test_store().await;
+        for i in 0..6 {
+            let mut payload = retired_test_payload("fact", "owner", json!({}));
+            payload.content = format!("pagetoken candidate row {i}");
+            store
+                .upsert("probe", &format!("page-{i}"), vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let outcome = search_lexical_paged(
+            &store,
+            "probe",
+            "pagetoken",
+            3,
+            2,
+            false,
+            false,
+            &[],
+            "admin",
+            2,
+        )
+        .await
+        .expect("paged lexical search");
+        let ids = outcome
+            .results
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["page-3".to_string(), "page-4".to_string()],
+            "offset must skip candidates consumed by an earlier page"
+        );
+        assert_eq!(
+            outcome.next_offset, 5,
+            "the cursor must resume after the last candidate this page examined"
+        );
+    }
+
+    #[tokio::test]
+    async fn tantivy_short_page_marks_incomplete_after_hydration_vetoes() {
+        let store = retired_test_store().await;
+        let live = "tantivy-live";
+        let live_content = "tantivyshorttoken live row";
+        let live_payload = tantivy_exclusion_payload(live_content, json!({}));
+        store
+            .upsert("probe", live, vec![0.0; 4], live_payload.clone())
+            .await
+            .unwrap();
+        let archived_content = "tantivyshorttoken tantivyshorttoken tantivyshorttoken row";
+        for i in 0..4 {
+            let p = tantivy_exclusion_payload(archived_content, json!({"archived": true}));
+            store
+                .upsert("probe", &format!("tantivy-arch-{i}"), vec![0.0; 4], p)
+                .await
+                .unwrap();
+        }
+        // Index docs claim the archived rows are live, so TopDocs fills its
+        // candidate window with them before hydration reads the real payloads.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for i in 0..4 {
+            let stale = tantivy_exclusion_payload(archived_content, json!({}));
+            idx.upsert_memory("probe", &format!("tantivy-arch-{i}"), &stale)
+                .unwrap();
+        }
+        idx.upsert_memory("probe", live, &live_payload).unwrap();
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+
+        let outcome = store
+            .search_tantivy_lexical("probe", "tantivyshorttoken", 1, false, false, &[], "tester")
+            .await
+            .expect("tantivy lexical search");
+        assert!(
+            outcome.results.iter().all(|r| r.id == live),
+            "hydrated archived rows must never surface, got: {:?}",
+            outcome
+                .results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            outcome.incomplete,
+            "a short Tantivy page after hydration vetoes must be marked incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_revalidation_drops_rows_archived_after_hydration() {
+        let store = retired_test_store().await;
+        let payload = retired_test_payload("fact", "owner", json!({}));
+        store
+            .upsert("probe", "revoked", vec![0.0; 4], payload.clone())
+            .await
+            .unwrap();
+        let (_, hydrated) = store.get("probe", "revoked").await.unwrap().unwrap();
+        let result = crate::traits::SearchResult {
+            id: "revoked".to_string(),
+            score: 0.0,
+            payload: hydrated,
+            evidence: None,
+        };
+        // A writer archives the row between hydration and the return.
+        let mut archived = payload.clone();
+        archived.metadata = json!({"archived": true});
+        store
+            .upsert("probe", "revoked", vec![0.0; 4], archived)
+            .await
+            .unwrap();
+        let active = store
+            .with_conn(|conn| Ok(ActiveGenerations::read(conn, "probe")))
+            .await
+            .unwrap();
+        let kept = revalidate_lexical_results(
+            &store,
+            "probe",
+            vec![result],
+            &active,
+            "owner",
+            false,
+            false,
+            true,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            kept.is_empty(),
+            "a row archived after hydration must be dropped just before return"
+        );
+    }
+
+    // Fresh-load: the bob assertion below must hold against a fresh
+    // load from stored rows (rebuild_lexical_index clears the loaded
+    // set and re-derives every lexical doc via ensure_lexical_loaded), not
+    // only in the long-lived index built by the upserts above.
+    #[tokio::test]
+    async fn lexical_search_enforces_acl_after_fresh_index_load() {
+        let store = retired_test_store().await;
+        for (id, metadata) in [
+            (
+                "object-acl",
+                json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
+            ),
+            (
+                "malformed-acl",
+                json!({"visible_to": [{"unexpected": "x"}]}),
+            ),
+        ] {
+            let mut payload = retired_test_payload("fact", "owner", metadata);
+            payload.content = "quixotic freshload row".to_string();
+            store
+                .upsert("probe", id, vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        let rebuilt = store
+            .rebuild_lexical_index(Some("probe"))
+            .await
+            .expect("rebuild the lexical index from stored rows");
+        assert_eq!(rebuilt, 2);
+        let bob = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "bob", 2)
+            .await
+            .expect("lexical search as bob after fresh load");
+        let bob_ids: Vec<String> = bob.results.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            bob_ids.is_empty(),
+            "bob must not retrieve ACL-restricted rows after fresh load, got: {bob_ids:?}"
+        );
+        let alice = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "alice", 2)
+            .await
+            .expect("lexical search as alice after fresh load");
+        let alice_ids: Vec<String> = alice.results.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            alice_ids.contains(&"object-acl".to_string()),
+            "alice must retrieve the object-form ACL row after fresh load, got: {alice_ids:?}"
+        );
+        assert!(
+            !alice_ids.contains(&"malformed-acl".to_string()),
+            "all-malformed visible_to must fail closed after fresh load, got: {alice_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_enforces_object_form_visible_to_acl() {
+        // Regression: lexical_doc parsed visible_to with as_str() only,
+        // so object-form entries
+        // ({"principal":"alice","role":"viewer"}) were dropped, leaving an
+        // empty ACL — which acl_allows treats as unrestricted for viewers.
+        // A memory restricted via the object form was therefore retrievable
+        // by ANY principal through the in-house lexical search path.
+        let store = retired_test_store().await;
+
+        for (id, metadata) in [
+            (
+                "object-acl",
+                json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
+            ),
+            ("string-acl", json!({"visible_to": ["alice"]})),
+            (
+                "malformed-acl",
+                json!({"visible_to": [{"unexpected": "x"}]}),
+            ),
+        ] {
+            let mut payload = retired_test_payload("fact", "owner", metadata);
+            payload.content = "quixotic restricted row".to_string();
+            store
+                .upsert("probe", id, vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+
+        let ids_for = |outcome: &crate::traits::LexicalSearchOutcome| {
+            outcome
+                .results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // A different principal must see none of the restricted rows.
+        let bob = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "bob", 2)
+            .await
+            .expect("lexical search as bob");
+        let bob_ids = ids_for(&bob);
+        assert!(
+            bob_ids.is_empty(),
+            "bob must not retrieve ACL-restricted rows, got: {bob_ids:?}"
+        );
+
+        // The named principal sees the object- and string-form rows, but
+        // not the all-malformed row (fail-closed, not unrestricted).
+        let alice = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "alice", 2)
+            .await
+            .expect("lexical search as alice");
+        let alice_ids = ids_for(&alice);
+        assert!(
+            alice_ids.contains(&"object-acl".to_string()),
+            "alice must retrieve the object-form ACL row, got: {alice_ids:?}"
+        );
+        assert!(
+            alice_ids.contains(&"string-acl".to_string()),
+            "alice must retrieve the string-form ACL row, got: {alice_ids:?}"
+        );
+        assert!(
+            !alice_ids.contains(&"malformed-acl".to_string()),
+            "all-malformed visible_to must fail closed, got: {alice_ids:?}"
+        );
+    }
+
+    // Wildcard/mixed guards for the canonical extraction: an
+    // object-wildcard {"principal":"*"} row stays viewer-visible to an
+    // arbitrary principal, and a mixed string+object visible_to row admits
+    // the object-named principal.
+    #[tokio::test]
+    async fn lexical_search_wildcard_and_mixed_visible_to_guards() {
+        let store = retired_test_store().await;
+        for (id, metadata) in [
+            (
+                "object-wildcard",
+                json!({"visible_to": [{"principal": "*", "role": "viewer"}]}),
+            ),
+            (
+                "mixed-acl",
+                json!({"visible_to": ["alice", {"principal": "carol", "role": "viewer"}]}),
+            ),
+        ] {
+            let mut payload = retired_test_payload("fact", "owner", metadata);
+            payload.content = "quixotic guard row".to_string();
+            store
+                .upsert("probe", id, vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        let bob = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "bob", 2)
+            .await
+            .expect("lexical search as bob");
+        let bob_ids: Vec<String> = bob.results.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            bob_ids.contains(&"object-wildcard".to_string()),
+            "object-wildcard row must stay viewer-visible to bob, got: {bob_ids:?}"
+        );
+        assert!(
+            !bob_ids.contains(&"mixed-acl".to_string()),
+            "mixed-acl row must not be visible to bob, got: {bob_ids:?}"
+        );
+        let carol = store
+            .search_lexical("probe", "quixotic", 10, false, false, &[], "carol", 2)
+            .await
+            .expect("lexical search as carol");
+        let carol_ids: Vec<String> = carol.results.iter().map(|r| r.id.clone()).collect();
+        assert!(
+            carol_ids.contains(&"mixed-acl".to_string()),
+            "mixed string+object row must admit object-named carol, got: {carol_ids:?}"
+        );
+    }
+
+    // Rows with valid_to 0 and valid_to "soon" are retired under
+    // is_retired_at semantics (unparseable non-null reads as 0). A stale
+    // Tantivy entry (exclusion metadata stripped) must not surface them
+    // from search_tantivy_lexical; search_with_domain is the in-test
+    // control and must exclude them both pre- and post-fix.
+    #[tokio::test]
+    async fn tantivy_lexical_hydration_excludes_retired_valid_to_rows() {
+        let store = retired_test_store().await;
+        let zero_payload =
+            tantivy_exclusion_payload("retiretoken zero row", json!({"valid_to": 0}));
+        let soon_payload =
+            tantivy_exclusion_payload("retiretoken soon row", json!({"valid_to": "soon"}));
+        let clean_payload = tantivy_exclusion_payload("retiretoken clean row", json!({}));
+        for (id, payload) in [
+            ("retired-zero", &zero_payload),
+            ("retired-soon", &soon_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            store
+                .upsert("probe", id, vec![1.0, 0.0, 0.0, 0.0], payload.clone())
+                .await
+                .unwrap();
+        }
+        // Control: the vector/domain path already excludes both retired rows.
+        let control = store
+            .search_with_domain(
+                "probe",
+                vec![1.0, 0.0, 0.0, 0.0],
+                10,
+                false,
+                false,
+                &[],
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let control_ids: Vec<&str> = control.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            control_ids.contains(&"clean-row"),
+            "control must surface the clean row, got: {control_ids:?}"
+        );
+        assert!(
+            !control_ids.contains(&"retired-zero") && !control_ids.contains(&"retired-soon"),
+            "control (search_with_domain) must exclude both retired rows, got: {control_ids:?}"
+        );
+        // Seed a stale Tantivy index: same ids/content, metadata stripped.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for (id, payload) in [
+            ("retired-zero", &zero_payload),
+            ("retired-soon", &soon_payload),
+            ("clean-row", &clean_payload),
+        ] {
+            let mut stale = payload.clone();
+            stale.metadata = json!({});
+            idx.upsert_memory("probe", id, &stale).unwrap();
+        }
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+        let outcome = store
+            .search_tantivy_lexical("probe", "retiretoken", 10, false, false, &[], "tester")
+            .await
+            .unwrap();
+        let ids: Vec<&str> = outcome.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&"clean-row"),
+            "clean row must surface from tantivy search, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"retired-zero"),
+            "valid_to:0 row must not surface from tantivy search, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"retired-soon"),
+            "valid_to:\"soon\" row must not surface from tantivy search, got: {ids:?}"
+        );
+    }
+
+    // The hydration ACL check must derive the owner canonically
+    // (can_read_memory): a row whose payload
+    // user_id is empty but whose metadata names user_id alice is alice's
+    // row — admitted for alice, denied for bob, even though its ACL names
+    // only carol.
+    #[tokio::test]
+    async fn tantivy_lexical_hydration_uses_metadata_owner_for_acl() {
+        let store = retired_test_store().await;
+        let mut payload = tantivy_exclusion_payload(
+            "a1token metadata owner row",
+            json!({"user_id": "alice", "visible_to": ["carol"]}),
+        );
+        payload.user_id = String::new();
+        store
+            .upsert("probe", "metadata-owner-row", vec![0.0; 4], payload.clone())
+            .await
+            .unwrap();
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        idx.upsert_memory("probe", "metadata-owner-row", &payload)
+            .unwrap();
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+        let alice = store
+            .search_tantivy_lexical("probe", "a1token", 10, false, false, &[], "alice")
+            .await
+            .unwrap();
+        let alice_ids: Vec<&str> = alice.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            alice_ids.contains(&"metadata-owner-row"),
+            "metadata-derived owner alice must be admitted via tantivy search, got: {alice_ids:?}"
+        );
+        let bob = store
+            .search_tantivy_lexical("probe", "a1token", 10, false, false, &[], "bob")
+            .await
+            .unwrap();
+        let bob_ids: Vec<&str> = bob.results.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !bob_ids.contains(&"metadata-owner-row"),
+            "bob must be denied the metadata-owner row via tantivy search, got: {bob_ids:?}"
+        );
+    }
+
+    // Limit-fill: the top hits by the deterministic score-then-id sort
+    // (fts finalize: equal scores sort by id) are object-ACL-restricted
+    // to alice; searching as the excluded
+    // principal bob must still return a full `limit` of visible results,
+    // which requires the ACL to be applied BEFORE the limit truncates.
+    #[tokio::test]
+    async fn lexical_search_limit_fills_with_visible_results_past_restricted_top_hits() {
+        let store = retired_test_store().await;
+        for id in ["a-restricted-1", "a-restricted-2"] {
+            let mut payload = retired_test_payload(
+                "fact",
+                "owner",
+                json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
+            );
+            payload.content = "quixotic fillterm row".to_string();
+            store
+                .upsert("probe", id, vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        for id in ["b-visible-1", "b-visible-2", "b-visible-3"] {
+            let mut payload = retired_test_payload("fact", "owner", json!({}));
+            payload.content = "quixotic fillterm row".to_string();
+            store
+                .upsert("probe", id, vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        let bob = store
+            .search_lexical("probe", "quixotic", 3, false, false, &[], "bob", 2)
+            .await
+            .expect("lexical search as bob");
+        let bob_ids: Vec<String> = bob.results.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(
+            bob_ids,
+            vec![
+                "b-visible-1".to_string(),
+                "b-visible-2".to_string(),
+                "b-visible-3".to_string()
+            ],
+            "bob must get a full limit of visible results past the restricted top hits, got: {bob_ids:?}"
         );
     }
 }
