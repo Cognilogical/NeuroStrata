@@ -124,6 +124,65 @@ fn check_title(title: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Caller text a task stores and returns to later sessions (title,
+/// description, note, close reason) with each secret replaced by
+/// `[REDACTED:<category>]`; the categories are added to `found`. Task text is
+/// kept rather than refused, since a note written at session end has no one
+/// to fix a rejected call.
+fn redact_into(text: &str, found: &mut Vec<&'static str>) -> String {
+    let (scrubbed, categories) = crate::secrets::redact(text);
+    found.extend(categories);
+    scrubbed
+}
+
+/// A caller's title, redacted and checked. It is refused only when it is over
+/// the limit both as written and redacted: a pasted secret can make it too
+/// long, and a marker longer than a short secret must not make it too long.
+fn check_title_redacted(title: &str, found: &mut Vec<&'static str>) -> Result<String, String> {
+    let redacted = redact_into(title, found);
+    match check_title(&redacted) {
+        Ok(t) => Ok(t),
+        Err(e) if check_title(title).is_err() => Err(e),
+        Err(_) => Ok(redacted.trim().to_string()),
+    }
+}
+
+/// Every place a task row is written runs this, so task text from any path
+/// (bootstrap, imports, staged actions, notes that quote an older title) is
+/// stored redacted. The tools redact first to name the categories in their
+/// replies; running it again here changes nothing.
+fn redact_task_payload(payload: &mut MemoryPayload) {
+    payload.content = crate::secrets::redact(&payload.content).0;
+    let Some(task) = payload
+        .metadata
+        .get_mut("task")
+        .and_then(|t| t.as_object_mut())
+    else {
+        return;
+    };
+    for key in ["description", "close_reason"] {
+        if let Some(Value::String(text)) = task.get_mut(key) {
+            *text = crate::secrets::redact(text).0;
+        }
+    }
+    if let Some(history) = task.get_mut("history").and_then(|h| h.as_array_mut()) {
+        for entry in history {
+            if let Some(Value::String(note)) = entry.get_mut("note") {
+                *note = crate::secrets::redact(note).0;
+            }
+        }
+    }
+}
+
+/// The `redactions` reply field: one `{"category": ...}` per secret replaced,
+/// empty when none. Never the secret itself.
+fn redactions_json(found: &[&'static str]) -> Value {
+    json!(found
+        .iter()
+        .map(|category| json!({ "category": category }))
+        .collect::<Vec<_>>())
+}
+
 const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 /// How many fresh suffixes to try before declaring a collision problem.
 const ID_ATTEMPTS: usize = 64;
@@ -320,8 +379,9 @@ async fn save_task(
     namespace: &str,
     id: &str,
     vector: Vec<f32>,
-    payload: MemoryPayload,
+    mut payload: MemoryPayload,
 ) -> Result<(), String> {
+    redact_task_payload(&mut payload);
     store
         .init(namespace)
         .await
@@ -374,7 +434,7 @@ pub fn stage_task_transition_at(
         }
     }
     let ctx = machine::Ctx {
-        reason: note.to_string(),
+        reason: crate::secrets::redact(note).0,
         extraction_edge_exists: false,
         actor: actor.to_string(),
         session: session.to_string(),
@@ -427,6 +487,7 @@ async fn write_task_row(
         .init(namespace)
         .await
         .map_err(|_| "Failed to initialize table.".to_string())?;
+    let content = &crate::secrets::redact(content).0;
     let vector = emb
         .embed(content)
         .await
@@ -444,7 +505,7 @@ async fn write_task_row(
         metadata.insert(key, value);
     }
 
-    let payload = MemoryPayload {
+    let mut payload = MemoryPayload {
         content: content.to_string(),
         user_id: user_id.to_string(),
         memory_type: "task".to_string(),
@@ -453,6 +514,7 @@ async fn write_task_row(
         location_lines: String::new(),
         metadata: Value::Object(metadata),
     };
+    redact_task_payload(&mut payload);
     store
         .upsert(namespace, id, vector, payload.clone())
         .await
@@ -965,11 +1027,25 @@ fn persist_active_session_file_with_home(
             active.insert("subagent_prompt_injection".to_string(), json!(inj));
         }
         active.insert("updated_at".to_string(), json!(machine::timestamp()));
+    } else {
+        // No task is in progress: drop the fields a finished (completed or
+        // released) task left behind, or the session-start hook keeps
+        // announcing it as the active task.
+        for key in [
+            "task_id",
+            "active_task_id",
+            "status",
+            "session_id",
+            "subagent_prompt_injection",
+        ] {
+            active.remove(key);
+        }
+        active.insert("updated_at".to_string(), json!(machine::timestamp()));
     }
 
     if std::fs::create_dir_all(&ns_dir).is_ok() {
         if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
-            let _ = std::fs::write(&session_path, serialized);
+            let _ = harness_plugins::write_atomically(&session_path, &serialized);
         }
     }
 }
@@ -1092,6 +1168,238 @@ fn seed_expand_next_hops(namespace: &str, seeds: &[String], edges: &[Value]) -> 
         }
     }
     actions
+}
+
+/// Serializes every read-modify-write of `.NeuroStrata/active_session.json`
+/// (claim, snapshot, and the cleanup after a task ends), so a cleanup cannot
+/// clear the fields a concurrent claim has just written. One daemon process
+/// runs all of them (see [`claim_lock`]), so a process lock covers it.
+static SESSION_FILE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// The task id the session file at `project_root` currently names, if any,
+/// and the session id written with it.
+fn session_file_task_id(project_root: &std::path::Path) -> Option<(String, Option<String>)> {
+    let text = std::fs::read_to_string(
+        project_root
+            .join(".NeuroStrata")
+            .join("active_session.json"),
+    )
+    .ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    let task_id = value.get("task_id").and_then(|v| v.as_str())?.to_string();
+    Some((
+        task_id,
+        value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    ))
+}
+
+/// Whether a session file's claim is still the task row's claim: the same
+/// session holds it. A task another session has taken over (from another
+/// worktree) no longer belongs in this file. The claim's recorded worktree is
+/// not compared: a claim in a folder that is not a git checkout records the
+/// daemon's checkout while its session file is in the project folder.
+fn file_names_current_claim(file_session: Option<&str>, task: &Task) -> bool {
+    file_session == task.task_field("session_id").and_then(|v| v.as_str())
+}
+
+/// The row of task `id` read fresh: `Ok(Some)` when it is in progress and a
+/// snapshot would show it (not archived, expired or mesh-conflicting),
+/// `Ok(None)` when it is not, `Err` when the store could not be read. A read
+/// error is never taken as "finished".
+async fn in_progress_task(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    id: &str,
+) -> Result<Option<Task>, ()> {
+    let payload = match store.get(namespace, id).await {
+        Ok(Some((_, payload))) => payload,
+        Ok(None) => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let now = chrono::Utc::now().timestamp();
+    let expired = payload
+        .metadata
+        .get("valid_to")
+        .is_some_and(|v| !v.is_null() && v.as_i64().unwrap_or(0) <= now);
+    let task = Task {
+        id: id.to_string(),
+        payload,
+    };
+    let shown = task.payload.memory_type == "task"
+        && task.status() == Status::InProgress
+        && !expired
+        && !crate::handlers::archive_memory::is_archived(&task.payload)
+        && !crate::synaptic_mesh::conflict::is_conflicting(&task.payload);
+    Ok(shown.then_some(task))
+}
+
+/// [`persist_active_session_file`] under [`SESSION_FILE_LOCK`]. `claimed` is
+/// the row a claim has just saved, written as is. Otherwise a task is named
+/// only when its row is in progress at write time and its claim is in this
+/// worktree: the task the file already names (a claim that may have landed
+/// after the snapshot listed the tasks), else `candidate` (the task the
+/// snapshot found), else none. If a row cannot be read, the file is left as
+/// it is.
+pub(crate) async fn refresh_active_session_file(
+    store: &Arc<dyn VectorStore>,
+    project_root: &std::path::Path,
+    namespace: &str,
+    golden_rules: &[SearchResult],
+    claimed: Option<(&str, &MemoryPayload)>,
+    candidate: Option<&str>,
+) {
+    let _session_guard = SESSION_FILE_LOCK.lock().await;
+    if let Some(claimed) = claimed {
+        persist_active_session_file(project_root, namespace, golden_rules, Some(claimed));
+        return;
+    }
+    let mut active: Option<Task> = None;
+    // The task the file names counts only while the session that wrote it
+    // still holds the claim. The snapshot's candidate counts only while its
+    // claim is still in this worktree: another worktree may have taken it over
+    // between the snapshot's listing and this lock.
+    let root = project_root.to_string_lossy();
+    let claimed_here = |task: &Task| {
+        task.task_field("worktree")
+            .and_then(|v| v.as_str())
+            .is_some_and(|w| !w.is_empty() && crate::paths::same_location(w, &root))
+    };
+    let named = session_file_task_id(project_root);
+    // The file's own task comes first: a claim in this worktree that landed
+    // after the snapshot listed the tasks is newer than the snapshot's pick.
+    let candidates = named
+        .map(|(id, session)| (id, Some(session)))
+        .into_iter()
+        .chain(candidate.map(|id| (id.to_string(), None)));
+    for (id, file_session) in candidates {
+        match in_progress_task(store, namespace, &id).await {
+            Ok(Some(task))
+                if match file_session.as_ref() {
+                    Some(session) => file_names_current_claim(session.as_deref(), &task),
+                    None => claimed_here(&task),
+                } =>
+            {
+                active = Some(task);
+                break;
+            }
+            Ok(_) => {}
+            Err(()) => return,
+        }
+    }
+    // The block cached at claim time, without the rules retired since.
+    let fresh = match &active {
+        Some(task) => Some((
+            task.id.as_str(),
+            task_payload_without_retired_entries(store, namespace, &task.payload).await,
+        )),
+        None => None,
+    };
+    persist_active_session_file(
+        project_root,
+        namespace,
+        golden_rules,
+        fresh.as_ref().map(|(id, payload)| (*id, payload)),
+    );
+}
+
+/// When task `task_id` stops being in progress (completed, released, blocked),
+/// remove its fields from each session file `task_claim` may have written:
+/// the worktree the claim recorded, the caller's own root (see
+/// [`caller_session_root`]), and the namespace's registered project root. So
+/// the next session start does not announce a finished task. Only a file that still names this task is
+/// touched: another task claimed since keeps its fields, and so does this
+/// task when the same session has claimed it again meanwhile (its row is
+/// read again under the session file lock). Best effort.
+pub(crate) async fn clear_finished_task_from_session_file(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    task_id: &str,
+    roots: &[std::path::PathBuf],
+) {
+    let rid = crate::registry::registry_row_id(namespace);
+    let registry_root = match store.get(namespace, &rid).await {
+        Ok(Some((_, registry))) => registry
+            .metadata
+            .get("project_root")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from),
+        _ => None,
+    };
+    let mut seen = HashSet::new();
+    let roots: Vec<&std::path::PathBuf> = roots
+        .iter()
+        .chain(registry_root.as_ref())
+        .filter(|root| seen.insert(root.join(".NeuroStrata")))
+        .collect();
+    let _session_guard = SESSION_FILE_LOCK.lock().await;
+    let mut row: Option<Result<Option<Task>, ()>> = None;
+    for root in roots {
+        let session_path = root.join(".NeuroStrata").join("active_session.json");
+        let Some(mut active) = std::fs::read_to_string(&session_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.as_object().cloned())
+        else {
+            continue;
+        };
+        if active.get("task_id").and_then(|v| v.as_str()) != Some(task_id) {
+            continue;
+        }
+        // Read the row once, under the lock: the same session may have
+        // claimed this task again meanwhile, or the read may fail. A file
+        // whose claim another session has since taken over is cleared.
+        if row.is_none() {
+            row = Some(in_progress_task(store, namespace, task_id).await);
+        }
+        let file_session = active.get("session_id").and_then(|v| v.as_str());
+        match row.as_ref() {
+            Some(Err(())) => return,
+            Some(Ok(Some(task))) if file_names_current_claim(file_session, task) => continue,
+            _ => {}
+        }
+        for key in [
+            "task_id",
+            "active_task_id",
+            "status",
+            "session_id",
+            "subagent_prompt_injection",
+        ] {
+            active.remove(key);
+        }
+        active.insert("updated_at".to_string(), json!(machine::timestamp()));
+        if let Ok(serialized) = serde_json::to_string_pretty(&Value::Object(active)) {
+            let _ = harness_plugins::write_atomically(&session_path, &serialized);
+        }
+    }
+}
+
+/// The session-file roots a task finishing now may have been written to:
+/// the worktree its claim recorded, and the root the caller names.
+fn session_file_roots_for(args: &Value, task: &Task) -> Vec<std::path::PathBuf> {
+    let recorded = task
+        .task_field("worktree")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from);
+    recorded
+        .into_iter()
+        .chain(caller_session_root(args))
+        .collect()
+}
+
+/// The root `task_claim` writes the session file into for a caller that names
+/// `worktree`, `project_root` or `cwd`: the enclosing worktree, else the
+/// nearest folder with `.git` or `.NeuroStrata`.
+fn caller_session_root(args: &Value) -> Option<std::path::PathBuf> {
+    let explicit = arg_str(args, "worktree")
+        .or_else(|| arg_str(args, "project_root"))
+        .or_else(|| arg_str(args, "cwd"))?;
+    Some(resolve_session_root_dir(std::path::Path::new(explicit)))
 }
 
 /// Auto-retrieve relevant governing rules, memories, code symbols, and 1-hop
@@ -2318,8 +2626,9 @@ pub async fn handle_task_create(
         Ok(n) => n,
         Err(e) => return e,
     };
+    let mut redactions = Vec::new();
     let title = match arg_str(&args, "title") {
-        Some(t) => match check_title(t) {
+        Some(t) => match check_title_redacted(t, &mut redactions) {
             Ok(v) => v,
             Err(e) => return e,
         },
@@ -2381,7 +2690,7 @@ pub async fn handle_task_create(
         Err(e) => return e,
     };
     let description = arg_str(&args, "description")
-        .map(|s| s.to_string())
+        .map(|s| redact_into(s, &mut redactions))
         .filter(|s| !s.is_empty());
     let parent_id = arg_str(&args, "parent_id").map(|s| s.to_string());
     let user_id = arg_str(&args, "user_id").unwrap_or("unknown").to_string();
@@ -2469,6 +2778,7 @@ pub async fn handle_task_create(
                 "task": task_summary(&id, &payload, false),
                 "auto_retrieved_context": hits_json,
                 "subagent_prompt_injection": subagent_prompt,
+                "redactions": redactions_json(&redactions),
             }))
         }
         Err(e) => e,
@@ -2631,6 +2941,9 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
             );
         }
     }
+    // The worktree a stale holder claimed in; its session file still names
+    // the task under the old session until it is cleared after this claim.
+    let mut taken_over_worktree: Option<std::path::PathBuf> = None;
     match evaluate_claim_decision(k_status, same_session, age, gate::STALE_AFTER_SECS) {
         KernelClaimDecision::IdempotentSameSession => {
             // Legacy rows written before attribution existed keep the holder
@@ -2714,6 +3027,11 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
                 Ok(released) => task = released,
                 Err(e) => return format!("ERROR: {}", e),
             }
+            taken_over_worktree = task
+                .task_field("worktree")
+                .and_then(|v| v.as_str())
+                .filter(|w| !w.trim().is_empty())
+                .map(std::path::PathBuf::from);
             {
                 let obj = task_obj_mut(&mut task.payload);
                 obj.remove("assignee");
@@ -2808,7 +3126,20 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     let hint_root = explicit_root.clone().or_else(|| session_root.clone());
     if let Some(root) = session_root {
         let golden = collect_golden_rules(&store, &namespace, None).await;
-        persist_active_session_file(&root, &namespace, &golden, Some((&id, &task.payload)));
+        refresh_active_session_file(
+            &store,
+            &root,
+            &namespace,
+            &golden,
+            Some((&id, &task.payload)),
+            None,
+        )
+        .await;
+    }
+    // After the new claim is written: a file there that names this task under
+    // the new session is kept.
+    if let Some(old) = taken_over_worktree {
+        clear_finished_task_from_session_file(&store, &namespace, &id, &[old]).await;
     }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("claim-{}", id))
@@ -2890,15 +3221,22 @@ pub async fn handle_task_update(
             }
         },
     };
-    let note = arg_str(&args, "note").map(|s| s.to_string());
+    // A note is never refused (a handoff must not be lost): it is stored
+    // with each secret replaced (`redact_into`), and so is a new title. The
+    // reply names the categories.
+    let mut redactions = Vec::new();
+    let note = arg_str(&args, "note").map(|raw| redact_into(raw, &mut redactions));
     // The title is the task's content (section 1.1), so renaming it means
     // rewriting content AND re-embedding: a title is what search_memory reads.
     let new_title = match args.get("title") {
         None => None,
-        Some(_) => match check_title(arg_str(&args, "title").unwrap_or_default()) {
-            Ok(t) => Some(t),
-            Err(e) => return e,
-        },
+        Some(_) => {
+            match check_title_redacted(arg_str(&args, "title").unwrap_or_default(), &mut redactions)
+            {
+                Ok(t) => Some(t),
+                Err(e) => return e,
+            }
+        }
     };
     let priority = match args.get("priority") {
         None => None,
@@ -2940,6 +3278,8 @@ pub async fn handle_task_update(
         .task_field("history")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
+    // Before an unclaim drops the worktree mark the claim recorded.
+    let session_roots = session_file_roots_for(&args, &task);
 
     // A rename is history, not a transition: without a caller's note the
     // history entry says what the title became, so Working Memory keeps the
@@ -2947,7 +3287,11 @@ pub async fn handle_task_update(
     let rename_note = new_title
         .as_ref()
         .filter(|t| **t != task.payload.content)
-        .map(|t| format!("renamed: '{}' -> '{}'", task.payload.content, t));
+        // A title stored before redaction existed may still hold a secret.
+        .map(|t| {
+            let old_title = crate::secrets::redact(&task.payload.content).0;
+            format!("renamed: '{old_title}' -> '{t}'")
+        });
 
     let ctx = Ctx {
         reason: note.clone().unwrap_or_default(),
@@ -3102,6 +3446,9 @@ pub async fn handle_task_update(
     if let Err(e) = save_task(&store, &namespace, &id, vector, task.payload.clone()).await {
         return e;
     }
+    if from == Status::InProgress && task.status() != Status::InProgress {
+        clear_finished_task_from_session_file(&store, &namespace, &id, &session_roots).await;
+    }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("update-{}", id))
         .to_string();
@@ -3156,10 +3503,78 @@ pub async fn handle_task_update(
         "task": task_summary(&id, &task.payload, false),
         "graph_queries_count": graph_queries_count,
         "graph_lookup_nudge": Value::Null,
+        "redactions": redactions_json(&redactions),
     }))
 }
 
 // ── tool: neurostrata_task_list ────────────────────────────────────────────
+
+/// Labels a task row that is history, so nobody reads it as live work:
+/// `retired: true` once its `valid_to` has passed (superseded or expired),
+/// `archived: true` when it carries the archive tombstone. The labels stay
+/// apart because archiving leaves `valid_to` as it was.
+fn label_history_row(summary: &mut Value, payload: &MemoryPayload, retired: bool) {
+    if let Some(obj) = summary.as_object_mut() {
+        if retired {
+            obj.insert("retired".to_string(), json!(true));
+        }
+        if crate::handlers::archive_memory::is_archived(payload) {
+            obj.insert("archived".to_string(), json!(true));
+        }
+    }
+}
+
+/// Notes a `neurostrata_task_get` reply carries without `include_history`:
+/// the latest ones, where a handoff note lands.
+const TASK_GET_RECENT_NOTES: usize = 5;
+
+/// `neurostrata_task_get`: one task's status, holder, worktree and notes,
+/// read without claiming it. A claim is a write: it is refused on a task a
+/// live session holds or a finished one, takes over a stale holder, and marks
+/// the task in progress, so it cannot stand in for a read. The reply carries
+/// the latest notes and `history_count`; `include_history: true` returns every
+/// note. A retired or archived row is still returned, labelled as
+/// [`label_history_row`] says.
+pub async fn handle_task_get(args: Value, store: Arc<dyn VectorStore>) -> String {
+    let id = match required_str(&args, "id") {
+        Ok(v) => v.to_string(),
+        Err(e) => return e,
+    };
+    let namespace = match required_str(&args, "namespace") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
+    if let Err(e) = check_namespace(&namespace) {
+        return e;
+    }
+    let include_history = args
+        .get("include_history")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let task = match load_task(&store, &namespace, &id).await {
+        Ok((task, _)) => task,
+        Err(e) => return e,
+    };
+    let mut summary = task_summary(&task.id, &task.payload, true);
+    let notes = summary
+        .get("history")
+        .and_then(|h| h.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(obj) = summary.as_object_mut() {
+        if !include_history && notes.len() > TASK_GET_RECENT_NOTES {
+            obj.insert(
+                "history".to_string(),
+                json!(notes[notes.len() - TASK_GET_RECENT_NOTES..]),
+            );
+        }
+        obj.insert("history_count".to_string(), json!(notes.len()));
+    }
+    let retired = gate::is_retired(&task.payload.metadata, chrono::Utc::now().timestamp());
+    label_history_row(&mut summary, &task.payload, retired);
+    encode(&json!({ "id": id, "namespace": namespace, "task": summary }))
+}
 
 pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> String {
     let namespace = match required_str(&args, "namespace") {
@@ -3261,12 +3676,8 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
             let mut summary = task_summary(&m.id, &m.payload, include_history);
             if let Some(obj) = summary.as_object_mut() {
                 obj.insert("ready".to_string(), json!(ready));
-                if retired {
-                    // A row shown as history must say so, so nobody reads it as
-                    // live claimed work.
-                    obj.insert("retired".to_string(), json!(true));
-                }
             }
+            label_history_row(&mut summary, &m.payload, retired);
             summary
         })
         .collect();
@@ -3362,10 +3773,15 @@ pub async fn handle_task_complete(
         ));
     }
 
-    let reason = arg_str(&args, "reason")
-        .or_else(|| arg_str(&args, "close_reason"))
-        .unwrap_or("")
-        .to_string();
+    // The close reason and follow-up task texts are stored and returned like
+    // notes, so each secret in them is replaced, never stored.
+    let mut redactions = Vec::new();
+    let reason = redact_into(
+        arg_str(&args, "reason")
+            .or_else(|| arg_str(&args, "close_reason"))
+            .unwrap_or(""),
+        &mut redactions,
+    );
     let link_memory_id = arg_str(&args, "link_memory_id").map(|s| s.to_string());
     let memory = args.get("memory").cloned();
 
@@ -3417,7 +3833,7 @@ pub async fn handle_task_complete(
                     return Err(format!("ERROR: follow_up_tasks[{}] must be an object.", i));
                 }
                 let title = match item.get("title").and_then(|t| t.as_str()) {
-                    Some(t) => match check_title(t) {
+                    Some(t) => match check_title_redacted(t, &mut redactions) {
                         Ok(v) => v,
                         Err(e) => {
                             return Err(format!("ERROR: follow_up_tasks[{}].title: {}", i, e))
@@ -3433,7 +3849,7 @@ pub async fn handle_task_complete(
                 let description = item
                     .get("description")
                     .and_then(|s| s.as_str())
-                    .map(|s| s.to_string())
+                    .map(|s| redact_into(s, &mut redactions))
                     .filter(|s| !s.is_empty());
                 let task_type = match item.get("task_type").and_then(|t| t.as_str()) {
                     None => "task".to_string(),
@@ -3802,6 +4218,8 @@ pub async fn handle_task_complete(
         }
     }
     save_task(&store, &namespace, &id, vector, completed.payload.clone()).await?;
+    let session_roots = session_file_roots_for(&args, &task);
+    clear_finished_task_from_session_file(&store, &namespace, &id, &session_roots).await;
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("complete-{}", id))
         .to_string();
@@ -3930,6 +4348,7 @@ pub async fn handle_task_complete(
         "follow_up_tasks_created": follow_up_created_ids,
         "task_intent_signals": signals,
         "transition": { "from": task.status().as_str(), "to": "done" },
+        "redactions": redactions_json(&redactions),
     });
     reply["learning_hook"] = serde_json::to_value(&learning_report)
         .unwrap_or_else(|_| json!({ "errors": ["serialize learning hook report"] }));
@@ -6455,8 +6874,10 @@ mod tests {
             "  - fact-live -> src/a.rs -> rule-live",
             "- Mandatory Graph-First Lookup Rule: ...",
         ]
-        .join("
-");
+        .join(
+            "
+",
+        );
         task.metadata["task"]["subagent_prompt_injection"] = json!(only_retired_entries);
         let current = task_payload_without_retired_entries(&store, "probe", &task).await;
         assert_eq!(
@@ -6467,8 +6888,10 @@ mod tests {
                 "  - fact-live -> src/a.rs -> rule-live",
                 "- Mandatory Graph-First Lookup Rule: ...",
             ]
-            .join("
-"))
+            .join(
+                "
+"
+            ))
         );
 
         task.metadata["task"]["subagent_prompt_injection"] = json!(block);
@@ -9984,7 +10407,10 @@ exit 0
             metadata: json!({ "task": { "status": "open" } }),
         };
         assert_eq!(task_summary("t", &payload, true)["history"], json!([]));
-        assert_eq!(task_summary("t", &payload, false)["history_count"], json!(0));
+        assert_eq!(
+            task_summary("t", &payload, false)["history_count"],
+            json!(0)
+        );
     }
 
     #[tokio::test]
@@ -10444,6 +10870,253 @@ exit 0
         );
     }
 
+    /// A note is never refused: a secret in it is stored as
+    /// `[REDACTED:<category>]` and the reply says how many and which kinds,
+    /// never the secret. A clean note is stored as written.
+    #[tokio::test]
+    async fn a_note_is_stored_with_its_secrets_redacted() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "keep secrets out", 1).await;
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let history = || {
+            let store = store.clone();
+            let id = id.clone();
+            async move {
+                let (_, p) = store.get("MyProj", &id).await.unwrap().unwrap();
+                p.metadata["task"]["history"].to_string()
+            }
+        };
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "note": format!("Handoff: push with {key}") }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.contains(key), "{reply}");
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["redactions"], json!([{ "category": "github_pat" }]));
+        let stored = history().await;
+        assert!(!stored.contains(key), "{stored}");
+        assert!(
+            stored.contains("Handoff: push with [REDACTED:github_pat]"),
+            "{stored}"
+        );
+
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "note": "Handoff: run the suite" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["redactions"], json!([]));
+        assert!(history().await.contains("Handoff: run the suite"));
+    }
+
+    /// Every task text a later session reads back is scrubbed the same way as
+    /// a note: the title and description on create and rename, and the close
+    /// reason and follow-up tasks on complete.
+    #[tokio::test]
+    async fn task_titles_descriptions_and_close_reasons_are_stored_redacted() {
+        let store = store_with_namespace("MyProj").await;
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let stored = |id: String| {
+            let store = store.clone();
+            async move {
+                let (_, p) = store.get("MyProj", &id).await.unwrap().unwrap();
+                format!("{} {}", p.content, p.metadata)
+            }
+        };
+
+        let reply = handle_task_create(
+            json!({
+                "namespace": "MyProj",
+                "title": format!("rotate {key}"),
+                "description": "then set password=hunter22 everywhere",
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            !reply.contains(key) && !reply.contains("hunter22"),
+            "{reply}"
+        );
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(
+            parsed["redactions"],
+            json!([{ "category": "github_pat" }, { "category": "password" }])
+        );
+        let id = parsed["id"].as_str().unwrap().to_string();
+        let row = stored(id.clone()).await;
+        assert!(!row.contains(key) && !row.contains("hunter22"), "{row}");
+        assert!(row.contains("rotate [REDACTED:github_pat]"), "{row}");
+        assert!(
+            row.contains("then set password=[REDACTED:password] everywhere"),
+            "{row}"
+        );
+
+        // A title within the limit as written is not refused because its
+        // marker is longer than the secret it replaced.
+        let near_limit = format!("{} password=hunter22", "x".repeat(180));
+        assert!(near_limit.chars().count() <= MAX_TITLE);
+        let reply = handle_task_create(
+            json!({ "namespace": "MyProj", "title": near_limit }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
+        assert_eq!(parsed["redactions"], json!([{ "category": "password" }]));
+
+        // A title over the limit only because of its secret is not refused:
+        // the length is checked on the redacted title.
+        let long_title = format!("{} {key}", "x".repeat(170));
+        assert!(long_title.chars().count() > MAX_TITLE);
+        let reply = handle_task_create(
+            json!({ "namespace": "MyProj", "title": long_title }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
+        assert_eq!(parsed["redactions"], json!([{ "category": "github_pat" }]));
+
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": id, "title": format!("rotate {key} now") }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.contains(key), "{reply}");
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["redactions"], json!([{ "category": "github_pat" }]));
+        let row = stored(id.clone()).await;
+        assert!(
+            row.contains("rotate [REDACTED:github_pat] now") && !row.contains(key),
+            "{row}"
+        );
+
+        claim(&store, &id).await;
+        let mem_id = uuid::Uuid::new_v4().to_string();
+        let vector = StubEmbedder.embed("the lesson").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &mem_id,
+                vector,
+                MemoryPayload {
+                    content: "the lesson".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "extracted_from": [id.as_str()] }),
+                },
+            )
+            .await
+            .unwrap();
+        let reply = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "reason": "rotated, old password=hunter22",
+                "follow_up_tasks": [{ "title": "audit", "description": format!("check {key}") }],
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect("completes");
+        assert!(
+            !reply.contains(key) && !reply.contains("hunter22"),
+            "{reply}"
+        );
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(
+            parsed["redactions"],
+            json!([{ "category": "password" }, { "category": "github_pat" }])
+        );
+        let row = stored(id.clone()).await;
+        assert!(
+            row.contains("rotated, old password=[REDACTED:password]"),
+            "{row}"
+        );
+        assert!(!row.contains("hunter22"), "{row}");
+        let follow_up = parsed["follow_up_tasks_created"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let row = stored(follow_up).await;
+        assert!(
+            row.contains("check [REDACTED:github_pat]") && !row.contains(key),
+            "{row}"
+        );
+    }
+
+    /// Task text that reaches the store without passing the three tools is
+    /// redacted too: the bootstrap description, a note staged by an action,
+    /// and the rename note that quotes a title stored before redaction.
+    #[tokio::test]
+    async fn every_task_write_path_stores_text_redacted() {
+        let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let store = temp_store().await;
+        let reply = handle_bootstrap(
+            json!({
+                "namespace": "MyProj",
+                "project_root": "/tmp",
+                "project_description": format!("deploys with {key}"),
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
+        let first_id = parsed["first_task"]["id"].as_str().unwrap().to_string();
+        let (_, first) = store.get("MyProj", &first_id).await.unwrap().unwrap();
+        let row = first.metadata.to_string();
+        assert!(
+            row.contains("deploys with [REDACTED:github_pat]") && !row.contains(key),
+            "{row}"
+        );
+
+        let (_, _, staged) = stage_task_transition_at(
+            &first_id,
+            &first,
+            "open",
+            &format!("use {key}"),
+            "a",
+            "s",
+            1,
+        )
+        .expect("staged");
+        let row = staged.metadata.to_string();
+        assert!(
+            row.contains("use [REDACTED:github_pat]") && !row.contains(key),
+            "{row}"
+        );
+
+        let (vector, mut legacy) = store.get("MyProj", &first_id).await.unwrap().unwrap();
+        legacy.content = format!("old title {key}");
+        store
+            .upsert("MyProj", &first_id, vector, legacy)
+            .await
+            .unwrap();
+        let reply = handle_task_update(
+            json!({ "namespace": "MyProj", "id": first_id, "title": "new title" }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        assert!(!reply.contains(key), "{reply}");
+        let (_, renamed) = store.get("MyProj", &first_id).await.unwrap().unwrap();
+        let row = format!("{} {}", renamed.content, renamed.metadata);
+        assert!(!row.contains(key), "{row}");
+    }
+
     #[test]
     fn zero_action_exempt_shell_payload_allows_git_push_and_rejects_mutations() {
         assert!(crate::server::is_zero_action_exempt_shell_payload(
@@ -10839,6 +11512,159 @@ exit 0
     }
 
     #[tokio::test]
+    async fn task_get_reads_a_task_without_claiming_it() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        handle_task_claim(
+            json!({ "namespace": "MyProj", "id": id, "assignee": "agent-a", "session_id": "ses_a" }),
+            store.clone(),
+        )
+        .await;
+        for n in 0..7 {
+            handle_task_update(
+                json!({ "namespace": "MyProj", "id": id, "note": format!("note {n}"), "session_id": "ses_a" }),
+                emb(),
+                store.clone(),
+            )
+            .await;
+        }
+        let (_, before) = store.get("MyProj", &id).await.unwrap().unwrap();
+
+        let reply: Value = serde_json::from_str(
+            &handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store.clone()).await,
+        )
+        .expect("task_get replies with json");
+        let task = &reply["task"];
+        assert_eq!(task["status"], json!("in_progress"), "{reply}");
+        assert_eq!(task["assignee"], json!("agent-a"), "{reply}");
+        assert_eq!(task["session_id"], json!("ses_a"), "{reply}");
+        // The claim plus seven notes; the latest five come back, newest last.
+        assert_eq!(task["history_count"], json!(8), "{reply}");
+        let notes = task["history"].as_array().expect("history");
+        assert_eq!(notes.len(), TASK_GET_RECENT_NOTES, "{reply}");
+        assert_eq!(notes.last().unwrap()["note"], json!("note 6"), "{reply}");
+
+        let all: Value = serde_json::from_str(
+            &handle_task_get(
+                json!({ "id": id, "namespace": "MyProj", "include_history": true }),
+                store.clone(),
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(all["task"]["history"].as_array().unwrap().len(), 8, "{all}");
+
+        // Reading changed nothing: same holder, same history, same timestamp.
+        let (_, after) = store.get("MyProj", &id).await.unwrap().unwrap();
+        assert_eq!(before.metadata, after.metadata);
+    }
+
+    #[tokio::test]
+    async fn task_get_reads_a_done_task_and_refuses_a_non_task() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["task"]["status"] = json!("done");
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+        let reply: Value = serde_json::from_str(
+            &handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store.clone()).await,
+        )
+        .expect("task_get replies with json");
+        assert_eq!(reply["task"]["status"], json!("done"), "{reply}");
+        assert!(reply["task"].get("retired").is_none(), "{reply}");
+
+        let rule_id = "myproj-rule";
+        store
+            .upsert(
+                "MyProj",
+                rule_id,
+                StubEmbedder.embed("a rule").await.unwrap(),
+                MemoryPayload {
+                    content: "a rule".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "rule".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        let not_a_task = handle_task_get(
+            json!({ "id": rule_id, "namespace": "MyProj" }),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            not_a_task.contains("is a rule memory, not a task"),
+            "{not_a_task}"
+        );
+
+        let missing =
+            handle_task_get(json!({ "id": "myproj-zzzz", "namespace": "MyProj" }), store).await;
+        assert!(missing.starts_with("ERROR: no task with id"), "{missing}");
+    }
+
+    #[tokio::test]
+    async fn task_get_labels_a_retired_or_archived_task() {
+        let store = store_with_namespace("MyProj").await;
+        // Expired: valid_to in the past. Archived: through the real archive
+        // tool, so the label reads the tombstone archive_memory writes.
+        let expired = create_task(&store, "MyProj", "the old work", 2).await;
+        let (vector, mut payload) = store.get("MyProj", &expired).await.unwrap().unwrap();
+        payload.metadata["valid_to"] = json!(chrono::Utc::now().timestamp() - 60);
+        store
+            .upsert("MyProj", &expired, vector, payload)
+            .await
+            .unwrap();
+        let shelved = create_task(&store, "MyProj", "the shelved work", 2).await;
+        let archived = crate::handlers::archive_memory::archive_memory(
+            json!({ "namespace": "MyProj", "id": shelved }),
+            store.clone(),
+            Arc::new(crate::events::ThalamicBus::new(16)),
+        )
+        .await;
+        assert!(archived.is_archived(), "{archived}");
+
+        let mut read = Vec::new();
+        for id in [&expired, &shelved] {
+            let reply: Value = serde_json::from_str(
+                &handle_task_get(json!({ "id": id, "namespace": "MyProj" }), store.clone()).await,
+            )
+            .expect("task_get replies with json");
+            read.push(reply);
+        }
+        assert_eq!(read[0]["task"]["retired"], json!(true), "{}", read[0]);
+        assert!(read[0]["task"].get("archived").is_none(), "{}", read[0]);
+        // Archiving leaves valid_to alone, so an archived task is labelled
+        // archived, not retired.
+        assert_eq!(read[1]["task"]["archived"], json!(true), "{}", read[1]);
+        assert!(read[1]["task"].get("retired").is_none(), "{}", read[1]);
+
+        // task_list labels its rows with the same helper.
+        let list: Value = serde_json::from_str(
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "include_retired": true }),
+                store,
+            )
+            .await,
+        )
+        .unwrap();
+        let row = |title: &str| {
+            list["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["title"] == json!(title))
+                .cloned()
+                .unwrap_or_else(|| panic!("{title} missing from {list}"))
+        };
+        assert_eq!(row("the old work")["retired"], json!(true), "{list}");
+        assert_eq!(row("the shelved work")["archived"], json!(true), "{list}");
+    }
+
+    #[tokio::test]
     async fn a_stale_holder_is_released_then_claimed() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
@@ -11075,6 +11901,92 @@ exit 0
             "{reprioritized}"
         );
         assert_eq!(reprioritized["task"]["history_count"], json!(3));
+    }
+
+    /// A takeover clears the old holder's session file, so a session started
+    /// there before its first snapshot is not told to work on the task.
+    #[tokio::test]
+    async fn a_takeover_clears_the_old_holders_session_file() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let git_dir = || {
+            let dir = tempfile::tempdir().unwrap();
+            let init = std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .arg(dir.path())
+                .status()
+                .unwrap();
+            assert!(init.success());
+            dir
+        };
+        let (old, new) = (git_dir(), git_dir());
+        let session = |dir: &tempfile::TempDir| -> serde_json::Value {
+            let path = dir.path().join(".NeuroStrata").join("active_session.json");
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let claim = |session_id: &str, dir: &tempfile::TempDir| {
+            handle_task_claim(
+                json!({
+                    "namespace": "MyProj", "id": id, "assignee": session_id,
+                    "session_id": session_id, "worktree": dir.path().to_string_lossy()
+                }),
+                store.clone(),
+            )
+        };
+        claim("ses_a", &old).await;
+        assert_eq!(session(&old)["task_id"], json!(id), "{}", session(&old));
+
+        // Age the claim past the staleness window.
+        let (vector, mut payload) = store.get("MyProj", &id).await.unwrap().unwrap();
+        payload.metadata["task"]["updated_at"] = json!("2020-01-01T00:00:00Z");
+        store.upsert("MyProj", &id, vector, payload).await.unwrap();
+
+        let takeover = claim("ses_b", &new).await;
+        assert!(takeover.contains("in_progress"), "{}", takeover);
+        assert_eq!(
+            session(&new)["session_id"],
+            json!("ses_b"),
+            "{}",
+            session(&new)
+        );
+        let old_file = session(&old);
+        assert!(old_file.get("task_id").is_none(), "{}", old_file);
+        assert_eq!(old_file["namespace"], json!("MyProj"), "{}", old_file);
+
+        // A snapshot in the old worktree that listed the task before the
+        // takeover does not write it back: under the lock, its claim is now in
+        // the other worktree.
+        refresh_active_session_file(&store, old.path(), "MyProj", &[], None, Some(&id)).await;
+        let old_file = session(&old);
+        assert!(old_file.get("task_id").is_none(), "{}", old_file);
+        // In its own worktree the same candidate is still written.
+        refresh_active_session_file(&store, new.path(), "MyProj", &[], None, Some(&id)).await;
+        assert_eq!(session(&new)["task_id"], json!(id), "{}", session(&new));
+    }
+
+    /// Cleanup also drops the legacy `active_task_id` key, which the plugin
+    /// still reads as the active task.
+    #[tokio::test]
+    async fn session_file_cleanup_drops_the_legacy_active_task_id() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".NeuroStrata").join("active_session.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            json!({ "namespace": "MyProj", "task_id": id, "active_task_id": id }).to_string(),
+        )
+        .unwrap();
+        // The task is open, not in progress: the file's claim is stale.
+        clear_finished_task_from_session_file(&store, "MyProj", &id, &[dir.path().to_path_buf()])
+            .await;
+        let file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            file.get("task_id").is_none() && file.get("active_task_id").is_none(),
+            "{file}"
+        );
     }
 
     #[tokio::test]
@@ -12777,12 +13689,7 @@ exit 0
 
         // The verbatim spelling a claim stores matches the caller's plain root,
         // and beats an unstamped claim listed earlier.
-        let rows = [
-            open_mine.clone(),
-            other.clone(),
-            unstamped.clone(),
-            mine,
-        ];
+        let rows = [open_mine.clone(), other.clone(), unstamped.clone(), mine];
         assert_eq!(pick(&rows, r"C:\repo\mine").as_deref(), Some("t-mine"));
         // A task claimed in another worktree, or with no worktree stamped
         // (it may come from any folder of the namespace), is never named.
