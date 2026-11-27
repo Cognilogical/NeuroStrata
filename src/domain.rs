@@ -158,11 +158,23 @@ fn bare_id_rule_reason(id: &str) -> Option<String> {
 /// A bare id is 1 to 128 ASCII characters from `[A-Za-z0-9._:-]`. A qualified
 /// id `<namespace>::<path>` validates compositely: the prefix passes DR-1, the
 /// path is non-empty, and the path carries no quotes, backslashes or control
-/// characters. Spaces and `/` stay legal in the path, as file paths need them.
+/// characters. The whole qualified id stays inside the same 128-character cap
+/// as a bare id — the bound is on the address, not on one of its spellings,
+/// so a hostile peer cannot park megabytes behind a `::` that the bare-id
+/// rule would have refused (generated ids, taxonomy rows included, are held
+/// to `MAX_ID_CHARS` the same way). Spaces and `/` stay legal in the path,
+/// as file paths need them.
 pub fn validate_id(id: &str) -> Result<(), ValidationError> {
     if let Some(pos) = id.find(NAMESPACE_SEPARATOR) {
         let (prefix, qualified) = id.split_at(pos);
         let path = &qualified[NAMESPACE_SEPARATOR.len()..];
+        let len = id.chars().count();
+        if len > MAX_ID_CHARS {
+            return Err(ValidationError::Id(format!(
+                "'{}' is not a valid qualified id: must be 1 to {MAX_ID_CHARS} characters (got {len})",
+                id.escape_debug()
+            )));
+        }
         if let Some(reason) = namespace_rule_reason(prefix) {
             return Err(ValidationError::Id(format!(
                 "'{}' is not a valid qualified id: namespace prefix '{}' {reason}",
@@ -381,6 +393,7 @@ mod tests {
     #[test]
     fn valid_ids_accepted() {
         let longest = "i".repeat(128);
+        let longest_qualified = format!("probe::{}", "i".repeat(121));
         for ok in [
             "a",
             "memory-1",
@@ -390,6 +403,7 @@ mod tests {
             "probe::src/a.rs",
             "probe::src/with space.rs",
             "probe::generation::src/a.rs",
+            longest_qualified.as_str(),
         ] {
             assert!(validate_id(ok).is_ok(), "{ok:?}");
         }
@@ -398,9 +412,11 @@ mod tests {
     #[test]
     fn invalid_ids_rejected() {
         let too_long = "i".repeat(129);
+        let too_long_qualified = format!("probe::{}", "i".repeat(500));
         for bad in [
             "",
             too_long.as_str(),
+            too_long_qualified.as_str(),
             "a b",
             "a/b",
             "a~b",
@@ -421,6 +437,14 @@ mod tests {
         }
         let err = validate_id(&too_long).expect_err("129 chars must be refused");
         assert!(err.to_string().contains("128"), "{err}");
+        // The cap is on the whole qualified id: a megabyte parked behind a
+        // `::` is the same refusal as a megabyte bare id, not a bypass of it.
+        let err = validate_id(&too_long_qualified)
+            .expect_err("a qualified id past the cap must be refused");
+        assert!(
+            err.to_string().contains("qualified id: must be 1 to 128"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -444,6 +468,14 @@ mod tests {
             assert!(validate_id(bad).is_err(), "write accepted {bad:?}");
             assert!(validate_id_for_read(bad).is_err(), "read accepted {bad:?}");
         }
+        // The qualified-id cap is a write rule and a read rule alike: a
+        // legacy row can hold a long id, but the gate never addresses it.
+        let hostile = format!("probe::{}", "i".repeat(4_000));
+        assert!(validate_id(&hostile).is_err(), "write accepted {hostile:?}");
+        assert!(
+            validate_id_for_read(&hostile).is_err(),
+            "read accepted {hostile:?}"
+        );
     }
 
     #[test]
@@ -474,6 +506,11 @@ mod tests {
         assert!(err.to_string().contains("namespace prefix"), "{err}");
         let err = validate_id("probe::").expect_err("empty path must be refused");
         assert!(err.to_string().contains("non-empty"), "{err}");
+        // The bare-id cap cannot be sidestepped by qualifying: the bound is
+        // on the whole address, whatever its spelling.
+        let err = validate_id(&format!("probe::{}", "i".repeat(129)))
+            .expect_err("a qualified id past the cap must be refused");
+        assert!(err.to_string().contains("128"), "{err}");
     }
 
     #[test]
