@@ -117,7 +117,7 @@ pub struct ObjectViewResponse {
 }
 
 fn is_active_payload(payload: &MemoryPayload, now_ts: i64) -> bool {
-    if payload.metadata.get("archived").and_then(|v| v.as_bool()) == Some(true) {
+    if crate::lexical::archived_flag(&payload.metadata) {
         return false;
     }
     if payload
