@@ -1,24 +1,7 @@
-//! Offline tracked-upgrade drift gate for issue #339.
-//!
-//! The four items recorded in
-//! `docs/superpowers/specs/2026-11-25-tracked-upgrade-dispositions.md` are
-//! upgrades the repository deliberately has **not** taken yet, or took in a
-//! different change. Without a gate, each one silently becomes stale: the
-//! `spareval` dependency edge drifts onto `oxiri 0.3`, `Dockerfile.base` picks
-//! up a CI consumer, a plugin manifest floats onto TypeScript 7, or a workflow
-//! action reference loses its SHA pin.
-//!
-//! These tests read committed files from `HEAD` through local git: a dirty
-//! worktree cannot make evidence describe a state that was never committed.
-//! They perform no network I/O and can run as the permanent `tracked-upgrades`
-//! eval suite.
-
 use std::path::{Path, PathBuf};
 
 use serde_yaml::Value as YamlValue;
 
-/// Values this gate enforces and the decision record must repeat verbatim.
-/// Keeping them in one place makes a record-vs-gate drift a single-point edit.
 const OXIRI_BAND: (u64, u64) = (0, 2);
 /// Exact locked releases, not just bands: a patch bump still changes what CI
 /// resolves, so the decision record pins these specific versions (#339).
@@ -27,6 +10,16 @@ const OXIRI_VERSION: &str = "0.2.11";
 const BASE_IMAGE: &str = "ubuntu:24.04";
 const ICU_PACKAGE: &str = "libicu74";
 const TYPESCRIPT_PIN: &str = "~6.0.3";
+const KNOWN_MANIFESTS: [&str; 8] = [
+    "plugins/core/package.json",
+    "plugins/claude/package.json",
+    "plugins/codex/package.json",
+    "plugins/hermes/package.json",
+    "plugins/opencode/package.json",
+    "plugins/github-cli/package.json",
+    "plugins/openclaw/package.json",
+    "web-ui/package.json",
+];
 
 struct TrackedAction {
     name: &'static str,
@@ -60,8 +53,6 @@ const TRACKED_ACTIONS: [TrackedAction; 3] = [
     },
 ];
 
-/// Resolve a repository-relative path from the crate root, so the tests run
-/// from any working directory.
 fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
@@ -85,24 +76,38 @@ fn git_stdout(args: &[&str]) -> String {
 /// Every path tracked in `HEAD`. Git lists symlinks as blobs and never
 /// recurses into them, so evidence enumeration cannot loop or escape the
 /// checkout through a crafted directory symlink.
+fn head_ref() -> String {
+    std::env::var("TRACKED_UPGRADES_COMMIT").unwrap_or_else(|_| "HEAD".to_owned())
+}
+
 fn committed_files() -> Vec<String> {
-    git_stdout(&["ls-tree", "-r", "--name-only", "HEAD"])
+    let head = head_ref();
+    git_stdout(&["ls-tree", "-r", "--name-only", &head])
         .lines()
         .map(str::to_owned)
         .collect()
 }
 
 fn read_relative(relative: &str) -> String {
-    git_stdout(&["show", &format!("HEAD:{relative}")])
+    git_stdout(&["show", &format!("{}:{relative}", head_ref())])
+}
+
+fn read_relative_lossy(relative: &str) -> String {
+    let head = head_ref();
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .args(["show", &format!("{head}:{relative}")])
+        .output()
+        .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+    assert!(output.status.success(), "git show {head}:{relative} failed");
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 fn read_path(path: &Path) -> String {
     read_relative(&relative(path))
 }
 
-/// A parsed `major.minor.patch` version. Pre-release and build suffixes are
-/// stripped before the numeric triple is compared, because the contracts here
-/// are about the release line, not a specific prerelease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Version {
     major: u64,
@@ -147,9 +152,6 @@ impl Version {
     }
 }
 
-/// The compatibility band a Cargo requirement selects. For `0.x` crates the
-/// minor version is the breaking boundary, so `0.2` and `0.3` are different
-/// bands even though both share major version 0.
 fn requirement_band(requirement: &str) -> (u64, u64) {
     let trimmed = requirement.trim();
     // Only a plain, caret, tilde, or exact requirement naming a full
@@ -232,8 +234,6 @@ fn package_version(package: &toml::Value) -> &str {
         })
 }
 
-/// The root `oxiri` requirement string, whether written as `oxiri = "0.2"` or
-/// as an inline table with a `version` key.
 fn root_oxiri_requirement() -> String {
     let manifest = cargo_toml();
     let dependency = manifest
@@ -278,7 +278,6 @@ fn select_committed_paths(committed: &[String], predicate: impl Fn(&str) -> bool
     paths
 }
 
-/// Every `.yml`/`.yaml` workflow committed in `.github/workflows`.
 fn workflow_paths() -> Vec<PathBuf> {
     let paths = committed_paths_where(|path| {
         path.starts_with(".github/workflows/")
@@ -322,9 +321,6 @@ fn action_descriptor_paths() -> Vec<PathBuf> {
     committed_paths_where(|path| is_action_descriptor(Path::new(path)))
 }
 
-/// Is this file CI/build configuration that could invoke the deferred image?
-/// Named directories and well-known build filenames cover consumers that live
-/// outside `.github` and `scripts`; docs and source are deliberately excluded.
 fn is_ci_config(path: &Path) -> bool {
     let components: Vec<String> = path
         .components()
@@ -349,9 +345,7 @@ fn is_ci_config(path: &Path) -> bool {
     if is_top_level {
         return true;
     }
-    // Conventional CI homes, including hosted providers that keep their
-    // pipeline outside .github. A consumer in any of them is still a consumer.
-    const CI_DIRS: [&str; 9] = [
+    const CI_DIRS: [&str; 11] = [
         "ci",
         ".ci",
         "build",
@@ -361,6 +355,8 @@ fn is_ci_config(path: &Path) -> bool {
         ".circleci",
         ".buildkite",
         ".gitlab",
+        ".azuredevops",
+        "tools",
     ];
     let parent_dirs = &components[..components.len().saturating_sub(1)];
     if parent_dirs
@@ -381,7 +377,12 @@ fn is_ci_config(path: &Path) -> bool {
         || name.starts_with(".travis")
         || name == "action.yml"
         || name == "action.yaml";
-    is_build_file || (components.len() == 1 && (name.ends_with(".yml") || name.ends_with(".yaml")))
+    is_build_file
+        || (components.len() == 1
+            && (name.ends_with(".yml")
+                || name.ends_with(".yaml")
+                || name.ends_with(".sh")
+                || name.ends_with(".py")))
 }
 
 /// Every committed CI/build config, so a consumer added in a new CI location
@@ -391,7 +392,31 @@ fn ci_paths() -> Vec<PathBuf> {
     committed_paths_where(|path| is_ci_config(Path::new(path)))
 }
 
-/// `FROM` accepts option flags such as `--platform=` before the image name.
+fn consumer_scan_paths(committed: &[String]) -> Vec<String> {
+    const BINARY_EXTENSIONS: [&str; 12] = [
+        "png", "jpg", "jpeg", "gif", "ico", "pdf", "zip", "gz", "woff", "woff2", "ttf", "bin",
+    ];
+    committed
+        .iter()
+        .filter(|path| {
+            if path.starts_with("docs/")
+                || path.starts_with(".NeuroStrata/")
+                || path.starts_with("target/")
+                || *path == "tests/dependency_tracked_upgrades.rs"
+            {
+                return false;
+            }
+            let extension = Path::new(path.as_str())
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            !BINARY_EXTENSIONS.contains(&extension.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
 fn from_image(line: &str) -> Option<String> {
     line.split_whitespace()
         .skip(1)
@@ -399,8 +424,6 @@ fn from_image(line: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Parse Dockerfile stages once: global `ARG` before the first `FROM` is
-/// legal and is not a stage directive; continuation lines are already joined.
 fn dockerfile_stages(raw: &str) -> Vec<(String, Vec<String>)> {
     let mut stages: Vec<(String, Vec<String>)> = Vec::new();
     for line in dockerfile_logical_lines(raw) {
@@ -409,7 +432,6 @@ fn dockerfile_stages(raw: &str) -> Vec<(String, Vec<String>)> {
                 .unwrap_or_else(|| panic!("Dockerfile.base FROM has no image: {line:?}"));
             stages.push((image, Vec::new()));
         } else if is_instruction(&line, "ARG") && stages.is_empty() {
-            // Global build arguments precede the first stage without error.
             continue;
         } else if let Some((_, directives)) = stages.last_mut() {
             directives.push(line);
@@ -420,7 +442,6 @@ fn dockerfile_stages(raw: &str) -> Vec<(String, Vec<String>)> {
     stages
 }
 
-/// Shell `#` comments only start at a word boundary and never inside quotes.
 fn strip_shell_comment(line: &str) -> &str {
     let mut quote: Option<char> = None;
     let mut word_boundary = true;
@@ -447,39 +468,113 @@ fn strip_shell_comment(line: &str) -> &str {
     line
 }
 
-/// Recognize an actual `apt`/`apt-get install <package>` command, ignoring
-/// shell comments, `echo`, and other mentions of the package. Options may
-/// appear before `install` (`apt-get -y install ...` is valid).
+fn shell_segments(command: &str) -> (Vec<Vec<String>>, Vec<String>) {
+    let mut segments: Vec<Vec<String>> = vec![Vec::new()];
+    let mut operators = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    while let Some(character) = chars.next() {
+        match quote {
+            Some(open) => {
+                if character == open {
+                    quote = None;
+                } else if character == '\\' && open == '"' {
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                    }
+                } else {
+                    word.push(character);
+                }
+            }
+            None => match character {
+                '\'' | '"' => quote = Some(character),
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        word.push(next);
+                    }
+                }
+                ';' | '|' | '&' => {
+                    if !word.is_empty() {
+                        segments.last_mut().unwrap().push(std::mem::take(&mut word));
+                    }
+                    let mut operator = character.to_string();
+                    if chars.peek() == Some(&character) && (character == '|' || character == '&') {
+                        operator.push(chars.next().unwrap());
+                    }
+                    operators.push(operator);
+                    segments.push(Vec::new());
+                }
+                c if c.is_whitespace() => {
+                    if !word.is_empty() {
+                        segments.last_mut().unwrap().push(std::mem::take(&mut word));
+                    }
+                }
+                _ => word.push(character),
+            },
+        }
+    }
+    if !word.is_empty() {
+        segments.last_mut().unwrap().push(word);
+    }
+    (segments, operators)
+}
+
+fn strip_run(words: &[String]) -> &[String] {
+    if words
+        .first()
+        .is_some_and(|word| word == "RUN" || word == "run")
+    {
+        &words[1..]
+    } else {
+        words
+    }
+}
+
+fn segment_installs_package(words: &[String], package: &str) -> bool {
+    let words = strip_run(words);
+    let mut at = 0;
+    if words.get(at).is_some_and(|word| word == "sudo") {
+        at += 1;
+    }
+    while words.get(at).is_some_and(|word| word.contains('=')) {
+        at += 1;
+    }
+    if !words
+        .get(at)
+        .is_some_and(|word| word == "apt-get" || word == "apt")
+    {
+        return false;
+    }
+    let Some(install_at) = words[at + 1..].iter().position(|word| word == "install") else {
+        return false;
+    };
+    words[at + 1 + install_at + 1..]
+        .iter()
+        .any(|word| word == package)
+}
+
+/// Count only an apt install that is actually reached. `false &&` and
+/// `true ||` short-circuit before the install, so they cannot satisfy the
+/// base-image contract even though the text is present.
 fn apt_installs_package(command: &str, package: &str) -> bool {
-    let command = strip_shell_comment(command);
-    for part in command.split([';', '|', '&']) {
-        let tokens: Vec<&str> = part
-            .split_whitespace()
-            .map(|token| token.trim_matches(['\'', '"']))
-            .filter(|token| !token.is_empty())
-            .collect();
-        let mut at = 0;
-        if tokens.first() == Some(&"sudo") {
-            at = 1;
-        }
-        while tokens.get(at).is_some_and(|token| token.contains('=')) {
-            at += 1;
-        }
-        let Some(binary) = tokens.get(at) else {
-            continue;
-        };
-        if *binary != "apt-get" && *binary != "apt" {
-            continue;
-        }
-        let Some(install_at) = tokens[at + 1..]
-            .iter()
-            .position(|token| *token == "install")
-        else {
-            continue;
-        };
-        let arguments = &tokens[at + 1 + install_at + 1..];
-        if arguments.contains(&package) {
+    let (segments, operators) = shell_segments(strip_shell_comment(command));
+    let mut reached = true;
+    for (index, segment) in segments.iter().enumerate() {
+        if reached && segment_installs_package(segment, package) {
             return true;
+        }
+        let truth = match strip_run(segment).first().map(String::as_str) {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        };
+        if let Some(operator) = operators.get(index) {
+            reached = match operator.as_str() {
+                "&&" => reached && truth != Some(false),
+                "||" => reached && truth != Some(true),
+                _ => reached,
+            };
         }
     }
     false
@@ -492,8 +587,6 @@ fn is_full_sha(reference: &str) -> bool {
             .all(|character| character.is_ascii_hexdigit())
 }
 
-/// Dockerfile instruction names are case-insensitive. Require a whitespace
-/// delimiter so `FROMAGE` or `RUNNER` cannot be mistaken for an instruction.
 fn is_instruction(line: &str, name: &str) -> bool {
     line.get(..name.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
@@ -503,9 +596,6 @@ fn is_instruction(line: &str, name: &str) -> bool {
             .is_some_and(u8::is_ascii_whitespace)
 }
 
-/// Join Dockerfile continuation lines and drop blank/comment lines. A stage's
-/// `RUN ... apt-get install ...` may be split across several physical lines;
-/// the build sees one logical instruction, so the gate must too.
 fn dockerfile_logical_lines(raw: &str) -> Vec<String> {
     let mut pending = String::new();
     let mut logical = Vec::new();
@@ -528,8 +618,6 @@ fn dockerfile_logical_lines(raw: &str) -> Vec<String> {
     logical
 }
 
-/// Only step `uses` declarations are executed as actions. Nested data such
-/// as `with.uses` is not an action reference and must not be collected.
 fn collect_step_uses(steps: &YamlValue, out: &mut Vec<String>) {
     let Some(sequence) = steps.as_sequence() else {
         return;
@@ -544,8 +632,6 @@ fn collect_step_uses(steps: &YamlValue, out: &mut Vec<String>) {
     }
 }
 
-/// A reusable-workflow job declares `uses` at job level; its `steps` (if any)
-/// are ordinary action steps. Only those two forms execute GitHub Actions.
 fn collect_job_uses(job: &YamlValue, out: &mut Vec<String>) {
     let Some(mapping) = job.as_mapping() else {
         return;
@@ -558,8 +644,6 @@ fn collect_job_uses(job: &YamlValue, out: &mut Vec<String>) {
     }
 }
 
-/// Collect executable `uses` declarations from a workflow or composite
-/// action descriptor: workflow jobs and their steps, plus `runs.steps`.
 fn collect_yaml_uses(value: &YamlValue, out: &mut Vec<String>) {
     let Some(root) = value.as_mapping() else {
         return;
@@ -625,29 +709,31 @@ fn version_annotation(raw: &str, target: &str) -> Option<String> {
     }
 }
 
-/// Every tracked-action reference in a workflow, structurally parsed.
-fn workflow_action_references(path: &Path) -> Vec<(String, Option<String>)> {
-    let raw = read_path(path);
-    let document: YamlValue = serde_yaml::from_str(&raw)
-        .unwrap_or_else(|error| panic!("parse YAML {}: {error}", path.display()));
+/// Parse `uses` values from raw YAML. A `uses` field is a single action
+/// target: folding a version note into the scalar produces an invalid GitHub
+/// reference, so the whole value must be one token with no comment marker.
+fn parse_workflow_action_references(raw: &str, label: &str) -> Vec<(String, Option<String>)> {
+    let document: YamlValue =
+        serde_yaml::from_str(raw).unwrap_or_else(|error| panic!("parse YAML {label}: {error}"));
     let mut uses = Vec::new();
     collect_yaml_uses(&document, &mut uses);
     uses.into_iter()
         .map(|value| {
-            let mut tokens = value.split_whitespace();
-            let target = tokens.next().unwrap_or("").to_owned();
-            let inline = tokens
-                .find(|token| token.starts_with('v') || token.starts_with('V'))
-                .map(str::to_owned);
-            let annotation = inline.or_else(|| version_annotation(&raw, &target));
+            assert!(
+                !value.chars().any(char::is_whitespace) && !value.contains('#'),
+                "{label}: invalid action reference {value:?}; a version note belongs in a YAML comment, not inside `uses`"
+            );
+            let target = value.trim().to_owned();
+            let annotation = version_annotation(raw, &target);
             (target, annotation)
         })
         .collect()
 }
 
-/// Every `typescript` declaration in a manifest. Peer and optional ranges
-/// are executable constraints too, so a conflicting compiler there must be
-/// as visible as one in `dependencies` or `devDependencies`.
+fn workflow_action_references(path: &Path) -> Vec<(String, Option<String>)> {
+    parse_workflow_action_references(&read_path(path), &relative(path))
+}
+
 fn typescript_declarations(document: &serde_json::Value) -> Vec<String> {
     [
         "dependencies",
@@ -666,38 +752,96 @@ fn typescript_declarations(document: &serde_json::Value) -> Vec<String> {
     .collect()
 }
 
-/// Only the first markdown table is the canonical current-state record. A
-/// stale copy of an old fact elsewhere in the document must not satisfy the
-/// gate while the current-state row says something different.
-fn current_state_table(document: &str) -> String {
-    let mut rows: Vec<&str> = Vec::new();
-    let mut in_table = false;
-    for line in document.lines() {
-        if line.starts_with('|') {
-            in_table = true;
-            rows.push(line);
-        } else if in_table {
-            break;
+fn discover_manifests(committed: &[String]) -> Vec<String> {
+    let mut manifests: Vec<String> = KNOWN_MANIFESTS
+        .iter()
+        .map(|manifest| (*manifest).to_owned())
+        .collect();
+    for path in committed {
+        if path.starts_with("plugins/")
+            && path.ends_with("/package.json")
+            && !manifests.contains(path)
+        {
+            manifests.push(path.clone());
         }
     }
-    rows.join("\n")
+    manifests.sort();
+    manifests
 }
 
-/// A tracked action's name, version, and SHA must occupy one table row.
-/// Checking each token anywhere lets two actions swap SHAs and still pass.
-fn decision_record_action_row(document: &str, action: &TrackedAction) -> bool {
+fn manifest_count_matches_record(manifests: &[String]) -> bool {
+    manifests.len() == KNOWN_MANIFESTS.len()
+}
+
+fn markdown_tables(document: &str) -> Vec<Vec<String>> {
+    let mut tables: Vec<Vec<String>> = Vec::new();
+    let mut rows: Vec<String> = Vec::new();
+    for line in document.lines() {
+        if line.starts_with('|') {
+            rows.push(line.to_owned());
+        } else if !rows.is_empty() {
+            tables.push(std::mem::take(&mut rows));
+        }
+    }
+    if !rows.is_empty() {
+        tables.push(rows);
+    }
+    tables
+}
+
+fn current_state_table(document: &str) -> String {
+    markdown_tables(document)
+        .first()
+        .map(|rows| rows.join("\n"))
+        .unwrap_or_default()
+}
+
+fn table_cells(row: &str) -> Vec<String> {
+    row.split('|')
+        .map(|cell| cell.trim().trim_matches('`').to_owned())
+        .collect()
+}
+
+fn current_state_row(tables: &[Vec<String>], item: &str) -> Option<String> {
+    tables
+        .first()?
+        .iter()
+        .find(|row| {
+            table_cells(row)
+                .get(1)
+                .is_some_and(|cell| cell.eq_ignore_ascii_case(item))
+        })
+        .cloned()
+}
+
+fn action_row_tables<'a>(
+    tables: &'a [Vec<String>],
+    action: &TrackedAction,
+) -> Vec<&'a Vec<String>> {
+    tables
+        .iter()
+        .filter(|table| {
+            table.iter().any(|row| {
+                table_cells(row)
+                    .get(1)
+                    .is_some_and(|cell| cell == action.name)
+            })
+        })
+        .collect()
+}
+
+fn decision_record_action_row(tables: &[Vec<String>], action: &TrackedAction) -> bool {
     let name = format!("`{}`", action.name);
     let version = format!("`{}`", action.version);
     let sha = format!("`{}`", action.sha);
-    document.lines().any(|line| {
-        if !line.starts_with('|') {
-            return false;
-        }
-        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
-        cells.contains(&name.as_str())
-            && cells.contains(&version.as_str())
-            && cells.contains(&sha.as_str())
-    })
+    let tables = action_row_tables(tables, action);
+    tables.len() == 1
+        && tables[0].iter().any(|line| {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            cells.contains(&name.as_str())
+                && cells.contains(&version.as_str())
+                && cells.contains(&sha.as_str())
+        })
 }
 
 /// Recognize a tracked action before splitting off its reference, so an
@@ -726,38 +870,62 @@ fn tracked_upgrades_decision_record_names_all_four() {
         );
     }
 
-    // Marker-only checks let the record drift away from what the gate
-    // actually enforces. Every recorded version and disposition named by
-    // the tests below must therefore appear verbatim in the record.
-    let recorded = [
-        format!("root pin `{}.{}`", OXIRI_BAND.0, OXIRI_BAND.1),
-        format!("`spareval {SPAREVAL_VERSION}` edge `{OXIRI_VERSION}`"),
-        format!("`{BASE_IMAGE}` + `{ICU_PACKAGE}`"),
-        format!("`{TYPESCRIPT_PIN}` in all 8 manifests"),
-        format!(
-            "upload `{}`, download `{}`, checkout `{}`",
-            TRACKED_ACTIONS[0].version, TRACKED_ACTIONS[1].version, TRACKED_ACTIONS[2].version
-        ),
-        format!("**Blocked** by `spareval {SPAREVAL_VERSION}`"),
-        "**Deferred** to Ubuntu 26.04 LTS".to_owned(),
-        "**Deferred** to TypeScript 7.1".to_owned(),
-        "**Landed** in #340".to_owned(),
-    ];
-    let current_state = current_state_table(&document);
+    let tables = markdown_tables(&document);
     assert!(
-        !current_state.is_empty(),
+        !current_state_table(&document).is_empty(),
         "decision record {RECORD} has no canonical current-state table"
     );
-    for fact in &recorded {
-        assert!(
-            current_state.contains(fact),
-            "canonical current-state table in {RECORD} no longer records {fact:?}; versions and dispositions must move with the gate, and a stale copy elsewhere cannot satisfy it (#339)"
-        );
+    let recorded: [(&str, Vec<String>); 4] = [
+        (
+            "oxiri",
+            vec![
+                format!("root pin `{}.{}`", OXIRI_BAND.0, OXIRI_BAND.1),
+                format!("`spareval {SPAREVAL_VERSION}` edge `{OXIRI_VERSION}`"),
+                format!("**Blocked** by `spareval {SPAREVAL_VERSION}`"),
+            ],
+        ),
+        (
+            "Dockerfile.base",
+            vec![
+                format!("`{BASE_IMAGE}` + `{ICU_PACKAGE}`"),
+                "**Deferred** to Ubuntu 26.04 LTS".to_owned(),
+            ],
+        ),
+        (
+            "TypeScript",
+            vec![
+                format!("`{TYPESCRIPT_PIN}` in all 8 manifests"),
+                "**Deferred** to TypeScript 7.1".to_owned(),
+            ],
+        ),
+        (
+            "artifact actions",
+            vec![
+                format!(
+                    "upload `{}`, download `{}`, checkout `{}`",
+                    TRACKED_ACTIONS[0].version,
+                    TRACKED_ACTIONS[1].version,
+                    TRACKED_ACTIONS[2].version
+                ),
+                "**Landed** in #340".to_owned(),
+            ],
+        ),
+    ];
+    for (item, facts) in &recorded {
+        let row = current_state_row(&tables, item).unwrap_or_else(|| {
+            panic!("canonical current-state table in {RECORD} has no row for {item}")
+        });
+        for fact in facts {
+            assert!(
+                row.contains(fact),
+                "row for {item} in {RECORD} no longer records {fact:?}; facts must stay bound to their own row (#339)"
+            );
+        }
     }
     for action in &TRACKED_ACTIONS {
         assert!(
-            decision_record_action_row(&document, action),
-            "decision record {RECORD} has no row pairing {} with {} and {}; swapping SHAs between actions must fail the gate (#339)",
+            decision_record_action_row(&tables, action),
+            "decision record {RECORD} has no unique row pairing {} with {} and {}; swapping SHAs between actions or keeping a stale duplicate table must fail the gate (#339)",
             action.name, action.version, action.sha
         );
     }
@@ -917,8 +1085,6 @@ fn dockerfile_base_stays_on_ubuntu_24_04_lts() {
             "Dockerfile.base stage {} builds from {image:?}; every active stage must stay on {BASE_IMAGE} until the 26.04 LTS migration in #339 is unblocked",
             index + 1
         );
-        // A real apt install command, not a comment or an `echo` mentioning
-        // the package. Options such as `-y` may precede `install`.
         let installs_icu = directives
             .iter()
             .any(|line| is_instruction(line, "RUN") && apt_installs_package(line, ICU_PACKAGE));
@@ -932,19 +1098,21 @@ fn dockerfile_base_stays_on_ubuntu_24_04_lts() {
 
 #[test]
 fn dockerfile_base_has_no_ci_consumer() {
-    // Scan CI/build configuration across the repository, not just a fixed
-    // list of directories: a consumer added in `ci/`, a root YAML pipeline,
-    // or a new build config must still fail the no-consumer gate.
-    let files = ci_paths();
+    let committed = committed_files();
+    let ci = ci_paths();
     assert!(
-        !files.is_empty(),
+        !ci.is_empty(),
         "no CI/build configuration found to scan for Dockerfile.base consumers"
     );
-
+    let files = consumer_scan_paths(&committed);
+    assert!(
+        ci.iter().all(|path| files.contains(&relative(path))),
+        "CI configuration must be part of the consumer scan"
+    );
     let offenders: Vec<String> = files
         .iter()
-        .filter(|path| read_relative(&relative(path)).contains("Dockerfile.base"))
-        .map(|path| relative(path))
+        .filter(|path| read_relative_lossy(path).contains("Dockerfile.base"))
+        .cloned()
         .collect();
 
     assert!(
@@ -956,21 +1124,8 @@ fn dockerfile_base_has_no_ci_consumer() {
 
 #[test]
 fn typescript_pins_are_6_0_3_across_plugins_and_web_ui() {
-    const KNOWN_MANIFESTS: [&str; 8] = [
-        "plugins/core/package.json",
-        "plugins/claude/package.json",
-        "plugins/codex/package.json",
-        "plugins/hermes/package.json",
-        "plugins/opencode/package.json",
-        "plugins/github-cli/package.json",
-        "plugins/openclaw/package.json",
-        "web-ui/package.json",
-    ];
     const PIN: &str = TYPESCRIPT_PIN;
 
-    // The known eight must still exist — a deleted manifest fails here —
-    // but the checked set is discovered from the repository, so a newly
-    // added plugins/*/package.json is gated too instead of escaping.
     let committed = committed_files();
     for manifest in KNOWN_MANIFESTS {
         assert!(
@@ -978,28 +1133,18 @@ fn typescript_pins_are_6_0_3_across_plugins_and_web_ui() {
             "known TypeScript manifest {manifest} is missing from HEAD; #339 pins all eight manifests to {PIN}"
         );
     }
-    let mut manifests: Vec<String> = KNOWN_MANIFESTS
-        .iter()
-        .map(|manifest| (*manifest).to_owned())
-        .collect();
-    for path in &committed {
-        if path.starts_with("plugins/")
-            && path.ends_with("/package.json")
-            && !manifests.contains(path)
-        {
-            manifests.push(path.clone());
-        }
-    }
-    manifests.sort();
+    let manifests = discover_manifests(&committed);
+    assert!(
+        manifest_count_matches_record(&manifests),
+        "found {} manifests but the decision record pins TypeScript in all 8; a new plugin manifest must update the record and gate together",
+        manifests.len()
+    );
 
     for manifest in &manifests {
         let manifest = manifest.as_str();
         let raw = read_relative(manifest);
         let document: serde_json::Value =
             serde_json::from_str(&raw).unwrap_or_else(|error| panic!("parse {manifest}: {error}"));
-        // Both dependency maps are checked: a manifest that declares
-        // TypeScript twice must not pass on the dev pin while a conflicting
-        // runtime pin silently selects a different compiler.
         let declarations = typescript_declarations(&document);
         assert!(
             !declarations.is_empty(),
@@ -1024,15 +1169,8 @@ fn artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned() {
     let mut seen = [0_usize; TRACKED_ACTIONS.len()];
 
     let mut paths = workflow_paths();
-    // Local composite actions execute workflow steps too; a tracked `uses`
-    // inside one must be pinned exactly like a workflow reference.
     paths.extend(action_descriptor_paths());
     for path in paths {
-        // Parse YAML structurally: line scanning skips valid forms such as
-        // extra spacing after the dash, folded scalars, flow-style mappings,
-        // and whitespace before the `uses` colon. Every tracked reference in
-        // the document must be pinned, even when another ordinary step keeps
-        // a presence check satisfied.
         for (index, (target, annotation)) in
             workflow_action_references(&path).into_iter().enumerate()
         {
@@ -1040,8 +1178,6 @@ fn artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned() {
                 continue;
             };
             let action = tracked.name;
-            // A tracked action without `@` is still a reference. Skipping it
-            // lets one floating target hide behind another pinned reference.
             assert!(
                 !reference.is_empty(),
                 "{}:{}: {action} has no @ reference; every tracked action must be pinned to a full SHA even when another reference is correct (#339)",
@@ -1116,7 +1252,6 @@ fn requirement_band_rejects_cargo_hyphen_ranges() {
 
 #[test]
 fn dockerfile_logical_lines_join_continuations_and_match_case_insensitively() {
-    // Lowercase instructions and a split apt install are both valid Docker.
     let raw = "from ubuntu:24.04\nrun apt-get update && \\\n  DEBIAN_FRONTEND=noninteractive apt-get install -y libicu74\n";
     let lines = dockerfile_logical_lines(raw);
     assert_eq!(
@@ -1381,7 +1516,8 @@ fn decision_record_action_rows_reject_swapped_shas() {
         sha: "aaa",
         version: "v7.0.2",
     };
-    assert!(decision_record_action_row(document, &upload));
+    let tables = markdown_tables(document);
+    assert!(decision_record_action_row(&tables, &upload));
     let swapped = TrackedAction {
         name: "actions/upload-artifact",
         slot: 0,
@@ -1390,7 +1526,7 @@ fn decision_record_action_rows_reject_swapped_shas() {
         version: "v7.0.2",
     };
     assert!(
-        !decision_record_action_row(document, &swapped),
+        !decision_record_action_row(&tables, &swapped),
         "swapping SHAs keeps every token present but must break the action/version/SHA pairing"
     );
 }
@@ -1403,5 +1539,145 @@ fn current_state_table_ignores_stale_prose() {
     assert!(
         !table.contains("root pin `0.2`"),
         "a stale copy in later prose must not satisfy the canonical current-state gate"
+    );
+}
+
+#[test]
+fn apt_installs_package_only_counts_reachable_commands() {
+    assert!(apt_installs_package(
+        "RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y git curl libicu74 ca-certificates",
+        ICU_PACKAGE
+    ));
+    assert!(!apt_installs_package(
+        "RUN echo \"apt-get install -y libicu74\"",
+        ICU_PACKAGE
+    ));
+    assert!(!apt_installs_package(
+        "RUN false && apt-get install -y libicu74",
+        ICU_PACKAGE
+    ));
+    assert!(!apt_installs_package(
+        "RUN true || apt-get install -y libicu74",
+        ICU_PACKAGE
+    ));
+    assert!(!apt_installs_package(
+        "RUN apt-get update && echo apt-get install libicu74",
+        ICU_PACKAGE
+    ));
+}
+
+#[test]
+fn consumer_discovery_covers_ci_invoked_helpers() {
+    for path in [
+        ".azuredevops/pipelines/build.yml",
+        "ci/build.sh",
+        "tools/build_base.py",
+        "build.sh",
+    ] {
+        assert!(
+            is_ci_config(Path::new(path)),
+            "{path} is a committed CI/build config and must be scanned"
+        );
+    }
+    let committed = vec![
+        ".github/workflows/ci.yml".to_owned(),
+        "tools/build_base.py".to_owned(),
+        "docs/superpowers/specs/notes.md".to_owned(),
+        "tests/dependency_tracked_upgrades.rs".to_owned(),
+    ];
+    let scanned = consumer_scan_paths(&committed);
+    assert!(scanned.contains(&"tools/build_base.py".to_owned()));
+    assert!(!scanned.contains(&"docs/superpowers/specs/notes.md".to_owned()));
+    assert!(!scanned.contains(&"tests/dependency_tracked_upgrades.rs".to_owned()));
+}
+
+#[test]
+fn extra_manifest_breaks_the_recorded_count() {
+    let mut committed = vec!["plugins/core/package.json".to_owned()];
+    for name in [
+        "claude",
+        "codex",
+        "hermes",
+        "opencode",
+        "github-cli",
+        "openclaw",
+        "ninth",
+    ] {
+        committed.push(format!("plugins/{name}/package.json"));
+    }
+    committed.push("web-ui/package.json".to_owned());
+    let manifests = discover_manifests(&committed);
+    assert_eq!(manifests.len(), 9);
+    assert!(
+        !manifest_count_matches_record(&manifests),
+        "a ninth plugin manifest must fail the 'all 8 manifests' claim in the decision record"
+    );
+}
+
+#[test]
+fn invalid_action_reference_is_rejected() {
+    let quoted = "jobs:\n  build:\n    steps:\n      - uses: 'actions/checkout@abc # v7.0.1'\n";
+    assert!(
+        std::panic::catch_unwind(|| parse_workflow_action_references(quoted, "quoted.yml"))
+            .is_err()
+    );
+    let folded =
+        "jobs:\n  build:\n    steps:\n      - uses: >-\n          actions/checkout@abc # v7.0.1\n";
+    assert!(
+        std::panic::catch_unwind(|| parse_workflow_action_references(folded, "folded.yml"))
+            .is_err()
+    );
+    let valid = "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@abc # v7.0.1\n";
+    let refs = parse_workflow_action_references(valid, "valid.yml");
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].0, "actions/checkout@abc");
+    assert_eq!(refs[0].1.as_deref(), Some("v7.0.1"));
+}
+
+#[test]
+fn current_state_facts_bind_to_their_own_row() {
+    let document = "\
+| Item | Current state | Disposition |
+| --- | --- | --- |
+| `oxiri` | root pin `0.2` | **Blocked** by `spareval 0.2.9` |
+| `Dockerfile.base` | `ubuntu:24.04` + `libicu74` | **Deferred** to Ubuntu 26.04 LTS |
+
+Stale: root pin `0.3` was recorded here.
+";
+    let tables = markdown_tables(document);
+    assert_eq!(tables.len(), 1);
+    assert_eq!(
+        current_state_row(&tables, "oxiri").as_deref(),
+        Some("| `oxiri` | root pin `0.2` | **Blocked** by `spareval 0.2.9` |")
+    );
+    assert!(!current_state_row(&tables, "oxiri")
+        .unwrap()
+        .contains("root pin `0.3`"));
+
+    let swapped = "\
+| Item | Current state | Disposition |
+| --- | --- | --- |
+| `oxiri` | `ubuntu:24.04` + `libicu74` | **Deferred** to Ubuntu 26.04 LTS |
+| `Dockerfile.base` | root pin `0.2` | **Blocked** by `spareval 0.2.9` |
+";
+    let swapped_tables = markdown_tables(swapped);
+    assert!(!current_state_row(&swapped_tables, "oxiri")
+        .unwrap()
+        .contains("root pin `0.2`"));
+
+    let stale = format!(
+        "{}\n\n| Action | Version | SHA |\n| --- | --- | --- |\n| `{}` | `{}` | `{}` |\n",
+        document, TRACKED_ACTIONS[0].name, TRACKED_ACTIONS[0].version, TRACKED_ACTIONS[0].sha
+    );
+    let action = &TRACKED_ACTIONS[0];
+    assert_eq!(action_row_tables(&markdown_tables(&stale), action).len(), 1);
+    let duplicated = format!(
+        "{stale}\n\n| Action | Version | SHA |\n| --- | --- | --- |\n| `{}` | `{}` | `{}` |\n",
+        action.name, action.version, action.sha
+    );
+    assert_eq!(
+        action_row_tables(&markdown_tables(&duplicated), action).len(),
+        2,
+        "a stale duplicate action table must not satisfy the gate"
     );
 }
