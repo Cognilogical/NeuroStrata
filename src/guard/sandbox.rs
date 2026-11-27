@@ -628,7 +628,10 @@ where
     // daemon's memory without limit; the verdict keeps only the last 500
     // bytes anyway.
     const CAPTURE_LIMIT: usize = 64 * 1024;
-    let mut buf = std::collections::VecDeque::with_capacity(CAPTURE_LIMIT);
+    // Pin the element type: `Extend<&u8>` and the blanket `Extend<T>` make
+    // `with_capacity` ambiguous on Windows, where `collect` below compounds it.
+    let mut buf: std::collections::VecDeque<u8> =
+        std::collections::VecDeque::with_capacity(CAPTURE_LIMIT);
     if let Some(mut pipe) = pipe {
         use tokio::io::AsyncReadExt;
         let mut chunk = [0u8; 16 * 1024];
@@ -636,7 +639,7 @@ where
             match pipe.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
-                    buf.extend(&chunk[..read]);
+                    buf.extend(chunk[..read].iter().copied());
                     if buf.len() > CAPTURE_LIMIT {
                         let excess = buf.len() - CAPTURE_LIMIT;
                         buf.drain(..excess);
@@ -645,7 +648,7 @@ where
             }
         }
     }
-    buf.into_iter().collect()
+    buf.into()
 }
 
 /// UTF-8-safe tail slice: never splits a multi-byte codepoint, so indexing
