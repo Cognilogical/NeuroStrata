@@ -48,6 +48,9 @@ pub struct MockStore {
     /// How many times `get` was called. Rejection tests assert a refused
     /// address never reached a store read.
     get_calls: AtomicUsize,
+    /// How many times `list` was called. Read routes that must reject caller
+    /// input before scanning a namespace assert this stays zero.
+    list_calls: AtomicUsize,
 }
 
 impl MockStore {
@@ -60,6 +63,7 @@ impl MockStore {
             list_namespaces_calls: AtomicUsize::new(0),
             upsert_calls: AtomicUsize::new(0),
             get_calls: AtomicUsize::new(0),
+            list_calls: AtomicUsize::new(0),
         }
     }
 
@@ -71,6 +75,11 @@ impl MockStore {
     /// The number of `get` calls this store has served.
     pub fn get_calls(&self) -> usize {
         self.get_calls.load(Ordering::SeqCst)
+    }
+
+    /// The number of `list` calls this store has served.
+    pub fn list_calls(&self) -> usize {
+        self.list_calls.load(Ordering::SeqCst)
     }
 
     /// The number of `upsert` calls this store has served.
@@ -338,6 +347,7 @@ impl VectorStore for MockStore {
         user_id: Option<&str>,
         memory_type: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
         let rows = self.rows.lock().expect("mock store lock");
         Ok(rows
             .iter()

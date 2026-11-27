@@ -248,17 +248,14 @@ pub async fn handle_mesh_pull(
 }
 
 /// Validate the caller's `namespace` argument (a string or an array of them)
-/// against DR-1 without consulting the catalog or the mesh. A value of any
-/// other shape is not a namespace declaration and is left to the resolver's
-/// default branch.
+/// against DR-1 without consulting the catalog or the mesh. The supplied
+/// string is checked unchanged: it is argument syntax, so surrounding
+/// whitespace is not a spelling of a valid namespace, and an empty or blank
+/// value is refused rather than treated as "absent" (which would silently
+/// fall back to the mesh manifest). A value of any other shape is not a
+/// namespace declaration and is left to the resolver's default branch.
 fn validate_caller_namespaces(arguments: &Value) -> Result<(), String> {
-    let check = |s: &str| {
-        if s.trim().is_empty() {
-            Ok(())
-        } else {
-            crate::domain::validate_namespace(s.trim()).map_err(|e| e.to_string())
-        }
-    };
+    let check = |s: &str| crate::domain::validate_namespace(s).map_err(|e| e.to_string());
     match arguments.get("namespace") {
         Some(Value::String(s)) => check(s),
         Some(Value::Array(items)) => {
@@ -283,20 +280,24 @@ async fn served_namespaces(
 ) -> Result<Vec<String>, String> {
     let mut served: Vec<String> = vec![];
     // `handle_mesh_pull` already refused malformed declarations before any
-    // I/O; this repeats the check so a direct caller cannot skip it.
+    // I/O; this repeats the check so a direct caller cannot skip it. The
+    // caller's spelling is validated unchanged, so a blank or padded value
+    // never becomes a silent "serve the manifest namespaces" fallback.
     match arguments.get("namespace") {
-        Some(Value::String(s)) if !s.trim().is_empty() => {
-            crate::domain::validate_namespace(s.trim()).map_err(|e| e.to_string())?;
+        Some(Value::String(s)) => {
+            crate::domain::validate_namespace(s).map_err(|e| e.to_string())?;
             served.push(crate::server::resolve_namespace(store, s).await);
         }
         Some(Value::Array(items)) => {
-            for item in items {
-                if let Some(s) = item.as_str() {
-                    if !s.trim().is_empty() {
-                        crate::domain::validate_namespace(s.trim()).map_err(|e| e.to_string())?;
-                        served.push(crate::server::resolve_namespace(store, s).await);
-                    }
-                }
+            // Check every supplied name before the first resolution: one bad
+            // element must refuse the whole declaration without consulting
+            // the catalog for its valid neighbours.
+            let declared: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
+            for s in &declared {
+                crate::domain::validate_namespace(s).map_err(|e| e.to_string())?;
+            }
+            for s in declared {
+                served.push(crate::server::resolve_namespace(store, s).await);
             }
         }
         _ => served.extend(mesh.manifest().namespaces.iter().cloned()),
@@ -2873,15 +2874,52 @@ mod tests {
         let (_base, mesh) = mesh_with_commit("served-ns");
         let mock = std::sync::Arc::new(crate::guard::testkit::MockStore::new());
         let store: std::sync::Arc<dyn VectorStore> = mock.clone();
-        let err = served_namespaces(&json!({ "namespace": "bad/ns" }), &mesh, &store)
-            .await
-            .expect_err("an illegal caller namespace must be refused");
-        assert!(err.starts_with("ERROR [NAMESPACE]"), "{err}");
+        // The supplied string is validated unchanged: malformed, padded and
+        // blank values are all refusals, never a fallback to the manifest.
+        let refused = [
+            json!("bad/ns"),
+            json!("team:proj"),
+            json!(" probe "),
+            json!(""),
+            json!("   "),
+            json!(["probe", " probe "]),
+            json!([""]),
+            json!(["probe", "bad/ns"]),
+        ];
+        for raw in refused {
+            let err = served_namespaces(&json!({ "namespace": raw }), &mesh, &store)
+                .await
+                .expect_err("an illegal caller namespace must be refused");
+            assert!(err.starts_with("ERROR [NAMESPACE]"), "{raw}: {err}");
+        }
         assert_eq!(
             mock.list_namespaces_calls(),
             0,
             "a refused namespace must not consult the catalog"
         );
+    }
+
+    #[test]
+    fn caller_namespace_arguments_are_validated_unchanged() {
+        for refused in ["", "   ", " probe ", "bad/ns", "team:proj"] {
+            let err = validate_caller_namespaces(&json!({ "namespace": refused }))
+                .expect_err("a malformed caller namespace must be refused");
+            assert!(err.starts_with("ERROR [NAMESPACE]"), "{refused:?}: {err}");
+        }
+        for refused in [
+            json!(["probe", " probe "]),
+            json!([""]),
+            json!(["   "]),
+            json!(["probe", "bad/ns"]),
+        ] {
+            let err = validate_caller_namespaces(&json!({ "namespace": refused }))
+                .expect_err("a malformed element in a caller array must be refused");
+            assert!(err.starts_with("ERROR [NAMESPACE]"), "{refused}: {err}");
+        }
+        assert!(validate_caller_namespaces(&json!({ "namespace": "probe" })).is_ok());
+        assert!(validate_caller_namespaces(&json!({ "namespace": ["probe", "other.ns"] })).is_ok());
+        // No declaration at all still falls back to the mesh manifest.
+        assert!(validate_caller_namespaces(&json!({})).is_ok());
     }
 
     fn mesh_id_str(mesh: &MeshStorage) -> String {
@@ -5971,16 +6009,28 @@ mod tests {
         let project = scratch("wire-bad-ns");
         let mock = std::sync::Arc::new(crate::guard::testkit::MockStore::new());
         let store: std::sync::Arc<dyn VectorStore> = mock.clone();
-        let out = handle_mesh_pull(
-            &json!({
-                "project_root": project.display().to_string(),
-                "namespace": "team:proj",
-            }),
-            store,
-            emb(),
-        )
-        .await;
-        assert!(out.starts_with("ERROR [NAMESPACE]"), "{out}");
+        // Padded and blank strings are supplied values, not "absent": each is
+        // refused before the project pointer, `git pull` or the catalog.
+        let refused = [
+            json!("team:proj"),
+            json!(" probe "),
+            json!(""),
+            json!("   "),
+            json!(["probe", " probe "]),
+            json!([""]),
+        ];
+        for namespace in refused {
+            let out = handle_mesh_pull(
+                &json!({
+                    "project_root": project.display().to_string(),
+                    "namespace": namespace,
+                }),
+                store.clone(),
+                emb(),
+            )
+            .await;
+            assert!(out.starts_with("ERROR [NAMESPACE]"), "{namespace}: {out}");
+        }
         assert_eq!(
             mock.list_namespaces_calls(),
             0,
