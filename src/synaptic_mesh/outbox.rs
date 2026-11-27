@@ -196,6 +196,18 @@ static OUTBOX_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(unix)]
 fn reject_unsafe_path(path: &Path, expect_dir: bool) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
+    // The final component is not enough: every existing ancestor must also
+    // be free of symlinks before creation or chmod follows the redirect.
+    for ancestor in path.ancestors() {
+        if let Ok(meta) = std::fs::symlink_metadata(ancestor) {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "refusing symlinked outbox ancestor {}",
+                    ancestor.display()
+                ));
+            }
+        }
+    }
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -220,6 +232,8 @@ fn reject_unsafe_path(_path: &Path, _expect_dir: bool) -> Result<(), String> {
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), String> {
+    // Pre-create validation: create_dir_all follows symlinked ancestors.
+    reject_unsafe_path(dir, true)?;
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("outbox dir {} could not be created: {e}", dir.display()))?;
     reject_unsafe_path(dir, true)?;

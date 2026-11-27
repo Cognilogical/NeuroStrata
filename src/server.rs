@@ -5674,27 +5674,43 @@ async fn handle_add_memory(
                     None => None,
                 };
 
-                // Exact reuse / blocked exact duplicate: no new row, no Created pulse.
+                // Exact reuse / blocked exact duplicate: no new row. A prior
+                // add may have stored the matched row and then failed its
+                // durable append, so re-emit for BOTH a reused row and a
+                // blocked exact duplicate -- a stored row must never stay
+                // unsynced just because this retry wrote nothing new.
                 let Some(upsert) = upsert else {
-                    return match decision {
-                        DedupDecision::LinkedExisting => {
-                            let id = linked_id.unwrap_or_default();
-                            // A prior add may have stored this row and then
-                            // failed its durable append. Re-emit on the retry
-                            // so a stored mutation never goes unsynced.
-                            if let Err(err) = bus.emit_checked(
-                                ThalamicPulse::Created {
-                                    id: id.clone(),
-                                    namespace: namespace.to_string(),
-                                    kind: payload.memory_type.clone(),
-                                },
-                                &RecursionToken::root(),
-                            ) {
+                    let existing_id = linked_id
+                        .clone()
+                        .or_else(|| report.dedup_hint.as_ref().map(|h| h.candidate_id.clone()))
+                        .filter(|id| !id.is_empty());
+                    let reemit = matches!(
+                        decision,
+                        DedupDecision::LinkedExisting | DedupDecision::BlockedExact
+                    );
+                    if reemit {
+                        if let Some(id) = &existing_id {
+                            if let Err(err) = bus
+                                .emit_checked(
+                                    ThalamicPulse::Created {
+                                        id: id.clone(),
+                                        namespace: namespace.to_string(),
+                                        kind: payload.memory_type.clone(),
+                                    },
+                                    &RecursionToken::root(),
+                                )
+                                .await
+                            {
                                 return format!(
                                     "Reused existing memory {}, but its durable sync record failed: {}. Nothing new was stored; retry after the outbox is healthy.",
                                     id, err
                                 );
                             }
+                        }
+                    }
+                    return match decision {
+                        DedupDecision::LinkedExisting => {
+                            let id = existing_id.unwrap_or_default();
                             format!(
                                 "Reused existing memory for namespace: {}\nMemory ID: {}",
                                 namespace, id
@@ -5714,14 +5730,17 @@ async fn handle_add_memory(
                 // it goes through `emit_checked` -- a failed durable append
                 // fails the report rather than letting a stored memory claim
                 // a success its sync record never made.
-                if let Err(err) = bus.emit_checked(
-                    ThalamicPulse::Created {
-                        id: upsert.id.clone(),
-                        namespace: namespace.to_string(),
-                        kind: payload.memory_type.clone(),
-                    },
-                    &RecursionToken::root(),
-                ) {
+                if let Err(err) = bus
+                    .emit_checked(
+                        ThalamicPulse::Created {
+                            id: upsert.id.clone(),
+                            namespace: namespace.to_string(),
+                            kind: payload.memory_type.clone(),
+                        },
+                        &RecursionToken::root(),
+                    )
+                    .await
+                {
                     return format!(
                         "Stored memory {} in namespace {}, but its durable event record failed: {}. The write is not confirmed; the mesh may not see this memory until a later mutation or reconciliation.",
                         upsert.id, namespace, err
@@ -7249,21 +7268,52 @@ async fn handle_ingest_directory(
             // Genuinely trigger the live-bus PostIngestNormalize subscriber on
             // top of the AC4 direct normalize above.
             if let Some(bus) = bus {
-                // This mutation is mesh-qualified: a failed durable append
-                // must not be converted into a lossy queue delivery while
-                // ingestion still reports success.
-                if let Err(err) = bus.emit_checked(
-                    ThalamicPulse::Created {
-                        id: format!("ingest:{namespace}"),
-                        namespace: namespace.to_string(),
-                        kind: "ingest_done".to_string(),
-                    },
-                    &RecursionToken::root(),
-                ) {
+                // The completion marker drives normalize/freshness subscribers;
+                // it is NOT a memory mutation (MeshOutbox skips it). A failed
+                // durable append must not be converted into a lossy delivery
+                // while ingestion still reports success.
+                if let Err(err) = bus
+                    .emit_checked(
+                        ThalamicPulse::Created {
+                            id: format!("ingest:{namespace}"),
+                            namespace: namespace.to_string(),
+                            kind: "ingest_done".to_string(),
+                        },
+                        &RecursionToken::root(),
+                    )
+                    .await
+                {
                     return format!(
                         "Failed to ingest directory {}: rows were stored but the mesh sync record could not be durably appended: {err}",
                         dir_path
                     );
+                }
+                // Emit one real `Created` per shareable row the ingest wrote.
+                // The synthetic `ingest:<ns>` id has no backing memory, so a
+                // lookup-based capture would strand it; per-row pulses carry a
+                // row the subscriber can actually read back.
+                for (row_id, kind) in
+                    crate::events::subscribers::mesh_outbox::shareable_rows_for_mesh(
+                        &*store, namespace,
+                    )
+                    .await
+                {
+                    if let Err(err) = bus
+                        .emit_checked(
+                            ThalamicPulse::Created {
+                                id: row_id.clone(),
+                                namespace: namespace.to_string(),
+                                kind,
+                            },
+                            &RecursionToken::root(),
+                        )
+                        .await
+                    {
+                        return format!(
+                            "Failed to ingest directory {}: row {} was stored but its mesh sync record could not be durably appended: {err}",
+                            dir_path, row_id
+                        );
+                    }
                 }
             }
             // Auto-register watch on successful ingest (idempotent).
@@ -8072,6 +8122,7 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
                 }),
                 relationships: rels_converted,
                 update_id: Uuid::parse_str(&update_id).unwrap_or(id),
+                bus_seq: None,
                 origin_mesh_epoch,
                 trust: trust_enum,
                 signer_did: None,
@@ -10789,14 +10840,17 @@ async fn handle_supersede_memory(
             .and_then(|value| value.as_str())
             .unwrap_or(id)
             .to_string();
-        if let Err(err) = bus.emit_checked(
-            ThalamicPulse::Superseded {
-                old_id: id.to_string(),
-                new_id: successor,
-                namespace: namespace.to_string(),
-            },
-            &RecursionToken::root(),
-        ) {
+        if let Err(err) = bus
+            .emit_checked(
+                ThalamicPulse::Superseded {
+                    old_id: id.to_string(),
+                    new_id: successor,
+                    namespace: namespace.to_string(),
+                },
+                &RecursionToken::root(),
+            )
+            .await
+        {
             return format!(
                 "Memory {} was already superseded, but the retry's durable sync record failed: {}. The row is unchanged; retry after the outbox is healthy.",
                 id, err
@@ -11056,14 +11110,17 @@ async fn handle_supersede_memory(
     // retired while it was still active. Class M (Wave 3): `emit_checked` --
     // this pulse is the retirement's sync record, so a failed durable append
     // is reported rather than swallowed.
-    if let Err(err) = bus.emit_checked(
-        ThalamicPulse::Superseded {
-            old_id: id.to_string(),
-            new_id: new_id.clone(),
-            namespace: namespace.to_string(),
-        },
-        &RecursionToken::root(),
-    ) {
+    if let Err(err) = bus
+        .emit_checked(
+            ThalamicPulse::Superseded {
+                old_id: id.to_string(),
+                new_id: new_id.clone(),
+                namespace: namespace.to_string(),
+            },
+            &RecursionToken::root(),
+        )
+        .await
+    {
         return format!(
             "Superseded {} with {} in namespace {}, but the retirement's durable event record failed: {}. Both rows are stored; the mesh may not see the retirement until a later mutation or reconciliation.",
             id, new_id, namespace, err
@@ -19571,7 +19628,6 @@ mod tests {
                         store: store.as_ref(),
                         namespace: "probe",
                         ts: 1_700_000_000,
-                        delivery: None,
                     },
                 )
                 .await

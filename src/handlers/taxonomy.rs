@@ -94,7 +94,6 @@ pub async fn tee_taxonomy_pulse_to_project_outbox(
         store,
         namespace,
         ts: chrono::Utc::now().timestamp(),
-        delivery: None,
     };
     let _ = sub.handle(pulse, &RecursionToken::root(), &ctx).await;
 }
@@ -271,7 +270,7 @@ pub async fn handle_taxonomy_with_auth_and_bus(
                     // memory-write paths. A failed durable append fails the
                     // request instead of reporting a success the mesh never
                     // hears about.
-                    if let Err(err) = b.emit_checked(pulse, &RecursionToken::root()) {
+                    if let Err(err) = b.emit_checked(pulse, &RecursionToken::root()).await {
                         return json!({
                             "ok": false,
                             "error": format!(

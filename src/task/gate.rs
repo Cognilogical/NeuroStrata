@@ -322,6 +322,34 @@ pub fn extraction_exists(memories: &[SearchResult], task_id: &str, now: i64) -> 
     })
 }
 
+/// The id of the LIVE lesson row that discharges `task_id`: the memory that
+/// declares `metadata.extracted_from` naming any id in the task's work
+/// lineage. This is the authoritative target of the extraction edge -- the
+/// completion pulse must announce the row the edge actually points at, never
+/// an id guessed from the write path. `None` when no live lesson exists.
+pub fn extraction_target(memories: &[SearchResult], task_id: &str, now: i64) -> Option<String> {
+    let lineage = work_lineage(memories, task_id);
+    memories
+        .iter()
+        .find(|m| {
+            m.id != task_id
+                && !is_retired(&m.payload.metadata, now)
+                && m.payload
+                    .metadata
+                    .get("extracted_from")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|arr| {
+                        arr.iter().any(|target| {
+                            target
+                                .as_str()
+                                .is_some_and(|t| lineage.iter().any(|id| id == t))
+                        })
+                    })
+        })
+        .map(|m| m.id.clone())
+        .filter(|id| !id.is_empty())
+}
+
 /// Whether a retired row's lesson is carried by a live successor: the row
 /// that replaced it is itself a completed task whose own inbound extraction
 /// edge exists.

@@ -104,6 +104,12 @@ pub const OUTBOX_FILE_NAME: &str = "event-outbox.jsonl";
 /// The per-class offsets file, sibling of [`OUTBOX_FILE_NAME`].
 pub const OFFSETS_FILE_NAME: &str = "event-outbox.offsets.json";
 
+/// Advisory exclusive lock held by an open outbox instance for its whole
+/// lifetime. `self.inner` serialises threads inside one instance; this file
+/// serialises independent handles and daemon processes against the same
+/// directory, so only one of them can allocate sequences and rewrite offsets.
+pub const INSTANCE_LOCK_FILE_NAME: &str = "event-outbox.instance.lock";
+
 /// The format version stamped on every entry and on the offsets file.
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -292,6 +298,12 @@ pub enum EventOutboxError {
     Io(std::io::Error),
     /// An entry could not be encoded or decoded.
     Serde(serde_json::Error),
+    /// A required durable delivery did not reach its class subscriber
+    /// successfully; the write is not confirmed to the mesh.
+    DeliveryFailed,
+    /// A required durable delivery was not acknowledged within the bounded
+    /// wait; it stays pending in the outbox for replay.
+    DeliveryTimeout,
 }
 
 impl fmt::Display for EventOutboxError {
@@ -324,6 +336,14 @@ impl fmt::Display for EventOutboxError {
             EventOutboxError::Serde(err) => {
                 write!(f, "event outbox serialization error: {err}")
             }
+            EventOutboxError::DeliveryFailed => write!(
+                f,
+                "durable delivery did not succeed; the entry stays pending for retry"
+            ),
+            EventOutboxError::DeliveryTimeout => write!(
+                f,
+                "durable delivery was not acknowledged in time; the entry stays pending for replay"
+            ),
         }
     }
 }
@@ -334,7 +354,9 @@ impl std::error::Error for EventOutboxError {
             EventOutboxError::Poisoned
             | EventOutboxError::RecursionRefused
             | EventOutboxError::MeshUnavailable
-            | EventOutboxError::BacklogFull { .. } => None,
+            | EventOutboxError::BacklogFull { .. }
+            | EventOutboxError::DeliveryFailed
+            | EventOutboxError::DeliveryTimeout => None,
             EventOutboxError::Io(err) => Some(err),
             EventOutboxError::Serde(err) => Some(err),
         }
@@ -501,6 +523,9 @@ pub struct EventOutbox {
     /// it.
     max_pending: usize,
     inner: Mutex<Inner>,
+    /// Process-wide advisory lock. Dropped with the outbox, which releases
+    /// the lock and lets a later handle take over (#8).
+    instance_lock: std::fs::File,
 }
 
 /// The file operations the append write step needs, behind a trait so a test
@@ -683,6 +708,18 @@ impl EventOutbox {
         max_pending: usize,
     ) -> Result<Self, EventOutboxError> {
         create_private_dir(dir)?;
+        // The advisory lock is taken for each open/append/advance critical
+        // section, NOT for the instance lifetime: a restart opens a second
+        // handle while the previous bus's dispatcher still holds the first,
+        // and a lifetime lock would deadlock that legitimate recovery. The fd
+        // is kept per instance so every operation locks the same file.
+        use fs2::FileExt;
+        let instance_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(dir.join(INSTANCE_LOCK_FILE_NAME))?;
+        instance_lock.lock_exclusive()?;
         let path = dir.join(OUTBOX_FILE_NAME);
         // Create (and tighten) the entries file now so no reader ever races a
         // missing file and no old world-readable mode survives an upgrade.
@@ -742,6 +779,7 @@ impl EventOutbox {
                 opaque_lines,
                 opaque_markers,
             }),
+            instance_lock,
         };
         let skipped = outbox.corrupt_entries_skipped();
         if skipped > 0 {
@@ -756,11 +794,60 @@ impl EventOutbox {
         if let Err(err) = outbox.compact_if_needed() {
             tracing::error!("event outbox: startup compaction failed: {err}");
         }
+        // Release the open-time lock; subsequent operations take it again via
+        // `with_instance_lock`.
+        outbox.instance_lock.unlock()?;
         Ok(outbox)
     }
 
     fn entries_path(&self) -> PathBuf {
         self.dir.join(OUTBOX_FILE_NAME)
+    }
+
+    /// Serialise one cross-handle / cross-process critical section. The lock
+    /// is per operation, never per instance: a restart can open a second
+    /// handle while the previous bus's dispatcher is still alive.
+    fn with_instance_lock<T>(&self, f: impl FnOnce() -> T) -> T {
+        use fs2::FileExt;
+        let _ = self.instance_lock.lock_exclusive();
+        let out = f();
+        let _ = FileExt::unlock(&self.instance_lock);
+        out
+    }
+
+    /// Merge the on-disk sequence and offsets into this instance while the
+    /// OS lock is held. `self.inner` is a snapshot taken at open time; without
+    /// this refresh a second handle could allocate the same sequence and its
+    /// offsets write could clobber the first handle's acknowledgments (#8).
+    fn merge_disk_state(&self, inner: &mut Inner) {
+        let disk = read_offsets(&self.dir);
+        inner.offsets.base_seq = inner.offsets.base_seq.max(disk.base_seq);
+        if inner.offsets.generation == 0 {
+            inner.offsets.generation = disk.generation;
+        }
+        for class in EventClass::all() {
+            let merged = inner.offsets.get(class).max(disk.get(class));
+            inner.offsets.set(class, merged);
+            let mut acked = inner.acked(class).clone();
+            let disk_acked = match class {
+                EventClass::Audit => &disk.audit_acked,
+                EventClass::Mesh => &disk.mesh_acked,
+            };
+            for seq in disk_acked {
+                acked.insert(*seq);
+            }
+            acked.retain(|seq| *seq > merged);
+            while acked.len() > MAX_OUT_OF_ORDER_ACKS {
+                acked.pop_first();
+            }
+            inner
+                .offsets
+                .set_acked(class, acked.iter().copied().collect());
+            *inner.acked_mut(class) = acked;
+        }
+        let high = inner.offsets.high_water();
+        inner.next_seq = inner.next_seq.max(high.saturating_add(1));
+        inner.base_seq = inner.base_seq.max(high);
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, EventOutboxError> {
@@ -788,24 +875,29 @@ impl EventOutbox {
         pulse: &ThalamicPulse,
         capture: Option<MeshCapture>,
     ) -> Result<u64, EventOutboxError> {
-        let mut inner = self.lock()?;
-        if inner.poisoned {
-            return Err(EventOutboxError::Poisoned);
-        }
-        // The pending ceiling: compaction cannot reclaim a backlog whose
-        // subscriber never acknowledges, so refuse at the bound -- before any
-        // write, so the refusal is clean (no sequence consumed, no bytes, no
-        // mirror entry, nothing to roll back).
-        let pending = inner.pending_count(class);
-        if pending >= self.max_pending {
-            return Err(EventOutboxError::BacklogFull {
-                class,
-                pending,
-                ceiling: self.max_pending,
-            });
-        }
-        let mut file = open_private_append(&self.entries_path())?;
-        self.append_locked(&mut inner, class, pulse, &mut file, capture)
+        self.with_instance_lock(|| {
+            let mut inner = self.lock()?;
+            if inner.poisoned {
+                return Err(EventOutboxError::Poisoned);
+            }
+            // Refresh the cross-handle state first: a second opener's pending
+            // backlog must be counted before this one claims a sequence (#8).
+            self.merge_disk_state(&mut inner);
+            // The pending ceiling: compaction cannot reclaim a backlog whose
+            // subscriber never acknowledges, so refuse at the bound -- before
+            // any write, so the refusal is clean (no sequence consumed, no
+            // bytes, no mirror entry, nothing to roll back).
+            let pending = inner.pending_count(class);
+            if pending >= self.max_pending {
+                return Err(EventOutboxError::BacklogFull {
+                    class,
+                    pending,
+                    ceiling: self.max_pending,
+                });
+            }
+            let mut file = open_private_append(&self.entries_path())?;
+            self.append_locked(&mut inner, class, pulse, &mut file, capture)
+        })
     }
 
     /// The append body, shared by the production path and the failed-rollback
@@ -970,7 +1062,12 @@ impl EventOutbox {
     /// no acknowledged entry is redelivered by a later process. Offsets never
     /// move backwards.
     pub fn advance(&self, class: EventClass, seq: u64) -> Result<(), EventOutboxError> {
+        self.with_instance_lock(|| self.advance_inner(class, seq))
+    }
+
+    fn advance_inner(&self, class: EventClass, seq: u64) -> Result<(), EventOutboxError> {
         let mut inner = self.lock()?;
+        self.merge_disk_state(&mut inner);
         let current = inner.offsets.get(class);
         if seq <= current {
             return Ok(());
@@ -1182,6 +1279,20 @@ fn sync_dir(dir: &Path) {
 #[cfg(unix)]
 fn reject_unsafe_path(path: &Path, expect_dir: bool) -> Result<(), EventOutboxError> {
     use std::os::unix::fs::MetadataExt;
+    // Checking only the leaf is not enough: `create_dir_all` and
+    // `OpenOptions` follow symlinked ANCESTORS too. Refuse an existing
+    // symlink anywhere on the way to the outbox before creation, chmod, or
+    // an append can touch the redirected path.
+    for ancestor in path.ancestors() {
+        if let Ok(meta) = std::fs::symlink_metadata(ancestor) {
+            if meta.file_type().is_symlink() {
+                return Err(EventOutboxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("refusing symlinked outbox ancestor {}", ancestor.display()),
+                )));
+            }
+        }
+    }
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1209,6 +1320,10 @@ fn reject_unsafe_path(_path: &Path, _expect_dir: bool) -> Result<(), EventOutbox
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), EventOutboxError> {
+    // Validate BEFORE creating: create_dir_all follows a symlinked ancestor
+    // while building the missing tail, so a post-create check would already
+    // have written through the attacker's redirect.
+    reject_unsafe_path(dir, true)?;
     std::fs::create_dir_all(dir)?;
     reject_unsafe_path(dir, true)?;
     #[cfg(unix)]
@@ -1306,6 +1421,36 @@ mod tests {
                 other => format!("{other:?}"),
             })
             .collect()
+    }
+
+    /// Two independently opened handles over the same directory must not
+    /// allocate the same sequence or lose each other's acknowledged prefix
+    /// (#8). The OS lock is per operation, so a second handle can coexist
+    /// with the first (as a crash-restart bus does) without deadlocking.
+    #[test]
+    fn two_open_handles_never_reuse_a_sequence() {
+        let dir = scratch("two-handles");
+        let first = EventOutbox::open(&dir).expect("first open");
+        let second = EventOutbox::open(&dir).expect("second open while first is alive");
+        let s1 = first
+            .append(EventClass::Mesh, &created("m1"))
+            .expect("first append");
+        let s2 = second
+            .append(EventClass::Mesh, &created("m2"))
+            .expect("second append");
+        assert_ne!(s1, s2, "independent handles must not allocate the same seq");
+        first.advance(EventClass::Mesh, s1).expect("first ack");
+        drop(first);
+        drop(second);
+
+        let reopened = EventOutbox::open(&dir).expect("reopen after both handles close");
+        assert_eq!(
+            reopened.offset(EventClass::Mesh),
+            s1,
+            "the other handle's append must not clobber the acknowledged prefix"
+        );
+        assert_eq!(reopened.pending(EventClass::Mesh).len(), 1);
+        assert_eq!(reopened.pending(EventClass::Mesh)[0].seq, s2);
     }
 
     #[test]

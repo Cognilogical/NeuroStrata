@@ -965,7 +965,12 @@ fn wire_mesh_publish(
         }
     }
     let store_for_drain = vector_store.clone();
-    tokio::spawn(mesh_drain_loop(project_root.clone(), wake, store_for_drain));
+    tokio::spawn(mesh_drain_loop(
+        project_root.clone(),
+        wake,
+        store_for_drain,
+        bus.clone(),
+    ));
 
     // Session start (spec §Triggers): ONE best-effort pull + validation,
     // never blocking startup beyond a 5s timeout and never crashing it.
@@ -1096,22 +1101,31 @@ async fn mesh_drain_loop(
     project_root: PathBuf,
     wake: Arc<tokio::sync::Notify>,
     store: Arc<dyn VectorStore>,
+    bus: Arc<ThalamicBus>,
 ) {
     let mut interval = tokio::time::interval(MESH_DRAIN_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Publish-side binding last applied. Re-resolving the pointer each tick
+    // lets a mesh switch or epoch purge rebind the subscriber at runtime.
+    let mut bound: Option<(uuid::Uuid, u32)> = None;
     loop {
         tokio::select! {
             _ = interval.tick() => {}
             _ = wake.notified() => {}
         }
-        drain_mesh_once(&project_root, &store).await;
+        drain_mesh_once(&project_root, &store, &bus, &mut bound).await;
     }
 }
 
 /// One drain of the served project's mesh. Re-resolves the pointer each tick
 /// so a leave/rejoin during a session is picked up; every failure is a logged
 /// no-op, never a daemon crash.
-async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorStore>) {
+async fn drain_mesh_once(
+    project_root: &std::path::Path,
+    store: &Arc<dyn VectorStore>,
+    bus: &Arc<ThalamicBus>,
+    bound: &mut Option<(uuid::Uuid, u32)>,
+) {
     use crate::synaptic_mesh::{
         mesh_service::resolve_node_id,
         outbox::{outbox_dir_for, Outbox},
@@ -1120,7 +1134,21 @@ async fn drain_mesh_once(project_root: &std::path::Path, store: &Arc<dyn VectorS
     };
 
     let mesh_dir = match MeshStorage::read_pointer(project_root) {
-        Ok(Some((_mesh_id, dir, _remote))) => dir,
+        Ok(Some((mesh_id, dir, _remote))) => {
+            // Rebind the PUBLISH side when the pointer changes: the drain side
+            // already re-resolves it, but captures must not keep flowing to a
+            // mesh the project left.
+            let epoch = MeshStorage::open(&dir).map(|m| m.manifest().epoch).ok();
+            if let Some(epoch) = epoch {
+                if bound.as_ref() != Some(&(mesh_id, epoch)) {
+                    let capture = crate::events::MeshCapture { mesh_id, epoch };
+                    bus.set_mesh_binding(capture);
+                    bus.refresh_mesh_subscriber(capture, &outbox_dir_for(&dir));
+                    *bound = Some((mesh_id, epoch));
+                }
+            }
+            dir
+        }
         Ok(None) => return,
         Err(e) => {
             tracing::warn!(
@@ -3432,6 +3460,7 @@ mod tests {
 
         // Live path: append + delivery + acknowledgment.
         bus.emit_checked(audit("a1"), &RecursionToken::root())
+            .await
             .expect("the audit append succeeds");
         let outbox = bus.outbox().expect("outbox attached");
         let deadline = Instant::now() + Duration::from_secs(5);

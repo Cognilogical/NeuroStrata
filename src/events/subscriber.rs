@@ -111,28 +111,41 @@ pub struct SubscriberContext<'a> {
     pub store: &'a dyn VectorStore,
     pub namespace: &'a str,
     pub ts: i64,
-    /// Set when the invocation is a durable outbox delivery rather than a
-    /// live queue delivery: which class's acknowledgment it earns and at
-    /// which sequence. A consumer that can be redelivered (the mesh outbox)
-    /// keys its deduplication on this identity; every other subscriber sees
-    /// `None`.
-    pub delivery: Option<DurableDelivery>,
 }
 
 impl<'a> SubscriberContext<'a> {
-    /// Backward-compatible construction path for external subscribers written
-    /// against the pre-durability three-field context. A live (non-durable)
-    /// invocation has no delivery identity, which is exactly what those
-    /// consumers observed before the field existed. The bus itself builds
-    /// durable contexts directly so it can stamp the delivery.
+    /// Construction path for external subscribers. The three fields are the
+    /// whole struct: a downstream `SubscriberContext { store, namespace, ts }`
+    /// literal keeps compiling. Durable identity is task-local state instead
+    /// of a public field, so adding durability did not break that API.
     pub fn new(store: &'a dyn VectorStore, namespace: &'a str, ts: i64) -> Self {
         Self {
             store,
             namespace,
             ts,
-            delivery: None,
         }
     }
+}
+
+tokio::task_local! {
+    /// Durable identity of the subscriber invocation in progress. Task-local
+    /// rather than a context field: the bus sets it around each invocation,
+    /// and subscribers that only handle live events never have to know it
+    /// exists.
+    static DELIVERY: Option<DurableDelivery>;
+}
+
+/// The durable identity of the current subscriber invocation, if any.
+pub fn current_delivery() -> Option<DurableDelivery> {
+    DELIVERY.try_with(|delivery| *delivery).unwrap_or(None)
+}
+
+/// Run `future` with a durable delivery identity visible to its subscribers.
+pub async fn with_delivery<F: std::future::Future>(
+    delivery: Option<DurableDelivery>,
+    future: F,
+) -> F::Output {
+    DELIVERY.scope(delivery, future).await
 }
 
 /// A consumer of thalamic pulses.
@@ -160,6 +173,12 @@ pub trait MemorySubscriber: Send + Sync {
     fn retry_on_timeout(&self) -> bool {
         false
     }
+
+    /// Rebind a mesh-publishing subscriber after the project's mesh pointer or
+    /// manifest epoch changes at runtime. Default no-op: every subscriber
+    /// except `MeshOutbox` is mesh-agnostic. The daemon calls this from its
+    /// drain loop, which already re-resolves the pointer each tick.
+    fn refresh_mesh_binding(&self, _binding: super::MeshCapture, _outbox_dir: &std::path::Path) {}
 }
 
 /// What the bus lost or had to interrupt, published on the backpressure watch
@@ -200,6 +219,13 @@ pub enum BackpressureEvent {
     /// gives `GuardEventLog`'s `payload_hash`. The full text stays in the
     /// local WARN log.
     SubscriberPanic { name: &'static str, payload: String },
+    /// A durable delivery failed and is retried with bounded exponential
+    /// backoff. `attempts` is the consecutive-failure count behind the pause.
+    DurableRetry {
+        class: &'static str,
+        seq: u64,
+        attempts: u32,
+    },
 }
 
 /// A read-only snapshot of what the bus has done, for the metrics endpoint.
@@ -237,6 +263,8 @@ pub struct BusMetrics {
     /// Unacknowledged outbox entries replayed into the queue when the bus was
     /// constructed. These are handled in addition to `events_emitted`.
     pub outbox_replayed: u64,
+    /// Failed durable deliveries that entered bounded exponential backoff.
+    pub durable_retries: u64,
 }
 
 #[cfg(test)]

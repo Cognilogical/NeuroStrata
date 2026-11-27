@@ -97,7 +97,7 @@ impl MemorySubscriber for GuardEventLog {
         ctx.store
             .upsert(
                 namespace,
-                &audit_id(ctx.delivery),
+                &audit_id(crate::events::current_delivery()),
                 vec![0.0; self.dimensions],
                 audit_payload(
                     namespace,

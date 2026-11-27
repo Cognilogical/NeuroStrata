@@ -714,6 +714,7 @@ mod tests {
             rdf: Some(RdfBlock { schema: "neurostrata-rdf-record/v1".to_string(), format: "n-quads".to_string(), canonical_hash: digest.clone(), quads: nquads.clone() }),
             relationships: vec![crate::synaptic_mesh::record::Relationship { kind: "supersedes".to_string(), target: Uuid::parse_str("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13").unwrap() }],
             update_id: Uuid::parse_str(update_id_val).unwrap(),
+            bus_seq: None,
             origin_mesh_epoch: 3,
             trust: crate::synaptic_mesh::manifest::Trust::Trusted,
             signer_did: None,

@@ -575,6 +575,7 @@ mod tests {
             rdf: None,
             relationships: vec![],
             update_id: Uuid::new_v4(),
+            bus_seq: None,
             origin_mesh_epoch: 2,
             trust: Trust::Trusted,
             signature: None,

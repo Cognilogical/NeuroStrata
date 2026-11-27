@@ -3930,12 +3930,6 @@ pub async fn handle_task_complete(
     // `extracted_from: [id]`).
     let mut memories = list_now().await?;
     let mut edge = gate::extraction_exists(&memories, &id, now);
-    // What the gate credited before this call wrote anything: the emit site
-    // below distinguishes a first completion (the edge is this call's own
-    // work, or nobody named a lesson) from a retry after a failed durable
-    // append (the edge survived the failed attempt).
-    let edge_stored_before_call = edge;
-
     // Path 2: bind an already-written memory. Its existing vector is reused
     // verbatim -- linking must never change what the memory ranks for.
     if !edge {
@@ -4187,21 +4181,17 @@ pub async fn handle_task_complete(
     // every subscriber down a chain that does not exist. The ordering is the
     // invariant -- nothing re-derives it from the adjacent check.
     // A retry after a failed durable append can find the extraction edge
-    // already stored by the failed attempt and would otherwise skip the
-    // pulse, leaving a stored mutation without its mesh sync record. The
-    // retry signature is narrow: the edge was durable when the call arrived
-    // AND the caller still named `link_memory_id`. A first completion never
-    // presents that pairing -- a plain link stores its edge inside this call,
-    // and a Path 1 completion has no lesson to name -- so both stay silent.
-    // The worker's idempotency absorbs the duplicate a genuine retry can
+    // already stored and would otherwise skip the pulse, leaving a stored
+    // mutation without its mesh sync record. The authoritative target is the
+    // row the EXTRACTED_FROM edge actually points at: derive it from the
+    // (post-write, gated) memory list so a retry announces the validated
+    // lesson rather than an id guessed from the write path. A first link
+    // stores its edge inside this call and is announced from that same edge;
+    // the worker's idempotency absorbs the duplicate a genuine retry can
     // produce.
-    let announced_lesson = inline_lesson.or_else(|| {
-        if edge_stored_before_call {
-            link_memory_id.clone()
-        } else {
-            None
-        }
-    });
+    let announced_lesson = gate::extraction_target(&memories, &id, now)
+        .or(inline_lesson)
+        .or_else(|| link_memory_id.clone());
     if let Some(lesson_id) = announced_lesson {
         // Class M (Wave 3): the completion's sync record goes through
         // `emit_checked` -- a failed durable append fails the completion
@@ -4215,6 +4205,7 @@ pub async fn handle_task_complete(
             },
             &crate::events::RecursionToken::root(),
         )
+        .await
         .map_err(|e| {
             format!(
                 "ERROR: the lesson {} was extracted, but the completion's durable event record failed: {}. The completion was not recorded; retry neurostrata_task_complete with `link_memory_id: \"{}\"` so the retry still publishes the sync record.",
@@ -12961,12 +12952,12 @@ exit 0
         );
     }
 
-    /// Linking an already-written memory adds the edge but creates no row, so
-    /// there is no "gave way to" to publish. The negative half of the
-    /// contract: an emit here would announce a move for a memory that was
-    /// already there.
+    /// Linking an already-written memory adds the edge but creates no row;
+    /// the completion still announces the VALIDATED lesson so the mesh sees
+    /// the task-to-lesson transition (#6). The pulse must name the row the
+    /// extraction edge actually points at, never an unvalidated caller id.
     #[tokio::test]
-    async fn linking_an_existing_memory_emits_nothing() {
+    async fn linking_an_existing_memory_announces_the_validated_lesson() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
         claim(&store, &id).await;
@@ -13001,12 +12992,14 @@ exit 0
         .await
         .expect("linking must not embed anything");
 
-        // The dispatcher is asynchronous, so a pulse in flight would show up
-        // late. Give it the window this path must stay silent through.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let pulses = pulses_seen(&seen, 1).await;
         assert!(
-            seen.lock().expect("recorder lock").is_empty(),
-            "binding an existing memory publishes no pulse"
+            pulses.iter().any(|pulse| matches!(
+                pulse,
+                ThalamicPulse::Superseded { old_id, new_id, .. }
+                    if old_id == &id && new_id == &mem_id
+            )),
+            "the completion must name the validated extraction target: {pulses:?}"
         );
     }
 
