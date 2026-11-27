@@ -2171,6 +2171,27 @@ fn estimate_field_row_bytes(fields: &[&str]) -> u64 {
     })
 }
 
+/// Conservative cost of replaying `targets` edge rows plus the metadata
+/// rewrite that carries their provenance. Used before relinking, rebinding
+/// and reconciliation so a growing write cannot pass admission on the cost
+/// of the declarer row alone (#453 follow-up).
+fn estimate_edge_targets_bytes<'a>(
+    rel_type: &str,
+    source: &str,
+    targets: impl Iterator<Item = &'a str>,
+) -> u64 {
+    // The leading allowance is the metadata row rewritten to carry the
+    // provenance; each target then gets its own edge row and full page.
+    targets.fold(ROW_OVERHEAD_BYTES, |total, target| {
+        total
+            .saturating_add(rel_type.len() as u64)
+            .saturating_add(source.len() as u64)
+            .saturating_add(target.len() as u64)
+            .saturating_add(EDGE_ROW_OVERHEAD_BYTES)
+            .saturating_add(ROW_OVERHEAD_BYTES)
+    })
+}
+
 /// A `governs` stub is a full Memory row with a zero embedding, not just an
 /// edge: account for it before the write, not after (#453 review).
 fn estimate_stub_row_bytes(dimensions: usize, namespace: &str, declared: &str) -> u64 {
@@ -5342,7 +5363,7 @@ impl LadybugStore {
         let namespace = namespace.to_string();
         let id = id.to_string();
         let metadata = serde_json::to_string(&metadata)?;
-        self.write_with_deadline("test raw metadata overwrite", move |conn| {
+        self.write_with_deadline_unmetered("test raw metadata overwrite", move |conn| {
             let query = format!(
                 "MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' SET m.metadata = '{}'",
                 escape_ladybug_string(&namespace),
@@ -5775,9 +5796,12 @@ impl LadybugStore {
         let (create_node_table, create_rel_tables) = memory_table_ddl(dimensions);
         let stamp = self.locked_unknown_stamp();
         let _ = self
-            .write_with_deadline("re-attesting an empty LockedUnknown store", move |conn| {
-                stamp.attest_and_stamp(conn, dimensions, &create_node_table, &create_rel_tables)
-            })
+            .write_with_deadline_unmetered(
+                "re-attesting an empty LockedUnknown store",
+                move |conn| {
+                    stamp.attest_and_stamp(conn, dimensions, &create_node_table, &create_rel_tables)
+                },
+            )
             .await;
     }
 
@@ -5821,7 +5845,7 @@ impl LadybugStore {
             dimensions: self.dimensions,
         };
         let outcome = self
-            .write_with_deadline(
+            .write_with_deadline_unmetered(
                 "migrating a data-bearing LockedUnknown store",
                 move |conn| migration.migrate_data_bearing(conn),
             )
@@ -6081,7 +6105,12 @@ impl LadybugStore {
     ///: each waited its 30s, gave up, and handed the
     /// turn to the next. Held by the task, the turn is released when the work
     /// actually finishes, so a caller giving up costs a wait instead.
-    async fn write_with_deadline<T, F>(&self, what: &'static str, f: F) -> Result<T>
+    ///
+    /// This variant is EXPLICITLY unmetered: it is only for deletion,
+    /// maintenance and open-time writes that must work on an over-cap store.
+    /// Every growing write uses [`Self::write_with_deadline_within_cap`] with
+    /// a conservative incoming estimate (#453 follow-up).
+    async fn write_with_deadline_unmetered<T, F>(&self, what: &'static str, f: F) -> Result<T>
     where
         T: Send + 'static,
         F: Fn(&Connection) -> Result<T> + Clone + Send + 'static,
@@ -6089,7 +6118,7 @@ impl LadybugStore {
         self.write_with_deadline_within_cap(what, None, f).await
     }
 
-    /// [`Self::write_with_deadline`] with the `max_db_bytes` admission check
+    /// [`Self::write_with_deadline_unmetered`] with the `max_db_bytes` admission check
     /// taken inside the *same* exclusive writer turn as the write itself.
     ///
     /// Checking before the turn (as a plain pre-flight does) lets two
@@ -8481,7 +8510,7 @@ impl LadybugStore {
             anyhow::bail!("generation 0 is not generation-scoped");
         }
         let namespace_owned = namespace.to_string();
-        self.write_with_deadline("pruning a superseded generation", move |conn| {
+        self.write_with_deadline_unmetered("pruning a superseded generation", move |conn| {
             // Both checks run INSIDE the write turn. A publication or rollback
             // (`publish_generation`) takes the same writer lock, so it cannot
             // move the pointer between the check and the delete. The checked
@@ -8617,7 +8646,7 @@ impl LadybugStore {
         // unprunable forever; the live set below then excludes generations
         // whose ingest is genuinely still running.
         let ns_cleanup = namespace.to_string();
-        self.write_with_deadline("clearing abandoned staging markers", move |conn| {
+        self.write_with_deadline_unmetered("clearing abandoned staging markers", move |conn| {
             clear_abandoned_staging(conn, &ns_cleanup, chrono::Utc::now().timestamp())
         })
         .await?;
@@ -8651,7 +8680,7 @@ impl LadybugStore {
         // value is current.
         if !backfill.is_empty() {
             let ns_backfill = namespace.to_string();
-            self.write_with_deadline("recording recovered rollback targets", move |conn| {
+            self.write_with_deadline_unmetered("recording recovered rollback targets", move |conn| {
                 for (source, generation) in backfill.iter() {
                     let key = crate::parser::ingest::generation_key(&ns_backfill, source);
                     let query = format!(
@@ -9207,7 +9236,7 @@ impl LadybugStore {
         ids: &[String],
     ) -> Result<(usize, usize, usize)> {
         self.run_hygiene_chunks_with(namespace, ids, |ns, chunk| async move {
-            self.write_with_deadline("repairing namespace hygiene", move |conn| {
+            self.write_with_deadline_unmetered("repairing namespace hygiene", move |conn| {
                 hygiene_repair_chunk(conn, &ns, &chunk)
             })
             .await
@@ -10960,7 +10989,7 @@ impl VectorStore for LadybugStore {
         // Use write_with_deadline so the write lock is held INSIDE the
         // spawn_blocking closure (see R5). Holding an async lock across
         // with_conn releases it on timeout while the C++ call is still running.
-        let outcome = self.write_with_deadline("initializing schema", move |conn| {
+        let outcome = self.write_with_deadline_unmetered("initializing schema", move |conn| {
 
             let (create_node_table, create_rel_tables) = memory_table_ddl(dimensions);
             if let Err(e) = conn.query(&create_node_table) {
@@ -12465,7 +12494,7 @@ impl VectorStore for LadybugStore {
         let id = id.to_string();
         let index_namespace = namespace.clone();
         let index_id = id.clone();
-        let outcome = self.write_with_deadline("deleting a memory", move |conn| {
+        let outcome = self.write_with_deadline_unmetered("deleting a memory", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_id = escape_ladybug_string(&id);
 
@@ -12517,7 +12546,7 @@ impl VectorStore for LadybugStore {
         let index_from = from.to_string();
         let index_to = to.to_string();
         let (id, from, to) = (id.to_string(), from.to_string(), to.to_string());
-        let outcome = self.write_with_deadline("moving a memory", move |conn| {
+        let outcome = self.write_with_deadline_unmetered("moving a memory", move |conn| {
             // One statement, so there is no moment at which the memory exists in
             // neither namespace, and the row keeps its id, vector and edges.
             // VERIFY the row actually sat in `from` before claiming the move:
@@ -12680,9 +12709,14 @@ impl VectorStore for LadybugStore {
         let id = id.to_string();
         let rel_type = rel_type.to_string();
         let keep = keep.to_vec();
-        self.write_with_deadline("reconciling declared edges", move |conn| {
-            reconcile_declared_edges_on(conn, &namespace, &id, &rel_type, &keep)
-        })
+        // A reconcile rewrites provenance metadata and can re-add retained
+        // bindings; pay for every edge before the write (#453 follow-up).
+        let incoming = estimate_edge_targets_bytes(&rel_type, &id, keep.iter().map(String::as_str));
+        self.write_with_deadline_within_cap(
+            "reconciling declared edges",
+            Some(incoming),
+            move |conn| reconcile_declared_edges_on(conn, &namespace, &id, &rel_type, &keep),
+        )
         .await
     }
 
@@ -12706,83 +12740,86 @@ impl VectorStore for LadybugStore {
         let keep_for_reconcile = keep.to_vec();
         let keep_owned = keep.to_vec();
         let declared_owned = declared.to_vec();
+        let incoming = estimate_edge_targets_bytes(&rel_type, &id, keep.iter().map(String::as_str));
         let created = self
-            .write_with_deadline("rebinding declared edges", move |conn| {
-                if keep_owned.is_empty() {
-                    return Ok(0);
-                }
-                let safe_ns = escape_ladybug_string(&namespace);
-                let safe_id = escape_ladybug_string(&id);
-                let targets = keep_owned
-                    .iter()
-                    .map(|target| format!("'{}'", escape_ladybug_string(target)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                // Existing targets are not churn: only a genuinely new binding
-                // is reported as materialised.
-                let existing_query = format!(
-                    "MATCH (a:Memory {{id: '{safe_id}'}})-[r:{rel_type}]->(b:Memory) \
+            .write_with_deadline_within_cap(
+                "rebinding declared edges",
+                Some(incoming),
+                move |conn| {
+                    if keep_owned.is_empty() {
+                        return Ok(0);
+                    }
+                    let safe_ns = escape_ladybug_string(&namespace);
+                    let safe_id = escape_ladybug_string(&id);
+                    let targets = keep_owned
+                        .iter()
+                        .map(|target| format!("'{}'", escape_ladybug_string(target)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    // Existing targets are not churn: only a genuinely new binding
+                    // is reported as materialised.
+                    let existing_query = format!(
+                        "MATCH (a:Memory {{id: '{safe_id}'}})-[r:{rel_type}]->(b:Memory) \
                      WHERE a.namespace = '{safe_ns}' AND b.id IN [{targets}] RETURN b.id"
-                );
-                let mut existing = std::collections::HashSet::new();
-                for row in conn.query(&existing_query)? {
-                    existing.insert(format!("{}", row[0]));
-                }
-                // The unchanged head is the provenance source: its stored
-                // coordinates are what `upsert` would have stamped had the
-                // declaration reached it on this pass.
-                let source = {
-                    let query = format!(
+                    );
+                    let mut existing = std::collections::HashSet::new();
+                    for row in conn.query(&existing_query)? {
+                        existing.insert(format!("{}", row[0]));
+                    }
+                    // The unchanged head is the provenance source: its stored
+                    // coordinates are what `upsert` would have stamped had the
+                    // declaration reached it on this pass.
+                    let source = {
+                        let query = format!(
                         "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' \
                          RETURN m.metadata, m.location, m.location_lines, m.content"
                     );
-                    let mut rows = conn.query(&query)?;
-                    rows.next().map(|row| {
-                        let metadata = match &row[0] {
-                            lbug::Value::String(raw) => {
-                                serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({}))
-                            }
-                            _ => serde_json::json!({}),
-                        };
-                        EdgeProvenanceSource::from_row(
-                            &metadata,
-                            &format!("{}", row[1]),
-                            &format!("{}", row[2]),
-                            &format!("{}", row[3]),
-                        )
-                    })
-                };
-                let now = chrono::Utc::now().timestamp();
-                let mut created = 0usize;
-                let mut fresh_entries: Vec<Value> = Vec::new();
-                for (index, target) in keep_owned.iter().enumerate() {
-                    if existing.contains(target) {
-                        continue;
-                    }
-                    let declared_target = declared_owned
-                        .get(index)
-                        .map(String::as_str)
-                        .unwrap_or(target.as_str());
-                    let (evidence_id, entry) = match &source {
-                        Some(source) => {
-                            let (evidence_id, entry) = edge_provenance_entry(
-                                &id,
-                                &rel_type,
-                                index,
-                                declared_target,
-                                target,
-                                "self_to_target",
-                                source,
-                            );
-                            (evidence_id, Some(entry))
-                        }
-                        None => (id.clone(), None),
+                        let mut rows = conn.query(&query)?;
+                        rows.next().map(|row| {
+                            let metadata = match &row[0] {
+                                lbug::Value::String(raw) => serde_json::from_str(raw)
+                                    .unwrap_or_else(|_| serde_json::json!({})),
+                                _ => serde_json::json!({}),
+                            };
+                            EdgeProvenanceSource::from_row(
+                                &metadata,
+                                &format!("{}", row[1]),
+                                &format!("{}", row[2]),
+                                &format!("{}", row[3]),
+                            )
+                        })
                     };
-                    let safe_target = escape_ladybug_string(target);
-                    let safe_evidence = escape_ladybug_string(&evidence_id);
-                    // Both endpoints must belong to the namespace; a global
-                    // MATCH on a repeated id would otherwise bridge namespaces.
-                    let query = format!(
+                    let now = chrono::Utc::now().timestamp();
+                    let mut created = 0usize;
+                    let mut fresh_entries: Vec<Value> = Vec::new();
+                    for (index, target) in keep_owned.iter().enumerate() {
+                        if existing.contains(target) {
+                            continue;
+                        }
+                        let declared_target = declared_owned
+                            .get(index)
+                            .map(String::as_str)
+                            .unwrap_or(target.as_str());
+                        let (evidence_id, entry) = match &source {
+                            Some(source) => {
+                                let (evidence_id, entry) = edge_provenance_entry(
+                                    &id,
+                                    &rel_type,
+                                    index,
+                                    declared_target,
+                                    target,
+                                    "self_to_target",
+                                    source,
+                                );
+                                (evidence_id, Some(entry))
+                            }
+                            None => (id.clone(), None),
+                        };
+                        let safe_target = escape_ladybug_string(target);
+                        let safe_evidence = escape_ladybug_string(&evidence_id);
+                        // Both endpoints must belong to the namespace; a global
+                        // MATCH on a repeated id would otherwise bridge namespaces.
+                        let query = format!(
                         "MATCH (a:Memory {{id: '{safe_id}'}}), (b:Memory {{id: '{safe_target}'}}) \
                          WHERE a.namespace = '{safe_ns}' AND b.namespace = '{safe_ns}' \
                          MERGE (a)-[r:{rel_type}]->(b) ON CREATE SET r.source = '{safe_ns}', \
@@ -12790,61 +12827,62 @@ impl VectorStore for LadybugStore {
                          r.extractor = 'upsert', r.confidence = 1.0, \
                          r.evidence_id = '{safe_evidence}', r.origin = 'local' RETURN r"
                     );
-                    // A target that vanished between planning and this write
-                    // binds nothing, exactly like upsert, and reports no edge.
-                    for _row in conn.query(&query)? {
-                        created += 1;
-                        if let Some(entry) = entry.clone() {
-                            fresh_entries.push(entry);
+                        // A target that vanished between planning and this write
+                        // binds nothing, exactly like upsert, and reports no edge.
+                        for _row in conn.query(&query)? {
+                            created += 1;
+                            if let Some(entry) = entry.clone() {
+                                fresh_entries.push(entry);
+                            }
                         }
                     }
-                }
-                if !fresh_entries.is_empty() {
-                    let read_q = format!(
+                    if !fresh_entries.is_empty() {
+                        let read_q = format!(
                         "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' \
                          RETURN m.metadata"
                     );
-                    let mut rows = conn.query(&read_q)?;
-                    if let Some(row) = rows.next() {
-                        if let lbug::Value::String(meta_str) = &row[0] {
-                            if let Ok(mut meta) = serde_json::from_str::<Value>(meta_str) {
-                                if let Some(obj) = meta.as_object_mut() {
-                                    let sources = obj
-                                        .entry("edge_sources".to_string())
-                                        .or_insert_with(|| serde_json::json!([]));
-                                    if !sources.is_array() {
-                                        *sources = serde_json::json!([]);
-                                    }
-                                    let sources = sources.as_array_mut().expect("array");
-                                    for entry in fresh_entries {
-                                        // One citation per live binding: only
-                                        // the entry for this binding is
-                                        // replaced, so retained declarations
-                                        // and earlier rebinds keep theirs.
-                                        sources.retain(|existing| {
-                                            !(existing.get("rel_type") == entry.get("rel_type")
-                                                && existing.get("extractor")
-                                                    == entry.get("extractor")
-                                                && existing.get("resolved_target")
-                                                    == entry.get("resolved_target"))
-                                        });
-                                        sources.push(entry);
-                                    }
-                                    if let Ok(new_meta) = serde_json::to_string(&meta) {
-                                        let update_q = format!(
-                                            "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' \
+                        let mut rows = conn.query(&read_q)?;
+                        if let Some(row) = rows.next() {
+                            if let lbug::Value::String(meta_str) = &row[0] {
+                                if let Ok(mut meta) = serde_json::from_str::<Value>(meta_str) {
+                                    if let Some(obj) = meta.as_object_mut() {
+                                        let sources = obj
+                                            .entry("edge_sources".to_string())
+                                            .or_insert_with(|| serde_json::json!([]));
+                                        if !sources.is_array() {
+                                            *sources = serde_json::json!([]);
+                                        }
+                                        let sources = sources.as_array_mut().expect("array");
+                                        for entry in fresh_entries {
+                                            // One citation per live binding: only
+                                            // the entry for this binding is
+                                            // replaced, so retained declarations
+                                            // and earlier rebinds keep theirs.
+                                            sources.retain(|existing| {
+                                                !(existing.get("rel_type") == entry.get("rel_type")
+                                                    && existing.get("extractor")
+                                                        == entry.get("extractor")
+                                                    && existing.get("resolved_target")
+                                                        == entry.get("resolved_target"))
+                                            });
+                                            sources.push(entry);
+                                        }
+                                        if let Ok(new_meta) = serde_json::to_string(&meta) {
+                                            let update_q = format!(
+                                                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' \
                                              AND m.id = '{safe_id}' SET m.metadata = '{}'",
-                                            escape_ladybug_string(&new_meta)
-                                        );
-                                        conn.query(&update_q)?;
+                                                escape_ladybug_string(&new_meta)
+                                            );
+                                            conn.query(&update_q)?;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                Ok(created)
-            })
+                    Ok(created)
+                },
+            )
             .await?;
         self.reconcile_declared_edges(&namespace_key, &id_key, &rel_type_key, &keep_for_reconcile)
             .await?;
@@ -13077,7 +13115,30 @@ impl VectorStore for LadybugStore {
         }
 
         let namespace_owned = namespace.to_string();
-        self.write_with_deadline("relinking the graph", move |conn| {
+        // Replay writes every retained binding and every mention edge, plus
+        // the metadata rows carrying their provenance. Account for all of it
+        // before the write, not just for the declarer (#453 follow-up).
+        let incoming = wanted
+            .iter()
+            .chain(vault_wanted.iter())
+            .fold(0u64, |total, (rel, pairs)| {
+                total.saturating_add(estimate_edge_targets_bytes(
+                    rel,
+                    "",
+                    pairs.iter().map(|(_, target)| target.as_str()),
+                ))
+            })
+            .saturating_add(estimate_edge_targets_bytes(
+                "RELATES_TO",
+                "",
+                mention_pairs.iter().map(|(_, target)| target.as_str()),
+            ))
+            .saturating_add(mention_updates.iter().fold(0u64, |total, (_, meta)| {
+                total
+                    .saturating_add(meta.len() as u64)
+                    .saturating_add(ROW_OVERHEAD_BYTES)
+            }));
+        self.write_with_deadline_within_cap("relinking the graph", Some(incoming), move |conn| {
             // Update only mentions metadata rows that actually changed, batched
             // via UNWIND to avoid a separate write transaction per memory.
             for chunk in mention_updates.chunks(100) {
@@ -13197,7 +13258,7 @@ impl VectorStore for LadybugStore {
     async fn clear_ingested(&self, namespace: &str) -> Result<()> {
         let namespace = namespace.to_string();
         let index_namespace = namespace.clone();
-        let outcome = self.write_with_deadline("clearing the ingested rows", move |conn| {
+        let outcome = self.write_with_deadline_unmetered("clearing the ingested rows", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
 
             // Every row the ingester owns: the AST symbols and the directory/file
@@ -13311,7 +13372,14 @@ impl VectorStore for LadybugStore {
         let namespace = namespace.to_string();
         let refresh_ns = namespace.clone();
         let source_key = source_key.to_string();
-        self.write_with_deadline("publishing a staging generation", move |conn| {
+        // The flip MERGEs one pointer row; the namespace/source strings are
+        // the only fields it can grow (#453 follow-up).
+        let pointer_id = crate::parser::ingest::generation_key(&namespace, &source_key);
+        let incoming = estimate_field_row_bytes(&[&pointer_id, &namespace, &source_key]);
+        self.write_with_deadline_within_cap(
+            "publishing a staging generation",
+            Some(incoming),
+            move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_sk = escape_ladybug_string(&source_key);
             // The flip is one statement on this source's pointer row: the active
@@ -13343,7 +13411,8 @@ impl VectorStore for LadybugStore {
             );
             conn.query(&clear_staging)?;
             Ok(())
-        })
+            },
+        )
         .await?;
         self.refresh_lexical_after_pointer_change(&refresh_ns).await;
         Ok(())
@@ -13358,7 +13427,7 @@ impl VectorStore for LadybugStore {
         let namespace = namespace.to_string();
         let refresh_ns = namespace.clone();
         let source_key = source_key.to_string();
-        self.write_with_deadline("aborting a staging generation", move |conn| {
+        self.write_with_deadline_unmetered("aborting a staging generation", move |conn| {
             // A staged node's id is `ns::<generation>::<path>`, so every row of
             // this generation shares the prefix. The namespace predicate keeps
             // a foreign row whose id happens to start with that prefix (a
@@ -19078,6 +19147,50 @@ eurostrata\src\daemon.rs",
         );
         drop(first);
         fs2::FileExt::lock_exclusive(&second).unwrap();
+    }
+
+    /// PR #453 follow-up: generation publishing is a persistent write. It
+    /// must not bypass `max_db_bytes` through the unmetered wrapper.
+    #[tokio::test]
+    async fn publishing_a_generation_is_refused_when_the_store_is_full() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("publish-cap.db");
+        let seed = capped_test_store(&path, 0).await;
+        drop(seed);
+
+        // Half the seeded footprint leaves no headroom for the pointer row.
+        let cap = current_store_bytes_at(&path) / 2;
+        let store = capped_test_store(&path, cap).await;
+        let err = store
+            .publish_generation("probe", PROBE_SOURCE, 1)
+            .await
+            .expect_err("a publish with no headroom must be refused");
+        assert!(err.to_string().contains("STORE_FULL"), "{err}");
+    }
+
+    /// PR #453 follow-up: relink/rebind admission pays for every replayed
+    /// edge, not just the declarer row.
+    #[test]
+    fn an_edge_batch_estimate_counts_every_target_and_the_metadata_rewrite() {
+        let targets = vec!["probe::a.rs".to_string(), "probe::b.rs".to_string()];
+        let two = estimate_edge_targets_bytes(
+            "GOVERNS",
+            "probe::rule",
+            targets.iter().map(String::as_str),
+        );
+        let one = estimate_edge_targets_bytes(
+            "GOVERNS",
+            "probe::rule",
+            targets[..1].iter().map(String::as_str),
+        );
+        assert!(
+            two > one,
+            "two targets must cost more than one: {one} -> {two}"
+        );
+        assert!(
+            two >= 2 * (ROW_OVERHEAD_BYTES + EDGE_ROW_OVERHEAD_BYTES),
+            "each edge carries a full row allowance: {two}"
+        );
     }
 
     /// Task 2: TaskStore and OntologyStore round-trip against a temporary

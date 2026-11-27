@@ -609,7 +609,9 @@
         "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_failed_size_measurement_is_an_error_not_zero -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_ordinary_counter_write_is_refused_when_the_store_is_full -- --test-threads=1",
         "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::the_cap_error_permits_only_individual_hallucination_deletes -- --test-threads=1",
-        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::the_cap_guard_lock_excludes_a_second_handle -- --test-threads=1"
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::the_cap_guard_lock_excludes_a_second_handle -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::publishing_a_generation_is_refused_when_the_store_is_full -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_edge_batch_estimate_counts_every_target_and_the_metadata_rewrite -- --test-threads=1"
       ],
       "tests": [
         "config::tests::store_limits_parse_from_json",
@@ -636,7 +638,9 @@
         "store::ladybug::tests::a_failed_size_measurement_is_an_error_not_zero",
         "store::ladybug::tests::an_ordinary_counter_write_is_refused_when_the_store_is_full",
         "store::ladybug::tests::the_cap_error_permits_only_individual_hallucination_deletes",
-        "store::ladybug::tests::the_cap_guard_lock_excludes_a_second_handle"
+        "store::ladybug::tests::the_cap_guard_lock_excludes_a_second_handle",
+        "store::ladybug::tests::publishing_a_generation_is_refused_when_the_store_is_full",
+        "store::ladybug::tests::an_edge_batch_estimate_counts_every_target_and_the_metadata_rewrite"
       ],
       "thresholds": {
         "ignored": 0
