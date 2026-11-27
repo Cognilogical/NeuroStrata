@@ -1703,6 +1703,9 @@ async fn _with_watch(
                                 .get("namespace")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("global");
+                            if let Err(e) = check_namespace_arg(ns_raw) {
+                                result_text = e;
+                            } else {
                             let ns = resolve_namespace(&store, ns_raw).await;
                             let scip_path = arguments
                                 .get("scip_path")
@@ -1726,6 +1729,7 @@ async fn _with_watch(
                                         result_text = format!("Error ingesting SCIP index: {e}");
                                     }
                                 }
+                            }
                             }
                         }
                         "neurostrata_ingest_bounded" => {
@@ -8138,7 +8142,12 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
     };
 
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
-        Some(n) if !n.is_empty() => n.to_string(),
+        Some(n) if !n.is_empty() => {
+            if let Err(e) = check_namespace_arg(n) {
+                return serde_json::json!({"ok":false,"error":e}).to_string();
+            }
+            resolve_namespace(&store, n).await
+        }
         // No explicit namespace: resolve the project-root ("NeuroStrata")
         // default the same way every other handler does.
         _ => resolve_namespace(&store, "NeuroStrata").await,
@@ -9821,6 +9830,9 @@ pub(crate) async fn handle_object_view_with_auth(
     };
     if let Err(e) = check_namespace_arg(ns_raw) {
         return e;
+    }
+    if let Err(e) = crate::domain::validate_id_for_read(id_raw) {
+        return serde_json::json!({"ok": false, "error": e.to_string()}).to_string();
     }
     let namespace = resolve_namespace(&store, ns_raw).await;
     let Some(lb_store) = crate::traits::VectorStore::as_any(store.as_ref())

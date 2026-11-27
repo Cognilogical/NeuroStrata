@@ -101,12 +101,12 @@ fn namespace_rule_reason(ns: &str) -> Option<String> {
     if !ns.is_ascii() {
         return Some("must contain only ASCII characters".to_string());
     }
-    // A leading letter or digit keeps option-like names (`-x`, `--help`)
-    // from being consumed as CLI flags by the hook and from reading as a
-    // path step. This mirrors the JSON schema and the documented DR-1 rule.
+    // DR-1: characters from [A-Za-z0-9._-], leading dot prohibited. A leading
+    // dot would read as a path step; `:` stays banned so `<ns>::<id>` splits
+    // unambiguously.
     let first = ns.chars().next().expect("length checked above");
-    if !first.is_ascii_alphanumeric() {
-        return Some("must start with an ASCII letter or digit".to_string());
+    if first == '.' {
+        return Some("must not start with '.'".to_string());
     }
     if let Some(ch) = ns
         .chars()
@@ -121,9 +121,8 @@ fn namespace_rule_reason(ns: &str) -> Option<String> {
 }
 
 /// Validate a namespace under DR-1: 1 to 64 ASCII characters from
-/// `[A-Za-z0-9._-]`, starting with an ASCII letter or digit. `:` is banned so
-/// a `<namespace>::<path>` id always splits unambiguously; a leading `-`,
-/// `_` or `.` would read as a CLI option or a path step.
+/// `[A-Za-z0-9._-]`, and must not start with `.`. `:` is banned so a
+/// `<namespace>::<path>` id always splits unambiguously.
 pub fn validate_namespace(ns: &str) -> Result<(), ValidationError> {
     match namespace_rule_reason(ns) {
         None => Ok(()),
@@ -247,12 +246,13 @@ pub fn validate_namespace_legacy(ns: &str) -> Result<(), ValidationError> {
 fn is_legacy_file_path_id(id: &str) -> bool {
     if id.is_empty()
         || id.chars().count() > MAX_ID_CHARS
-        || !id.is_ascii()
         || !id.contains('/')
         || id.contains(':')
-        || id
-            .chars()
-            .any(|c| matches!(c, '\'' | '"' | '\\') || c.is_control() || !c.is_ascii_graphic())
+        || id.chars().any(|c| {
+            matches!(c, '\'' | '"' | '\\')
+                || c.is_control()
+                || !(c.is_ascii_graphic() || (!c.is_ascii() && !c.is_control()))
+        })
     {
         return false;
     }
@@ -275,13 +275,23 @@ fn is_legacy_file_path_id(id: &str) -> bool {
 /// must keep working). Qualified ids are unchanged: their paths already
 /// allow `/` and spaces, and their prefixes still obey DR-1.
 pub fn validate_id_for_read(id: &str) -> Result<(), ValidationError> {
-    if validate_id(id).is_ok() || is_legacy_file_path_id(id) {
-        Ok(())
-    } else {
-        Err(ValidationError::Id(format!(
-            "'{}' is not a valid id for read",
-            id.escape_debug()
-        )))
+    match validate_id(id) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if is_legacy_file_path_id(id) {
+                Ok(())
+            } else {
+                let reason = err.to_string();
+                let reason = reason
+                    .split_once(" is not a valid id: ")
+                    .map(|(_, r)| r)
+                    .unwrap_or("it does not satisfy DR-2");
+                Err(ValidationError::Id(format!(
+                    "'{}' is not a valid id for read: {reason}",
+                    id.escape_debug()
+                )))
+            }
+        }
     }
 }
 
@@ -291,7 +301,7 @@ pub fn validate_id_for_read(id: &str) -> Result<(), ValidationError> {
 pub fn validate_id_for_namespace(id: &str, namespace: &str) -> Result<(), ValidationError> {
     if let Some(pos) = id.find(NAMESPACE_SEPARATOR) {
         let prefix = &id[..pos];
-        if prefix != namespace {
+        if !prefix.eq_ignore_ascii_case(namespace) {
             return Err(ValidationError::Id(format!(
                 "'{}' names namespace '{}' but the row belongs to '{}'",
                 id.escape_debug(),
