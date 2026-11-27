@@ -11373,9 +11373,10 @@ exit 0
         );
     }
 
-    /// A note is never refused: a secret in it is stored as
-    /// `[REDACTED:<category>]` and the reply says how many and which kinds,
-    /// never the secret. A clean note is stored as written.
+    /// A secret in a note is refused before any write; a clean note is stored
+    /// verbatim with an empty redactions reply. Redaction stays the store-layer
+    /// defense for text arriving outside the tools (see
+    /// every_task_write_path_stores_text_redacted).
     #[tokio::test]
     async fn a_note_is_stored_with_its_secrets_redacted() {
         let store = store_with_namespace("MyProj").await;
@@ -11389,21 +11390,17 @@ exit 0
                 p.metadata["task"]["history"].to_string()
             }
         };
+        let before = history().await;
+
         let reply = handle_task_update(
             json!({ "namespace": "MyProj", "id": id, "note": format!("Handoff: push with {key}") }),
             emb(),
             store.clone(),
         )
         .await;
+        assert_security_refusal(&reply);
         assert!(!reply.contains(key), "{reply}");
-        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
-        assert_eq!(parsed["redactions"], json!([{ "category": "github_pat" }]));
-        let stored = history().await;
-        assert!(!stored.contains(key), "{stored}");
-        assert!(
-            stored.contains("Handoff: push with [REDACTED:github_pat]"),
-            "{stored}"
-        );
+        assert_eq!(history().await, before, "a refused note appends no history");
 
         let reply = handle_task_update(
             json!({ "namespace": "MyProj", "id": id, "note": "Handoff: run the suite" }),
@@ -11416,13 +11413,15 @@ exit 0
         assert!(history().await.contains("Handoff: run the suite"));
     }
 
-    /// Every task text a later session reads back is scrubbed the same way as
-    /// a note: the title and description on create and rename, and the close
-    /// reason and follow-up tasks on complete.
+    /// Task text supplied through the tools is refused when it carries a
+    /// secret; clean text is stored verbatim with an empty redactions reply.
+    /// Redaction remains the store-layer defense for rows written outside the
+    /// tools.
     #[tokio::test]
     async fn task_titles_descriptions_and_close_reasons_are_stored_redacted() {
         let store = store_with_namespace("MyProj").await;
         let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
+        let before = store.list("MyProj", None, None).await.unwrap().len();
         let stored = |id: String| {
             let store = store.clone();
             async move {
@@ -11431,37 +11430,48 @@ exit 0
             }
         };
 
+        // Create refuses a secret in the title.
         let reply = handle_task_create(
             json!({
                 "namespace": "MyProj",
                 "title": format!("rotate {key}"),
-                "description": "then set password=hunter22 everywhere",
+                "description": "then store the credential in the vault",
             }),
             emb(),
             store.clone(),
         )
         .await;
-        assert!(
-            !reply.contains(key) && !reply.contains("hunter22"),
-            "{reply}"
-        );
-        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_security_refusal(&reply);
         assert_eq!(
-            parsed["redactions"],
-            json!([{ "category": "github_pat" }, { "category": "password" }])
+            store.list("MyProj", None, None).await.unwrap().len(),
+            before,
+            "a refused create writes no row"
         );
+
+        // Clean text is stored verbatim; no redactions are reported.
+        let reply = handle_task_create(
+            json!({
+                "namespace": "MyProj",
+                "title": "rotate the signing material",
+                "description": "then store the credential in the vault",
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["redactions"], json!([]));
         let id = parsed["id"].as_str().unwrap().to_string();
         let row = stored(id.clone()).await;
-        assert!(!row.contains(key) && !row.contains("hunter22"), "{row}");
-        assert!(row.contains("rotate [REDACTED:github_pat]"), "{row}");
         assert!(
-            row.contains("then set password=[REDACTED:password] everywhere"),
+            row.contains("rotate the signing material")
+                && row.contains("then store the credential in the vault"),
             "{row}"
         );
 
-        // A title within the limit as written is not refused because its
-        // marker is longer than the secret it replaced.
-        let near_limit = format!("{} password=hunter22", "x".repeat(180));
+        // Length is judged on the text as written: a clean near-limit title
+        // passes, a clean over-limit title is refused by the length check.
+        let near_limit = format!("{} rotated", "x".repeat(180));
         assert!(near_limit.chars().count() <= MAX_TITLE);
         let reply = handle_task_create(
             json!({ "namespace": "MyProj", "title": near_limit }),
@@ -11470,61 +11480,42 @@ exit 0
         )
         .await;
         let parsed: Value = serde_json::from_str(&reply).expect(&reply);
-        assert_eq!(parsed["redactions"], json!([{ "category": "password" }]));
+        assert_eq!(parsed["redactions"], json!([]));
 
-        // A title over the limit only because of its secret is not refused:
-        // the length is checked on the redacted title.
-        let long_title = format!("{} {key}", "x".repeat(170));
-        assert!(long_title.chars().count() > MAX_TITLE);
+        let over_limit = format!("{} rotated", "x".repeat(MAX_TITLE));
+        assert!(over_limit.chars().count() > MAX_TITLE);
         let reply = handle_task_create(
-            json!({ "namespace": "MyProj", "title": long_title }),
+            json!({ "namespace": "MyProj", "title": over_limit }),
             emb(),
             store.clone(),
         )
         .await;
-        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
-        assert_eq!(parsed["redactions"], json!([{ "category": "github_pat" }]));
+        assert!(reply.contains("ERROR"), "{reply}");
 
+        // A secret in a rename is refused; the stored row is unchanged.
+        let row_before = stored(id.clone()).await;
         let reply = handle_task_update(
             json!({ "namespace": "MyProj", "id": id, "title": format!("rotate {key} now") }),
             emb(),
             store.clone(),
         )
         .await;
-        assert!(!reply.contains(key), "{reply}");
-        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
-        assert_eq!(parsed["redactions"], json!([{ "category": "github_pat" }]));
-        let row = stored(id.clone()).await;
-        assert!(
-            row.contains("rotate [REDACTED:github_pat] now") && !row.contains(key),
-            "{row}"
+        assert_security_refusal(&reply);
+        assert_eq!(
+            stored(id.clone()).await,
+            row_before,
+            "a refused rename writes nothing"
         );
 
+        // Completion refuses a secret in the reason or a follow-up before any
+        // extraction, follow-up row, or done state is written.
         claim(&store, &id).await;
-        let mem_id = uuid::Uuid::new_v4().to_string();
-        let vector = StubEmbedder.embed("the lesson").await.unwrap();
-        store
-            .upsert(
-                "MyProj",
-                &mem_id,
-                vector,
-                MemoryPayload {
-                    content: "the lesson".to_string(),
-                    user_id: "kenton".to_string(),
-                    memory_type: "fact".to_string(),
-                    agent_name: None,
-                    location: String::new(),
-                    location_lines: String::new(),
-                    metadata: json!({ "extracted_from": [id.as_str()] }),
-                },
-            )
-            .await
-            .unwrap();
-        let reply = handle_task_complete(
+        let before_complete = store.list("MyProj", None, None).await.unwrap().len();
+        let err = handle_task_complete(
             json!({
                 "namespace": "MyProj",
                 "id": id,
-                "reason": "rotated, old password=hunter22",
+                "reason": "rotated",
                 "follow_up_tasks": [{ "title": "audit", "description": format!("check {key}") }],
             }),
             emb(),
@@ -11533,31 +11524,14 @@ exit 0
             quiet_bus(),
         )
         .await
-        .expect("completes");
-        assert!(
-            !reply.contains(key) && !reply.contains("hunter22"),
-            "{reply}"
-        );
-        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        .expect_err("a secret follow-up must refuse the completion");
+        assert_security_refusal(&err);
         assert_eq!(
-            parsed["redactions"],
-            json!([{ "category": "password" }, { "category": "github_pat" }])
+            store.list("MyProj", None, None).await.unwrap().len(),
+            before_complete,
+            "a refused completion writes no follow-up"
         );
-        let row = stored(id.clone()).await;
-        assert!(
-            row.contains("rotated, old password=[REDACTED:password]"),
-            "{row}"
-        );
-        assert!(!row.contains("hunter22"), "{row}");
-        let follow_up = parsed["follow_up_tasks_created"][0]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let row = stored(follow_up).await;
-        assert!(
-            row.contains("check [REDACTED:github_pat]") && !row.contains(key),
-            "{row}"
-        );
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
     }
 
     /// Task text that reaches the store without passing the three tools is
