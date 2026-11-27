@@ -2451,10 +2451,12 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
             None if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            None => return Err(anyhow::anyhow!(
+            None => {
+                return Err(anyhow::anyhow!(
                 "Another NeuroStrata daemon, or a CLI command working on the store, holds {:?}.",
                 db_path
-            )),
+            ))
+            }
         }
     }
 }
@@ -3956,6 +3958,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cli_root_registry_refuses_a_pristine_store_without_an_embedder() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let _env = crate::daemon::project_root_env_test_lock();
         let old_home = std::env::var_os("HOME");
         let old_model = std::env::var_os("NEUROSTRATA_MODEL");
@@ -5982,6 +5985,7 @@ mod tests {
     /// guard's restart guidance forever.
     #[tokio::test]
     async fn fallback_add_on_pristine_store_adopts_configured_model_and_writes() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let root =
@@ -6085,6 +6089,7 @@ mod tests {
     /// the pristine record is adopted.
     #[tokio::test]
     async fn fallback_edit_on_pristine_labelled_store_adopts_and_edits() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let root =
@@ -6146,7 +6151,7 @@ mod tests {
         prepare_fallback_write_store(&vector_store, &embedder, "probe")
             .await
             .expect("the fallback write preparation inits the store under the serving model");
-        let outcome = crate::server::edit_memory(
+        let error = crate::server::edit_memory(
             &*vector_store,
             &*embedder,
             "probe",
@@ -6156,26 +6161,42 @@ mod tests {
             "",
         )
         .await
-        .expect("the fallback edit must adopt the pristine record and proceed");
+        .expect_err("a stale pristine sidecar must not adopt over the persisted marker");
         assert!(
-            matches!(outcome, crate::server::EditOutcome::Edited),
-            "the seeded row is edited: {outcome:?}"
+            error.to_string().contains("recorded embedding model"),
+            "the refusal must name the recorded model: {error}"
         );
-        let (_, edited) = vector_store
-            .get("probe", "m1")
-            .await
-            .expect("get the edited row")
-            .expect("the edited row exists");
-        assert_eq!(edited.content, "edited");
         let content = std::fs::read_to_string(crate::model_choice::store_state_path(&db_path))
             .expect("sidecar exists");
         let sidecar: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
             sidecar["descriptor"]["model"],
-            serde_json::json!("GTEBaseENV15"),
-            "the pristine record is adopted to the configured model"
+            serde_json::json!("BGESmallENV15"),
+            "a refused fallback must leave the sidecar on the marker's model"
         );
         drop(vector_store);
+
+        // The same row is still editable under the model that actually
+        // produced its vector: the refusal did not poison the store.
+        write_config("BGESmallENV15");
+        let matching: Arc<dyn VectorStore> = Arc::new(
+            LadybugStore::for_testing(&db_path, 4)
+                .expect("reopen under the recorded model")
+                .with_embed_config_dir(&config_dir)
+                .with_serving_descriptor(Some(descriptor("BGESmallENV15"))),
+        );
+        matching.init("probe").await.expect("reopen init");
+        matching
+            .upsert("probe", "m1", vec![0.1, 0.2, 0.3, 0.4], payload("edited"))
+            .await
+            .expect("the model that produced the marker must still write the store");
+        let (_, edited) = matching
+            .get("probe", "m1")
+            .await
+            .expect("get the edited row")
+            .expect("the edited row exists");
+        assert_eq!(edited.content, "edited");
+        drop(matching);
         let _ = std::fs::remove_dir_all(&root);
         match previous {
             Some(value) => std::env::set_var("NEUROSTRATA_MODEL", value),
@@ -6196,6 +6217,7 @@ mod tests {
     /// as ingest performs it.
     #[tokio::test]
     async fn fallback_ingest_on_pristine_store_adopts_configured_model_and_writes() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let root =
@@ -6299,6 +6321,7 @@ mod tests {
     /// arms perform them.
     #[tokio::test]
     async fn fallback_write_arms_prepare_store_before_mutating() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let root =
@@ -6360,7 +6383,7 @@ mod tests {
         prepare_fallback_write_store(&vector_store, &embedder, "probe")
             .await
             .expect("the fallback write preparation inits the store under the serving model");
-        let outcome = crate::server::set_metadata(
+        let error = crate::server::set_metadata(
             &*vector_store,
             "probe",
             "m1",
@@ -6368,31 +6391,19 @@ mod tests {
             "admin",
         )
         .await
-        .expect("the fallback SetMetadata arm must adopt the pristine record and proceed");
+        .expect_err("a stale pristine sidecar must not adopt over the persisted marker");
         assert!(
-            matches!(outcome, crate::server::MetadataOutcome::Updated),
-            "the metadata write lands: {outcome:?}"
+            error.to_string().contains("recorded embedding model"),
+            "the refusal must name the recorded model: {error}"
         );
         let (_, row) = vector_store
             .get("probe", "m1")
             .await
-            .expect("read the updated row")
+            .expect("read the unchanged row")
             .expect("the row exists");
-        assert_eq!(
-            row.metadata.get("k").and_then(serde_json::Value::as_str),
-            Some("v"),
-            "the fallback SetMetadata write survives the metadata round-trip"
-        );
-        let bus = Arc::new(crate::events::ThalamicBus::new(crate::daemon::BUS_CAPACITY));
-        let archive = crate::handlers::archive_memory::archive_memory(
-            serde_json::json!({ "namespace": "probe", "id": "m1" }),
-            vector_store.clone(),
-            bus,
-        )
-        .await;
         assert!(
-            archive.is_archived(),
-            "the fallback Archive arm must retire the row the same metadata write left behind: {archive:?}"
+            row.metadata.get("k").is_none(),
+            "the refused metadata write must leave the row untouched"
         );
         drop(vector_store);
         let _ = std::fs::remove_dir_all(&root);

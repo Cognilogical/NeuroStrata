@@ -409,6 +409,20 @@ pub(crate) fn store_state_unparseable_error(db_path: &Path, reason: &str) -> any
 /// a state another writer is between read and write.
 static STORE_STATE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// `NEUROSTRATA_MODEL` is process-global. Every test that mutates it must
+/// hold this one lock for the test's whole lifetime, otherwise a parallel
+/// test can observe another's override or restore a stale value (#457
+/// re-review).
+#[cfg(test)]
+pub(crate) static MODEL_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn model_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    MODEL_ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Write the sidecar's identity fields (`has_data` / `descriptor`) while
 /// **always** carrying the health currently on disk (`#212`, Codex P2).
 ///
@@ -974,6 +988,7 @@ mod tests {
         write_initial_embedders_file(&config_dir, bge_small_q(), &db_path)
             .expect("write choice file");
 
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         // An env-named model that is in the file wins over the first entry.
         std::env::set_var("NEUROSTRATA_MODEL", "NomicEmbedTextV15");
@@ -1754,6 +1769,7 @@ mod tests {
         // a bare db file plus its sidecar — no engine fixture is
         // needed, and the refusal must leave every byte (and the file
         // set) untouched.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -1837,6 +1853,7 @@ mod tests {
         // unparseable local name falls back to a different model at
         // load — both pass here and remain gated by the store-level
         // check on the true serving descriptor.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -1892,6 +1909,7 @@ mod tests {
 
     #[test]
     fn unparseable_sidecar_refuses_daemon_preflight() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -1930,6 +1948,7 @@ mod tests {
 
     #[test]
     fn wrong_version_sidecar_refuses_daemon_preflight() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let tmp = tempfile::tempdir().expect("temp dir");

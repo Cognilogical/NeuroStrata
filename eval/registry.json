@@ -589,6 +589,31 @@
         "ignored": 0
       }
     },
+    "store-embedding-marker": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::store_identity -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::store_identity::the_embedding_marker_is_recorded_with_the_first_vector",
+        "store::ladybug::store_identity::a_marker_write_failure_refuses_the_first_vector",
+        "store::ladybug::store_identity::the_persisted_marker_refuses_a_different_embedding_space_without_the_sidecar",
+        "store::ladybug::store_identity::the_marker_and_sidecar_disagreement_refuses_vector_ops",
+        "store::ladybug::store_identity::legacy_adoption_is_recorded_as_marker_provenance",
+        "store::ladybug::store_identity::an_adopted_marker_survives_sidecar_loss",
+        "store::ladybug::store_identity::row_identity_audit_reports_a_scoped_id_under_the_wrong_namespace",
+        "store::ladybug::store_identity::row_identity_audit_reports_an_unqualified_ingested_row",
+        "store::ladybug::store_identity::audit_at_init_never_blocks_open",
+        "store::ladybug::store_identity::the_first_batched_vector_write_records_the_marker",
+        "store::ladybug::store_identity::a_mismatched_marker_refuses_commit_action_batch_without_writing",
+        "store::ladybug::store_identity::absent_sidecar_legacy_adoption_records_no_provenance",
+        "store::ladybug::store_identity::a_lost_sidecar_and_wrong_model_does_not_synthesize_a_false_identity",
+        "store::ladybug::store_identity::an_unverified_recovery_open_skips_adoption",
+        "store::ladybug::store_identity::a_failed_adoption_is_non_fatal_and_retried"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "dependency-advisory": {
       "commands": [
         "cargo test --locked --test dependency_integrity -- --test-threads=1"

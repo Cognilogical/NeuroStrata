@@ -1604,6 +1604,7 @@ mod tests {
         // non-default pick. Which file gets hashed is proven against
         // fixture bytes by verify_hashes_the_file_fastembed_loads; the
         // emitted pin's correctness is the table constant asserted here.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::set_var("NEUROSTRATA_MODEL", "");
 
