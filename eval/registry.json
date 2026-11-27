@@ -625,6 +625,11 @@
         "events::bus::tests::poisoned_queue_degrades_not_panics",
         "events::bus::tests::poisoned_registry_degrades_not_panics",
         "events::bus::tests::poisoned_registry_snapshot_skips_one_pulse_not_the_dispatcher",
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "daemon-logging": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp tests::tracing_output_reaches_stderr -- --exact --test-threads=1",
