@@ -65,6 +65,25 @@
         "ignored": 0
       }
     },
+    "lexical-visibility": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp lexical::tests::archived_bool_and_int_both_excluded_from_upsert_index -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp lexical::tests::archived_bool_and_int_both_excluded_from_rebuild -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::inhouse_lexical_excludes_int_archived_rows -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::tantivy_hydration_backfills_past_dropped_hits -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::tantivy_hydration_rechecks_acl_object_form -- --exact --test-threads=1"
+      ],
+      "tests": [
+        "lexical::tests::archived_bool_and_int_both_excluded_from_upsert_index",
+        "lexical::tests::archived_bool_and_int_both_excluded_from_rebuild",
+        "store::ladybug::tests::inhouse_lexical_excludes_int_archived_rows",
+        "store::ladybug::tests::tantivy_hydration_backfills_past_dropped_hits",
+        "store::ladybug::tests::tantivy_hydration_rechecks_acl_object_form"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "guard-3000": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp guard::semantic::tests -- --test-threads=1"

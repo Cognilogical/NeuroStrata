@@ -7468,14 +7468,28 @@ const STRUCTURAL_MEMORY_TYPES: [&str; 10] = [
     "action_receipt",
 ];
 
+/// Upper bound on how many Tantivy hits one lexical search may scan while
+/// backing up a page whose top hits were dropped during hydration (#404).
+/// The window doubles from `limit` until the page is full, the index is
+/// exhausted, or this cap is reached.
+const MAX_LEXICAL_SCAN_ROWS: usize = 1000;
+
+/// Read-gating options shared by the Tantivy hydration backstop.
+struct LexicalHydrationOptions<'a> {
+    include_tasks: bool,
+    include_archived: bool,
+    include_code_ast: bool,
+    principal: &'a str,
+}
+
 /// Row-class predicates for filtering at the store seam.
 /// These are applied BEFORE the candidate budget is spent.
 
 fn is_archived(metadata: &Value) -> bool {
-    metadata
-        .get("archived")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    // #404: one search-visibility predicate for every read path. The store
+    // must agree with Tantivy on both the boolean tombstone written by
+    // `archive_memory` and the legacy integer representation.
+    crate::lexical::archived_flag(metadata)
 }
 
 /// Row-class predicates for filtering at the store seam.
@@ -9202,6 +9216,95 @@ impl LadybugStore {
             .remove(namespace);
     }
 
+    /// Hydrate a slice of Tantivy hits into visible search results.
+    ///
+    /// The index entry is a derived, possibly stale view of the row. Every
+    /// backstop the index promised (namespace, generation/source, task and
+    /// code-AST gating, archive tombstone, registry/conflict exclusion,
+    /// retirement, and ReBAC ACL including object-form `visible_to`) is
+    /// re-asked of the store here, so a corrupted or stale index cannot leak
+    /// a restricted row. Hits are returned in the same `(score, id)` order the
+    /// index produced.
+    async fn hydrate_lexical_hits(
+        &self,
+        namespace: &str,
+        hits: &[crate::lexical::TantivyHit],
+        active: &ActiveGenerations,
+        options: &LexicalHydrationOptions<'_>,
+    ) -> Result<Vec<crate::traits::SearchResult>> {
+        let mut candidates = Vec::new();
+        for hit in hits {
+            // Defense in depth: the index query already scopes to `namespace`,
+            // but a hit whose stored namespace drifted (stale cross-namespace
+            // row) must not surface outside its own namespace.
+            if hit.namespace != namespace {
+                continue;
+            }
+            let Some((_, payload)) = self.get(namespace, &hit.id).await? else {
+                continue;
+            };
+            // #149 C2.4: a superseded or still-staged row must not surface
+            // even when the index entry is stale. The row's own source
+            // decides, so two worktrees sharing a namespace stay separate.
+            if !active.reaches_source(
+                &hit.id,
+                namespace,
+                &payload.memory_type,
+                row_source_key(&payload.metadata),
+            ) {
+                continue;
+            }
+            if !options.include_tasks && payload.memory_type == "task" {
+                continue;
+            }
+            if !options.include_code_ast
+                && (payload.memory_type == "code_ast" || payload.memory_type == "doc_section")
+            {
+                continue;
+            }
+            // Defense in depth: never surface an archived row when the caller
+            // excluded archived rows, even if its index entry predates the
+            // tombstone fix. One predicate covers both tombstone shapes.
+            if !options.include_archived && crate::lexical::archived_flag(&payload.metadata) {
+                continue;
+            }
+            // Defense in depth: registry and mesh-conflicting rows are
+            // excluded at index time, but a stale index entry must not
+            // surface them either (the in-house engine's doc_visible
+            // rejects both classes on every read).
+            if is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
+                continue;
+            }
+            // Defense in depth: never surface a retired row, even if its
+            // index entry predates the valid_to handling. Uses the
+            // is_retired_at predicate defined in this module: a non-null
+            // valid_to that does not parse as an integer reads as 0,
+            // i.e. retired.
+            if is_retired_at(&payload.metadata, chrono::Utc::now().timestamp()) {
+                continue;
+            }
+            if !crate::rebac::can_read_memory(
+                options.principal,
+                &payload.user_id,
+                &payload.metadata,
+            ) {
+                continue;
+            }
+            candidates.push(crate::traits::SearchResult {
+                id: hit.id.clone(),
+                score: hit.score,
+                payload,
+                evidence: Some(vec![crate::traits::SearchEvidence {
+                    kind: crate::traits::EvidenceKind::DirectMatch,
+                    path: Vec::new(),
+                    explanation: "Matched via Tantivy full-text lexical index.".to_string(),
+                    derivation: vec!["lexical".to_string()],
+                }]),
+            });
+        }
+        Ok(candidates)
+    }
+
     /// Search using the disk-backed Tantivy lexical index, hydrating payloads from LadybugDB.
     pub async fn search_tantivy_lexical(
         &self,
@@ -9262,119 +9365,84 @@ impl LadybugStore {
         } else {
             Some(active.active_generations_u64())
         };
-        let hits = {
-            let guard = self
-                .tantivy_lexical
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            let idx = guard.as_ref().expect("tantivy open");
-            idx.search_with_active_generations(
-                namespace,
-                query,
-                limit.max(1) * 4,
-                include_tasks,
-                include_archived,
-                None,
-                active_set.as_ref(),
-                include_code_ast,
-            )?
+        let hydration_options = LexicalHydrationOptions {
+            include_tasks,
+            include_archived,
+            include_code_ast,
+            principal,
         };
-        let mut candidates = Vec::new();
-        for hit in hits {
-            // Defense in depth: the index query already scopes to `namespace`,
-            // but a hit whose stored namespace drifted (stale cross-namespace
-            // row) must not surface outside its own namespace.
-            if hit.namespace != namespace {
-                continue;
+        let matches_domains = |result: &crate::traits::SearchResult| {
+            if domains.is_empty() {
+                return true;
             }
-            if let Some((_, payload)) = self.get(namespace, &hit.id).await? {
-                // #149 C2.4: a superseded or still-staged row must not surface
-                // even when the index entry is stale. The row's own source
-                // decides, so two worktrees sharing a namespace stay separate.
-                if !active.reaches_source(
-                    &hit.id,
+            let row_domains = crate::domain::domain_keys(&result.payload.metadata);
+            domains.iter().any(|d| row_domains.contains(d))
+        };
+        // Keep the historical `limit * 4` first fetch as the floor, then
+        // double only when hydration drops enough hits to shorten the page.
+        let mut window = limit.max(1).saturating_mul(4).min(MAX_LEXICAL_SCAN_ROWS);
+        let mut attempted: HashSet<String> = HashSet::new();
+        let mut hydrated_by_id: HashMap<String, crate::traits::SearchResult> = HashMap::new();
+        let mut candidates: Vec<crate::traits::SearchResult> = Vec::new();
+        loop {
+            let hits = {
+                let guard = self
+                    .tantivy_lexical
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                let idx = guard.as_ref().expect("tantivy open");
+                idx.search_with_active_generations(
                     namespace,
-                    &payload.memory_type,
-                    row_source_key(&payload.metadata),
-                ) {
-                    continue;
-                }
-                if !include_tasks && payload.memory_type == "task" {
-                    continue;
-                }
-                if !include_code_ast
-                    && (payload.memory_type == "code_ast" || payload.memory_type == "doc_section")
-                {
-                    continue;
-                }
-                // Defense in depth: never surface an archived row when the
-                // caller excluded archived rows, even if its index entry
-                // predates the tombstone fix. Bool/int-tolerant, matching
-                // lexical::archived_flag (duplicated inline per convention).
-                if !include_archived {
-                    let archived = match payload.metadata.get("archived") {
-                        Some(v) if v.as_bool() == Some(true) => true,
-                        Some(v) => v.as_i64().map(|n| n != 0).unwrap_or(false),
-                        None => false,
-                    };
-                    if archived {
-                        continue;
-                    }
-                }
-                // Defense in depth: registry and mesh-conflicting rows are
-                // excluded at index time, but a stale index entry must not
-                // surface them either (the in-house engine's doc_visible
-                // rejects both classes on every read).
-                if is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
-                    continue;
-                }
-                // Defense in depth: never surface a retired row, even if its
-                // index entry predates the valid_to handling. Uses the
-                // is_retired_at predicate defined in this module: a non-null
-                // valid_to that does not parse as an integer reads as 0,
-                // i.e. retired.
-                if is_retired_at(&payload.metadata, chrono::Utc::now().timestamp()) {
-                    continue;
-                }
-                if !crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
-                    continue;
-                }
-                candidates.push(crate::traits::SearchResult {
-                    id: hit.id,
-                    score: hit.score,
-                    payload,
-                    evidence: Some(vec![crate::traits::SearchEvidence {
-                        kind: crate::traits::EvidenceKind::DirectMatch,
-                        path: Vec::new(),
-                        explanation: "Matched via Tantivy full-text lexical index.".to_string(),
-                        derivation: vec!["lexical".to_string()],
-                    }]),
-                });
-            }
-        }
-        let mut domain_filter_applied = false;
-        let mut results = if !domains.is_empty() {
-            let filtered: Vec<_> = candidates
+                    query,
+                    window,
+                    include_tasks,
+                    include_archived,
+                    None,
+                    active_set.as_ref(),
+                    include_code_ast,
+                )?
+            };
+            // Hydrate by id, not by prefix position. Widening a window can
+            // shift tied hits across the old boundary; a positional slice
+            // then re-hydrates a displaced row and skips the row that moved
+            // into the prefix. `attempted` also keeps dropped hits from being
+            // re-queried on every widening.
+            let new_hits: Vec<_> = hits
                 .iter()
-                .filter(|r| {
-                    let row_domains = crate::domain::domain_keys(&r.payload.metadata);
-                    domains.iter().any(|d| row_domains.contains(d))
-                })
+                .filter(|hit| attempted.insert(hit.id.clone()))
                 .cloned()
                 .collect();
-            if !filtered.is_empty() {
-                domain_filter_applied = true;
-                filtered
-            } else {
-                candidates
+            if !new_hits.is_empty() {
+                for result in self
+                    .hydrate_lexical_hits(namespace, &new_hits, &active, &hydration_options)
+                    .await?
+                {
+                    hydrated_by_id.insert(result.id.clone(), result);
+                }
             }
-        } else {
-            candidates
-        };
+            candidates = hits
+                .iter()
+                .filter_map(|hit| hydrated_by_id.get(&hit.id).cloned())
+                .collect();
+            // A short window means the index had nothing more to offer; a full
+            // one may still hide visible rows behind dropped or filtered hits,
+            // so widen. The stop condition counts rows that survive the domain
+            // filter, never the raw candidates.
+            let matching = candidates.iter().filter(|r| matches_domains(r)).count();
+            let exhausted = hits.len() < window;
+            if matching >= limit || exhausted || window >= MAX_LEXICAL_SCAN_ROWS {
+                break;
+            }
+            window = (window * 2).min(MAX_LEXICAL_SCAN_ROWS);
+        }
+        let mut results: Vec<_> = candidates
+            .into_iter()
+            .filter(|r| matches_domains(r))
+            .collect();
         results.truncate(limit);
         Ok(crate::traits::LexicalSearchOutcome {
             results,
-            domain_filter_applied,
+            domain_filter_applied: !domains.is_empty(),
         })
     }
 
@@ -32446,6 +32514,248 @@ eurostrata\src\daemon.rs",
             .unwrap()
             .results;
         assert!(tantivy.is_empty(), "Tantivy must agree the row is archived");
+    }
+
+    /// #404: the in-house lexical path and the Tantivy path must agree on what
+    /// an archived row is. `is_archived` used to read `as_bool()` only, so a
+    /// legacy `{"archived": 1}` row stayed visible here while Tantivy hid it.
+    #[tokio::test]
+    async fn inhouse_lexical_excludes_int_archived_rows() {
+        let store = retired_test_store().await;
+        let archived_payload =
+            tantivy_exclusion_payload("intarchivneedle tombstoned row", json!({"archived": 1}));
+        let visible_payload = tantivy_exclusion_payload("intarchivneedle visible row", json!({}));
+        store
+            .upsert("probe", "archived-int", vec![0.0; 4], archived_payload)
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "visible", vec![0.0; 4], visible_payload)
+            .await
+            .unwrap();
+
+        let default_page = store
+            .search_lexical(
+                "probe",
+                "intarchivneedle",
+                10,
+                false,
+                false,
+                &[],
+                "admin",
+                0,
+            )
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&default_page),
+            vec!["visible".to_string()],
+            "an integer tombstone must stay off the default in-house page"
+        );
+
+        let escape_hatch = store
+            .search_lexical("probe", "intarchivneedle", 10, false, true, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        let escape_ids: std::collections::BTreeSet<&str> =
+            escape_hatch.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            escape_ids.contains("archived-int"),
+            "include_archived must still find the integer tombstone, got {escape_ids:?}"
+        );
+    }
+
+    /// #404: an index can hold more stale archived entries than the first
+    /// hydration window carries. The search must keep widening the window
+    /// until the page is full or the index is exhausted, instead of returning
+    /// a short page because `limit * 4` slots were all dropped.
+    #[tokio::test]
+    async fn tantivy_hydration_backfills_past_dropped_hits() {
+        let store = retired_test_store().await;
+        const STALE: usize = 400;
+        const CLEAN: usize = 5;
+        let mut rows: Vec<(String, MemoryPayload)> = Vec::new();
+
+        for i in 0..STALE {
+            let id = format!("stale-{i:04}");
+            let payload = tantivy_exclusion_payload(
+                "backfillneedle backfillneedle backfillneedle archived tombstone",
+                json!({"archived": true}),
+            );
+            store
+                .upsert("probe", &id, vec![0.0; 4], payload.clone())
+                .await
+                .unwrap();
+            rows.push((id, payload));
+        }
+        for i in 0..CLEAN {
+            let id = format!("clean-{i:04}");
+            let payload = tantivy_exclusion_payload(
+                "backfillneedle diluted by a long tail of unrelated filler words that lower this row's score",
+                json!({}),
+            );
+            store
+                .upsert("probe", &id, vec![0.0; 4], payload.clone())
+                .await
+                .unwrap();
+            rows.push((id, payload));
+        }
+
+        // Seed a stale index: same ids/content but the tombstone metadata is
+        // stripped, so only hydration can drop the archived rows.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        let stale_rows: Vec<(String, String, MemoryPayload)> = rows
+            .iter()
+            .map(|(id, payload)| {
+                let mut stale = payload.clone();
+                stale.metadata = json!({});
+                ("probe".to_string(), id.clone(), stale)
+            })
+            .collect();
+        idx.rebuild(&stale_rows).unwrap();
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+
+        let results = store
+            .search_tantivy_lexical(
+                "probe",
+                "backfillneedle",
+                CLEAN,
+                false,
+                false,
+                &[],
+                "tester",
+            )
+            .await
+            .unwrap()
+            .results;
+        let ids = result_ids(&results);
+        assert_eq!(
+            ids.len(),
+            CLEAN,
+            "the page must backfill past dropped hits, got {ids:?}"
+        );
+        assert!(
+            ids.iter().all(|id| id.starts_with("clean-")),
+            "only clean rows may fill the page, got {ids:?}"
+        );
+    }
+
+    /// #404: a domain-filtered page must keep widening past non-matching
+    /// rows. The first window can be entirely other domains; stopping at
+    /// `limit` raw candidates, or falling back to them, returns rows the
+    /// caller excluded.
+    #[tokio::test]
+    async fn tantivy_domain_filter_widens_past_nonmatching_hits() {
+        let store = retired_test_store().await;
+        for i in 0..6 {
+            store
+                .upsert(
+                    "probe",
+                    &format!("other-{i:02}"),
+                    vec![0.0; 4],
+                    tantivy_exclusion_payload(
+                        "domainfilterneedle domainfilterneedle domainfilterneedle domainfilterneedle",
+                        json!({"domain": "other"}),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "wanted-00",
+                vec![0.0; 4],
+                tantivy_exclusion_payload(
+                    "domainfilterneedle diluted by a long tail of unrelated filler words",
+                    json!({"domain": "wanted"}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let outcome = store
+            .search_tantivy_lexical(
+                "probe",
+                "domainfilterneedle",
+                1,
+                false,
+                false,
+                &["wanted".to_string()],
+                "tester",
+            )
+            .await
+            .unwrap();
+        assert!(outcome.domain_filter_applied);
+        assert_eq!(
+            result_ids(&outcome.results),
+            vec!["wanted-00".to_string()],
+            "the filtered page must widen past other-domain hits, not fall back to them"
+        );
+    }
+
+    /// #404: hydration must re-ask the canonical ACL predicate, including the
+    /// object (`{principal, role}`) form of `visible_to`. A stale index entry
+    /// must not widen an object-form ACL that excludes the caller.
+    #[tokio::test]
+    async fn tantivy_hydration_rechecks_acl_object_form() {
+        let store = retired_test_store().await;
+        let restricted_payload = tantivy_exclusion_payload(
+            "aclobjneedle restricted row",
+            json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
+        );
+        let public_payload = tantivy_exclusion_payload("aclobjneedle public row", json!({}));
+        for (id, payload) in [
+            ("restricted-row", &restricted_payload),
+            ("public-row", &public_payload),
+        ] {
+            store
+                .upsert("probe", id, vec![0.0; 4], payload.clone())
+                .await
+                .unwrap();
+        }
+
+        // Seed a stale index whose entries carry no ACL metadata. Hydration
+        // must use the store row, not the index entry.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for (id, payload) in [
+            ("restricted-row", &restricted_payload),
+            ("public-row", &public_payload),
+        ] {
+            let mut stale = payload.clone();
+            stale.metadata = json!({});
+            idx.upsert_memory("probe", id, &stale).unwrap();
+        }
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+
+        let alice = store
+            .search_tantivy_lexical("probe", "aclobjneedle", 10, false, false, &[], "alice")
+            .await
+            .unwrap()
+            .results;
+        let alice_ids: std::collections::BTreeSet<&str> =
+            alice.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            alice_ids.contains("restricted-row"),
+            "the ACL principal must read their own row, got {alice_ids:?}"
+        );
+
+        let bob = store
+            .search_tantivy_lexical("probe", "aclobjneedle", 10, false, false, &[], "bob")
+            .await
+            .unwrap()
+            .results;
+        let bob_ids: std::collections::BTreeSet<&str> = bob.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !bob_ids.contains("restricted-row"),
+            "an object-form ACL must still deny a stranger at hydration, got {bob_ids:?}"
+        );
+        assert!(
+            bob_ids.contains("public-row"),
+            "the public row must still surface, got {bob_ids:?}"
+        );
     }
 
     #[tokio::test]
