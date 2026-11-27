@@ -6697,11 +6697,11 @@ mod tests {
             let history = vault_history_id(note_id);
             assert!(
                 history.starts_with('h'),
-                "{note_id:?} must hash its history id, got {history:?}"
+                "{note_id:?} must hash its history id"
             );
             assert!(
                 crate::domain::validate_id(&history).is_ok(),
-                "{note_id:?} produced an invalid history id {history:?}"
+                "{note_id:?} produced an invalid history id"
             );
             assert!(
                 history.len() <= crate::domain::MAX_ID_CHARS,
@@ -6710,11 +6710,11 @@ mod tests {
             );
             assert!(
                 history.contains(".vault-history."),
-                "{note_id:?} lost the history marker: {history}"
+                "{note_id:?} lost the history marker"
             );
             assert!(
                 !history.contains(crate::domain::NAMESPACE_SEPARATOR),
-                "{note_id:?} kept a namespace separator in a hashed history id: {history}"
+                "{note_id:?} kept a namespace separator in a hashed history id"
             );
             assert_ne!(vault_history_id(note_id), history, "each call is unique");
         }
@@ -6818,7 +6818,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("seed {seed_id}: head must cite history"));
             assert!(
                 history_id.starts_with('h'),
-                "a qualified head hashes its history id: {history_id}"
+                "a qualified head hashes its history id"
             );
             let (_, history) = store
                 .get(ns, history_id)

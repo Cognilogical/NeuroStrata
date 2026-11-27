@@ -118,9 +118,10 @@ impl MemorySubscriber for GuardEventLog {
 /// standing between a retry and a silently overwritten audit trail. The id
 /// leads with the row's own namespace, so it names its owner (the DR-1 shape
 /// the strict write gate accepts) without softening the cross-namespace rule
-/// for system rows; the kind suffix keeps the trail greppable. The whole id
-/// (`<namespace>::guard_event::<uuid>`, at most 64 + 2 + 11 + 2 + 36
-/// characters) stays inside DR-2's 128-character cap by construction.
+/// for system rows; the kind suffix keeps the trail greppable. The id is short
+/// by construction (`<namespace>::guard_event::<uuid>`, at most 64 + 2 + 11 +
+/// 2 + 36 characters), so it is a valid qualified address under DR-2's DR-1
+/// prefix rule and non-empty path rule.
 fn audit_id(namespace: &str) -> String {
     format!(
         "{namespace}::{GUARD_EVENT_ID_PREFIX}::{}",

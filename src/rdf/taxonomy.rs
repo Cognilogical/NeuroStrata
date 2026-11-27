@@ -1307,8 +1307,10 @@ pub fn taxonomy_namespace_token(namespace: &str) -> String {
     }
 }
 
-/// Clamp a generated row id to DR-2's 128-character cap. Only the overflow
-/// path is content-addressed; ordinary ids keep their readable spelling.
+/// Clamp a generated row id to DR-2's 128-character bare-id cap. Only the
+/// overflow path is content-addressed; ordinary ids keep their readable
+/// spelling. Generated taxonomy row ids are bare (they carry no `::`), so the
+/// cap applies to them in full.
 fn bounded_taxonomy_id(kind: &str, base: &str, version: u64) -> String {
     let raw = format!("{base}-v{version}");
     if raw.len() <= crate::domain::MAX_ID_CHARS {

@@ -32,9 +32,10 @@ const FRESHNESS_FLAG_TYPE: &str = "freshness_flag";
 /// in the store: two namespaces sharing one id would make the second flip
 /// overwrite the first namespace's flag, and each would silently stop
 /// reporting its own staleness. Leading with the namespace also makes the id
-/// name its owner, the DR-1 shape the strict write gate accepts; the whole id
-/// (`<namespace>::export_freshness`, at most 64 + 2 + 17 characters) stays
-/// inside DR-2's 128-character cap by construction.
+/// name its owner, the DR-1 shape the strict write gate accepts. The id is
+/// short by construction (`<namespace>::export_freshness`, at most 64 + 2 + 17
+/// characters), so it is a valid qualified address under DR-2's DR-1 prefix
+/// rule and non-empty path rule.
 const FRESHNESS_FLAG_ID_PREFIX: &str = "export_freshness";
 
 /// The `user_id` a machine-written row carries. `system` is the same value the
