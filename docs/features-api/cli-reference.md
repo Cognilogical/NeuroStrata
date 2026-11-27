@@ -293,6 +293,14 @@ Queries the Thalamic Bus event dispatcher counters (`published`, `delivered`, `d
 neurostrata-mcp bus-metrics
 ```
 
+### Logging
+
+All `tracing` output goes to **stderr**, never stdout. Stdout is the MCP stdio channel, so a log line there would corrupt the protocol; the process installs one subscriber at startup with ANSI escapes off, and a second install is a no-op. `RUST_LOG` sets the filter. When it is unset or cannot be parsed (for example `RUST_LOG=neurostrata_mcp=lolwut`), the filter falls back to `info` rather than failing startup or going silent.
+
+```bash
+RUST_LOG=debug neurostrata-mcp status
+```
+
 ### `backup` & `restore`
 
 Creates a checkpointed snapshot (`CHECKPOINT` + store copy + `manifest.json`) or restores a snapshot into a new database path.
@@ -303,6 +311,8 @@ neurostrata-mcp restore <backup_dir> --into <new_db_path>
 ```
 
 `backup --no-open` copies the database, its write-ahead log, the checkpoint shadow, and the store-state sidecar directly to disk without opening or checkpointing the store. It **takes the store lock and holds it for the whole copy** (`#209`, `#241`): it refuses while another process holds the lock, and it fails closed when the lock cannot be taken at all, because an untakeable lock is not evidence that the store is free. Holding the lock across the window means a daemon that starts mid-copy cannot change the files being captured. Use a plain `backup <dir>` (daemon-coordinated) or `shutdown` first when the daemon is running.
+
+`restore` likewise **takes the target's store lock before it re-checks the destination and holds it until the database, every companion (`.wal`, `.wal.checkpoint`, `.shadow`, `.pinned.tmp`, `.store-state.json`), the post-install verification open, and the namespace listing have all completed**. A concurrent daemon or CLI command therefore cannot observe a half-restored store; the lock is released only after the restored set is complete or the failed copy has been rolled back.
 
 ### `semantic-eval`
 

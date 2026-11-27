@@ -282,10 +282,10 @@ fn is_mesh_conflicting(metadata: &Value) -> bool {
 }
 
 fn is_archived(metadata: &Value) -> bool {
-    metadata
-        .get("archived")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    // #404: the write/API predicate stays strict (`metadata.archived == true`),
+    // but every read surface shares the wider search-visibility predicate so
+    // the legacy integer tombstone cannot leak through GraphQL either.
+    crate::lexical::archived_flag(metadata)
 }
 
 fn is_retired_at(metadata: &Value, now: i64) -> bool {
@@ -295,18 +295,32 @@ fn is_retired_at(metadata: &Value, now: i64) -> bool {
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn build_memory_node(
-    id: &str,
-    namespace: &str,
-    payload: &crate::traits::MemoryPayload,
-    edges_by_source: &HashMap<String, Vec<(String, String, Option<String>)>>,
-    principal: &str,
-    variable_first: Option<i32>,
-    variable_after: Option<&str>,
-    include_archived: bool,
-    include_retired: bool,
-) -> Option<Value> {
+/// Grouped to replace `build_memory_node`'s 9-argument signature; field
+/// order preserves the original parameter order so the mirror stays aligned.
+struct BuildMemoryNodeParams<'a> {
+    pub id: &'a str,
+    pub namespace: &'a str,
+    pub payload: &'a crate::traits::MemoryPayload,
+    pub edges_by_source: &'a HashMap<String, Vec<(String, String, Option<String>)>>,
+    pub principal: &'a str,
+    pub variable_first: Option<i32>,
+    pub variable_after: Option<&'a str>,
+    pub include_archived: bool,
+    pub include_retired: bool,
+}
+
+fn build_memory_node(params: BuildMemoryNodeParams<'_>) -> Option<Value> {
+    let BuildMemoryNodeParams {
+        id,
+        namespace,
+        payload,
+        edges_by_source,
+        principal,
+        variable_first,
+        variable_after,
+        include_archived,
+        include_retired,
+    } = params;
     if crate::registry::is_registry_row(&payload.metadata) {
         return None; // hard exclude registry even by id -> null
     }
@@ -800,17 +814,17 @@ pub fn execute_on_records(
                                 nested_edges_args(f, root_name, var_map);
                             for (id_str, payload) in records.iter() {
                                 if id_str == &id_arg && !payload.memory_type.is_empty() {
-                                    root_result = build_memory_node(
-                                        id_str,
+                                    root_result = build_memory_node(BuildMemoryNodeParams {
+                                        id: id_str,
                                         namespace,
                                         payload,
                                         edges_by_source,
                                         principal,
-                                        nested_first,
-                                        nested_after.as_deref(),
-                                        var_include_archived,
-                                        var_include_retired,
-                                    );
+                                        variable_first: nested_first,
+                                        variable_after: nested_after.as_deref(),
+                                        include_archived: var_include_archived,
+                                        include_retired: var_include_retired,
+                                    });
                                     break;
                                 }
                             }
@@ -1032,17 +1046,17 @@ pub fn execute_on_records(
                                 nested_edges_args(f, root_name, var_map);
                             let memory_edges_fixed: Vec<Value> = page.iter().map(|(id_str, payload)| {
                                 let sort_key = if root_name == "memories" { "valid_from" } else { "score" };
-                                if let Some(node) = build_memory_node(
-                                    id_str,
+                                if let Some(node) = build_memory_node(BuildMemoryNodeParams {
+                                    id: id_str,
                                     namespace,
                                     payload,
                                     edges_by_source,
                                     principal,
-                                    nested_first,
-                                    nested_after.as_deref(),
-                                    var_include_archived,
-                                    var_include_retired,
-                                ) {
+                                    variable_first: nested_first,
+                                    variable_after: nested_after.as_deref(),
+                                    include_archived: var_include_archived,
+                                    include_retired: var_include_retired,
+                                }) {
                                     json!({ "cursor": encode_cursor(sort_key, id_str), "node": node })
                                 } else {
                                     json!({ "cursor": encode_cursor(sort_key, id_str), "node": null })
@@ -2933,5 +2947,87 @@ mod tests {
             "expected row-budget error, got {:?}",
             resp.errors
         );
+    }
+    #[test]
+    fn i8_edge_cursor_as_root_after_restarts_connection() {
+        let records = t3_numbered_records(3);
+        let edge_cursor = encode_cursor("edge", "m1:1");
+        let q = format!("{{ memories(after: \"{edge_cursor}\") {{ edges {{ node {{ id }} }} }} }}");
+        let resp = execute_on_records(&records, &Default::default(), "ns", "admin", &q, None);
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        assert_eq!(
+            t3_edge_ids(&resp, "memories"),
+            vec!["m1".to_string(), "m2".to_string(), "m3".to_string()],
+            "edge cursor as root after must restart the connection: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn i8_stray_text_variable_is_inert() {
+        let records = vec![
+            (
+                "db1".into(),
+                t3_payload(
+                    "database writes are batched",
+                    "fact",
+                    serde_json::json!({"valid_from": 200}),
+                ),
+            ),
+            (
+                "oth".into(),
+                t3_payload(
+                    "unrelated memory",
+                    "fact",
+                    serde_json::json!({"valid_from": 100}),
+                ),
+            ),
+        ];
+        let resp = execute_on_records(
+            &records,
+            &Default::default(),
+            "ns",
+            "admin",
+            "{ search { edges { node { id } } } }",
+            Some(&json!({"text": "database"})),
+        );
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let mut ids = t3_edge_ids(&resp, "search");
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["db1".to_string(), "oth".to_string()],
+            "unreferenced text variable must not filter search: {:?}",
+            resp.data
+        );
+    }
+
+    #[test]
+    fn i8_variable_first_clamp_forms() {
+        let records = t3_numbered_records(120);
+        let run = |n: serde_json::Value| {
+            execute_on_records(
+                &records,
+                &Default::default(),
+                "ns",
+                "admin",
+                "query($n: Int) { memories(first: $n) { edges { node { id } } } }",
+                Some(&json!({"n": n})),
+            )
+        };
+        let resp200 = run(json!(200));
+        assert_eq!(t3_edge_ids(&resp200, "memories").len(), 100);
+        assert!(
+            resp200
+                .errors
+                .iter()
+                .any(|e| e.message.contains("first clamped to 100")),
+            "expected clamp error for variable first=200, got: {:?}",
+            resp200.errors
+        );
+        let resp0 = run(json!(0));
+        assert_eq!(t3_edge_ids(&resp0, "memories").len(), 1);
+        let resp_neg = run(json!(-5));
+        assert_eq!(t3_edge_ids(&resp_neg, "memories").len(), 1);
     }
 }

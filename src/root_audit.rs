@@ -141,7 +141,7 @@ fn is_auditable(row: &SearchResult, now: i64) -> bool {
         return false;
     }
     let meta = &payload.metadata;
-    if meta.get("archived").and_then(Value::as_bool) == Some(true) {
+    if crate::lexical::archived_flag(meta) {
         return false;
     }
     if meta
