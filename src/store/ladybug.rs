@@ -9941,17 +9941,27 @@ fn migration_value_string(value: Option<&lbug::Value>) -> Option<String> {
     }
 }
 
-/// A `metadata.namespace` value is a HINT, never ownership evidence on its own:
-/// a legacy row can be crafted to point at another tenant. Callers must pair it
-/// with an independent signal (a qualified id, or a recovered qualified
-/// sibling) before writing it into `m.namespace`.
+/// A `metadata.namespace` value is the row's own stated owner. Issue #408
+/// requires a NULL-namespace row that names a namespace in metadata to be
+/// RESTORED to that namespace, so a well-formed value is accepted directly;
+/// only rows with no recoverable namespace at all are quarantined. Malformed
+/// values — empty, reserved, qualified, or containing separators/control
+/// characters — cannot name a tenant namespace and are rejected.
 fn namespace_from_metadata(raw: &str) -> Option<String> {
     let metadata: Value = serde_json::from_str(raw).ok()?;
     metadata
         .get("namespace")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|namespace| !namespace.is_empty())
+        .filter(|namespace| {
+            !namespace.is_empty()
+                && *namespace != QUARANTINE_NAMESPACE
+                && namespace.len() <= 128
+                && !namespace.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                && !namespace
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace())
+        })
         .map(str::to_string)
 }
 
@@ -10110,10 +10120,10 @@ fn superseded_metadata(raw: Option<&str>, generation: u64, scoped_id: &str) -> S
 ///
 /// Pass 1 recovers identities that carry their owner in the row's own scoped
 /// id. Pass 2 re-reads the namespace map and only then resolves bare rows —
-/// against the rows pass 1 just recovered, and against qualified siblings.
-/// A metadata namespace is a hint, not authority: it is accepted only when an
-/// independent row or the row's own qualified id corroborates it. Everything
-/// else is quarantined atomically with its reason recorded in metadata.
+/// first from the namespace the row states in metadata (issue #408 requires
+/// metadata-named rows to be restored), then from a unique qualified sibling
+/// recovered in pass 1. Only rows with no recoverable namespace are quarantined,
+/// atomically with their reason recorded in metadata.
 fn migrate_null_namespaces(conn: &Connection) -> Result<(usize, usize)> {
     let columns = inspect_memory_columns(conn)?;
     if !columns.iter().any(|column| column.name == "namespace") {
@@ -10155,7 +10165,9 @@ fn migrate_null_namespaces(conn: &Connection) -> Result<(usize, usize)> {
     }
 
     // Pass 2: namespaces recovered above are now visible to the qualified
-    // match, so a bare row with a scoped sibling is not quarantined.
+    // match, so a bare row with a scoped sibling is not quarantined. The
+    // metadata-declared namespace is checked first: #408 requires a row that
+    // names its namespace in metadata to be restored, not quarantined.
     let mut all_rows: Vec<(String, Option<String>)> = Vec::new();
     for row in conn.query("MATCH (m:Memory) RETURN m.id, m.namespace")? {
         let Some(id) = migration_value_string(row.first()) else {
@@ -10166,20 +10178,8 @@ fn migrate_null_namespaces(conn: &Connection) -> Result<(usize, usize)> {
 
     let mut quarantined = 0usize;
     for (id, metadata) in remaining {
-        let hint = metadata
-            .as_deref()
-            .and_then(namespace_from_metadata)
-            .filter(|hint| {
-                // Own evidence: an id already qualified by this namespace.
-                crate::parser::ingest::is_qualified(hint, &id)
-                    || all_rows.iter().any(|(other_id, other_namespace)| {
-                        other_id != &id
-                            && other_namespace.as_deref() == Some(hint.as_str())
-                            && crate::parser::ingest::is_qualified(hint, other_id)
-                            && logical_path_in_namespace(other_id, hint) == id
-                    })
-            });
-        let resolved = hint.or_else(|| unique_namespace_for_bare_id(&id, &all_rows));
+        let declared = metadata.as_deref().and_then(namespace_from_metadata);
+        let resolved = declared.or_else(|| unique_namespace_for_bare_id(&id, &all_rows));
         match resolved {
             Some(namespace) => {
                 set_memory_namespace(conn, &id, &namespace)?;
@@ -10335,7 +10335,7 @@ fn migration_column_specs(conn: &Connection) -> Result<Vec<(String, String)>> {
 /// which the copy omits rather than spelling as an empty string.
 fn migration_literal(value: Option<&lbug::Value>) -> Option<String> {
     match value {
-        None => None,
+        None | Some(lbug::Value::Null(_)) => None,
         Some(lbug::Value::String(text)) => Some(format!("'{}'", escape_ladybug_string(text))),
         Some(lbug::Value::Int64(number)) => Some(number.to_string()),
         Some(lbug::Value::Double(number)) => Some(number.to_string()),
@@ -10352,11 +10352,118 @@ fn migration_literal(value: Option<&lbug::Value>) -> Option<String> {
     }
 }
 
-/// Copy a legacy `Memory` table whose key is not solely `id` into a fresh table
-/// keyed by `id`. Rows with a missing or duplicated legacy key get a generated
-/// one; nodes and their relationship rows are copied with the new ids so the
-/// store opens with its data and topology intact.
+/// Scratch catalog names owned by the rebuild. The legacy source is never
+/// overwritten until every copied row and edge has been counted and matched.
+const REBUILD_NODE_TABLE: &str = "Memory__rebuild408";
+const LEGACY_NODE_TABLE: &str = "Memory__legacy408";
+
+fn rebuild_rel_table(name: &str) -> String {
+    format!("{name}__rebuild408")
+}
+fn legacy_rel_table(name: &str) -> String {
+    format!("{name}__legacy408")
+}
+
+/// Drop scratch tables left behind by an interrupted earlier rebuild. These
+/// names are migration-owned and cannot hold source data.
+fn clear_rebuild_artifacts(conn: &Connection) -> Result<()> {
+    let mut rel_tables = Vec::new();
+    let mut node_tables = Vec::new();
+    for row in conn.query("CALL show_tables() RETURN *")? {
+        let Some(lbug::Value::String(name)) = row.get(1) else {
+            continue;
+        };
+        if !(name.ends_with("__rebuild408") || name.ends_with("__legacy408")) {
+            continue;
+        }
+        let kind = match row.get(2) {
+            Some(lbug::Value::String(kind)) => kind.to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        if kind.contains("rel") {
+            rel_tables.push(name.clone());
+        } else {
+            node_tables.push(name.clone());
+        }
+    }
+    for table in rel_tables.into_iter().chain(node_tables) {
+        conn.query(&format!("DROP TABLE {table}"))?;
+    }
+    Ok(())
+}
+
+/// A stable primary key derived from the row's own namespace and content, not
+/// from its scan position. Rebuilding an id-less legacy table twice produces
+/// the same ids, and an identical row in two namespaces never collides.
+fn derived_legacy_id(namespace: &str, content: &str, metadata: &str, occurrence: usize) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"legacy-primary-key\0");
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(content.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(metadata.as_bytes());
+    if occurrence > 0 {
+        hasher.update(b"\0");
+        hasher.update(occurrence.to_string().as_bytes());
+    }
+    format!("derived-{}", &hex::encode(hasher.finalize())[..16])
+}
+
+fn migration_node_count(conn: &Connection, table: &str) -> Result<usize> {
+    let mut rows = conn.query(&format!("MATCH (n:{table}) RETURN count(n)"))?;
+    Ok(rows
+        .next()
+        .and_then(|row| match row.first() {
+            Some(lbug::Value::Int64(count)) => Some(*count as usize),
+            _ => None,
+        })
+        .unwrap_or(0))
+}
+
+fn migration_rel_count(conn: &Connection, table: &str) -> Result<usize> {
+    let mut rows = conn.query(&format!("MATCH ()-[r:{table}]->() RETURN count(r)"))?;
+    Ok(rows
+        .next()
+        .and_then(|row| match row.first() {
+            Some(lbug::Value::Int64(count)) => Some(*count as usize),
+            _ => None,
+        })
+        .unwrap_or(0))
+}
+
+/// Rename log with a reverse-order rollback. Engine DDL is auto-commit, so a
+/// mid-swap error must undo every rename already applied before the source can
+/// be declared lost.
+struct RenameLog(Vec<(String, String)>);
+
+impl RenameLog {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn apply(&mut self, conn: &Connection, from: &str, to: &str) -> Result<()> {
+        conn.query(&format!("ALTER TABLE {from} RENAME TO {to}"))?;
+        self.0.push((from.to_string(), to.to_string()));
+        Ok(())
+    }
+
+    fn rollback(&mut self, conn: &Connection) {
+        for (from, to) in self.0.drain(..).rev() {
+            if let Err(error) = conn.query(&format!("ALTER TABLE {to} RENAME TO {from}")) {
+                tracing::warn!("rollback rename {to} -> {from} failed: {error}");
+            }
+        }
+    }
+}
+
+/// Copy a legacy `Memory` table whose key is not solely `id` into a scratch
+/// table keyed by `id`. Every node and edge is copied and counted before the
+/// source tables are touched; the swap uses renames with a rollback log, so a
+/// failure anywhere leaves the original data and topology available.
 fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
+    clear_rebuild_artifacts(conn)?;
     let mut columns = migration_column_specs(conn)?;
     let id_index = match columns.iter().position(|(name, _)| name == "id") {
         Some(index) => index,
@@ -10370,6 +10477,7 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
             columns.push((required.to_string(), "STRING".to_string()));
         }
     }
+    let field_index = |name: &str| columns.iter().position(|(column, _)| column == name);
     let names: Vec<String> = columns.iter().map(|(name, _)| name.clone()).collect();
     let return_list = names
         .iter()
@@ -10384,18 +10492,38 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
             .collect();
         stored.push((legacy_id, literals));
     }
+    // A derived id must not depend on the engine's scan order.
+    stored.sort_by(|left, right| left.1.cmp(&right.1));
 
     let mut id_map: HashMap<String, String> = HashMap::new();
     let mut used: HashSet<String> = HashSet::new();
-    for (index, (legacy_id, literals)) in stored.iter_mut().enumerate() {
+    for (_, (legacy_id, literals)) in stored.iter_mut().enumerate() {
+        let raw = |name: &str| {
+            field_index(name)
+                .and_then(|index| literals.get(index))
+                .and_then(|value| value.as_deref())
+                .unwrap_or("")
+        };
         let candidate = legacy_id.as_deref().unwrap_or_default();
-        let mut new_id = if candidate.is_empty() || used.contains(candidate) {
-            format!("legacy-migrated-{index}")
+        let base = if candidate.is_empty() {
+            derived_legacy_id(raw("namespace"), raw("content"), raw("metadata"), 0)
         } else {
             candidate.to_string()
         };
+        let mut new_id = base.clone();
+        let mut occurrence = 1usize;
         while used.contains(&new_id) {
-            new_id.push_str("-copy");
+            new_id = if candidate.is_empty() {
+                derived_legacy_id(
+                    raw("namespace"),
+                    raw("content"),
+                    raw("metadata"),
+                    occurrence,
+                )
+            } else {
+                format!("{base}-copy{occurrence}")
+            };
+            occurrence += 1;
         }
         used.insert(new_id.clone());
         if let Some(old) = legacy_id.take() {
@@ -10469,12 +10597,10 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
         relationships.push((table.clone(), declarations, edges));
     }
 
-    for table in &rel_tables {
-        conn.query(&format!("DROP TABLE {table}"))?;
-    }
-    conn.query("DROP TABLE Memory")?;
+    // Build the replacement under scratch names. Nothing here can affect the
+    // source tables: a failure simply leaves the legacy store as it was.
     let ddl = format!(
-        "CREATE NODE TABLE Memory ({}, PRIMARY KEY (id))",
+        "CREATE NODE TABLE {REBUILD_NODE_TABLE} ({}, PRIMARY KEY (id))",
         columns
             .iter()
             .map(|(name, ty)| format!("{name} {ty}"))
@@ -10490,20 +10616,21 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
             .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name}: {value}")))
             .collect::<Vec<_>>()
             .join(", ");
-        conn.query(&format!("CREATE (:Memory {{{assignments}}})"))?;
+        conn.query(&format!("CREATE (:{REBUILD_NODE_TABLE} {{{assignments}}})"))?;
     }
-    for (table, declarations, edges) in relationships {
+    for (table, declarations, edges) in &relationships {
         let suffix = if declarations.is_empty() {
             String::new()
         } else {
             format!(", {declarations}")
         };
+        let scratch = rebuild_rel_table(table);
         conn.query(&format!(
-            "CREATE REL TABLE {table} (FROM Memory TO Memory{suffix})"
+            "CREATE REL TABLE {scratch} (FROM {REBUILD_NODE_TABLE} TO {REBUILD_NODE_TABLE}{suffix})"
         ))?;
         for (from, to, values) in edges {
-            let from = id_map.get(&from).cloned().unwrap_or(from);
-            let to = id_map.get(&to).cloned().unwrap_or(to);
+            let from = id_map.get(from).cloned().unwrap_or_else(|| from.clone());
+            let to = id_map.get(to).cloned().unwrap_or_else(|| to.clone());
             let assignments = values
                 .iter()
                 .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name}: {value}")))
@@ -10515,11 +10642,68 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
                 format!(" {{{assignments}}}")
             };
             conn.query(&format!(
-                "MATCH (a:Memory {{id: '{}'}}), (b:Memory {{id: '{}'}}) CREATE (a)-[:{table}{props}]->(b)",
+                "MATCH (a:{REBUILD_NODE_TABLE} {{id: '{}'}}), (b:{REBUILD_NODE_TABLE} {{id: '{}'}}) CREATE (a)-[:{scratch}{props}]->(b)",
                 escape_ladybug_string(&from),
                 escape_ladybug_string(&to)
             ))?;
         }
+    }
+
+    // Validate the complete replacement before touching the source.
+    let source_rows = stored.len();
+    let rebuilt_rows = migration_node_count(conn, REBUILD_NODE_TABLE)?;
+    if rebuilt_rows != source_rows {
+        anyhow::bail!(
+            "legacy rebuild copied {rebuilt_rows} of {source_rows} rows; original table left intact"
+        );
+    }
+    for (table, _, edges) in &relationships {
+        let copied = migration_rel_count(conn, &rebuild_rel_table(table))?;
+        if copied != edges.len() {
+            anyhow::bail!(
+                "legacy rebuild copied {copied} of {} {table} edges; original tables left intact",
+                edges.len()
+            );
+        }
+    }
+
+    // Rename swap: originals are renamed aside (never dropped first), then the
+    // validated scratch tables take their names. Any error undoes every rename.
+    let mut renames = RenameLog::new();
+    let swap = (|| -> Result<()> {
+        renames.apply(conn, "Memory", LEGACY_NODE_TABLE)?;
+        for (table, _, _) in &relationships {
+            renames.apply(conn, table, &legacy_rel_table(table))?;
+        }
+        renames.apply(conn, REBUILD_NODE_TABLE, "Memory")?;
+        for (table, _, _) in &relationships {
+            renames.apply(conn, &rebuild_rel_table(table), table)?;
+        }
+        if migration_node_count(conn, "Memory")? != source_rows {
+            anyhow::bail!("post-swap node count differs from the legacy source");
+        }
+        for (table, _, edges) in &relationships {
+            if migration_rel_count(conn, table)? != edges.len() {
+                anyhow::bail!("post-swap {table} edge count differs from the legacy source");
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = swap {
+        renames.rollback(conn);
+        return Err(error);
+    }
+
+    // Backups are only dropped once the swapped-in tables pass validation. A
+    // failure here leaves harmless duplicate catalogs, not a broken store.
+    for (table, _, _) in &relationships {
+        let backup = legacy_rel_table(table);
+        if let Err(error) = conn.query(&format!("DROP TABLE {backup}")) {
+            tracing::warn!("legacy backup relationship table {backup} still present: {error}");
+        }
+    }
+    if let Err(error) = conn.query(&format!("DROP TABLE {LEGACY_NODE_TABLE}")) {
+        tracing::warn!("legacy backup node table still present: {error}");
     }
     Ok(())
 }
@@ -38056,12 +38240,11 @@ mod store_migration {
         seed(
             &db,
             &memory_ddl("id"),
-            &[
-                &insert_row("legacy-file", None, r#"{"namespace":"alpha","kept":"yes"}"#),
-                // Independent ownership evidence: a qualified sibling in the
-                // namespace the metadata merely hints at.
-                &insert_row("alpha::9::legacy-file", Some("alpha"), "{}"),
-            ],
+            &[&insert_row(
+                "legacy-file",
+                None,
+                r#"{"namespace":"alpha","kept":"yes"}"#,
+            )],
         );
 
         let store = open(&db);
@@ -38136,14 +38319,14 @@ mod store_migration {
         let store = open(&db);
         store.init("alpha").await.expect("open completes");
         let report = store.last_migration_report().expect("migration report");
-        // The metadata-only hint is untrusted: without a qualified sibling it
-        // cannot establish ownership, so both rows are quarantined.
-        assert_eq!(report.null_namespace_recovered, 0);
-        assert_eq!(report.quarantined, 2);
+        // Issue #408: the metadata-named row is restored to `beta`; only the
+        // row with no recoverable namespace is quarantined.
+        assert_eq!(report.null_namespace_recovered, 1);
+        assert_eq!(report.quarantined, 1);
         assert_eq!(report.skipped_reason, None);
 
         assert_eq!(count_memory(&store, "m.namespace IS NOT NULL").await, 2);
-        assert_eq!(count_memory(&store, "m.namespace = 'beta'").await, 0);
+        assert_eq!(count_memory(&store, "m.namespace = 'beta'").await, 1);
         assert_eq!(
             count_memory(&store, &format!("m.namespace = '{QUARANTINE_NAMESPACE}'")).await,
             1
@@ -38192,6 +38375,45 @@ mod store_migration {
             _ => None,
         });
         assert_eq!(row_count, Some(1));
+    }
+
+    /// The rebuild must preserve relationship topology. Scratch tables are
+    /// built and counted before the rename swap, so edges survive and no
+    /// migration scratch catalog is left behind.
+    #[tokio::test]
+    async fn a_legacy_primary_key_rebuild_preserves_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[
+                rel_table_ddl(),
+                &insert_row("src/main.rs", Some("alpha"), "{}"),
+                &insert_row("src/lib.rs", Some("alpha"), "{}"),
+                "MATCH (a:Memory {id: 'src/main.rs'}), (b:Memory {id: 'src/lib.rs'}) CREATE (a)-[:RELATES_TO {source: 'alpha'}]->(b)",
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.pk_rebuilt, "the legacy key was rebuilt");
+        assert_eq!(report.skipped_reason, None);
+        assert_eq!(count_memory(&store, "true").await, 2);
+        assert_eq!(edge_count(&store).await, 1, "edges survive the swap");
+    }
+
+    #[test]
+    fn a_derived_legacy_id_is_stable_and_namespace_scoped() {
+        let a = derived_legacy_id("alpha", "content", "metadata", 0);
+        let b = derived_legacy_id("alpha", "content", "metadata", 0);
+        let other = derived_legacy_id("beta", "content", "metadata", 0);
+        let next = derived_legacy_id("alpha", "content", "metadata", 1);
+        assert_eq!(a, b, "the derived id is deterministic, not scan-order based");
+        assert_ne!(a, other, "namespace is part of the identity");
+        assert_ne!(a, next, "duplicate occurrences get distinct ids");
+        assert!(a.starts_with("derived-"));
     }
 
     #[tokio::test]
