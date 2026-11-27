@@ -3,9 +3,16 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "paths": {
+      "@neurostrata/plugin-core": ["../core/dist/index.d.ts"]
+    },
     "lib": ["ES2022"],
     "types": ["node"],
-    "typeRoots": ["./node_modules/@types", "../opencode/node_modules/@types"],
+    "typeRoots": [
+      "./node_modules/@types",
+      "../core/node_modules/@types",
+      "../opencode/node_modules/@types"
+    ],
     "rootDir": ".",
     "outDir": "./dist",
     "strict": true,

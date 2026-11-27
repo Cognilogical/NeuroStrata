@@ -87,6 +87,15 @@ check digest-order proof_evaluate_connector_post_gate_total \
 check epoch-swap proof_epoch_gate_total \
     's/KernelEpochDecision::QuarantineOld\s*\} else \{\s*KernelEpochDecision::RefuseFuture/KernelEpochDecision::RefuseFuture\n    } else {\n        KernelEpochDecision::QuarantineOld/'
 
+# I: break working-set eviction (allow Immortal tier to demote).
+check ws-eviction proof_evaluate_working_set_eviction_total \
+    's/WorkingSetTier::Immortal => GcAction::RetainFull,/WorkingSetTier::Immortal => GcAction::DemoteToStub,/'
+
+# J: break quantized stride folding (frontier no longer steps on stride
+# boundaries, so the KV-cache prefix mutates every turn).
+check ws-stride proof_evaluate_working_set_stride_fold_contract \
+    's{\(foldable / stride\) \* stride}{foldable}'
+
 if [ "$failures" -ne 0 ]; then
     echo "kani mutation check: $failures failure(s)" >&2
     exit 1
