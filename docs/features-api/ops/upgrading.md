@@ -20,9 +20,11 @@ After upgrading to a build with the project marker, run `neurostrata-mcp hooks i
 
 ## Store-open migration for legacy rows
 
-Every open of an existing store runs one migration inside the schema turn. It
-never blocks the open on its own account, and it never deletes a row or an
-edge.
+Every open of an existing store runs one migration inside the schema turn.
+Namespace recovery and identity auditing never block the open on their own
+account. The deliberate exception is a primary-key rebuild that cannot copy or
+validate every row and relationship: that fails loudly, because serving a
+half-migrated store would risk data loss. No row or edge is deleted.
 
 This port is **independent of #68**: it does not depend on, sequence with, or
 block that work. It only normalizes already-present on-disk stores so the
