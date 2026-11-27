@@ -551,13 +551,25 @@ pub(crate) fn build_thalamic_bus(
     project_root: impl Into<PathBuf>,
 ) -> Arc<ThalamicBus> {
     let bus = Arc::new(ThalamicBus::new(BUS_CAPACITY));
-    bus.attach_store(vector_store);
+    bus.attach_store(vector_store.clone());
     bus.register(Box::new(EpisodicPointerEcho::new(project_root)));
     bus.register(Box::new(ExportFreshnessDirty::new(dimensions)));
     bus.register(Box::new(GuardEventLog::new(dimensions)));
     bus.register(Box::new(
         crate::events::subscribers::PostIngestNormalize::new(),
     ));
+    // Two recoveries run once subscribers are in place: the bus cannot replay
+    // a pulse lost between the parent's commit and `emit`, and a child parked
+    // before that commit may still be staged after a stop. Both use durable
+    // store state, not in-memory bus state, so neither needs the old process.
+    let replay_store = vector_store.clone();
+    let replay_bus = bus.clone();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            crate::task::replay_pending_completion_events(&replay_store, &replay_bus).await;
+            crate::task::activate_committed_follow_ups(&replay_store).await;
+        });
+    }
     bus
 }
 

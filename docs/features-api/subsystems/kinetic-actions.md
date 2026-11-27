@@ -10,7 +10,7 @@ Every `neurostrata_action` mutation passes through a deterministic 5-stage fail-
 4. **Digital Twin Preconditions** — enforce `TwinVarPrecondition` bounds over current twin state.
 5. **Post-Image SHACL** — validate the staged post-image across all rows plus the `action_receipt` row, in a single atomic LadybugDB write turn with active-head CAS revalidation.
 
-Only `validate` never writes; `apply` commits all effects (`SupersedeMemory`, `UpsertMemory`, `SetTwinState`, `LinkEdge`, `TransitionTask`) plus a bitemporal `action_receipt` in one transaction. `TransitionTask` only targets `open`, `in_progress`, or `blocked` and never bypasses Lock 2 (`neurostrata_task_complete`).
+Only `validate` never writes; `apply` commits all effects (`SupersedeMemory`, `UpsertMemory`, `SetTwinState`, `LinkEdge`, `TransitionTask`) plus a bitemporal `action_receipt` in one transaction. `TransitionTask` only targets `open`, `in_progress`, or `blocked` and never bypasses Lock 2 (`neurostrata_task_complete`). It acquires the same per-task claim lock as the task handlers, so an action-driven transition cannot race a concurrent claim, update, or completion on that task.
 
 ## Atomic Apply & Revert Receipts
 

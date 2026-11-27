@@ -3884,6 +3884,13 @@ async fn record_graph_query_for_caller_root(
     query_hint: &str,
     caller_root: Option<&str>,
 ) {
+    // Defense in depth: even if a caller reaches this recorder through another
+    // path, never persist a secret-bearing hint in the ledger or task metadata.
+    if crate::secrets::scan_entry_point(query_hint, &serde_json::Value::Null, "graph_query")
+        .is_some()
+    {
+        return;
+    }
     // Legacy queries[] row (+ test ledger entry) without a counter bump.
     crate::task::record_legacy_query_path(store, namespace, tool_name, query_hint, caller_root)
         .await;
@@ -4012,6 +4019,14 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         Some(p) => p,
         None => return "Missing 'path' parameter.".to_string(),
     };
+    // A successful lookup stamps this path into the caller's task metadata.
+    // Judge it before the lookup and the stamp so a secret-bearing path is
+    // refused rather than persisted in recent_queries.
+    if let Some(rejection) =
+        crate::secrets::scan_entry_point(path, &serde_json::Value::Null, "memories_for_file")
+    {
+        return rejection.to_string();
+    }
     let namespace = resolve_namespace(&store, namespace).await;
 
     // Spec §6 R6.2: no pre-dispatch ledger write here. Receipts for this tool

@@ -2646,6 +2646,39 @@ pub async fn apply_action(
     invocation: &ActionInvocation,
     embedder: &dyn crate::traits::Embedder,
 ) -> Result<ActionApplyOutcome, ActionError> {
+    // Handlers hold the per-task lock across their load -> save sequence. Take
+    // the same locks here, in id order, across evaluate -> stage -> commit so
+    // a handler cannot save a stale payload over a committed action's status
+    // or history. The target ids are known from the caller's named parameters
+    // before the read-only evaluation, so the lock is held for the whole
+    // window in which a stale load could race the commit.
+    let mut task_ids = std::collections::BTreeSet::new();
+    {
+        let mut ont = store.get_ontology(&invocation.namespace);
+        if !ont.action_types.contains_key(&invocation.slug) {
+            store.refresh_ontology(&invocation.namespace).await;
+            ont = store.get_ontology(&invocation.namespace);
+        }
+        if let Some(definition) = ont.action_types.get(&invocation.slug) {
+            for effect in &definition.effects {
+                if let ActionEffectTemplate::TransitionTask { target_param, .. } = effect {
+                    if let Some(serde_json::Value::String(id)) = invocation.params.get(target_param)
+                    {
+                        task_ids.insert(id.clone());
+                    }
+                }
+            }
+        }
+    }
+    let mut locks = Vec::new();
+    for id in &task_ids {
+        locks.push(crate::task::claim_lock(id));
+    }
+    let mut _held = Vec::with_capacity(locks.len());
+    for lock in &locks {
+        _held.push(lock.lock().await);
+    }
+
     let eval = evaluate_action(store, invocation).await?;
     if !eval.submission_failures.is_empty() {
         return Ok(ActionApplyOutcome::Rejected {
@@ -8421,6 +8454,119 @@ mod tests {
         .expect("legacy raw row and raw receipt must revert cleanly");
         assert!(!rev.forced);
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A TransitionTask must not commit while a task handler holds the row's
+    /// lock: otherwise a handler's stale load could be saved over the action's
+    /// status and history. Both sides now take the same per-task lock.
+    #[tokio::test]
+    async fn action_transition_shares_the_task_lock_with_handlers() {
+        let tmp = std::env::temp_dir().join(format!("ns-action-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = crate::store::ladybug::LadybugStore::for_testing(&tmp, 4).expect("store");
+        let ns = "ns-action-lock";
+        store.init(ns).await.unwrap();
+
+        store
+            .upsert(
+                ns,
+                "task-1",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Task 1".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "task": {
+                            "title": "Task 1",
+                            "status": "open",
+                            "priority": 1,
+                            "created_at": 1700000000,
+                            "updated_at": 1700000000,
+                            "history": []
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                ns,
+                "act-lock",
+                vec![0.1; 4],
+                MemoryPayload {
+                    content: "Action: lock-transition".to_string(),
+                    user_id: "alice".to_string(),
+                    memory_type: "action_type".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({
+                        "action_type": {
+                            "slug": "lock-transition",
+                            "title": "Lock Transition",
+                            "description": "Transitions a task for the lock regression",
+                            "required_role": "editor",
+                            "parameters": {
+                                "task_id": {
+                                    "param_type": "memory_id",
+                                    "required": true,
+                                    "target_memory_type": "task"
+                                },
+                                "reason": { "param_type": "string", "required": true }
+                            },
+                            "submission_criteria": [],
+                            "effects": [{
+                                "op": "transition_task",
+                                "target_param": "task_id",
+                                "new_status": "blocked",
+                                "note_template": "Blocked on {{reason}}"
+                            }]
+                        }
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inv = ActionInvocation {
+            namespace: ns.to_string(),
+            slug: "lock-transition".to_string(),
+            security: ActionSecurityContext {
+                authenticated_principal: "alice".to_string(),
+                requested_principal: None,
+            },
+            params: BTreeMap::from([
+                ("task_id".to_string(), json!("task-1")),
+                ("reason".to_string(), json!("upstream valve maintenance")),
+            ]),
+        };
+
+        // A handler holds the row lock across its load -> save window.
+        let task_lock = crate::task::claim_lock("task-1");
+        let guard = task_lock.lock().await;
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            apply_action(&store, &inv, &DummyActionEmbedder),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the action waited on the shared task lock"
+        );
+        drop(guard);
+
+        let outcome = apply_action(&store, &inv, &DummyActionEmbedder)
+            .await
+            .expect("the action commits once the handler releases the lock");
+        assert!(outcome.is_applied(), "{outcome:?}");
+        let (_, payload) = store.get(ns, "task-1").await.unwrap().unwrap();
+        assert_eq!(payload.metadata["task"]["status"], json!("blocked"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

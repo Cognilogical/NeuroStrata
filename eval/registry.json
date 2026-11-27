@@ -24,6 +24,33 @@
         "ignored": 0
       }
     },
+    "secret-task-surfaces": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp task::tests::secret_ -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp task::tests::clean_content_passes_all_surfaces -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp task::tests::a_secret_in_the_inline_extraction_is_refused_before_any_write -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp task::tests::task_complete_rolls_back_partial_follow_ups -- --test-threads=1"
+      ],
+      "tests": [
+        "task::tests::secret_in_task_create_is_refused",
+        "task::tests::secret_in_task_update_is_refused",
+        "task::tests::secret_in_follow_up_task_is_refused",
+        "task::tests::secret_in_bootstrap_description_is_refused",
+        "task::tests::secret_in_blocked_by_is_refused",
+        "task::tests::secret_in_task_completion_reason_is_refused",
+        "task::tests::secret_in_task_claim_assignee_is_refused",
+        "task::tests::secret_in_task_create_identity_is_refused",
+        "task::tests::secret_in_task_claim_scope_is_refused",
+        "task::tests::secret_in_task_update_scope_is_refused",
+        "task::tests::secret_in_task_complete_identity_is_refused",
+        "task::tests::clean_content_passes_all_surfaces",
+        "task::tests::a_secret_in_the_inline_extraction_is_refused_before_any_write",
+        "task::tests::task_complete_rolls_back_partial_follow_ups"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "ingest-skip": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp parser::ingest::tests -- --test-threads=1 --skip ingest_memory_probe"
