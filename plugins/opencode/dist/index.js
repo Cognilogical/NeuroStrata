@@ -2,9 +2,9 @@
  * @neurostrata/plugin-core — Shared ESM implementation for all NeuroStrata harness adapters.
  *
  * Zero `require()` calls and zero external npm runtime dependencies. Only Node built-ins
- * (node:fs, node:os, node:path) are imported. Every harness adapter (opencode, claude,
- * codex, github-cli) is a thin wrapper that re-exports this module and builds one plugin
- * via `createHarnessPlugin`.
+ * (node:crypto, node:fs, node:os, node:path) are imported. Every harness adapter
+ * (opencode, claude, codex, github-cli, openclaw, hermes) re-exports this module and
+ * builds one plugin via `createHarnessPlugin`.
  *
  * Implements:
  *  - Bug 2: findProjectRoot / discoverProjectNamespace / resolveConfig (never hardcodes "NeuroStrata")
@@ -18,7 +18,8 @@
 // ──────────────────────────────────────────────────────────────────────
 // Node built-ins only (ESM). Zero require(), zero external runtime deps.
 // ──────────────────────────────────────────────────────────────────────
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 // ──────────────────────────────────────────────────────────────────────
@@ -1343,6 +1344,799 @@ export function persistConceptualBridges(projectRoot, bridges) {
     }
 }
 // ──────────────────────────────────────────────────────────────────────
+// Generational context-graph working set
+// ──────────────────────────────────────────────────────────────────────
+export const WORKING_SET_MAX_FRAME_BYTES = 4096;
+export const WORKING_SET_MAX_IDLE_TURNS = 3;
+export const WORKING_SET_STUB_MAX_BYTES = 192;
+export const WORKING_SET_MAX_ROOTS = 32;
+export const WORKING_SET_MAX_YOUNG_GEN = 64;
+export const WORKING_SET_MAX_STUBS = 128;
+export const WORKING_SET_MAX_TOOL_STUBS = 128;
+export const WORKING_SET_MAX_TOOL_DIGESTS = 128;
+export const WORKING_SET_MAX_EVENT_IDS = 128;
+export const WORKING_SET_MAX_INJECTION_KEYS = 128;
+export const WORKING_SET_MAX_ACTIVE_SESSION_BYTES = 1048576;
+export const TOOL_GC_INLINE_THRESHOLD_BYTES = 3072;
+export const TOOL_GC_HEAD_BYTES = 512;
+export const TOOL_GC_TAIL_BYTES = 512;
+export const TOOL_GC_STUB_MAX_BYTES = 512;
+export const WORKING_SET_SUMMARY_MAX_BYTES = 512;
+export const WORKING_SET_FRAME_OPEN = '[NeuroStrata Active Context]';
+export const WORKING_SET_FRAME_CLOSE = '[NeuroStrata End Active Context]';
+export const WORKING_SET_TIER0_MAX_BYTES = 2048;
+export const WORKING_SET_MAX_EDGES = 128;
+export const WORKING_SET_STRIDE_MESSAGES = 8;
+export const WORKING_SET_HOT_TAIL_MESSAGES = 12;
+export const WORKING_SET_TIER0_OPEN = '[NeuroStrata Golden Rules — IMMORTAL PREFIX]';
+export const WORKING_SET_TIER0_CLOSE = '[NeuroStrata End Immortal Prefix]';
+export const WORKING_SET_STRIDE_MARKER = '[NeuroStrata Quantized History Stride ';
+const U32_MAX = 0xffffffff;
+const HEX64 = /^[0-9a-f]{64}$/;
+const HEX12 = /^[0-9a-f]{12}$/;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/u;
+const NODE_KINDS = new Set([
+    'task_header',
+    'golden_rule',
+    'file',
+    'symbol',
+    'memory',
+    'ast_summary',
+    'conceptual_bridge',
+    'recall_text'
+]);
+const EXPAND_TOOLS = new Set([
+    'neurostrata_get_memory',
+    'neurostrata_memories_for_file',
+    'neurostrata_related',
+    'neurostrata_get_snapshot'
+]);
+const IMMORTAL_KINDS = new Set([
+    'task_header',
+    'golden_rule'
+]);
+const PINNED_KINDS = new Set(['file', 'symbol']);
+const YOUNG_KINDS = new Set([
+    'memory',
+    'ast_summary',
+    'conceptual_bridge'
+]);
+const STATE_KEYS = [
+    'version',
+    'project_id',
+    'namespace',
+    'session_id',
+    'epoch',
+    'turn_seq',
+    'active_turn_id',
+    'recent_event_ids',
+    'max_frame_bytes',
+    'max_idle_turns',
+    'used_frame_bytes',
+    'frame_fingerprint',
+    'last_injected_fingerprint',
+    'roots',
+    'young_gen',
+    'evicted_stubs',
+    'edges',
+    'tool_output_stubs',
+    'tool_output_digests'
+];
+const EDGE_KINDS = new Set([
+    'GOVERNS',
+    'DEPENDS_ON',
+    'CALLS',
+    'IMPORTS',
+    'CONCEPTUAL_BRIDGE',
+    'EXTRACTED_FROM'
+]);
+const EDGE_KEYS = ['from', 'to', 'kind', 'weight_bps', 'last_touched_turn'];
+const ONE_HOP_EDGE_KINDS = new Set([
+    'GOVERNS',
+    'EXTRACTED_FROM',
+    'CONCEPTUAL_BRIDGE'
+]);
+const STRUCTURAL_EDGE_KINDS = new Set([
+    'CALLS',
+    'IMPORTS',
+    'DEPENDS_ON'
+]);
+const NODE_REQUIRED = [
+    'id',
+    'kind',
+    'label',
+    'summary',
+    'governing_ids',
+    'byte_cost',
+    'last_touched_turn',
+    'expand_tool'
+];
+const NODE_OPTIONAL = ['path', 'symbol', 'memory_type'];
+const STUB_REQUIRED = [
+    'id',
+    'kind',
+    'pointer',
+    'byte_cost',
+    'last_touched_turn',
+    'governing_ids'
+];
+const STUB_OPTIONAL = ['path', 'memory_type', 'sha256'];
+const TOOL_STUB_KEYS = [
+    'id',
+    'tool_name',
+    'rel_path',
+    'sha256',
+    'bytes',
+    'epoch',
+    'last_touched_turn',
+    'governing_ids',
+    'pointer',
+    'byte_cost'
+];
+const TOOL_DIGEST_KEYS = [
+    'id',
+    'project_id',
+    'path_key',
+    'tool_name',
+    'sha256',
+    'bytes',
+    'epoch',
+    'last_touched_turn',
+    'read_count'
+];
+function wsRecord(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+        ? value
+        : null;
+}
+function wsExactKeys(value, required, optional = []) {
+    const allowed = new Set([...required, ...optional]);
+    return (required.every((key) => Object.hasOwn(value, key)) &&
+        Object.keys(value).every((key) => allowed.has(key)));
+}
+function wsU32(value) {
+    return (Number.isSafeInteger(value) &&
+        value >= 0 &&
+        value <= U32_MAX);
+}
+function wsText(value, maxBytes, singleLine = false) {
+    return (typeof value === 'string' &&
+        Buffer.byteLength(value) <= maxBytes &&
+        !CONTROL_CHARS.test(value) &&
+        (!singleLine || !/[\r\n]/u.test(value)));
+}
+function wsNormalizedText(text) {
+    return text.replace(/\r\n/g, '\n');
+}
+function wsEscapePointerToken(value) {
+    return value.replace(/[% ,|\[\]\r\n]/gu, (char) => `%${Buffer.from(char).toString('hex').toUpperCase()}`);
+}
+function wsEscapeFrameToken(value) {
+    return value.replace(/[%\[\]]/gu, (char) => `%${Buffer.from(char).toString('hex').toUpperCase()}`);
+}
+function wsTruncateUtf8(text, maxBytes) {
+    if (maxBytes <= 0)
+        return '';
+    let used = 0;
+    let out = '';
+    for (const char of text) {
+        const size = Buffer.byteLength(char);
+        if (used + size > maxBytes)
+            break;
+        out += char;
+        used += size;
+    }
+    return out;
+}
+function wsTailUtf8(text, maxBytes) {
+    if (maxBytes <= 0)
+        return '';
+    const chars = Array.from(text);
+    let used = 0;
+    let start = chars.length;
+    while (start > 0) {
+        const size = Buffer.byteLength(chars[start - 1]);
+        if (used + size > maxBytes)
+            break;
+        start--;
+        used += size;
+    }
+    return chars.slice(start).join('');
+}
+function wsSha(text) {
+    return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+function wsCanonicalProjectRoot(projectRoot) {
+    try {
+        const real = realpathSync.native(projectRoot);
+        const normalized = real.replace(/\\/g, '/');
+        return normalized.length > 1 ? normalized.replace(/\/+$/u, '') : normalized;
+    }
+    catch {
+        return null;
+    }
+}
+function wsProjectId(projectRoot) {
+    const canonical = wsCanonicalProjectRoot(projectRoot);
+    return canonical === null ? null : wsSha(canonical);
+}
+function wsScope(value) {
+    const rec = wsRecord(value);
+    if (!rec)
+        return null;
+    const projectRoot = wsCanonicalProjectRoot(value.projectRoot);
+    const projectId = wsProjectId(value.projectRoot);
+    if (projectRoot === null ||
+        projectId === null ||
+        value.projectId !== projectId)
+        return null;
+    if (!wsText(value.namespace, 128) || !wsText(value.sessionId, 256))
+        return null;
+    if (!wsU32(value.epoch))
+        return null;
+    return {
+        projectRoot,
+        projectId,
+        namespace: value.namespace,
+        sessionId: value.sessionId,
+        epoch: value.epoch
+    };
+}
+function wsEmptyFingerprint() {
+    return '0'.repeat(64);
+}
+function wsBlankState(scope) {
+    return {
+        version: 1,
+        project_id: scope.projectId,
+        namespace: scope.namespace,
+        session_id: scope.sessionId,
+        epoch: scope.epoch,
+        turn_seq: 0,
+        active_turn_id: null,
+        recent_event_ids: [],
+        max_frame_bytes: WORKING_SET_MAX_FRAME_BYTES,
+        max_idle_turns: WORKING_SET_MAX_IDLE_TURNS,
+        used_frame_bytes: 0,
+        frame_fingerprint: wsEmptyFingerprint(),
+        last_injected_fingerprint: wsEmptyFingerprint(),
+        roots: [],
+        young_gen: [],
+        evicted_stubs: [],
+        edges: [],
+        tool_output_stubs: [],
+        tool_output_digests: []
+    };
+}
+function wsFallbackScope(value) {
+    return {
+        projectRoot: resolve(value.projectRoot || process.cwd()),
+        projectId: HEX64.test(value.projectId) ? value.projectId : '0'.repeat(64),
+        namespace: wsText(value.namespace, 128) ? value.namespace : 'NeuroStrata',
+        sessionId: wsText(value.sessionId, 256)
+            ? value.sessionId
+            : '__no_session__',
+        epoch: wsU32(value.epoch) ? value.epoch : 0
+    };
+}
+function wsNodeTier(node, collection) {
+    if (collection === 'roots')
+        return IMMORTAL_KINDS.has(node.kind) ? 'Immortal' : 'PinnedRoot';
+    return 'YoungGen';
+}
+function wsCanonicalNodeLine(node, collection) {
+    const prefix = collection === 'roots' ? 'Root' : 'Young';
+    return `[${prefix}] ${wsEscapeFrameToken(node.id)} | ${wsEscapeFrameToken(node.summary)} | expand:${wsEscapeFrameToken(node.expand_tool)}\n`;
+}
+function wsTierRank(tier) {
+    return tier === 'Immortal'
+        ? 0
+        : tier === 'PinnedRoot'
+            ? 1
+            : tier === 'YoungGen'
+                ? 2
+                : 3;
+}
+function wsNodeCompare(a, b, aTier, bTier) {
+    return (wsTierRank(aTier) - wsTierRank(bTier) ||
+        b.last_touched_turn - a.last_touched_turn ||
+        b.byte_cost - a.byte_cost ||
+        (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+function wsStubCompare(a, b) {
+    return (b.last_touched_turn - a.last_touched_turn ||
+        b.byte_cost - a.byte_cost ||
+        (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+function wsToolCompare(a, b) {
+    return ((a.path_key ?? a.rel_path ?? '').localeCompare(b.path_key ?? b.rel_path ?? '') ||
+        a.tool_name.localeCompare(b.tool_name) ||
+        a.sha256.localeCompare(b.sha256) ||
+        a.id.localeCompare(b.id));
+}
+function wsVisibleIds(value) {
+    if (!Array.isArray(value) || value.length > 8)
+        return null;
+    const ids = value.map((id) => (typeof id === 'string' ? id.trim() : ''));
+    if (ids.some((id) => !wsText(id, 256)))
+        return null;
+    const sorted = [...new Set(ids)].sort();
+    return sorted.length === value.length &&
+        sorted.every((id, i) => id === value[i])
+        ? sorted
+        : null;
+}
+function wsRelPath(value) {
+    return (wsText(value, 512) &&
+        !value.startsWith('/') &&
+        !value.includes('\\') &&
+        !/^[A-Za-z]:/u.test(value) &&
+        value
+            .split('/')
+            .every((part) => part !== '' && part !== '.' && part !== '..'));
+}
+function wsValidateNode(value, collection) {
+    const rec = wsRecord(value);
+    if (!rec || !wsExactKeys(rec, NODE_REQUIRED, NODE_OPTIONAL))
+        return null;
+    if (!wsText(rec.id, 1024) || !NODE_KINDS.has(rec.kind))
+        return null;
+    if (!wsText(rec.label, 128, true) ||
+        !wsText(rec.summary, WORKING_SET_SUMMARY_MAX_BYTES, true))
+        return null;
+    const governing_ids = wsVisibleIds(rec.governing_ids);
+    if (governing_ids === null ||
+        !wsU32(rec.byte_cost) ||
+        rec.byte_cost < 1 ||
+        !wsU32(rec.last_touched_turn))
+        return null;
+    if (typeof rec.expand_tool !== 'string' || !EXPAND_TOOLS.has(rec.expand_tool))
+        return null;
+    if (Object.hasOwn(rec, 'path') && !wsRelPath(rec.path))
+        return null;
+    if (Object.hasOwn(rec, 'symbol') && !wsText(rec.symbol, 256, true))
+        return null;
+    if (Object.hasOwn(rec, 'memory_type') && !wsText(rec.memory_type, 64, true))
+        return null;
+    const kind = rec.kind;
+    if (collection === 'roots' &&
+        !IMMORTAL_KINDS.has(kind) &&
+        !PINNED_KINDS.has(kind))
+        return null;
+    if (collection === 'young_gen' && !YOUNG_KINDS.has(kind))
+        return null;
+    const node = {
+        id: rec.id,
+        kind,
+        label: rec.label,
+        summary: rec.summary,
+        governing_ids,
+        byte_cost: rec.byte_cost,
+        last_touched_turn: rec.last_touched_turn,
+        expand_tool: rec.expand_tool,
+        ...(Object.hasOwn(rec, 'path') ? { path: rec.path } : {}),
+        ...(Object.hasOwn(rec, 'symbol') ? { symbol: rec.symbol } : {}),
+        ...(Object.hasOwn(rec, 'memory_type')
+            ? { memory_type: rec.memory_type }
+            : {})
+    };
+    if (node.byte_cost !== Buffer.byteLength(wsCanonicalNodeLine(node, collection)))
+        return null;
+    return node;
+}
+function wsValidateStub(value) {
+    const rec = wsRecord(value);
+    if (!rec || !wsExactKeys(rec, STUB_REQUIRED, STUB_OPTIONAL))
+        return null;
+    if (!wsText(rec.id, 1024) || !NODE_KINDS.has(rec.kind))
+        return null;
+    if (!wsText(rec.pointer, WORKING_SET_STUB_MAX_BYTES, true) ||
+        !wsU32(rec.byte_cost) ||
+        !wsU32(rec.last_touched_turn))
+        return null;
+    const governing_ids = wsVisibleIds(rec.governing_ids);
+    if (governing_ids === null ||
+        rec.byte_cost !== Buffer.byteLength(`${rec.pointer}\n`))
+        return null;
+    if (Object.hasOwn(rec, 'path') && !wsRelPath(rec.path))
+        return null;
+    if (Object.hasOwn(rec, 'memory_type') && !wsText(rec.memory_type, 64, true))
+        return null;
+    if (Object.hasOwn(rec, 'sha256') && !HEX12.test(rec.sha256))
+        return null;
+    const kind = rec.kind;
+    if ((kind === 'file' || kind === 'symbol') &&
+        !HEX12.test(rec.sha256))
+        return null;
+    return {
+        id: rec.id,
+        kind,
+        pointer: rec.pointer,
+        byte_cost: rec.byte_cost,
+        last_touched_turn: rec.last_touched_turn,
+        governing_ids,
+        ...(Object.hasOwn(rec, 'path') ? { path: rec.path } : {}),
+        ...(Object.hasOwn(rec, 'memory_type')
+            ? { memory_type: rec.memory_type }
+            : {}),
+        ...(Object.hasOwn(rec, 'sha256') ? { sha256: rec.sha256 } : {})
+    };
+}
+function wsNormalizeToolName(value) {
+    const tool = value.trim().toLowerCase();
+    return /^[a-z][a-z0-9_]*$/u.test(tool) ? tool : null;
+}
+function wsValidateToolStub(value) {
+    const rec = wsRecord(value);
+    if (!rec || !wsExactKeys(rec, TOOL_STUB_KEYS))
+        return null;
+    if (typeof rec.id !== 'string' || !/^tool:[0-9a-f]{64}$/u.test(rec.id))
+        return null;
+    if (wsNormalizeToolName(rec.tool_name) !== rec.tool_name)
+        return null;
+    if (!wsRelPath(rec.rel_path) && rec.rel_path !== '-')
+        return null;
+    if (!HEX12.test(rec.sha256) ||
+        !wsU32(rec.bytes) ||
+        !wsU32(rec.epoch) ||
+        !wsU32(rec.last_touched_turn))
+        return null;
+    const governing_ids = wsVisibleIds(rec.governing_ids);
+    if (governing_ids === null ||
+        !wsText(rec.pointer, TOOL_GC_STUB_MAX_BYTES, true) ||
+        !wsU32(rec.byte_cost))
+        return null;
+    if (rec.byte_cost !== Buffer.byteLength(`${rec.pointer}\n`))
+        return null;
+    return rec;
+}
+function wsValidateDigest(value) {
+    const rec = wsRecord(value);
+    if (!rec || !wsExactKeys(rec, TOOL_DIGEST_KEYS))
+        return null;
+    if (typeof rec.id !== 'string' || !/^tool:[0-9a-f]{64}$/u.test(rec.id))
+        return null;
+    if (!HEX64.test(rec.project_id))
+        return null;
+    if (!wsRelPath(rec.path_key) && rec.path_key !== '-')
+        return null;
+    if (wsNormalizeToolName(rec.tool_name) !== rec.tool_name)
+        return null;
+    if (!HEX12.test(rec.sha256) ||
+        !wsU32(rec.bytes) ||
+        !wsU32(rec.epoch) ||
+        !wsU32(rec.last_touched_turn))
+        return null;
+    if (!wsU32(rec.read_count) || rec.read_count < 1)
+        return null;
+    return rec;
+}
+function wsCanonicalNodeId(value) {
+    return (wsText(value, 1024) &&
+        /^(?:task|rule|file|symbol|mem|bridge|text|ast):/u.test(value));
+}
+function wsValidateEdge(value) {
+    const rec = wsRecord(value);
+    if (!rec || !wsExactKeys(rec, EDGE_KEYS))
+        return null;
+    if (!wsCanonicalNodeId(rec.from) ||
+        !wsCanonicalNodeId(rec.to) ||
+        !EDGE_KINDS.has(rec.kind) ||
+        !wsU32(rec.weight_bps) ||
+        rec.weight_bps > 10000 ||
+        !wsU32(rec.last_touched_turn))
+        return null;
+    return {
+        from: rec.from,
+        to: rec.to,
+        kind: rec.kind,
+        weight_bps: rec.weight_bps,
+        last_touched_turn: rec.last_touched_turn
+    };
+}
+function wsEdgeCompare(a, b) {
+    return (b.last_touched_turn - a.last_touched_turn ||
+        b.weight_bps - a.weight_bps ||
+        (a.from < b.from ? -1 : a.from > b.from ? 1 : 0) ||
+        (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0) ||
+        (a.to < b.to ? -1 : a.to > b.to ? 1 : 0));
+}
+function wsEdgeKey(edge) {
+    return `${edge.from}\u0000${edge.kind}\u0000${edge.to}`;
+}
+function wsSameOrder(values, sorted, compare) {
+    if (values.length !== sorted.length)
+        return false;
+    for (let i = 0; i < values.length; i++)
+        if (compare(values[i], sorted[i]) !== 0)
+            return false;
+    return true;
+}
+function wsValidateState(value, scope) {
+    const rec = wsRecord(value);
+    if (!rec ||
+        !wsExactKeys(rec, STATE_KEYS.filter((key) => key !== 'edges'), ['edges']))
+        return null;
+    if (rec.version !== 1 ||
+        rec.project_id !== scope.projectId ||
+        rec.namespace !== scope.namespace ||
+        rec.session_id !== scope.sessionId ||
+        rec.epoch !== scope.epoch)
+        return null;
+    if (!wsU32(rec.turn_seq) ||
+        !wsU32(rec.used_frame_bytes) ||
+        rec.used_frame_bytes > WORKING_SET_MAX_FRAME_BYTES)
+        return null;
+    if (rec.max_frame_bytes !== WORKING_SET_MAX_FRAME_BYTES ||
+        !wsU32(rec.max_idle_turns) ||
+        rec.max_idle_turns > 30)
+        return null;
+    if (!HEX64.test(rec.frame_fingerprint) ||
+        !HEX64.test(rec.last_injected_fingerprint))
+        return null;
+    if (rec.active_turn_id !== null && !wsText(rec.active_turn_id, 128))
+        return null;
+    if (!Array.isArray(rec.recent_event_ids) ||
+        rec.recent_event_ids.length > WORKING_SET_MAX_EVENT_IDS)
+        return null;
+    if (rec.recent_event_ids.some((id) => !wsText(id, 256)) ||
+        new Set(rec.recent_event_ids).size !== rec.recent_event_ids.length)
+        return null;
+    if (!Array.isArray(rec.roots) ||
+        !Array.isArray(rec.young_gen) ||
+        !Array.isArray(rec.evicted_stubs) ||
+        (Object.hasOwn(rec, 'edges') && !Array.isArray(rec.edges)) ||
+        !Array.isArray(rec.tool_output_stubs) ||
+        !Array.isArray(rec.tool_output_digests))
+        return null;
+    const rawEdges = (Object.hasOwn(rec, 'edges') ? rec.edges : []);
+    if (rawEdges.length > WORKING_SET_MAX_EDGES)
+        return null;
+    const roots = rec.roots.map((node) => wsValidateNode(node, 'roots'));
+    const young = rec.young_gen.map((node) => wsValidateNode(node, 'young_gen'));
+    const stubs = rec.evicted_stubs.map(wsValidateStub);
+    const edges = rawEdges.map(wsValidateEdge);
+    const toolStubs = rec.tool_output_stubs.map(wsValidateToolStub);
+    const digests = rec.tool_output_digests.map(wsValidateDigest);
+    if ([...roots, ...young].some((node) => node === null) ||
+        stubs.some((stub) => stub === null) ||
+        edges.some((edge) => edge === null) ||
+        toolStubs.some((stub) => stub === null) ||
+        digests.some((digest) => digest === null))
+        return null;
+    const rootNodes = roots;
+    const youngNodes = young;
+    const stubNodes = stubs;
+    const edgeNodes = edges;
+    const toolStubNodes = toolStubs;
+    const digestNodes = digests;
+    const allIds = [...rootNodes, ...youngNodes, ...stubNodes].map((node) => node.id);
+    if (new Set(allIds).size !== allIds.length)
+        return null;
+    if (new Set(edgeNodes.map(wsEdgeKey)).size !== edgeNodes.length ||
+        !wsSameOrder(edgeNodes, [...edgeNodes].sort(wsEdgeCompare), wsEdgeCompare))
+        return null;
+    if (!wsSameOrder(rootNodes, [...rootNodes].sort((a, b) => wsNodeCompare(a, b, wsNodeTier(a, 'roots'), wsNodeTier(b, 'roots'))), (a, b) => wsNodeCompare(a, b, wsNodeTier(a, 'roots'), wsNodeTier(b, 'roots'))))
+        return null;
+    if (!wsSameOrder(youngNodes, [...youngNodes].sort((a, b) => wsNodeCompare(a, b, 'YoungGen', 'YoungGen')), (a, b) => wsNodeCompare(a, b, 'YoungGen', 'YoungGen')))
+        return null;
+    if (!wsSameOrder(stubNodes, [...stubNodes].sort(wsStubCompare), wsStubCompare))
+        return null;
+    if (!wsSameOrder(toolStubNodes, [...toolStubNodes].sort((a, b) => wsToolCompare(a, b)), (a, b) => wsToolCompare(a, b)))
+        return null;
+    if (!wsSameOrder(digestNodes, [...digestNodes].sort(wsToolCompare), wsToolCompare))
+        return null;
+    if (rootNodes.filter((node) => !IMMORTAL_KINDS.has(node.kind)).length >
+        WORKING_SET_MAX_ROOTS ||
+        youngNodes.length > WORKING_SET_MAX_YOUNG_GEN ||
+        stubNodes.length > WORKING_SET_MAX_STUBS ||
+        toolStubNodes.length > WORKING_SET_MAX_TOOL_STUBS ||
+        digestNodes.length > WORKING_SET_MAX_TOOL_DIGESTS)
+        return null;
+    const digestIds = new Set(digestNodes.map((digest) => digest.id));
+    if (toolStubNodes.length !== digestNodes.length ||
+        toolStubNodes.some((stub) => !digestIds.has(stub.id)))
+        return null;
+    if (digestNodes.some((digest) => digest.project_id !== scope.projectId || digest.epoch !== scope.epoch) ||
+        toolStubNodes.some((stub) => stub.epoch !== scope.epoch))
+        return null;
+    return {
+        version: 1,
+        project_id: scope.projectId,
+        namespace: scope.namespace,
+        session_id: scope.sessionId,
+        epoch: scope.epoch,
+        turn_seq: rec.turn_seq,
+        active_turn_id: rec.active_turn_id,
+        recent_event_ids: [...rec.recent_event_ids],
+        max_frame_bytes: WORKING_SET_MAX_FRAME_BYTES,
+        max_idle_turns: rec.max_idle_turns,
+        used_frame_bytes: rec.used_frame_bytes,
+        frame_fingerprint: rec.frame_fingerprint,
+        last_injected_fingerprint: rec.last_injected_fingerprint,
+        roots: rootNodes,
+        young_gen: youngNodes,
+        evicted_stubs: stubNodes,
+        edges: edgeNodes,
+        tool_output_stubs: toolStubNodes,
+        tool_output_digests: digestNodes
+    };
+}
+function wsNormalizeState(value, scope) {
+    return wsValidateState(value, scope) ?? wsBlankState(scope);
+}
+function wsReadBounded(path) {
+    let fd = null;
+    try {
+        fd = openSync(path, 'r');
+        const stat = fstatSync(fd);
+        if (!stat.isFile() || stat.size > WORKING_SET_MAX_ACTIVE_SESSION_BYTES)
+            return null;
+        const buffer = Buffer.alloc(WORKING_SET_MAX_ACTIVE_SESSION_BYTES + 1);
+        let read = 0;
+        while (read < buffer.length) {
+            const count = readSync(fd, buffer, read, buffer.length - read, read);
+            if (count === 0)
+                break;
+            read += count;
+        }
+        if (read > WORKING_SET_MAX_ACTIVE_SESSION_BYTES)
+            return null;
+        return buffer.subarray(0, read).toString('utf8');
+    }
+    catch {
+        return null;
+    }
+    finally {
+        if (fd !== null)
+            try {
+                closeSync(fd);
+            }
+            catch {
+                /* best effort */
+            }
+    }
+}
+const warnedWorkingSetParents = new Set();
+function wsReadParent(scope) {
+    const stateDir = join(scope.projectRoot, '.NeuroStrata');
+    const path = join(stateDir, 'active_session.json');
+    if (!isDirectory(stateDir) ||
+        !safeProjectStateDir(scope.projectRoot, stateDir, path)) {
+        return { path, status: 'absent', parent: null };
+    }
+    if (!existsSync(path))
+        return { path, status: 'absent', parent: null };
+    const text = wsReadBounded(path);
+    let parent = null;
+    if (text !== null) {
+        try {
+            parent = wsRecord(JSON.parse(text));
+        }
+        catch {
+            parent = null;
+        }
+    }
+    if (parent === null) {
+        if (!warnedWorkingSetParents.has(path)) {
+            warnedWorkingSetParents.add(path);
+            console.error(`[NeuroStrata] warning: ignoring invalid active session state at ${path}`);
+        }
+        return { path, status: 'invalid', parent: null };
+    }
+    return { path, status: 'valid', parent };
+}
+/** Mirrors the first-match Rust/Lean working-set decision table exactly. */
+export function evaluateWorkingSetEviction(input) {
+    if (input.tier === 'Immortal')
+        return 'retain_full';
+    if (input.tier === 'EvictedStub') {
+        return input.is_re_referenced &&
+            input.projected_frame_bytes <= input.max_frame_bytes
+            ? 'promote_to_young_gen'
+            : 'retain_stub';
+    }
+    if (input.tier === 'YoungGen') {
+        return (!input.is_re_referenced && input.turn_age > input.max_idle_turns) ||
+            input.projected_frame_bytes > input.max_frame_bytes
+            ? 'demote_to_stub'
+            : 'retain_full';
+    }
+    return !input.is_re_referenced &&
+        input.turn_age > 0 &&
+        input.projected_frame_bytes > input.max_frame_bytes
+        ? 'demote_to_stub'
+        : 'retain_full';
+}
+/** Rust `WorkingSetCacheTier::as_tag` mirror. */
+export function workingSetCacheTierAsTag(tier) {
+    switch (tier) {
+        case 'Tier0SystemPrefix':
+            return 'tier0_system_prefix';
+        case 'Tier1QuantizedHistory':
+            return 'tier1_quantized_history';
+        case 'Tier2TailDelta':
+            return 'tier2_tail_delta';
+        case 'EvictedHeapStub':
+            return 'evicted_heap_stub';
+    }
+}
+/** Mirrors `evaluate_working_set_cache_tier` exactly. Tier 1 is state-only. */
+export function evaluateWorkingSetCacheTier(tier, hasSystemChannel) {
+    if (tier === 'Immortal')
+        return hasSystemChannel ? 'Tier0SystemPrefix' : 'Tier2TailDelta';
+    if (tier === 'EvictedStub')
+        return 'EvictedHeapStub';
+    return 'Tier2TailDelta';
+}
+/** Mirrors `compute_working_set_quantized_frontier` exactly. */
+export function computeWorkingSetQuantizedFrontier(totalMessages, hotTailCount, stride) {
+    if (stride === 0 || totalMessages <= hotTailCount)
+        return 0;
+    return Math.floor((totalMessages - hotTailCount) / stride) * stride;
+}
+/** Mirrors `evaluate_working_set_stride_fold` exactly (first match wins). */
+export function evaluateWorkingSetStrideFold(input) {
+    if (input.message_index >= input.total_messages)
+        return 'invalid_message_index';
+    if (input.is_protected_system_or_pinned ||
+        input.stride === 0 ||
+        input.total_messages <= input.hot_tail_count)
+        return 'retain_raw_message';
+    return input.message_index <
+        computeWorkingSetQuantizedFrontier(input.total_messages, input.hot_tail_count, input.stride)
+        ? 'fold_into_quantized_stub'
+        : 'retain_raw_message';
+}
+/** Load and strictly validate the reconstructible local L1 cache. */
+export async function loadWorkingSet(scopeInput) {
+    const active = wsScope(scopeInput);
+    if (active === null)
+        return wsBlankState(wsFallbackScope(scopeInput));
+    const clean = wsBlankState(active);
+    const loaded = wsReadParent(active);
+    if (loaded.status !== 'valid' ||
+        !Object.hasOwn(loaded.parent, 'working_set'))
+        return clean;
+    const raw = loaded.parent.working_set;
+    const exact = wsValidateState(raw, active);
+    if (exact !== null)
+        return exact;
+    const persisted = wsRecord(raw);
+    if (!persisted ||
+        persisted.project_id !== active.projectId ||
+        persisted.namespace !== active.namespace ||
+        persisted.session_id !== active.sessionId ||
+        !wsU32(persisted.epoch) ||
+        persisted.epoch < active.epoch)
+        return clean;
+    const adoptedScope = { ...active, epoch: persisted.epoch };
+    const adopted = wsValidateState(raw, adoptedScope);
+    if (adopted === null)
+        return clean;
+    adopted.tool_output_stubs = [];
+    adopted.tool_output_digests = [];
+    adopted.recent_event_ids = [];
+    adopted.frame_fingerprint = wsEmptyFingerprint();
+    adopted.last_injected_fingerprint = wsEmptyFingerprint();
+    return adopted;
+}
+/** Merge only working_set into a valid parent session file, best effort. */
+export async function persistWorkingSet(scopeInput, stateInput) {
+    const scope = wsScope(scopeInput);
+    if (scope === null)
+        return;
+    const state = wsValidateState(stateInput, scope);
+    if (state === null)
+        return;
+    const current = wsReadParent(scope);
+    if (current.status === 'invalid')
+        return;
+    const parent = current.parent ?? {};
+    parent.working_set = state;
+    writeJsonAtomically(current.path, parent);
+}
+// ──────────────────────────────────────────────────────────────────────
 // Bug 3: canonical tool classification
 // ──────────────────────────────────────────────────────────────────────
 export const READ_FILE_TOOLS = new Set([
@@ -1412,6 +2206,1657 @@ export function isFileTouchTool(name) {
 }
 export function isMutatingTool(name) {
     return MUTATING_TOOLS.has(name);
+}
+function wsStateScope(state) {
+    return {
+        projectRoot: '',
+        project_id: state.project_id,
+        projectId: state.project_id,
+        namespace: state.namespace,
+        sessionId: state.session_id,
+        epoch: state.epoch
+    };
+}
+function wsCloneState(state) {
+    const cloneNode = (node) => ({
+        ...node,
+        governing_ids: [...node.governing_ids]
+    });
+    const cloneStub = (stub) => ({
+        ...stub,
+        governing_ids: [...stub.governing_ids]
+    });
+    return {
+        ...state,
+        recent_event_ids: [...state.recent_event_ids],
+        roots: state.roots.map(cloneNode),
+        young_gen: state.young_gen.map(cloneNode),
+        evicted_stubs: state.evicted_stubs.map(cloneStub),
+        edges: (state.edges ?? []).map((edge) => ({ ...edge })),
+        tool_output_stubs: state.tool_output_stubs.map((stub) => ({
+            ...stub,
+            governing_ids: [...stub.governing_ids]
+        })),
+        tool_output_digests: state.tool_output_digests.map((digest) => ({
+            ...digest
+        }))
+    };
+}
+function wsMakeStub(node) {
+    const path = wsEscapePointerToken(node.path ?? '-');
+    let pointer;
+    if (node.kind === 'memory') {
+        pointer = `[GCStub ${wsEscapePointerToken(node.id)} | ${wsEscapePointerToken(node.memory_type ?? 'memory')} | governs:${path} | expand:neurostrata_get_memory]`;
+    }
+    else if (node.kind === 'file' || node.kind === 'symbol') {
+        const identity = node.kind === 'symbol' && node.symbol
+            ? node.id.startsWith('symbol:')
+                ? node.id
+                : `symbol:${node.path ?? '-'}#${node.symbol}`
+            : node.id;
+        pointer = `[GCStub ${wsEscapePointerToken(identity)} | sha256:${wsSha(node.id).slice(0, 12)} | expand:neurostrata_memories_for_file]`;
+    }
+    else {
+        pointer = `[GCStub ${wsEscapePointerToken(node.id)} | ${wsEscapePointerToken(node.kind)} | governs:${path} | expand:${wsEscapePointerToken(node.expand_tool)}]`;
+    }
+    const byte_cost = Buffer.byteLength(`${pointer}\n`);
+    if (byte_cost > WORKING_SET_STUB_MAX_BYTES)
+        return null;
+    return {
+        id: node.id,
+        kind: node.kind,
+        pointer,
+        byte_cost,
+        last_touched_turn: node.last_touched_turn,
+        governing_ids: [...node.governing_ids],
+        ...(node.path ? { path: node.path } : {}),
+        ...(node.memory_type ? { memory_type: node.memory_type } : {}),
+        ...(node.kind === 'file' || node.kind === 'symbol'
+            ? { sha256: wsSha(node.id).slice(0, 12) }
+            : {})
+    };
+}
+function wsDemote(state, node, collection) {
+    const stub = wsMakeStub(node);
+    if (stub === null || stub.byte_cost >= node.byte_cost)
+        return false;
+    if (collection === 'roots')
+        state.roots = state.roots.filter((entry) => entry.id !== node.id);
+    else
+        state.young_gen = state.young_gen.filter((entry) => entry.id !== node.id);
+    const prior = state.evicted_stubs.find((entry) => entry.id === node.id);
+    if (prior && prior.kind !== node.kind)
+        return false;
+    state.evicted_stubs = [
+        ...state.evicted_stubs.filter((entry) => entry.id !== node.id),
+        stub
+    ];
+    return true;
+}
+function wsCapToolPairs(state) {
+    const byId = new Map(state.tool_output_digests.map((digest) => [digest.id, digest]));
+    const pairs = [...byId.values()]
+        .sort((a, b) => a.last_touched_turn - b.last_touched_turn || a.id.localeCompare(b.id))
+        .slice(-WORKING_SET_MAX_TOOL_DIGESTS);
+    const ids = new Set(pairs.map((digest) => digest.id));
+    state.tool_output_digests = pairs.sort(wsToolCompare);
+    state.tool_output_stubs = state.tool_output_stubs
+        .filter((stub) => ids.has(stub.id))
+        .sort((a, b) => wsToolCompare(a, b));
+}
+function wsSortAndCap(state) {
+    state.roots.sort((a, b) => wsNodeCompare(a, b, wsNodeTier(a, 'roots'), wsNodeTier(b, 'roots')));
+    const immortal = state.roots.filter((node) => IMMORTAL_KINDS.has(node.kind));
+    const pinned = state.roots.filter((node) => !IMMORTAL_KINDS.has(node.kind));
+    while (pinned.length > WORKING_SET_MAX_ROOTS) {
+        const node = pinned.pop();
+        if (!wsDemote(state, node, 'roots'))
+            state.roots = state.roots.filter((entry) => entry.id !== node.id);
+    }
+    state.roots = [...immortal, ...pinned].sort((a, b) => wsNodeCompare(a, b, wsNodeTier(a, 'roots'), wsNodeTier(b, 'roots')));
+    state.young_gen.sort((a, b) => wsNodeCompare(a, b, 'YoungGen', 'YoungGen'));
+    while (state.young_gen.length > WORKING_SET_MAX_YOUNG_GEN) {
+        const node = state.young_gen.pop();
+        if (!wsDemote(state, node, 'young_gen'))
+            state.young_gen = state.young_gen.filter((entry) => entry.id !== node.id);
+    }
+    state.evicted_stubs.sort(wsStubCompare);
+    if (state.evicted_stubs.length > WORKING_SET_MAX_STUBS)
+        state.evicted_stubs = state.evicted_stubs.slice(0, WORKING_SET_MAX_STUBS);
+    wsCapToolPairs(state);
+    state.recent_event_ids = state.recent_event_ids.slice(0, WORKING_SET_MAX_EVENT_IDS);
+}
+function wsChargedBytes(state) {
+    const fullBytes = [...state.roots, ...state.young_gen].reduce((sum, node) => sum + node.byte_cost, 0);
+    const stubBytes = state.evicted_stubs.reduce((sum, stub) => sum + stub.byte_cost, 0) +
+        state.tool_output_stubs.reduce((sum, stub) => sum + stub.byte_cost, 0);
+    return fullBytes + Math.min(Math.floor(state.max_frame_bytes / 2), stubBytes);
+}
+/** Apply TTL and deterministic pressure demotion without changing immortal nodes. */
+export function sweepWorkingSet(stateInput) {
+    const state = wsCloneState(stateInput);
+    for (const node of [...state.young_gen]) {
+        const age = Math.max(0, state.turn_seq - node.last_touched_turn);
+        const current = node.last_touched_turn === state.turn_seq;
+        const action = evaluateWorkingSetEviction({
+            tier: 'YoungGen',
+            turn_age: age,
+            max_idle_turns: state.max_idle_turns,
+            node_bytes: node.byte_cost,
+            projected_frame_bytes: wsChargedBytes(state),
+            max_frame_bytes: state.max_frame_bytes,
+            is_re_referenced: current
+        });
+        if (action === 'demote_to_stub')
+            wsDemote(state, node, 'young_gen');
+    }
+    let charged = wsChargedBytes(state);
+    if (charged > state.max_frame_bytes) {
+        const candidates = [
+            ...state.young_gen.map((node) => ({ node, tier: 'YoungGen' })),
+            ...state.roots
+                .filter((node) => !IMMORTAL_KINDS.has(node.kind) &&
+                node.last_touched_turn !== state.turn_seq)
+                .map((node) => ({ node, tier: 'PinnedRoot' }))
+        ].sort((a, b) => wsTierRank(a.tier) - wsTierRank(b.tier) ||
+            Math.max(0, state.turn_seq - b.node.last_touched_turn) -
+                Math.max(0, state.turn_seq - a.node.last_touched_turn) ||
+            b.node.byte_cost - a.node.byte_cost ||
+            (a.node.id < b.node.id ? -1 : a.node.id > b.node.id ? 1 : 0));
+        for (const candidate of candidates) {
+            if (charged <= state.max_frame_bytes)
+                break;
+            const age = Math.max(0, state.turn_seq - candidate.node.last_touched_turn);
+            const action = evaluateWorkingSetEviction({
+                tier: candidate.tier,
+                turn_age: age,
+                max_idle_turns: state.max_idle_turns,
+                node_bytes: candidate.node.byte_cost,
+                projected_frame_bytes: charged,
+                max_frame_bytes: state.max_frame_bytes,
+                is_re_referenced: candidate.node.last_touched_turn === state.turn_seq
+            });
+            if (action !== 'demote_to_stub')
+                continue;
+            const collection = candidate.tier === 'YoungGen' ? 'young_gen' : 'roots';
+            const before = charged;
+            if (wsDemote(state, candidate.node, collection))
+                charged = wsChargedBytes(state);
+            if (charged >= before)
+                continue;
+        }
+    }
+    const liveIds = new Set([...state.roots, ...state.young_gen, ...state.evicted_stubs].map((node) => node.id));
+    state.edges = state.edges
+        .filter((edge) => liveIds.has(edge.from) && liveIds.has(edge.to))
+        .sort(wsEdgeCompare)
+        .slice(0, WORKING_SET_MAX_EDGES);
+    wsSortAndCap(state);
+    return state;
+}
+/** Record typed graph edges with deterministic dedup, ordering, and cap. */
+export function recordWorkingSetEdges(stateInput, edges) {
+    const state = wsCloneState(stateInput);
+    const seen = new Set();
+    const collected = [];
+    for (const edge of [...edges, ...(state.edges ?? [])]) {
+        if (!wsCanonicalNodeId(edge.from) || !wsCanonicalNodeId(edge.to))
+            continue;
+        if (!EDGE_KINDS.has(edge.kind))
+            continue;
+        const weight = wsU32(edge.weight_bps) ? edge.weight_bps : 10000;
+        if (weight > 10000)
+            continue;
+        const last = wsU32(edge.last_touched_turn)
+            ? edge.last_touched_turn
+            : state.turn_seq;
+        if (!wsU32(last))
+            continue;
+        const candidate = {
+            from: edge.from,
+            to: edge.to,
+            kind: edge.kind,
+            weight_bps: weight,
+            last_touched_turn: last
+        };
+        const key = wsEdgeKey(candidate);
+        if (seen.has(key))
+            continue;
+        seen.add(key);
+        collected.push(candidate);
+    }
+    state.edges = collected.sort(wsEdgeCompare).slice(0, WORKING_SET_MAX_EDGES);
+    return state;
+}
+function wsTouchForId(state, id) {
+    const node = state.roots.find((entry) => entry.id === id) ??
+        state.young_gen.find((entry) => entry.id === id);
+    if (node) {
+        if (node.kind === 'file' || node.kind === 'symbol')
+            return {
+                id,
+                kind: node.kind,
+                ...(node.path ? { path: node.path } : {}),
+                ...(node.symbol ? { symbol: node.symbol } : {})
+            };
+        if (node.kind === 'recall_text')
+            return null;
+        if (node.kind === 'memory')
+            return { id, kind: 'memory', memoryId: id.slice(4) };
+        return { id, kind: node.kind };
+    }
+    const stub = state.evicted_stubs.find((entry) => entry.id === id);
+    if (stub) {
+        if (stub.kind === 'recall_text')
+            return null;
+        if (stub.kind === 'file' || stub.kind === 'symbol')
+            return {
+                id,
+                kind: stub.kind,
+                ...(stub.path ? { path: stub.path } : {})
+            };
+        if (stub.kind === 'memory')
+            return { id, kind: 'memory', memoryId: id.slice(4) };
+        return { id, kind: stub.kind };
+    }
+    if (id.startsWith('file:'))
+        return { id, kind: 'file', path: id.slice(5) };
+    if (id.startsWith('symbol:')) {
+        const body = id.slice(7);
+        const hash = body.indexOf('#');
+        return hash === -1
+            ? { id, kind: 'symbol', path: body }
+            : {
+                id,
+                kind: 'symbol',
+                path: body.slice(0, hash),
+                symbol: body.slice(hash + 1)
+            };
+    }
+    if (id.startsWith('mem:'))
+        return { id, kind: 'memory', memoryId: id.slice(4) };
+    return null;
+}
+function wsIncidentNeighbors(state, id, kinds) {
+    const neighbors = new Set();
+    for (const edge of state.edges) {
+        if (!kinds.has(edge.kind))
+            continue;
+        if (edge.from === id)
+            neighbors.add(edge.to);
+        else if (edge.to === id)
+            neighbors.add(edge.from);
+    }
+    return [...neighbors];
+}
+/**
+ * Deterministic 1-hop normative and 2-hop structural-to-normative spreading.
+ * A visited key terminates cycles on both hops; the 128-edge cap bounds work.
+ */
+function wsSpreadActivationIds(state, touchedIds) {
+    const candidates = touchedIds.filter((id) => {
+        const kind = wsTouchForId(state, id)?.kind;
+        return kind === 'file' || kind === 'symbol' || kind === 'memory';
+    });
+    const activated = new Set();
+    const touches = new Map();
+    const add = (id) => {
+        if (id === '' || activated.has(id))
+            return;
+        activated.add(id);
+        const touch = wsTouchForId(state, id);
+        if (touch)
+            touches.set(id, touch);
+    };
+    for (const u of candidates)
+        for (const neighbor of wsIncidentNeighbors(state, u, ONE_HOP_EDGE_KINDS))
+            add(neighbor);
+    const visited = new Set();
+    for (const u of candidates) {
+        const kind = wsTouchForId(state, u)?.kind;
+        if (kind !== 'file' && kind !== 'symbol')
+            continue;
+        for (const w of wsIncidentNeighbors(state, u, STRUCTURAL_EDGE_KINDS)) {
+            if (w === u)
+                continue;
+            for (const m of wsIncidentNeighbors(state, w, new Set(['GOVERNS']))) {
+                const key = `${u}\u0000${w}\u0000${m}`;
+                if (visited.has(key))
+                    continue;
+                visited.add(key);
+                add(m);
+            }
+        }
+    }
+    return { activatedIds: [...activated].sort(), touches: [...touches.values()] };
+}
+function wsNormalizeTouchPath(raw, projectRoot) {
+    const spelling = raw.replace(/\\/g, '/');
+    if (CONTROL_CHARS.test(spelling))
+        return null;
+    const absolute = resolve(projectRoot, spelling);
+    const rel = relative(projectRoot, absolute).replace(/\\/g, '/');
+    return wsRelPath(rel) ? rel : null;
+}
+function wsTouchNode(touch, turn, projectRoot) {
+    if (!wsText(touch.id, 1024) || !NODE_KINDS.has(touch.kind))
+        return null;
+    const path = touch.path === undefined
+        ? undefined
+        : wsNormalizeTouchPath(touch.path, projectRoot);
+    if (touch.path !== undefined && path === null)
+        return null;
+    if (touch.symbol !== undefined && !wsText(touch.symbol, 256, true))
+        return null;
+    const label = wsTruncateUtf8(touch.symbol ?? path ?? touch.memoryId ?? touch.id, 128);
+    const summary = wsTruncateUtf8(touch.symbol
+        ? `${path ?? '-'}#${touch.symbol}`
+        : (path ?? touch.memoryId ?? touch.id), WORKING_SET_SUMMARY_MAX_BYTES);
+    const collection = IMMORTAL_KINDS.has(touch.kind) || PINNED_KINDS.has(touch.kind)
+        ? 'roots'
+        : 'young_gen';
+    const expand_tool = touch.kind === 'task_header' || touch.kind === 'golden_rule'
+        ? 'neurostrata_get_snapshot'
+        : touch.kind === 'file' || touch.kind === 'symbol'
+            ? 'neurostrata_memories_for_file'
+            : touch.kind === 'conceptual_bridge' || touch.kind === 'ast_summary'
+                ? 'neurostrata_related'
+                : 'neurostrata_get_memory';
+    const node = {
+        id: touch.id,
+        kind: touch.kind,
+        label,
+        summary,
+        governing_ids: [],
+        byte_cost: 1,
+        last_touched_turn: turn,
+        expand_tool,
+        ...(path ? { path } : {}),
+        ...(touch.symbol ? { symbol: touch.symbol } : {})
+    };
+    node.byte_cost = Buffer.byteLength(wsCanonicalNodeLine(node, collection));
+    return node;
+}
+function wsExpansionInput(stub, namespace) {
+    if (stub.kind === 'file' || stub.kind === 'symbol')
+        return { namespace, path: stub.path ?? '-' };
+    if (stub.kind === 'memory')
+        return {
+            namespace,
+            id: stub.id.startsWith('mem:') ? stub.id.slice(4) : stub.id
+        };
+    return { namespace, id: stub.id };
+}
+function wsExpansionTool(stub) {
+    if (stub.kind === 'file' || stub.kind === 'symbol')
+        return 'neurostrata_memories_for_file';
+    if (stub.kind === 'memory')
+        return 'neurostrata_get_memory';
+    return 'neurostrata_related';
+}
+/** Advance one deterministic turn, mark touches, and retry fitting page faults. */
+export async function advanceWorkingSetTurn(stateInput, namespace, sessionId, projectRoot, touched, expand) {
+    const scope = wsScope({
+        projectRoot,
+        projectId: wsProjectId(projectRoot) ?? '',
+        namespace,
+        sessionId,
+        epoch: stateInput.epoch
+    });
+    if (scope === null ||
+        stateInput.project_id !== scope.projectId ||
+        stateInput.namespace !== namespace ||
+        stateInput.session_id !== sessionId)
+        return wsCloneState(stateInput);
+    const state = wsCloneState(stateInput);
+    if (state.turn_seq === U32_MAX) {
+        state.turn_seq = 0;
+        state.active_turn_id = null;
+        state.recent_event_ids = [];
+        state.frame_fingerprint = wsEmptyFingerprint();
+        state.last_injected_fingerprint = wsEmptyFingerprint();
+        workingSetInjectionFingerprints.delete(workingSetInjectionKey(scope));
+        for (const node of [...state.roots, ...state.young_gen])
+            node.last_touched_turn = 0;
+        for (const item of [
+            ...state.evicted_stubs,
+            ...state.edges,
+            ...state.tool_output_stubs,
+            ...state.tool_output_digests
+        ])
+            item.last_touched_turn = 0;
+    }
+    else {
+        state.turn_seq++;
+    }
+    const turn = state.turn_seq;
+    const touches = new Map();
+    for (const touch of touched)
+        if (wsText(touch.id, 1024))
+            touches.set(touch.id, touch);
+    const activation = wsSpreadActivationIds(state, [...touches.keys()]);
+    for (const touch of activation.touches)
+        if (!touches.has(touch.id))
+            touches.set(touch.id, touch);
+    for (const touch of touches.values()) {
+        const full = state.roots.find((node) => node.id === touch.id) ??
+            state.young_gen.find((node) => node.id === touch.id);
+        if (full) {
+            if (full.kind !== touch.kind)
+                continue;
+            full.last_touched_turn = turn;
+            continue;
+        }
+        const prior = state.evicted_stubs.find((stub) => stub.id === touch.id);
+        if (prior) {
+            if (prior.kind !== touch.kind)
+                continue;
+            prior.last_touched_turn = turn;
+            try {
+                const expanded = await expand({
+                    id: prior.id,
+                    expandTool: wsExpansionTool(prior),
+                    input: wsExpansionInput(prior, namespace)
+                });
+                const candidate = expanded === null
+                    ? null
+                    : wsValidateNode(expanded, YOUNG_KINDS.has(expanded.kind) ? 'young_gen' : 'roots');
+                if (candidate === null ||
+                    candidate.id !== prior.id ||
+                    candidate.kind !== prior.kind)
+                    continue;
+                const projectedFull = wsChargedBytes(state) - prior.byte_cost + candidate.byte_cost;
+                if (evaluateWorkingSetEviction({
+                    tier: 'EvictedStub',
+                    turn_age: 0,
+                    max_idle_turns: state.max_idle_turns,
+                    node_bytes: candidate.byte_cost,
+                    projected_frame_bytes: projectedFull,
+                    max_frame_bytes: state.max_frame_bytes,
+                    is_re_referenced: true
+                }) !== 'promote_to_young_gen')
+                    continue;
+                candidate.last_touched_turn = turn;
+                state.evicted_stubs = state.evicted_stubs.filter((stub) => stub.id !== prior.id);
+                if (IMMORTAL_KINDS.has(candidate.kind) ||
+                    PINNED_KINDS.has(candidate.kind))
+                    state.roots.push(candidate);
+                else
+                    state.young_gen.push(candidate);
+            }
+            catch {
+                // Expansion is advisory; a denied or unavailable page fault stays resident.
+            }
+            continue;
+        }
+        const node = wsTouchNode(touch, turn, projectRoot);
+        if (node === null)
+            continue;
+        if (IMMORTAL_KINDS.has(node.kind) || PINNED_KINDS.has(node.kind))
+            state.roots.push(node);
+        else
+            state.young_gen.push(node);
+    }
+    return sweepWorkingSet(state);
+}
+function wsEligibleTool(toolName) {
+    const normalized = wsNormalizeToolName(toolName);
+    if (normalized === null)
+        return null;
+    const approved = new Set([...READ_FILE_TOOLS].map((tool) => tool.toLowerCase()));
+    return approved.has(normalized) ? normalized : null;
+}
+function wsToolPath(filePath, toolName, projectRoot) {
+    if (toolName === 'grep' || toolName === 'glob' || toolName === 'mcp_glob')
+        return '-';
+    if (filePath === null || filePath.trim() === '')
+        return null;
+    return projectRoot === undefined
+        ? wsRelPath(filePath.trim())
+            ? filePath.trim()
+            : null
+        : wsNormalizeTouchPath(filePath, projectRoot);
+}
+function wsGoverningIds(value) {
+    if (!Array.isArray(value) || value.length > 8)
+        return null;
+    const ids = value.map((id) => (typeof id === 'string' ? id.trim() : ''));
+    if (ids.some((id) => !wsText(id, 256)))
+        return null;
+    return [...new Set(ids)].sort();
+}
+function wsToolPointer(path, sha256, bytes, governingIds) {
+    const base = `[NeuroStrata GC Stub -> path=${wsEscapePointerToken(path)} | sha256=${sha256} | bytes=${bytes}`;
+    const withIds = `${base} | governing_ids=[${governingIds.map(wsEscapePointerToken).join(',')}]]`;
+    const pointer = Buffer.byteLength(withIds) <= TOOL_GC_STUB_MAX_BYTES
+        ? withIds
+        : `${base} | governing_ids=[]]`;
+    return Buffer.byteLength(pointer) <= TOOL_GC_STUB_MAX_BYTES ? pointer : null;
+}
+function wsOutputSummary(raw) {
+    const normalized = wsNormalizedText(raw);
+    const bytes = Buffer.byteLength(normalized);
+    if (bytes <= 1024)
+        return { head: normalized, tail: '' };
+    return {
+        head: wsTruncateUtf8(normalized, TOOL_GC_HEAD_BYTES),
+        tail: wsTailUtf8(normalized, TOOL_GC_TAIL_BYTES)
+    };
+}
+function wsDehydratedText(raw, pointer) {
+    const { head, tail } = wsOutputSummary(raw);
+    return [
+        '[NeuroStrata GC Summary — head]',
+        head,
+        '[NeuroStrata GC Summary — tail]',
+        tail,
+        pointer,
+        ''
+    ].join('\n');
+}
+/** Pure size-based dehydration; duplicate history belongs to the scoped helper. */
+export function dehydrateToolOutput(rawText, toolName, filePath, governingIds) {
+    const tool = wsEligibleTool(toolName);
+    const path = tool === null ? null : wsToolPath(filePath, tool);
+    const ids = wsGoverningIds(governingIds);
+    if (tool === null ||
+        path === null ||
+        ids === null ||
+        typeof rawText !== 'string')
+        return { text: rawText, dehydrated: false };
+    const normalized = wsNormalizedText(rawText);
+    const bytes = Buffer.byteLength(normalized);
+    if (bytes <= TOOL_GC_INLINE_THRESHOLD_BYTES)
+        return { text: rawText, dehydrated: false };
+    const sha256 = wsSha(normalized).slice(0, 12);
+    const pointer = wsToolPointer(path, sha256, bytes, ids);
+    if (pointer === null)
+        return { text: rawText, dehydrated: false };
+    return { text: wsDehydratedText(rawText, pointer), dehydrated: true };
+}
+function wsRecordToolOutput(state, scope, rawText, toolName, filePath, governingIds) {
+    const tool = wsEligibleTool(toolName);
+    const path = tool === null ? null : wsToolPath(filePath, tool, scope.projectRoot);
+    const ids = wsGoverningIds(governingIds);
+    if (tool === null ||
+        path === null ||
+        ids === null ||
+        typeof rawText !== 'string')
+        return { text: rawText, dehydrated: false };
+    const normalized = wsNormalizedText(rawText);
+    const bytes = Buffer.byteLength(normalized);
+    const sha256 = wsSha(normalized).slice(0, 12);
+    const pointer = wsToolPointer(path, sha256, bytes, ids);
+    if (pointer === null)
+        return { text: rawText, dehydrated: false };
+    const id = `tool:${wsSha(`${scope.projectId}\n${scope.namespace}\n${scope.sessionId}\n${scope.epoch}\n${tool}\n${path}\n${sha256}`)}`;
+    const repeated = state.tool_output_digests.some((digest) => digest.path_key === path && digest.epoch === scope.epoch);
+    const prior = state.tool_output_digests.find((digest) => digest.id === id);
+    const digest = {
+        id,
+        project_id: scope.projectId,
+        path_key: path,
+        tool_name: tool,
+        sha256,
+        bytes,
+        epoch: scope.epoch,
+        last_touched_turn: state.turn_seq,
+        read_count: prior ? Math.min(U32_MAX, prior.read_count + 1) : 1
+    };
+    const stub = {
+        id,
+        tool_name: tool,
+        rel_path: path,
+        sha256,
+        bytes,
+        epoch: scope.epoch,
+        last_touched_turn: state.turn_seq,
+        governing_ids: ids,
+        pointer,
+        byte_cost: Buffer.byteLength(`${pointer}\n`)
+    };
+    state.tool_output_digests = [
+        ...state.tool_output_digests.filter((entry) => entry.id !== id),
+        digest
+    ];
+    state.tool_output_stubs = [
+        ...state.tool_output_stubs.filter((entry) => entry.id !== id),
+        stub
+    ];
+    wsCapToolPairs(state);
+    const dehydrated = repeated || bytes > TOOL_GC_INLINE_THRESHOLD_BYTES;
+    return {
+        text: dehydrated ? wsDehydratedText(rawText, pointer) : rawText,
+        dehydrated,
+        digest
+    };
+}
+/** Scoped duplicate-aware read dehydration with digest/stub pair persistence. */
+export async function dehydrateRepeatedReadOutput(scopeInput, rawText, toolName, filePath, governingIds) {
+    const scope = wsScope(scopeInput);
+    if (scope === null)
+        return { text: rawText, dehydrated: false };
+    const state = await loadWorkingSet(scope);
+    const result = wsRecordToolOutput(state, scope, rawText, toolName, filePath, governingIds);
+    const swept = sweepWorkingSet(state);
+    await persistWorkingSet(scope, swept);
+    return result;
+}
+function wsRecallStub(state, block, memoryIds) {
+    const normalized = wsNormalizedText(block);
+    const ids = wsGoverningIds(memoryIds);
+    if (ids === null)
+        return { text: block, changed: false };
+    const resident = new Set([...state.roots, ...state.young_gen, ...state.evicted_stubs].map((node) => node.id));
+    const allResident = ids.length > 0 && ids.every((id) => resident.has(`mem:${id}`));
+    const duplicateText = ids.length === 0 &&
+        state.evicted_stubs.some((stub) => stub.id === `text:${wsSha(normalized)}`);
+    if (Buffer.byteLength(normalized) <= TOOL_GC_INLINE_THRESHOLD_BYTES &&
+        !allResident &&
+        !duplicateText)
+        return { text: block, changed: false };
+    const pointers = [];
+    const additions = [];
+    if (ids.length > 0) {
+        for (const id of ids) {
+            const node = {
+                id: `mem:${id}`,
+                kind: 'memory',
+                label: id,
+                summary: '',
+                governing_ids: [id],
+                byte_cost: WORKING_SET_STUB_MAX_BYTES + 1,
+                last_touched_turn: state.turn_seq,
+                expand_tool: 'neurostrata_get_memory',
+                memory_type: 'memory'
+            };
+            const stub = wsMakeStub(node);
+            if (stub === null)
+                continue;
+            pointers.push(stub.pointer);
+            additions.push(stub);
+        }
+    }
+    else {
+        const sha = wsSha(normalized);
+        const pointer = `[GCStub text:${sha} | bytes=${Buffer.byteLength(normalized)} | expand:none]`;
+        const stub = {
+            id: `text:${sha}`,
+            kind: 'recall_text',
+            pointer,
+            byte_cost: Buffer.byteLength(`${pointer}\n`),
+            last_touched_turn: state.turn_seq,
+            governing_ids: []
+        };
+        pointers.push(pointer);
+        additions.push(stub);
+    }
+    if (pointers.length === 0)
+        return { text: block, changed: false };
+    for (const stub of additions)
+        state.evicted_stubs = [
+            ...state.evicted_stubs.filter((entry) => entry.id !== stub.id),
+            stub
+        ];
+    const { head, tail } = wsOutputSummary(block);
+    return {
+        text: [
+            '[NeuroStrata GC Summary — head]',
+            head,
+            '[NeuroStrata GC Summary — tail]',
+            tail,
+            ...pointers,
+            ''
+        ].join('\n'),
+        changed: true
+    };
+}
+function wsHeaderValue(value, maxBytes) {
+    const text = typeof value === 'string' ? value : '';
+    const clean = text.replace(CONTROL_CHARS, '');
+    if (Buffer.byteLength(clean) > maxBytes)
+        return wsSha(clean);
+    return wsEscapeFrameToken(clean || '-');
+}
+function wsRenderNodeLine(node, collection, summary = node.summary) {
+    const prefix = collection === 'roots' ? 'Root' : 'Young';
+    return `[${prefix}] ${wsEscapeFrameToken(node.id)} | ${wsEscapeFrameToken(summary)} | expand:${wsEscapeFrameToken(node.expand_tool)}\n`;
+}
+function wsFitNodeLine(node, collection, available) {
+    const full = wsRenderNodeLine(node, collection);
+    if (Buffer.byteLength(full) <= available)
+        return { line: full, node };
+    if (IMMORTAL_KINDS.has(node.kind))
+        return null;
+    const fixed = Buffer.byteLength(wsRenderNodeLine(node, collection, ''));
+    if (fixed >= available)
+        return null;
+    const summary = wsTruncateUtf8(node.summary, available - fixed);
+    if (summary === '')
+        return null;
+    const shortened = { ...node, summary };
+    shortened.byte_cost = Buffer.byteLength(wsCanonicalNodeLine(shortened, collection));
+    return { line: wsRenderNodeLine(shortened, collection), node: shortened };
+}
+function wsGoldenProjection(node, summary) {
+    return `  - ${wsEscapeFrameToken(node.id)} | ${wsEscapeFrameToken(summary)}\n`;
+}
+/** Render one bounded, marker-safe frame; state nodes are never demoted here. */
+export function renderWorkingSetFrame(state, activeSession) {
+    const close = `${WORKING_SET_FRAME_CLOSE}\n`;
+    const header = `${WORKING_SET_FRAME_OPEN} Namespace: ${wsHeaderValue(activeSession.namespace ?? state.namespace, 128)} | Active Task: ${wsHeaderValue(activeSession.task_id ?? activeSession.active_task_id, 128)} [${wsHeaderValue(activeSession.status, 32)}] | Epoch: ${state.epoch} | Turn: ${state.turn_seq}\n`;
+    const goldenHeading = '[NeuroStrata Golden Rules — ALWAYS ENFORCED]\n';
+    const workingHeading = '[NeuroStrata Working Set]\n';
+    const roots = [...state.roots].sort((a, b) => wsNodeCompare(a, b, wsNodeTier(a, 'roots'), wsNodeTier(b, 'roots')));
+    const young = [...state.young_gen].sort((a, b) => wsNodeCompare(a, b, 'YoungGen', 'YoungGen'));
+    const golden = roots.filter((node) => node.kind === 'golden_rule');
+    if (golden.length === 0 && Array.isArray(activeSession.golden_rules)) {
+        for (const value of activeSession.golden_rules) {
+            if (typeof value !== 'string' || value.trim() === '')
+                continue;
+            const summary = wsNormalizedText(value).trim();
+            const id = `rule:${wsSha(summary)}`;
+            const node = {
+                id,
+                kind: 'golden_rule',
+                label: id,
+                summary: wsTruncateUtf8(summary, WORKING_SET_SUMMARY_MAX_BYTES),
+                governing_ids: [],
+                byte_cost: 1,
+                last_touched_turn: state.turn_seq,
+                expand_tool: 'neurostrata_get_snapshot'
+            };
+            node.byte_cost = Buffer.byteLength(wsCanonicalNodeLine(node, 'roots'));
+            golden.push(node);
+        }
+    }
+    const immortal = [
+        ...golden.map((node) => ({
+            node,
+            line: wsGoldenProjection(node, node.summary)
+        })),
+        ...roots
+            .filter((node) => node.kind === 'task_header')
+            .map((node) => ({ node, line: wsRenderNodeLine(node, 'roots') }))
+    ];
+    const baseBytes = Buffer.byteLength(header + goldenHeading + workingHeading + close);
+    const goldenLines = [];
+    const workingLines = [];
+    if (immortal.every(({ line }) => Buffer.byteLength(line) <= WORKING_SET_MAX_FRAME_BYTES) &&
+        baseBytes +
+            immortal.reduce((sum, entry) => sum + Buffer.byteLength(entry.line), 0) <=
+            WORKING_SET_MAX_FRAME_BYTES) {
+        goldenLines.push(...immortal
+            .filter((entry) => entry.node.kind === 'golden_rule')
+            .map((entry) => entry.line));
+        workingLines.push(...immortal
+            .filter((entry) => entry.node.kind === 'task_header')
+            .map((entry) => entry.line));
+        const candidates = [
+            ...roots
+                .filter((node) => !IMMORTAL_KINDS.has(node.kind))
+                .map((node) => ({
+                line: wsRenderNodeLine(node, 'roots'),
+                node,
+                collection: 'roots'
+            })),
+            ...young.map((node) => ({
+                line: wsRenderNodeLine(node, 'young_gen'),
+                node,
+                collection: 'young_gen'
+            })),
+            ...[...state.evicted_stubs]
+                .sort(wsStubCompare)
+                .map((stub) => ({ line: `[Stub] ${stub.pointer}\n` })),
+            ...[...state.tool_output_stubs]
+                .sort(wsToolCompare)
+                .map((stub) => ({ line: `[ToolStub] ${stub.pointer}\n` }))
+        ];
+        let used = baseBytes +
+            goldenLines.reduce((sum, line) => sum + Buffer.byteLength(line), 0) +
+            workingLines.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
+        for (const candidate of candidates) {
+            const available = WORKING_SET_MAX_FRAME_BYTES - used - Buffer.byteLength(close);
+            if (candidate.node && candidate.collection) {
+                const fitted = wsFitNodeLine(candidate.node, candidate.collection, available);
+                if (fitted) {
+                    workingLines.push(fitted.line);
+                    used += Buffer.byteLength(fitted.line);
+                }
+            }
+            else if (Buffer.byteLength(candidate.line) <= available) {
+                workingLines.push(candidate.line);
+                used += Buffer.byteLength(candidate.line);
+            }
+        }
+    }
+    else if (golden.length > 0) {
+        const availableBytes = WORKING_SET_MAX_FRAME_BYTES - baseBytes;
+        const taskHeaders = immortal.filter((entry) => entry.node.kind === 'task_header');
+        const minimumGolden = golden.map((node) => wsGoldenProjection(node, ''));
+        const taskHeaderBytes = taskHeaders.reduce((sum, entry) => sum + Buffer.byteLength(entry.line), 0);
+        const minimumBytes = taskHeaderBytes +
+            minimumGolden.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
+        let shortenedGolden = null;
+        if (taskHeaders.every(({ line }) => Buffer.byteLength(line) <= WORKING_SET_MAX_FRAME_BYTES) &&
+            minimumGolden.every((line) => Buffer.byteLength(line) <= WORKING_SET_MAX_FRAME_BYTES) &&
+            minimumBytes <= availableBytes) {
+            let perRuleBudget = Math.floor((availableBytes - minimumBytes) / golden.length);
+            while (perRuleBudget >= 0) {
+                const candidate = golden.map((node) => wsGoldenProjection(node, wsTruncateUtf8(node.summary, perRuleBudget)));
+                const candidateBytes = taskHeaderBytes +
+                    candidate.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
+                if (candidate.every((line) => Buffer.byteLength(line) <= WORKING_SET_MAX_FRAME_BYTES) &&
+                    candidateBytes <= availableBytes) {
+                    shortenedGolden = candidate;
+                    break;
+                }
+                perRuleBudget--;
+            }
+        }
+        if (shortenedGolden !== null) {
+            goldenLines.push(...shortenedGolden);
+            workingLines.push(...taskHeaders.map((entry) => entry.line));
+        }
+        else {
+            const idsHash = wsSha(golden
+                .map((node) => node.id)
+                .sort()
+                .join('\n'));
+            goldenLines.push(`[NeuroStrata Golden Rule Manifest] count=${golden.length} | ids_sha256=${idsHash} | expand:neurostrata_get_snapshot\n`);
+        }
+    }
+    let text = header +
+        goldenHeading +
+        goldenLines.join('') +
+        workingHeading +
+        workingLines.join('') +
+        close;
+    if (Buffer.byteLength(text) > WORKING_SET_MAX_FRAME_BYTES) {
+        text = `${WORKING_SET_FRAME_OPEN}\n${goldenHeading}${workingHeading}${close}`;
+    }
+    return { text, usedBytes: Buffer.byteLength(text), fingerprint: wsSha(text) };
+}
+function wsGoldenRules(state, activeSession) {
+    const fromState = state.roots
+        .filter((node) => node.kind === 'golden_rule')
+        .map((node) => ({ id: node.id, summary: node.summary }));
+    if (fromState.length > 0 || !Array.isArray(activeSession.golden_rules))
+        return fromState;
+    const rules = [];
+    for (const value of activeSession.golden_rules) {
+        if (typeof value !== 'string' || value.trim() === '')
+            continue;
+        const summary = wsNormalizedText(value).trim();
+        rules.push({ id: `rule:${wsSha(summary)}`, summary });
+    }
+    return rules;
+}
+/** Tier 0: immortal Golden Rules only; zero volatile counters or task fields. */
+export function renderWorkingSetTier0Prefix(state, activeSession) {
+    const parent = wsRecord(activeSession) ?? {};
+    const open = `${WORKING_SET_TIER0_OPEN}\n`;
+    const close = `${WORKING_SET_TIER0_CLOSE}\n`;
+    const rules = wsGoldenRules(state, parent);
+    const projections = rules.map((rule) => wsGoldenProjection({ id: rule.id }, wsTruncateUtf8(rule.summary, WORKING_SET_SUMMARY_MAX_BYTES)));
+    let body = projections.join('');
+    if (Buffer.byteLength(open + body + close) > WORKING_SET_TIER0_MAX_BYTES) {
+        const idsHash = wsSha(rules
+            .map((rule) => rule.id)
+            .sort()
+            .join('\n'));
+        body = `[NeuroStrata Golden Rule Manifest] count=${rules.length} | ids_sha256=${idsHash} | expand:neurostrata_get_snapshot\n`;
+        while (Buffer.byteLength(open + body + close) > WORKING_SET_TIER0_MAX_BYTES &&
+            body.length > 0)
+            body = wsTruncateUtf8(body, Buffer.byteLength(body) - 1);
+    }
+    const text = open + body + close;
+    return { text, usedBytes: Buffer.byteLength(text), fingerprint: wsSha(text) };
+}
+/** Tier 2: volatile task/roots/young/edges/stubs; never invalidates tier 0. */
+export function renderWorkingSetDeltaFrame(state, activeSession, options) {
+    const parent = wsRecord(activeSession) ?? {};
+    const close = `${WORKING_SET_FRAME_CLOSE}\n`;
+    const header = `${WORKING_SET_FRAME_OPEN} Namespace: ${wsHeaderValue(parent.namespace ?? state.namespace, 128)} | Active Task: ${wsHeaderValue(parent.task_id ?? parent.active_task_id, 128)} [${wsHeaderValue(parent.status, 32)}] | Epoch: ${state.epoch} | Turn: ${state.turn_seq}\n`;
+    const tier0Bytes = renderWorkingSetTier0Prefix(state, activeSession).usedBytes;
+    const maxAllowed = Math.max(0, WORKING_SET_MAX_FRAME_BYTES - tier0Bytes);
+    const budget = Math.min(wsU32(options?.maxBytes) ? options.maxBytes : maxAllowed, maxAllowed);
+    const goldenHeading = '[NeuroStrata Golden Rules — ALWAYS ENFORCED]\n';
+    const workingHeading = '[NeuroStrata Working Set]\n';
+    const goldenLines = options?.omitImmortalRules
+        ? []
+        : wsGoldenRules(state, parent).map((rule) => wsGoldenProjection({ id: rule.id }, wsTruncateUtf8(rule.summary, WORKING_SET_SUMMARY_MAX_BYTES)));
+    const baseBytes = Buffer.byteLength(header + workingHeading + close) +
+        (options?.omitImmortalRules ? 0 : Buffer.byteLength(goldenHeading)) +
+        goldenLines.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
+    const candidates = [
+        ...state.roots
+            .filter((node) => !IMMORTAL_KINDS.has(node.kind))
+            .map((node) => wsRenderNodeLine(node, 'roots')),
+        ...state.young_gen.map((node) => wsRenderNodeLine(node, 'young_gen')),
+        ...[...state.edges]
+            .sort(wsEdgeCompare)
+            .map((edge) => `[Edge] ${wsEscapeFrameToken(edge.from)} -${edge.kind}-> ${wsEscapeFrameToken(edge.to)}\n`),
+        ...[...state.evicted_stubs]
+            .sort(wsStubCompare)
+            .map((stub) => `[Stub] ${stub.pointer}\n`),
+        ...[...state.tool_output_stubs]
+            .sort((a, b) => wsToolCompare(a, b))
+            .map((stub) => `[ToolStub] ${stub.pointer}\n`)
+    ];
+    let used = baseBytes;
+    const workingLines = [];
+    for (const line of candidates) {
+        if (used + Buffer.byteLength(line) + Buffer.byteLength(close) > budget)
+            continue;
+        workingLines.push(line);
+        used += Buffer.byteLength(line);
+    }
+    let text = header +
+        (options?.omitImmortalRules ? '' : goldenHeading) +
+        goldenLines.join('') +
+        workingHeading +
+        workingLines.join('') +
+        close;
+    if (Buffer.byteLength(text) > budget) {
+        text = `${header}${workingHeading}${close}`;
+        if (Buffer.byteLength(text) > budget)
+            text = wsTruncateUtf8(text, budget);
+    }
+    return { text, usedBytes: Buffer.byteLength(text), fingerprint: wsSha(text) };
+}
+/** Deterministic compaction checkpoint; replaces a lossy host LLM summary. */
+export function renderWorkingSetCompactionSummary(state, activeSession) {
+    const parent = wsRecord(activeSession) ?? {};
+    const rules = wsGoldenRules(state, parent);
+    const lines = [
+        '[NeuroStrata Compaction Summary]',
+        ...rules.map((rule) => `[Rules] ${rule.id} ${rule.summary}`),
+        `[Task] ${asString(parent.task_id ?? parent.active_task_id) ?? '-'} ${asString(parent.status) ?? '-'}`,
+        `[Roots] ${state.roots
+            .filter((node) => !IMMORTAL_KINDS.has(node.kind))
+            .map((node) => node.id)
+            .join(',')}`,
+        `[Edges] ${state.edges
+            .map((edge) => `${edge.from} -${edge.kind}-> ${edge.to}`)
+            .join(',')}`,
+        `[Restore] stubs=${state.evicted_stubs.length + state.tool_output_stubs.length} heap=LadybugDB`,
+        WORKING_SET_FRAME_CLOSE
+    ];
+    return wsTruncateUtf8(lines.join('\n'), WORKING_SET_SUMMARY_MAX_BYTES);
+}
+function wsPartText(value) {
+    if (typeof value === 'string')
+        return value;
+    const rec = wsRecord(value);
+    return typeof rec?.text === 'string' ? rec.text : '';
+}
+function wsMessageText(value) {
+    const direct = wsPartText(value);
+    if (direct !== '')
+        return direct;
+    const rec = wsRecord(value);
+    const content = rec?.content;
+    if (typeof content === 'string')
+        return content;
+    if (Array.isArray(content))
+        return content.map((part) => wsPartText(part)).join('\n');
+    return '';
+}
+function wsMessageIsProtected(value) {
+    const rec = wsRecord(value);
+    if (rec?.role === 'system' || rec?.role === 'developer')
+        return true;
+    const text = wsMessageText(value);
+    return (text.includes(WORKING_SET_TIER0_OPEN) ||
+        text.includes(WORKING_SET_TIER0_CLOSE) ||
+        text.includes(WORKING_SET_FRAME_OPEN));
+}
+/** Tier 1: fold pre-frontier history into stride-stable deterministic stubs. */
+export function projectWorkingSetMessages(messages, state, options) {
+    if (!Array.isArray(messages))
+        return { messages, quantizedFrontier: 0, foldedCount: 0 };
+    const hotTailCount = wsU32(options?.hotTailCount)
+        ? options.hotTailCount
+        : WORKING_SET_HOT_TAIL_MESSAGES;
+    const stride = wsU32(options?.stride)
+        ? options.stride
+        : WORKING_SET_STRIDE_MESSAGES;
+    const frontier = computeWorkingSetQuantizedFrontier(messages.length, hotTailCount, stride);
+    if (frontier === 0)
+        return { messages: [...messages], quantizedFrontier: 0, foldedCount: 0 };
+    const roots = state.roots.length;
+    const stubs = state.evicted_stubs.length + state.tool_output_stubs.length;
+    const projected = [];
+    for (let start = 0; start < frontier; start += stride) {
+        const end = Math.min(start + stride, frontier);
+        let folded = 0;
+        const retained = [];
+        for (let index = start; index < end; index++) {
+            if (wsMessageIsProtected(messages[index]))
+                retained.push(messages[index]);
+            else
+                folded++;
+        }
+        if (folded > 0)
+            projected.push(`${WORKING_SET_STRIDE_MARKER}${start}..${end}] folded_messages=${folded} | heap=LadybugDB | working_set_roots=${roots} | stubs=${stubs}`);
+        projected.push(...retained);
+    }
+    return {
+        messages: [...projected, ...messages.slice(frontier)],
+        quantizedFrontier: frontier,
+        foldedCount: frontier
+    };
+}
+/** Replace or append the immutable-prefix system part in place. */
+export function upsertWorkingSetSystemPrefix(system, tier0Text) {
+    if (!Array.isArray(system))
+        return false;
+    let index = -1;
+    for (let i = 0; i < system.length; i++) {
+        if (wsPartText(system[i]).includes(WORKING_SET_TIER0_OPEN)) {
+            index = i;
+            break;
+        }
+    }
+    if (index !== -1) {
+        if (wsPartText(system[index]) === tier0Text)
+            return false;
+        const record = wsRecord(system[index]);
+        system[index] =
+            record && typeof record.text === 'string'
+                ? { ...record, text: tier0Text }
+                : { type: 'text', text: tier0Text };
+        return true;
+    }
+    system.push({ type: 'text', text: tier0Text });
+    return true;
+}
+/** Attach or update the volatile delta on the tail without touching prefix. */
+export function upsertWorkingSetMessageTailDelta(messages, deltaText) {
+    if (!Array.isArray(messages))
+        return false;
+    let index = -1;
+    for (let i = 0; i < messages.length; i++) {
+        if (wsMessageText(messages[i]).includes(WORKING_SET_FRAME_OPEN)) {
+            index = i;
+            break;
+        }
+    }
+    if (index !== -1) {
+        if (wsMessageText(messages[index]) === deltaText)
+            return false;
+        const record = wsRecord(messages[index]);
+        messages[index] =
+            record && typeof record.content === 'string'
+                ? { ...record, content: deltaText }
+                : typeof messages[index] === 'string'
+                    ? deltaText
+                    : { role: 'user', content: deltaText };
+        return true;
+    }
+    messages.push({ role: 'user', content: deltaText });
+    return true;
+}
+function wsRegex(pattern) {
+    return new RegExp(pattern.source, 'g');
+}
+function wsReplaceCompleteFrames(text, replacement) {
+    const openTag = '[NeuroStrata Active Context]';
+    const closeTag = '[NeuroStrata End Active Context]';
+    const result = [];
+    let i = 0;
+    let found = false;
+    while (i < text.length) {
+        const openIdx = text.indexOf(openTag, i);
+        if (openIdx === -1) {
+            result.push(text.slice(i));
+            break;
+        }
+        const afterOpen = text.slice(openIdx + openTag.length);
+        const closeIdx = afterOpen.indexOf(closeTag);
+        if (closeIdx === -1) {
+            result.push(text.slice(i));
+            break;
+        }
+        const frameEnd = openIdx + openTag.length + closeIdx + closeTag.length;
+        const afterClose = text.slice(frameEnd);
+        const newlineMatch = afterClose.match(/^\r?\n/);
+        const newlineLen = newlineMatch ? newlineMatch[0].length : 0;
+        result.push(text.slice(i, openIdx));
+        result.push(replacement);
+        found = true;
+        i = frameEnd + newlineLen;
+    }
+    return { text: result.join(''), found };
+}
+function wsStripFrames(text) {
+    const replaced = wsReplaceCompleteFrames(text, '');
+    if (!replaced.found)
+        return { text: replaced.text, found: false };
+    const legacyOpen = '[NeuroStrata ';
+    let i = 0;
+    const legacyLines = [];
+    while (i < replaced.text.length) {
+        const openIdx = replaced.text.indexOf(legacyOpen, i);
+        if (openIdx === -1) {
+            legacyLines.push(replaced.text.slice(i));
+            break;
+        }
+        const afterOpen = replaced.text.slice(openIdx + legacyOpen.length);
+        const closeBrIdx = afterOpen.indexOf(']');
+        if (closeBrIdx === -1) {
+            legacyLines.push(replaced.text.slice(i));
+            break;
+        }
+        const header = replaced.text.slice(openIdx, openIdx + legacyOpen.length + closeBrIdx + 1);
+        const afterCloseBr = replaced.text.slice(openIdx + legacyOpen.length + closeBrIdx + 1);
+        if (afterCloseBr.startsWith('\n') || afterCloseBr === '') {
+            legacyLines.push(header);
+            i = openIdx + legacyOpen.length + closeBrIdx + 1;
+            if (replaced.text[i] === '\n')
+                i++;
+            continue;
+        }
+        const nextOpen = replaced.text.indexOf(legacyOpen, openIdx + 1);
+        const nextEnd = replaced.text.indexOf('\n', openIdx);
+        const endIdx = nextOpen === -1
+            ? nextEnd === -1
+                ? replaced.text.length
+                : nextEnd
+            : Math.min(nextOpen, nextEnd);
+        legacyLines.push('');
+        i = endIdx;
+    }
+    const found = replaced.found || legacyLines.some((l) => l !== '');
+    return { text: legacyLines.join('\n'), found };
+}
+/** Upsert one mutable frame using context[], content, then additionalContext. */
+export function upsertWorkingSetFrame(sink, frame) {
+    const rec = wsRecord(sink);
+    if (!rec)
+        return false;
+    if (Array.isArray(rec.context)) {
+        const kept = [];
+        let replaced = false;
+        let changed = false;
+        for (const value of rec.context) {
+            if (typeof value !== 'string') {
+                kept.push(value);
+                continue;
+            }
+            if (value === frame) {
+                if (replaced) {
+                    changed = true;
+                    continue;
+                }
+                replaced = true;
+                kept.push(frame);
+                continue;
+            }
+            const stripped = wsStripFrames(value);
+            if (!stripped.found) {
+                kept.push(value);
+                continue;
+            }
+            changed = true;
+            if (!replaced) {
+                kept.push(stripped.text
+                    ? `${stripped.text}${stripped.text.endsWith('\n') ? '' : '\n'}${frame}`
+                    : frame);
+                replaced = true;
+            }
+        }
+        if (!replaced) {
+            kept.unshift(frame);
+            changed = true;
+        }
+        if (changed)
+            rec.context = kept;
+        return changed;
+    }
+    for (const key of ['content', 'additionalContext']) {
+        if (typeof rec[key] !== 'string')
+            continue;
+        const old = rec[key];
+        if (old === frame)
+            return false;
+        const complete = wsReplaceCompleteFrames(old, frame);
+        if (complete.found) {
+            rec[key] = complete.text;
+        }
+        else {
+            const openIdx = old.indexOf(WORKING_SET_FRAME_OPEN);
+            if (openIdx !== -1) {
+                rec[key] = old.slice(0, openIdx) + frame;
+            }
+            else {
+                rec[key] = `${frame}${old}`;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+function wsActiveParent(scope) {
+    const loaded = wsReadParent(scope);
+    return loaded.status === 'valid' && loaded.parent ? loaded.parent : {};
+}
+function wsRememberEvent(state, eventId) {
+    if (!eventId || !wsText(eventId, 256))
+        return true;
+    if (state.recent_event_ids.includes(eventId))
+        return false;
+    state.recent_event_ids = [eventId, ...state.recent_event_ids].slice(0, WORKING_SET_MAX_EVENT_IDS);
+    return true;
+}
+function wsSeedActive(state, parent) {
+    const taskId = asString(parent.task_id ?? parent.active_task_id);
+    if (!taskId || !wsText(taskId, 1024))
+        return;
+    const id = `task:${taskId}`;
+    if (state.roots.some((node) => node.id === id))
+        return;
+    const node = wsTouchNode({ id, kind: 'task_header' }, state.turn_seq, '');
+    if (node)
+        state.roots.push(node);
+}
+export function wsSyncBridges(state, parent) {
+    if (!Array.isArray(parent.conceptual_bridges))
+        return;
+    for (const value of parent.conceptual_bridges.slice(0, 4)) {
+        const bridge = wsRecord(value);
+        const target = typeof value === 'string'
+            ? value.trim()
+            : asString(bridge?.target_id ?? bridge?.id);
+        if (!target)
+            continue;
+        const id = target.startsWith('bridge:') ? target : `bridge:${target}`;
+        if (state.young_gen.some((node) => node.id === id) ||
+            state.evicted_stubs.some((stub) => stub.id === id) ||
+            state.roots.some((node) => node.id === id))
+            continue;
+        const summary = typeof value === 'string'
+            ? value.trim()
+            : (asString(bridge?.target_summary ?? bridge?.content) ?? target);
+        const node = wsTouchNode({ id, kind: 'conceptual_bridge', memoryId: target }, state.turn_seq, '');
+        if (!node)
+            continue;
+        node.summary = wsTruncateUtf8(summary, WORKING_SET_SUMMARY_MAX_BYTES);
+        node.byte_cost = Buffer.byteLength(wsCanonicalNodeLine(node, 'young_gen'));
+        state.young_gen.push(node);
+    }
+}
+async function wsExpansion(request) {
+    if (!mcpClient)
+        return null;
+    try {
+        const text = await mcpClient.callTool(request.expandTool, request.input);
+        const body = wsRecord(JSON.parse(text));
+        const value = wsRecord(body?.memory) ?? wsRecord(body?.node) ?? body;
+        if (!value)
+            return null;
+        const id = asString(value.id);
+        const kind = asString(value.kind);
+        if (!id || !kind || !NODE_KINDS.has(kind) || kind === 'recall_text')
+            return null;
+        const summary = asString(value.summary) ?? asString(value.content) ?? id;
+        const collection = IMMORTAL_KINDS.has(kind) || PINNED_KINDS.has(kind) ? 'roots' : 'young_gen';
+        const expand_tool = kind === 'file' || kind === 'symbol'
+            ? 'neurostrata_memories_for_file'
+            : kind === 'task_header' || kind === 'golden_rule'
+                ? 'neurostrata_get_snapshot'
+                : kind === 'ast_summary' || kind === 'conceptual_bridge'
+                    ? 'neurostrata_related'
+                    : 'neurostrata_get_memory';
+        const node = {
+            id,
+            kind,
+            label: wsTruncateUtf8(asString(value.label) ?? id, 128),
+            summary: wsTruncateUtf8(summary, WORKING_SET_SUMMARY_MAX_BYTES),
+            governing_ids: wsGoverningIds(Array.isArray(value.governing_ids)
+                ? value.governing_ids
+                : []) ?? [],
+            byte_cost: 1,
+            last_touched_turn: 0,
+            expand_tool,
+            ...(typeof value.path === 'string' ? { path: value.path } : {}),
+            ...(typeof value.symbol === 'string' ? { symbol: value.symbol } : {}),
+            ...(typeof value.memory_type === 'string'
+                ? { memory_type: value.memory_type }
+                : {})
+        };
+        node.byte_cost = Buffer.byteLength(wsCanonicalNodeLine(node, collection));
+        return wsValidateNode(node, collection);
+    }
+    catch {
+        return null;
+    }
+}
+function wsFinalize(state, scope, parent) {
+    wsSeedActive(state, parent);
+    wsSyncBridges(state, parent);
+    const swept = sweepWorkingSet(state);
+    const rendered = renderWorkingSetFrame(swept, parent);
+    swept.used_frame_bytes = rendered.usedBytes;
+    swept.frame_fingerprint = rendered.fingerprint;
+    return { state: swept, frame: rendered.text, ...rendered };
+}
+/** Observe or advance one native turn, deduplicating native event/turn identity. */
+export async function runWorkingSetTurnBoundary(scopeInput, eventId, turnId) {
+    const scope = wsScope(scopeInput);
+    if (!scope)
+        return { frame: '', fingerprint: wsEmptyFingerprint(), changed: false };
+    const before = await loadWorkingSet(scope);
+    const parent = wsActiveParent(scope);
+    const state = before;
+    if (!wsRememberEvent(state, eventId)) {
+        const rendered = renderWorkingSetFrame(state, parent);
+        return {
+            frame: rendered.text,
+            fingerprint: rendered.fingerprint,
+            changed: false,
+            duplicateEvent: true
+        };
+    }
+    const hasTurnId = !!turnId && wsText(turnId, 128);
+    const newTurn = hasTurnId && turnId !== state.active_turn_id;
+    if (hasTurnId ? !newTurn : !eventId) {
+        if (eventId) {
+            await persistWorkingSet(scope, state);
+        }
+        const rendered = renderWorkingSetFrame(state, parent);
+        return {
+            frame: rendered.text,
+            fingerprint: rendered.fingerprint,
+            changed: false
+        };
+    }
+    const advanced = await advanceWorkingSetTurn(state, scope.namespace, scope.sessionId, scope.projectRoot, [], wsExpansion);
+    advanced.active_turn_id = newTurn ? turnId : advanced.active_turn_id;
+    const final = wsFinalize(advanced, scope, parent);
+    const changed = final.fingerprint !== before.frame_fingerprint ||
+        final.state.turn_seq !== before.turn_seq;
+    if (before.last_injected_fingerprint !== wsEmptyFingerprint() &&
+        renderWorkingSetFrame({ ...final.state, turn_seq: before.turn_seq }, parent)
+            .fingerprint === before.last_injected_fingerprint) {
+        final.state.last_injected_fingerprint = final.fingerprint;
+        rememberWorkingSetInjection(scope, final.fingerprint);
+    }
+    await persistWorkingSet(scope, final.state);
+    return { frame: final.frame, fingerprint: final.fingerprint, changed };
+}
+async function runWorkingSetContextCycleInternal(scopeInput, markInjected) {
+    const scope = wsScope(scopeInput);
+    if (!scope)
+        return { frame: '', fingerprint: wsEmptyFingerprint(), changed: false };
+    const state = await loadWorkingSet(scope);
+    const parent = wsActiveParent(scope);
+    const final = wsFinalize(state, scope, parent);
+    const remembered = workingSetInjectionFingerprints.get(workingSetInjectionKey(scope));
+    const changed = final.fingerprint !== state.frame_fingerprint ||
+        (final.fingerprint !== state.last_injected_fingerprint &&
+            final.fingerprint !== remembered);
+    if (!changed)
+        return {
+            frame: final.frame,
+            fingerprint: final.fingerprint,
+            changed: false
+        };
+    if (markInjected)
+        final.state.last_injected_fingerprint = final.fingerprint;
+    await persistWorkingSet(scope, final.state);
+    return { frame: final.frame, fingerprint: final.fingerprint, changed: true };
+}
+/** Render current state without advancing turns or marking touches. */
+export async function runWorkingSetContextCycle(scopeInput, eventId) {
+    return runWorkingSetContextCycleInternal(scopeInput, true);
+}
+/** Linear, bounded extraction of explicit prompt anchors (no model parsing). */
+function wsPromptAnchors(promptText, projectRoot) {
+    if (typeof promptText !== 'string' || promptText.length > 16384)
+        return [];
+    const tokens = [];
+    let token = '';
+    for (const char of promptText) {
+        const split = /\s/u.test(char) ||
+            char === '`' ||
+            char === '"' ||
+            char === "'" ||
+            char === '(' ||
+            char === ')' ||
+            char === ',' ||
+            char === ';';
+        if (split) {
+            if (token !== '') {
+                tokens.push(token);
+                token = '';
+            }
+        }
+        else
+            token += char;
+        if (tokens.length >= 64)
+            break;
+    }
+    if (token !== '' && tokens.length < 64)
+        tokens.push(token);
+    const touches = new Map();
+    const add = (touch) => {
+        if (touch && wsText(touch.id, 1024) && !touches.has(touch.id))
+            touches.set(touch.id, touch);
+    };
+    for (const raw of tokens) {
+        let value = raw;
+        while (value.length > 0 && '.,[]{}<>'.includes(value[0]))
+            value = value.slice(1);
+        while (value.length > 0 && '.,[]{}<>:'.includes(value[value.length - 1]))
+            value = value.slice(0, -1);
+        if (value.startsWith('mem:')) {
+            add({ id: value, kind: 'memory', memoryId: value.slice(4) });
+            continue;
+        }
+        if (value.startsWith('path:') || value.startsWith('file:')) {
+            const rel = wsNormalizeTouchPath(value.slice(value.indexOf(':') + 1), projectRoot);
+            if (rel !== null)
+                add({ id: `file:${rel}`, kind: 'file', path: rel });
+            continue;
+        }
+        if (value.startsWith('symbol:')) {
+            const body = value.slice(7);
+            const hash = body.indexOf('#');
+            if (hash > 0) {
+                const rel = wsNormalizeTouchPath(body.slice(0, hash), projectRoot);
+                const symbol = body.slice(hash + 1);
+                if (rel !== null && wsText(symbol, 256, true))
+                    add({
+                        id: `symbol:${rel}#${symbol}`,
+                        kind: 'symbol',
+                        path: rel,
+                        symbol
+                    });
+            }
+            continue;
+        }
+        if (value.includes('/') && !value.includes('://')) {
+            const rel = wsNormalizeTouchPath(value, projectRoot);
+            if (rel !== null)
+                add({ id: `file:${rel}`, kind: 'file', path: rel });
+        }
+    }
+    return [...touches.values()].slice(0, 32);
+}
+/** Pre-turn activation: mark anchors, spread edges, and persist L1 state. */
+export async function runWorkingSetPromptCycle(input) {
+    const empty = {
+        frame: '',
+        fingerprint: wsEmptyFingerprint(),
+        changed: false,
+        activatedIds: []
+    };
+    const scope = wsScope(input.scope);
+    if (!scope)
+        return empty;
+    const before = await loadWorkingSet(scope);
+    if (input.eventId && !wsRememberEvent(before, input.eventId))
+        return empty;
+    const newTurn = !!input.turnId &&
+        wsText(input.turnId, 128) &&
+        input.turnId !== before.active_turn_id;
+    if (input.turnId && !newTurn)
+        return empty;
+    const touches = wsPromptAnchors(input.promptText, scope.projectRoot);
+    const activation = wsSpreadActivationIds(before, touches.map((touch) => touch.id));
+    const state = await advanceWorkingSetTurn(before, scope.namespace, scope.sessionId, scope.projectRoot, touches, wsExpansion);
+    if (newTurn)
+        state.active_turn_id = input.turnId;
+    const parent = wsActiveParent(scope);
+    const final = wsFinalize(state, scope, parent);
+    const changed = final.fingerprint !== before.frame_fingerprint ||
+        final.state.turn_seq !== before.turn_seq;
+    await persistWorkingSet(scope, final.state);
+    return {
+        frame: final.frame,
+        fingerprint: final.fingerprint,
+        changed,
+        activatedIds: activation.activatedIds
+    };
+}
+/** Mark deterministic file/symbol/memory touches without advancing the turn. */
+export async function markWorkingSetTouches(scopeInput, touched, eventId) {
+    const scope = wsScope(scopeInput);
+    if (!scope)
+        return;
+    const state = await loadWorkingSet(scope);
+    if (!wsRememberEvent(state, eventId))
+        return;
+    const parent = wsActiveParent(scope);
+    for (const touch of touched) {
+        const normPath = touch.path === undefined
+            ? null
+            : wsNormalizeTouchPath(touch.path, scope.projectRoot);
+        const existing = state.roots.find((node) => node.id === touch.id ||
+            (normPath !== null &&
+                node.kind === touch.kind &&
+                node.path === normPath &&
+                node.symbol === touch.symbol)) ??
+            state.young_gen.find((node) => node.id === touch.id ||
+                (normPath !== null &&
+                    node.kind === touch.kind &&
+                    node.path === normPath &&
+                    node.symbol === touch.symbol));
+        if (existing) {
+            if (existing.kind !== touch.kind)
+                continue;
+            existing.last_touched_turn = state.turn_seq;
+            continue;
+        }
+        const stubIdx = state.evicted_stubs.findIndex((stub) => stub.id === touch.id ||
+            (normPath !== null &&
+                stub.kind === touch.kind &&
+                stub.path === normPath));
+        if (stubIdx !== -1) {
+            const prior = state.evicted_stubs[stubIdx];
+            if (prior.kind !== touch.kind)
+                continue;
+            const node = wsTouchNode(touch, state.turn_seq, scope.projectRoot);
+            if (!node)
+                continue;
+            node.governing_ids = [...prior.governing_ids];
+            if (prior.memory_type)
+                node.memory_type = prior.memory_type;
+            const collection = IMMORTAL_KINDS.has(node.kind) || PINNED_KINDS.has(node.kind)
+                ? 'roots'
+                : 'young_gen';
+            node.byte_cost = Buffer.byteLength(wsCanonicalNodeLine(node, collection));
+            state.evicted_stubs.splice(stubIdx, 1);
+            if (collection === 'roots')
+                state.roots.push(node);
+            else
+                state.young_gen.push(node);
+            continue;
+        }
+        const node = wsTouchNode(touch, state.turn_seq, scope.projectRoot);
+        if (!node)
+            continue;
+        if (IMMORTAL_KINDS.has(node.kind) || PINNED_KINDS.has(node.kind))
+            state.roots.push(node);
+        else
+            state.young_gen.push(node);
+    }
+    const final = wsFinalize(state, scope, parent);
+    await persistWorkingSet(scope, final.state);
+}
+/** Shared tool cycle: observe touches, dehydrate text, and return one frame. */
+export async function runWorkingSetToolCycle(input) {
+    const scope = wsScope(input.scope);
+    if (!scope)
+        return {
+            replacementText: null,
+            frame: '',
+            fingerprint: wsEmptyFingerprint(),
+            dehydrated: false,
+            changed: false
+        };
+    const current = await loadWorkingSet(scope);
+    const beforeFingerprint = current.frame_fingerprint;
+    const beforeInjected = current.last_injected_fingerprint;
+    if (input.eventId &&
+        wsText(input.eventId, 256) &&
+        current.recent_event_ids.includes(input.eventId)) {
+        const rendered = renderWorkingSetFrame(current, wsActiveParent(scope));
+        return {
+            replacementText: null,
+            frame: rendered.text,
+            fingerprint: rendered.fingerprint,
+            dehydrated: false,
+            changed: false
+        };
+    }
+    const args = asRecord(input.toolInput) ?? {};
+    const filePath = asString(args.file_path ?? args.filePath ?? args.path ?? args.notebook_path);
+    const touched = [];
+    if (filePath && isFileTouchTool(input.toolName))
+        touched.push({
+            id: `file:${filePath.replace(/\\/g, '/')}`,
+            kind: 'file',
+            path: filePath
+        });
+    if (input.advanceTurn) {
+        const boundary = await runWorkingSetTurnBoundary(scope, input.eventId, input.turnId);
+        if (!boundary.duplicateEvent) {
+            await markWorkingSetTouches(scope, touched);
+        }
+    }
+    else {
+        await markWorkingSetTouches(scope, touched, input.eventId);
+    }
+    let replacementText = null;
+    let dehydrated = false;
+    if (!input.isError &&
+        input.outputIsText &&
+        typeof input.rawText === 'string') {
+        const result = await dehydrateRepeatedReadOutput(scope, input.rawText, input.toolName, filePath ?? null, []);
+        dehydrated = result.dehydrated;
+        if (dehydrated)
+            replacementText = result.text;
+    }
+    const state = await loadWorkingSet(scope);
+    const parent = wsActiveParent(scope);
+    const final = wsFinalize(state, scope, parent);
+    const changed = final.fingerprint !== beforeFingerprint &&
+        final.fingerprint !== beforeInjected;
+    if (changed && !input.advanceTurn) {
+        final.state.last_injected_fingerprint = final.fingerprint;
+        rememberWorkingSetInjection(scope, final.fingerprint);
+    }
+    await persistWorkingSet(scope, final.state);
+    return {
+        replacementText,
+        frame: final.frame,
+        fingerprint: final.fingerprint,
+        dehydrated,
+        changed
+    };
 }
 // Tool output (stdout / file contents) is not user or assistant speech: intent
 // markers such as TODO:/defer found there are code or log noise, not a task
@@ -2591,7 +5036,158 @@ export function extractDaemonMemoryAdvisory(errorChannelText, nowMs = Date.now()
         "Raise NEUROSTRATA_BUFFER_POOL_BYTES (or the daemon's configured store.buffer_pool_bytes) and restart the daemon; repeated advisories are suppressed for 10 minutes."
     ].join(' ');
 }
+const WS_RECALL_EXCLUDED_HEADINGS = new Set([
+    'AST',
+    'Governing',
+    'File',
+    'Active',
+    'End',
+    'Plugin',
+    'Working',
+    'GC',
+    'Tool'
+]);
+function isAsciiRecallKind(kind) {
+    if (!kind || WS_RECALL_EXCLUDED_HEADINGS.has(kind))
+        return false;
+    const first = kind.charCodeAt(0);
+    const firstAlpha = (first >= 65 && first <= 90) || (first >= 97 && first <= 122);
+    if (!firstAlpha)
+        return false;
+    for (let i = 1; i < kind.length; i++) {
+        const code = kind.charCodeAt(i);
+        const ok = (code >= 65 && code <= 90) ||
+            (code >= 97 && code <= 122) ||
+            (code >= 48 && code <= 57) ||
+            code === 95 ||
+            code === 45;
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+function splitFirstToken(input) {
+    const trimmed = input.trim();
+    for (let i = 0; i < trimmed.length; i++) {
+        const ch = trimmed.charCodeAt(i);
+        if (ch === 32 || ch === 9 || ch === 10 || ch === 13) {
+            return [trimmed.slice(0, i), trimmed.slice(i + 1).trim()];
+        }
+    }
+    return [trimmed, ''];
+}
+export function wsRecallMemoryIds(block) {
+    const ids = [];
+    const prefix = '[NeuroStrata';
+    let cursor = 0;
+    while (cursor < block.length) {
+        const open = block.indexOf(prefix, cursor);
+        if (open < 0)
+            break;
+        const afterPrefix = open + prefix.length;
+        const nextChar = block.charCodeAt(afterPrefix);
+        if (nextChar !== 32 && nextChar !== 9) {
+            cursor = afterPrefix;
+            continue;
+        }
+        const close = block.indexOf(']', afterPrefix + 1);
+        if (close < 0)
+            break;
+        const newline = block.indexOf('\n', afterPrefix + 1);
+        if (newline >= 0 && newline < close) {
+            cursor = newline + 1;
+            continue;
+        }
+        const inner = block.slice(afterPrefix + 1, close).trim();
+        cursor = close + 1;
+        if (!inner || inner.includes('—') || inner.includes('|'))
+            continue;
+        const [firstToken, afterFirst] = splitFirstToken(inner);
+        let rest = '';
+        if (firstToken === 'Golden') {
+            const [secondToken, afterSecond] = splitFirstToken(afterFirst);
+            if (secondToken !== 'Rule')
+                continue;
+            rest = afterSecond;
+        }
+        else if (isAsciiRecallKind(firstToken)) {
+            rest = afterFirst;
+        }
+        else {
+            continue;
+        }
+        const validFromIdx = rest.indexOf('(valid_from');
+        if (validFromIdx >= 0) {
+            rest = rest.slice(0, validFromIdx).trim();
+        }
+        if (!rest || rest === 'Manifest')
+            continue;
+        const [memId] = splitFirstToken(rest);
+        if (memId && !memId.startsWith('('))
+            ids.push(memId);
+    }
+    return [...new Set(ids)].slice(0, 8);
+}
+async function dehydrateWorkingSetRecall(scope, block) {
+    if (!block)
+        return block;
+    try {
+        const state = await loadWorkingSet(scope);
+        const result = wsRecallStub(state, block, wsRecallMemoryIds(block));
+        if (!result.changed)
+            return block;
+        await persistWorkingSet(scope, sweepWorkingSet(state));
+        return result.text;
+    }
+    catch {
+        return block;
+    }
+}
+function workingSetHookScope(config, sessionId) {
+    if (!sessionId)
+        return null;
+    const projectRoot = effectiveProjectRoot(config);
+    const projectId = wsProjectId(projectRoot);
+    if (projectId === null)
+        return null;
+    const scope = {
+        projectRoot,
+        projectId,
+        namespace: config.namespace,
+        sessionId,
+        epoch: currentSessionEpoch(sessionId)
+    };
+    return wsScope(scope);
+}
 const sessionEpochs = new Map();
+const workingSetInjectionFingerprints = new Map();
+function workingSetInjectionKey(scope) {
+    return JSON.stringify([
+        scope.projectId,
+        scope.namespace,
+        scope.sessionId,
+        scope.epoch
+    ]);
+}
+function rememberWorkingSetInjection(scope, fingerprint) {
+    const key = workingSetInjectionKey(scope);
+    workingSetInjectionFingerprints.delete(key);
+    workingSetInjectionFingerprints.set(key, fingerprint);
+    while (workingSetInjectionFingerprints.size > WORKING_SET_MAX_INJECTION_KEYS) {
+        const oldest = workingSetInjectionFingerprints.keys().next().value;
+        if (oldest === undefined)
+            break;
+        workingSetInjectionFingerprints.delete(oldest);
+    }
+}
+function forgetWorkingSetInjections(sessionId) {
+    const sid = sessionId ?? '__default__';
+    for (const key of workingSetInjectionFingerprints.keys()) {
+        const scope = JSON.parse(key);
+        if (scope[2] === sid)
+            workingSetInjectionFingerprints.delete(key);
+    }
+}
 function sessionEpochState(sessionId) {
     const sid = sessionId ?? '__default__';
     let state = sessionEpochs.get(sid);
@@ -2611,15 +5207,18 @@ export function incrementSessionEpoch(sessionId) {
     st.epoch += 1;
     st.seenFiles.clear();
     st.baselineInjectedEpoch = -1;
+    forgetWorkingSetInjections(sessionId);
 }
 export function sessionSeenFiles(sessionId) {
     return sessionEpochState(sessionId).seenFiles;
 }
 export function resetSessionEpoch(sessionId) {
     sessionEpochs.delete(sessionId ?? '__default__');
+    forgetWorkingSetInjections(sessionId);
 }
 export function resetAllSessionEpochs() {
     sessionEpochs.clear();
+    workingSetInjectionFingerprints.clear();
 }
 /**
  * `session.hook("context")` handler. Reads `.NeuroStrata/active_session.json`
@@ -2629,67 +5228,72 @@ export function resetAllSessionEpochs() {
  */
 export async function sessionContextHandler(event, config) {
     const sessionId = asString(event?.sessionID ?? event?.session_id);
-    const st = sessionEpochState(sessionId);
-    const projectRoot = effectiveProjectRoot(config);
-    let active = null;
-    const sessionPath = join(projectRoot, '.NeuroStrata', 'active_session.json');
-    if (existsSync(sessionPath)) {
-        try {
-            active = asRecord(JSON.parse(readFileSync(sessionPath, 'utf8')));
-        }
-        catch {
-            active = null;
-        }
-    }
-    const taskId = asString(active?.task_id);
-    const goldenRules = Array.isArray(active?.golden_rules)
+    const scope = workingSetHookScope(config, sessionId);
+    if (!scope || !event || typeof event !== 'object')
+        return;
+    const loaded = wsReadParent(scope);
+    if (loaded.status !== 'valid' || !loaded.parent)
+        return;
+    const active = loaded.parent;
+    const taskId = asString(active.task_id ?? active.active_task_id);
+    const goldenRules = Array.isArray(active.golden_rules)
         ? active.golden_rules.filter((g) => typeof g === 'string' && g.trim() !== '')
         : [];
-    if (!active || (!taskId && goldenRules.length === 0))
-        return; // nothing to baseline-inject
-    if (st.baselineInjectedEpoch !== st.epoch) {
-        st.baselineInjectedEpoch = st.epoch;
-        const ns = asString(active.namespace) ?? config.namespace;
-        const parts = [];
-        if (taskId) {
-            const status = asString(active.status) ?? '';
-            parts.push(`[NeuroStrata Active Context] Namespace: ${markdownCodeSpanValue(ns)} | Active Task: ${markdownCodeSpanValue(taskId)} [${markdownCodeSpanValue(status)}]`);
-        }
-        if (goldenRules.length > 0) {
-            parts.push(`[NeuroStrata Golden Rules — ALWAYS ENFORCED]\n${goldenRules.map((g) => `  - ${g}`).join('\n')}`);
-        }
-        let extra = '';
-        const injection = asString(active.subagent_prompt_injection);
-        if (injection)
-            extra += `\n${injection.trim()}`;
-        const bridges = active.conceptual_bridges;
-        if (bridges !== undefined && bridges !== null && Array.isArray(bridges)) {
-            const formatted = bridges
-                .map((b) => {
-                if (typeof b === 'string')
-                    return b;
-                const bridge = b;
-                const type = bridge.memory_type ?? bridge.target_type ?? 'memory';
-                const id = bridge.id ?? bridge.target_id;
-                const content = bridge.content ?? bridge.target_summary ?? '';
-                const why = bridge.why_connected ?? bridge.path ?? '';
-                return `[${type}] ${id}: ${content} (${why})`;
-            })
-                .join('; ');
-            extra += `\n[NeuroStrata Conceptual Bridges] ${formatted}`;
-        }
-        const full = parts.join('\n') + extra;
-        if (typeof event.additionalContext === 'string') {
-            event.additionalContext += `\n${full}`;
+    const bridges = Array.isArray(active.conceptual_bridges)
+        ? active.conceptual_bridges
+        : [];
+    if (!taskId && goldenRules.length === 0 && bridges.length === 0)
+        return;
+    try {
+        const cycle = await runWorkingSetContextCycle(scope);
+        if (!cycle.changed)
+            return;
+        if (Array.isArray(event.system) && Array.isArray(event.messages)) {
+            const state = await loadWorkingSet(scope);
+            const tier0 = renderWorkingSetTier0Prefix(state, active);
+            const delta = renderWorkingSetDeltaFrame(state, active, {
+                omitImmortalRules: true
+            });
+            upsertWorkingSetSystemPrefix(event.system, tier0.text);
+            event.messages = projectWorkingSetMessages(event.messages, state).messages;
+            upsertWorkingSetMessageTailDelta(event.messages, delta.text);
         }
         else {
-            event.additionalContext = full;
+            if (!Array.isArray(event.context) &&
+                typeof event.content !== 'string' &&
+                typeof event.additionalContext !== 'string') {
+                event.additionalContext = '';
+            }
+            if (!upsertWorkingSetFrame(event, cycle.frame))
+                return;
         }
-        if (Array.isArray(event?.context)) {
-            event.context.push(full);
-        }
+        sessionEpochState(sessionId).baselineInjectedEpoch = scope.epoch;
+        rememberWorkingSetInjection(scope, cycle.fingerprint);
     }
-    // Same epoch: leave event.additionalContext untouched.
+    catch {
+        // Working-set injection is advisory; never block the host context hook.
+    }
+}
+/** `session.hook("prompt")` handler: activate anchors before the model call. */
+export async function sessionPromptHandler(event, config) {
+    const idle = { changed: false, activatedIds: [] };
+    const sessionId = asString(event?.sessionID ?? event?.session_id);
+    const scope = workingSetHookScope(config, sessionId);
+    if (!scope || !event || typeof event !== 'object')
+        return idle;
+    try {
+        const promptText = wsMessageText(event.prompt ?? event.text ?? event.message ?? event.userPrompt ?? event);
+        const cycle = await runWorkingSetPromptCycle({
+            scope,
+            promptText,
+            turnId: asString(event.turnID ?? event.turnId ?? event.turn_id),
+            eventId: asString(event.eventID ?? event.eventId ?? event.id)
+        });
+        return { changed: cycle.changed, activatedIds: cycle.activatedIds };
+    }
+    catch {
+        return idle;
+    }
 }
 /**
  * `session.hook("compaction")` handler. Increments the session epoch and
@@ -2699,6 +5303,21 @@ export async function sessionContextHandler(event, config) {
 export async function sessionCompactionHandler(event, config) {
     const sessionId = asString(event?.sessionID ?? event?.session_id);
     incrementSessionEpoch(sessionId);
+    const scope = workingSetHookScope(config, sessionId);
+    if (!scope || wsReadParent(scope).status !== 'valid')
+        return;
+    try {
+        await runWorkingSetContextCycleInternal(scope, false);
+        if (event && typeof event === 'object') {
+            const parent = wsActiveParent(scope);
+            event.result = {
+                summary: renderWorkingSetCompactionSummary(await loadWorkingSet(scope), parent)
+            };
+        }
+    }
+    catch {
+        // Compaction remains best-effort; the next context hook can retry.
+    }
 }
 // ──────────────────────────────────────────────────────────────────────
 // Bug 5: execute.before / execute.after recall delivery
@@ -2899,15 +5518,71 @@ const executeAfterHandler = async (output, secondArg) => {
                             : typeof event?.content === 'string'
                                 ? event.content
                                 : '';
-    const sessionId = asString(event?.sessionID ?? event?.session_id);
+    const sessionId = asString(event?.sessionID ?? event?.session_id ?? meta?.sessionID ?? meta?.session_id);
     const epoch = currentSessionEpoch(sessionId);
+    const scope = workingSetHookScope(config, sessionId);
+    const resultContent = event?.result?.content;
+    const outputIsText = Array.isArray(resultContent)
+        ? resultContent.every((part) => part && part.type === 'text' && typeof part.text === 'string')
+        : [
+            event?.result?.output,
+            event?.output,
+            event?.result,
+            event?.response,
+            event?.content
+        ].some((value) => typeof value === 'string');
+    const nativeEventId = asString(event?.callID ??
+        event?.call_id ??
+        event?.toolCallId ??
+        event?.tool_call_id ??
+        event?.tool_use_id ??
+        meta?.callID ??
+        meta?.call_id ??
+        meta?.toolCallId ??
+        meta?.tool_call_id ??
+        meta?.tool_use_id);
+    const workingSetEventId = nativeEventId
+        ? `opencode:execute.after:${nativeEventId}`
+        : undefined;
+    const toolInput = asRecord(event?.args ??
+        event?.input ??
+        event?.toolInput ??
+        meta?.args ??
+        meta?.input ??
+        meta?.toolInput);
+    const isError = event?.status === 'error' ||
+        event?.isError === true ||
+        targetRec?.isError === true ||
+        asRecord(event?.result).isError === true;
+    let replacementText = null;
+    if (scope) {
+        try {
+            const cycle = await runWorkingSetToolCycle({
+                scope,
+                turnId: asString(event?.turnID ?? event?.turn_id ?? meta?.turnID ?? meta?.turn_id),
+                eventId: workingSetEventId,
+                toolName,
+                toolInput,
+                rawText: outputIsText ? rawText : null,
+                outputIsText,
+                isError,
+                advanceTurn: true
+            });
+            replacementText = cycle.replacementText;
+        }
+        catch {
+            // Working-set collection is advisory and must not block tool execution.
+        }
+    }
     const suffixParts = [];
     // 1. Pending recall block delivered by execute.before (legacy V1 / Claude / Hermes).
-    const pendingBlock = consumePendingRecall(meta, targetRec) ??
+    let pendingBlock = consumePendingRecall(meta, targetRec) ??
         (targetRec
             ? targetRec.neurostrataContext
             : undefined) ??
         (meta ? meta.neurostrataContext : undefined);
+    if (pendingBlock && scope)
+        pendingBlock = await dehydrateWorkingSetRecall(scope, pendingBlock);
     if (pendingBlock)
         suffixParts.push(pendingBlock);
     // 2. Task-intent nudge on non-NeuroStrata-native tools. Read-only
@@ -2950,20 +5625,24 @@ const executeAfterHandler = async (output, secondArg) => {
                 }
                 if (snippets.length > 0) {
                     confirmPrefetchDelivery(config.namespace, fp);
-                    suffixParts.push(`[NeuroStrata File Context — ${normalizedPath}]\n${snippets.slice(0, 2).join('\n')}`);
+                    let block = `[NeuroStrata File Context — ${normalizedPath}]\n${snippets.slice(0, 2).join('\n')}`;
+                    if (scope)
+                        block = await dehydrateWorkingSetRecall(scope, block);
+                    suffixParts.push(block);
                 }
             }
         }
     }
     const legacyPrefix = pendingBlock ? `${pendingBlock}\n\n` : '';
     const newSuffix = suffixParts.slice(pendingBlock ? 1 : 0).join('\n\n');
-    const combined = rawText
-        ? `${legacyPrefix}${rawText}${newSuffix ? '\n\n' + newSuffix : ''}`
+    const outputText = replacementText ?? rawText;
+    const combined = outputText
+        ? `${legacyPrefix}${outputText}${newSuffix ? '\n\n' + newSuffix : ''}`
         : `${legacyPrefix}${newSuffix}`;
     // Only mutate the event when there is actually something to prepend or
     // append; otherwise leave event.result.content / output / content untouched
     // (preserving the tool's original output, including V2 content arrays).
-    const hasAnything = !!pendingBlock || newSuffix !== '';
+    const hasAnything = !!pendingBlock || newSuffix !== '' || replacementText !== null;
     if (hasAnything && event && typeof event === 'object') {
         // OpenCode V2: mutate event.result.content in-place (and result.output).
         if (event.result && typeof event.result === 'object') {
@@ -2977,6 +5656,10 @@ const executeAfterHandler = async (output, secondArg) => {
             if (typeof event.result.output === 'string')
                 event.result.output = combined;
         }
+        if (typeof event.result === 'string')
+            event.result = combined;
+        if (typeof event.response === 'string')
+            event.response = combined;
         // Preserve legacy top-level fields for V1 / Claude / Hermes harnesses.
         if (newSuffix !== '') {
             if (typeof event.additionalContext === 'string') {
@@ -3060,7 +5743,10 @@ const executeBeforeHandler = async (input) => {
         }
         for (const fp of inspection.queriedFiles) {
             try {
-                await prefetchMemoriesForFile(config.namespace, fp);
+                await prefetchMemoriesForFile(config.namespace, fp, {
+                    recordLedgerDir: config.projectRoot,
+                    projectRoot: config.projectRoot
+                });
             }
             catch {
                 // prefetch never blocks execution
@@ -3116,7 +5802,10 @@ const executeBeforeHandler = async (input) => {
         filePath = extractFilePath(args, altArgs, input?.input);
         if (filePath) {
             try {
-                snippets = await prefetchMemoriesForFile(config.namespace, filePath);
+                snippets = await prefetchMemoriesForFile(config.namespace, filePath, {
+                    recordLedgerDir: config.projectRoot,
+                    projectRoot: config.projectRoot
+                });
             }
             catch {
                 snippets = [];
@@ -3257,6 +5946,7 @@ export async function initialize(ctx) {
     if (typeof ctx?.session?.hook === 'function') {
         ctx.session.hook('context', (event) => sessionContextHandler(event, config));
         ctx.session.hook('compaction', (event) => sessionCompactionHandler(event, config));
+        ctx.session.hook('prompt', (event) => sessionPromptHandler(event, config));
     }
     // Claude Code style hook events.
     if (ctx?.hooks?.PreToolUse && typeof ctx.hooks.PreToolUse === 'function') {
@@ -3553,3 +6243,4 @@ export function createHarnessPlugin(pluginId = 'neurostrata', harnessName = 'Ope
 }
 export const plugin = createHarnessPlugin("neurostrata", "OpenCode");
 export default plugin;
+//# sourceMappingURL=index.js.map

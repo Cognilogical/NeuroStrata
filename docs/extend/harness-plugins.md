@@ -23,14 +23,14 @@
 
 The installer writes one config file per harness, each naming the namespace:
 
-| Harness | Config file |
-| --- | --- |
+| Harness     | Config file                                                                                         |
+| ----------- | --------------------------------------------------------------------------------------------------- |
 | Claude Code | `.NeuroStrata/plugins/claude/neurostrata.json` (`{"id": "neurostrata-claude", "namespace": "..."}`) |
-| OpenCode | `.opencode/neurostrata-plugin.json` (`neurostrata.namespace`) |
-| Codex | `.codex/plugins/neurostrata.json` (hooks: `.codex/hooks.json`) |
-| Hermes | `.hermes/plugins/neurostrata.json` |
-| OpenClaw | `.openclaw/plugins/neurostrata.json` |
-| GitHub CLI | `.NeuroStrata/plugins/github-cli/copilot-extension.json` (hooks: `.github/hooks/neurostrata.json`) |
+| OpenCode    | `.opencode/neurostrata-plugin.json` (`neurostrata.namespace`)                                       |
+| Codex       | `.codex/plugins/neurostrata.json` (hooks: `.codex/hooks.json`)                                      |
+| Hermes      | `.hermes/plugins/neurostrata.json`                                                                  |
+| OpenClaw    | `.openclaw/plugins/neurostrata.json`                                                                |
+| GitHub CLI  | `.NeuroStrata/plugins/github-cli/copilot-extension.json` (hooks: `.github/hooks/neurostrata.json`)  |
 
 Each CLI hook runner (`cli-hook.mjs`) reads its harness's config file (`readHarnessConfig`) and passes it to the plugin as config; the plugin reads `NEUROSTRATA_NAMESPACE` itself, in its own place in the order. The runner the installer writes to `<root>/.NeuroStrata/plugins/<harness>/` reads `<root>`'s config first, then the one at the project folder's checkout top (and its main checkout's, for a linked worktree). The Claude hooks (PreToolUse, SessionStart, Stop, SessionEnd, PreCompact) run `node "<runner>"`, with no namespace in the command. An older install's `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"` commands are repaired by the installer: the first namespace they name (SessionStart, then PreToolUse, then Stop) is written to Claude's config file and read back before the commands lose it; if that fails, those commands stay as they are and the install reply carries a warning. A fresh install whose config file cannot be written still installs the hooks, with the same warning.
 
@@ -69,6 +69,27 @@ Claude Code `NotebookEdit` is a file-mutating tool like `Write` and `Edit`: it i
 `neurostrata-1e14`: subagent context headers sanitize namespace and task labels to `[A-Za-z0-9_.:-]` before interpolation. Code Mode's `execute`/`mcp_execute` tool output is also excluded from task-intent intake.
 
 `neurostrata-nb9q`: subagent graph-first injection is agent- and harness-aware: read-only subagents (`reviewer`, `checker`, `checker-free`, `explore`) receive a skip note instead of directives to call MCP tools they do not have, and Code Mode harnesses reference `execute` with `tools.neurostrata.*`. Intent extraction from `read`/`grep`/`glob`/shell tool output is suppressed, because `TODO:`/`defer` in stdout or source comments is not a task obligation; user and assistant turns still nudge.
+
+## Generational Context Graph L1 Working-Set Garbage Collector (`neurostrata-zji8`)
+
+`@neurostrata/plugin-core` implements an $O(1)$ per-turn Generational Context Graph L1 Working-Set Garbage Collector (`WORKING_SET_MAX_FRAME_BYTES = 4096` UTF-8 bytes) backed by `.NeuroStrata/active_session.json#working_set` (`WORKING_SET_SCHEMA_VERSION = 1`). Instead of accumulating unbounded recall blocks or tool outputs in the prompt history, the working-set engine maintains four tiers (`Immortal`, `PinnedRoot`, `YoungGen`, `EvictedStub`) whose eviction precedence (`evaluateWorkingSetEviction`) is formally verified across 2,560 truth-table parity rows in `src/formal_kernel.rs::evaluate_working_set_eviction` and `proofs/NeuroStrata/WorkingSetGc.lean`:
+
+- **Metadata-only persistence:** `.NeuroStrata/active_session.json#working_set` stores only bounded node metadata, pointer lines, and SHA-256 digests (`tool_output_digests`); raw tool outputs and private memory contents are never persisted to disk.
+- **Dehydration and delta frame rendering:** Read-only inspection tool outputs exceeding `TOOL_GC_INLINE_THRESHOLD_BYTES = 3072` bytes or repeating an identical canonical read in the same epoch are dehydrated into bounded UTF-8 head/tail previews (`512` head + `512` tail bytes) plus deterministic 1-line pointer stubs (`[NeuroStrata GC Stub -> ...]`). `renderWorkingSetFrame` and `upsertWorkingSetFrame` inject or replace the `[NeuroStrata Active Context] ... [NeuroStrata End Active Context]` frame in place only when its SHA-256 `frame_fingerprint` changes.
+- **Delta-only frame injection:** The `changed` flag in `runWorkingSetToolCycle` and `runWorkingSetContextCycle` gates whether the `[NeuroStrata Active Context]` frame is injected as `additionalContext` in `PostToolUse`, `SessionStart`, and `Stop` CLI replies. `runWorkingSetToolCycle` captures `beforeFingerprint` and `beforeInjected` prior to mutation, evaluates `final.fingerprint !== beforeFingerprint && final.fingerprint !== beforeInjected`, and persists `last_injected_fingerprint` when `changed && !input.advanceTurn`, while `runWorkingSetTurnBoundary` carries `last_injected_fingerprint` forward when only `turn_seq` incremented. `wsReplaceCompleteFrames`, `wsStripFrames`, and `wsRecallMemoryIds` use linear `indexOf` scanning instead of regex backtracking, preserving text before the first open tag and avoiding polynomial ReDoS on uncontrolled recall text.
+- **Six-harness lifecycle & installer wiring (`src/task/harness_plugins.rs`):**
+  - **OpenCode, Claude Code, Codex, and GitHub CLI** build thin adapters via `plugins/core/bundle-adapter.mjs`; **OpenClaw** and **Hermes** compile against `@neurostrata/plugin-core` via `bundle-adapter.mjs --compiled-adapter`, emitting deterministic 4-artifact bundles (`dist/index.{js,js.map,d.ts,d.ts.map}`) across all 7 packages (28 artifacts total).
+  - The Rust installer wires native lifecycle hooks for Claude (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`), Codex (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`), and GitHub CLI (`.github/hooks/neurostrata.json` with `sessionStart`, `userPromptSubmitted`, `preToolUse`, `postToolUse`, `agentStop` plus `.git/info/exclude`), preserving foreign hooks and refusing symlinks.
+
+### Three-tier KV-cache projection (`neurostrata-zji8` Task 5)
+
+`plugins/core/index.ts` projects the working set into three KV-cache tiers without ever calling an LLM:
+
+- **Tier 0 (`renderWorkingSetTier0Prefix`):** immortal Golden Rules only, capped at `WORKING_SET_TIER0_MAX_BYTES = 2048`. `evaluateWorkingSetCacheTier` routes `Immortal` nodes with a system channel to `tier0_system_prefix`; the text contains no turn, epoch, or task counters, so its SHA-256 fingerprint is byte-identical across turns and task updates. On OpenCode V2 `{ system, messages }` events, `upsertWorkingSetSystemPrefix` replaces this prefix in `event.system` in place.
+- **Tier 1 (`projectWorkingSetMessages`):** quantized history folded at `WORKING_SET_STRIDE_MESSAGES = 8` boundaries, keeping a `WORKING_SET_HOT_TAIL_MESSAGES = 12` hot tail. `computeWorkingSetQuantizedFrontier` and `evaluateWorkingSetStrideFold` mirror `src/formal_kernel.rs` exactly (8 cache-tier and 128 stride-fold rows). Protected system/pinned messages and every message at or beyond the frontier are retained verbatim; folded buckets become deterministic stubs, so the prefix is byte-identical within a stride bucket.
+- **Tier 2 (`renderWorkingSetDeltaFrame`):** volatile task header, roots, young gen, typed `working_set.edges`, and stubs. Edges use `WorkingSetEdgeKind` (`GOVERNS`, `DEPENDS_ON`, `CALLS`, `IMPORTS`, `CONCEPTUAL_BRIDGE`, `EXTRACTED_FROM`), deduplicated by `(from, kind, to)` and capped at `WORKING_SET_MAX_EDGES = 128`. `upsertWorkingSetMessageTailDelta` attaches the delta to the tail of `event.messages` on OpenCode V2 and to `additionalContext` on the CLI adapters, bounded so Tier 0 + Tier 2 never exceed `WORKING_SET_MAX_FRAME_BYTES = 4096`.
+
+`sessionPromptHandler` registers as `ctx.session.hook("prompt")` and the Claude runner handles `UserPromptSubmit`: `runWorkingSetPromptCycle` extracts `file:`, `symbol:`, `mem:`, and project-relative path anchors with a linear tokenizer, then applies deterministic 1-hop (`GOVERNS`/`EXTRACTED_FROM`/`CONCEPTUAL_BRIDGE`) and 2-hop (structural edge → `GOVERNS`) spreading activation before the model call. Cyclic edges terminate via a visited key; page-faulted stub neighbors are promoted through the existing ReBAC-filtered expansion callback. `sessionCompactionHandler` replaces the lossy host LLM summary with `event.result = { summary }` from `renderWorkingSetCompactionSummary`, preserving Golden Rules, active task, roots, edges, and stub restore pointers in a deterministic bounded payload. Older v1 snapshots with no `working_set.edges` load with `edges: []`.
 
 ## Implementing a New Harness Adapter
 
