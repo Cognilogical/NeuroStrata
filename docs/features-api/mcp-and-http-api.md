@@ -59,6 +59,8 @@ On the daemon side, a task's stamped `worktree` is compared with the caller's ro
 
 When a task is completed, or `neurostrata_task_update` moves it out of `in_progress`, its task fields are removed from each session file that still names it: the one in the worktree the claim recorded, the one at the root the call names, and the one at the namespace's registered project root. When no task is in progress, `neurostrata_get_snapshot` also removes `task_id`, `status`, `session_id` and `subagent_prompt_injection` from `.NeuroStrata/active_session.json`, so session start stops announcing a task once it is completed or released. Other keys (namespace, golden rules) stay.
 
+A stale session file left behind by a crashed or released session is not trusted on a fresh claim: `neurostrata_get_snapshot` refreshes the in-progress block from the authoritative task row before it is announced, so task fields for a task that has since ended are cleared rather than replayed into the next session's context.
+
 ## Code Intelligence & SCIP Call-Graph Tools
 
 - `neurostrata_Export_scip` — export SCIP code graph data.

@@ -462,7 +462,8 @@ impl SecretScanner {
             if meets_high_entropy(token) {
                 return Some((
                     "high_entropy_secret",
-                    cap.get(1).map_or(0..0, |m| whole_value_span(text, m.range())),
+                    cap.get(1)
+                        .map_or(0..0, |m| whole_value_span(text, m.range())),
                 ));
             }
         }
@@ -519,7 +520,8 @@ impl SecretScanner {
             {
                 return Some((
                     "password",
-                    cap.get(2).map_or(0..0, |m| whole_value_span(text, m.range())),
+                    cap.get(2)
+                        .map_or(0..0, |m| whole_value_span(text, m.range())),
                 ));
             }
         }
@@ -713,8 +715,8 @@ fn whole_value_span(text: &str, matched: std::ops::Range<usize>) -> std::ops::Ra
     let line_end = after.find(['\n', '\r']).unwrap_or(after.len());
     let end = match text[..matched.start].chars().last() {
         Some(quote @ ('"' | '\'')) => {
-            let backslashes = text[..matched.end].len()
-                - text[..matched.end].trim_end_matches('\\').len();
+            let backslashes =
+                text[..matched.end].len() - text[..matched.end].trim_end_matches('\\').len();
             let mut escaped = backslashes % 2 == 1;
             after
                 .char_indices()
@@ -1364,13 +1366,34 @@ mod tests {
     #[test]
     fn redact_replaces_the_whole_value_not_only_the_matched_start() {
         for (text, kept) in [
-            (r#"set password="abcd;efgh ij" now"#, r#"set password="[REDACTED:password]" now"#),
-            (r#"set password="abcd\"e;f" now"#, r#"set password="[REDACTED:password]" now"#),
-            (r#"set password="abcd\\" now"#, r#"set password="[REDACTED:password]" now"#),
-            ("set password=\"abcd\nefgh\r\nijkl\" now", "set password=\"[REDACTED:password]\" now"),
-            ("set password=\"abcd;ef\nnext line", "set password=\"[REDACTED:password]\nnext line"),
-            ("set password='wxyz,12}' now", "set password='[REDACTED:password]' now"),
-            ("set password=abcd;efgh now", "set password=[REDACTED:password] now"),
+            (
+                r#"set password="abcd;efgh ij" now"#,
+                r#"set password="[REDACTED:password]" now"#,
+            ),
+            (
+                r#"set password="abcd\"e;f" now"#,
+                r#"set password="[REDACTED:password]" now"#,
+            ),
+            (
+                r#"set password="abcd\\" now"#,
+                r#"set password="[REDACTED:password]" now"#,
+            ),
+            (
+                "set password=\"abcd\nefgh\r\nijkl\" now",
+                "set password=\"[REDACTED:password]\" now",
+            ),
+            (
+                "set password=\"abcd;ef\nnext line",
+                "set password=\"[REDACTED:password]\nnext line",
+            ),
+            (
+                "set password='wxyz,12}' now",
+                "set password='[REDACTED:password]' now",
+            ),
+            (
+                "set password=abcd;efgh now",
+                "set password=[REDACTED:password] now",
+            ),
         ] {
             let (scrubbed, found) = redact(text);
             assert_eq!(scrubbed, kept, "{text}");

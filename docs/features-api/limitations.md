@@ -11,11 +11,11 @@ increment is one store write turn, so concurrent firings serialize and no
 update is lost (`concurrent_hit_counts_are_not_lost`).
 
 - A failed increment is reported through `tracing::warn!` and does not change
-  the verdict: this binary installs no tracing subscriber (the same
-  disclosure made below for the RSS knob), so the warning is discarded and in
-  practice the failure is not recorded anywhere. The guard's job is the
-  pass/reject decision, and a bookkeeping write failure must not turn a pass
-  into a rejection (or vice versa).
+  the verdict: this binary installs a global tracing subscriber on stderr
+  (`init_tracing`, the same wiring described below for the RSS knob), so the
+  warning is emitted to stderr — it is not persisted anywhere else. The
+  guard's job is the pass/reject decision, and a bookkeeping write failure
+  must not turn a pass into a rejection (or vice versa).
 - The count answers "how often did this rule fire", not "how often did this
   rule decide the outcome". Several rules can fire on one action; the first
   deterministic reject decides.
@@ -66,8 +66,10 @@ process delta, but the attribution to that call is not exact.
   fire; `storage_status` exposes `rss_available` so a caller can tell.
 - A mistyped `NEUROSTRATA_RSS_LOG_MB` is reported (once per bad value) and falls
   back to the default; `0` disables the per-call log (the sampler still runs).
-  The report goes to stderr: this binary installs no `tracing` subscriber, so a
-  `tracing::warn!` would be discarded.
+  The report goes directly to stderr via `eprintln!`: this binary also
+  installs a global `tracing` subscriber on stderr (`init_tracing`), so a
+  `tracing::warn!` would reach stderr as well, but this path reports
+  directly so the warning is visible regardless of subscriber state.
 
 ## Search results can be incomplete
 
