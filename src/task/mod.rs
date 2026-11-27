@@ -2902,10 +2902,15 @@ async fn record_graph_query_inner(
         return;
     };
     let now = chrono::Utc::now().timestamp();
+    // A search hint is free text written to the task's recent_queries stamp
+    // and the session ledger. The #411 amendment scrubs free text rather than
+    // dropping the lookup: redact the hint before either history write so a
+    // pasted credential cannot survive in either log.
+    let hint = crate::secrets::redact(query_hint).0;
     let entry_str = format!(
         "{}:{}",
         tool_name,
-        query_hint.chars().take(80).collect::<String>()
+        hint.chars().take(80).collect::<String>()
     );
     let mut project_root: Option<String> = caller_root
         .map(str::trim)
@@ -3015,7 +3020,7 @@ async fn record_graph_query_inner(
         project_root = walk_to_worktree_marker(&crate::daemon::resolve_project_root())
             .map(|root| root.to_string_lossy().into_owned());
     }
-    let governed_prefix = if query_hint.ends_with('/')
+    let governed_prefix = if hint.ends_with('/')
         || (project_root.is_some()
             && std::path::Path::new(project_root.as_ref().unwrap())
                 .join(query_hint)
@@ -3023,16 +3028,16 @@ async fn record_graph_query_inner(
     {
         // Explicit directory coverage: preserve trailing slash without
         // widening to the top-level directory.
-        format!("{}/", query_hint.trim_end_matches('/'))
+        format!("{}/", hint.trim_end_matches('/'))
     } else if tool_name == "neurostrata_memories_for_file"
-        || query_hint.contains('/')
-        || query_hint.contains('.')
+        || hint.contains('/')
+        || hint.contains('.')
     {
         // Exact file coverage: preserve the queried path verbatim.
-        query_hint.to_string()
+        hint.to_string()
     } else {
         // Bare module/domain keyword: widen to directory coverage.
-        format!("{}/", query_hint)
+        format!("{}/", hint)
     };
     if let Some(root) = project_root.filter(|r| !is_home_without_git(std::path::Path::new(r))) {
         let ledger_path = std::path::Path::new(&root).join(".NeuroStrata/session_queries.json");
@@ -3047,7 +3052,7 @@ async fn record_graph_query_inner(
                 arr.push(json!({
                     "ts": now,
                     "tool": tool_name,
-                    "query": query_hint,
+                    "query": hint,
                     "governed_prefixes": [governed_prefix],
                 }));
             }
@@ -3572,14 +3577,54 @@ fn scan_resolved_scope(scope: &gate::GateScope, surface: &str) -> Option<String>
         .map(|rejection| rejection.to_string())
 }
 
-/// Judge the caller's raw payload before redaction or namespace normalization.
-/// Redaction is a store-layer defense, never a way to hide a secret from the
-/// scanner: a refused write must leave nothing behind to normalize or embed.
+/// Keys whose string values are free text under the amendment to #411: a
+/// secret there is replaced with `[REDACTED:<category>]` and the write still
+/// happens. Keys themselves are never rewritten -- a secret-shaped key is a
+/// credential the value scan would never see, so it still refuses the write.
+/// Everything else (identity, scope, structured lists, memory content) stays
+/// under the whole-write refusal.
+fn redact_free_text_fields(value: &mut Value) {
+    const FREE_TEXT: &[&str] = &[
+        "title",
+        "description",
+        "note",
+        "reason",
+        "close_reason",
+        "project_description",
+    ];
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if FREE_TEXT.contains(&key.as_str()) {
+                    if let Value::String(text) = val {
+                        *text = crate::secrets::redact(text).0;
+                        continue;
+                    }
+                }
+                redact_free_text_fields(val);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_free_text_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Judge the caller's raw payload before namespace normalization, after the
+/// #411 amendment has had its way with free text: secrets in structured and
+/// identity fields still refuse the whole write, secrets in free text are
+/// scrubbed here so the handlers' existing redaction paths can store the
+/// text and list the replaced categories in their reply. A mixed payload
+/// still refuses, because the structured secret survives this pass.
 fn scan_raw_task_args(args: &Value, surface: &str) -> Option<String> {
-    let raw = args
+    let mut raw = args
         .as_object()
         .map(|obj| Value::Object(obj.clone()))
         .unwrap_or(Value::Null);
+    redact_free_text_fields(&mut raw);
     crate::secrets::scan_entry_point("", &raw, surface).map(|r| r.to_string())
 }
 
@@ -5921,19 +5966,12 @@ pub async fn handle_bootstrap(
     if let Err(e) = check_namespace(&namespace) {
         return e;
     }
-    let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
-    // The description lands verbatim in the seeded task below, but marker
-    // and plugin setup run first: judge it before either, so a refused
-    // bootstrap leaves no setup state behind.
-    if let Some(desc) = &project_description {
-        let mut scan_meta = Map::new();
-        scan_meta.insert("description".to_string(), json!(desc));
-        if let Some(rejection) =
-            crate::secrets::scan_entry_point("", &Value::Object(scan_meta), "task_bootstrap")
-        {
-            return rejection.to_string();
-        }
-    }
+    // A project description is free text: the #411 amendment replaces its
+    // secrets and keeps the bootstrap, rather than stranding a new project.
+    // Namespace and root above are identity/scope and still refuse raw.
+    let mut bootstrap_redactions = Vec::new();
+    let project_description =
+        arg_str(&args, "project_description").map(|s| redact_into(s, &mut bootstrap_redactions));
     let checked = match checked_marker_root(project_root) {
         Ok(root) => root,
         Err(e) => return e,
@@ -6034,6 +6072,7 @@ pub async fn handle_bootstrap(
             { "path": ".NeuroStrata/docs/.gitkeep", "overwrite": false, "content": "" }
         ],
         "first_task": { "id": task_id, "title": title },
+        "redactions": redactions_json(&bootstrap_redactions),
         "harness_plugins": harness_plugins,
         "tasks_created": tasks_created,
         "hooks": { "install_command": "neurostrata-mcp hooks install" },
@@ -9938,6 +9977,90 @@ exit 0
         );
     }
 
+    /// A search hint is free text written to a log/history surface, not a
+    /// structured field: a secret in it is redacted in the task stamp and the
+    /// session ledger, while the dispatch itself is still recorded.
+    #[tokio::test]
+    async fn graph_query_ledger_redacts_free_text_secret_without_dropping_the_write() {
+        use crate::guard::testkit::MockStore;
+
+        let store: Arc<dyn VectorStore> = Arc::new(MockStore::new());
+        let ns = "FreeTextQueryRedaction";
+        let vector = StubEmbedder.embed("seed").await.unwrap();
+        store
+            .upsert(
+                ns,
+                "task-a",
+                vector.clone(),
+                MemoryPayload {
+                    content: "task".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "task": { "status": "in_progress", "title": "task-a" } }),
+                },
+            )
+            .await
+            .expect("seed task");
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".NeuroStrata")).unwrap();
+        let caller_root = tmp.path().to_str().unwrap().to_string();
+        let key = format!("ghp_{}", "Ab1".repeat(12));
+
+        record_graph_query_with_root(
+            &store,
+            ns,
+            "neurostrata_search_memory",
+            &format!("find {key}"),
+            Some(&caller_root),
+        )
+        .await;
+
+        let row = store.get(ns, "task-a").await.unwrap().unwrap().1;
+        let recent = row.metadata["task"]["recent_queries"]
+            .as_array()
+            .expect("recent_queries written");
+        assert_eq!(recent.len(), 1, "the redacted query is still recorded");
+        let stamped = recent[0].as_str().unwrap();
+        assert!(!stamped.contains(&key), "{stamped}");
+        assert!(stamped.contains("[REDACTED:github_pat]"), "{stamped}");
+        assert_eq!(
+            seeded_task_count(&store, ns, "task-a").await,
+            1,
+            "the dispatch is still counted"
+        );
+
+        let ledger: Value = serde_json::from_str(
+            &std::fs::read_to_string(ledger_at(tmp.path())).expect("ledger written"),
+        )
+        .expect("valid ledger");
+        let query = ledger["queries"][0]["query"].as_str().unwrap();
+        assert!(!query.contains(&key), "{query}");
+        assert!(query.contains("[REDACTED:github_pat]"), "{query}");
+        for prefix in ledger["queries"][0]["governed_prefixes"]
+            .as_array()
+            .unwrap()
+        {
+            let p = prefix.as_str().unwrap();
+            assert!(!p.contains(&key), "{p}");
+        }
+
+        // Clean hints must stay byte-identical: redaction is not rewriting.
+        record_graph_query_with_root(
+            &store,
+            ns,
+            "neurostrata_search_memory",
+            "parser",
+            Some(&caller_root),
+        )
+        .await;
+        let row = store.get(ns, "task-a").await.unwrap().unwrap().1;
+        let recent = row.metadata["task"]["recent_queries"].as_array().unwrap();
+        assert!(recent[1].as_str().unwrap().ends_with(":parser"));
+    }
+
     /// Panel C15: when no caller task context reaches the generic dispatch,
     /// the first-match fallback must be stable (lowest task id), not whichever
     /// row `store.list` happened to return first.
@@ -12156,7 +12279,6 @@ exit 0
                 p.metadata["task"]["history"].to_string()
             }
         };
-        let before = history().await;
 
         let reply = handle_task_update(
             json!({ "namespace": "MyProj", "id": id, "note": format!("Handoff: push with {key}") }),
@@ -12164,9 +12286,13 @@ exit 0
             store.clone(),
         )
         .await;
-        assert_security_refusal(&reply);
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["redactions"][0]["category"], "github_pat", "{reply}");
         assert!(!reply.contains(key), "{reply}");
-        assert_eq!(history().await, before, "a refused note appends no history");
+        assert!(history()
+            .await
+            .contains("Handoff: push with [REDACTED:github_pat]"));
+        assert!(!history().await.contains(key), "no raw secret in history");
 
         let reply = handle_task_update(
             json!({ "namespace": "MyProj", "id": id, "note": "Handoff: run the suite" }),
@@ -12179,10 +12305,10 @@ exit 0
         assert!(history().await.contains("Handoff: run the suite"));
     }
 
-    /// Task text supplied through the tools is refused when it carries a
-    /// secret; clean text is stored verbatim with an empty redactions reply.
-    /// Redaction remains the store-layer defense for rows written outside the
-    /// tools.
+    /// Free text (title, description, close reason, follow-ups) supplied
+    /// through the tools is redacted and stored; clean text is stored
+    /// verbatim with an empty redactions reply. Store-layer redaction stays
+    /// the defense for rows written outside the tools.
     #[tokio::test]
     async fn task_titles_descriptions_and_close_reasons_are_stored_redacted() {
         let store = store_with_namespace("MyProj").await;
@@ -12196,7 +12322,7 @@ exit 0
             }
         };
 
-        // Create refuses a secret in the title.
+        // Create redacts a secret in the title and still writes the row.
         let reply = handle_task_create(
             json!({
                 "namespace": "MyProj",
@@ -12207,12 +12333,17 @@ exit 0
             store.clone(),
         )
         .await;
-        assert_security_refusal(&reply);
+        let secret_create: Value = serde_json::from_str(&reply).expect(&reply);
+        assert_eq!(secret_create["redactions"][0]["category"], "github_pat");
         assert_eq!(
             store.list("MyProj", None, None).await.unwrap().len(),
-            before,
-            "a refused create writes no row"
+            before + 1,
+            "a redacted create writes the row"
         );
+        assert!(!reply.contains(key), "{reply}");
+        assert!(stored(secret_create["id"].as_str().unwrap().to_string())
+            .await
+            .contains("rotate [REDACTED:github_pat]"));
 
         // Clean text is stored verbatim; no redactions are reported.
         let reply = handle_task_create(
@@ -12258,30 +12389,28 @@ exit 0
         .await;
         assert!(reply.contains("ERROR"), "{reply}");
 
-        // A secret in a rename is refused; the stored row is unchanged.
-        let row_before = stored(id.clone()).await;
+        // A secret in a rename is redacted; the stored title replaces it.
         let reply = handle_task_update(
             json!({ "namespace": "MyProj", "id": id, "title": format!("rotate {key} now") }),
             emb(),
             store.clone(),
         )
         .await;
-        assert_security_refusal(&reply);
-        assert_eq!(
-            stored(id.clone()).await,
-            row_before,
-            "a refused rename writes nothing"
-        );
+        let renamed: Value = serde_json::from_str(&reply).expect(&reply);
+        assert_eq!(renamed["redactions"][0]["category"], "github_pat");
+        assert!(!reply.contains(key), "{reply}");
+        let row = stored(id.clone()).await;
+        assert!(row.contains("rotate [REDACTED:github_pat] now"), "{row}");
+        assert!(!row.contains(key), "{row}");
 
-        // Completion refuses a secret in the reason or a follow-up before any
-        // extraction, follow-up row, or done state is written.
+        // Completion redacts a secret in a follow-up and still commits.
         claim(&store, &id).await;
-        let before_complete = store.list("MyProj", None, None).await.unwrap().len();
-        let err = handle_task_complete(
+        let reply = handle_task_complete(
             json!({
                 "namespace": "MyProj",
                 "id": id,
                 "reason": "rotated",
+                "memory": { "content": "rotate credentials on a schedule" },
                 "follow_up_tasks": [{ "title": "audit", "description": format!("check {key}") }],
             }),
             emb(),
@@ -12290,14 +12419,13 @@ exit 0
             quiet_bus(),
         )
         .await
-        .expect_err("a secret follow-up must refuse the completion");
-        assert_security_refusal(&err);
-        assert_eq!(
-            store.list("MyProj", None, None).await.unwrap().len(),
-            before_complete,
-            "a refused completion writes no follow-up"
-        );
-        assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
+        .expect("a secret follow-up is redacted, not refused");
+        let completed: Value = serde_json::from_str(&reply).expect(&reply);
+        assert_eq!(completed["redactions"][0]["category"], "github_pat");
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::Done);
+        assert!(!reply.contains(key), "{reply}");
+        let child_id = completed["follow_up_tasks_created"][0].as_str().unwrap();
+        assert!(!stored(child_id.to_string()).await.contains(key));
     }
 
     /// Task text that reaches the store without passing the three tools is
@@ -12307,8 +12435,9 @@ exit 0
     async fn every_task_write_path_stores_text_redacted() {
         let key = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef123456";
         let store = temp_store().await;
-        // Task tools refuse secrets before any write: bootstrap included.
-        let refused = handle_bootstrap(
+        // Bootstrap's description is free text: the secret is redacted in the
+        // seeded task, and the bootstrap itself still completes.
+        let boot = handle_bootstrap(
             json!({
                 "namespace": "MyProj",
                 "project_root": "/tmp",
@@ -12318,30 +12447,16 @@ exit 0
             store.clone(),
         )
         .await;
-        assert!(
-            refused.contains("ERROR [SECURITY]"),
-            "bootstrap refuses the secret: {refused}"
-        );
-        // Paths that bypass the tools (action staging, legacy rows) still
-        // get store-layer redaction. Seed a clean task to exercise them.
-        let reply = handle_bootstrap(
-            json!({
-                "namespace": "MyProj",
-                "project_root": "/tmp",
-                "project_description": "deploys the release",
-            }),
-            emb(),
-            store.clone(),
-        )
-        .await;
-        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
+        let parsed: Value = serde_json::from_str(&boot).expect(&boot);
         let first_id = parsed["first_task"]["id"].as_str().unwrap().to_string();
         let (_, first) = store.get("MyProj", &first_id).await.unwrap().unwrap();
         let row = first.metadata.to_string();
         assert!(
-            row.contains("deploys the release") && !row.contains(key),
+            row.contains("deploys with [REDACTED:github_pat]") && !row.contains(key),
             "{row}"
         );
+        // Paths that bypass the tools (action staging, legacy rows) still
+        // get store-layer redaction, exercised on the same seeded task.
 
         let (_, _, staged) = stage_task_transition_at(
             &first_id,
@@ -14281,7 +14396,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn secret_in_task_create_is_refused() {
+    async fn secret_in_task_create_description_is_redacted() {
         let store = store_with_namespace("MyProj").await;
         let before = store.list("MyProj", None, None).await.unwrap().len();
         let token = scanner_fixture();
@@ -14296,20 +14411,29 @@ exit 0
             store.clone(),
         )
         .await;
+        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
 
-        assert_security_refusal(&reply);
+        assert_eq!(parsed["redactions"][0]["category"], "github_pat", "{reply}");
         assert_eq!(
             store.list("MyProj", None, None).await.unwrap().len(),
-            before,
-            "a refused create writes no row"
+            before + 1,
+            "a redacted create still writes the task"
         );
+        let (_, payload) = store
+            .get("MyProj", parsed["id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let description = payload.metadata["task"]["description"].as_str().unwrap();
+        assert_eq!(description, "push with [REDACTED:github_pat]");
+        assert!(!description.contains(&token), "{description}");
+        assert!(!reply.contains(&token), "{reply}");
     }
 
     #[tokio::test]
-    async fn secret_in_task_update_is_refused() {
+    async fn secret_in_task_update_note_is_redacted() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
-        let before = store.list("MyProj", None, None).await.unwrap().len();
         let token = scanner_fixture();
 
         let reply = handle_task_update(
@@ -14322,36 +14446,26 @@ exit 0
             store.clone(),
         )
         .await;
+        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
 
-        assert_security_refusal(&reply);
-        assert_eq!(
-            store.list("MyProj", None, None).await.unwrap().len(),
-            before
-        );
-        assert_eq!(
-            status_of(&store, "MyProj", &id).await,
-            Status::Open,
-            "a refused update moves nothing"
-        );
+        assert_eq!(parsed["redactions"][0]["category"], "github_pat", "{reply}");
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::Open);
         let (_, payload) = store.get("MyProj", &id).await.unwrap().unwrap();
-        let history = payload
-            .metadata
-            .get("task")
-            .and_then(|t| t.get("history"))
-            .and_then(|h| h.as_array())
-            .map_or(0, Vec::len);
-        assert_eq!(history, 0, "a refused update appends no history");
+        let history = payload.metadata["task"]["history"].as_array().unwrap();
+        assert_eq!(history.len(), 1, "the redacted note is still recorded");
+        assert_eq!(history[0]["note"], "deployed with [REDACTED:github_pat]");
+        assert!(!serde_json::to_string(history).unwrap().contains(&token));
+        assert!(!reply.contains(&token), "{reply}");
     }
 
     #[tokio::test]
-    async fn secret_in_follow_up_task_is_refused() {
+    async fn secret_in_follow_up_task_is_redacted() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
         claim(&store, &id).await;
-        let before = store.list("MyProj", None, None).await.unwrap().len();
         let token = scanner_fixture();
 
-        let err = handle_task_complete(
+        let reply = handle_task_complete(
             json!({
                 "namespace": "MyProj",
                 "id": id,
@@ -14367,19 +14481,33 @@ exit 0
             quiet_bus(),
         )
         .await
-        .expect_err("a secret in any follow-up must refuse the whole completion");
+        .expect("a secret in free text is redacted, not refused");
+        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
 
-        assert_security_refusal(&err);
-        assert_eq!(
-            store.list("MyProj", None, None).await.unwrap().len(),
-            before,
-            "a refused completion writes no extraction and no follow-up"
+        assert!(
+            parsed["redactions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["category"] == "github_pat"),
+            "{reply}"
         );
-        assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
+        let children = parsed["follow_up_tasks_created"].as_array().unwrap();
+        assert_eq!(children.len(), 2, "both follow-ups are still created");
+        let (_, child) = store
+            .get("MyProj", children[1].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let row = child.metadata.to_string();
+        assert!(row.contains("use [REDACTED:github_pat]"), "{row}");
+        assert!(!row.contains(&token), "{row}");
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::Done);
+        assert!(!reply.contains(&token), "{reply}");
     }
 
     #[tokio::test]
-    async fn secret_in_bootstrap_description_is_refused() {
+    async fn secret_in_bootstrap_description_is_redacted() {
         let root =
             std::env::temp_dir().join(format!("ns-bootstrap-secret-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -14396,13 +14524,21 @@ exit 0
             store.clone(),
         )
         .await;
+        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
 
-        assert_security_refusal(&reply);
+        assert_eq!(parsed["redactions"][0]["category"], "github_pat", "{reply}");
         let rows = store.list("BootProj", None, None).await.unwrap_or_default();
-        assert!(
-            rows.iter().all(|r| r.payload.memory_type != "task"),
-            "a refused bootstrap creates no task row"
+        let row = rows
+            .iter()
+            .find(|r| r.payload.memory_type == "task")
+            .unwrap();
+        assert_eq!(
+            row.payload.metadata["task"]["description"]
+                .as_str()
+                .unwrap(),
+            "deploy with [REDACTED:github_pat]"
         );
+        assert!(!reply.contains(&token), "{reply}");
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -14455,16 +14591,13 @@ exit 0
     }
 
     #[tokio::test]
-    async fn secret_in_task_completion_reason_is_refused() {
+    async fn secret_in_task_completion_reason_is_redacted() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
         claim(&store, &id).await;
-        let before = store.list("MyProj", None, None).await.unwrap().len();
         let token = scanner_fixture();
 
-        let history_before =
-            store.get("MyProj", &id).await.unwrap().unwrap().1.metadata["task"]["history"].clone();
-        let err = handle_task_complete(
+        let reply = handle_task_complete(
             json!({
                 "namespace": "MyProj",
                 "id": id,
@@ -14477,26 +14610,21 @@ exit 0
             quiet_bus(),
         )
         .await
-        .expect_err("a secret in the completion reason must refuse before any write");
+        .expect("a secret in the close reason is redacted, not refused");
+        let parsed: Value = serde_json::from_str(&reply).expect(&reply);
 
-        assert_security_refusal(&err);
-        assert_eq!(
-            store.list("MyProj", None, None).await.unwrap().len(),
-            before
-        );
-        assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
-        // Row count and status alone would miss a partial write that only
-        // appended the secret reason to the existing row's history.
-        let history_after =
+        assert_eq!(parsed["redactions"][0]["category"], "github_pat", "{reply}");
+        assert_eq!(status_of(&store, "MyProj", &id).await, Status::Done);
+        let history =
             store.get("MyProj", &id).await.unwrap().unwrap().1.metadata["task"]["history"].clone();
-        assert_eq!(
-            history_after, history_before,
-            "a refused completion leaves the parent's history unchanged"
-        );
         assert!(
-            !history_after.to_string().contains(&token),
-            "no history entry carries the supplied reason"
+            history
+                .to_string()
+                .contains("shipped with [REDACTED:github_pat]"),
+            "{history}"
         );
+        assert!(!history.to_string().contains(&token), "{history}");
+        assert!(!reply.contains(&token), "{reply}");
     }
 
     #[tokio::test]
