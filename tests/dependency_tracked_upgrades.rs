@@ -8,11 +8,11 @@
 //! up a CI consumer, a plugin manifest floats onto TypeScript 7, or a workflow
 //! action reference loses its SHA pin.
 //!
-//! These tests read only committed files. They perform no network I/O and
-//! invoke no external tools, so they are deterministic on every platform and
-//! can run as the permanent `tracked-upgrades` eval suite.
+//! These tests read committed files from `HEAD` through local git: a dirty
+//! worktree cannot make evidence describe a state that was never committed.
+//! They perform no network I/O and can run as the permanent `tracked-upgrades`
+//! eval suite.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_yaml::Value as YamlValue;
@@ -66,13 +66,38 @@ fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
+fn git_stdout(args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(env!("CARGO_MANIFEST_DIR"))
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("run git {args:?}: {error}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("git {args:?} output is not UTF-8: {error}"))
+}
+
+/// Every path tracked in `HEAD`. Git lists symlinks as blobs and never
+/// recurses into them, so evidence enumeration cannot loop or escape the
+/// checkout through a crafted directory symlink.
+fn committed_files() -> Vec<String> {
+    git_stdout(&["ls-tree", "-r", "--name-only", "HEAD"])
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
 fn read_relative(relative: &str) -> String {
-    let path = repo_path(relative);
-    fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    git_stdout(&["show", &format!("HEAD:{relative}")])
 }
 
 fn read_path(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    read_relative(&relative(path))
 }
 
 /// A parsed `major.minor.patch` version. Pre-release and build suffixes are
@@ -227,53 +252,48 @@ fn root_oxiri_requirement() -> String {
     }
 }
 
-/// Every `.yml`/`.yaml` workflow, sorted for deterministic diagnostics.
-fn workflow_paths() -> Vec<PathBuf> {
-    let directory = repo_path(".github/workflows");
-    let mut paths: Vec<PathBuf> = fs::read_dir(&directory)
-        .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
-        .map(|entry| {
-            entry
-                .unwrap_or_else(|error| panic!("read entry in {}: {error}", directory.display()))
-                .path()
-        })
-        .filter(|path| {
-            matches!(
-                path.extension().and_then(|extension| extension.to_str()),
-                Some("yml" | "yaml")
-            )
-        })
-        .collect();
-    paths.sort();
-    assert!(
-        !paths.is_empty(),
-        "no workflow files found in {}",
-        directory.display()
-    );
-    paths
-}
-
-/// Recursively collect every regular file below `root`.
-fn collect_files(root: &Path, files: &mut Vec<PathBuf>) {
-    let entries =
-        fs::read_dir(root).unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
-    for entry in entries {
-        let path = entry
-            .unwrap_or_else(|error| panic!("read entry in {}: {error}", root.display()))
-            .path();
-        if path.is_dir() {
-            collect_files(&path, files);
-        } else {
-            files.push(path);
-        }
-    }
-}
-
 fn relative(path: &Path) -> String {
     path.strip_prefix(env!("CARGO_MANIFEST_DIR"))
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+/// Select committed paths with a predicate. Enumerating from `git ls-tree`
+/// instead of walking the worktree pins evidence to HEAD and never recurses
+/// into a directory symlink (git records a symlink as a single blob), so a
+/// crafted link cannot loop or escape the checkout and exhaust CI.
+fn committed_paths_where(predicate: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    select_committed_paths(&committed_files(), predicate)
+}
+
+fn select_committed_paths(committed: &[String], predicate: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = committed
+        .iter()
+        .filter(|path| predicate(path))
+        .map(|path| repo_path(path))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Every `.yml`/`.yaml` workflow committed in `.github/workflows`.
+fn workflow_paths() -> Vec<PathBuf> {
+    let paths = committed_paths_where(|path| {
+        path.starts_with(".github/workflows/")
+            && matches!(
+                Path::new(path)
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+                Some("yml" | "yaml")
+            )
+    });
+    assert!(
+        !paths.is_empty(),
+        "no committed workflow files found in .github/workflows; #339 expects at least one"
+    );
+    paths
 }
 
 /// All versions of a crate in the lockfile. Comparing a band instead of the
@@ -295,17 +315,11 @@ fn is_action_descriptor(path: &Path) -> bool {
 }
 
 /// Local composite actions are workflow code: a tracked `uses` inside one is
-/// executed just like a `uses` in a workflow, so it must join the scan.
+/// executed just like a `uses` in a workflow, so it must join the scan. A
+/// workflow may invoke a local action anywhere in the repository, so every
+/// `action.yml`/`action.yaml` is scanned, not just `.github/actions`.
 fn action_descriptor_paths() -> Vec<PathBuf> {
-    let directory = repo_path(".github/actions");
-    if !directory.is_dir() {
-        return Vec::new();
-    }
-    let mut paths = Vec::new();
-    collect_files(&directory, &mut paths);
-    paths.retain(|path| is_action_descriptor(path));
-    paths.sort();
-    paths
+    committed_paths_where(|path| is_action_descriptor(Path::new(path)))
 }
 
 /// Is this file CI/build configuration that could invoke the deferred image?
@@ -335,7 +349,19 @@ fn is_ci_config(path: &Path) -> bool {
     if is_top_level {
         return true;
     }
-    const CI_DIRS: [&str; 6] = ["ci", ".ci", "build", ".build", "infra", ".devcontainer"];
+    // Conventional CI homes, including hosted providers that keep their
+    // pipeline outside .github. A consumer in any of them is still a consumer.
+    const CI_DIRS: [&str; 9] = [
+        "ci",
+        ".ci",
+        "build",
+        ".build",
+        "infra",
+        ".devcontainer",
+        ".circleci",
+        ".buildkite",
+        ".gitlab",
+    ];
     let parent_dirs = &components[..components.len().saturating_sub(1)];
     if parent_dirs
         .iter()
@@ -350,44 +376,19 @@ fn is_ci_config(path: &Path) -> bool {
         || name.starts_with("taskfile")
         || name.ends_with(".mk")
         || name.ends_with(".nix")
+        || name == "jenkinsfile"
+        || name == "azure-pipelines.yml"
+        || name.starts_with(".travis")
         || name == "action.yml"
         || name == "action.yaml";
     is_build_file || (components.len() == 1 && (name.ends_with(".yml") || name.ends_with(".yaml")))
 }
 
-/// Walk the repository for every CI/build config, so a consumer added in a
-/// new CI location cannot escape the no-consumer gate.
+/// Every committed CI/build config, so a consumer added in a new CI location
+/// cannot escape the no-consumer gate. Paths come from HEAD rather than a
+/// filesystem walk, which also keeps symlinks from being traversed.
 fn ci_paths() -> Vec<PathBuf> {
-    fn walk(root: &Path, out: &mut Vec<PathBuf>) {
-        let entries =
-            fs::read_dir(root).unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
-        for entry in entries {
-            let path = entry
-                .unwrap_or_else(|error| panic!("read entry in {}: {error}", root.display()))
-                .path();
-            if path.is_dir() {
-                let name = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("");
-                if matches!(
-                    name,
-                    ".git" | "target" | "node_modules" | "dist" | ".NeuroStrata"
-                ) {
-                    continue;
-                }
-                walk(&path, out);
-            } else if is_ci_config(Path::new(&relative(&path))) {
-                out.push(path);
-            }
-        }
-    }
-    let root = repo_path("");
-    let mut paths = Vec::new();
-    walk(&root, &mut paths);
-    paths.sort();
-    paths.dedup();
-    paths
+    committed_paths_where(|path| is_ci_config(Path::new(path)))
 }
 
 /// `FROM` accepts option flags such as `--platform=` before the image name.
@@ -587,7 +588,19 @@ fn version_annotation(raw: &str, target: &str) -> Option<String> {
             continue;
         };
         let before = &line[..position];
-        if !before.contains("uses") || !before.contains(':') {
+        // Bind the annotation to a YAML `uses` key on this exact source line.
+        // A `run:` command that merely mentions the target with a version
+        // comment is not an action reference and cannot annotate one.
+        let Some(key) = before.rfind("uses") else {
+            continue;
+        };
+        if !before[key + 4..].trim_start().starts_with(':') {
+            continue;
+        }
+        if !before[..key]
+            .chars()
+            .all(|character| matches!(character, ' ' | '\t' | '-' | '{' | ',' | '\'' | '"'))
+        {
             continue;
         }
         let after = &line[position + target.len()..];
@@ -653,22 +666,63 @@ fn typescript_declarations(document: &serde_json::Value) -> Vec<String> {
     .collect()
 }
 
+/// Only the first markdown table is the canonical current-state record. A
+/// stale copy of an old fact elsewhere in the document must not satisfy the
+/// gate while the current-state row says something different.
+fn current_state_table(document: &str) -> String {
+    let mut rows: Vec<&str> = Vec::new();
+    let mut in_table = false;
+    for line in document.lines() {
+        if line.starts_with('|') {
+            in_table = true;
+            rows.push(line);
+        } else if in_table {
+            break;
+        }
+    }
+    rows.join("\n")
+}
+
+/// A tracked action's name, version, and SHA must occupy one table row.
+/// Checking each token anywhere lets two actions swap SHAs and still pass.
+fn decision_record_action_row(document: &str, action: &TrackedAction) -> bool {
+    let name = format!("`{}`", action.name);
+    let version = format!("`{}`", action.version);
+    let sha = format!("`{}`", action.sha);
+    document.lines().any(|line| {
+        if !line.starts_with('|') {
+            return false;
+        }
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        cells.contains(&name.as_str())
+            && cells.contains(&version.as_str())
+            && cells.contains(&sha.as_str())
+    })
+}
+
+/// Recognize a tracked action before splitting off its reference, so an
+/// unqualified `uses: actions/checkout` is still seen and can be rejected.
+fn match_tracked_reference(target: &str) -> Option<(&'static TrackedAction, &str)> {
+    let (name, reference) = target.split_once('@').unwrap_or((target, ""));
+    TRACKED_ACTIONS
+        .iter()
+        .find(|action| action.name == name)
+        .map(|action| (action, reference))
+}
+
 #[test]
 fn tracked_upgrades_decision_record_names_all_four() {
     const RECORD: &str = "docs/superpowers/specs/2026-11-25-tracked-upgrade-dispositions.md";
-    let path = repo_path(RECORD);
     assert!(
-        path.is_file(),
-        "decision record {} is missing; #339 requires one dated record for all four tracked upgrades",
-        path.display()
+        committed_files().iter().any(|path| path == RECORD),
+        "decision record {RECORD} is missing from HEAD; #339 requires one committed dated record for all four tracked upgrades"
     );
     let document = read_relative(RECORD);
 
     for marker in ["oxiri", "Dockerfile.base", "TypeScript", "artifact actions"] {
         assert!(
             document.contains(marker),
-            "decision record {} does not name {marker:?}; all four tracked upgrades must stay documented",
-            path.display()
+            "decision record {RECORD} does not name {marker:?}; all four tracked upgrades must stay documented"
         );
     }
 
@@ -689,22 +743,23 @@ fn tracked_upgrades_decision_record_names_all_four() {
         "**Deferred** to TypeScript 7.1".to_owned(),
         "**Landed** in #340".to_owned(),
     ];
+    let current_state = current_state_table(&document);
+    assert!(
+        !current_state.is_empty(),
+        "decision record {RECORD} has no canonical current-state table"
+    );
     for fact in &recorded {
         assert!(
-            document.contains(fact),
-            "decision record {} no longer records {fact:?}; versions and dispositions must move with the gate (#339)",
-            path.display()
+            current_state.contains(fact),
+            "canonical current-state table in {RECORD} no longer records {fact:?}; versions and dispositions must move with the gate, and a stale copy elsewhere cannot satisfy it (#339)"
         );
     }
     for action in &TRACKED_ACTIONS {
-        for token in [action.sha, action.version] {
-            assert!(
-                document.contains(token),
-                "decision record {} no longer records {token:?} for {}; the SHA/version table must match the workflow gate (#339)",
-                path.display(),
-                action.name
-            );
-        }
+        assert!(
+            decision_record_action_row(&document, action),
+            "decision record {RECORD} has no row pairing {} with {} and {}; swapping SHAs between actions must fail the gate (#339)",
+            action.name, action.version, action.sha
+        );
     }
 }
 
@@ -888,11 +943,7 @@ fn dockerfile_base_has_no_ci_consumer() {
 
     let offenders: Vec<String> = files
         .iter()
-        .filter(|path| {
-            let bytes =
-                fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-            String::from_utf8_lossy(&bytes).contains("Dockerfile.base")
-        })
+        .filter(|path| read_relative(&relative(path)).contains("Dockerfile.base"))
         .map(|path| relative(path))
         .collect();
 
@@ -920,63 +971,49 @@ fn typescript_pins_are_6_0_3_across_plugins_and_web_ui() {
     // The known eight must still exist — a deleted manifest fails here —
     // but the checked set is discovered from the repository, so a newly
     // added plugins/*/package.json is gated too instead of escaping.
+    let committed = committed_files();
     for manifest in KNOWN_MANIFESTS {
         assert!(
-            repo_path(manifest).is_file(),
-            "known TypeScript manifest {manifest} is missing; #339 pins all eight manifests to {PIN}"
+            committed.iter().any(|path| path == manifest),
+            "known TypeScript manifest {manifest} is missing from HEAD; #339 pins all eight manifests to {PIN}"
         );
     }
     let mut manifests: Vec<String> = KNOWN_MANIFESTS
         .iter()
         .map(|manifest| (*manifest).to_owned())
         .collect();
-    let plugins_dir = repo_path("plugins");
-    let mut plugin_entries: Vec<PathBuf> = fs::read_dir(&plugins_dir)
-        .unwrap_or_else(|error| panic!("read {}: {error}", plugins_dir.display()))
-        .map(|entry| {
-            entry
-                .unwrap_or_else(|error| panic!("read entry in {}: {error}", plugins_dir.display()))
-                .path()
-        })
-        .collect();
-    plugin_entries.sort();
-    for entry in plugin_entries {
-        let candidate = entry.join("package.json");
-        if candidate.is_file() {
-            let discovered = relative(&candidate).replace('\\', "/");
-            if !manifests.contains(&discovered) {
-                manifests.push(discovered);
-            }
+    for path in &committed {
+        if path.starts_with("plugins/")
+            && path.ends_with("/package.json")
+            && !manifests.contains(path)
+        {
+            manifests.push(path.clone());
         }
     }
     manifests.sort();
 
     for manifest in &manifests {
         let manifest = manifest.as_str();
-        let path = repo_path(manifest);
         let raw = read_relative(manifest);
-        let document: serde_json::Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+        let document: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|error| panic!("parse {manifest}: {error}"));
         // Both dependency maps are checked: a manifest that declares
         // TypeScript twice must not pass on the dev pin while a conflicting
         // runtime pin silently selects a different compiler.
         let declarations = typescript_declarations(&document);
         assert!(
             !declarations.is_empty(),
-            "{} has no typescript dependency; #339 pins every plugin and web-ui manifest to {PIN}",
-            path.display()
+            "{manifest} has no typescript dependency; #339 pins every plugin and web-ui manifest to {PIN}"
         );
         for typescript in declarations {
             assert_eq!(
                 typescript, PIN,
-                "{} pins TypeScript {typescript:?}; #339 requires {PIN} across every plugin and web-ui manifest",
-                path.display()
+                "{manifest} pins TypeScript {typescript:?}; #339 requires {PIN} across every plugin and web-ui manifest"
             );
             let parsed = Version::parse(typescript.trim().trim_start_matches('~'));
             assert_ne!(
                 parsed.major, 7,
-                "{} selects TypeScript 7.x ({typescript:?}); the 7.1 migration is a separate tracked upgrade (#339)",
-                path.display()
+                "{manifest} selects TypeScript 7.x ({typescript:?}); the 7.1 migration is a separate tracked upgrade (#339)"
             );
         }
     }
@@ -999,15 +1036,18 @@ fn artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned() {
         for (index, (target, annotation)) in
             workflow_action_references(&path).into_iter().enumerate()
         {
-            let Some((action, reference)) = target.split_once('@') else {
+            let Some((tracked, reference)) = match_tracked_reference(&target) else {
                 continue;
             };
-            let Some(tracked) = TRACKED_ACTIONS
-                .iter()
-                .find(|candidate| candidate.name == action)
-            else {
-                continue;
-            };
+            let action = tracked.name;
+            // A tracked action without `@` is still a reference. Skipping it
+            // lets one floating target hide behind another pinned reference.
+            assert!(
+                !reference.is_empty(),
+                "{}:{}: {action} has no @ reference; every tracked action must be pinned to a full SHA even when another reference is correct (#339)",
+                relative(&path),
+                index + 1
+            );
 
             assert!(
                 is_full_sha(reference),
@@ -1253,5 +1293,115 @@ fn yaml_uses_collection_ignores_nested_data_fields() {
         uses,
         ["actions/checkout@real", "actions/checkout@reusable"],
         "only executable step and reusable-job uses declarations are action references"
+    );
+}
+
+#[test]
+fn version_annotation_ignores_run_line_that_mentions_uses() {
+    let raw = "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@abc\n      - run: echo \"uses: actions/checkout@abc # v7.0.1\"\n";
+    assert_eq!(
+        version_annotation(raw, "actions/checkout@abc"),
+        None,
+        "a run: command that mentions the target is not a uses key and cannot annotate it"
+    );
+    let flow =
+        "jobs:\n  build:\n    steps:\n      - { uses: 'actions/checkout@abc', name: c } # v7.0.1\n";
+    assert_eq!(
+        version_annotation(flow, "actions/checkout@abc").as_deref(),
+        Some("v7.0.1"),
+        "a flow-style uses key on the same line still carries its annotation"
+    );
+}
+
+#[test]
+fn is_ci_config_recognizes_hosted_ci_and_root_pipelines() {
+    for path in [
+        ".circleci/config.yml",
+        ".buildkite/pipeline.yml",
+        ".gitlab-ci.yml",
+        "Jenkinsfile",
+        "azure-pipelines.yml",
+    ] {
+        assert!(
+            is_ci_config(Path::new(path)),
+            "{path} is a conventional CI config and must be scanned for Dockerfile.base consumers"
+        );
+    }
+}
+
+#[test]
+fn committed_enumeration_never_follows_symlinks() {
+    // A directory symlink is a single blob in git and is never recursed into.
+    // Enumeration driven by the committed path list cannot reach paths that
+    // exist only behind such a link.
+    let committed = vec![
+        "ci/config.yml".to_owned(),
+        ".github/actions/local/action.yml".to_owned(),
+        ".github/actions/local/link".to_owned(),
+        "docs/notes.md".to_owned(),
+    ];
+    let ci = select_committed_paths(&committed, |path| is_ci_config(Path::new(path)));
+    assert!(ci.iter().any(|path| relative(path) == "ci/config.yml"));
+    assert!(ci
+        .iter()
+        .all(|path| committed.iter().any(|entry| entry == &relative(path))));
+    assert!(!ci.iter().any(|path| relative(path).starts_with("ci/link/")));
+    let descriptors =
+        select_committed_paths(&committed, |path| is_action_descriptor(Path::new(path)));
+    assert_eq!(
+        descriptors
+            .iter()
+            .map(|path| relative(path))
+            .collect::<Vec<_>>(),
+        [".github/actions/local/action.yml"],
+        "only committed descriptors are collected; a symlink blob is not expanded"
+    );
+}
+
+#[test]
+fn match_tracked_reference_detects_unqualified_target() {
+    let (action, reference) =
+        match_tracked_reference("actions/checkout").expect("checkout is tracked");
+    assert_eq!(action.name, "actions/checkout");
+    assert_eq!(
+        reference, "",
+        "an unqualified tracked target must be visible to the gate"
+    );
+    assert!(match_tracked_reference("actions/checkout@abc").is_some());
+    assert!(match_tracked_reference("actions/untracked@abc").is_none());
+}
+
+#[test]
+fn decision_record_action_rows_reject_swapped_shas() {
+    let document = "| Action | Version | SHA |\n| --- | --- | --- |\n| `actions/upload-artifact` | `v7.0.2` | `aaa` |\n| `actions/checkout` | `v7.0.1` | `bbb` |\n";
+    let upload = TrackedAction {
+        name: "actions/upload-artifact",
+        slot: 0,
+        major: 7,
+        sha: "aaa",
+        version: "v7.0.2",
+    };
+    assert!(decision_record_action_row(document, &upload));
+    let swapped = TrackedAction {
+        name: "actions/upload-artifact",
+        slot: 0,
+        major: 7,
+        sha: "bbb",
+        version: "v7.0.2",
+    };
+    assert!(
+        !decision_record_action_row(document, &swapped),
+        "swapping SHAs keeps every token present but must break the action/version/SHA pairing"
+    );
+}
+
+#[test]
+fn current_state_table_ignores_stale_prose() {
+    let document = "| Item | Current state | Disposition |\n| --- | --- | --- |\n| `oxiri` | root pin `0.3` | **Blocked** by `spareval 0.2.9` |\n\nOld note: root pin `0.2` was recorded here.\n";
+    let table = current_state_table(document);
+    assert!(table.contains("root pin `0.3`"));
+    assert!(
+        !table.contains("root pin `0.2`"),
+        "a stale copy in later prose must not satisfy the canonical current-state gate"
     );
 }

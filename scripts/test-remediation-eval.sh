@@ -30,7 +30,7 @@ cat > "$tmp/registry.json" <<'JSON'
 JSON
 
 EVAL_REGISTRY="$tmp/registry.json" EVAL_ALLOW_DIRTY=1 \
-  bash "$root/scripts/remediation-eval.sh" self-pass --json "$tmp/pass.json"
+  bash "$root/scripts/remediation-eval.sh" self-pass --json "$tmp/pass.json" >/dev/null
 jq -e '.verdict == "PASS" and .failed == 0 and .ignored == 0' "$tmp/pass.json" >/dev/null
 
 if EVAL_REGISTRY="$tmp/registry.json" EVAL_ALLOW_DIRTY=1 \
@@ -80,7 +80,7 @@ cat > "$tmp/path-registry.json" <<'JSON'
 JSON
 
 # --json must not delete the registry used by the same run.
-cp "$tmp/path-registry.json" "$tmp/protected-registry.json"
+cp -f "$tmp/path-registry.json" "$tmp/protected-registry.json"
 if EVAL_REGISTRY="$tmp/protected-registry.json" EVAL_ALLOW_DIRTY=1 \
   bash "$root/scripts/remediation-eval.sh" quick-pass --json "$tmp/protected-registry.json" >/dev/null 2>&1; then
   echo "FAIL: --json colliding with the registry was accepted" >&2
@@ -91,21 +91,54 @@ if ! jq -e . "$tmp/protected-registry.json" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Any existing repository input is protected, not just the named paths.
+if EVAL_REGISTRY="$tmp/path-registry.json" EVAL_ALLOW_DIRTY=1 \
+  bash "$root/scripts/remediation-eval.sh" quick-pass --json "$root/Cargo.toml" >/dev/null 2>&1; then
+  echo "FAIL: --json naming a repository input was accepted" >&2
+  exit 1
+fi
+if ! [ -f "$root/Cargo.toml" ]; then
+  echo "FAIL: evaluation deleted a repository input" >&2
+  exit 1
+fi
+
 # Two runs on one output path must not publish another run's verdict.
+mkdir -p "$tmp/shared-locks"
 EVAL_REGISTRY="$tmp/path-registry.json" EVAL_ALLOW_DIRTY=1 \
-  bash "$root/scripts/remediation-eval.sh" quick-fail --json "$tmp/race.json" >/dev/null 2>&1 &
+  REMEDIATION_EVAL_LOCK_DIR="$tmp/shared-locks" \
+  bash "$root/scripts/remediation-eval.sh" quick-fail --json "$tmp/race.json" >"$tmp/fail.out" 2>/dev/null &
 fail_pid=$!
 EVAL_REGISTRY="$tmp/path-registry.json" EVAL_ALLOW_DIRTY=1 \
-  bash "$root/scripts/remediation-eval.sh" quick-pass --json "$tmp/race.json" >/dev/null 2>&1 &
+  REMEDIATION_EVAL_LOCK_DIR="$tmp/shared-locks" \
+  bash "$root/scripts/remediation-eval.sh" quick-pass --json "$tmp/race.json" >"$tmp/pass.out" 2>/dev/null &
 pass_pid=$!
 if wait "$fail_pid"; then
   echo "FAIL: concurrent renamed expectation passed" >&2
   exit 1
 fi
 wait "$pass_pid"
-if [ -e "$tmp/race.json" ] && ! jq -e '.verdict == "PASS" and .suite == "quick-pass"' "$tmp/race.json" >/dev/null; then
-  echo "FAIL: concurrent runs published an inconsistent verdict" >&2
+fail_id=$(sed -n 's/^run_id=//p' "$tmp/fail.out" | head -1)
+pass_id=$(sed -n 's/^run_id=//p' "$tmp/pass.out" | head -1)
+if [ -z "$fail_id" ] || [ -z "$pass_id" ]; then
+  echo "FAIL: runs did not emit run ids for verdict attribution" >&2
   exit 1
+fi
+if [ -z "$(ls -A "$tmp/shared-locks")" ]; then
+  echo "FAIL: no lock shared outside the worktree was used" >&2
+  exit 1
+fi
+if grep -q '"verdict":"PASS"' "$tmp/fail.out"; then
+  echo "FAIL: the failing run published a PASS verdict" >&2
+  exit 1
+fi
+if [ -e "$tmp/race.json" ]; then
+  # A final PASS is acceptable only when it belongs to the passing run,
+  # never to the failing run or to an earlier invocation.
+  if ! jq -e --arg pass "$pass_id" --arg fail "$fail_id" \
+    '.verdict == "PASS" and .run_id == $pass and .run_id != $fail' "$tmp/race.json" >/dev/null; then
+    echo "FAIL: a stale or foreign verdict was left at the shared output path" >&2
+    exit 1
+  fi
 fi
 
 echo "remediation-eval self-test: PASS"
