@@ -140,12 +140,30 @@ pub fn single_prefix_matches(location: &str, prefix: &str) -> bool {
     }
     let pref = normalize_prefix_comparison_value(prefix);
     if pref.is_empty() {
-        return loc != ".." && !loc.starts_with("../");
+        return stays_below(&loc);
     }
     loc == pref
         || loc
             .strip_prefix(&pref)
-            .is_some_and(|rest| rest.starts_with('/'))
+            .is_some_and(|rest| rest.starts_with('/') && stays_below(rest))
+}
+
+/// Whether `rest`, the part of a location after a matched prefix, stays below
+/// that prefix: a `..` that climbs out of it (`docs/../other.rs` under `docs`)
+/// names a sibling, not something inside the prefix.
+fn stays_below(rest: &str) -> bool {
+    let mut depth = 0usize;
+    for component in rest.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => match depth.checked_sub(1) {
+                Some(d) => depth = d,
+                None => return false,
+            },
+            _ => depth += 1,
+        }
+    }
+    true
 }
 
 /// A location matches when any resolved spelling of the requested prefix matches.
@@ -420,6 +438,25 @@ mod tests {
         assert!(!path_prefix_forms_match("/other/src/lib.rs", &forms));
         assert!(!path_prefix_forms_match("../other/src/lib.rs", &forms));
         assert!(!path_prefix_forms_match("", &forms));
+        assert!(!path_prefix_forms_match("src/../../other/lib.rs", &forms));
+        assert!(!path_prefix_forms_match(
+            "/repo/src/../../other/lib.rs",
+            &forms
+        ));
+    }
+
+    #[test]
+    fn a_prefix_does_not_match_a_location_that_climbs_out_of_it() {
+        for prefix in ["/repo/src/../docs", "/repo/docs", "docs"] {
+            let inside = format!("{prefix}/a.md");
+            let deeper = format!("{prefix}/x/../a.md");
+            let sibling = format!("{prefix}/../other.rs");
+            assert!(single_prefix_matches(&inside, prefix), "{inside}");
+            assert!(single_prefix_matches(&deeper, prefix), "{deeper}");
+            assert!(!single_prefix_matches(&sibling, prefix), "{sibling}");
+            let sibling = format!(r"{prefix}\x\..\..\other.rs");
+            assert!(!single_prefix_matches(&sibling, prefix), "{sibling}");
+        }
     }
 
     #[test]
