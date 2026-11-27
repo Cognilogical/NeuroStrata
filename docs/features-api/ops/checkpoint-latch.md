@@ -87,13 +87,13 @@ absent, and a status payload written before they existed still parses.
 
    ```bash
    # ~/.config/neurostrata/config.json
-   { "storage_hygiene": { "buffer_pool_mb": 768 } }
+   { "store": { "buffer_pool_bytes": 805306368 } }
    ```
 
-   or, per process:
+   The pool is configured in bytes only. Or, per process:
 
    ```bash
-   NEUROSTRATA_BUFFER_POOL_MB=768 neurostrata-mcp daemon
+   NEUROSTRATA_BUFFER_POOL_BYTES=805306368 neurostrata-mcp daemon
    ```
 
    `0` hands sizing back to the engine (it sizes the pool to most of the
@@ -124,7 +124,7 @@ the next open is clean.
 ## 5. What this does not do
 
 - It does not resize the pool. Sizing is a configuration decision (see
-  `storage_hygiene.buffer_pool_mb`); the floor exists because a pool too small
-  for a single query makes queries fail.
+  `store.buffer_pool_bytes`); the floor exists because a pool too small for a
+  single query makes queries fail.
 - It does not remove the retry loop's cause. It removes the retries.
 - It does not persist the latch across restarts. A restart is the recovery.

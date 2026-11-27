@@ -102,7 +102,7 @@ pub(crate) fn annotate_daemon_memory_error(msg: &str) -> String {
         || lower.contains("out of memory")
         || lower.contains("cannot allocate memory")
     {
-        let advice = " [NEUROSTRATA_ADVICE[daemon_memory]: raise NEUROSTRATA_BUFFER_POOL_MB or storage_hygiene.buffer_pool_mb and restart the daemon]";
+        let advice = " [NEUROSTRATA_ADVICE[daemon_memory]: raise NEUROSTRATA_BUFFER_POOL_BYTES or store.buffer_pool_bytes and restart the daemon]";
         if !msg.contains("NEUROSTRATA_ADVICE[daemon_memory]") {
             return format!("{msg}{advice}");
         }

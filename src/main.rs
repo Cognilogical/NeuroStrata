@@ -8640,6 +8640,9 @@ where
 
 fn main() -> anyhow::Result<()> {
     init_tracing();
+    // #414: megabyte pool settings are not accepted anywhere; fail before
+    // hooks, daemon start, or database open with the exact byte replacement.
+    config::reject_legacy_pool_env()?;
     let runtime = runtime()?;
     runtime.block_on(run())
 }

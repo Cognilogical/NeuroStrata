@@ -16,6 +16,8 @@ Starts the NeuroStrata MCP server (HTTP loopback on `127.0.0.1:34343` and/or std
 neurostrata-mcp daemon
 ```
 
+Startup fails before any hook, daemon, or database work when the retired `NEUROSTRATA_BUFFER_POOL_MB` variable is set or the loaded config contains `storage_hygiene.buffer_pool_mb`. The error names the exact byte replacement: `NEUROSTRATA_BUFFER_POOL_BYTES=<mb * 1048576>` or `store.buffer_pool_bytes=<mb * 1048576>`. The megabyte spellings are recognized only to produce that error, never as pool configuration; bytes-only settings govern (`neurostrata-o6d1`, `#414`). See [Building](ops/building.md).
+
 ### `status`
 
 Read-only preflight check reporting store health, lock holder, and whether the running daemon matches the on-disk binary build.

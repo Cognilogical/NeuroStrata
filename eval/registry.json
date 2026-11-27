@@ -387,7 +387,7 @@
         "store::ladybug::checkpoint_latch_tests::a_successful_checkpoint_after_the_latch_reenables_the_engine",
         "store::ladybug::checkpoint_latch_tests::a_repeated_out_of_pool_failure_keeps_the_latch",
         "store::ladybug::checkpoint_latch_tests::a_clean_close_after_the_re_enable_leaves_no_write_ahead_log",
-        "store::ladybug::buffer_pool_tests::a_checkpoint_out_of_pool_is_not_retried"
+        "store::ladybug::checkpoint_latch_tests::a_checkpoint_out_of_pool_is_not_retried"
       ],
       "thresholds": {
         "ignored": 0,
@@ -603,6 +603,63 @@
         "store::ladybug::tests::memories_for_file_forms_matches_per_form_failures_and_empty_input",
         "store::ladybug::tests::memories_for_file_forms_matches_per_form_retirement_boundary",
         "paths::tests::prefix_equal_to_configured_or_checkout_root_resolves_to_root_forms"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
+    "store-size-cap": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::store_limits_tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp config::tests::store_limits_parse_from_json -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_write_exactly_at_the_cap_is_allowed_and_one_byte_over_is_not -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::the_engine_config_carries_the_size_cap_backstop -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_write_that_would_pass_the_cap_is_refused_and_lands_nothing -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_oversized_single_payload_is_refused_before_the_engine_write -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_action_batch_that_would_pass_the_cap_lands_nothing -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_over_cap_store_still_opens_and_reads -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_over_cap_store_recovers_its_wal_and_verified_reopens -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::concurrent_writers_cannot_both_pass_the_cap -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_write_within_the_cap_succeeds_and_persists -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::estimates_count_every_persisted_field_and_edge -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp config::tests::a_null_byte_setting_does_not_hide_the_legacy_pool -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::store_limits_tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::estimates_include_generated_stubs_edges_and_provenance -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::a_failed_size_measurement_is_an_error_not_zero -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_ordinary_counter_write_is_refused_when_the_store_is_full -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::the_cap_error_permits_only_individual_hallucination_deletes -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::the_cap_guard_lock_excludes_a_second_handle -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::publishing_a_generation_is_refused_when_the_store_is_full -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::an_edge_batch_estimate_counts_every_target_and_the_metadata_rewrite -- --test-threads=1"
+      ],
+      "tests": [
+        "config::tests::store_limits_parse_from_json",
+        "config::tests::a_null_byte_setting_does_not_hide_the_legacy_pool",
+        "store::ladybug::store_limits_tests::the_environment_wins_over_the_config",
+        "store::ladybug::store_limits_tests::an_unparseable_environment_value_falls_back_to_the_config",
+        "store::ladybug::store_limits_tests::zero_means_no_cap_and_the_default_pool_is_bytes",
+        "store::ladybug::store_limits_tests::a_pool_below_the_floor_is_raised_and_said_so",
+        "store::ladybug::store_limits_tests::the_legacy_megabyte_key_is_read_once_with_a_warning",
+        "store::ladybug::store_limits_tests::the_legacy_megabyte_environment_fills_in_when_the_byte_variable_is_absent",
+        "store::ladybug::store_limits_tests::with_limits_on_installs_the_backstop_and_pool_in_the_engine_config",
+        "store::ladybug::store_limits_tests::load_from_emits_the_deprecation_warning_exactly_once",
+        "store::ladybug::tests::a_write_exactly_at_the_cap_is_allowed_and_one_byte_over_is_not",
+        "store::ladybug::tests::the_engine_config_carries_the_size_cap_backstop",
+        "store::ladybug::tests::a_write_that_would_pass_the_cap_is_refused_and_lands_nothing",
+        "store::ladybug::tests::an_oversized_single_payload_is_refused_before_the_engine_write",
+        "store::ladybug::tests::an_action_batch_that_would_pass_the_cap_lands_nothing",
+        "store::ladybug::tests::an_over_cap_store_still_opens_and_reads",
+        "store::ladybug::tests::an_over_cap_store_recovers_its_wal_and_verified_reopens",
+        "store::ladybug::tests::concurrent_writers_cannot_both_pass_the_cap",
+        "store::ladybug::tests::a_write_within_the_cap_succeeds_and_persists",
+        "store::ladybug::tests::estimates_count_every_persisted_field_and_edge",
+        "store::ladybug::tests::estimates_include_generated_stubs_edges_and_provenance",
+        "store::ladybug::tests::a_failed_size_measurement_is_an_error_not_zero",
+        "store::ladybug::tests::an_ordinary_counter_write_is_refused_when_the_store_is_full",
+        "store::ladybug::tests::the_cap_error_permits_only_individual_hallucination_deletes",
+        "store::ladybug::tests::the_cap_guard_lock_excludes_a_second_handle",
+        "store::ladybug::tests::publishing_a_generation_is_refused_when_the_store_is_full",
+        "store::ladybug::tests::an_edge_batch_estimate_counts_every_target_and_the_metadata_rewrite"
       ],
       "thresholds": {
         "ignored": 0

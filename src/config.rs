@@ -91,6 +91,63 @@ impl Default for DeduplicationConfig {
     }
 }
 
+/// Byte-denominated store settings (#414). Both values are in bytes so the
+/// buffer pool and the size cap are commensurable. The older megabyte knob is
+/// deprecated and migrated on load, never used as a second live setting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct StoreConfig {
+    /// Cap on the engine's buffer pool. `None` uses the 384 MiB default and
+    /// `Some(0)` hands sizing back to the engine. Values below the 128 MiB
+    /// floor are raised to it in `store::ladybug`.
+    pub buffer_pool_bytes: Option<u64>,
+    /// Hard cap on the store's on-disk bytes (database plus write-ahead log).
+    /// `None` or `Some(0)` means no cap.
+    pub max_db_bytes: Option<u64>,
+}
+
+/// #414 owner ruling (2026-11-27): no megabyte knob is configuration. A legacy
+/// value is recognized only to fail with the exact byte replacement.
+fn legacy_pool_error(legacy_key: &str, replacement_key: &str, value: &str, mb: u64) -> String {
+    format!(
+        "{legacy_key}={value} is no longer accepted; replace it with \
+         {replacement_key}={} bytes",
+        mb.saturating_mul(1024 * 1024)
+    )
+}
+
+/// Error text for the legacy environment variable, including the exact byte
+/// replacement when the value is numeric.
+pub(crate) fn legacy_pool_env_error(value: &str) -> String {
+    let value = value.trim();
+    match value.parse::<u64>() {
+        Ok(mb) => legacy_pool_error(
+            "NEUROSTRATA_BUFFER_POOL_MB",
+            "NEUROSTRATA_BUFFER_POOL_BYTES",
+            value,
+            mb,
+        ),
+        Err(_) => format!(
+            "NEUROSTRATA_BUFFER_POOL_MB={value:?} is no longer accepted; replace it with \
+             NEUROSTRATA_BUFFER_POOL_BYTES=<bytes>; the megabyte variable must not be set"
+        ),
+    }
+}
+
+/// The real environment check. `None` (unset or empty) is the only accepted
+/// state; any legacy value fails closed.
+pub(crate) fn reject_legacy_pool_env_at(value: Option<&str>) -> Result<()> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(value) => anyhow::bail!("{}", legacy_pool_env_error(value)),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn reject_legacy_pool_env() -> Result<()> {
+    let raw = std::env::var("NEUROSTRATA_BUFFER_POOL_MB").ok();
+    reject_legacy_pool_env_at(raw.as_deref())
+}
+
 #[derive(Debug, Deserialize, serde::Serialize)]
 pub struct Config {
     #[serde(default)]
@@ -121,6 +178,9 @@ pub struct Config {
 
     #[serde(default)]
     pub storage_hygiene: crate::storage::snapshot::StorageHygieneConfig,
+
+    #[serde(default)]
+    pub store: StoreConfig,
 
     #[serde(default)]
     pub rag_chat: crate::rag_chat::RagChatConfig,
@@ -194,6 +254,7 @@ impl Config {
                 lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
                 hybrid_weights: default_hybrid_weights(),
                 storage_hygiene: crate::storage::snapshot::StorageHygieneConfig::default(),
+                store: StoreConfig::default(),
                 rag_chat: crate::rag_chat::RagChatConfig::default(),
                 multimodal: crate::multimodal::MultimodalConfig::default(),
                 federation_allowed_hosts: Vec::new(),
@@ -229,7 +290,20 @@ impl Config {
     pub fn load_from(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Could not read config at {}", path.display()))?;
+        reject_legacy_pool_env()?;
         let mut config: Config = serde_json::from_str(&content)?;
+
+        if let Some(mb) = config.storage_hygiene.legacy_buffer_pool_mb {
+            anyhow::bail!(
+                "{}",
+                legacy_pool_error(
+                    "storage_hygiene.buffer_pool_mb",
+                    "store.buffer_pool_bytes",
+                    &mb.to_string(),
+                    mb,
+                )
+            );
+        }
 
         if config.db_path.is_dir() {
             config.db_path = config.db_path.join("ladybug.db");
@@ -689,6 +763,60 @@ mod tests {
         dir
     }
 
+    /// Issue #414: the byte-denominated store settings parse from the
+    /// `store` object, and a config that predates them gets `None` for both
+    /// (resolution then applies the defaults).
+    #[test]
+    fn store_limits_parse_from_json() {
+        let config: Config = serde_json::from_str(
+            r#"{"db_path":"test.db","store":{"buffer_pool_bytes":536870912,"max_db_bytes":1073741824}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.store.buffer_pool_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(config.store.max_db_bytes, Some(1024 * 1024 * 1024));
+
+        let bare: Config = serde_json::from_str(r#"{"db_path":"test.db"}"#).unwrap();
+        assert_eq!(bare.store, StoreConfig::default());
+        assert!(bare.store.buffer_pool_bytes.is_none());
+        assert!(bare.store.max_db_bytes.is_none());
+    }
+
+    /// Owner ruling 2026-11-27 (#414): the megabyte key is not configuration.
+    /// It is recognized only to fail with the exact byte replacement, whether
+    /// or not a byte setting is also present.
+    #[test]
+    fn a_legacy_megabyte_pool_key_is_rejected_with_a_byte_migration_error() {
+        let dir = temp_dir("legacy-pool");
+        let path = dir.join("config.json");
+        let legacy = r#"{"db_path":"test.db","store":{"buffer_pool_bytes":null},"storage_hygiene":{"buffer_pool_mb":768}}"#;
+        fs::write(&path, legacy).unwrap();
+        let err = Config::load_from(&path).unwrap_err().to_string();
+        assert!(err.contains("storage_hygiene.buffer_pool_mb"), "{err}");
+        assert!(err.contains("store.buffer_pool_bytes=805306368"), "{err}");
+        assert!(err.contains("no longer accepted"), "{err}");
+
+        let both = r#"{"db_path":"test.db","store":{"buffer_pool_bytes":536870912},"storage_hygiene":{"buffer_pool_mb":768}}"#;
+        fs::write(&path, both).unwrap();
+        let err = Config::load_from(&path).unwrap_err().to_string();
+        assert!(err.contains("store.buffer_pool_bytes=805306368"), "{err}");
+    }
+
+    /// The byte-only setting loads and is the only pool key that round-trips.
+    #[test]
+    fn byte_pool_settings_load_without_any_legacy_field() {
+        let dir = temp_dir("byte-pool");
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"db_path":"test.db","store":{"buffer_pool_bytes":536870912}}"#,
+        )
+        .unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.store.buffer_pool_bytes, Some(536870912));
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains("buffer_pool_mb"), "{serialized}");
+    }
+
     #[test]
     fn config_without_project_contexts_deserializes_empty_registry() {
         let config: Config = serde_json::from_str(r#"{"db_path":"db"}"#).unwrap();
@@ -848,6 +976,7 @@ mod tests {
             lexical_fuzzy_max_distance: default_lexical_fuzzy_max_distance(),
             hybrid_weights: default_hybrid_weights(),
             storage_hygiene: crate::storage::StorageHygieneConfig::default(),
+            store: StoreConfig::default(),
             rag_chat: crate::rag_chat::RagChatConfig::default(),
             multimodal: crate::multimodal::MultimodalConfig::default(),
             federation_allowed_hosts: Vec::new(),

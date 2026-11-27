@@ -4571,7 +4571,8 @@ describe('daemon memory advisory (#140)', () => {
     const first = extractDaemonMemoryAdvisory(text, showAt)
     assert.notEqual(first, null, 'a marked error channel yields the advisory')
     assert.match(first, /DAEMON MEMORY ADVISORY/)
-    assert.match(first, /NEUROSTRATA_BUFFER_POOL_MB/)
+    assert.match(first, /NEUROSTRATA_BUFFER_POOL_BYTES/)
+    assert.match(first, /store\.buffer_pool_bytes/)
 
     const withinWindow = extractDaemonMemoryAdvisory(
       text,

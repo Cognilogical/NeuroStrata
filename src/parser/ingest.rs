@@ -4892,8 +4892,8 @@ use super::x;"#;
     }
 
     /// Memory probe, not a correctness test: ingests `NS_PROBE_DIR` twice into a
-    /// store opened the way the daemon opens it (default 384 MB buffer-pool cap;
-    /// set `NEUROSTRATA_BUFFER_POOL_MB=0` to measure the engine default) so peak
+    /// store opened the way the daemon opens it (default 384 MiB buffer-pool cap;
+    /// set `NEUROSTRATA_BUFFER_POOL_BYTES=0` to measure the engine default) so peak
     /// working set can be read from outside the process. Run:
     ///   NS_PROBE_DIR=<dir> cargo test --bin neurostrata-mcp ingest_memory_probe -- --ignored --nocapture
     #[tokio::test]
