@@ -17190,6 +17190,39 @@ eurostrata\src\daemon.rs",
         }
     }
 
+    #[tokio::test]
+    async fn ontobug_catalog_marks_dirty_only_after_the_turn_is_held() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store =
+            LadybugStore::for_testing(dir.path().join("db"), 4).expect("open temp database");
+        let _ = store.dirty.take();
+
+        // A caller that gave up while queued dispatched nothing, so it must
+        // not mark the store dirty for a checkpoint to flush.
+        let held = Arc::clone(&store.write_lock).lock_owned().await;
+        let queued = store.with_ontobug_catalog(|_| Ok::<(), ontobug::Error>(()));
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(20), queued).await;
+        assert!(timed_out.is_err(), "a held turn must not be acquired");
+        assert!(
+            !store.dirty.is_set(),
+            "a queued cancellation must not mark the store dirty"
+        );
+        drop(held);
+
+        // The turn is held now: a catalog operation that ends in an error has
+        // still had its chance to mutate the database, so it must mark dirty.
+        let err = store
+            .with_ontobug_catalog(|_| -> std::result::Result<(), ontobug::Error> {
+                Err(ontobug::Error::Other("boom".to_string()))
+            })
+            .await;
+        assert!(err.is_err(), "the catalog error must reach the caller");
+        assert!(
+            store.dirty.is_set(),
+            "a catalog mutation that ends in an error must leave the store dirty"
+        );
+    }
+
     #[test]
     fn a_first_read_starts_the_count_at_one() {
         assert_eq!(
@@ -36382,6 +36415,13 @@ impl LadybugStore {
         let _guard = self
             .acquire_write_turn_within("updating the ontobug catalog", write_turn_budget())
             .await?;
+        // Constructed only after the turn is held: a caller that gave up while
+        // queued returns above and marks nothing, while schema init or a caller
+        // mutation that ends in an error still leaves the flag set for a
+        // checkpoint to flush.
+        let _dirty = MarkDirtyOnDrop {
+            dirty: Arc::clone(&self.dirty),
+        };
         let mut catalog = ontobug::Catalog::from_database(self.db.clone(), &self.local_path)
             .map_err(|e| anyhow::anyhow!(e))?;
         f(&mut catalog).map_err(|e| anyhow::anyhow!(e))
