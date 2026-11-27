@@ -3930,6 +3930,11 @@ pub async fn handle_task_complete(
     // `extracted_from: [id]`).
     let mut memories = list_now().await?;
     let mut edge = gate::extraction_exists(&memories, &id, now);
+    // What the gate credited before this call wrote anything: the emit site
+    // below distinguishes a first completion (the edge is this call's own
+    // work, or nobody named a lesson) from a retry after a failed durable
+    // append (the edge survived the failed attempt).
+    let edge_stored_before_call = edge;
 
     // Path 2: bind an already-written memory. Its existing vector is reused
     // verbatim -- linking must never change what the memory ranks for.
@@ -4182,10 +4187,21 @@ pub async fn handle_task_complete(
     // every subscriber down a chain that does not exist. The ordering is the
     // invariant -- nothing re-derives it from the adjacent check.
     // A retry after a failed durable append can find the extraction edge
-    // already stored (path 1/2) and would otherwise skip the pulse, leaving a
-    // stored mutation without its mesh sync record. Re-emit from the linked id
-    // too; the worker's idempotency absorbs a genuine duplicate.
-    let announced_lesson = inline_lesson.or_else(|| link_memory_id.clone());
+    // already stored by the failed attempt and would otherwise skip the
+    // pulse, leaving a stored mutation without its mesh sync record. The
+    // retry signature is narrow: the edge was durable when the call arrived
+    // AND the caller still named `link_memory_id`. A first completion never
+    // presents that pairing -- a plain link stores its edge inside this call,
+    // and a Path 1 completion has no lesson to name -- so both stay silent.
+    // The worker's idempotency absorbs the duplicate a genuine retry can
+    // produce.
+    let announced_lesson = inline_lesson.or_else(|| {
+        if edge_stored_before_call {
+            link_memory_id.clone()
+        } else {
+            None
+        }
+    });
     if let Some(lesson_id) = announced_lesson {
         // Class M (Wave 3): the completion's sync record goes through
         // `emit_checked` -- a failed durable append fails the completion
@@ -4201,8 +4217,8 @@ pub async fn handle_task_complete(
         )
         .map_err(|e| {
             format!(
-                "ERROR: the lesson {} was extracted, but the completion's durable event record failed: {}. The completion was not recorded; retry neurostrata_task_complete.",
-                lesson_id, e
+                "ERROR: the lesson {} was extracted, but the completion's durable event record failed: {}. The completion was not recorded; retry neurostrata_task_complete with `link_memory_id: \"{}\"` so the retry still publishes the sync record.",
+                lesson_id, e, lesson_id
             )
         })?;
     }
@@ -12992,6 +13008,64 @@ exit 0
             seen.lock().expect("recorder lock").is_empty(),
             "binding an existing memory publishes no pulse"
         );
+    }
+
+    /// The retry half of the same contract. A failed durable append leaves the
+    /// extraction edge stored and the completion unrecorded; the retry names
+    /// the lesson via `link_memory_id`, and that pairing -- edge durable
+    /// before the call, lesson named anyway -- must still publish the sync
+    /// record the failed attempt never delivered.
+    #[tokio::test]
+    async fn linking_a_lesson_against_an_already_stored_edge_emits_the_retry_pulse() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+        // The failed attempt's durable residue: the lesson and its edge,
+        // both stored before this completion call.
+        let mem_id = uuid::Uuid::new_v4().to_string();
+        let vector = StubEmbedder.embed("the lesson").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &mem_id,
+                vector,
+                MemoryPayload {
+                    content: "the lesson".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "extracted_from": [id.as_str()] }),
+                },
+            )
+            .await
+            .unwrap();
+        let (bus, seen) = recording_bus();
+
+        handle_task_complete(
+            json!({ "namespace": "MyProj", "id": id, "link_memory_id": mem_id }),
+            emb(),
+            store.clone(),
+            None,
+            bus,
+        )
+        .await
+        .expect("the edge is already stored; the retry completes");
+
+        let pulses = pulses_seen(&seen, 1).await;
+        match &pulses[0] {
+            ThalamicPulse::Superseded {
+                old_id,
+                new_id,
+                namespace,
+            } => {
+                assert_eq!(old_id, &id, "the task is the row that gave way");
+                assert_eq!(new_id, &mem_id, "the named lesson is the replacement");
+                assert_eq!(namespace, "MyProj");
+            }
+            other => panic!("expected Superseded, got {:?}", other),
+        }
     }
 
     #[tokio::test]
