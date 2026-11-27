@@ -1,6 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import { createHash } from 'node:crypto'
 import {
   readFileSync,
   mkdirSync,
@@ -9,6 +10,7 @@ import {
   mkdtempSync,
   existsSync,
   copyFileSync,
+  realpathSync,
   symlinkSync
 } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
@@ -154,6 +156,7 @@ import {
   isCodeExecTool,
   adapterStatus,
   pendingRecallBlocks,
+  pendingRecallByCall,
   injectedMemoryIds,
   prefetchedPaths,
   cachedTaskInjection,
@@ -174,6 +177,39 @@ import {
   daemonTokenPath,
   addSessionWorktree,
   isSessionScopedTool,
+  WORKING_SET_MAX_FRAME_BYTES,
+  WORKING_SET_MAX_IDLE_TURNS,
+  WORKING_SET_STUB_MAX_BYTES,
+  WORKING_SET_MAX_ROOTS,
+  WORKING_SET_MAX_YOUNG_GEN,
+  WORKING_SET_MAX_STUBS,
+  WORKING_SET_MAX_TOOL_STUBS,
+  WORKING_SET_MAX_TOOL_DIGESTS,
+  WORKING_SET_MAX_EVENT_IDS,
+  WORKING_SET_MAX_INJECTION_KEYS,
+  WORKING_SET_MAX_ACTIVE_SESSION_BYTES,
+  TOOL_GC_INLINE_THRESHOLD_BYTES,
+  TOOL_GC_HEAD_BYTES,
+  TOOL_GC_TAIL_BYTES,
+  TOOL_GC_STUB_MAX_BYTES,
+  WORKING_SET_SUMMARY_MAX_BYTES,
+  WORKING_SET_FRAME_OPEN,
+  WORKING_SET_FRAME_CLOSE,
+  loadWorkingSet,
+  persistWorkingSet,
+  advanceWorkingSetTurn,
+  sweepWorkingSet,
+  evaluateWorkingSetEviction,
+  dehydrateToolOutput,
+  dehydrateRepeatedReadOutput,
+  renderWorkingSetFrame,
+  upsertWorkingSetFrame,
+  runWorkingSetToolCycle,
+  runWorkingSetContextCycle,
+  runWorkingSetTurnBoundary,
+  markWorkingSetTouches,
+  wsSyncBridges,
+  wsRecallMemoryIds,
   canonicalToolName
 } from './dist/index.js'
 
@@ -630,9 +666,12 @@ describe('project root marker and namespace order', () => {
     // With no config of its own, the session checkout falls back to the
     // runner's install root (the legitimate use of runnerDir).
     buildLayout(base, ['bare git-dir'])
-    assert.deepEqual(readHarnessConfig('claude', under(base, 'bare'), runnerDir), {
-      namespace: 'example-project'
-    })
+    assert.deepEqual(
+      readHarnessConfig('claude', under(base, 'bare'), runnerDir),
+      {
+        namespace: 'example-project'
+      }
+    )
     assert.deepEqual(readHarnessConfig('claude', other), {
       namespace: 'from-other'
     })
@@ -660,9 +699,14 @@ describe('project root marker and namespace order', () => {
     const originalError = console.error
     console.error = (line) => errors.push(String(line))
     try {
-      assert.throws(() => readHarnessConfig('claude', repo), /could not be read/)
+      assert.throws(
+        () => readHarnessConfig('claude', repo),
+        /could not be read/
+      )
       assert.ok(
-        errors.some((line) => line.includes(config) && line.includes('valid JSON')),
+        errors.some(
+          (line) => line.includes(config) && line.includes('valid JSON')
+        ),
         `unreadable config must be reported on stderr; saw ${JSON.stringify(errors)}`
       )
       // A missing config stays a normal miss, not a fail-closed error.
@@ -822,7 +866,11 @@ describe('project root marker and namespace order', () => {
       return
     }
     assert.equal(
-      resolveHookProjectDir('claude', { ...start, hook_event_name: 'PreToolUse' }, {}),
+      resolveHookProjectDir(
+        'claude',
+        { ...start, hook_event_name: 'PreToolUse' },
+        {}
+      ),
       repo
     )
     // Byte-for-byte: a Windows path's backslashes are JSON-escaped, so a
@@ -3795,17 +3843,12 @@ describe('round-9: CLI hook runners flush stdout before exiting', () => {
     ]
     for (const rel of sources) {
       const src = readFileSync(new URL(rel, import.meta.url), 'utf8')
-      const marker = 'await writeStdout(JSON.stringify(out));'
+      const marker = 'await writeStdout(JSON.stringify(out))'
       const idx = src.indexOf(marker)
       assert.ok(idx !== -1, `${rel}: missing awaited stdout write`)
       assert.ok(
         !src.includes('process.stdout.write(JSON.stringify(out))'),
         `${rel}: un-awaited stdout write still present`
-      )
-      const after = src.slice(idx + marker.length)
-      assert.ok(
-        /^\s*return;/.test(after),
-        `${rel}: the runner must return directly after the awaited write`
       )
       // process.exit while a daemon socket is open crashes node on Windows,
       // and the host then treats the hook as failed.
@@ -3820,26 +3863,26 @@ describe('round-9: CLI hook runners flush stdout before exiting', () => {
     }
   })
 
-  it('runner tails emit deny JSON instead of process.exit(2) (issue #368 F5)', () => {
+  it('runner catches fail closed only for pre-tool events and await stdout', () => {
     for (const name of ['claude', 'codex', 'github-cli', 'opencode']) {
       const rel = `../${name}/cli-hook.mjs`
       const src = readFileSync(new URL(rel, import.meta.url), 'utf8')
-      const code = src
-        .split(/\r?\n/)
-        .filter((line) => !line.trim().startsWith('//'))
-        .join('\n')
-      assert.ok(
-        !/process\.exit\(2\)/.test(code),
-        `${rel}: nonzero exit is collapsed by PowerShell and fails open`
-      )
       const tail = src.slice(src.indexOf('main().catch'))
-      assert.ok(
-        tail.includes('permissionDecision: "deny"'),
-        `${rel}: the fail-closed tail must emit a deny decision`
+      // A failed Stop blocks the turn with exit code 2; elsewhere only
+      // PreToolUse takes a deny decision (#425).
+      assert.match(
+        tail,
+        /failed !== ['"]pretooluse['"]/,
+        `${rel}: fail-closed behavior must be limited to PreToolUse`
+      )
+      assert.match(
+        tail,
+        /permissionDecision:\s*['"]deny['"]/,
+        `${rel}: pre-tool failures must emit a deny decision`
       )
       assert.ok(
-        tail.includes('process.stdout.write'),
-        `${rel}: the deny JSON must be written to stdout`
+        tail.includes('await writeStdout('),
+        `${rel}: the catch response must be awaited on stdout`
       )
     }
   })
@@ -3880,10 +3923,18 @@ export default { handleHookEvent };
         new URL(`../${harness}/cli-hook.mjs`, import.meta.url),
         'utf8'
       )
-      runners.push({ label: `plugins/${harness}/cli-hook.mjs`, harness, source: copy })
+      runners.push({
+        label: `plugins/${harness}/cli-hook.mjs`,
+        harness,
+        source: copy
+      })
     }
     for (const harness of ['claude', 'github-cli']) {
-      runners.push({ label: `installer runner as ${harness}`, harness, source: embedded[1] })
+      runners.push({
+        label: `installer runner as ${harness}`,
+        harness,
+        source: embedded[1]
+      })
     }
     const run = (dir, { named, copilot, flags = [] }) =>
       new Promise((resolveRun, rejectRun) => {
@@ -3948,9 +3999,14 @@ export default { handleHookEvent };
         const dir = join(base, String(index), runner.harness)
         mkdirSync(join(dir, 'dist'), { recursive: true })
         writeFileSync(join(dir, 'cli-hook.mjs'), runner.source)
-        writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module' }))
+        writeFileSync(
+          join(dir, 'package.json'),
+          JSON.stringify({ type: 'module' })
+        )
         writeFileSync(join(dir, 'dist', 'index.js'), bundle)
-        const results = await Promise.all(cases.map(([input]) => run(dir, input)))
+        const results = await Promise.all(
+          cases.map(([input]) => run(dir, input))
+        )
         for (const [i, [input, expected, code]] of cases.entries()) {
           const what = `${runner.label} ${JSON.stringify(input)}`
           const { stdout, code: status } = results[i]
@@ -3974,13 +4030,28 @@ export default { handleHookEvent };
             assert.deepEqual(Object.keys(reply), ['hookSpecificOutput'], what)
             assert.deepEqual(
               Object.keys(reply.hookSpecificOutput).sort(),
-              ['hookEventName', 'permissionDecision', 'permissionDecisionReason'],
+              [
+                'hookEventName',
+                'permissionDecision',
+                'permissionDecisionReason'
+              ],
               what
             )
-            assert.equal(reply.hookSpecificOutput.hookEventName, 'PreToolUse', what)
-            assert.equal(reply.hookSpecificOutput.permissionDecision, 'deny', what)
+            assert.equal(
+              reply.hookSpecificOutput.hookEventName,
+              'PreToolUse',
+              what
+            )
+            assert.equal(
+              reply.hookSpecificOutput.permissionDecision,
+              'deny',
+              what
+            )
           } else {
-            const want = typeof expected === 'function' ? expected(runner.harness) : expected
+            const want =
+              typeof expected === 'function'
+                ? expected(runner.harness)
+                : expected
             assert.deepEqual(reply, want, what)
           }
         }
@@ -4140,24 +4211,22 @@ describe('sessionContextHandler bridge formatting (no [object Object])', () => {
       await sessionContextHandler(ev, config)
       const ctx = ev.additionalContext ?? ''
       assert.ok(
-        ctx.includes('[NeuroStrata Conceptual Bridges]'),
-        'bridges section present'
+        ctx.includes('[Young] bridge:t1 | always claim first'),
+        'object bridge projected into YoungGen'
+      )
+      assert.ok(
+        ctx.includes('[Young] bridge:t3 | gate blocks'),
+        'object with source_id falls back to target_type'
+      )
+      assert.ok(
+        ctx.includes(
+          '[Young] bridge:a plain string bridge | a plain string bridge'
+        ),
+        'string bridge passed through'
       )
       assert.ok(
         !ctx.includes('[object Object]'),
         'no [object Object] in bridge formatting'
-      )
-      assert.ok(
-        ctx.includes('[rule] t1: always claim first (src/a.rs)'),
-        'object bridge formatted cleanly'
-      )
-      assert.ok(
-        ctx.includes('a plain string bridge'),
-        'string bridge passed through'
-      )
-      assert.ok(
-        ctx.includes('[fact] t3: gate blocks'),
-        'object with source_id falls back to target_type'
       )
     } finally {
       rmSync(tmpDir, { recursive: true, force: true })
@@ -5845,7 +5914,11 @@ describe('canonicalToolName', () => {
 describe('usableNamespace — linear quote stripping (code-scanning 25-27)', () => {
   async function usable() {
     const mod = await import('./dist/index.js')
-    assert.equal(typeof mod.usableNamespace, 'function', 'helper exported from dist')
+    assert.equal(
+      typeof mod.usableNamespace,
+      'function',
+      'helper exported from dist'
+    )
     return mod.usableNamespace
   }
 
@@ -5862,7 +5935,9 @@ describe('usableNamespace — linear quote stripping (code-scanning 25-27)', () 
 
   it('handles long quote runs without superlinear backtracking', async () => {
     const f = await usable()
-    const adversarial = Array.from({ length: 200 }, () => '"'.repeat(50) + 'x').join('') + "'".repeat(50)
+    const adversarial =
+      Array.from({ length: 200 }, () => '"'.repeat(50) + 'x').join('') +
+      "'".repeat(50)
     assert.equal(f(adversarial), undefined)
     assert.equal(f('"'.repeat(20000) + 'ns' + "'".repeat(20000)), 'ns')
   })
@@ -5883,10 +5958,22 @@ describe('PR #400 namespace resolution regressions', () => {
   it('stops at a session config whose namespace is unusable', () => {
     const session = tmp()
     const runnerRoot = tmp()
-    const sessionCfg = join(session, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json')
+    const sessionCfg = join(
+      session,
+      '.NeuroStrata',
+      'plugins',
+      'claude',
+      'neurostrata.json'
+    )
     mkdirSync(dirname(sessionCfg), { recursive: true })
     writeFileSync(sessionCfg, JSON.stringify({ namespace: '$INVALID' }))
-    const runnerCfg = join(runnerRoot, '.NeuroStrata', 'plugins', 'claude', 'neurostrata.json')
+    const runnerCfg = join(
+      runnerRoot,
+      '.NeuroStrata',
+      'plugins',
+      'claude',
+      'neurostrata.json'
+    )
     mkdirSync(dirname(runnerCfg), { recursive: true })
     writeFileSync(runnerCfg, JSON.stringify({ namespace: 'runner-project' }))
     const runnerDir = dirname(runnerCfg)
@@ -5907,5 +5994,2485 @@ describe('PR #400 namespace resolution regressions', () => {
     } finally {
       delete process.env.NEUROSTRATA_NAMESPACE
     }
+  })
+})
+
+const wsHash = (value) => createHash('sha256').update(value).digest('hex')
+const wsCanonicalRoot = (root) => {
+  const normalized = realpathSync.native(root).replace(/\\/g, '/')
+  return normalized.length > 1 ? normalized.replace(/\/+$/u, '') : normalized
+}
+const wsScope = (root, overrides = {}) => ({
+  projectRoot: root,
+  projectId: wsHash(wsCanonicalRoot(root)),
+  namespace: 'NeuroStrata',
+  sessionId: 'session-ws',
+  epoch: 0,
+  ...overrides
+})
+const wsNode = (id, kind, overrides = {}) => {
+  const value = {
+    id,
+    kind,
+    label: id,
+    summary: `summary:${id}`,
+    governing_ids: [],
+    byte_cost: 64,
+    last_touched_turn: 0,
+    expand_tool:
+      kind === 'golden_rule'
+        ? 'neurostrata_get_snapshot'
+        : kind === 'file' || kind === 'symbol'
+          ? 'neurostrata_memories_for_file'
+          : 'neurostrata_get_memory',
+    ...overrides
+  }
+  if (kind === 'golden_rule' || kind === 'task_header') {
+    value.byte_cost = Buffer.byteLength(
+      `[Root] ${id} | ${value.summary} | expand:${value.expand_tool}\n`
+    )
+  } else if (kind === 'file' || kind === 'symbol') {
+    value.byte_cost = Buffer.byteLength(
+      `[Root] ${id} | ${value.summary} | expand:${value.expand_tool}\n`
+    )
+  } else {
+    value.byte_cost = Buffer.byteLength(
+      `[Young] ${id} | ${value.summary} | expand:${value.expand_tool}\n`
+    )
+  }
+  return value
+}
+const wsState = (scope, overrides = {}) => ({
+  version: 1,
+  project_id: scope.projectId,
+  namespace: scope.namespace,
+  session_id: scope.sessionId,
+  epoch: scope.epoch,
+  turn_seq: 0,
+  active_turn_id: null,
+  recent_event_ids: [],
+  max_frame_bytes: 4096,
+  max_idle_turns: 3,
+  used_frame_bytes: 0,
+  frame_fingerprint: '0'.repeat(64),
+  last_injected_fingerprint: '0'.repeat(64),
+  roots: [],
+  young_gen: [],
+  evicted_stubs: [],
+  edges: [],
+  tool_output_stubs: [],
+  tool_output_digests: [],
+  ...overrides
+})
+const wsParent = (root, state, extra = {}) => {
+  const dir = join(root, '.NeuroStrata')
+  mkdirSync(dir, { recursive: true })
+  const path = join(dir, 'active_session.json')
+  writeFileSync(
+    path,
+    JSON.stringify(
+      {
+        namespace: state.namespace,
+        session_id: state.session_id,
+        task_id: 'task-parent',
+        status: 'in_progress',
+        golden_rules: ['always claim first'],
+        owner_field: { preserved: true },
+        working_set: state,
+        ...extra
+      },
+      null,
+      2
+    )
+  )
+  return path
+}
+
+describe('working-set GC decision and strict state', () => {
+  it('exports every fixed working-set budget', () => {
+    assert.deepEqual(
+      [
+        WORKING_SET_MAX_FRAME_BYTES,
+        WORKING_SET_MAX_IDLE_TURNS,
+        WORKING_SET_STUB_MAX_BYTES,
+        WORKING_SET_MAX_ROOTS,
+        WORKING_SET_MAX_YOUNG_GEN,
+        WORKING_SET_MAX_STUBS,
+        WORKING_SET_MAX_TOOL_STUBS,
+        WORKING_SET_MAX_TOOL_DIGESTS,
+        WORKING_SET_MAX_EVENT_IDS,
+        WORKING_SET_MAX_INJECTION_KEYS,
+        WORKING_SET_MAX_ACTIVE_SESSION_BYTES,
+        TOOL_GC_INLINE_THRESHOLD_BYTES,
+        TOOL_GC_HEAD_BYTES,
+        TOOL_GC_TAIL_BYTES,
+        TOOL_GC_STUB_MAX_BYTES,
+        WORKING_SET_SUMMARY_MAX_BYTES
+      ],
+      [
+        4096, 3, 192, 32, 64, 128, 128, 128, 128, 128, 1048576, 3072, 512, 512,
+        512, 512
+      ]
+    )
+  })
+
+  it('matches the complete 2560-row Rust/Lean decision corpus', () => {
+    const tiers = ['Immortal', 'PinnedRoot', 'YoungGen', 'EvictedStub']
+    const ages = [0, 1, 3, 4, 0xffffffff]
+    const ttls = [0, 3]
+    const sizes = [0, 1, 256, 0xffffffff]
+    const projections = [0, 4096, 4097, 0xffffffff]
+    const caps = [0, 4096]
+    let rows = 0
+    for (const tier of tiers)
+      for (const turn_age of ages)
+        for (const max_idle_turns of ttls)
+          for (const node_bytes of sizes)
+            for (const projected_frame_bytes of projections)
+              for (const max_frame_bytes of caps)
+                for (const is_re_referenced of [false, true]) {
+                  let expected
+                  if (tier === 'Immortal') expected = 'retain_full'
+                  else if (tier === 'EvictedStub')
+                    expected =
+                      is_re_referenced &&
+                      projected_frame_bytes <= max_frame_bytes
+                        ? 'promote_to_young_gen'
+                        : 'retain_stub'
+                  else if (tier === 'YoungGen')
+                    expected =
+                      (!is_re_referenced && turn_age > max_idle_turns) ||
+                      projected_frame_bytes > max_frame_bytes
+                        ? 'demote_to_stub'
+                        : 'retain_full'
+                  else
+                    expected =
+                      !is_re_referenced &&
+                      turn_age > 0 &&
+                      projected_frame_bytes > max_frame_bytes
+                        ? 'demote_to_stub'
+                        : 'retain_full'
+                  assert.equal(
+                    evaluateWorkingSetEviction({
+                      tier,
+                      turn_age,
+                      max_idle_turns,
+                      node_bytes,
+                      projected_frame_bytes,
+                      max_frame_bytes,
+                      is_re_referenced
+                    }),
+                    expected,
+                    `row ${rows}`
+                  )
+                  rows++
+                }
+    assert.equal(rows, 2560)
+  })
+
+  it('loads and persists strict state while preserving unknown parent fields', async () => {
+    const root = canonicalTempDir('ns-core-ws-state-')
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        roots: [wsNode('rule:abc', 'golden_rule', { summary: 'always claim' })]
+      })
+      const parent = wsParent(root, state)
+      const loaded = await loadWorkingSet(scope)
+      assert.deepEqual(loaded, state)
+      loaded.turn_seq = 2
+      await persistWorkingSet(scope, loaded)
+      const saved = JSON.parse(readFileSync(parent, 'utf8'))
+      assert.equal(saved.working_set.turn_seq, 2)
+      assert.deepEqual(saved.owner_field, { preserved: true })
+      assert.equal(saved.task_id, 'task-parent')
+      const trailingScope = wsScope(`${root}/`)
+      assert.equal(trailingScope.projectId, scope.projectId)
+      assert.equal((await loadWorkingSet(trailingScope)).turn_seq, 2)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects non-4096 caps and unknown nested fields without overwriting parents', async () => {
+    const root = canonicalTempDir('ns-core-ws-invalid-')
+    try {
+      const scope = wsScope(root)
+      for (const mutate of [
+        (state) => {
+          state.max_frame_bytes = 123
+        },
+        (state) => {
+          state.roots[0].unexpected = true
+        },
+        (state) => {
+          state.young_gen = 'invalid'
+        }
+      ]) {
+        const state = wsState(scope, {
+          roots: [wsNode('rule:abc', 'golden_rule')]
+        })
+        mutate(state)
+        const parent = wsParent(root, state)
+        const before = readFileSync(parent, 'utf8')
+        const loaded = await loadWorkingSet(scope)
+        assert.deepEqual(loaded.roots, [])
+        assert.equal(loaded.turn_seq, 0)
+        assert.equal(readFileSync(parent, 'utf8'), before)
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects corrupt, oversized, mismatched, and symlinked state without overwriting it', async () => {
+    const root = canonicalTempDir('ns-core-ws-corrupt-')
+    const outside = canonicalTempDir('ns-core-ws-outside-')
+    try {
+      const scope = wsScope(root)
+      const dir = join(root, '.NeuroStrata')
+      const parent = join(dir, 'active_session.json')
+      mkdirSync(dir, { recursive: true })
+      for (const text of ['{broken', 'x'.repeat(1048577)]) {
+        writeFileSync(parent, text)
+        assert.deepEqual((await loadWorkingSet(scope)).roots, [])
+        assert.equal(readFileSync(parent, 'utf8'), text)
+      }
+      const state = wsState(scope, {
+        roots: [wsNode('rule:abc', 'golden_rule')]
+      })
+      wsParent(root, state)
+      for (const mismatch of [
+        { namespace: 'Other' },
+        { sessionId: 'other-session' },
+        { epoch: -1 }
+      ]) {
+        assert.deepEqual(
+          (await loadWorkingSet(wsScope(root, mismatch))).roots,
+          []
+        )
+      }
+      const external = join(outside, 'active_session.json')
+      writeFileSync(external, JSON.stringify({ working_set: state }))
+      rmSync(parent)
+      symlinkSync(external, parent)
+      assert.deepEqual((await loadWorkingSet(scope)).roots, [])
+      assert.equal(
+        readFileSync(external, 'utf8'),
+        JSON.stringify({ working_set: state })
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  it('adopts newer epochs but starts older epochs clean', async () => {
+    const root = canonicalTempDir('ns-core-ws-epoch-')
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        epoch: 1,
+        turn_seq: 8,
+        active_turn_id: 'turn-old',
+        recent_event_ids: ['event-old'],
+        frame_fingerprint: 'a'.repeat(64),
+        last_injected_fingerprint: 'b'.repeat(64),
+        roots: [wsNode('rule:abc', 'golden_rule')],
+        young_gen: [wsNode('mem:old', 'memory', { memory_type: 'fact' })]
+      })
+      wsParent(root, state)
+      const newer = await loadWorkingSet(wsScope(root, { epoch: 0 }))
+      assert.equal(newer.epoch, 1)
+      assert.equal(newer.turn_seq, 8)
+      assert.deepEqual(newer.recent_event_ids, [])
+      assert.equal(newer.frame_fingerprint, '0'.repeat(64))
+      assert.equal(newer.last_injected_fingerprint, '0'.repeat(64))
+      assert.equal(newer.young_gen.length, 1)
+      assert.equal(newer.roots.length, 1)
+      wsParent(
+        root,
+        wsState(scope, { roots: [wsNode('rule:abc', 'golden_rule')] })
+      )
+      const older = await loadWorkingSet(wsScope(root, { epoch: 1 }))
+      assert.deepEqual(older.roots, [])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps runtime imports inside the four approved Node built-ins', () => {
+    const source = readFileSync(
+      join(REPO_ROOT, 'plugins/core/index.ts'),
+      'utf8'
+    )
+    const imports = [...source.matchAll(/\bfrom\s+['"](node:[^'"]+)['"]/g)].map(
+      (m) => m[1]
+    )
+    assert.ok(imports.length >= 3)
+    assert.deepEqual([...new Set(imports)].sort(), [
+      'node:crypto',
+      'node:fs',
+      'node:os',
+      'node:path'
+    ])
+  })
+})
+
+describe('working-set GC cycles, sweep, and rendering', () => {
+  it('marks touches, advances once, and resets all derived identity at u32::MAX', async () => {
+    const root = canonicalTempDir('ns-core-ws-turn-')
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        turn_seq: 0xffffffff,
+        active_turn_id: 'old-turn',
+        recent_event_ids: ['old-event'],
+        frame_fingerprint: 'a'.repeat(64),
+        last_injected_fingerprint: 'b'.repeat(64),
+        roots: [
+          wsNode('rule:abc', 'golden_rule', { last_touched_turn: 0xffffffff })
+        ]
+      })
+      wsParent(root, state)
+      const advanced = await advanceWorkingSetTurn(
+        await loadWorkingSet(scope),
+        scope.namespace,
+        scope.sessionId,
+        scope.projectRoot,
+        [{ id: 'file:src/a.ts', kind: 'file', path: 'src/a.ts' }],
+        async () => null
+      )
+      assert.equal(advanced.turn_seq, 0)
+      assert.equal(advanced.active_turn_id, null)
+      assert.deepEqual(advanced.recent_event_ids, [])
+      assert.equal(advanced.frame_fingerprint, '0'.repeat(64))
+      assert.equal(advanced.last_injected_fingerprint, '0'.repeat(64))
+      assert.ok(advanced.roots.every((node) => node.last_touched_turn === 0))
+      assert.ok(advanced.roots.some((node) => node.id === 'file:src/a.ts'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('promotes fitting page faults and retains failed or oversized stubs', async () => {
+    const scope = wsScope(REPO_ROOT)
+    const pointer =
+      '[GCStub mem:page | rule | governs:- | expand:neurostrata_get_memory]'
+    const stub = {
+      id: 'mem:page',
+      kind: 'memory',
+      pointer,
+      byte_cost: Buffer.byteLength(`${pointer}\n`),
+      last_touched_turn: 0,
+      governing_ids: [],
+      memory_type: 'rule'
+    }
+    const state = wsState(scope, { evicted_stubs: [stub] })
+    const full = wsNode('mem:page', 'memory', { memory_type: 'rule' })
+    const promoted = await advanceWorkingSetTurn(
+      state,
+      scope.namespace,
+      scope.sessionId,
+      scope.projectRoot,
+      [{ id: stub.id, kind: 'memory', memoryId: 'page' }],
+      async () => full
+    )
+    assert.equal(promoted.evicted_stubs.length, 0)
+    assert.equal(promoted.young_gen[0].summary, full.summary)
+    const failed = await advanceWorkingSetTurn(
+      state,
+      scope.namespace,
+      scope.sessionId,
+      scope.projectRoot,
+      [{ id: stub.id, kind: 'memory', memoryId: 'page' }],
+      async () => null
+    )
+    assert.equal(failed.evicted_stubs[0].id, stub.id)
+    const oversized = await advanceWorkingSetTurn(
+      state,
+      scope.namespace,
+      scope.sessionId,
+      scope.projectRoot,
+      [{ id: stub.id, kind: 'memory', memoryId: 'page' }],
+      async () => ({ ...full, summary: 'x'.repeat(5000) })
+    )
+    assert.equal(oversized.evicted_stubs[0].id, stub.id)
+  })
+
+  it('promotes a page fault when another resident node remains in frame', async () => {
+    const scope = wsScope(REPO_ROOT)
+    const resident = wsNode('rule:resident', 'golden_rule', {
+      summary: 'resident rule'
+    })
+    const pointer =
+      '[GCStub mem:page | rule | governs:- | expand:neurostrata_get_memory]'
+    const stub = {
+      id: 'mem:page',
+      kind: 'memory',
+      pointer,
+      byte_cost: Buffer.byteLength(`${pointer}\n`),
+      last_touched_turn: 0,
+      governing_ids: [],
+      memory_type: 'rule'
+    }
+    const full = wsNode('mem:page', 'memory', { memory_type: 'rule' })
+    const promoted = await advanceWorkingSetTurn(
+      wsState(scope, { roots: [resident], evicted_stubs: [stub] }),
+      scope.namespace,
+      scope.sessionId,
+      scope.projectRoot,
+      [{ id: stub.id, kind: 'memory', memoryId: 'page' }],
+      async () => full
+    )
+    assert.equal(promoted.evicted_stubs.length, 0)
+    assert.ok(promoted.roots.some((node) => node.id === resident.id))
+    assert.ok(promoted.young_gen.some((node) => node.id === full.id))
+    const charged =
+      [...promoted.roots, ...promoted.young_gen].reduce(
+        (sum, node) => sum + node.byte_cost,
+        0
+      ) +
+      promoted.evicted_stubs.reduce((sum, entry) => sum + entry.byte_cost, 0)
+    assert.ok(charged <= promoted.max_frame_bytes)
+  })
+
+  it('prefixes symbol stub identities without duplicating an existing pointer', () => {
+    const scope = wsScope(REPO_ROOT)
+    const cases = [
+      {
+        id: 'src/a.ts#parse',
+        path: 'src/a.ts',
+        symbol: 'parse',
+        identity: 'symbol:src/a.ts#parse'
+      },
+      {
+        id: 'symbol:src/b.ts#run',
+        path: 'src/b.ts',
+        symbol: 'run',
+        identity: 'symbol:src/b.ts#run'
+      }
+    ]
+    for (const entry of cases) {
+      const target = wsNode(entry.id, 'symbol', {
+        path: entry.path,
+        symbol: entry.symbol,
+        summary: 't'.repeat(150)
+      })
+      const fillers = Array.from({ length: 32 }, (_, i) =>
+        wsNode(`file:filler-${i}`, 'symbol', {
+          path: `src/filler-${i}.ts`,
+          symbol: 'fn',
+          summary: 'f'.repeat(200)
+        })
+      )
+      const swept = sweepWorkingSet(
+        wsState(scope, { roots: [target, ...fillers] })
+      )
+      const stub = swept.evicted_stubs.find((node) => node.id === entry.id)
+      assert.ok(stub)
+      assert.equal(
+        stub.pointer,
+        `[GCStub ${entry.identity} | sha256:${wsHash(entry.id).slice(0, 12)} | expand:neurostrata_memories_for_file]`
+      )
+    }
+  })
+
+  it('retains TTL equality, demotes expiry, and preserves current pinned roots under pressure', () => {
+    const scope = wsScope(REPO_ROOT)
+    const young = wsNode('mem:young', 'memory', {
+      summary: 'y'.repeat(300),
+      memory_type: 'fact'
+    })
+    const pinned = wsNode('file:src/a.ts', 'file', {
+      path: 'src/a.ts',
+      summary: 'p'.repeat(300)
+    })
+    const atThree = sweepWorkingSet(
+      wsState(scope, {
+        turn_seq: 3,
+        young_gen: [{ ...young, last_touched_turn: 0 }]
+      })
+    )
+    assert.equal(atThree.young_gen.length, 1)
+    const atFour = sweepWorkingSet(
+      wsState(scope, {
+        turn_seq: 4,
+        young_gen: [{ ...young, last_touched_turn: 0 }]
+      })
+    )
+    assert.equal(atFour.young_gen.length, 0)
+    assert.equal(atFour.evicted_stubs[0].id, young.id)
+    const pressured = sweepWorkingSet(
+      wsState(scope, {
+        turn_seq: 5,
+        roots: [
+          { ...pinned, last_touched_turn: 5 },
+          ...Array.from({ length: 12 }, (_, i) => ({
+            ...pinned,
+            id: `file:src/b-${i}.ts`,
+            path: `src/b-${i}.ts`,
+            last_touched_turn: 1
+          }))
+        ]
+      })
+    )
+    assert.ok(
+      pressured.roots.some(
+        (node) => node.id === pinned.id && node.last_touched_turn === 5
+      )
+    )
+    assert.ok(!pressured.roots.some((node) => node.id === 'file:src/b-0.ts'))
+  })
+
+  it('enforces canonical ordering and every collection cap', () => {
+    const scope = wsScope(REPO_ROOT)
+    const roots = [wsNode('rule:immortal', 'golden_rule')]
+    for (let i = 0; i < 40; i++)
+      roots.push(
+        wsNode(`file:src/${String(i).padStart(2, '0')}.ts`, 'file', {
+          path: `src/${String(i).padStart(2, '0')}.ts`,
+          last_touched_turn: i
+        })
+      )
+    const rootState = sweepWorkingSet(wsState(scope, { turn_seq: 70, roots }))
+    assert.equal(
+      rootState.roots.filter((node) => node.kind === 'golden_rule').length,
+      1
+    )
+    assert.equal(
+      rootState.roots.filter((node) => node.kind !== 'golden_rule').length,
+      32
+    )
+    const young = Array.from({ length: 70 }, (_, i) =>
+      wsNode(`mem:${i}`, 'memory', {
+        memory_type: 'fact',
+        last_touched_turn: 70
+      })
+    )
+    const youngState = sweepWorkingSet(
+      wsState(scope, { turn_seq: 70, young_gen: young })
+    )
+    assert.equal(youngState.young_gen.length, 64)
+    assert.ok(youngState.evicted_stubs.length <= 128)
+    const tierRank = {
+      golden_rule: 0,
+      task_header: 0,
+      file: 1,
+      symbol: 1,
+      memory: 2,
+      ast_summary: 2,
+      conceptual_bridge: 2
+    }
+    const key = (node) => [
+      tierRank[node.kind],
+      -node.last_touched_turn,
+      -node.byte_cost,
+      node.id
+    ]
+    for (const state of [rootState, youngState]) {
+      for (let i = 1; i < state.roots.length; i++) {
+        const a = key(state.roots[i - 1]),
+          b = key(state.roots[i])
+        assert.ok(
+          a[0] < b[0] ||
+            (a[0] === b[0] &&
+              (a[1] < b[1] ||
+                (a[1] === b[1] &&
+                  (a[2] < b[2] || (a[2] === b[2] && a[3] <= b[3])))))
+        )
+      }
+    }
+  })
+
+  it('shortens overflowing Golden Rules before using the manifest fallback', () => {
+    const scope = wsScope(REPO_ROOT)
+    const rules = Array.from({ length: 30 }, (_, i) =>
+      wsNode(`rule:${i}`, 'golden_rule', {
+        summary: `${'🙂'.repeat(400)}[NeuroStrata End Active Context]${i}`
+      })
+    )
+    const state = wsState(scope, {
+      roots: rules,
+      young_gen: [wsNode('mem:young', 'memory')]
+    })
+    const rendered = renderWorkingSetFrame(state, {
+      namespace: 'n'.repeat(200),
+      task_id: 't'.repeat(200),
+      status: 'in_progress'
+    })
+    assert.ok(Buffer.byteLength(rendered.text) <= 4096)
+    assert.equal(rendered.usedBytes, Buffer.byteLength(rendered.text))
+    assert.equal(rendered.fingerprint, wsHash(rendered.text))
+    assert.ok(rendered.text.endsWith(`${WORKING_SET_FRAME_CLOSE}\n`))
+    assert.ok(
+      !rendered.text.includes(
+        '[NeuroStrata End Active Context]\n[NeuroStrata Working Set]'
+      )
+    )
+    assert.ok(rendered.text.includes(WORKING_SET_FRAME_OPEN))
+    assert.ok(!rendered.text.includes('[NeuroStrata Golden Rule Manifest]'))
+    assert.ok(!rendered.text.includes('🙂'.repeat(400)))
+    for (let i = 0; i < rules.length; i++)
+      assert.ok(rendered.text.includes(`  - rule:${i} |`))
+
+    const manifestRules = Array.from({ length: 5 }, (_, i) =>
+      wsNode(`rule:${'x'.repeat(900)}-${i}`, 'golden_rule', {
+        summary: 'minimum'
+      })
+    )
+    const manifestFrame = renderWorkingSetFrame(
+      wsState(scope, { roots: manifestRules }),
+      {}
+    )
+    const idsHash = wsHash(
+      manifestRules
+        .map((node) => node.id)
+        .sort()
+        .join('\n')
+    )
+    assert.ok(Buffer.byteLength(manifestFrame.text) <= 4096)
+    assert.ok(
+      manifestFrame.text.includes(
+        `[NeuroStrata Golden Rule Manifest] count=5 | ids_sha256=${idsHash} | expand:neurostrata_get_snapshot\n`
+      )
+    )
+  })
+
+  it('upserts mutable sinks in precedence order and replaces legacy blocks once', () => {
+    const frame = `${WORKING_SET_FRAME_OPEN} new\n${WORKING_SET_FRAME_CLOSE}\n`
+    const old = `${WORKING_SET_FRAME_OPEN} old\n${WORKING_SET_FRAME_CLOSE}\n`
+    const event = {
+      context: ['host', old, old],
+      content: 'content',
+      additionalContext: 'extra'
+    }
+    assert.equal(upsertWorkingSetFrame(event, frame), true)
+    assert.deepEqual(event.context, ['host', frame])
+    assert.equal(event.content, 'content')
+    assert.equal(event.additionalContext, 'extra')
+    const content = { content: `before\n${old}after` }
+    assert.equal(upsertWorkingSetFrame(content, frame), true)
+    assert.equal(content.content, `before\n${frame}after`)
+    const legacy = {
+      additionalContext: `before\n${WORKING_SET_FRAME_OPEN} legacy\nafter`
+    }
+    assert.equal(upsertWorkingSetFrame(legacy, frame), true)
+    assert.equal(legacy.additionalContext, `before\n${frame}`)
+    const repeat = { context: ['host', frame] }
+    assert.equal(upsertWorkingSetFrame(repeat, frame), false)
+    assert.deepEqual(repeat.context, ['host', frame])
+  })
+
+  it('deduplicates turn/event identity and never advances context cycles', async () => {
+    const root = canonicalTempDir('ns-core-ws-cycle-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const first = await runWorkingSetTurnBoundary(scope, 'event-1', 'turn-1')
+      assert.equal(first.changed, true)
+      const state1 = await loadWorkingSet(scope)
+      assert.equal(state1.turn_seq, 1)
+      const repeat = await runWorkingSetTurnBoundary(scope, 'event-1', 'turn-1')
+      assert.equal(repeat.changed, false)
+      assert.equal((await loadWorkingSet(scope)).turn_seq, 1)
+      await markWorkingSetTouches(
+        scope,
+        [{ id: 'file:src/a.ts', kind: 'file', path: 'src/a.ts' }],
+        'event-2'
+      )
+      assert.equal(
+        (await runWorkingSetContextCycle(scope, 'event-2')).changed,
+        true
+      )
+      const before = await loadWorkingSet(scope)
+      const context = await runWorkingSetContextCycle(scope, 'event-2')
+      assert.equal(context.changed, false)
+      assert.deepEqual(await loadWorkingSet(scope), before)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('working-set tool-output and recall dehydration', () => {
+  it('normalizes CRLF and dehydrates only eligible output over 3072 bytes', () => {
+    const raw = `head\r\n${'🙂'.repeat(2000)}`
+    const result = dehydrateToolOutput(raw, ' Read ', 'src/a.ts', ['rule-1'])
+    assert.equal(result.dehydrated, true)
+    assert.ok(result.text.includes('[NeuroStrata GC Summary — head]'))
+    assert.ok(result.text.includes('[NeuroStrata GC Summary — tail]'))
+    assert.ok(result.text.includes('[NeuroStrata GC Stub ->'))
+    assert.ok(!result.text.includes('\r'))
+    assert.equal(
+      dehydrateToolOutput('tiny', 'edit', 'src/a.ts', []).dehydrated,
+      false
+    )
+    assert.equal(
+      dehydrateToolOutput('x'.repeat(3073), 'unknown', null, []).dehydrated,
+      false
+    )
+    assert.equal(
+      dehydrateToolOutput('x'.repeat(3073), 'grep', null, []).text.includes(
+        'path=-'
+      ),
+      true
+    )
+  })
+
+  it('records first small reads inline and produces deterministic repeated-read stubs', async () => {
+    const root = canonicalTempDir('ns-core-ws-tool-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const first = await dehydrateRepeatedReadOutput(
+        scope,
+        'tiny\r\ntext',
+        'Read',
+        'src/a.ts',
+        ['rule-1']
+      )
+      assert.equal(first.dehydrated, false)
+      assert.equal(first.text, 'tiny\r\ntext')
+      const firstState = await loadWorkingSet(scope)
+      assert.equal(firstState.tool_output_digests.length, 1)
+      assert.equal(firstState.tool_output_stubs.length, 1)
+      assert.deepEqual(Object.keys(firstState.tool_output_digests[0]).sort(), [
+        'bytes',
+        'epoch',
+        'id',
+        'last_touched_turn',
+        'path_key',
+        'project_id',
+        'read_count',
+        'sha256',
+        'tool_name'
+      ])
+      const second = await dehydrateRepeatedReadOutput(
+        scope,
+        'tiny\r\ntext',
+        'read',
+        'src/a.ts',
+        ['rule-1']
+      )
+      assert.equal(second.dehydrated, true)
+      assert.ok(second.text.includes('[NeuroStrata GC Stub ->'))
+      assert.ok(second.text.includes('tiny\ntext'))
+      assert.ok(!second.text.includes('\r'))
+      const third = await dehydrateRepeatedReadOutput(
+        scope,
+        'tiny\r\ntext',
+        'read',
+        'src/a.ts',
+        ['rule-1']
+      )
+      assert.equal(third.text, second.text)
+      const state = await loadWorkingSet(scope)
+      assert.equal(state.tool_output_digests[0].read_count, 3)
+      assert.ok(!JSON.stringify(state).includes('tiny'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('isolates digest identity by project, namespace, session, and epoch', async () => {
+    const roots = [
+      canonicalTempDir('ns-core-ws-id-a-'),
+      canonicalTempDir('ns-core-ws-id-b-')
+    ]
+    try {
+      const variants = [
+        wsScope(roots[0]),
+        wsScope(roots[1]),
+        wsScope(roots[0], { namespace: 'Other' }),
+        wsScope(roots[0], { sessionId: 'other-session' }),
+        wsScope(roots[0], { epoch: 1 })
+      ]
+      const ids = []
+      for (const scope of variants) {
+        wsParent(scope.projectRoot, wsState(scope))
+        const result = await dehydrateRepeatedReadOutput(
+          scope,
+          'same output',
+          'read',
+          'src/a.ts',
+          []
+        )
+        assert.equal(result.dehydrated, false)
+        const digest = (await loadWorkingSet(scope)).tool_output_digests[0]
+        assert.match(digest.id, /^tool:[0-9a-f]{64}$/)
+        assert.equal(digest.project_id, scope.projectId)
+        ids.push(digest.id)
+      }
+      assert.equal(new Set(ids).size, variants.length)
+    } finally {
+      for (const root of roots) rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps mutating, errored, unknown, and non-text cycle output unchanged', async () => {
+    const root = canonicalTempDir('ns-core-ws-shapes-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      for (const input of [
+        {
+          toolName: 'edit',
+          rawText: 'x'.repeat(4000),
+          outputIsText: true,
+          isError: false
+        },
+        {
+          toolName: 'read',
+          rawText: 'x'.repeat(4000),
+          outputIsText: true,
+          isError: true
+        },
+        {
+          toolName: 'read',
+          rawText: 'x'.repeat(4000),
+          outputIsText: false,
+          isError: false
+        },
+        {
+          toolName: 'unknown',
+          rawText: 'x'.repeat(4000),
+          outputIsText: true,
+          isError: false
+        }
+      ]) {
+        const result = await runWorkingSetToolCycle({
+          scope,
+          toolInput: {},
+          advanceTurn: false,
+          ...input
+        })
+        assert.equal(result.replacementText, null)
+        assert.equal(result.dehydrated, false)
+        assert.ok(Buffer.byteLength(result.frame) <= 4096)
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('replaces large eligible text without persisting raw or restricted output', async () => {
+    const root = canonicalTempDir('ns-core-ws-privacy-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const raw = `raw-secret-${'x'.repeat(4000)}`
+      const result = await runWorkingSetToolCycle({
+        scope,
+        toolName: 'read',
+        toolInput: { path: 'src/a.ts' },
+        rawText: raw,
+        outputIsText: true,
+        isError: false,
+        advanceTurn: true
+      })
+      assert.equal(result.dehydrated, true)
+      assert.ok(result.replacementText.includes('[NeuroStrata GC Stub ->'))
+      const persisted = readFileSync(
+        join(root, '.NeuroStrata/active_session.json'),
+        'utf8'
+      )
+      assert.ok(!persisted.includes('raw-secret-'))
+      assert.ok(!persisted.includes('x'.repeat(100)))
+      assert.ok(Buffer.byteLength(result.frame) <= 4096)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('working-set GC hook, recall, and fail-soft integration', () => {
+  async function registerAfter(root) {
+    resetClientForTesting()
+    let after = null
+    await initialize({
+      location: {
+        directory: root,
+        project: { root, canonical: root }
+      },
+      session: { hook: () => {} },
+      tool: {
+        hook: (name, cb) => {
+          if (name === 'execute.after') after = cb
+        }
+      },
+      hooks: {},
+      config: {
+        namespace: 'NeuroStrata',
+        endpoint: 'http://127.0.0.1:1/mcp',
+        requestTimeoutMs: 50,
+        intentDetection: { enabled: false, injectReminder: false }
+      }
+    })
+    assert.equal(typeof after, 'function')
+    return after
+  }
+
+  it('injects one bounded frame, replaces changed fingerprints, and skips missing sessions', async () => {
+    const root = canonicalTempDir('ns-core-ws-context-hook-')
+    try {
+      const scope = wsScope(root)
+      const parentPath = wsParent(root, wsState(scope), {
+        conceptual_bridges: [
+          {
+            target_id: 'bridge-target',
+            target_type: 'fact',
+            target_summary: 'bridge summary',
+            path: 'src/a.ts -> src/b.ts'
+          }
+        ]
+      })
+      const config = {
+        projectRoot: root,
+        namespace: 'NeuroStrata',
+        intentDetection: { enabled: false, injectReminder: false }
+      }
+      const first = { sessionID: scope.sessionId, context: ['host context'] }
+      await sessionContextHandler(first, config)
+      assert.equal(first.additionalContext, undefined)
+      assert.equal(first.context.length, 2)
+      const frame = first.context[0]
+      assert.ok(frame.startsWith(WORKING_SET_FRAME_OPEN))
+      assert.ok(frame.endsWith(`${WORKING_SET_FRAME_CLOSE}\n`))
+      assert.ok(frame.includes('bridge:bridge-target'))
+      assert.ok(Buffer.byteLength(frame) <= 4096)
+      const injected = await loadWorkingSet(scope)
+      assert.equal(injected.last_injected_fingerprint, wsHash(frame))
+
+      const repeat = { sessionID: scope.sessionId, context: [...first.context] }
+      await sessionContextHandler(repeat, config)
+      assert.deepEqual(repeat.context, first.context)
+
+      const parent = JSON.parse(readFileSync(parentPath, 'utf8'))
+      parent.golden_rules = ['changed golden rule']
+      writeFileSync(parentPath, JSON.stringify(parent, null, 2))
+      const changed = {
+        sessionID: scope.sessionId,
+        context: [...first.context]
+      }
+      await sessionContextHandler(changed, config)
+      assert.equal(changed.context.length, 2)
+      assert.notEqual(changed.context[0], frame)
+      assert.ok(changed.context[0].includes('changed golden rule'))
+      assert.equal(
+        changed.context.filter((v) =>
+          String(v).includes(WORKING_SET_FRAME_OPEN)
+        ).length,
+        1
+      )
+
+      const beforeMissing = readFileSync(parentPath, 'utf8')
+      const missing = { context: ['host context'] }
+      await sessionContextHandler(missing, config)
+      assert.deepEqual(missing, { context: ['host context'] })
+      assert.equal(readFileSync(parentPath, 'utf8'), beforeMissing)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('reinjects context after u32::MAX wraps despite a remembered fingerprint', async () => {
+    const root = canonicalTempDir('ns-core-ws-wrap-injection-')
+    try {
+      const scope = wsScope(root)
+      const parentPath = wsParent(root, wsState(scope))
+      const config = {
+        projectRoot: root,
+        namespace: 'NeuroStrata',
+        intentDetection: { enabled: false, injectReminder: false }
+      }
+      const initial = { sessionID: scope.sessionId, context: [] }
+      await sessionContextHandler(initial, config)
+      assert.equal(initial.context.length, 1)
+
+      const parent = JSON.parse(readFileSync(parentPath, 'utf8'))
+      parent.working_set.turn_seq = 0xffffffff
+      parent.working_set.frame_fingerprint = '0'.repeat(64)
+      parent.working_set.last_injected_fingerprint = '0'.repeat(64)
+      writeFileSync(parentPath, JSON.stringify(parent, null, 2))
+
+      const wrapped = await runWorkingSetTurnBoundary(
+        scope,
+        'event-wrap',
+        'turn-wrap'
+      )
+      assert.equal(wrapped.changed, true)
+      assert.equal((await loadWorkingSet(scope)).turn_seq, 0)
+
+      const next = { sessionID: scope.sessionId, context: [] }
+      await sessionContextHandler(next, config)
+      assert.equal(next.context.length, 1)
+      assert.equal(next.context[0], initial.context[0])
+      assert.equal(
+        (await loadWorkingSet(scope)).last_injected_fingerprint,
+        wsHash(initial.context[0])
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('rebuilds the working set on compaction without consuming the next context injection', async () => {
+    const root = canonicalTempDir('ns-core-ws-compaction-hook-')
+    try {
+      const scope = wsScope(root)
+      const stale = wsState(scope)
+      stale.young_gen = [wsNode('mem:stale', 'memory')]
+      wsParent(root, stale, { task_id: 'task-compact', status: 'in_progress' })
+      const config = {
+        projectRoot: root,
+        namespace: 'NeuroStrata',
+        intentDetection: { enabled: false, injectReminder: false }
+      }
+      const initial = { sessionID: scope.sessionId, context: [] }
+      await sessionContextHandler(initial, config)
+      assert.equal(initial.context.length, 1)
+
+      await sessionCompactionHandler({ sessionID: scope.sessionId }, config)
+      const compacted = await loadWorkingSet(scope)
+      assert.equal(compacted.epoch, 1)
+      assert.ok(compacted.roots.some((node) => node.id === 'task:task-compact'))
+      assert.ok(!compacted.young_gen.some((node) => node.id === 'mem:stale'))
+      assert.equal(compacted.last_injected_fingerprint, '0'.repeat(64))
+
+      const next = { sessionID: scope.sessionId, context: [] }
+      await sessionContextHandler(next, config)
+      assert.equal(next.context.length, 1)
+      assert.ok(next.context[0].includes('task:task-compact'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('dehydrates execute.after text once per read and preserves non-text parts', async () => {
+    const root = canonicalTempDir('ns-core-ws-after-hook-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const after = await registerAfter(root)
+      const raw = `HEAD${'x'.repeat(4000)}TAIL`
+      const large = {
+        name: 'read',
+        callID: 'call-large',
+        sessionID: scope.sessionId,
+        args: { path: 'src/a.ts' },
+        result: { content: raw, output: raw }
+      }
+      await after(large)
+      assert.ok(
+        large.result.content.includes('[NeuroStrata GC Summary — head]')
+      )
+      assert.ok(large.result.content.includes('[NeuroStrata GC Stub ->'))
+      assert.equal(large.result.output, large.result.content)
+      assert.ok(!large.result.content.includes(raw))
+      const largeState = await loadWorkingSet(scope)
+      assert.equal(largeState.tool_output_digests.length, 1)
+      assert.equal(largeState.turn_seq, 1)
+      assert.ok(largeState.roots.some((node) => node.id === 'file:src/a.ts'))
+
+      const repeated = {
+        name: 'read',
+        callID: 'call-small',
+        sessionID: scope.sessionId,
+        args: { path: 'src/a.ts' },
+        result: {
+          content: 'small repeated read',
+          output: 'small repeated read'
+        }
+      }
+      await after(repeated)
+      assert.ok(repeated.result.content.includes('[NeuroStrata GC Stub ->'))
+      const repeatedState = await loadWorkingSet(scope)
+      assert.equal(repeatedState.tool_output_digests.length, 2)
+      const changedRead = repeatedState.tool_output_digests.find(
+        (digest) => digest.bytes === Buffer.byteLength('small repeated read')
+      )
+      assert.equal(changedRead.read_count, 1)
+      assert.equal(repeatedState.turn_seq, 2)
+
+      const image = { type: 'image', url: 'https://example.invalid/image.png' }
+      const mixed = {
+        name: 'read',
+        callID: 'call-mixed',
+        sessionID: scope.sessionId,
+        args: { path: 'src/mixed.ts' },
+        result: { content: [image, { type: 'text', text: 'z'.repeat(4000) }] }
+      }
+      await after(mixed)
+      assert.deepEqual(mixed.result.content, [
+        image,
+        { type: 'text', text: 'z'.repeat(4000) }
+      ])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('deduplicates native result events without advancing or replacing twice', async () => {
+    const root = canonicalTempDir('ns-core-ws-after-dedupe-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const after = await registerAfter(root)
+      const raw = `HEAD${'x'.repeat(4000)}TAIL`
+      const first = {
+        name: 'read',
+        callID: 'call-dedupe',
+        sessionID: scope.sessionId,
+        args: { path: 'src/a.ts' },
+        result: { content: raw, output: raw }
+      }
+      await after(first)
+      assert.ok(first.result.content.includes('[NeuroStrata GC Stub ->'))
+      const before = await loadWorkingSet(scope)
+      const repeated = {
+        name: 'read',
+        callID: 'call-dedupe',
+        sessionID: scope.sessionId,
+        args: { path: 'src/a.ts' },
+        result: { content: raw, output: raw }
+      }
+      await after(repeated)
+      assert.equal(repeated.result.content, raw)
+      const afterState = await loadWorkingSet(scope)
+      assert.equal(afterState.turn_seq, before.turn_seq)
+      assert.equal(afterState.tool_output_digests[0].read_count, 1)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('dehydrates text-only and resident structured recall without persisting bodies', async () => {
+    const root = canonicalTempDir('ns-core-ws-recall-hook-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope))
+      const after = await registerAfter(root)
+      const textOnly = `[NeuroStrata Governing Memories for src/a.ts]\n${'restricted-body-'.repeat(300)}`
+      pendingRecallBlocks.push(textOnly)
+      pendingRecallByCall.set('call:call-text-recall', textOnly)
+      const textEvent = {
+        name: 'read',
+        callID: 'call-text-recall',
+        sessionID: scope.sessionId,
+        args: { path: 'src/a.ts' },
+        result: { content: 'tool output' }
+      }
+      await after(textEvent)
+      assert.ok(textEvent.result.content.includes('[GCStub text:'))
+      assert.ok(!textEvent.result.content.includes(textOnly))
+      assert.ok(textEvent.result.content.length < textOnly.length)
+
+      await markWorkingSetTouches(scope, [
+        {
+          id: 'mem:mem-rule-1',
+          kind: 'memory',
+          memoryId: 'mem-rule-1'
+        }
+      ])
+      const structured =
+        '[NeuroStrata Governing Memories for src/b.ts]\n[NeuroStrata rule mem-rule-1 (valid_from 2026-01-01T00:00:00Z)] short restricted body'
+      pendingRecallBlocks.push(structured)
+      pendingRecallByCall.set('call:call-structured-recall', structured)
+      const structuredEvent = {
+        name: 'read',
+        callID: 'call-structured-recall',
+        sessionID: scope.sessionId,
+        args: { path: 'src/b.ts' },
+        result: { content: 'tool output' }
+      }
+      await after(structuredEvent)
+      assert.ok(
+        structuredEvent.result.content.includes('[GCStub mem:mem-rule-1')
+      )
+      const persisted = readFileSync(
+        join(root, '.NeuroStrata/active_session.json'),
+        'utf8'
+      )
+      assert.ok(!persisted.includes('restricted-body-'))
+      assert.ok(!persisted.includes('short restricted body'))
+    } finally {
+      pendingRecallBlocks.length = 0
+      pendingRecallByCall.clear()
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+
+  it('keeps tool execution fail-soft when the session parent is corrupt', async () => {
+    const root = canonicalTempDir('ns-core-ws-corrupt-hook-')
+    try {
+      mkdirSync(join(root, '.NeuroStrata'), { recursive: true })
+      const parentPath = join(root, '.NeuroStrata/active_session.json')
+      writeFileSync(parentPath, '{not-json')
+      const after = await registerAfter(root)
+      const event = {
+        name: 'read',
+        callID: 'call-corrupt',
+        sessionID: 'session-corrupt',
+        args: { path: 'src/a.ts' },
+        result: { content: 'x'.repeat(4000) }
+      }
+      await after(event)
+      assert.equal(readFileSync(parentPath, 'utf8'), '{not-json')
+      assert.equal(typeof event.result.content, 'string')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+      resetModuleState()
+    }
+  })
+})
+
+describe('working-set GC four-artifact adapter bundler', () => {
+  const coreSource = [
+    'export declare const coreValue: number;',
+    'export declare function createHarnessPlugin(): {};',
+    'export default createHarnessPlugin();',
+    ''
+  ].join('\n')
+  const coreJs = [
+    'export const coreValue = 1;',
+    'export function createHarnessPlugin() { return {}; }',
+    'export default createHarnessPlugin();',
+    '//# sourceMappingURL=index.js.map',
+    ''
+  ].join('\n')
+  const coreDts = [
+    'export declare const coreValue: number;',
+    'export declare function createHarnessPlugin(): {};',
+    'declare const _default: {',
+    '    id: string;',
+    '};',
+    'export default _default;',
+    '//# sourceMappingURL=index.d.ts.map',
+    ''
+  ].join('\n')
+  const thinSource = [
+    'export * from "@neurostrata/plugin-core";',
+    'import { createHarnessPlugin } from "@neurostrata/plugin-core";',
+    '',
+    'export const plugin = createHarnessPlugin("neurostrata", "OpenCode");',
+    'export default plugin;',
+    ''
+  ].join('\n')
+  const compiledSource = [
+    'import { createHarnessPlugin, coreValue } from "@neurostrata/plugin-core";',
+    'export { coreValue } from "@neurostrata/plugin-core";',
+    'const host = "keep";',
+    'export const plugin = createHarnessPlugin(host);',
+    'export default plugin;',
+    ''
+  ].join('\n')
+  const compiledJs = [
+    'import { createHarnessPlugin, coreValue } from "@neurostrata/plugin-core";',
+    'export { coreValue } from "@neurostrata/plugin-core";',
+    'const host = "keep";',
+    'export const plugin = createHarnessPlugin(host);',
+    'export default plugin;',
+    '//# sourceMappingURL=index.js.map',
+    ''
+  ].join('\n')
+  const compiledDts = [
+    'import { createHarnessPlugin } from "@neurostrata/plugin-core";',
+    'export { coreValue } from "@neurostrata/plugin-core";',
+    'export declare const plugin: ReturnType<typeof createHarnessPlugin>;',
+    'export default plugin;',
+    '//# sourceMappingURL=index.d.ts.map',
+    ''
+  ].join('\n')
+
+  function lineCount(text) {
+    return text.endsWith('\n')
+      ? text.split('\n').length - 1
+      : text.split('\n').length
+  }
+
+  function identityMap(source, file) {
+    return {
+      version: 3,
+      file,
+      sources: ['../index.ts'],
+      sourcesContent: [source],
+      names: [],
+      mappings: Array.from({ length: lineCount(source) }, (_, index) =>
+        index === 0 ? 'AAAA' : 'AACA'
+      ).join(';')
+    }
+  }
+
+  function tscStyleMap(source, file) {
+    const map = identityMap(source, file)
+    map.sourceRoot = ''
+    delete map.sourcesContent
+    return map
+  }
+
+  function makeFixture(adapterName = 'opencode') {
+    const root = mkdtempSync(join(tmpdir(), 'ns-core-bundle-'))
+    const coreDir = join(root, 'plugins/core')
+    const adapterDir = join(root, 'plugins', adapterName)
+    mkdirSync(join(coreDir, 'dist'), { recursive: true })
+    mkdirSync(adapterDir, { recursive: true })
+    copyFileSync(
+      join(REPO_ROOT, 'plugins/core/bundle-adapter.mjs'),
+      join(coreDir, 'bundle-adapter.mjs')
+    )
+    writeFileSync(join(coreDir, 'index.ts'), coreSource)
+    writeFileSync(join(coreDir, 'dist/index.js'), coreJs)
+    writeFileSync(join(coreDir, 'dist/index.d.ts'), coreDts)
+    writeFileSync(
+      join(coreDir, 'dist/index.js.map'),
+      JSON.stringify(tscStyleMap(coreSource, 'index.js'))
+    )
+    writeFileSync(
+      join(coreDir, 'dist/index.d.ts.map'),
+      JSON.stringify(tscStyleMap(coreSource, 'index.d.ts'))
+    )
+    writeFileSync(join(adapterDir, 'index.ts'), thinSource)
+    return { root, coreDir, adapterDir }
+  }
+
+  function writeCompiledFixture(adapterDir) {
+    const compiled = join(adapterDir, 'dist/.compiled')
+    mkdirSync(compiled, { recursive: true })
+    writeFileSync(join(adapterDir, 'index.ts'), compiledSource)
+    writeFileSync(join(compiled, 'index.js'), compiledJs)
+    writeFileSync(join(compiled, 'index.d.ts'), compiledDts)
+    const jsMap = tscStyleMap(compiledSource, 'index.js')
+    jsMap.sources = ['../../index.ts']
+    jsMap.mappings = jsMap.mappings
+      .split(';')
+      .map((line, index) => (index === 2 ? 'KACK' : line))
+      .join(';')
+    writeFileSync(join(compiled, 'index.js.map'), JSON.stringify(jsMap))
+    const dtsMap = tscStyleMap(compiledSource, 'index.d.ts')
+    dtsMap.sources = ['../../index.ts']
+    writeFileSync(join(compiled, 'index.d.ts.map'), JSON.stringify(dtsMap))
+    return compiled
+  }
+
+  function runBundle(root, cwd, args = []) {
+    return execFileSyncTop(
+      process.execPath,
+      [join(root, 'plugins/core/bundle-adapter.mjs'), ...args],
+      { cwd, encoding: 'utf8' }
+    )
+  }
+
+  function readMap(path) {
+    return JSON.parse(readFileSync(path, 'utf8'))
+  }
+
+  function decodeMappings(mappings) {
+    const alphabet =
+      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    const digits = new Map([...alphabet].map((char, index) => [char, index]))
+    let source = 0
+    let originalLine = 0
+    let originalColumn = 0
+    let name = 0
+    return mappings.split(';').map((line) => {
+      let generatedColumn = 0
+      if (!line) return []
+      return line.split(',').map((segment) => {
+        const values = []
+        let raw = 0
+        let shift = 0
+        for (const char of segment) {
+          const digit = digits.get(char)
+          assert.notEqual(digit, undefined)
+          raw += (digit & 31) * 2 ** shift
+          if (digit & 32) {
+            shift += 5
+            continue
+          }
+          const magnitude = Math.floor(raw / 2)
+          values.push(raw % 2 === 1 ? -magnitude : magnitude)
+          raw = 0
+          shift = 0
+        }
+        assert.equal(raw, 0)
+        generatedColumn += values[0]
+        const decoded = { generatedColumn }
+        if (values.length > 1) {
+          source += values[1]
+          originalLine += values[2]
+          originalColumn += values[3]
+          decoded.source = source
+          decoded.originalLine = originalLine
+          decoded.originalColumn = originalColumn
+        }
+        if (values.length > 4) {
+          name += values[4]
+          decoded.name = name
+        }
+        return decoded
+      })
+    })
+  }
+
+  function assertComposedMap(path, file, sourcesContent) {
+    const map = readMap(path)
+    assert.equal(map.version, 3)
+    assert.equal(map.file, file)
+    assert.equal('sourceRoot' in map, false)
+    assert.deepEqual(map.sources, ['../../core/index.ts', '../index.ts'])
+    assert.deepEqual(map.sourcesContent, sourcesContent)
+    assert.ok(map.mappings.length > 0)
+    return decodeMappings(map.mappings)
+  }
+
+  it('emits four deterministic thin-adapter artifacts with exact composed maps', () => {
+    const { root, adapterDir } = makeFixture()
+    try {
+      runBundle(root, adapterDir)
+      const dist = join(adapterDir, 'dist')
+      for (const name of [
+        'index.js',
+        'index.js.map',
+        'index.d.ts',
+        'index.d.ts.map'
+      ]) {
+        assert.ok(existsSync(join(dist, name)), name)
+      }
+      const js = readFileSync(join(dist, 'index.js'), 'utf8')
+      assert.ok(js.includes('export const coreValue = 1;'))
+      assert.ok(
+        js.includes(
+          'export const plugin = createHarnessPlugin("neurostrata", "OpenCode");'
+        )
+      )
+      assert.ok(!js.includes('@neurostrata/plugin-core'))
+      assert.ok(!js.includes('export default createHarnessPlugin();'))
+      assert.equal((js.match(/\bexport default\b/g) ?? []).length, 1)
+
+      const jsLines = assertComposedMap(
+        join(dist, 'index.js.map'),
+        'index.js',
+        [coreSource, thinSource]
+      )
+      const pluginLine = js
+        .split('\n')
+        .findIndex((line) => line.startsWith('export const plugin'))
+      assert.equal(jsLines[pluginLine][0].source, 1)
+      assert.equal(jsLines[pluginLine][0].originalLine, 3)
+
+      const dts = readFileSync(join(dist, 'index.d.ts'), 'utf8')
+      assert.ok(dts.includes('export declare const coreValue: number;'))
+      assert.ok(
+        dts.includes(
+          'export declare const plugin: ReturnType<typeof createHarnessPlugin>;'
+        )
+      )
+      assert.equal((dts.match(/\bexport default\b/g) ?? []).length, 1)
+      assertComposedMap(join(dist, 'index.d.ts.map'), 'index.d.ts', [
+        coreSource,
+        thinSource
+      ])
+
+      const before = [
+        'index.js',
+        'index.js.map',
+        'index.d.ts',
+        'index.d.ts.map'
+      ].map((name) => readFileSync(join(dist, name)))
+      runBundle(root, adapterDir)
+      const after = [
+        'index.js',
+        'index.js.map',
+        'index.d.ts',
+        'index.d.ts.map'
+      ].map((name) => readFileSync(join(dist, name)))
+      assert.deepEqual(after, before)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('composes compiled OpenClaw shims, preserves host bytes, and removes .compiled', () => {
+    const { root, adapterDir } = makeFixture('openclaw')
+    const compiled = writeCompiledFixture(adapterDir)
+    try {
+      runBundle(root, adapterDir, ['--compiled-adapter'])
+      const dist = join(adapterDir, 'dist')
+      const js = readFileSync(join(dist, 'index.js'), 'utf8')
+      assert.ok(js.includes('const host = "keep";'))
+      assert.ok(js.includes('export const plugin = createHarnessPlugin(host);'))
+      assert.ok(js.includes('//# sourceMappingURL=index.js.map'))
+      assert.ok(!js.includes('@neurostrata/plugin-core'))
+      assert.ok(!js.includes('export default createHarnessPlugin();'))
+      assert.equal((js.match(/\bexport default\b/g) ?? []).length, 1)
+      assert.equal(existsSync(compiled), false)
+
+      const jsLines = assertComposedMap(
+        join(dist, 'index.js.map'),
+        'index.js',
+        [coreSource, compiledSource]
+      )
+      const hostLine = js
+        .split('\n')
+        .findIndex((line) => line === 'const host = "keep";')
+      assert.equal(jsLines[hostLine][0].source, 1)
+      assert.equal(jsLines[hostLine][0].originalLine, 2)
+      assert.equal(jsLines[hostLine][0].originalColumn, 5)
+
+      const dts = readFileSync(join(dist, 'index.d.ts'), 'utf8')
+      assert.ok(
+        dts.includes(
+          'export declare const plugin: ReturnType<typeof createHarnessPlugin>;'
+        )
+      )
+      assert.ok(!dts.includes('@neurostrata/plugin-core'))
+      assert.equal((dts.match(/\bexport default\b/g) ?? []).length, 1)
+      const dtsLines = assertComposedMap(
+        join(dist, 'index.d.ts.map'),
+        'index.d.ts',
+        [coreSource, compiledSource]
+      )
+      const declarationLine = dts
+        .split('\n')
+        .findIndex((line) => line.startsWith('export declare const plugin'))
+      assert.equal(dtsLines[declarationLine][0].source, 1)
+      assert.equal(dtsLines[declarationLine][0].originalLine, 2)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects compiled-adapter mode outside OpenClaw or Hermes before writes', () => {
+    const { root, adapterDir } = makeFixture('opencode')
+    try {
+      mkdirSync(join(adapterDir, 'dist'), { recursive: true })
+      writeFileSync(join(adapterDir, 'dist/keep.txt'), 'keep')
+      assert.throws(
+        () => runBundle(root, adapterDir, ['--compiled-adapter']),
+        /compiled-adapter.*(?:openclaw|hermes)/i
+      )
+      assert.equal(existsSync(join(adapterDir, 'dist/index.js')), false)
+      assert.equal(existsSync(join(adapterDir, 'dist/index.d.ts')), false)
+      assert.equal(
+        readFileSync(join(adapterDir, 'dist/keep.txt'), 'utf8'),
+        'keep'
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects aliased core imports and multiple shim default exports before writes', () => {
+    const { root, adapterDir } = makeFixture('openclaw')
+    const compiled = writeCompiledFixture(adapterDir)
+    try {
+      writeFileSync(
+        join(compiled, 'index.js'),
+        compiledJs.replace(
+          'import { createHarnessPlugin, coreValue }',
+          'import { createHarnessPlugin, coreValue as renamedCoreValue }'
+        )
+      )
+      assert.throws(
+        () => runBundle(root, adapterDir, ['--compiled-adapter']),
+        /alias|unaliased/i
+      )
+      assert.equal(existsSync(join(adapterDir, 'dist/index.js')), false)
+      assert.equal(existsSync(compiled), true)
+
+      writeFileSync(
+        join(compiled, 'index.js'),
+        `${compiledJs}export default plugin;\n`
+      )
+      assert.throws(
+        () => runBundle(root, adapterDir, ['--compiled-adapter']),
+        /default export/i
+      )
+      assert.equal(existsSync(join(adapterDir, 'dist/index.js')), false)
+      assert.equal(existsSync(compiled), true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('PR #435 regression tests', () => {
+  it('wsSyncBridges does not create duplicate bridge IDs after eviction to stubs', async () => {
+    const root = canonicalTempDir('ns-core-ws-bridge-dup-')
+    try {
+      const scope = wsScope(root)
+      const parent = wsParent(root, wsState(scope, { roots: [] }))
+      // Create a bridge in young_gen
+      const state = wsState(scope, {
+        young_gen: [
+          wsNode('bridge:test-bridge', 'conceptual_bridge', {
+            memoryId: 'test-bridge'
+          })
+        ],
+        roots: []
+      })
+      wsParent(root, state)
+      const loaded = await loadWorkingSet(scope)
+      // Simulate eviction by moving to evicted_stubs with valid stub fields
+      const stub = {
+        id: 'bridge:test-bridge',
+        kind: 'conceptual_bridge',
+        pointer: 'test-bridge',
+        byte_cost: Buffer.byteLength('test-bridge\n'),
+        last_touched_turn: 1,
+        governing_ids: []
+      }
+      loaded.evicted_stubs.push(stub)
+      loaded.young_gen = []
+      await persistWorkingSet(scope, loaded)
+      // Now sync bridges again - should skip because it's in evicted_stubs
+      const newState = await loadWorkingSet(scope)
+      const testParent = { conceptual_bridges: ['test-bridge'] }
+      wsSyncBridges(newState, testParent)
+      const bridges = newState.young_gen.filter(
+        (n) => n.kind === 'conceptual_bridge'
+      )
+      assert.equal(
+        bridges.length,
+        0,
+        'bridge should not be duplicated after eviction to stubs'
+      )
+      // Also verify roots check
+      loaded.roots.push(
+        wsNode('bridge:another-bridge', 'conceptual_bridge', {
+          memoryId: 'another-bridge'
+        })
+      )
+      loaded.evicted_stubs = []
+      await persistWorkingSet(scope, loaded)
+      const state2 = await loadWorkingSet(scope)
+      const testParent2 = { conceptual_bridges: ['another-bridge'] }
+      wsSyncBridges(state2, testParent2)
+      const bridges2 = state2.young_gen.filter(
+        (n) => n.kind === 'conceptual_bridge' && n.memoryId === 'another-bridge'
+      )
+      assert.equal(
+        bridges2.length,
+        0,
+        'bridge should not be duplicated when in roots'
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('runWorkingSetTurnBoundary does not advance turn_seq for repeated turnId with distinct eventIds', async () => {
+    const root = canonicalTempDir('ns-core-ws-turn-dup-')
+    try {
+      const scope = wsScope(root)
+      // Initial state
+      const state = wsState(scope, { turn_seq: 0 })
+      wsParent(root, state)
+      // First call with turn-1, call-1
+      let boundary = await runWorkingSetTurnBoundary(scope, 'call-1', 'turn-1')
+      assert.equal(boundary.changed, true, 'first call should advance turn')
+      assert.equal(
+        boundary.duplicateEvent,
+        undefined,
+        'first call should not be duplicate'
+      )
+      // Second call with same turnId, different eventId
+      boundary = await runWorkingSetTurnBoundary(scope, 'call-2', 'turn-1')
+      assert.equal(
+        boundary.changed,
+        false,
+        'second call same turnId should not advance'
+      )
+      assert.equal(
+        boundary.duplicateEvent,
+        undefined,
+        'different eventId should not be duplicate'
+      )
+      const state2 = await loadWorkingSet(scope)
+      assert.equal(
+        state2.turn_seq,
+        1,
+        'turn_seq should be 1 after two calls with same turnId'
+      )
+      assert.deepEqual(state2.recent_event_ids, ['call-2', 'call-1'])
+      // Third call with same turnId, different eventId
+      boundary = await runWorkingSetTurnBoundary(scope, 'call-3', 'turn-1')
+      assert.equal(
+        boundary.changed,
+        false,
+        'third call same turnId should not advance'
+      )
+      const state3 = await loadWorkingSet(scope)
+      assert.equal(state3.turn_seq, 1, 'turn_seq should still be 1')
+      assert.deepEqual(state3.recent_event_ids, ['call-3', 'call-2', 'call-1'])
+      // Fourth call
+      boundary = await runWorkingSetTurnBoundary(scope, 'call-4', 'turn-1')
+      assert.equal(
+        boundary.changed,
+        false,
+        'fourth call same turnId should not advance'
+      )
+      const state4 = await loadWorkingSet(scope)
+      assert.equal(state4.turn_seq, 1, 'turn_seq should still be 1')
+      assert.deepEqual(state4.recent_event_ids, [
+        'call-4',
+        'call-3',
+        'call-2',
+        'call-1'
+      ])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('execute.after / dehydrateWorkingSetRecall extracts only mem-123 not Context from File Context heading', async () => {
+    const block = `[NeuroStrata File Context — src/a.ts]\n[NeuroStrata rule mem-123] Always claim a task before editing.\n[NeuroStrata Golden Rule mem-456] Another rule.`
+    const ids = wsRecallMemoryIds(block)
+    assert.deepEqual(
+      ids,
+      ['mem-123', 'mem-456'],
+      'should extract mem-123 and mem-456 but not Context from File Context heading'
+    )
+    assert.ok(
+      !ids.includes('Context'),
+      'must not extract "Context" as a memory ID'
+    )
+    assert.ok(!ids.includes('File'), 'must not extract "File" as a memory ID')
+    assert.ok(
+      !ids.includes('Active'),
+      'must not extract "Active" as a memory ID'
+    )
+    assert.ok(!ids.includes('End'), 'must not extract "End" as a memory ID')
+    assert.ok(
+      !ids.includes('Plugin'),
+      'must not extract "Plugin" as a memory ID'
+    )
+    assert.ok(!ids.includes('AST'), 'must not extract "AST" as a memory ID')
+    assert.ok(
+      !ids.includes('Governing'),
+      'must not extract "Governing" as a memory ID'
+    )
+    const pathological = `[NeuroStrata${'  '.repeat(5000)}rule${'  '.repeat(5000)}mem-999 ${'(valid_from '.repeat(2000)}${' '.repeat(5000)}]`
+    const t0 = performance.now()
+    const pathIds = wsRecallMemoryIds(pathological)
+    assert.deepEqual(pathIds, ['mem-999'])
+    assert.ok(performance.now() - t0 < 50)
+  })
+
+  it('upsertWorkingSetFrame linearly strips pathological repeated Active Context prefixes without regex backtracking', () => {
+    const repeatedFrames =
+      '[NeuroStrata Active Context]\n[NeuroStrata End Active Context]\n'.repeat(
+        1000
+      )
+    const frame = `[NeuroStrata Active Context]\nNew frame content\n[NeuroStrata End Active Context]\n`
+    const sink = { additionalContext: repeatedFrames }
+    const changed = upsertWorkingSetFrame(sink, frame)
+    assert.equal(changed, true)
+    assert.ok(sink.additionalContext.includes('New frame content'))
+    assert.ok(
+      !sink.additionalContext.includes(
+        '[NeuroStrata Active Context]\n[NeuroStrata End Active Context]\n'.repeat(
+          1000
+        )
+      )
+    )
+    // Verify no polynomial time behavior - this should complete quickly
+    const start = performance.now()
+    const sink2 = {
+      additionalContext:
+        '[NeuroStrata Active Context]\n[NeuroStrata End Active Context]\n'.repeat(
+          5000
+        )
+    }
+    upsertWorkingSetFrame(sink2, frame)
+    const elapsed = performance.now() - start
+    assert.ok(
+      elapsed < 200,
+      `linear scan should complete quickly, took ${elapsed}ms`
+    )
+  })
+
+  it('runWorkingSetToolCycle enforces delta-only injection and records touches across repeated turnId tool calls', async () => {
+    const root = canonicalTempDir('ns-core-ws-delta-inject-')
+    try {
+      const scope = wsScope(root)
+      wsParent(root, wsState(scope, { turn_seq: 0 }))
+      const start1 = await runWorkingSetContextCycle(scope, 'e1')
+      assert.equal(start1.changed, true)
+      const start2 = await runWorkingSetContextCycle(scope, 'e2')
+      assert.equal(start2.changed, false)
+
+      const read1 = await runWorkingSetToolCycle({
+        scope,
+        eventId: 'u1',
+        toolName: 'Read',
+        toolInput: { file_path: join(root, 'a.txt') },
+        rawText: 'alpha\n',
+        outputIsText: true,
+        isError: false,
+        advanceTurn: false
+      })
+      assert.equal(read1.changed, true)
+
+      const bash1 = await runWorkingSetToolCycle({
+        scope,
+        eventId: 'u2',
+        toolName: 'Bash',
+        toolInput: { command: 'ls' },
+        rawText: 'a.txt\n',
+        outputIsText: true,
+        isError: false,
+        advanceTurn: false
+      })
+      assert.equal(bash1.changed, false)
+
+      const start3 = await runWorkingSetContextCycle(scope, 'e3')
+      assert.equal(start3.changed, false)
+
+      await runWorkingSetTurnBoundary(scope, 'stop-1', 't1')
+      const stop1 = await runWorkingSetContextCycle(scope, 'stop-1')
+      assert.equal(stop1.changed, false)
+
+      // Second tool call in the same turnId with advanceTurn: true still records touches
+      await runWorkingSetToolCycle({
+        scope,
+        turnId: 't2',
+        eventId: 'u3',
+        toolName: 'Read',
+        toolInput: { file_path: join(root, 'b.txt') },
+        rawText: 'beta\n',
+        outputIsText: true,
+        isError: false,
+        advanceTurn: true
+      })
+      await runWorkingSetToolCycle({
+        scope,
+        turnId: 't2',
+        eventId: 'u4',
+        toolName: 'Read',
+        toolInput: { file_path: join(root, 'c.txt') },
+        rawText: 'gamma\n',
+        outputIsText: true,
+        isError: false,
+        advanceTurn: true
+      })
+      const loaded = await loadWorkingSet(scope)
+      assert.equal(loaded.turn_seq, 2)
+      assert.ok(loaded.roots.some((n) => n.path === 'b.txt'))
+      assert.ok(loaded.roots.some((n) => n.path === 'c.txt'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+// ──────────────────────────────────────────────────────────────────────
+// Task 5: 3-tier KV-cache graph projection, typed edges, prompt activation
+// ──────────────────────────────────────────────────────────────────────
+
+describe('Task 5: three-tier KV-cache decision mirrors', () => {
+  it('exports the four fixed 3-tier budgets', async () => {
+    const core = await import('./dist/index.js')
+    assert.equal(core.WORKING_SET_TIER0_MAX_BYTES, 2048)
+    assert.equal(core.WORKING_SET_MAX_EDGES, 128)
+    assert.equal(core.WORKING_SET_STRIDE_MESSAGES, 8)
+    assert.equal(core.WORKING_SET_HOT_TAIL_MESSAGES, 12)
+  })
+
+  it('matches all 8 cache-tier rows and their Rust tags', async () => {
+    const core = await import('./dist/index.js')
+    const tags = [
+      'tier0_system_prefix',
+      'tier1_quantized_history',
+      'tier2_tail_delta',
+      'evicted_heap_stub'
+    ]
+    let rows = 0
+    for (const tier of ['Immortal', 'PinnedRoot', 'YoungGen', 'EvictedStub']) {
+      for (const hasSystemChannel of [false, true]) {
+        const actual = core.workingSetCacheTierAsTag(
+          core.evaluateWorkingSetCacheTier(tier, hasSystemChannel)
+        )
+        const expected =
+          tier === 'Immortal'
+            ? hasSystemChannel
+              ? 'tier0_system_prefix'
+              : 'tier2_tail_delta'
+            : tier === 'EvictedStub'
+              ? 'evicted_heap_stub'
+              : 'tier2_tail_delta'
+        assert.equal(actual, expected, `${tier}/${hasSystemChannel}`)
+        assert.ok(tags.includes(actual))
+        rows++
+      }
+    }
+    assert.equal(rows, 8)
+  })
+
+  it('matches all 128 stride-fold rows and frontier steps', async () => {
+    const core = await import('./dist/index.js')
+    let rows = 0
+    for (const total of [0, 12, 20, 28]) {
+      for (const index of [0, 7, 8, 19]) {
+        for (const hot of [0, 12]) {
+          for (const stride of [0, 8]) {
+            for (const protectedMessage of [false, true]) {
+              const input = {
+                total_messages: total,
+                message_index: index,
+                hot_tail_count: hot,
+                stride,
+                is_protected_system_or_pinned: protectedMessage
+              }
+              const frontier = core.computeWorkingSetQuantizedFrontier(
+                total,
+                hot,
+                stride
+              )
+              const expected =
+                index >= total
+                  ? 'invalid_message_index'
+                  : protectedMessage || stride === 0 || total <= hot
+                    ? 'retain_raw_message'
+                    : index < frontier
+                      ? 'fold_into_quantized_stub'
+                      : 'retain_raw_message'
+              assert.equal(
+                core.evaluateWorkingSetStrideFold(input),
+                expected,
+                JSON.stringify(input)
+              )
+              rows++
+            }
+          }
+        }
+      }
+    }
+    assert.equal(rows, 128)
+    assert.equal(core.computeWorkingSetQuantizedFrontier(19, 12, 8), 0)
+    assert.equal(core.computeWorkingSetQuantizedFrontier(20, 12, 8), 8)
+    assert.equal(core.computeWorkingSetQuantizedFrontier(27, 12, 8), 8)
+    assert.equal(core.computeWorkingSetQuantizedFrontier(28, 12, 8), 16)
+  })
+})
+
+const wsEdge = (from, kind, to, last = 0, weight = 5000) => ({
+  from,
+  to,
+  kind,
+  weight_bps: weight,
+  last_touched_turn: last
+})
+const wsSortedEdges = (...edges) =>
+  [...edges].sort(
+    (a, b) =>
+      b.last_touched_turn - a.last_touched_turn ||
+      b.weight_bps - a.weight_bps ||
+      (a.from < b.from ? -1 : a.from > b.from ? 1 : 0) ||
+      (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0) ||
+      (a.to < b.to ? -1 : a.to > b.to ? 1 : 0)
+  )
+const wsStub = (id, kind = 'memory', overrides = {}) => {
+  const expand =
+    kind === 'file' || kind === 'symbol'
+      ? 'neurostrata_memories_for_file'
+      : 'neurostrata_get_memory'
+  const pointer = `[GCStub ${id} | - | expand:${expand}]`
+  return {
+    id,
+    kind,
+    pointer,
+    byte_cost: Buffer.byteLength(`${pointer}\n`),
+    last_touched_turn: 0,
+    governing_ids: [],
+    ...overrides
+  }
+}
+
+describe('Task 5: typed edges and spreading activation', () => {
+  it('loads edges, defaults omitted v1 edges, and deduplicates/caps edges', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-edges-'))
+    try {
+      const scope = wsScope(root)
+      const edges = wsSortedEdges(
+        wsEdge('file:src/a.ts', 'GOVERNS', 'mem:r1', 1, 10000),
+        wsEdge('file:src/b.ts', 'CALLS', 'file:src/a.ts', 1, 5000),
+        wsEdge('symbol:src/a.ts#f', 'CONCEPTUAL_BRIDGE', 'mem:r2', 1, 7500)
+      )
+      const state = wsState(scope, { edges })
+      wsParent(root, state)
+      assert.equal((await core.loadWorkingSet(scope)).edges.length, 3)
+
+      const fresh = wsState(scope)
+      const deduped = core.recordWorkingSetEdges(fresh, [
+        { from: 'file:a', kind: 'GOVERNS', to: 'mem:1' },
+        { from: 'file:a', kind: 'GOVERNS', to: 'mem:1' },
+        { from: 'file:a', kind: 'CALLS', to: 'file:b' }
+      ])
+      assert.equal(deduped.edges.length, 2)
+      assert.deepEqual(
+        deduped.edges.map((edge) => `${edge.from}|${edge.kind}|${edge.to}`),
+        ['file:a|CALLS|file:b', 'file:a|GOVERNS|mem:1']
+      )
+      assert.equal(deduped.edges[0].last_touched_turn, fresh.turn_seq)
+
+      const merged = core.recordWorkingSetEdges(state, [
+        { from: 'file:a', kind: 'GOVERNS', to: 'mem:1' },
+        { from: 'file:b', kind: 'CALLS', to: 'file:a' }
+      ])
+      assert.equal(merged.edges.length, 5)
+      assert.ok(
+        merged.edges.some(
+          (edge) =>
+            edge.from === 'symbol:src/a.ts#f' &&
+            edge.kind === 'CONCEPTUAL_BRIDGE'
+        )
+      )
+      const overridden = core.recordWorkingSetEdges(merged, [
+        {
+          from: 'file:a',
+          kind: 'GOVERNS',
+          to: 'mem:1',
+          weight_bps: 1,
+          last_touched_turn: 7
+        }
+      ])
+      assert.equal(overridden.edges.length, 5)
+      assert.equal(
+        overridden.edges.find((edge) => edge.from === 'file:a').weight_bps,
+        1
+      )
+
+      const many = Array.from({ length: 200 }, (_, i) =>
+        wsEdge(`file:f${i}`, 'GOVERNS', `mem:m${i}`, 0, 10000)
+      )
+      const capped = core.recordWorkingSetEdges(fresh, many)
+      assert.equal(capped.edges.length, 128)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('prunes edges with missing endpoints in sweepWorkingSet', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-prune-')))
+    const state = wsState(scope, {
+      roots: [wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })],
+      young_gen: [wsNode('mem:alive', 'memory')],
+      edges: wsSortedEdges(
+        wsEdge('file:src/a.ts', 'GOVERNS', 'mem:alive', 1, 10000),
+        wsEdge('mem:gone', 'GOVERNS', 'mem:alive', 1, 10000),
+        wsEdge('file:src/a.ts', 'GOVERNS', 'mem:missing', 1, 10000)
+      )
+    })
+    const swept = core.sweepWorkingSet(state)
+    assert.equal(swept.edges.length, 1)
+    assert.equal(swept.edges[0].from, 'file:src/a.ts')
+    assert.equal(swept.edges[0].to, 'mem:alive')
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('never mutates input edge objects across edge cycles', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-immutable-'))
+    try {
+      const scope = wsScope(root)
+      const edge = wsEdge(
+        'file:src/a.ts',
+        'GOVERNS',
+        'mem:r1',
+        0xffffffff,
+        10000
+      )
+      const state = wsState(scope, {
+        turn_seq: 0xffffffff,
+        roots: [wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })],
+        young_gen: [wsNode('mem:r1', 'memory')],
+        edges: [edge]
+      })
+      const snapshot = { ...edge }
+      core.recordWorkingSetEdges(state, [
+        { from: 'file:src/a.ts', kind: 'CALLS', to: 'mem:r1' }
+      ])
+      core.sweepWorkingSet(state)
+      await core.advanceWorkingSetTurn(
+        state,
+        scope.namespace,
+        scope.sessionId,
+        scope.projectRoot,
+        [],
+        async () => null
+      )
+      assert.deepEqual(state.edges[0], snapshot)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('activates 1-hop and 2-hop neighbors and terminates on cycles', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-activate-'))
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        turn_seq: 4,
+        roots: [
+          wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' }),
+          wsNode('file:src/b.ts', 'file', { path: 'src/b.ts' })
+        ],
+        young_gen: [wsNode('mem:r1', 'memory'), wsNode('mem:r2', 'memory')],
+        edges: wsSortedEdges(
+          wsEdge('file:src/a.ts', 'GOVERNS', 'mem:r1', 4, 10000),
+          wsEdge('mem:r1', 'GOVERNS', 'file:src/a.ts', 4, 10000),
+          wsEdge('file:src/a.ts', 'CALLS', 'file:src/b.ts', 4, 5000),
+          wsEdge('file:src/b.ts', 'GOVERNS', 'mem:r2', 4, 10000)
+        )
+      })
+      const expanded = await core.advanceWorkingSetTurn(
+        state,
+        scope.namespace,
+        scope.sessionId,
+        scope.projectRoot,
+        [{ id: 'file:src/a.ts', kind: 'file', path: 'src/a.ts' }],
+        async () => null
+      )
+      assert.equal(expanded.turn_seq, 5)
+      assert.equal(
+        expanded.young_gen.find((node) => node.id === 'mem:r1')
+          .last_touched_turn,
+        5
+      )
+      assert.equal(
+        expanded.young_gen.find((node) => node.id === 'mem:r2')
+          .last_touched_turn,
+        5
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('promotes page-faulted stub neighbors through the expansion callback', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-fault-'))
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        turn_seq: 1,
+        roots: [wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })],
+        evicted_stubs: [wsStub('mem:r3')],
+        edges: wsSortedEdges(
+          wsEdge('file:src/a.ts', 'EXTRACTED_FROM', 'mem:r3', 1, 10000)
+        )
+      })
+      const expanded = await core.advanceWorkingSetTurn(
+        state,
+        scope.namespace,
+        scope.sessionId,
+        scope.projectRoot,
+        [{ id: 'file:src/a.ts', kind: 'file', path: 'src/a.ts' }],
+        async (request) => {
+          assert.equal(request.id, 'mem:r3')
+          return wsNode('mem:r3', 'memory')
+        }
+      )
+      assert.ok(expanded.young_gen.some((node) => node.id === 'mem:r3'))
+      assert.ok(!expanded.evicted_stubs.some((stub) => stub.id === 'mem:r3'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('Task 5: tier 0 / tier 2 split rendering', () => {
+  const goldenState = (scope) =>
+    wsState(scope, {
+      roots: [
+        wsNode('rule:abc', 'golden_rule', { summary: 'always claim first' })
+      ]
+    })
+
+  it('renders an invariant immortal system prefix with no volatile counters', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-tier0-')))
+    const first = core.renderWorkingSetTier0Prefix(goldenState(scope), null)
+    assert.match(first.text, /\[NeuroStrata Golden Rules — IMMORTAL PREFIX\]/)
+    assert.match(first.text, /\[NeuroStrata End Immortal Prefix\]/)
+    assert.match(first.text, /always claim first/)
+    assert.ok(!/Turn:/u.test(first.text))
+    assert.ok(!/Epoch:/u.test(first.text))
+    assert.equal(first.usedBytes, Buffer.byteLength(first.text))
+    const later = core.renderWorkingSetTier0Prefix(
+      { ...goldenState(scope), turn_seq: 9, epoch: 3 },
+      { task_id: 'task-changed', status: 'done' }
+    )
+    assert.equal(later.fingerprint, first.fingerprint)
+    assert.ok(first.usedBytes <= 2048)
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('renders a bounded delta frame with edge lines and omits golden rules', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-delta-')))
+    const state = wsState(scope, {
+      roots: [
+        wsNode('rule:abc', 'golden_rule', { summary: 'always claim first' }),
+        wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })
+      ],
+      edges: wsSortedEdges(
+        wsEdge('file:src/a.ts', 'GOVERNS', 'mem:r1', 0, 10000)
+      )
+    })
+    const parent = {
+      namespace: scope.namespace,
+      task_id: 'task-5',
+      status: 'in_progress',
+      golden_rules: ['always claim first']
+    }
+    const tier0 = core.renderWorkingSetTier0Prefix(state, parent)
+    const delta = core.renderWorkingSetDeltaFrame(state, parent, {
+      omitImmortalRules: true
+    })
+    assert.ok(!delta.text.includes('IMMORTAL PREFIX'))
+    assert.match(delta.text, /\[Edge\] file:src\/a\.ts -GOVERNS-> mem:r1/)
+    assert.ok(tier0.usedBytes + delta.usedBytes <= 4096)
+    assert.equal(delta.usedBytes, Buffer.byteLength(delta.text))
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('honors a tiny maxBytes without exceeding the combined frame budget', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-budget-')))
+    const state = goldenState(scope)
+    const parent = {
+      namespace: scope.namespace,
+      task_id: 'task-5',
+      status: 'in_progress'
+    }
+    const tier0 = core.renderWorkingSetTier0Prefix(state, parent)
+    const delta = core.renderWorkingSetDeltaFrame(state, parent, {
+      omitImmortalRules: true,
+      maxBytes: 32
+    })
+    assert.ok(delta.usedBytes <= 32)
+    assert.ok(tier0.usedBytes + delta.usedBytes <= 4096)
+    const multibyte = core.renderWorkingSetTier0Prefix(
+      wsState(scope, {
+        roots: [
+          wsNode('rule:multi', 'golden_rule', {
+            summary: '🧠🧠🧠🧠'.repeat(300)
+          })
+        ]
+      }),
+      parent
+    )
+    assert.equal(
+      Buffer.from(multibyte.text, 'utf8').toString('utf8'),
+      multibyte.text
+    )
+    assert.ok(multibyte.usedBytes <= 2048)
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('renders a deterministic bounded compaction summary', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-compact-')))
+    const state = wsState(scope, {
+      roots: [
+        wsNode('rule:abc', 'golden_rule', { summary: 'always claim first' }),
+        wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })
+      ],
+      edges: wsSortedEdges(
+        wsEdge('file:src/a.ts', 'GOVERNS', 'mem:r1', 0, 10000)
+      )
+    })
+    const summary = core.renderWorkingSetCompactionSummary(state, {
+      namespace: scope.namespace,
+      task_id: 'task-5',
+      status: 'in_progress'
+    })
+    assert.match(summary, /always claim first/)
+    assert.match(summary, /task-5/)
+    assert.match(summary, /GOVERNS/)
+    assert.ok(Buffer.byteLength(summary) <= 512)
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+})
+
+describe('Task 5: quantized stride window projection', () => {
+  const messagesOf = (count) =>
+    Array.from({ length: count }, (_, i) => ({
+      role: 'user',
+      content: `message ${i}`
+    }))
+
+  it('steps the frontier at stride boundaries and keeps bucket prefixes identical', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-stride-')))
+    const state = wsState(scope)
+    for (let count = 12; count <= 19; count++) {
+      assert.equal(
+        core.projectWorkingSetMessages(messagesOf(count), state)
+          .quantizedFrontier,
+        0
+      )
+    }
+    const p20 = core.projectWorkingSetMessages(messagesOf(20), state)
+    const p27 = core.projectWorkingSetMessages(messagesOf(27), state)
+    assert.equal(p20.quantizedFrontier, 8)
+    assert.equal(p27.quantizedFrontier, 8)
+    assert.deepEqual(p20.messages[0], p27.messages[0])
+    assert.equal(p20.foldedCount, 8)
+
+    const p28 = core.projectWorkingSetMessages(messagesOf(28), state)
+    const p35 = core.projectWorkingSetMessages(messagesOf(35), state)
+    assert.equal(p28.quantizedFrontier, 16)
+    assert.equal(p35.quantizedFrontier, 16)
+    assert.deepEqual(p28.messages.slice(0, 2), p35.messages.slice(0, 2))
+    assert.deepEqual(p28.messages.slice(-12), messagesOf(28).slice(16))
+    const below = messagesOf(8)
+    const projectedBelow = core.projectWorkingSetMessages(below, state)
+    assert.notStrictEqual(projectedBelow.messages, below)
+    assert.deepEqual(projectedBelow.messages, below)
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('never folds protected system messages', async () => {
+    const core = await import('./dist/index.js')
+    const scope = wsScope(mkdtempSync(join(tmpdir(), 'ns-ws5-protect-')))
+    const messages = messagesOf(20)
+    messages[0] = {
+      role: 'system',
+      content: '[NeuroStrata Golden Rules — IMMORTAL PREFIX] never fold me'
+    }
+    const projected = core.projectWorkingSetMessages(messages, wsState(scope))
+    assert.ok(
+      projected.messages.some(
+        (message) =>
+          typeof message.content === 'string' &&
+          message.content.includes('never fold me')
+      )
+    )
+    rmSync(scope.projectRoot, { recursive: true, force: true })
+  })
+
+  it('upserts the system prefix and message-tail delta in place', async () => {
+    const core = await import('./dist/index.js')
+    const system = []
+    const tier0 =
+      '[NeuroStrata Golden Rules — IMMORTAL PREFIX]\n[NeuroStrata End Immortal Prefix]\n'
+    assert.equal(core.upsertWorkingSetSystemPrefix(system, tier0), true)
+    assert.equal(system.length, 1)
+    assert.equal(core.upsertWorkingSetSystemPrefix(system, tier0), false)
+    const messages = [{ role: 'user', content: 'hello' }]
+    const delta = `${WORKING_SET_FRAME_OPEN} delta\n${WORKING_SET_FRAME_CLOSE}\n`
+    assert.equal(core.upsertWorkingSetMessageTailDelta(messages, delta), true)
+    assert.equal(messages.length, 2)
+    assert.equal(core.upsertWorkingSetMessageTailDelta(messages, delta), false)
+    assert.equal(messages.length, 2)
+  })
+})
+
+describe('Task 5: pre-turn prompt activation', () => {
+  it('extracts anchors, activates neighbors, and persists before the model call', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-prompt-'))
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        roots: [wsNode('file:src/a.ts', 'file', { path: 'src/a.ts' })],
+        young_gen: [wsNode('mem:r1', 'memory')],
+        edges: wsSortedEdges(
+          wsEdge('file:src/a.ts', 'GOVERNS', 'mem:r1', 0, 10000)
+        )
+      })
+      wsParent(root, state)
+      const result = await core.runWorkingSetPromptCycle({
+        scope,
+        promptText: 'inspect file:src/a.ts and mem:r1',
+        turnId: 'prompt-1'
+      })
+      assert.equal(result.changed, true)
+      assert.ok(result.activatedIds.includes('mem:r1'))
+      assert.match(result.frame, /task:task-parent/)
+      const persisted = await core.loadWorkingSet(scope)
+      assert.equal(persisted.turn_seq, 1)
+      assert.equal(
+        persisted.young_gen.find((node) => node.id === 'mem:r1')
+          .last_touched_turn,
+        1
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('stops spreading at two hops before the model call', async () => {
+    const core = await import('./dist/index.js')
+    const root = mkdtempSync(join(tmpdir(), 'ns-ws5-3hop-'))
+    try {
+      const scope = wsScope(root)
+      const state = wsState(scope, {
+        roots: [
+          wsNode('file:a', 'file', { path: 'a' }),
+          wsNode('file:b', 'file', { path: 'b' }),
+          wsNode('file:c', 'file', { path: 'c' })
+        ],
+        young_gen: [wsNode('mem:r3', 'memory')],
+        edges: wsSortedEdges(
+          wsEdge('file:a', 'GOVERNS', 'file:b', 0, 10000),
+          wsEdge('file:b', 'CALLS', 'file:c', 0, 5000),
+          wsEdge('file:c', 'GOVERNS', 'mem:r3', 0, 10000),
+          wsEdge('file:c', 'CALLS', 'file:b', 0, 5000)
+        )
+      })
+      wsParent(root, state)
+      const result = await core.runWorkingSetPromptCycle({
+        scope,
+        promptText: 'inspect file:a',
+        turnId: 'prompt-3hop'
+      })
+      assert.ok(result.activatedIds.includes('file:b'))
+      assert.ok(!result.activatedIds.includes('mem:r3'))
+      const persisted = await core.loadWorkingSet(scope)
+      assert.equal(
+        persisted.young_gen.find((node) => node.id === 'mem:r3')
+          .last_touched_turn,
+        0
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('registers a prompt session hook on createHarnessPlugin', async () => {
+    const core = await import('./dist/index.js')
+    const hooks = new Map()
+    const config = {
+      namespace: 'NeuroStrata',
+      endpoint: 'http://127.0.0.1:1/mcp',
+      bearerToken: null,
+      tokenFile: null,
+      strictMode: false,
+      requestTimeoutMs: 50,
+      intentDetection: { enabled: false, injectReminder: false }
+    }
+    const plugin = core.createHarnessPlugin('test-prompt', 'opencode')
+    await plugin.setup({
+      config,
+      location: { project: { root: process.cwd(), canonical: process.cwd() } },
+      session: { hook: (name, fn) => hooks.set(name, fn) }
+    })
+    assert.equal(typeof hooks.get('prompt'), 'function')
+    assert.equal(typeof hooks.get('context'), 'function')
+    assert.equal(typeof hooks.get('compaction'), 'function')
   })
 })
