@@ -5257,30 +5257,11 @@ impl LadybugStore {
                     }
                 }
 
-                // Alias resolution must never redirect a write onto a row with
-                // foreign mesh provenance or private eligibility.
-                let mut protected = HashSet::new();
-                if !pairs.is_empty() {
-                    let ids = pairs
-                        .iter()
-                        .map(|(_, id)| format!("'{}'", escape_ladybug_string(id)))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let query = format!(
-                        "MATCH (m:Memory) WHERE m.id IN [{ids}] RETURN m.id, COALESCE(m.metadata, '')"
-                    );
-                    for row in conn.query(&query)? {
-                        if let Some(lbug::Value::String(id)) = row.first() {
-                            if row_is_protected(migration_value_string(row.get(1)).as_deref()) {
-                                protected.insert(id.clone());
-                            }
-                        }
-                    }
-                }
-                let aliases = pairs
-                    .into_iter()
-                    .filter(|(_, id)| !protected.contains(id))
-                    .collect::<HashMap<_, _>>();
+                // The cache is shared by reads and writes, so it includes
+                // protected aliases: qualified reads must find sovereign rows
+                // rather than miss them. Write paths re-check the target in
+                // their writer turn (`legacy_alias_in_conn`) and refuse it.
+                let aliases = pairs.into_iter().collect::<HashMap<_, _>>();
                 Ok(aliases)
             })
             .await?;
@@ -10019,6 +10000,9 @@ fn logical_path_in_namespace<'a>(id: &'a str, namespace: &str) -> &'a str {
 /// mesh provenance (`metadata.mesh`) or private eligibility. Such a row must
 /// never become the target of a legacy alias — a qualified re-ingest would
 /// overwrite content this process does not own.
+/// External mesh provenance or private eligibility makes a row sovereign.
+/// Local mesh annotations (conflict/update/lifecycle metadata) do not: taxonomy
+/// and other in-process stewards must still be able to maintain those rows.
 fn row_is_protected(metadata: Option<&str>) -> bool {
     let Some(metadata) = metadata else {
         return false;
@@ -10028,7 +10012,15 @@ fn row_is_protected(metadata: Option<&str>) -> bool {
         // cannot prove the row is safe to overwrite.
         return !metadata.trim().is_empty();
     };
-    metadata.get("mesh").is_some()
+    let external_mesh = metadata
+        .get("mesh")
+        .and_then(Value::as_object)
+        .and_then(|mesh| mesh.get("origin"))
+        .and_then(Value::as_str)
+        .map_or(false, |origin| {
+            origin.eq_ignore_ascii_case("foreign") || origin.eq_ignore_ascii_case("mesh-import")
+        });
+    external_mesh
         || metadata
             .get("eligibility")
             .and_then(Value::as_str)
@@ -10369,12 +10361,9 @@ fn migrate_legacy_id_aliases(conn: &Connection) -> Result<usize> {
         }
         // Identity is structural, not provenance-based: every bare legacy id
         // owns its qualified identity regardless of which older binary wrote
-        // it (user_id varies across versions). Imported rows with foreign mesh
-        // provenance or private eligibility remain protected — a qualified
-        // re-ingest must not overwrite content this process does not own.
-        if row_is_protected(metadata.as_deref()) {
-            continue;
-        }
+        // it (user_id varies across versions). Protected rows are aliased so
+        // qualified reads find them instead of creating a duplicate; the
+        // writer-turn resolver refuses to modify a protected alias target.
         // A row a foreign surface owns (a vault import note carries
         // `metadata.vault_source`) owns its exact id outright: no alias is
         // recorded for it, so a qualified ingest of the same path writes its
@@ -10579,9 +10568,17 @@ fn legacy_alias_in_conn(
             .and_then(|row| migration_value_string(row.first()))
             .map(|metadata| row_is_protected(Some(&metadata)))
             .unwrap_or(false);
-        if !protected {
-            return Ok(Some(stored.clone()));
+        if protected && stored != requested_id {
+            anyhow::bail!(
+                "legacy row '{}' is protected; refusing to modify it through alias '{}'",
+                stored,
+                canonical_id
+            );
         }
+        // Naming the protected row by its exact stored id is direct
+        // stewardship (taxonomy and other owners do this), not alias
+        // redirection; preserve that existing contract.
+        return Ok(Some(stored.clone()));
     }
     Ok(None)
 }
@@ -14014,17 +14011,28 @@ impl VectorStore for LadybugStore {
         // A qualified id for a row an older binary wrote bare must delete that
         // stored row, not report the qualified id missing.
         let stored_id = match self.resolve_legacy_alias(&namespace, &id).await {
-            Ok(Some(aliased)) => aliased,
-            Ok(None) => id.clone(),
+            Ok(Some(aliased)) => Some(aliased),
+            Ok(None) => None,
             Err(error) => {
                 tracing::warn!("legacy alias lookup failed during delete: {error}");
-                id.clone()
+                None
             }
         };
         let index_namespace = namespace.clone();
         let index_id = id.clone();
-        let index_stored_id = stored_id.clone();
         let outcome = self.write_with_deadline("deleting a memory", move |conn| {
+            // Re-resolve inside the same writer turn as publication. The
+            // outer lookup preserves staging-generation semantics; this
+            // second lookup catches a repointed alias and refuses a protected
+            // target instead of deleting or missing it through a stale id.
+            let stored_id = if stored_id.is_some() {
+                match legacy_alias_in_conn(conn, &namespace, &id)? {
+                    Some(stored) => stored,
+                    None => id.clone(),
+                }
+            } else {
+                id.clone()
+            };
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_id = escape_ladybug_string(&stored_id);
 
@@ -14045,17 +14053,20 @@ impl VectorStore for LadybugStore {
                 "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m",
                 safe_id, safe_ns
             ))?;
-            Ok(())
+            Ok(stored_id)
         })
         .await;
-        if outcome.is_ok() {
-            self.lexical_remove_doc(&index_namespace, &index_id);
-            if index_stored_id != index_id {
-                self.lexical_remove_doc(&index_namespace, &index_stored_id);
+        match outcome {
+            Ok(stored_id) => {
+                self.lexical_remove_doc(&index_namespace, &index_id);
+                if stored_id != index_id {
+                    self.lexical_remove_doc(&index_namespace, &stored_id);
+                }
+                self.refresh_ontology(&index_namespace).await;
+                Ok(())
             }
-            self.refresh_ontology(&index_namespace).await;
+            Err(error) => Err(error),
         }
-        outcome
     }
 
     async fn relocate(&self, id: &str, from: &str, to: &str) -> Result<RelocateOutcome> {
@@ -40319,6 +40330,137 @@ mod store_migration {
         assert!(
             alias_target(&store, "alpha::src/main.rs").await.is_none(),
             "the protected canonical row suppresses the alias"
+        );
+    }
+
+    #[test]
+    fn row_is_protected_distinguishes_external_origin_from_local_annotations() {
+        assert!(row_is_protected(Some(r#"{"mesh":{"origin":"foreign"}}"#)));
+        assert!(row_is_protected(Some(
+            r#"{"mesh":{"origin":"mesh-import"}}"#
+        )));
+        assert!(!row_is_protected(Some(r#"{"mesh":{"conflict":true}}"#)));
+        assert!(!row_is_protected(Some(r#"{"mesh":{"update_id":"u-1"}}"#)));
+        assert!(row_is_protected(Some(r#"{"eligibility":"private"}"#)));
+        assert!(row_is_protected(Some("not-json")));
+    }
+
+    /// A protected bare legacy row is aliased so qualified reads find it, but
+    /// the writer turn refuses to overwrite it through that identity.
+    #[tokio::test]
+    async fn a_protected_bare_legacy_row_is_aliased_for_reads_but_not_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row(
+                "src/main.rs",
+                Some("alpha"),
+                r#"{"mesh":{"origin":"foreign"},"kept":"yes"}"#,
+            )],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs")
+        );
+        let (_, before) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("qualified read")
+            .expect("protected legacy row found through its alias");
+        assert_eq!(before.content, "content-src/main.rs");
+
+        let error = store
+            .upsert(
+                "alpha",
+                "alpha::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("overwrite"),
+            )
+            .await
+            .expect_err("a protected alias target must not be overwritten");
+        assert!(error.to_string().contains("protected"), "{error}");
+        let (_, after) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("qualified read after refusal")
+            .expect("row remains");
+        assert_eq!(after.content, before.content);
+        assert_eq!(
+            count_memory(&store, "m.namespace = 'alpha'").await,
+            1,
+            "a refused re-ingest must not create a duplicate"
+        );
+    }
+
+    /// Direct stewardship by the exact stored id remains allowed; only an
+    /// alias that would redirect a different requested id is refused.
+    #[tokio::test]
+    async fn a_protected_legacy_row_can_be_stewarded_by_its_exact_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row(
+                "src/main.rs",
+                Some("alpha"),
+                r#"{"eligibility":"private"}"#,
+            )],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        store
+            .upsert(
+                "alpha",
+                "src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("stewarded"),
+            )
+            .await
+            .expect("the owner may update the exact protected row");
+        let (_, payload) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("direct read")
+            .expect("row remains");
+        assert_eq!(payload.content, "stewarded");
+    }
+
+    /// The read alias never authorizes deletion of sovereign content.
+    #[tokio::test]
+    async fn a_protected_bare_legacy_row_cannot_be_deleted_through_its_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row(
+                "src/main.rs",
+                Some("alpha"),
+                r#"{"mesh":{"origin":"foreign"}}"#,
+            )],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let error = store
+            .delete("alpha", "alpha::src/main.rs")
+            .await
+            .expect_err("a protected alias target must not be deleted");
+        assert!(error.to_string().contains("protected"), "{error}");
+        assert_eq!(
+            stored_namespace(&store, "src/main.rs").await.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs")
         );
     }
 

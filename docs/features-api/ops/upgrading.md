@@ -58,7 +58,10 @@ current binary can open them; no #68 schema or lifecycle change is assumed.
 - **Legacy ids.** Rows an older binary wrote as bare ids are recorded in
   `LegacyIdAlias (id, namespace, canonical_id)`. A later re-ingest of the
   qualified id resolves through that alias and updates the existing row in
-  place, so edges stay attached and no duplicate row appears.
+  place, so edges stay attached and no duplicate row appears. Protected bare
+  rows are aliased for reads too, but the writer turn refuses to overwrite or
+  delete them **through that alias**; foreign-surface rows (for example vault
+  imports) keep their own identity and are not aliased.
 - **Recovery opens.** An unverified recovery open (checksum-config mismatch,
   unverified WAL replay, or a discarded unreadable WAL) skips the migration
   entirely and reports `skipped_reason = "unverified_open"`; a later verified
