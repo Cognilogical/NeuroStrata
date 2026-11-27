@@ -106,7 +106,18 @@ pub async fn archive_memory(
             return ArchiveOutcome::Invalid("ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the namespace the memory lives in.".to_string())
         }
     };
+    // Both addresses are checked before resolve_namespace consults the
+    // catalog; a malformed caller id must never reach a store read.
+    if let Err(e) = crate::domain::validate_namespace(namespace_arg) {
+        return ArchiveOutcome::Invalid(e.to_string());
+    }
+    if let Err(e) = crate::domain::validate_id_for_read(&id) {
+        return ArchiveOutcome::Invalid(e.to_string());
+    }
     let namespace = crate::server::resolve_namespace(&store, namespace_arg).await;
+    if let Err(e) = crate::domain::validate_id_for_namespace(&id, &namespace) {
+        return ArchiveOutcome::Invalid(e.to_string());
+    }
 
     // Retiring a row hides it from every future search, so the machine-wide
     // stratum keeps the same guard the destructive tools carry. The wording

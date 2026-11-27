@@ -10598,27 +10598,20 @@ impl VectorStore for LadybugStore {
         // unambiguous. Qualified targets are left untouched.
         // DR-1/DR-2 before any store access: a malformed address is refused
         // here even when a caller bypassed the server or task surface.
-        let strict = (|| {
+        // A qualified id names its owner. A foreign prefix is never a legacy
+        // shape and must not be laundered by an existing row: without this,
+        // upsert could mutate another namespace's row through this one.
+        crate::domain::validate_id_for_namespace(id, namespace)?;
+        let strict: Result<(), crate::domain::ValidationError> = (|| {
             crate::domain::validate_namespace(namespace)?;
             crate::domain::validate_id(id)?;
-            if let Some(pos) = id.find(crate::domain::NAMESPACE_SEPARATOR) {
-                let prefix = &id[..pos];
-                if prefix != namespace {
-                    return Err(crate::domain::ValidationError::Id(format!(
-                        "'{}' names namespace '{}' but the row belongs to '{}'",
-                        id.escape_debug(),
-                        prefix.escape_debug(),
-                        namespace.escape_debug()
-                    )));
-                }
-            }
             Ok(())
         })();
         if let Err(reason) = strict {
             // Legacy rows written before DR-1/DR-2 remain updatable (feedback,
             // edits) only when the address has a legacy-valid shape AND the
             // row already exists. A new write with a legacy shape stays refused.
-            if crate::domain::validate_namespace_for_read(namespace).is_err()
+            if crate::domain::validate_namespace_legacy(namespace).is_err()
                 || crate::domain::validate_id_for_read(id).is_err()
                 || !matches!(self.get(namespace, id).await, Ok(Some(_)))
             {
@@ -36203,6 +36196,11 @@ impl LadybugStore {
             .map_err(|e| ActionError::Storage(e.to_string()))?;
         for w in &batch.writes {
             crate::domain::validate_id(&w.id).map_err(|e| ActionError::Storage(e.to_string()))?;
+            // A qualified row id must name the namespace this batch writes.
+            // There is no existence fallback here: one foreign prefix refuses
+            // the whole transaction before it begins.
+            crate::domain::validate_id_for_namespace(&w.id, namespace)
+                .map_err(|e| ActionError::Storage(e.to_string()))?;
         }
         // Expected heads and edge endpoints are query keys too. Validating
         // only the staged row ids lets a malformed reference reach a Cypher
@@ -36218,8 +36216,15 @@ impl LadybugStore {
                 }
                 ExpectedHead::UniqueActionSlug { .. } => Vec::new(),
             };
+            let is_edge = matches!(head, ExpectedHead::EdgeState { .. });
             for id in ids {
                 crate::domain::validate_id(id).map_err(|e| ActionError::Storage(e.to_string()))?;
+                // Edge endpoints may legitimately name another namespace;
+                // row-address expectations may not.
+                if !is_edge {
+                    crate::domain::validate_id_for_namespace(id, namespace)
+                        .map_err(|e| ActionError::Storage(e.to_string()))?;
+                }
             }
         }
         for ed in &batch.edge_deltas {

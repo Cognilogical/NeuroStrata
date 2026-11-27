@@ -875,6 +875,9 @@ fn validate_parsed_record(
     // DR-1 first: a malformed namespace is refused even when the caller lists
     // it as served, so parity can never launder an illegal address.
     crate::domain::validate_namespace(&record.namespace).map_err(|e| e.to_string())?;
+    // The apply path reads (namespace, id) before its eventual upsert, so a
+    // peer record's id is checked here, at the import boundary, not later.
+    crate::domain::validate_id(&record.id.to_string()).map_err(|e| e.to_string())?;
     if !served.iter().any(|s| s == &record.namespace) {
         return Err(format!(
             "record namespace {} is not served (served: {})",

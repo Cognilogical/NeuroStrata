@@ -4360,18 +4360,19 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
         Some(n) => n,
         None => return "Missing 'id' parameter.".to_string(),
     };
-    // Addresses are checked before resolve_namespace consults the catalog.
-    if let Err(e) = crate::domain::validate_namespace_for_read(namespace) {
-        return e.to_string();
-    }
-    if let Err(e) = crate::domain::validate_id_for_read(seed) {
-        return e.to_string();
-    }
-    let original_seed = seed;
+    // The caller namespace is checked strictly before resolve_namespace
+    // consults the catalog. A file-path seed is resolved by the path resolver
+    // below, so memory-id validation must wait until that step has run.
     if let Err(e) = check_namespace_arg(namespace) {
         return e;
     }
+    let original_seed = seed;
     let namespace = resolve_namespace(&store, namespace).await;
+    if !is_file_path_seed(seed) {
+        if let Err(e) = crate::domain::validate_id_for_read(seed) {
+            return e.to_string();
+        }
+    }
     let store_for_meta = store.clone();
     let project_root = arguments.get("project_root").and_then(|v| v.as_str());
 
@@ -7311,14 +7312,12 @@ async fn handle_feedback_memory(arguments: Value, store: Arc<dyn VectorStore>) -
     };
     // A legacy row can be rated, but its address must be checked before the
     // catalog read; a new write with a legacy shape is refused by the store.
-    if let Err(e) = crate::domain::validate_namespace_for_read(namespace) {
-        return e.to_string();
+    // The caller namespace is strict; only the row id tolerates old shapes.
+    if let Err(e) = check_namespace_arg(namespace) {
+        return e;
     }
     if let Err(e) = crate::domain::validate_id_for_read(&id) {
         return e.to_string();
-    }
-    if let Err(e) = check_namespace_arg(namespace) {
-        return e;
     }
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
@@ -7376,6 +7375,9 @@ async fn handle_validate_shapes(arguments: Value, store: Arc<dyn VectorStore>) -
     };
     if let Err(e) = check_namespace_arg(&namespace) {
         return e;
+    }
+    if let Err(e) = crate::domain::validate_id_for_read(&id) {
+        return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
     }
     let namespace = resolve_namespace(&store, &namespace).await;
     match store.get(&namespace, &id).await {
@@ -8823,6 +8825,9 @@ pub(crate) async fn handle_provenance_for(
     };
     if let Err(e) = check_namespace_arg(ns_raw) {
         return e;
+    }
+    if let Err(e) = crate::domain::validate_id_for_read(memory_id) {
+        return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
     }
     let namespace = resolve_namespace(&store, ns_raw).await;
     match store.get(&namespace, memory_id).await {
@@ -17182,6 +17187,79 @@ mod tests {
             0,
             "get_snapshot consulted catalog"
         );
+    }
+
+    #[tokio::test]
+    async fn read_handlers_refuse_malformed_ids_before_catalog_access() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply =
+            handle_validate_shapes(json!({ "namespace": "probe", "id": "bad/id" }), store).await;
+        assert!(reply.contains("ERROR [ID]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "validate_shapes consulted catalog"
+        );
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_provenance_for(
+            &json!({ "namespace": "probe", "memory_id": "bad/id" }),
+            store,
+        )
+        .await;
+        assert!(reply.contains("ERROR [ID]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "provenance consulted catalog"
+        );
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let outcome = crate::handlers::archive_memory::archive_memory(
+            json!({ "namespace": "probe", "id": "bad/id" }),
+            store,
+            quiet_bus(),
+        )
+        .await;
+        assert!(format!("{outcome:?}").contains("ERROR [ID]"), "{outcome:?}");
+        assert_eq!(mock.list_namespaces_calls(), 0, "archive consulted catalog");
+    }
+
+    #[tokio::test]
+    async fn option_like_namespaces_are_refused_before_catalog_access() {
+        // A namespace beginning with '-' would be consumed as a CLI flag by
+        // the hook, so every handler refuses it before listing namespaces.
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let text = crate::handlers::memory::handle_get_memory(
+            json!({ "namespace": "--help", "id": "mem-1" }),
+            store,
+        )
+        .await;
+        assert!(text.starts_with("ERROR [NAMESPACE]"), "{text}");
+        assert_eq!(mock.list_namespaces_calls(), 0);
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let text = handle_related(json!({ "namespace": "--help", "id": "src/a.rs" }), store).await;
+        assert!(text.starts_with("ERROR [NAMESPACE]"), "{text}");
+        assert_eq!(mock.list_namespaces_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_foreign_qualified_prefix_is_not_an_address_in_this_namespace() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let text = crate::handlers::memory::handle_get_memory(
+            json!({ "namespace": "probe", "id": "other::src/a.rs" }),
+            store,
+        )
+        .await;
+        assert!(text.starts_with("ERROR [ID]"), "{text}");
+        assert!(text.contains("names namespace"), "{text}");
     }
 
     #[tokio::test]

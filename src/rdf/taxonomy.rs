@@ -1307,9 +1307,40 @@ pub fn taxonomy_namespace_token(namespace: &str) -> String {
     }
 }
 
+/// Clamp a generated row id to DR-2's 128-character cap. Only the overflow
+/// path is content-addressed; ordinary ids keep their readable spelling.
+fn bounded_taxonomy_id(kind: &str, base: &str, version: u64) -> String {
+    let raw = format!("{base}-v{version}");
+    if raw.len() <= crate::domain::MAX_ID_CHARS {
+        return raw;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(base.as_bytes());
+    format!("{kind}-h{}-v{version}", &hex::encode(digest)[..64])
+}
+
+/// Derive the next version from an existing row's id so an upgrade keeps
+/// addressing the row an earlier binary wrote, whatever escape spelling that
+/// binary used for the namespace token. Mixed-version upserts then converge
+/// on one id for a slug instead of publishing two active versions.
+fn versioned_row_id_from_existing(existing: &str, version: u64, kind: &str) -> String {
+    let base = existing
+        .rfind("-v")
+        .filter(|at| {
+            let suffix = &existing[at + 2..];
+            !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+        })
+        .map(|at| &existing[..at])
+        .unwrap_or(existing);
+    bounded_taxonomy_id(kind, base, version)
+}
+
 /// Deterministic, namespace-qualified row ID for a thesis version.
 pub fn thesis_row_id(namespace: &str, version: u64) -> String {
-    format!("thesis-{}--v{version}", taxonomy_namespace_token(namespace))
+    // The extra trailing hyphen is part of the historical spelling: the
+    // version suffix is `--v<n>` for theses and `-v<n>` for concepts.
+    let base = format!("thesis-{}-", taxonomy_namespace_token(namespace));
+    bounded_taxonomy_id("thesis", &base, version)
 }
 
 /// Escape a literal slug that would otherwise be indistinguishable from the
@@ -1336,18 +1367,17 @@ fn encode_concept_slug(slug: &str) -> String {
 /// Deterministic, namespace-qualified row ID for a SKOS concept version.
 pub fn concept_row_id(namespace: &str, slug: &str, version: u64) -> String {
     let token = taxonomy_namespace_token(namespace);
-    let raw = format!("concept-{token}--{}-v{version}", encode_concept_slug(slug));
-    if raw.len() <= 128 {
-        return raw;
+    let raw = format!("concept-{token}--{}", encode_concept_slug(slug));
+    let versioned = format!("{raw}-v{version}");
+    if versioned.len() <= crate::domain::MAX_ID_CHARS {
+        return versioned;
     }
     // Keep the row id inside DR-2's bare-id cap. The slug is content-addressed
     // only when the combined id would overflow; ordinary slugs stay readable.
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(slug.as_bytes());
-    format!(
-        "concept-{token}--h{}-v{version}",
-        &hex::encode(digest)[..32]
-    )
+    let hashed = format!("concept-{token}--h{}", &hex::encode(digest)[..32]);
+    bounded_taxonomy_id("concept", &hashed, version)
 }
 
 async fn execute_set_thesis(
@@ -1450,7 +1480,10 @@ async fn execute_set_thesis(
         } else {
             (1u64, None)
         };
-    let new_id = thesis_row_id(namespace, next_ver);
+    let new_id = match superseded_id.as_deref() {
+        Some(existing) => versioned_row_id_from_existing(existing, next_ver, "thesis"),
+        None => thesis_row_id(namespace, next_ver),
+    };
     expected_heads.push(ExpectedHead::AbsentOrInactive {
         row_id: new_id.clone(),
     });
@@ -1897,7 +1930,12 @@ async fn execute_upsert_concept(
         } else {
             (1u64, None)
         };
-    let new_id = concept_row_id(namespace, &slug, next_ver);
+    // Continue the existing row's id spelling so an upgrade cannot fork a
+    // slug into two active concepts under old and new namespace encodings.
+    let new_id = match superseded_id.as_deref() {
+        Some(existing) => versioned_row_id_from_existing(existing, next_ver, "concept"),
+        None => concept_row_id(namespace, &slug, next_ver),
+    };
 
     let mut expected_heads: Vec<ExpectedHead> = vec![ExpectedHead::AbsentOrInactive {
         row_id: new_id.clone(),
@@ -3865,6 +3903,41 @@ mod tests {
                 panic!("long taxonomy input produced an invalid id: {error}")
             });
         }
+    }
+
+    #[test]
+    fn generated_concept_ids_stay_within_dr2_for_long_versions() {
+        let ns = "a".repeat(64);
+        let slug = "s".repeat(64);
+        let id = concept_row_id(&ns, &slug, u64::MAX);
+        assert!(id.len() <= crate::domain::MAX_ID_CHARS, "{}", id.len());
+        crate::domain::validate_id(&id).expect("bounded concept id must be DR-2 valid");
+        // Deterministic across concurrent callers of the same slug/version.
+        assert_eq!(id, concept_row_id(&ns, &slug, u64::MAX));
+        let thesis = thesis_row_id(&ns, u64::MAX);
+        assert!(
+            thesis.len() <= crate::domain::MAX_ID_CHARS,
+            "{}",
+            thesis.len()
+        );
+        crate::domain::validate_id(&thesis).expect("bounded thesis id must be DR-2 valid");
+    }
+
+    #[test]
+    fn an_existing_escaped_taxonomy_id_keeps_its_spelling_on_upgrade() {
+        // A row written by an earlier binary used the pre-change token for a
+        // dotted namespace. The next version must stay on that row instead
+        // of publishing a second active concept under a different id.
+        let legacy = "concept-a-2e-b--core-concept-v1";
+        assert_eq!(
+            versioned_row_id_from_existing(legacy, 2, "concept"),
+            "concept-a-2e-b--core-concept-v2"
+        );
+        let legacy_thesis = "thesis-a-2e-b--v1";
+        assert_eq!(
+            versioned_row_id_from_existing(legacy_thesis, 2, "thesis"),
+            "thesis-a-2e-b--v2"
+        );
     }
 
     #[test]

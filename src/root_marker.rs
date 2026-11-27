@@ -78,8 +78,8 @@ impl RootConfig {
         }
         // A marker written by an older release may carry a colon-bearing
         // namespace. Keep such roots trustworthy on read; writes still use
-        // the strict DR-1 rule.
-        if crate::domain::validate_namespace_for_read(&self.namespace).is_err() {
+        // the strict DR-1 rule. Caller arguments never reach this helper.
+        if crate::domain::validate_namespace_legacy(&self.namespace).is_err() {
             return Some(format!("invalid namespace {:?}", self.namespace));
         }
         None
@@ -2096,10 +2096,9 @@ mod tests {
         );
         assert!(matches!(read_marker(tmp.path()), MarkerRead::Valid(_)));
         write_raw(tmp.path(), br#"{"version":1,"namespace":"team:proj"}"#);
-        assert!(matches!(
-            read_marker(tmp.path()),
-            MarkerRead::Unreadable { .. }
-        ));
+        // An earlier release wrote colon-bearing namespaces; those roots stay
+        // discoverable even though the same spelling is refused on write.
+        assert!(matches!(read_marker(tmp.path()), MarkerRead::Valid(_)));
         write_raw(tmp.path(), br#"{"version":1,"namespace":"-x"}"#);
         assert!(matches!(
             read_marker(tmp.path()),

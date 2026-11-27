@@ -11534,15 +11534,21 @@ exit 0
 
     #[tokio::test]
     async fn task_get_refuses_malformed_addresses_before_store_access() {
-        let store = store_with_namespace("MyProj").await;
-        let bad_id = handle_task_get(
-            json!({ "id": "bad/id", "namespace": "MyProj" }),
-            store.clone(),
-        )
-        .await;
+        // A spy makes the ordering claim testable: a typed refusal alone
+        // would still pass if resolve_namespace had listed the catalog first.
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let bad_id = handle_task_get(json!({ "id": "bad/id", "namespace": "MyProj" }), store).await;
         assert!(bad_id.starts_with("ERROR [ID]:"), "{bad_id}");
         assert!(bad_id.contains("bad/id"), "{bad_id}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a malformed id must not consult the namespace catalog"
+        );
 
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
         let bad_ns = handle_task_get(
             json!({ "id": "myproj-abc", "namespace": "team:proj" }),
             store,
@@ -11550,6 +11556,11 @@ exit 0
         .await;
         assert!(bad_ns.starts_with("ERROR [NAMESPACE]:"), "{bad_ns}");
         assert!(bad_ns.contains("team:proj"), "{bad_ns}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a malformed namespace must not consult the namespace catalog"
+        );
     }
 
     #[tokio::test]
