@@ -259,6 +259,35 @@ mod tests {
         }
     }
 
+    /// Seed a row whose qualified id names a foreign prefix, straight into
+    /// the engine. The strict write gate refuses that spelling through
+    /// `upsert` now, but a database opened from an older binary can still
+    /// hold one, so the mirror's robustness against it is seeded directly
+    /// instead of through the public write gate.
+    async fn seed_foreign_qualified_row(
+        store: &LadybugStore,
+        namespace: &str,
+        id: &str,
+        payload: &MemoryPayload,
+    ) {
+        let query = format!(
+            "CREATE (:Memory {{id: '{}', namespace: '{}', content: '{}', user_id: '{}', memory_type: '{}', agent_name: '', location: '', location_lines: '', metadata: '{}'}})",
+            crate::store::ladybug::escape_ladybug_string(id),
+            crate::store::ladybug::escape_ladybug_string(namespace),
+            crate::store::ladybug::escape_ladybug_string(&payload.content),
+            crate::store::ladybug::escape_ladybug_string(&payload.user_id),
+            crate::store::ladybug::escape_ladybug_string(&payload.memory_type),
+            crate::store::ladybug::escape_ladybug_string(&payload.metadata.to_string()),
+        );
+        store
+            .with_conn(move |conn| {
+                conn.query(&query)?;
+                Ok(())
+            })
+            .await
+            .expect("seed the foreign-prefixed row");
+    }
+
     /// A bus carrying a real store and the outbox subscriber over `outbox_dir`.
     async fn wired(
         tag: &str,
@@ -489,7 +518,10 @@ mod tests {
     }
 
     /// Structural rows (`::`-qualified source ids from the AST ingest) never
-    /// enter the outbox, same mirror as above.
+    /// enter the outbox, same mirror as above. The id is seeded directly: it
+    /// carries a prefix the namespace does not own, a historical spelling
+    /// the public write gate now refuses, and the point here is that the
+    /// mirror keeps such a legacy row strictly local anyway.
     #[tokio::test]
     async fn a_structural_namespaced_row_is_not_captured() {
         let dir = scratch("structural-namespaced");
@@ -498,15 +530,13 @@ mod tests {
         let (bus, store) = wired("structural-ns-db", outbox_dir.clone(), wake).await;
 
         let id = format!("src::{}", uuid::Uuid::now_v7());
-        store
-            .upsert(
-                "ns",
-                &id,
-                vec![0.0; TEST_DIMENSIONS],
-                payload_as("system", "rule", serde_json::json!({})),
-            )
-            .await
-            .unwrap();
+        seed_foreign_qualified_row(
+            &store,
+            "ns",
+            &id,
+            &payload_as("system", "rule", serde_json::json!({})),
+        )
+        .await;
 
         bus.emit(
             ThalamicPulse::Created {

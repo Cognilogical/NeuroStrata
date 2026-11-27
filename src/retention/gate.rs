@@ -441,23 +441,35 @@ mod tests {
         ));
         let store = LadybugStore::for_testing(&dir, 4).expect("test store");
         store.init("ac5-ns").await.expect("init");
+        // The target rows' ids name a prefix the namespace does not own, a
+        // historical spelling the public write gate now refuses. They are
+        // mention-resolution targets, not subjects of the measurement, so
+        // they are seeded directly the way an older binary's rows would
+        // already sit in the database.
         for i in 0..10 {
             let id = format!("Ac5::src/lib{}.rs", i);
+            let payload = MemoryPayload {
+                content: format!("node {}", i),
+                user_id: "auto-ingestor".to_string(),
+                memory_type: "file".to_string(),
+                agent_name: None,
+                location: String::new(),
+                location_lines: String::new(),
+                metadata: serde_json::json!({}),
+            };
+            let query = format!(
+                "CREATE (:Memory {{id: '{}', namespace: 'ac5-ns', content: '{}', user_id: '{}', memory_type: '{}', agent_name: '', location: '', location_lines: '', metadata: '{}'}})",
+                crate::store::ladybug::escape_ladybug_string(&id),
+                crate::store::ladybug::escape_ladybug_string(&payload.content),
+                crate::store::ladybug::escape_ladybug_string(&payload.user_id),
+                crate::store::ladybug::escape_ladybug_string(&payload.memory_type),
+                crate::store::ladybug::escape_ladybug_string(&payload.metadata.to_string()),
+            );
             store
-                .upsert(
-                    "ac5-ns",
-                    &id,
-                    vec![0.1; 4],
-                    MemoryPayload {
-                        content: format!("node {}", i),
-                        user_id: "auto-ingestor".to_string(),
-                        memory_type: "file".to_string(),
-                        agent_name: None,
-                        location: String::new(),
-                        location_lines: String::new(),
-                        metadata: serde_json::json!({}),
-                    },
-                )
+                .with_conn(move |conn| {
+                    conn.query(&query)?;
+                    Ok(())
+                })
                 .await
                 .expect("seed node");
         }

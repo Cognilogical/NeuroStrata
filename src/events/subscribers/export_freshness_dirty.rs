@@ -27,10 +27,14 @@ use serde_json::json;
 /// the export-freshness gate can find it without guessing an id.
 const FRESHNESS_FLAG_TYPE: &str = "freshness_flag";
 
-/// The id prefix the sentinel carries. Namespaced because `upsert` MERGEs on id
-/// alone, across every namespace in the store: two namespaces sharing one id
-/// would make the second flip overwrite the first namespace's flag, and each
-/// would silently stop reporting its own staleness.
+/// The id suffix the sentinel carries. The qualified id leads with the row's
+/// own namespace, because `upsert` MERGEs on id alone, across every namespace
+/// in the store: two namespaces sharing one id would make the second flip
+/// overwrite the first namespace's flag, and each would silently stop
+/// reporting its own staleness. Leading with the namespace also makes the id
+/// name its owner, the DR-1 shape the strict write gate accepts; the whole id
+/// (`<namespace>::export_freshness`, at most 64 + 2 + 17 characters) stays
+/// inside DR-2's 128-character cap by construction.
 const FRESHNESS_FLAG_ID_PREFIX: &str = "export_freshness";
 
 /// The `user_id` a machine-written row carries. `system` is the same value the
@@ -106,8 +110,22 @@ impl MemorySubscriber for ExportFreshnessDirty {
 }
 
 /// The sentinel's id for one namespace. Deterministic, so a second flip in the
-/// same namespace MERGEs the same row rather than appending another.
+/// same namespace MERGEs the same row rather than appending another. The id
+/// names the namespace that owns the row, so the strict write gate accepts it
+/// without exempting system rows from the cross-namespace rule.
 fn flag_id(namespace: &str) -> String {
+    format!("{namespace}::{FRESHNESS_FLAG_ID_PREFIX}")
+}
+
+/// The sentinel's id as releases before DR-1 wrote it (`export_freshness::<ns>`):
+/// the prefix named the row's kind, not its owner, so the strict write gate
+/// refuses that spelling. Databases opened from those releases can still hold
+/// a dirty legacy row, and the gate keeps honoring it -- a pre-upgrade
+/// mutation that was never exported is exactly the staleness this module
+/// exists to refuse. The clear path removes such a row rather than updating
+/// it: a foreign-prefixed id can never pass `upsert` again, and a flag row's
+/// absence already reads as clean.
+fn legacy_flag_id(namespace: &str) -> String {
     format!("{FRESHNESS_FLAG_ID_PREFIX}::{namespace}")
 }
 
@@ -153,6 +171,19 @@ pub async fn check_export_freshness(store: &dyn VectorStore) -> Result<(), Strin
     let mut dirty: Vec<String> = Vec::new();
     for ns in &namespaces {
         match store.get(ns, &flag_id(ns)).await {
+            Ok(Some((_, payload))) => {
+                if payload.metadata.get("dirty") == Some(&serde_json::json!(true)) {
+                    dirty.push(ns.clone());
+                }
+            }
+            // A missing current flag still falls through to the legacy
+            // probe below: a pre-DR-1 database holds only the legacy row.
+            Ok(None) => {}
+            Err(e) => return Err(format!("Failed to read freshness flag for {ns}: {e}")),
+        }
+        // A dirty flag written by a pre-DR-1 release still means "behind",
+        // so it refuses the export the same way a current row does.
+        match store.get(ns, &legacy_flag_id(ns)).await {
             Ok(Some((_, payload))) => {
                 if payload.metadata.get("dirty") == Some(&serde_json::json!(true)) {
                     dirty.push(ns.clone());
@@ -219,11 +250,43 @@ pub async fn clear_export_freshness_for_namespace(
                         anyhow::anyhow!("Failed to clear freshness flag for {namespace}: {e}")
                     })?;
             }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Failed to read freshness flag for {namespace}: {e}"
+            ))
+        }
+    }
+    clear_legacy_export_freshness(store, namespace).await
+}
+
+/// The legacy half of a clear pass: pre-DR-1 releases wrote the flag as
+/// `export_freshness::<ns>`, a spelling the strict write gate now refuses, so
+/// the only available clear for such a row is deleting it -- and a missing
+/// flag row has always meant clean. Only a dirty legacy row is touched; an
+/// inert one (dirty already false) is left as historical data.
+async fn clear_legacy_export_freshness(
+    store: &dyn VectorStore,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    match store.get(namespace, &legacy_flag_id(namespace)).await {
+        Ok(Some((_, payload))) => {
+            if payload.metadata.get("dirty") == Some(&serde_json::json!(true)) {
+                store
+                    .delete(namespace, &legacy_flag_id(namespace))
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to clear legacy freshness flag for {namespace}: {e}"
+                        )
+                    })?;
+            }
             Ok(())
         }
         Ok(None) => Ok(()),
         Err(e) => Err(anyhow::anyhow!(
-            "Failed to read freshness flag for {namespace}: {e}"
+            "Failed to read legacy freshness flag for {namespace}: {e}"
         )),
     }
 }
@@ -742,5 +805,75 @@ mod tests {
         // one-line wrapper at the call site.
         let gate: Result<(), String> = check_export_freshness(&store).await;
         assert!(gate.is_err(), "the CLI shape refuses: {gate:?}");
+    }
+
+    /// Seed a dirty flag row in the pre-DR-1 spelling (`export_freshness::<ns>`):
+    /// the exact id releases before the namespace rule wrote, which the strict
+    /// write gate now refuses, so it cannot be seeded through `upsert`. The
+    /// row is written directly, the way it already sits in a database opened
+    /// from an older binary.
+    async fn seed_legacy_flag(store: &LadybugStore, namespace: &str) {
+        let id = legacy_flag_id(namespace);
+        let payload = dirty_payload(namespace, "created", 1_000);
+        let query = format!(
+            "CREATE (:Memory {{id: '{}', namespace: '{}', content: '{}', user_id: 'system', memory_type: '{}', agent_name: 'thalamic_bus', location: '', location_lines: '', metadata: '{}'}})",
+            crate::store::ladybug::escape_ladybug_string(&id),
+            crate::store::ladybug::escape_ladybug_string(namespace),
+            crate::store::ladybug::escape_ladybug_string(&payload.content),
+            crate::store::ladybug::escape_ladybug_string(&payload.memory_type),
+            crate::store::ladybug::escape_ladybug_string(&payload.metadata.to_string()),
+        );
+        store
+            .with_conn(move |conn| {
+                conn.query(&query)?;
+                Ok(())
+            })
+            .await
+            .expect("seed the legacy flag row");
+    }
+
+    /// A dirty flag a pre-DR-1 release wrote still refuses the export: the
+    /// mutation behind it may never have been exported, and silently reading
+    /// it as clean is the staleness this module exists to prevent.
+    #[tokio::test]
+    async fn the_check_refuses_a_dirty_flag_written_before_dr1() {
+        let (_dir, store) = scratch("legacy-refuses");
+        store.init("a").await.expect("init a");
+        seed_legacy_flag(&store, "a").await;
+
+        let err = check_export_freshness(&store)
+            .await
+            .expect_err("the gate refuses a legacy dirty flag");
+        assert!(
+            err.contains("a"),
+            "the error names the legacy-dirty namespace: {err}"
+        );
+    }
+
+    /// The clear pass must be able to clear a legacy dirty flag, or an
+    /// upgraded database could never export again. The strict write gate
+    /// refuses to update the legacy spelling, so the clear deletes the row
+    /// -- a missing flag row has always meant clean -- and the gate passes.
+    #[tokio::test]
+    async fn the_clear_pass_removes_a_dirty_flag_written_before_dr1() {
+        let (_dir, store) = scratch("legacy-clear");
+        store.init("a").await.expect("init a");
+        seed_legacy_flag(&store, "a").await;
+
+        clear_export_freshness_for_namespace(&store, "a")
+            .await
+            .expect("the clear pass handles the legacy row");
+
+        assert!(
+            store
+                .get("a", &legacy_flag_id("a"))
+                .await
+                .expect("the legacy row is still addressable")
+                .is_none(),
+            "the legacy flag row is gone: its absence reads clean"
+        );
+        check_export_freshness(&store)
+            .await
+            .expect("a cleared legacy flag no longer refuses the export");
     }
 }

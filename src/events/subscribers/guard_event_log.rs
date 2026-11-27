@@ -33,10 +33,10 @@ use serde_json::json;
 /// memory, so a reader can find the trail without guessing from the content.
 const GUARD_EVENT_TYPE: &str = "guard_event";
 
-/// The id prefix every audit row carries. The suffix is a fresh v4 per call,
-/// which is what makes the no-dedup guarantee structural rather than a promise:
-/// `upsert` MERGEs on id, so a unique id is the only thing stopping a second
-/// guard call on one trace from overwriting the first.
+/// The id suffix every audit row carries. The trailing part is a fresh v4 per
+/// call, which is what makes the no-dedup guarantee structural rather than a
+/// promise: `upsert` MERGEs on id, so a unique id is the only thing stopping a
+/// second guard call on one trace from overwriting the first.
 const GUARD_EVENT_ID_PREFIX: &str = "guard_event";
 
 /// The `user_id` a machine-written row carries. `system` is the same value the
@@ -96,7 +96,7 @@ impl MemorySubscriber for GuardEventLog {
         ctx.store
             .upsert(
                 namespace,
-                &audit_id(),
+                &audit_id(namespace),
                 vec![0.0; self.dimensions],
                 audit_payload(
                     namespace,
@@ -115,9 +115,17 @@ impl MemorySubscriber for GuardEventLog {
 
 /// One row's id. A fresh v4 per call, so two calls that share a `trace_id`
 /// still get two rows: `upsert` MERGEs on id, and the id is the only thing
-/// standing between a retry and a silently overwritten audit trail.
-fn audit_id() -> String {
-    format!("{GUARD_EVENT_ID_PREFIX}::{}", uuid::Uuid::new_v4())
+/// standing between a retry and a silently overwritten audit trail. The id
+/// leads with the row's own namespace, so it names its owner (the DR-1 shape
+/// the strict write gate accepts) without softening the cross-namespace rule
+/// for system rows; the kind suffix keeps the trail greppable. The whole id
+/// (`<namespace>::guard_event::<uuid>`, at most 64 + 2 + 11 + 2 + 36
+/// characters) stays inside DR-2's 128-character cap by construction.
+fn audit_id(namespace: &str) -> String {
+    format!(
+        "{namespace}::{GUARD_EVENT_ID_PREFIX}::{}",
+        uuid::Uuid::new_v4()
+    )
 }
 
 /// The audit row: what was decided, about what, and on whose call.

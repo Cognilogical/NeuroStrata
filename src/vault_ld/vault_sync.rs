@@ -2943,26 +2943,14 @@ mod tests {
         );
         let ns = "vault_collision";
         store.init(ns).await.expect("init");
-        // Three distinct DR-2-valid qualified ids whose `:` and `/` path
-        // separators flatten to the same `a__x_y_z.md` filename.
+        // Three distinct ids whose `:` and `/` path separators flatten to the
+        // same `a__x_y_z.md` filename. They name a prefix the namespace does
+        // not own -- the historical spelling the public write gate now
+        // refuses -- so they are seeded directly, the way rows written by an
+        // older binary already sit in the database, rather than through
+        // `upsert`.
         for id in ["a::x/y/z", "a::x/y:z", "a::x:y/z"] {
-            store
-                .upsert(
-                    ns,
-                    id,
-                    vec![0.0; 4],
-                    crate::traits::MemoryPayload {
-                        content: format!("body of {id}"),
-                        user_id: "default".to_string(),
-                        memory_type: "fact".to_string(),
-                        agent_name: None,
-                        location: String::new(),
-                        location_lines: String::new(),
-                        metadata: serde_json::json!({}),
-                    },
-                )
-                .await
-                .expect("seed note");
+            seed_legacy_row(&store, ns, id).await;
         }
         let config = VaultSyncConfig {
             namespace: ns.to_string(),
@@ -2995,8 +2983,12 @@ mod tests {
             .count();
         assert_eq!(md_count, 1, "only one file may be written");
 
-        // Re-import into a fresh store + namespace: count must match export.
-        let fresh_ns = "vault_collision_reimport";
+        // Re-import into a fresh store: count must match export. The fresh
+        // namespace is `a` -- the one these note ids name -- because DR-1
+        // makes a qualified id's prefix its owner: importing them into any
+        // other namespace would be a cross-namespace write the store now
+        // refuses, so the round trip goes through the ids' own namespace.
+        let fresh_ns = "a";
         let fresh_store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
             crate::store::ladybug::LadybugStore::for_testing(root.join("db2"), 4)
                 .expect("fresh temp store"),

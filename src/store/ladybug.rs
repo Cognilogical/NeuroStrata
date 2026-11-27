@@ -18119,6 +18119,36 @@ eurostrata\src\daemon.rs",
         }
     }
 
+    /// Seed a row whose qualified id names a foreign prefix, straight into the
+    /// engine. The strict write gate refuses that spelling through `upsert`
+    /// now, but the generation-scoping fixtures pin that aborts and deletes
+    /// stay robust against one anyway: a database opened from an older binary
+    /// can still hold such a row, and a namespace-scoped operation must not
+    /// touch it just because its id starts with this namespace's prefix.
+    async fn seed_foreign_prefixed_row(
+        store: &LadybugStore,
+        namespace: &str,
+        id: &str,
+        payload: &MemoryPayload,
+    ) {
+        let query = format!(
+            "CREATE (:Memory {{id: '{}', namespace: '{}', content: '{}', user_id: '{}', memory_type: '{}', agent_name: '', location: '', location_lines: '', metadata: '{}'}})",
+            escape_ladybug_string(id),
+            escape_ladybug_string(namespace),
+            escape_ladybug_string(&payload.content),
+            escape_ladybug_string(&payload.user_id),
+            escape_ladybug_string(&payload.memory_type),
+            escape_ladybug_string(&payload.metadata.to_string()),
+        );
+        store
+            .with_conn(move |conn| {
+                conn.query(&query)?;
+                Ok(())
+            })
+            .await
+            .expect("seed the foreign-prefixed row");
+    }
+
     /// Task 2: TaskStore and OntologyStore round-trip against a temporary
     /// LadybugStore, plus vocabulary acceptance for the new `data_pointer`
     /// memory type. `data_pointer` is private: it is never in
@@ -33282,16 +33312,17 @@ eurostrata\src\daemon.rs",
         let root = tempfile::tempdir().unwrap();
         let store = LadybugStore::for_testing(root.path().join("abort.lbug"), 4).unwrap();
         store.init("gen").await.unwrap();
+        // The direct seed below does not create the namespace's table the
+        // way `upsert` does, so the fixture states it explicitly.
+        store.init("other").await.unwrap();
         let foreign_id = "gen::1::src/foreign.rs";
-        store
-            .upsert(
-                "other",
-                foreign_id,
-                vec![0.0; 4],
-                retired_test_payload("fact", "agent", json!({})),
-            )
-            .await
-            .unwrap();
+        seed_foreign_prefixed_row(
+            &store,
+            "other",
+            foreign_id,
+            &retired_test_payload("fact", "agent", json!({})),
+        )
+        .await;
 
         let generation = store.begin_generation("gen", "src").await.unwrap();
         let staged_id = crate::parser::ingest::generation_scoped_id("gen", generation, "src/a.rs");
@@ -33396,15 +33427,17 @@ eurostrata\src\daemon.rs",
 
         let foreign_id =
             crate::parser::ingest::generation_scoped_id("gen", first, "src/foreign.rs");
-        store
-            .upsert(
-                "other",
-                &foreign_id,
-                vec![0.0; 4],
-                retired_test_payload("fact", "agent", json!({})),
-            )
-            .await
-            .unwrap();
+        // Seeded directly: the id names "gen" while the row lives in "other",
+        // a historical spelling the public write gate refuses, and exactly
+        // the decoy the scoping assertion below needs to stay robust against.
+        store.init("other").await.unwrap();
+        seed_foreign_prefixed_row(
+            &store,
+            "other",
+            &foreign_id,
+            &retired_test_payload("fact", "agent", json!({})),
+        )
+        .await;
 
         let deleted = store.delete_generation("gen", first).await.unwrap();
         assert!(deleted > 0, "the superseded generation is deleted");
