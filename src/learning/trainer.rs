@@ -56,6 +56,10 @@ pub struct SuiteReport {
     pub metrics: serde_json::Value,
 }
 
+/// Sentinel used by `EvaluationReport::default` to mean "no candidate yet".
+/// It is never a real candidate identity: evaluation refuses it.
+pub const NO_CANDIDATE: &str = "bridge-placeholder";
+
 /// Evaluation report for a candidate model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvaluationReport {
@@ -66,13 +70,20 @@ pub struct EvaluationReport {
 impl Default for EvaluationReport {
     fn default() -> Self {
         Self {
-            candidate: "bridge-placeholder".to_string(),
+            candidate: NO_CANDIDATE.to_string(),
             suites: Vec::new(),
         }
     }
 }
 
 impl EvaluationReport {
+    /// An evaluation may only be attributed to a real, explicitly named
+    /// candidate — never the default sentinel or a blank identity.
+    pub fn has_real_candidate(&self) -> bool {
+        let candidate = self.candidate.trim();
+        !candidate.is_empty() && candidate != NO_CANDIDATE
+    }
+
     /// Compute gold metric (mean of suite metrics) — real, not fabricated.
     /// Returns None only if no suites have numeric metrics.
     pub fn gold_metrics(&self) -> Option<f64> {
@@ -109,6 +120,13 @@ impl Default for ActiveManifest {
             provider_mode: "none".to_string(),
         }
     }
+}
+
+/// Normalize a training version once at the CLI boundary. The provider trims
+/// the manifest identity on load, so promotion must persist the same trimmed
+/// value or the exact-match gating check leaves the model shadow-only.
+pub fn normalize_version(raw: &str) -> ModelVersion {
+    raw.trim().to_string()
 }
 
 /// Local training runtime wrapper used by the coordinator.
@@ -287,6 +305,11 @@ impl Trainer {
     /// Evaluate a candidate model using real evaluation reports.
     /// Does not fabricate metrics; requires actual suite reports.
     pub fn evaluate_candidate(&self, report: &EvaluationReport) -> Result<f64> {
+        if !report.has_real_candidate() {
+            return Err(anyhow!(
+                "Candidate report has no real candidate identity; evaluation refused (fail-closed)"
+            ));
+        }
         tracing::debug!(candidate = %report.candidate, "evaluating candidate report");
         report.gold_metrics().ok_or_else(|| {
             anyhow!(
@@ -314,11 +337,17 @@ impl Trainer {
                 Self::PROMOTION_MIN_SCORE
             ));
         }
+        // Persist the same normalized identity the serving provider reports;
+        // an untrimmed active_version never matches and keeps the model shadow.
+        let version = version.trim();
+        if version.is_empty() {
+            return Err(anyhow!("Promotion refused: empty candidate version"));
+        }
         tracing::debug!(candidate = %version, score = score, "promoting candidate report");
         manifest.previous_good_version = manifest.active_version.clone();
-        manifest.active_version = Some(version.clone());
+        manifest.active_version = Some(version.to_string());
         manifest.candidate_version = None;
-        manifest.shadow_version = Some(version.clone());
+        manifest.shadow_version = Some(version.to_string());
         // Copy active bundle to root cache so it stays in sync.
         let cand_bundle = self.runtime.model_cache.join("candidates").join(version);
         let root_model = self.runtime.model_cache.join("model.onnx");
@@ -493,8 +522,45 @@ mod tests {
     #[test]
     fn default_evaluation_report_names_its_placeholder() {
         let report = EvaluationReport::default();
-        assert_eq!(report.candidate, "bridge-placeholder");
+        assert_eq!(report.candidate, NO_CANDIDATE);
         assert!(report.suites.is_empty());
+    }
+
+    #[test]
+    fn evaluation_refuses_default_report_even_with_metrics() {
+        let mut report = EvaluationReport::default();
+        report.suites.push(SuiteReport {
+            name: "proxy".to_string(),
+            metrics: serde_json::json!({"score": 0.9}),
+        });
+        assert!(report.gold_metrics().is_some());
+        let t = Trainer::new(Arc::new(LocalTrainingRuntime {
+            python: PathBuf::from("python"),
+            laya_train: PathBuf::from("laya-train"),
+            model_cache: PathBuf::from(".cache/laya"),
+        }));
+        assert!(
+            t.evaluate_candidate(&report).is_err(),
+            "a default report's placeholder identity must never be attributed as a real candidate"
+        );
+        report.candidate = "v-real".to_string();
+        assert!(t.evaluate_candidate(&report).is_ok());
+    }
+
+    #[test]
+    fn promote_normalizes_whitespace_version() {
+        let mut manifest = ActiveManifest::default();
+        let t = Trainer::new(Arc::new(LocalTrainingRuntime {
+            python: PathBuf::from("python"),
+            laya_train: PathBuf::from("laya-train"),
+            model_cache: PathBuf::from(".cache/laya"),
+        }));
+        t.promote(&mut manifest, &normalize_version("  v-trimmed  "), 0.9)
+            .unwrap();
+        // The provider trims the manifest identity, so active_version must be
+        // the trimmed value for the exact-match gate to fire.
+        assert_eq!(manifest.active_version.as_deref(), Some("v-trimmed"));
+        assert!(t.promote(&mut manifest, &"   ".to_string(), 0.9).is_err());
     }
 
     #[test]

@@ -19,10 +19,11 @@ pub struct ModelBundle {
 impl ModelBundle {
     /// Load a bundle from `bundle_dir`, reading its `manifest.json`.
     ///
-    /// The bundle's version is the one its manifest declares
-    /// (`bundle_version`, falling back to `model_version` then legacy
-    /// `version`) — never a string minted by this loader. A bundle whose
-    /// manifest is missing, unparsable, or declares no version is refused.
+    /// The bundle's version is the single identity its manifest declares,
+    /// resolved by the same shared rule the serving provider uses:
+    /// `model_version`, then legacy `version`, then `bundle_version`. Never a
+    /// string minted by this loader. A manifest that is missing, unparsable,
+    /// or declares no version is refused.
     pub fn load(bundle_dir: &Path, embedder_id: &str) -> Result<Self> {
         let root = bundle_dir.to_path_buf();
         let manifest_path = root.join("manifest.json");
@@ -34,25 +35,14 @@ impl ModelBundle {
         })?;
         let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
             .map_err(|e| anyhow::anyhow!("Bad bundle manifest JSON: {e}"))?;
-        // A version must be non-empty after trimming: an empty or
-        // whitespace-only `bundle_version` is treated as absent so a
-        // non-empty `model_version` can be used, otherwise the bundle is
-        // refused.
-        let non_empty = |key: &str| {
-            manifest[key]
-                .as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        };
-        let version = non_empty("bundle_version")
-            .or_else(|| non_empty("model_version"))
-            .or_else(|| non_empty("version"))
-            .ok_or_else(|| {
+        // One shared precedence rule for loading, promotion, and serving:
+        // the promoted candidate identity wins over the bundle-level one.
+        let version =
+            crate::judgment::laya_onnx::resolve_manifest_identity(&manifest).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Bundle manifest declares no bundle_version, model_version or version"
+                    "Bundle manifest declares no model_version, version or bundle_version"
                 )
-            })?
-            .to_string();
+            })?;
         let mut calibration_tier = crate::judgment::CalibrationTier::ProxyInternal;
 
         // calibration_tier
@@ -128,16 +118,39 @@ mod tests {
 
     #[test]
     fn bundle_version_is_not_fabricated() {
+        // Only the bundle-level field is declared: this test proves the
+        // declared value is used verbatim, never a loader-minted string.
         let dir = temp_bundle_with_manifest(
             "version",
-            Some(
-                r#"{"bundle_version":"0.4.14-bridge","model_version":"v1.11.1","embedder_id":"test-embedder"}"#,
-            ),
+            Some(r#"{"bundle_version":"0.4.14-bridge","embedder_id":"test-embedder"}"#),
         );
         let bundle = ModelBundle::load(&dir, "test-embedder").unwrap();
         // The version must come from the bundle's own manifest, never from a
         // hardcoded string minted by the loader.
         assert_eq!(bundle.version, "0.4.14-bridge");
+    }
+
+    #[test]
+    fn bundle_and_provider_report_one_identity() {
+        // A manifest declaring two different non-empty identities must yield
+        // ONE value from both loaders, otherwise promotion and serving diverge
+        // and the model stays shadow-only.
+        let dir = temp_bundle_with_manifest(
+            "one-identity",
+            Some(
+                r#"{"bundle_version":"0.4.14-bridge","model_version":"candidate-7","embedder_id":"laya","calibration_tier":"GoldShipped"}"#,
+            ),
+        );
+        fs::write(dir.join("model.onnx"), b"fake").unwrap();
+        let bundle = ModelBundle::load(&dir, "laya").unwrap();
+        let provider = crate::judgment::laya_onnx::LayaOnnxProvider::load(
+            &dir,
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .unwrap();
+        assert_eq!(bundle.version, provider.model_version());
+        assert_eq!(bundle.version, "candidate-7");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

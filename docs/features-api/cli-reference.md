@@ -261,9 +261,11 @@ neurostrata-mcp learn rollback
 neurostrata-mcp learn reset
 ```
 
+`learn train VERSION` normalizes `VERSION` once (leading/trailing whitespace is trimmed) and uses that same identity for the candidate artifact, evaluation report, and promoted `active_version`. The serving provider reports the identical manifest identity, so a promoted model leaves shadow mode and can gate bare standalone writes. Evaluation refuses reports whose candidate is missing or the default placeholder.
+
 ### `laya`
 
-Fetches a pinned, checksum-verified Laya ONNX duplicate-judgment bundle into `artifacts/laya-bundle` by default.
+Fetches a pinned, checksum-verified Laya ONNX duplicate-judgment bundle into `artifacts/laya-bundle` by default. Downloads are staged in an isolated directory and validated there before an atomic swap into the target; a failed or invalid fetch leaves any usable installed bundle untouched, and concurrent fetches cannot interleave their files.
 
 ```bash
 neurostrata-mcp laya [MODEL] [--out-dir <dir>]

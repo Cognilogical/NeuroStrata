@@ -16,6 +16,25 @@ use tokenizers::Tokenizer;
 use crate::judgment::{DuplicateJudgment, JudgmentProvider};
 use crate::traits::{MemoryPayload, SearchResult};
 
+/// Resolve the ONE identity a bundle manifest declares. Candidate identity
+/// (`model_version`, then legacy `version`) wins over the bundle-level
+/// `bundle_version` because promotion records the candidate as active; every
+/// loader and the serving provider must therefore agree on this value.
+/// Absent or whitespace-only fields are treated as absent.
+pub fn resolve_manifest_identity(manifest: &serde_json::Value) -> Option<String> {
+    let non_empty = |key: &str| {
+        manifest
+            .get(key)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    non_empty("model_version")
+        .or_else(|| non_empty("version"))
+        .or_else(|| non_empty("bundle_version"))
+        .map(str::to_string)
+}
+
 /// A `JudgmentProvider` for Laya ONNX models loaded and validated by the
 /// runtime system. Inference is performed locally via ONNX Runtime with
 /// `spawn_blocking` to avoid blocking the async runtime.
@@ -60,26 +79,11 @@ impl LayaOnnxProvider {
 
         // A version must be declared and non-empty after trimming: a
         // serving provider must never mint a fabricated model identity
-        // for an unversioned bundle.
-        let non_empty = |key: &str| {
-            manifest
-                .get(key)
-                .and_then(|x| x.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        };
-        // Promotion records the candidate identity (`model_version` for
-        // built-in training, `version` for legacy bundles) as active. Report
-        // that same identifier so a promoted bundle can actually gate; fall
-        // back to a declared `bundle_version` when no candidate identity is
-        // present rather than fabricating one.
-        let model_version = non_empty("model_version")
-            .or_else(|| non_empty("version"))
-            .or_else(|| non_empty("bundle_version"))
-            .ok_or_else(|| {
-                anyhow!("Bundle manifest declares no model_version, version or bundle_version")
-            })?
-            .to_string();
+        // for an unversioned bundle. Use the single shared precedence so
+        // loading, promotion, and serving report the same identity.
+        let model_version = resolve_manifest_identity(&manifest).ok_or_else(|| {
+            anyhow!("Bundle manifest declares no model_version, version or bundle_version")
+        })?;
 
         let temperature = manifest
             .get("temperature")
@@ -223,18 +227,7 @@ impl LayaOnnxProvider {
             .map_err(|e| anyhow!("Cannot read downloaded manifest: {e}"))?;
         let manifest: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| anyhow!("Bad downloaded manifest JSON: {e}"))?;
-        let non_empty = |key: &str| {
-            manifest
-                .get(key)
-                .and_then(|x| x.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        };
-        if non_empty("model_version")
-            .or_else(|| non_empty("version"))
-            .or_else(|| non_empty("bundle_version"))
-            .is_none()
-        {
+        if resolve_manifest_identity(&manifest).is_none() {
             return Err(anyhow!(
                 "Downloaded Laya bundle at {} declares no non-empty model_version, version or bundle_version",
                 target_path.display()
@@ -243,28 +236,108 @@ impl LayaOnnxProvider {
         Ok(())
     }
 
-    /// Fetch a pinned Laya model bundle by model identifier.
-    /// Downloads from the registry-defined URL and verifies the SHA-256 checksum
-    /// before writing to the target directory, ensuring supply-chain integrity.
+    /// Validate a fully staged bundle, then swap it into `target`. Never
+    /// touch the target until validation succeeds: a failed download must
+    /// leave a usable installed bundle in place.
+    fn install_validated_bundle(staging: &Path, target: &Path) -> Result<()> {
+        Self::validate_fetched_bundle(staging)?;
+        Self::swap_bundle_dirs(staging, target)
+    }
+
+    /// Rename-based replacement. The old target is held as a backup and
+    /// restored if the final rename fails, so there is no window in which a
+    /// caller observes a half-installed bundle.
+    fn swap_bundle_dirs(staging: &Path, target: &Path) -> Result<()> {
+        if !target.exists() {
+            std::fs::rename(staging, target).map_err(|e| {
+                anyhow!("Cannot install staged bundle at {}: {e}", target.display())
+            })?;
+            return Ok(());
+        }
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "bundle".to_string());
+        let backup = target.with_file_name(format!(".{name}.backup-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&backup);
+        std::fs::rename(target, &backup).map_err(|e| {
+            anyhow!(
+                "Cannot set aside existing bundle at {}: {e}",
+                target.display()
+            )
+        })?;
+        if let Err(e) = std::fs::rename(staging, target) {
+            let _ = std::fs::rename(&backup, target);
+            return Err(anyhow!(
+                "Cannot install staged bundle at {}: {e}",
+                target.display()
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&backup);
+        Ok(())
+    }
+
+    /// Blocking half of `fetch_model`. One exclusive lock per target covers
+    /// the entire download-validate-swap sequence so concurrent fetches can
+    /// neither interleave files nor replace each other's result.
+    fn fetch_model_blocking(model_id: &str, target: &Path) -> Result<()> {
+        let parent = target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "bundle".to_string());
+        use fs2::FileExt;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(parent.join(format!(".{name}.fetch.lock")))?;
+        lock.lock_exclusive()?;
+        let result = (|| {
+            let staging = parent.join(format!(".{name}.staging-{}", uuid::Uuid::new_v4()));
+            let _ = std::fs::remove_dir_all(&staging);
+            std::fs::create_dir_all(&staging)?;
+            // Reuse the installed bundle's pins if present, so a fetch stays
+            // deterministic instead of falling back to a remote default.
+            let registry = target.join("registry.json");
+            if registry.exists() {
+                std::fs::copy(&registry, staging.join("registry.json"))?;
+            }
+            let fetched = crate::model_downloader::fetch_from_registry(model_id, &staging);
+            match fetched.and_then(|_| Self::install_validated_bundle(&staging, target)) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    Err(e)
+                }
+            }
+        })();
+        let _ = lock.unlock();
+        result
+    }
+
+    /// Fetch a pinned Laya model bundle by model identifier. Downloads into
+    /// an isolated staging directory, validates the complete bundle there,
+    /// and only then atomically replaces the target. Failed or invalid
+    /// fetches never replace a usable installed bundle.
     pub async fn fetch_model(model_id: &str, target_dir: &str) -> Result<()> {
         let target_path = PathBuf::from(target_dir);
-        std::fs::create_dir_all(&target_path)?;
-
-        // Use the common model downloader (spawn_blocking to avoid blocking async runtime)
-        let _written = tokio::task::spawn_blocking({
-            let model_id = model_id.to_string();
-            let target_path = target_path.clone();
-            move || crate::model_downloader::fetch_from_registry(&model_id, &target_path)
-        })
-        .await??;
-
-        Self::validate_fetched_bundle(&target_path)?;
-
-        println!(
+        // Build the success line before moving both values into the blocking
+        // closure; the downloader must own them for the whole fetch.
+        let success = format!(
             "Laya model '{}' fetched and verified to '{}'",
             model_id,
             target_path.display()
         );
+        let model_id = model_id.to_string();
+        tokio::task::spawn_blocking(move || Self::fetch_model_blocking(&model_id, &target_path))
+            .await??;
+        println!("{success}");
         Ok(())
     }
 }
@@ -719,6 +792,142 @@ mod tests {
         .unwrap();
         assert!(LayaOnnxProvider::validate_fetched_bundle(&dir).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a local `.tar.gz` bundle plus registry so fetch tests never
+    /// touch the network. The archive always carries manifest + model.onnx.
+    fn local_registry_with_bundle(root: &Path, manifest: &str) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use sha2::{Digest, Sha256};
+        use tar::Builder;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = Builder::new(&mut encoder);
+            for (name, bytes) in [
+                ("manifest.json", manifest.as_bytes()),
+                ("model.onnx", b"new-model".as_slice()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, name, bytes).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let archive = encoder.finish().unwrap();
+        let archive_path = root.join("bundle.tar.gz");
+        std::fs::write(&archive_path, &archive).unwrap();
+        let hash = hex::encode(Sha256::digest(&archive));
+        let registry = serde_json::json!({
+            "version": "test",
+            "models": [{
+                "name": "laya-test",
+                "url": format!("file://{}", archive_path.display()),
+                "sha256": hash,
+                "path": "model.onnx",
+                "files": ["manifest.json", "model.onnx"]
+            }]
+        });
+        std::fs::write(root.join("registry.json"), registry.to_string()).unwrap();
+    }
+
+    fn staging_leftovers(root: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("staging"))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn invalid_fetch_preserves_installed_bundle() {
+        let root = std::env::temp_dir().join(format!("ns-fetch-safe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        // Download declares no usable version: staging validation must fail.
+        local_registry_with_bundle(&root, r#"{"embedder_id":"laya","version":"   "}"#);
+        let target = root.join("bundle");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            target.join("manifest.json"),
+            r#"{"embedder_id":"laya","model_version":"installed-v1"}"#,
+        )
+        .unwrap();
+        std::fs::write(target.join("model.onnx"), b"installed-model").unwrap();
+        std::fs::copy(root.join("registry.json"), target.join("registry.json")).unwrap();
+
+        assert!(
+            LayaOnnxProvider::fetch_model("laya-test", target.to_str().unwrap())
+                .await
+                .is_err()
+        );
+        let manifest = std::fs::read_to_string(target.join("manifest.json")).unwrap();
+        assert!(
+            manifest.contains("installed-v1"),
+            "a failed fetch must not replace the usable bundle: {manifest}"
+        );
+        assert_eq!(
+            std::fs::read(target.join("model.onnx")).unwrap(),
+            b"installed-model"
+        );
+        assert!(staging_leftovers(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn valid_fetch_replaces_installed_bundle() {
+        let root = std::env::temp_dir().join(format!("ns-fetch-swap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        local_registry_with_bundle(
+            &root,
+            r#"{"embedder_id":"laya","model_version":"new-v2","calibration_tier":"GoldShipped"}"#,
+        );
+        let target = root.join("bundle");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            target.join("manifest.json"),
+            r#"{"embedder_id":"laya","model_version":"installed-v1"}"#,
+        )
+        .unwrap();
+        std::fs::copy(root.join("registry.json"), target.join("registry.json")).unwrap();
+
+        LayaOnnxProvider::fetch_model("laya-test", target.to_str().unwrap())
+            .await
+            .expect("valid downloaded bundle installs");
+        let manifest = std::fs::read_to_string(target.join("manifest.json")).unwrap();
+        assert!(manifest.contains("new-v2"));
+        assert!(staging_leftovers(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn concurrent_fetches_to_one_target_do_not_interleave() {
+        let root = std::env::temp_dir().join(format!("ns-fetch-parallel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        local_registry_with_bundle(
+            &root,
+            r#"{"embedder_id":"laya","model_version":"new-v2","calibration_tier":"GoldShipped"}"#,
+        );
+        let target = root.join("bundle");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::copy(root.join("registry.json"), target.join("registry.json")).unwrap();
+        let target_str = target.to_str().unwrap().to_string();
+
+        let (first, second) = tokio::join!(
+            LayaOnnxProvider::fetch_model("laya-test", &target_str),
+            LayaOnnxProvider::fetch_model("laya-test", &target_str)
+        );
+        assert!(first.is_ok() && second.is_ok());
+        let manifest = std::fs::read_to_string(target.join("manifest.json")).unwrap();
+        assert!(manifest.contains("new-v2"));
+        assert!(staging_leftovers(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

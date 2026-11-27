@@ -2451,10 +2451,12 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
             None if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            None => return Err(anyhow::anyhow!(
+            None => {
+                return Err(anyhow::anyhow!(
                 "Another NeuroStrata daemon, or a CLI command working on the store, holds {:?}.",
                 db_path
-            )),
+            ))
+            }
         }
     }
 }
@@ -3539,6 +3541,10 @@ fn print_learn_control(req: crate::learning::control::LearningControlRequest) {
 /// Build the dedup dataset, train a candidate, evaluate it fail-closed, and
 /// promote it when the real eval report carries numeric metrics.
 async fn run_learn_train(version: &str) -> anyhow::Result<()> {
+    // Normalize once at the boundary: the serving provider trims the manifest
+    // identity and promotion persists this exact string for the gating
+    // exact-match, so all three must see the same normalized version.
+    let version = crate::learning::trainer::normalize_version(version);
     let root = crate::learning::control::default_learning_dir();
     let paths = crate::judgment::laya_onnx::LearningPaths::new(root.clone());
     let mgr = crate::judgment::laya_onnx::LearningRuntimeManager::new(paths.clone());
@@ -3560,14 +3566,14 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
     )
     .await?;
 
-    trainer.train_candidate(&version.to_string()).await?;
+    trainer.train_candidate(&version).await?;
     job_state = trainer.transition(
         &job_state,
         crate::learning::trainer::TrainingJobState::ProxyShadow,
     )?;
 
     // The builtin train path writes under runtime model_cache, not LearningPaths.
-    let candidate_dir = model_cache.join("candidates").join(version);
+    let candidate_dir = model_cache.join("candidates").join(&version);
     let eval_path = candidate_dir.join("eval_report.json");
     let eval_raw = std::fs::read_to_string(&eval_path).map_err(|_| {
         anyhow::anyhow!(
@@ -3609,7 +3615,7 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
     } else {
         crate::learning::trainer::ActiveManifest::default()
     };
-    trainer.promote(&mut manifest, &version.to_string(), score)?;
+    trainer.promote(&mut manifest, &version, score)?;
     job_state = trainer.transition(
         &job_state,
         crate::learning::trainer::TrainingJobState::Promoted,
@@ -3642,7 +3648,7 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
         "{}",
         serde_json::json!({
             "ok": true,
-            "version": version,
+            "version": version.clone(),
             "rt_state": format!("{:?}", rt_state),
             "score": score,
             "active_version": manifest.active_version,
@@ -3653,7 +3659,7 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
             "train_jsonl": paths.train_jsonl(),
             "proxy_eval_jsonl": paths.proxy_eval_jsonl(),
             "base_model_dir": paths.base_model_dir(),
-            "candidate_dir": paths.candidate_dir(&version.to_string()),
+            "candidate_dir": paths.candidate_dir(&version),
         })
     );
     Ok(())
