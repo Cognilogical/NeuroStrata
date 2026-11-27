@@ -10,6 +10,8 @@
 - `discoverProjectNamespace` — the last step of the namespace order below: `.NeuroStrata/session_queries.json`, else the project folder's name
 - `findRootMarker` — finds the project root marker for a folder, mirroring `neurostrata-mcp`'s walk (checked against the shared cases in `tests/fixtures/root-marker-cases.json`)
 
+`extractDaemonMemoryAdvisory` surfaces the daemon's buffer-pool / OOM guidance from the error channel only when the text carries the advisory marker, so a memory that merely discusses the setting cannot synthesize one; it is shown once per ten-minute window. The guidance names `NEUROSTRATA_BUFFER_POOL_BYTES` (or the daemon's configured `store.buffer_pool_bytes`), the byte-denominated variable that replaced the megabyte form (`#453`).
+
 ### Namespace order
 
 `resolveConfig` uses the same order as `neurostrata-mcp namespace resolve`:
