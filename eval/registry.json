@@ -620,7 +620,18 @@
         "guard::sandbox::tests::a_descendant_holding_a_pipe_does_not_hang_the_verdict",
         "guard::sandbox::tests::stalled_cleanup_child_is_killed_and_reaped",
         "guard::sandbox::tests::mount_cwd_revalidation_detects_a_swapped_symlink",
-        "guard::sandbox::tests::sandbox_concurrency_is_bounded"
+        "guard::sandbox::tests::sandbox_concurrency_is_bounded",
+        "guard::sandbox::tests::post_kill_reap_is_bounded",
+        "guard::sandbox::tests::sync_removal_failure_is_a_cleanup_failure",
+        "guard::sandbox::tests::permit_is_held_until_container_cleanup_finishes",
+        "guard::sandbox::tests::bounded_sync_removal_kills_a_stalled_cleanup_child",
+        "guard::sandbox::tests::workspace_scope_refuses_paths_outside_the_project_root",
+        "guard::sandbox::tests::effective_concurrency_bounds_aggregate_memory",
+        "guard::sandbox::tests::unsupported_action_types_are_approved_fail_open",
+        "guard::sandbox::tests::pipe_read_errors_are_reported_with_partial_output",
+        "guard::sandbox::tests::registry_suite_membership_is_checked_not_global_contains",
+        "guard::sandbox::tests::available_permits_are_not_counted_as_queue_waiters",
+        "guard::sandbox::tests::sandbox_args_make_root_read_only_and_bound_scratch"
       ],
       "thresholds": {
         "ignored": 0

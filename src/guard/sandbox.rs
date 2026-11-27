@@ -1,5 +1,5 @@
 use crate::guard::models::ValidateVerdict;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -43,12 +43,57 @@ pub(crate) const SANDBOX_MAX_CONCURRENT_RUNS: usize = 8;
 pub(crate) const SANDBOX_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const SANDBOX_MAX_QUEUED: usize = 16;
 
+/// Per-run container memory reservation, matching `--memory=512m` below.
+const SANDBOX_PER_RUN_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+/// Default aggregate budget. Operators can raise it (implicitly raising
+/// concurrency) with `NEUROSTRATA_SANDBOX_MEMORY_BUDGET_MB`; the hard cap of
+/// [`SANDBOX_MAX_CONCURRENT_RUNS`] still applies.
+const SANDBOX_TOTAL_MEMORY_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+/// Writable scratch is a bounded tmpfs, never the container's root overlay.
+const SANDBOX_TMPFS_SIZE: &str = "64m";
+
 static SANDBOX_CONCURRENCY: std::sync::OnceLock<tokio::sync::Semaphore> =
     std::sync::OnceLock::new();
 static SANDBOX_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn sandbox_concurrency() -> &'static tokio::sync::Semaphore {
-    SANDBOX_CONCURRENCY.get_or_init(|| tokio::sync::Semaphore::new(SANDBOX_MAX_CONCURRENT_RUNS))
+    SANDBOX_CONCURRENCY.get_or_init(|| tokio::sync::Semaphore::new(effective_sandbox_runs()))
+}
+
+/// Derive the live permit count from BOTH a configurable aggregate budget and
+/// the host's available memory, reserving 20% for the daemon and other
+/// processes. Eight 512 MiB containers can otherwise trigger a host-wide OOM
+/// on a machine with less than 4 GiB free.
+fn effective_sandbox_runs_for(available_bytes: u64, budget_bytes: u64, hard_cap: usize) -> usize {
+    let budget_runs = (budget_bytes / SANDBOX_PER_RUN_MEMORY_BYTES) as usize;
+    let usable = available_bytes.saturating_mul(8) / 10;
+    let host_runs = (usable / SANDBOX_PER_RUN_MEMORY_BYTES) as usize;
+    hard_cap.min(budget_runs).min(host_runs).max(1)
+}
+
+fn host_available_memory_bytes() -> Option<u64> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in info.lines() {
+        if let Some(value) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = value.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+fn effective_sandbox_runs() -> usize {
+    let budget = std::env::var("NEUROSTRATA_SANDBOX_MEMORY_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(SANDBOX_TOTAL_MEMORY_BUDGET_BYTES);
+    // No host reading (non-Linux) means the configured budget alone governs.
+    effective_sandbox_runs_for(
+        host_available_memory_bytes().unwrap_or(u64::MAX),
+        budget,
+        SANDBOX_MAX_CONCURRENT_RUNS,
+    )
 }
 
 struct QueueSlot;
@@ -63,6 +108,12 @@ impl Drop for QueueSlot {
 pub(crate) async fn acquire_sandbox_permit(
     limit: Duration,
 ) -> Result<tokio::sync::SemaphorePermit<'static>, String> {
+    // Only callers that actually have to wait occupy a queue slot. Counting
+    // immediate acquisitions rejects valid runs when several callers overlap
+    // and a permit is already free.
+    if let Ok(permit) = sandbox_concurrency().try_acquire() {
+        return Ok(permit);
+    }
     let waiting = SANDBOX_WAITERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let _slot = QueueSlot;
     if waiting > SANDBOX_MAX_QUEUED {
@@ -89,6 +140,56 @@ fn sandbox_action_type(action_type: &str) -> Result<&'static str, String> {
             "Sandbox execution requested for unsupported action_type '{action_type}'; only bash and script can be sandboxed"
         )),
     }
+}
+
+/// Case variants of shell actions are sandboxed; non-shell actions never
+/// mount anything, so they keep the documented `ApprovedFailOpen` verdict
+/// after the deterministic and semantic rule checks instead of being
+/// rejected for a container they were never going to use.
+fn sandbox_action_decision(action_type: &str) -> Result<&'static str, ValidateVerdict> {
+    match sandbox_action_type(action_type) {
+        Ok(normalized) => Ok(normalized),
+        Err(_) => Err(ValidateVerdict::ApprovedFailOpen {
+            warning: format!(
+                "Sandbox execution not applicable for action_type '{action_type}'; approved after deterministic and semantic rule checks"
+            ),
+        }),
+    }
+}
+
+/// The caller's workspace is the daemon project root plus the operator's
+/// `allowed_external_dirs`. A canonical cwd outside both must never be bind
+/// mounted into the sandbox, even when it is readable and not on the
+/// sensitive-path refusal list.
+fn sandbox_allowed_external_dirs() -> Vec<PathBuf> {
+    let Ok(path) = crate::config::Config::default_path() else {
+        return Vec::new();
+    };
+    if !path.exists() {
+        return Vec::new();
+    }
+    match crate::config::Config::load_from(&path) {
+        Ok(config) => config.allowed_external_dirs,
+        Err(e) => {
+            warn!(
+                "could not read {} for sandbox allowed_external_dirs; treating it as empty: {e}",
+                path.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn workspace_cwd_refusal_with(cwd: &Path, root: &Path, allowlist: &[PathBuf]) -> Option<String> {
+    crate::daemon::check_caller_path(cwd, root, allowlist).err()
+}
+
+fn workspace_cwd_refusal(cwd: &Path) -> Option<String> {
+    workspace_cwd_refusal_with(
+        cwd,
+        &crate::daemon::resolve_project_root(),
+        &sandbox_allowed_external_dirs(),
+    )
 }
 
 /// Host paths a guarded action's working directory may never sit under: the
@@ -221,18 +322,24 @@ impl SandboxEvaluator {
             std::fs::canonicalize(cwd).map_err(|_| anyhow::anyhow!("Invalid cwd path"))?;
         let cwd_str = canonical_cwd.to_string_lossy().to_string();
 
-        // Normalize first, then fail closed: a case variant such as `BASH`
-        // must still be sandboxed, and an unsupported type must never receive
-        // approval without the container and mount checks.
-        let action_type = match sandbox_action_type(action_type) {
-            Ok(normalized) => normalized,
-            Err(reason) => {
-                return Ok(ValidateVerdict::DeterministicReject {
-                    reasons: vec![reason],
-                    constraints: vec![],
-                });
-            }
-        };
+        // Normalize shell types; non-shell types never mount, so they keep
+        // the documented fail-open verdict instead of being rejected.
+        if let Err(verdict) = sandbox_action_decision(action_type) {
+            return Ok(verdict);
+        }
+
+        // The refusal list is a blacklist; pair it with the caller's workspace
+        // allowlist so any other readable host directory cannot be mounted and
+        // have its contents returned in the rejection logs.
+        if let Some(reason) = workspace_cwd_refusal(&canonical_cwd) {
+            return Ok(ValidateVerdict::DeterministicReject {
+                reasons: vec![format!("Security violation: {reason}")],
+                constraints: vec![
+                    "Never mount a directory outside the authenticated caller's workspace or allowed_external_dirs."
+                        .to_string(),
+                ],
+            });
+        }
 
         if let Some(refused) = working_directory_refusal(&cwd_str) {
             return Ok(ValidateVerdict::DeterministicReject {
@@ -273,15 +380,7 @@ pub(crate) enum RunOutcome {
 /// refused as a whole because #410's acceptance criteria name
 /// `/home/user/project` explicitly.
 pub(crate) fn working_directory_refusal(cwd: &str) -> Option<String> {
-    let home = dirs::home_dir();
-    // `evaluate` canonicalizes the cwd before calling this; canonicalize the
-    // home too where possible so a symlinked home still compares equal.
-    let home = home.as_deref().map(|h| {
-        std::fs::canonicalize(h)
-            .ok()
-            .unwrap_or_else(|| h.to_path_buf())
-    });
-    working_directory_refusal_with_home_and_case(cwd, home.as_deref(), fold_case_paths())
+    working_directory_refusal_with_home(cwd, dirs::home_dir().as_deref())
 }
 
 /// Pure core of [`working_directory_refusal`]: takes the home directory as a
@@ -291,7 +390,10 @@ pub(crate) fn working_directory_refusal_with_home(
     cwd: &str,
     home: Option<&Path>,
 ) -> Option<String> {
-    working_directory_refusal_with_home_and_case(cwd, home, fold_case_paths())
+    // Canonicalize the home too where possible so a symlinked home still
+    // compares equal with the already-canonicalized cwd.
+    let home = home.map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
+    working_directory_refusal_with_home_and_case(cwd, home.as_deref(), fold_case_paths())
 }
 
 /// Windows and (default) macOS filesystems are case-insensitive: two paths
@@ -421,7 +523,7 @@ async fn evaluate_with_timeout(
 
     // One process-wide permit per live run, held across spawn/timeout/cleanup
     // so concurrent validations cannot collectively exhaust the host.
-    let _permit = match acquire_sandbox_permit(SANDBOX_QUEUE_TIMEOUT).await {
+    let permit = match acquire_sandbox_permit(SANDBOX_QUEUE_TIMEOUT).await {
         Ok(permit) => permit,
         Err(reason) => {
             return Ok(ValidateVerdict::DeterministicReject {
@@ -450,7 +552,7 @@ async fn evaluate_with_timeout(
     let container = format!("neurostrata-sandbox-{}", uuid::Uuid::new_v4());
     // If this future is cancelled or dropped, the named container must still
     // be removed: killing the `podman run` client does not stop the container.
-    let mut cleanup_guard = ContainerCleanupGuard::new(engine, &container);
+    let mut cleanup_guard = ContainerCleanupGuard::new(engine, &container, permit);
     let child = sandbox_command(engine, &cwd_for_mount, &container).spawn()?;
     let (outcome, cleanup_failure) = match run_child_with_timeout_named(
         child,
@@ -578,9 +680,10 @@ pub(crate) fn sandbox_run_args(cwd: &str) -> Vec<String> {
         "--pids-limit=256".to_string(),
         "--memory=512m".to_string(),
         "--network=none".to_string(),
+        "--read-only".to_string(),
         "-v".to_string(),
         format!("{}:/workspace:ro", cwd),
-        "--tmpfs=/tmp".to_string(),
+        format!("--tmpfs=/tmp:size={SANDBOX_TMPFS_SIZE}"),
         "-w=/workspace".to_string(),
         SANDBOX_IMAGE.to_string(),
         "sh".to_string(),
@@ -599,6 +702,7 @@ pub(crate) fn sandbox_run_args(cwd: &str) -> Vec<String> {
 /// are still feeding stdin blocks on a full pipe, and a child that never
 /// reads stdin (`sleep 60`) blocks `write_all` forever, letting the sandbox
 /// outlive its timeout.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn run_child_with_timeout(
     child: tokio::process::Child,
     payload: &str,
@@ -644,15 +748,30 @@ async fn run_child_with_timeout_named(
                 tokio::join!(&mut stdout_task, &mut stderr_task)
             })
             .await;
-            let (stdout, stderr) = match drained {
+            let ((stdout, stdout_error), (stderr, stderr_error)) = match drained {
                 Ok((stdout, stderr)) => (stdout.unwrap_or_default(), stderr.unwrap_or_default()),
                 Err(_) => {
                     stdout_task.abort();
                     stderr_task.abort();
                     warn!("Sandbox: output drains exceeded shared {PIPE_DRAIN_TIMEOUT:?} after child exit; abandoning captured output");
-                    (Vec::new(), Vec::new())
+                    ((Vec::new(), None), (Vec::new(), None))
                 }
             };
+            let capture_errors: Vec<String> =
+                [stdout_error, stderr_error].into_iter().flatten().collect();
+            for error in &capture_errors {
+                warn!("Sandbox: output capture failed: {error}");
+            }
+            let mut stderr = stderr;
+            if !capture_errors.is_empty() {
+                // Surface the failure in the verdict's diagnostics rather than
+                // presenting a partial capture as if it were the full output.
+                let note = format!(
+                    "\n[sandbox output capture errors: {}]",
+                    capture_errors.join("; ")
+                );
+                stderr.extend_from_slice(note.as_bytes());
+            }
             Ok((
                 RunOutcome::Completed(std::process::Output {
                     status,
@@ -666,28 +785,10 @@ async fn run_child_with_timeout_named(
             if let Err(e) = child.start_kill() {
                 warn!("Sandbox timeout: failed to kill child: {}", e);
             }
-            // Reap the killed child before returning: a bounded first wait
-            // keeps the verdict prompt, but if the child somehow survives the
-            // first SIGKILL we re-kill and wait until it is actually reaped
-            // rather than leaving a zombie behind the released permit.
+            // Reap the killed child before returning, with BOTH waits bounded
+            // so a stubborn child cannot keep the permit past the verdict.
             const POST_KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
-            match timeout(POST_KILL_WAIT_TIMEOUT, child.wait()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    warn!("Sandbox timeout: failed to reap child: {}", e);
-                }
-                Err(_) => {
-                    warn!(
-                        "Sandbox timeout: child did not exit within {POST_KILL_WAIT_TIMEOUT:?}; escalating kill and waiting for reap"
-                    );
-                    if let Err(e) = child.start_kill() {
-                        warn!("Sandbox timeout: escalated kill failed: {e}");
-                    }
-                    if let Err(e) = child.wait().await {
-                        warn!("Sandbox timeout: failed to reap child after escalation: {e}");
-                    }
-                }
-            }
+            let _reaped = reap_after_kill(&mut child, POST_KILL_WAIT_TIMEOUT).await;
             // Killing the `podman run` client does not stop the container it
             // created. Remove it by the name passed to `--name`, and surface
             // any failed removal in the verdict instead of logging it away.
@@ -722,8 +823,39 @@ async fn run_child_with_timeout_named(
     }
 }
 
+/// Kill then reap the child, but never hold the run permit indefinitely: the
+/// escalation itself is bounded, and an unreapable child returns `false` so
+/// the verdict can still be delivered.
+async fn reap_after_kill(child: &mut tokio::process::Child, post_wait: Duration) -> bool {
+    match timeout(post_wait, child.wait()).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(e)) => {
+            warn!("Sandbox timeout: failed to reap child: {e}");
+            false
+        }
+        Err(_) => {
+            warn!("Sandbox timeout: child did not exit within {post_wait:?}; escalating kill");
+            if let Err(e) = child.start_kill() {
+                warn!("Sandbox timeout: escalated kill failed: {e}");
+            }
+            match timeout(post_wait, child.wait()).await {
+                Ok(Ok(_)) => true,
+                Ok(Err(e)) => {
+                    warn!("Sandbox timeout: failed to reap child after escalation: {e}");
+                    false
+                }
+                Err(_) => {
+                    warn!("Sandbox timeout: child still unreaped after bounded escalation; returning verdict");
+                    false
+                }
+            }
+        }
+    }
+}
+
 /// Outcome of a deadline-bounded cleanup subprocess.
 struct CleanupOutcome {
+    #[allow(dead_code)]
     pid: Option<u32>,
     timed_out: bool,
     succeeded: bool,
@@ -746,20 +878,23 @@ impl CleanupOutcome {
 }
 
 /// Removes a named container if a sandbox run is cancelled or dropped before
-/// its own cleanup path completes. A `std::thread` keeps the removal bounded
-/// even when the async runtime is being torn down.
+/// its own cleanup path completes. The guard OWNS the run permit: the
+/// synchronous, bounded removal finishes in `Drop` before the permit is
+/// released, so a new run can never start beside a still-live container.
 struct ContainerCleanupGuard {
     engine: String,
     name: String,
     armed: bool,
+    _permit: tokio::sync::SemaphorePermit<'static>,
 }
 
 impl ContainerCleanupGuard {
-    fn new(engine: &str, name: &str) -> Self {
+    fn new(engine: &str, name: &str, permit: tokio::sync::SemaphorePermit<'static>) -> Self {
         Self {
             engine: engine.to_string(),
             name: name.to_string(),
             armed: true,
+            _permit: permit,
         }
     }
 
@@ -773,13 +908,22 @@ impl Drop for ContainerCleanupGuard {
         if !self.armed {
             return;
         }
-        let engine = self.engine.clone();
-        let name = self.name.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = remove_container_sync(&engine, &name, Duration::from_secs(2)) {
-                warn!("Sandbox cancellation: failed to remove container {name}: {e}");
-            }
-        });
+        let result = remove_container_sync(&self.engine, &self.name, Duration::from_secs(2));
+        if let Some(reason) = sync_cleanup_failure(result, &self.name) {
+            warn!("Sandbox cancellation: {reason}");
+        }
+    }
+}
+
+/// An unsuccessful or failed synchronous removal is a cleanup failure, not a
+/// success to be logged and ignored.
+fn sync_cleanup_failure(result: std::io::Result<bool>, name: &str) -> Option<String> {
+    match result {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "Container cleanup for {name} was unsuccessful; the container may still be running"
+        )),
+        Err(e) => Some(format!("Container cleanup for {name} failed: {e}")),
     }
 }
 
@@ -801,7 +945,21 @@ fn remove_container_sync(engine: &str, name: &str, limit: Duration) -> std::io::
             }
             None => {
                 child.kill()?;
-                child.wait()?;
+                // Bound the reap too: an unbounded `wait()` here would keep
+                // the caller's permit after the cleanup deadline fired.
+                let reap_deadline = std::time::Instant::now() + Duration::from_millis(500);
+                loop {
+                    match child.try_wait()? {
+                        Some(_) => break,
+                        None if std::time::Instant::now() < reap_deadline => {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        None => {
+                            warn!("Sandbox cleanup: cleanup child {name} still unreaped after bounded wait");
+                            break;
+                        }
+                    }
+                }
                 return Ok(false);
             }
         }
@@ -848,7 +1006,7 @@ async fn cleanup_with_timeout(
     }
 }
 
-async fn read_pipe<R>(pipe: Option<R>) -> Vec<u8>
+async fn read_pipe<R>(pipe: Option<R>) -> (Vec<u8>, Option<String>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -861,12 +1019,19 @@ where
     // `with_capacity` ambiguous on Windows, where `collect` below compounds it.
     let mut buf: std::collections::VecDeque<u8> =
         std::collections::VecDeque::with_capacity(CAPTURE_LIMIT);
+    let mut failure = None;
     if let Some(mut pipe) = pipe {
         use tokio::io::AsyncReadExt;
         let mut chunk = [0u8; 16 * 1024];
         loop {
             match pipe.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(e) => {
+                    // Keep the bytes already captured but tell the caller why
+                    // the tail is missing instead of hiding the read error.
+                    failure = Some(e.to_string());
+                    break;
+                }
                 Ok(read) => {
                     buf.extend(chunk[..read].iter().copied());
                     if buf.len() > CAPTURE_LIMIT {
@@ -877,7 +1042,7 @@ where
             }
         }
     }
-    buf.into()
+    (buf.into(), failure)
 }
 
 /// UTF-8-safe tail slice: never splits a multi-byte codepoint, so indexing
@@ -896,6 +1061,37 @@ fn safe_utf8_suffix(s: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The semaphore tests share one process-global semaphore; serialize them
+    /// so the default parallel runner cannot make one consume the other's
+    /// permits and fail intermittently.
+    static TEST_SEM_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn semaphore_test_lock() -> &'static tokio::sync::Mutex<()> {
+        TEST_SEM_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    async fn lock_semaphore_async() -> tokio::sync::MutexGuard<'static, ()> {
+        semaphore_test_lock().lock().await
+    }
+
+    fn lock_semaphore_sync() -> tokio::sync::MutexGuard<'static, ()> {
+        semaphore_test_lock().blocking_lock()
+    }
+
+    fn registry_suite_has_test(registry: &str, suite: &str, name: &str) -> bool {
+        let value: serde_json::Value = match serde_json::from_str(registry) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+        value
+            .get("suites")
+            .and_then(|suites| suites.get(suite))
+            .and_then(|entry| entry.get("tests"))
+            .and_then(|tests| tests.as_array())
+            .map(|tests| tests.iter().any(|test| test.as_str() == Some(name)))
+            .unwrap_or(false)
+    }
 
     #[test]
     fn sandbox_image_is_digest_pinned_and_never_latest() {
@@ -934,9 +1130,10 @@ mod tests {
                 "--pids-limit=256".to_string(),
                 "--memory=512m".to_string(),
                 "--network=none".to_string(),
+                "--read-only".to_string(),
                 "-v".to_string(),
                 "/work/project:/workspace:ro".to_string(),
-                "--tmpfs=/tmp".to_string(),
+                format!("--tmpfs=/tmp:size={SANDBOX_TMPFS_SIZE}"),
                 "-w=/workspace".to_string(),
                 SANDBOX_IMAGE.to_string(),
                 "sh".to_string(),
@@ -975,7 +1172,7 @@ mod tests {
 
         for cwd in ["/etcetera", "/homework", "/work/project"] {
             assert_eq!(
-                working_directory_refusal(cwd),
+                working_directory_refusal_with_home(cwd, Some(Path::new("/Users/alice"))),
                 None,
                 "component prefix, not a string prefix, must decide: {cwd}"
             );
@@ -1394,15 +1591,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_full_sandbox_queue_rejects_within_its_deadline() {
+        let _guard = lock_semaphore_async().await;
         let sem = sandbox_concurrency();
-        let held: Vec<_> = (0..SANDBOX_MAX_CONCURRENT_RUNS)
+        let held: Vec<_> = (0..effective_sandbox_runs())
             .map(|_| sem.try_acquire().expect("permit"))
             .collect();
         let started = std::time::Instant::now();
         let err = acquire_sandbox_permit(Duration::from_millis(50))
             .await
-            .err()
-            .expect("a full queue must be rejected, not waited on forever");
+            .expect_err("a full queue must be rejected, not waited on forever");
         assert!(err.contains("queue"), "unexpected rejection: {err}");
         assert!(
             started.elapsed() < Duration::from_millis(500),
@@ -1463,8 +1660,14 @@ mod tests {
         let log = dir.path().join("calls.log");
         write_logging_engine(&engine, &log);
 
-        let guard =
-            ContainerCleanupGuard::new(&engine.to_string_lossy(), "neurostrata-sandbox-cancelled");
+        let permit = acquire_sandbox_permit(Duration::from_millis(100))
+            .await
+            .expect("permit");
+        let guard = ContainerCleanupGuard::new(
+            &engine.to_string_lossy(),
+            "neurostrata-sandbox-cancelled",
+            permit,
+        );
         drop(guard);
 
         let mut calls = String::new();
@@ -1482,7 +1685,11 @@ mod tests {
             "dropping the run must remove the named container: {calls}"
         );
 
-        let mut guard = ContainerCleanupGuard::new(&engine.to_string_lossy(), "not-launched");
+        let permit = acquire_sandbox_permit(Duration::from_millis(100))
+            .await
+            .expect("permit");
+        let mut guard =
+            ContainerCleanupGuard::new(&engine.to_string_lossy(), "not-launched", permit);
         guard.disarm();
         drop(guard);
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1528,15 +1735,33 @@ mod tests {
     fn hardening_registry_lists_every_sandbox_regression() {
         const REGISTRY: &str = include_str!("../../eval/registry.json");
         for name in [
+            "guard::sandbox::tests::sandbox_image_is_digest_pinned_and_never_latest",
+            "guard::sandbox::tests::sandbox_args_pin_the_hardening_set",
+            "guard::sandbox::tests::forbidden_working_directories_are_refused",
+            "guard::sandbox::tests::exact_home_directory_is_refused_but_descendants_are_allowed",
+            "guard::sandbox::tests::a_project_working_directory_is_allowed",
+            "guard::sandbox::tests::a_timed_out_run_kills_and_reaps_its_child",
+            "guard::sandbox::tests::a_large_payload_to_a_child_that_never_reads_stdin_times_out_and_reaps",
             "guard::sandbox::tests::unknown_home_fails_closed",
             "guard::sandbox::tests::a_descendant_holding_a_pipe_does_not_hang_the_verdict",
             "guard::sandbox::tests::stalled_cleanup_child_is_killed_and_reaped",
             "guard::sandbox::tests::mount_cwd_revalidation_detects_a_swapped_symlink",
             "guard::sandbox::tests::sandbox_concurrency_is_bounded",
+            "guard::sandbox::tests::post_kill_reap_is_bounded",
+            "guard::sandbox::tests::sync_removal_failure_is_a_cleanup_failure",
+            "guard::sandbox::tests::permit_is_held_until_container_cleanup_finishes",
+            "guard::sandbox::tests::bounded_sync_removal_kills_a_stalled_cleanup_child",
+            "guard::sandbox::tests::workspace_scope_refuses_paths_outside_the_project_root",
+            "guard::sandbox::tests::effective_concurrency_bounds_aggregate_memory",
+            "guard::sandbox::tests::unsupported_action_types_are_approved_fail_open",
+            "guard::sandbox::tests::pipe_read_errors_are_reported_with_partial_output",
+            "guard::sandbox::tests::registry_suite_membership_is_checked_not_global_contains",
+            "guard::sandbox::tests::available_permits_are_not_counted_as_queue_waiters",
+            "guard::sandbox::tests::sandbox_args_make_root_read_only_and_bound_scratch",
         ] {
             assert!(
-                REGISTRY.contains(&format!("\"{name}\"")),
-                "the hardening suite must pin its regression test: {name}"
+                registry_suite_has_test(REGISTRY, "guard-sandbox-hardening", name),
+                "the hardening suite itself must pin its regression test: {name}"
             );
         }
     }
@@ -1559,8 +1784,208 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_kill_reap_is_bounded() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        child.start_kill().expect("kill child");
+        let started = std::time::Instant::now();
+        let reaped = reap_after_kill(&mut child, Duration::from_millis(200)).await;
+        assert!(reaped, "a killed child must be reaped");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "post-kill reaping must itself be bounded"
+        );
+    }
+
+    #[test]
+    fn sync_removal_failure_is_a_cleanup_failure() {
+        assert!(sync_cleanup_failure(Ok(true), "c").is_none());
+        assert!(sync_cleanup_failure(Ok(false), "c")
+            .expect("an unsuccessful removal is a failure")
+            .contains("unsuccessful"));
+        let err = std::io::Error::other("boom");
+        assert!(sync_cleanup_failure(Err(err), "c")
+            .expect("a spawn failure is a cleanup failure")
+            .contains("boom"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permit_is_held_until_container_cleanup_finishes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = dir.path().join("slow-engine.sh");
+        let log = dir.path().join("calls.log");
+        std::fs::write(
+            &engine,
+            format!(
+                "#!/bin/sh\nsleep 0.3\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                log.display()
+            ),
+        )
+        .expect("write engine");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod engine");
+
+        let permit = acquire_sandbox_permit(Duration::from_millis(100))
+            .await
+            .expect("permit");
+        let guard = ContainerCleanupGuard::new(&engine.to_string_lossy(), "hold-permit", permit);
+        drop(guard);
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.contains("rm -f hold-permit"),
+            "guard drop must finish removal before the permit is released: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_sync_removal_kills_a_stalled_cleanup_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = dir.path().join("slow-rm.sh");
+        std::fs::write(&engine, "#!/bin/sh\nexec sleep 60\n").expect("write engine");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod engine");
+        let started = std::time::Instant::now();
+        let result = remove_container_sync(
+            &engine.to_string_lossy(),
+            "stalled",
+            Duration::from_millis(200),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "sync removal is bounded"
+        );
+        assert!(!result.expect("sync removal result"));
+    }
+
+    #[test]
+    fn workspace_scope_refuses_paths_outside_the_project_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        let allowed = dir.path().join("allowed");
+        for p in [&root, &outside, &allowed] {
+            std::fs::create_dir_all(p).expect("create dir");
+        }
+        assert_eq!(workspace_cwd_refusal_with(&root, &root, &[]), None);
+        assert!(
+            workspace_cwd_refusal_with(&outside, &root, &[]).is_some(),
+            "a readable directory outside the workspace must be refused before mounting"
+        );
+        assert_eq!(
+            workspace_cwd_refusal_with(&allowed, &root, std::slice::from_ref(&allowed)),
+            None,
+            "an explicit allowlisted directory stays mountable"
+        );
+    }
+
+    #[test]
+    fn effective_concurrency_bounds_aggregate_memory() {
+        const PER_RUN: u64 = 512 * 1024 * 1024;
+        assert_eq!(effective_sandbox_runs_for(8 * PER_RUN, 8 * PER_RUN, 8), 6);
+        assert_eq!(effective_sandbox_runs_for(8 * PER_RUN, 4 * PER_RUN, 8), 4);
+        assert_eq!(effective_sandbox_runs_for(PER_RUN, 8 * PER_RUN, 8), 1);
+        assert_eq!(
+            effective_sandbox_runs_for(0, 0, 8),
+            1,
+            "no usable capacity still allows at most one run, never zero or eight"
+        );
+    }
+
+    #[test]
+    fn unsupported_action_types_are_approved_fail_open() {
+        assert!(matches!(sandbox_action_decision("  BASH "), Ok("bash")));
+        assert!(matches!(sandbox_action_decision("Script"), Ok("script")));
+        let decision = sandbox_action_decision("write");
+        assert!(
+            matches!(decision, Err(ValidateVerdict::ApprovedFailOpen { .. })),
+            "a valid non-shell action must keep the documented fail-open verdict: {decision:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipe_read_errors_are_reported_with_partial_output() {
+        struct FailingReader {
+            sent: bool,
+        }
+        impl tokio::io::AsyncRead for FailingReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if !self.sent {
+                    self.sent = true;
+                    buf.put_slice(b"partial");
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Ready(Err(std::io::Error::other("pipe broke")))
+                }
+            }
+        }
+        let (data, err) = read_pipe(Some(FailingReader { sent: false })).await;
+        assert_eq!(data, b"partial", "bytes read before the error are kept");
+        assert!(err
+            .expect("a pipe read error must be returned")
+            .contains("pipe broke"));
+    }
+
+    #[test]
+    fn registry_suite_membership_is_checked_not_global_contains() {
+        const FIXTURE: &str =
+            r#"{"suites":{"guard-sandbox-hardening":{"tests":["a"]},"other":{"tests":["b"]}}}"#;
+        assert!(registry_suite_has_test(
+            FIXTURE,
+            "guard-sandbox-hardening",
+            "a"
+        ));
+        assert!(
+            !registry_suite_has_test(FIXTURE, "guard-sandbox-hardening", "b"),
+            "a name in a different suite must not satisfy the hardening suite check"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn available_permits_are_not_counted_as_queue_waiters() {
+        let _guard = lock_semaphore_async().await;
+        let before = SANDBOX_WAITERS.load(std::sync::atomic::Ordering::Relaxed);
+        SANDBOX_WAITERS.store(SANDBOX_MAX_QUEUED, std::sync::atomic::Ordering::Relaxed);
+        let result = acquire_sandbox_permit(Duration::from_millis(100)).await;
+        SANDBOX_WAITERS.store(before, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            result.is_ok(),
+            "a free permit must not be rejected because overlapping callers inflated the queue count"
+        );
+    }
+
+    #[test]
+    fn sandbox_args_make_root_read_only_and_bound_scratch() {
+        let args = sandbox_run_args("/work/project");
+        assert!(
+            args.iter().any(|a| a == "--read-only"),
+            "the container root filesystem must be read-only: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.starts_with("--tmpfs=/tmp:size=")),
+            "writable scratch must have a bounded size: {args:?}"
+        );
+    }
+
     #[test]
     fn sandbox_concurrency_is_bounded() {
+        let _guard = lock_semaphore_sync();
         assert_eq!(SANDBOX_MAX_CONCURRENT_RUNS, 8);
         let sem = sandbox_concurrency();
         let available = sem.available_permits();
