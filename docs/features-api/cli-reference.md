@@ -463,3 +463,7 @@ neurostrata-mcp vault-sync import NeuroStrata /path/to/vault /path/to/out [princ
 ```
 
 Export writes one YAML-LD Markdown note per memory readable by `principal` (ReBAC `can_read_memory`; default `default`), plus `topology.canvas` (Open JSON Canvas 1.0) under `output_dir`. Import secret-scans and SHACL-validates (`Mode::Native`) every `*.md` BEFORE any store write — violating notes are skipped and reported in `errors`, never partially stored; each stored note passes a ReBAC `can_write_memory` check. Unresolved `[[WikiLinks]]` materialize as `stub: true` notes. `vault_path`/`output_dir` resolve under the process cwd (CLI/MCP J6 boundary); the HTTP daemon instead validates against its startup root and `allowed_external_dirs`. The same behavior is available over HTTP as `POST /vault-sync`. See [`ops/obsidian.md`](ops/obsidian.md).
+
+## Test-Only Model Environment Serialization
+
+Tests in the CLI binary that override the process-wide `NEUROSTRATA_MODEL` variable acquire one shared `MODEL_ENV_TEST_LOCK` for the whole test. This keeps parallel tests from observing another test's override or restoring a stale value. No CLI command or runtime behavior changes.

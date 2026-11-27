@@ -112,3 +112,7 @@ At startup the daemon refreshes the harness plugin files in its startup root and
 ## Storage Status Surfaces
 
 `storage status` has two provenance layers since #212. The path-only (no-open) surface — used by the CLI's dispatch and by callers that must not open the store — reports filesystem and store-state sidecar facts: `wal_bytes`, `wal_age_secs` (age of the active WAL, regular files only), `checkpoint_failures`, and the persisted `last_recovery { at, kind, wal_bytes }` history. The live-handle surface additionally owns `opened_via_recovery` and its kind _exclusively_: a verified live store never reports recovery because the sidecar holds a `last_recovery` entry. Identity writes (`has_data`, descriptor) and health writes (checkpoint health) are split (`write_store_state_identity` vs. the health writers), and a fresh process still reports the last real checkpoint because `record_checkpoint_outcome` persists to the sidecar (best effort, never propagated).
+
+## Test-Only Model Environment Serialization
+
+Daemon-side tests that override the process-wide `NEUROSTRATA_MODEL` variable acquire the shared `MODEL_ENV_TEST_LOCK` for the whole test, so a parallel test cannot observe another test's model override. This is a test-harness guarantee only: no MCP tool or HTTP route changes.
