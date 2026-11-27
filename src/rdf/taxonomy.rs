@@ -1332,7 +1332,30 @@ fn versioned_row_id_from_existing(existing: &str, version: u64, kind: &str) -> S
         })
         .map(|at| &existing[..at])
         .unwrap_or(existing);
-    bounded_taxonomy_id(kind, base, version)
+    // Earlier releases escaped non-alphanumerics as `~2e~`; `~` is outside
+    // DR-2. Re-spell those escapes as the current `-2e-` form so the new
+    // version has a valid id. The old row is still located by its original
+    // id; only the successor's address is rewritten.
+    let mut migrated = String::with_capacity(base.len());
+    let mut rest = base;
+    while let Some(at) = rest.find('~') {
+        migrated.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        if let Some(end) = after.find('~') {
+            let inner = &after[..end];
+            if inner.len() == 2 && inner.bytes().all(|b| b.is_ascii_hexdigit()) {
+                migrated.push('-');
+                migrated.push_str(inner);
+                migrated.push('-');
+                rest = &after[end + 1..];
+                continue;
+            }
+        }
+        migrated.push('~');
+        rest = after;
+    }
+    migrated.push_str(rest);
+    bounded_taxonomy_id(kind, &migrated, version)
 }
 
 /// Deterministic, namespace-qualified row ID for a thesis version.
@@ -3845,6 +3868,18 @@ pub async fn build_task_taxonomy_context(
 mod tests {
     use super::*;
     use crate::rdf::action::ActionSecurityContext;
+
+    #[test]
+    fn legacy_tilde_escaped_row_ids_version_into_dr2_valid_ids() {
+        let next = versioned_row_id_from_existing("thesis-team~2e~proj--v3", 4, "thesis");
+        assert!(!next.contains('~'), "{next}");
+        assert!(crate::domain::validate_id(&next).is_ok(), "{next}");
+        assert!(next.ends_with("-v4"), "{next}");
+        let concept = versioned_row_id_from_existing("concept-a~2d~b--slug-v7", 8, "concept");
+        assert!(crate::domain::validate_id(&concept).is_ok(), "{concept}");
+        assert!(concept.contains("-2d-"), "{concept}");
+    }
+
     use crate::store::ladybug::LadybugStore;
     use crate::traits::{Embedder, VectorStore};
     use std::sync::Arc;

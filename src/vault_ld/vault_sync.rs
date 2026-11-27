@@ -246,9 +246,11 @@ pub fn note_to_turtle(note: &VaultNote) -> Result<String, String> {
     turtle.push_str(&format!("@prefix yaml: <{}> .\n", YAML_LD_CONTEXT));
     turtle.push_str("\n");
 
-    // Memory ids are UUIDs/bare slugs, not absolute IRIs; wrap them in a
-    // stable urn: so the Turtle parses. Preserve ids that are already IRIs.
-    let subject = if note.id.contains(':') {
+    // Memory ids are UUIDs/bare slugs or qualified `ns::path` names, not
+    // absolute IRIs. A colon in the first path segment of a relative IRI is
+    // illegal, so only absolute IRIs are used verbatim; every other id gets
+    // the stable urn: wrapper.
+    let subject = if note.id.contains("://") || note.id.starts_with("urn:") {
         note.id.clone()
     } else {
         format!("urn:vault:{}", note.id)
@@ -2944,12 +2946,14 @@ mod tests {
         let ns = "vault_collision";
         store.init(ns).await.expect("init");
         // Three distinct ids whose `:` and `/` path separators flatten to the
-        // same `a__x_y_z.md` filename. They name a prefix the namespace does
-        // not own -- the historical spelling the public write gate now
-        // refuses -- so they are seeded directly, the way rows written by an
-        // older binary already sit in the database, rather than through
-        // `upsert`.
-        for id in ["a::x/y/z", "a::x/y:z", "a::x:y/z"] {
+        // same `vault_collision__x_y_z.md` filename. Each id names the
+        // namespace that owns it, so the store's ownership gate cannot refuse
+        // a seed before the collision assertions run.
+        for id in [
+            "vault_collision::x/y/z",
+            "vault_collision::x/y:z",
+            "vault_collision::x:y/z",
+        ] {
             seed_legacy_row(&store, ns, id).await;
         }
         let config = VaultSyncConfig {
@@ -2972,7 +2976,10 @@ mod tests {
             result.errors
         );
         assert!(
-            result.errors.iter().any(|e| e.contains("a__x_y_z.md")),
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("vault_collision__x_y_z.md")),
             "{:?}",
             result.errors
         );
@@ -2983,12 +2990,10 @@ mod tests {
             .count();
         assert_eq!(md_count, 1, "only one file may be written");
 
-        // Re-import into a fresh store: count must match export. The fresh
-        // namespace is `a` -- the one these note ids name -- because DR-1
-        // makes a qualified id's prefix its owner: importing them into any
-        // other namespace would be a cross-namespace write the store now
-        // refuses, so the round trip goes through the ids' own namespace.
-        let fresh_ns = "a";
+        // Re-import into a fresh store: count must match export. The namespace
+        // stays the same because the exported frontmatter names qualified ids
+        // owned by it; a foreign prefix is refused at the store by design.
+        let fresh_ns = ns;
         let fresh_store: std::sync::Arc<dyn VectorStore> = std::sync::Arc::new(
             crate::store::ladybug::LadybugStore::for_testing(root.join("db2"), 4)
                 .expect("fresh temp store"),

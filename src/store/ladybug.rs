@@ -10350,6 +10350,18 @@ impl LadybugStore {
     }
 }
 
+/// Recheck a legacy-shaped address inside the write turn. The preflight read
+/// can go stale when another caller deletes the row first; without this the
+/// MERGE recreates a row whose shape new writes refuse.
+fn legacy_row_still_present(conn: &Connection, id: &str) -> Result<bool> {
+    let query = format!(
+        "MATCH (m:Memory {{id: '{}'}}) RETURN m LIMIT 1",
+        escape_ladybug_string(id)
+    );
+    let mut result = conn.query(&query)?;
+    Ok(result.next().is_some())
+}
+
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, namespace: &str) -> Result<()> {
@@ -10730,6 +10742,7 @@ impl VectorStore for LadybugStore {
             crate::domain::validate_id(id)?;
             Ok(())
         })();
+        let legacy_address = strict.is_err();
         if let Err(reason) = strict {
             // Legacy rows written before DR-1/DR-2 remain updatable (feedback,
             // edits) only when the address has a legacy-valid shape AND the
@@ -11099,6 +11112,14 @@ impl VectorStore for LadybugStore {
         let outcome = self.write_with_deadline("writing a memory", move |conn| {
 
             let safe_id = escape_ladybug_string(&id);
+            // Atomic recheck: the preflight read can go stale. A legacy row
+            // deleted before this turn must not be recreated by the MERGE.
+            if legacy_address && !legacy_row_still_present(conn, &id)? {
+                anyhow::bail!(
+                    "legacy-shaped memory '{}' was deleted before the write turn; refusing to recreate it",
+                    id
+                );
+            }
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_content = escape_ladybug_string(&payload.content);
             let safe_user_id = escape_ladybug_string(&payload.user_id);
@@ -16921,6 +16942,34 @@ mod tests {
     use super::*;
     use crate::traits::memory_vocabulary;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn legacy_row_presence_is_rechecked_inside_the_write_turn() {
+        let store = retired_test_store().await;
+        store
+            .upsert(
+                "probe",
+                "mem-1",
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .expect("seed row");
+        let present = store
+            .with_conn(|conn| legacy_row_still_present(conn, "mem-1"))
+            .await
+            .expect("presence check");
+        assert!(present, "seeded row must pass the atomic recheck");
+        store.delete("probe", "mem-1").await.expect("delete row");
+        let present = store
+            .with_conn(|conn| legacy_row_still_present(conn, "mem-1"))
+            .await
+            .expect("presence check");
+        assert!(
+            !present,
+            "a deleted row must not be recreated by the legacy path"
+        );
+    }
 
     /// The canonical source key used by the relink/publish seed helpers. A real
     /// ingest derives it from the directory path (`source_key_for`); the unit
