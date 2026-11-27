@@ -222,6 +222,8 @@
         "store::ladybug::store_migration::a_bare_id_matching_two_namespaces_is_quarantined",
         "store::ladybug::store_migration::a_superseded_legacy_id_repoints_to_each_new_generation",
         "store::ladybug::store_migration::a_modern_publication_records_no_alias_of_its_own",
+        "store::ladybug::store_migration::a_protected_null_namespace_row_with_corroborated_owner_is_recovered",
+        "store::ladybug::store_migration::a_protected_null_namespace_row_with_conflicting_owner_is_untouched",
         "store::ladybug::store_migration::a_legacy_primary_key_rebuild_preserves_non_memory_relationships",
         "store::ladybug::store_migration::a_legacy_primary_key_rebuild_preserves_mixed_memory_relationships"
       ],

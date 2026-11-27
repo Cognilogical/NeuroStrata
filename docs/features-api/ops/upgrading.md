@@ -48,9 +48,11 @@ current binary can open them; no #68 schema or lifecycle change is assumed.
   claim exists against contradicting structural evidence, the row moves to
   `_quarantine` instead of being exposed under a tenant that never owned it.
   Imported rows with foreign mesh provenance or private eligibility are never
-  rewritten or quarantined. A row with no recoverable owner moves to
-  `_quarantine` with `metadata.quarantine` recorded; it is still there, just
-  out of ordinary reads, list, search and export.
+  rewritten or quarantined. They participate in recovery only when trusted
+  structural evidence corroborates the metadata-named owner; an unproven or
+  conflicting claim leaves the protected row untouched. A row with no
+  recoverable owner moves to `_quarantine` with `metadata.quarantine` recorded;
+  it is still there, just out of ordinary reads, list, search and export.
 - **Legacy ids.** Rows an older binary wrote as bare ids are recorded in
   `LegacyIdAlias (id, namespace, canonical_id)`. A later re-ingest of the
   qualified id resolves through that alias and updates the existing row in

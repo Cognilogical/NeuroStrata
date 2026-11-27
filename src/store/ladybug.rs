@@ -10198,7 +10198,9 @@ fn superseded_metadata(raw: Option<&str>, generation: u64, scoped_id: &str) -> S
 /// first from the namespace the row states in metadata (issue #408 requires
 /// metadata-named rows to be restored), then from a unique qualified sibling
 /// recovered in pass 1. Only rows with no recoverable namespace are quarantined,
-/// atomically with their reason recorded in metadata.
+/// atomically with their reason recorded in metadata. Protected imports remain
+/// sovereign: they are recovered only when structural evidence corroborates
+/// their metadata, and otherwise stay untouched rather than being quarantined.
 fn migrate_null_namespaces(conn: &Connection) -> Result<(usize, usize)> {
     let columns = inspect_memory_columns(conn)?;
     if !columns.iter().any(|column| column.name == "namespace") {
@@ -10210,7 +10212,7 @@ fn migrate_null_namespaces(conn: &Connection) -> Result<(usize, usize)> {
         conn.query("ALTER TABLE Memory ADD metadata STRING")?;
     }
 
-    let mut pending: Vec<(String, Option<String>)> = Vec::new();
+    let mut pending: Vec<(String, Option<String>, bool)> = Vec::new();
     for row in conn
         .query("MATCH (m:Memory) WHERE m.namespace IS NULL RETURN m.id, COALESCE(m.metadata, '')")?
     {
@@ -10218,13 +10220,11 @@ fn migrate_null_namespaces(conn: &Connection) -> Result<(usize, usize)> {
             continue;
         };
         let metadata = migration_value_string(row.get(1));
-        // Protected imports are sovereign. Their namespace and metadata must
-        // never be rewritten by a recovery pass, and an unrecoverable protected
-        // row is not quarantined either.
-        if row_is_protected(metadata.as_deref()) {
-            continue;
-        }
-        pending.push((id, metadata));
+        // Protected imports are sovereign: their metadata is never rewritten
+        // and an unproven row is never quarantined. They still participate in
+        // recovery when trusted structural evidence corroborates ownership.
+        let protected = row_is_protected(metadata.as_deref());
+        pending.push((id, metadata, protected));
     }
     if pending.is_empty() {
         return Ok((0, 0));
@@ -10242,7 +10242,7 @@ fn migrate_null_namespaces(conn: &Connection) -> Result<(usize, usize)> {
 
     let mut recovered = 0usize;
     let mut quarantined = 0usize;
-    for (id, metadata) in pending {
+    for (id, metadata, protected) in pending {
         // Check metadata.namespace FIRST — #408 restores a row that names its
         // owner in metadata. Metadata is caller-controlled, though, so it is
         // only proof when no trusted structural evidence contradicts it: a
@@ -10257,17 +10257,32 @@ fn migrate_null_namespaces(conn: &Connection) -> Result<(usize, usize)> {
             None
         };
         let trusted = scoped.or(sibling);
-        let resolved = match (declared, trusted) {
-            (Some(declared), Some(trusted)) if declared == trusted => Some(declared),
-            (Some(declared), None) => Some(declared),
-            (None, Some(trusted)) => Some(trusted),
-            (Some(_), Some(_)) => None,
-            (None, None) => None,
+        let resolved = if protected {
+            // A protected import's namespace is never inferred from metadata
+            // alone: an unverified claim must not move it into another tenant.
+            // Structural corroboration is required, and a conflict leaves the
+            // sovereign row untouched (not quarantined).
+            match (declared, trusted) {
+                (Some(declared), Some(trusted)) if declared == trusted => Some(declared),
+                _ => None,
+            }
+        } else {
+            match (declared, trusted) {
+                (Some(declared), Some(trusted)) if declared == trusted => Some(declared),
+                (Some(declared), None) => Some(declared),
+                (None, Some(trusted)) => Some(trusted),
+                (Some(_), Some(_)) => None,
+                (None, None) => None,
+            }
         };
         match resolved {
             Some(namespace) => {
                 set_memory_namespace(conn, &id, &namespace)?;
                 recovered += 1;
+            }
+            None if protected => {
+                // Sovereign import: leave its NULL namespace and metadata
+                // exactly as the older binary wrote them.
             }
             None => {
                 let record = quarantined_metadata(metadata.as_deref(), &id);
@@ -38964,6 +38979,24 @@ mod store_migration {
             .expect("namespace query")
     }
 
+    async fn stored_metadata(store: &LadybugStore, id: &str) -> Option<String> {
+        let id = id.to_string();
+        store
+            .with_conn(move |conn| {
+                let query = format!(
+                    "MATCH (m:Memory) WHERE m.id = '{}' RETURN m.metadata",
+                    escape_ladybug_string(&id)
+                );
+                let mut rows = conn.query(&query)?;
+                Ok(rows.next().and_then(|row| match row.first() {
+                    Some(lbug::Value::String(metadata)) => Some(metadata.clone()),
+                    _ => None,
+                }))
+            })
+            .await
+            .expect("metadata query")
+    }
+
     async fn edge_count(store: &LadybugStore) -> i64 {
         store
             .with_conn(move |conn| {
@@ -40094,6 +40127,70 @@ mod store_migration {
         assert_eq!(
             count_memory(&store, &format!("m.namespace = '{QUARANTINE_NAMESPACE}'")).await,
             0
+        );
+    }
+
+    /// A protected NULL-namespace row whose scoped id corroborates the owner
+    /// named in metadata is recovered, but its metadata is left byte-identical.
+    #[tokio::test]
+    async fn a_protected_null_namespace_row_with_corroborated_owner_is_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let metadata = r#"{"namespace":"beta","mesh":{"origin":"foreign"},"kept":"yes"}"#;
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("beta::7::imported-row", None, metadata)],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 1);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(
+            stored_namespace(&store, "beta::7::imported-row")
+                .await
+                .as_deref(),
+            Some("beta")
+        );
+        assert_eq!(
+            stored_metadata(&store, "beta::7::imported-row")
+                .await
+                .as_deref(),
+            Some(metadata),
+            "recovery changes only the namespace, never protected metadata"
+        );
+    }
+
+    /// A protected row whose structural owner contradicts its metadata claim
+    /// is left exactly where the older binary put it, not moved into either
+    /// tenant and not quarantined.
+    #[tokio::test]
+    async fn a_protected_null_namespace_row_with_conflicting_owner_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let metadata = r#"{"namespace":"beta","mesh":{"origin":"foreign"}}"#;
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("alpha::7::imported-row", None, metadata)],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 0);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(
+            stored_namespace(&store, "alpha::7::imported-row").await,
+            None
+        );
+        assert_eq!(
+            stored_metadata(&store, "alpha::7::imported-row")
+                .await
+                .as_deref(),
+            Some(metadata)
         );
     }
 
