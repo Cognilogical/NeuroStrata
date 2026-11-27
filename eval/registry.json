@@ -219,7 +219,9 @@
         "store::ladybug::store_migration::a_staged_generation_upsert_leaves_the_legacy_bare_row_untouched",
         "store::ladybug::store_migration::a_transient_alias_load_failure_is_retried_on_the_next_upsert",
         "store::ladybug::store_migration::a_scoped_counterpart_suppresses_the_legacy_alias",
-        "store::ladybug::store_migration::a_bare_id_matching_two_namespaces_is_quarantined"
+        "store::ladybug::store_migration::a_bare_id_matching_two_namespaces_is_quarantined",
+        "store::ladybug::store_migration::a_legacy_primary_key_rebuild_preserves_non_memory_relationships",
+        "store::ladybug::store_migration::a_legacy_primary_key_rebuild_preserves_mixed_memory_relationships"
       ],
       "thresholds": {
         "ignored": 0

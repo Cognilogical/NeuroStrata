@@ -10747,10 +10747,99 @@ impl RenameLog {
     }
 }
 
+/// One endpoint of an edge the rebuild copies into a scratch relationship
+/// table. A `Memory` endpoint carries the row's new id in the rebuilt table;
+/// an endpoint on any other node table is bound by that table's own primary
+/// key, which the rebuild never touches.
+enum RebuildEndpoint {
+    /// The new id of a rebuilt `Memory` row.
+    Memory(String),
+    /// A row of an untouched node table, bound by its own primary key.
+    Keyed {
+        table: String,
+        key: String,
+        literal: String,
+    },
+}
+
+impl RebuildEndpoint {
+    /// The MATCH node pattern that binds this endpoint while the scratch
+    /// edges are copied: `(a:Memory__rebuild408 {id: '...'})` or
+    /// `(b:Task {task_id: 'T-101'})`.
+    fn pattern(&self, tag: &str) -> String {
+        match self {
+            RebuildEndpoint::Memory(id) => format!(
+                "({tag}:{REBUILD_NODE_TABLE} {{id: '{}'}})",
+                escape_ladybug_string(id)
+            ),
+            RebuildEndpoint::Keyed {
+                table,
+                key,
+                literal,
+            } => {
+                format!("({tag}:{table} {{{key}: {literal}}})")
+            }
+        }
+    }
+}
+
+/// One relationship table the rebuild recreates: its declared endpoint
+/// connections with `Memory` rewritten to the scratch node table, its
+/// property declarations, and the edges to copy.
+struct RebuildRelTable {
+    table: String,
+    connections: Vec<(String, String)>,
+    declarations: String,
+    edges: Vec<(
+        RebuildEndpoint,
+        RebuildEndpoint,
+        Vec<(String, Option<String>)>,
+    )>,
+}
+
+/// The declared endpoint connections of a relationship table, straight from
+/// the engine catalog: `((source table, destination table), (source primary
+/// key, destination primary key))` per connection. A rel table can declare
+/// several connections, and they are the only authority on which node tables
+/// its rows bind — guessing `Memory` endpoints for a table that declares
+/// others is how relationship rows get lost.
+fn rel_table_connections(
+    conn: &Connection,
+    table: &str,
+) -> Result<Vec<((String, String), (String, String))>> {
+    let mut connections = Vec::new();
+    for row in conn.query(&format!("CALL show_connection('{table}') RETURN *"))? {
+        let (
+            Some(lbug::Value::String(source)),
+            Some(lbug::Value::String(destination)),
+            Some(lbug::Value::String(source_key)),
+            Some(lbug::Value::String(destination_key)),
+        ) = (row.get(0), row.get(1), row.get(2), row.get(3))
+        else {
+            anyhow::bail!(
+                "relationship table {table} reported a connection the rebuild \
+                 cannot read; refusing the rebuild with the store untouched"
+            );
+        };
+        connections.push((
+            (source.clone(), destination.clone()),
+            (source_key.clone(), destination_key.clone()),
+        ));
+    }
+    Ok(connections)
+}
+
 /// Copy a legacy `Memory` table whose key is not solely `id` into a scratch
 /// table keyed by `id`. Every node and edge is copied and counted before the
 /// source tables are touched; the swap uses renames with a rollback log, so a
 /// failure anywhere leaves the original data and topology available.
+///
+/// Relationship tables keep the endpoint kinds they were declared with.
+/// Tables that never touch `Memory` are left completely untouched, and a
+/// table mixing `Memory` with other endpoints is recreated with every
+/// connection — the `Memory` side rebound to the rebuilt row, the other
+/// side still bound by its own primary key. Anything the rebuild cannot
+/// read or represent is refused loudly while the store is still untouched.
 fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
     clear_rebuild_artifacts(conn)?;
     let source_columns = migration_column_specs(conn)?;
@@ -10853,11 +10942,8 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
         literals[id_index] = Some(format!("'{}'", escape_ladybug_string(&new_id)));
     }
 
-    let mut relationships: Vec<(
-        String,
-        String,
-        Vec<(String, String, Vec<(String, Option<String>)>)>,
-    )> = Vec::new();
+    let width = source_columns.len();
+    let mut relationships: Vec<RebuildRelTable> = Vec::new();
     let mut rel_tables: Vec<String> = Vec::new();
     for row in conn.query("CALL show_tables() RETURN *")? {
         let Some(lbug::Value::String(name)) = row.get(1) else {
@@ -10872,6 +10958,27 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
         }
     }
     for table in &rel_tables {
+        let connections = rel_table_connections(conn, table)?;
+        if connections.is_empty() {
+            anyhow::bail!(
+                "relationship table {table} exposes no endpoint connections; \
+                 refusing the rebuild with the store untouched"
+            );
+        }
+        if !connections
+            .iter()
+            .any(|((source, destination), _)| source == "Memory" || destination == "Memory")
+        {
+            // No row of this table binds a Memory node, so nothing in it is
+            // affected by the node-table swap. It must stay exactly as the
+            // older binary left it: recreating it with Memory endpoints (or
+            // renaming the original aside) would destroy its rows.
+            tracing::info!(
+                "relationship table {table} has no Memory endpoint; \
+                 the rebuild leaves the table untouched"
+            );
+            continue;
+        }
         let mut properties: Vec<(String, String)> = Vec::new();
         for row in conn.query(&format!("CALL table_info('{table}') RETURN *"))? {
             let Some(lbug::Value::String(name)) = row.get(1) else {
@@ -10893,54 +11000,132 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
         } else {
             format!(", {selects}")
         };
-        // Project every source property of both endpoints. A legacy table may
-        // have no `id` property at all, and a NULL or duplicated id cannot
-        // identify a row; the full source value tuple can.
-        let endpoint_a = source_columns
-            .iter()
-            .map(|(name, _)| format!("a.{name}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let endpoint_b = source_columns
-            .iter()
-            .map(|(name, _)| format!("b.{name}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let endpoint_query = format!("{endpoint_a}, {endpoint_b}{select}");
-        let width = source_columns.len();
         let mut edges = Vec::new();
-        for row in conn.query(&format!(
-            "MATCH (a:Memory)-[r:{table}]->(b:Memory) RETURN {endpoint_query}"
-        ))? {
-            let from_values: Vec<Option<String>> = (0..width)
-                .map(|offset| migration_literal(row.get(offset)))
-                .collect();
-            let to_values: Vec<Option<String>> = (width..2 * width)
-                .map(|offset| migration_literal(row.get(offset)))
-                .collect();
-            let from = source_map
-                .get(&migration_row_key(&from_values))
-                .cloned()
-                .unwrap_or_else(|| migration_value_string(row.get(0)).unwrap_or_default());
-            let to = source_map
-                .get(&migration_row_key(&to_values))
-                .cloned()
-                .unwrap_or_else(|| migration_value_string(row.get(width)).unwrap_or_default());
-            let values = properties
-                .iter()
-                .enumerate()
-                .map(|(offset, (name, _))| {
-                    (name.clone(), migration_literal(row.get(offset + 2 * width)))
-                })
-                .collect();
-            edges.push((from, to, values));
+        for ((source, destination), (source_key, destination_key)) in &connections {
+            // Scan each connection with the labels it actually declares: a
+            // Memory endpoint is identified through every source property
+            // (ids may be absent, NULL, or duplicated), an endpoint on
+            // another node table through that table's own primary key.
+            let source_is_memory = source == "Memory";
+            let destination_is_memory = destination == "Memory";
+            let source_projection = if source_is_memory {
+                source_columns
+                    .iter()
+                    .map(|(name, _)| format!("a.{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                format!("a.{source_key}")
+            };
+            let destination_projection = if destination_is_memory {
+                source_columns
+                    .iter()
+                    .map(|(name, _)| format!("b.{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                format!("b.{destination_key}")
+            };
+            let endpoint_query = format!("{source_projection}, {destination_projection}{select}");
+            let source_width = if source_is_memory { width } else { 1 };
+            let destination_width = if destination_is_memory { width } else { 1 };
+            for row in conn.query(&format!(
+                "MATCH (a:{source})-[r:{table}]->(b:{destination}) RETURN {endpoint_query}"
+            ))? {
+                let from = if source_is_memory {
+                    let values: Vec<Option<String>> = (0..source_width)
+                        .map(|offset| migration_literal(row.get(offset)))
+                        .collect();
+                    RebuildEndpoint::Memory(
+                        source_map
+                            .get(&migration_row_key(&values))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                migration_value_string(row.get(0)).unwrap_or_default()
+                            }),
+                    )
+                } else {
+                    RebuildEndpoint::Keyed {
+                        table: source.clone(),
+                        key: source_key.clone(),
+                        literal: match migration_literal(row.get(0)) {
+                            Some(literal) => literal,
+                            None => anyhow::bail!(
+                                "endpoint {source} of relationship table {table} has no \
+                                 readable primary key; refusing the rebuild with the store \
+                                 untouched"
+                            ),
+                        },
+                    }
+                };
+                let to = if destination_is_memory {
+                    let values: Vec<Option<String>> = (source_width
+                        ..source_width + destination_width)
+                        .map(|offset| migration_literal(row.get(offset)))
+                        .collect();
+                    RebuildEndpoint::Memory(
+                        source_map
+                            .get(&migration_row_key(&values))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                migration_value_string(row.get(source_width)).unwrap_or_default()
+                            }),
+                    )
+                } else {
+                    RebuildEndpoint::Keyed {
+                        table: destination.clone(),
+                        key: destination_key.clone(),
+                        literal: match migration_literal(row.get(source_width)) {
+                            Some(literal) => literal,
+                            None => anyhow::bail!(
+                                "endpoint {destination} of relationship table {table} has no \
+                                 readable primary key; refusing the rebuild with the store \
+                                 untouched"
+                            ),
+                        },
+                    }
+                };
+                let values = properties
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, (name, _))| {
+                        (
+                            name.clone(),
+                            migration_literal(row.get(source_width + destination_width + offset)),
+                        )
+                    })
+                    .collect();
+                edges.push((from, to, values));
+            }
         }
         let declarations = properties
             .iter()
             .map(|(name, ty)| format!("{name} {ty}"))
             .collect::<Vec<_>>()
             .join(", ");
-        relationships.push((table.clone(), declarations, edges));
+        let scratch_connections = connections
+            .iter()
+            .map(|((source, destination), _)| {
+                (
+                    if source == "Memory" {
+                        REBUILD_NODE_TABLE.to_string()
+                    } else {
+                        source.clone()
+                    },
+                    if destination == "Memory" {
+                        REBUILD_NODE_TABLE.to_string()
+                    } else {
+                        destination.clone()
+                    },
+                )
+            })
+            .collect();
+        relationships.push(RebuildRelTable {
+            table: table.clone(),
+            connections: scratch_connections,
+            declarations,
+            edges,
+        });
     }
 
     // Build the replacement under scratch names. Nothing here can affect the
@@ -10965,20 +11150,29 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
             .join(", ");
         conn.query(&format!("CREATE (:{REBUILD_NODE_TABLE} {{{assignments}}})"))?;
     }
-    for (table, declarations, edges) in &relationships {
-        let suffix = if declarations.is_empty() {
+    for rel in &relationships {
+        // The scratch group keeps every declared connection, with `Memory`
+        // rewritten to the scratch node table; the rename swap restores the
+        // original endpoint names with it.
+        let connections = rel
+            .connections
+            .iter()
+            .map(|(source, destination)| format!("FROM {source} TO {destination}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if rel.declarations.is_empty() {
             String::new()
         } else {
-            format!(", {declarations}")
+            format!(", {}", rel.declarations)
         };
-        let scratch = rebuild_rel_table(table);
+        let scratch = rebuild_rel_table(&rel.table);
         conn.query(&format!(
-            "CREATE REL TABLE {scratch} (FROM {REBUILD_NODE_TABLE} TO {REBUILD_NODE_TABLE}{suffix})"
+            "CREATE REL TABLE {scratch} ({connections}{suffix})"
         ))?;
-        record_rebuild_artifact(conn, &scratch, table, "scratch")?;
-        for (from, to, values) in edges {
-            let from = from.as_str();
-            let to = to.as_str();
+        record_rebuild_artifact(conn, &scratch, &rel.table, "scratch")?;
+        for (from, to, values) in &rel.edges {
+            let from_pattern = from.pattern("a");
+            let to_pattern = to.pattern("b");
             let assignments = values
                 .iter()
                 .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name}: {value}")))
@@ -10990,9 +11184,7 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
                 format!(" {{{assignments}}}")
             };
             conn.query(&format!(
-                "MATCH (a:{REBUILD_NODE_TABLE} {{id: '{}'}}), (b:{REBUILD_NODE_TABLE} {{id: '{}'}}) CREATE (a)-[:{scratch}{props}]->(b)",
-                escape_ladybug_string(&from),
-                escape_ladybug_string(&to)
+                "MATCH {from_pattern}, {to_pattern} CREATE (a)-[:{scratch}{props}]->(b)"
             ))?;
         }
     }
@@ -11005,12 +11197,13 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
             "legacy rebuild copied {rebuilt_rows} of {source_rows} rows; original table left intact"
         );
     }
-    for (table, _, edges) in &relationships {
-        let copied = migration_rel_count(conn, &rebuild_rel_table(table))?;
-        if copied != edges.len() {
+    for rel in &relationships {
+        let copied = migration_rel_count(conn, &rebuild_rel_table(&rel.table))?;
+        if copied != rel.edges.len() {
             anyhow::bail!(
-                "legacy rebuild copied {copied} of {} {table} edges; original tables left intact",
-                edges.len()
+                "legacy rebuild copied {copied} of {} {} edges; original tables left intact",
+                rel.edges.len(),
+                rel.table
             );
         }
     }
@@ -11019,24 +11212,27 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
     // validated scratch tables take their names. Any error undoes every rename.
     let mut renames = RenameLog::new();
     record_rebuild_artifact(conn, LEGACY_NODE_TABLE, "Memory", "backup")?;
-    for (table, _, _) in &relationships {
-        record_rebuild_artifact(conn, &legacy_rel_table(table), table, "backup")?;
+    for rel in &relationships {
+        record_rebuild_artifact(conn, &legacy_rel_table(&rel.table), &rel.table, "backup")?;
     }
     let swap = (|| -> Result<()> {
         renames.apply(conn, "Memory", LEGACY_NODE_TABLE)?;
-        for (table, _, _) in &relationships {
-            renames.apply(conn, table, &legacy_rel_table(table))?;
+        for rel in &relationships {
+            renames.apply(conn, &rel.table, &legacy_rel_table(&rel.table))?;
         }
         renames.apply(conn, REBUILD_NODE_TABLE, "Memory")?;
-        for (table, _, _) in &relationships {
-            renames.apply(conn, &rebuild_rel_table(table), table)?;
+        for rel in &relationships {
+            renames.apply(conn, &rebuild_rel_table(&rel.table), &rel.table)?;
         }
         if migration_node_count(conn, "Memory")? != source_rows {
             anyhow::bail!("post-swap node count differs from the legacy source");
         }
-        for (table, _, edges) in &relationships {
-            if migration_rel_count(conn, table)? != edges.len() {
-                anyhow::bail!("post-swap {table} edge count differs from the legacy source");
+        for rel in &relationships {
+            if migration_rel_count(conn, &rel.table)? != rel.edges.len() {
+                anyhow::bail!(
+                    "post-swap {} edge count differs from the legacy source",
+                    rel.table
+                );
             }
         }
         Ok(())
@@ -11048,8 +11244,8 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
 
     // Backups are only dropped once the swapped-in tables pass validation. A
     // failure here leaves harmless duplicate catalogs, not a broken store.
-    for (table, _, _) in &relationships {
-        let backup = legacy_rel_table(table);
+    for rel in &relationships {
+        let backup = legacy_rel_table(&rel.table);
         if let Err(error) = conn.query(&format!("DROP TABLE {backup}")) {
             tracing::warn!("legacy backup relationship table {backup} still present: {error}");
         }
@@ -38742,6 +38938,29 @@ mod store_migration {
             .expect("table_info query")
     }
 
+    /// The declared endpoint kinds of a relationship table, as the engine
+    /// catalog reports them: one `(source, destination)` pair per connection.
+    async fn rel_endpoints(store: &LadybugStore, table: &str) -> Vec<(String, String)> {
+        let table = table.to_string();
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&format!("CALL show_connection('{table}') RETURN *"))?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    if let (
+                        Some(lbug::Value::String(source)),
+                        Some(lbug::Value::String(destination)),
+                    ) = (row.get(0), row.get(1))
+                    {
+                        out.push((source.clone(), destination.clone()));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .expect("show_connection query")
+    }
+
     fn row_payload(content: &str) -> MemoryPayload {
         MemoryPayload {
             content: content.to_string(),
@@ -38962,6 +39181,169 @@ mod store_migration {
         assert_eq!(report.skipped_reason, None);
         assert_eq!(count_memory(&store, "true").await, 2);
         assert_eq!(edge_count(&store).await, 1, "edges survive the swap");
+    }
+
+    /// A relationship whose endpoints are not `Memory` nodes must survive the
+    /// legacy primary-key rebuild untouched. Recreating every relationship
+    /// table with `Memory` endpoints (or scanning it with `Memory` labels)
+    /// made such rows disappear and could stop the open outright; the
+    /// endpoint kinds an older binary declared are part of the store's data.
+    #[tokio::test]
+    async fn a_legacy_primary_key_rebuild_preserves_non_memory_relationships() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[
+                "CREATE NODE TABLE Task (task_id STRING, title STRING, PRIMARY KEY (task_id))",
+                "CREATE REL TABLE TaskDependsOn (FROM Task TO Task, reason STRING)",
+                &insert_row("src/main.rs", Some("alpha"), "{}"),
+                "CREATE (:Task {task_id: 'T-101', title: 'first'})",
+                "CREATE (:Task {task_id: 'T-102', title: 'second'})",
+                "MATCH (a:Task {task_id: 'T-101'}), (b:Task {task_id: 'T-102'}) CREATE (a)-[:TaskDependsOn {reason: 'blocks'}]->(b)",
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.pk_rebuilt, "the legacy key was rebuilt");
+        assert_eq!(report.skipped_reason, None);
+
+        let edges: Vec<(String, String, String)> = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (a:Task)-[r:TaskDependsOn]->(b:Task) RETURN a.task_id, b.task_id, r.reason",
+                )?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    if let (
+                        Some(lbug::Value::String(from)),
+                        Some(lbug::Value::String(to)),
+                        Some(lbug::Value::String(reason)),
+                    ) = (row.get(0), row.get(1), row.get(2))
+                    {
+                        out.push((from.clone(), to.clone(), reason.clone()));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .expect("task dependency query");
+        assert_eq!(
+            edges,
+            vec![(
+                "T-101".to_string(),
+                "T-102".to_string(),
+                "blocks".to_string()
+            )],
+            "the Task -> Task row survives with its endpoints and properties"
+        );
+        assert_eq!(
+            rel_endpoints(&store, "TaskDependsOn").await,
+            vec![("Task".to_string(), "Task".to_string())],
+            "the declared endpoint kinds are not rewritten to Memory"
+        );
+    }
+
+    /// A relationship with a `Memory` endpoint and a non-`Memory` endpoint
+    /// must survive the rebuild in both orientations: the Memory side rebinds
+    /// to the rebuilt row's id, the other endpoint keeps its own primary
+    /// key, and the relationship's properties stay attached.
+    #[tokio::test]
+    async fn a_legacy_primary_key_rebuild_preserves_mixed_memory_relationships() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[
+                "CREATE NODE TABLE Task (task_id STRING, title STRING, PRIMARY KEY (task_id))",
+                "CREATE REL TABLE TaskMention (FROM Memory TO Task, FROM Task TO Memory, source STRING)",
+                &insert_row("src/main.rs", Some("alpha"), "{}"),
+                "CREATE (:Task {task_id: 'T-101', title: 'first'})",
+                "MATCH (a:Memory {name: 'n-src/main.rs'}), (b:Task {task_id: 'T-101'}) CREATE (a)-[:TaskMention {source: 'alpha'}]->(b)",
+                "MATCH (a:Task {task_id: 'T-101'}), (b:Memory {name: 'n-src/main.rs'}) CREATE (a)-[:TaskMention {source: 'beta'}]->(b)",
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.pk_rebuilt, "the legacy key was rebuilt");
+        assert_eq!(report.skipped_reason, None);
+
+        let memory_first: Vec<(String, String, String)> = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (a:Memory)-[r:TaskMention]->(b:Task) RETURN a.id, b.task_id, r.source",
+                )?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    if let (
+                        Some(lbug::Value::String(id)),
+                        Some(lbug::Value::String(task)),
+                        Some(lbug::Value::String(source)),
+                    ) = (row.get(0), row.get(1), row.get(2))
+                    {
+                        out.push((id.clone(), task.clone(), source.clone()));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .expect("memory-to-task query");
+        assert_eq!(
+            memory_first,
+            vec![(
+                "src/main.rs".to_string(),
+                "T-101".to_string(),
+                "alpha".to_string()
+            )],
+            "the Memory -> Task row rebinds to the rebuilt Memory row"
+        );
+
+        let task_first: Vec<(String, String, String)> = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (a:Task)-[r:TaskMention]->(b:Memory) RETURN a.task_id, b.id, r.source",
+                )?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    if let (
+                        Some(lbug::Value::String(task)),
+                        Some(lbug::Value::String(id)),
+                        Some(lbug::Value::String(source)),
+                    ) = (row.get(0), row.get(1), row.get(2))
+                    {
+                        out.push((task.clone(), id.clone(), source.clone()));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .expect("task-to-memory query");
+        assert_eq!(
+            task_first,
+            vec![(
+                "T-101".to_string(),
+                "src/main.rs".to_string(),
+                "beta".to_string()
+            )],
+            "the Task -> Memory row rebinds to the rebuilt Memory row"
+        );
+
+        let mut endpoints = rel_endpoints(&store, "TaskMention").await;
+        endpoints.sort();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("Memory".to_string(), "Task".to_string()),
+                ("Task".to_string(), "Memory".to_string()),
+            ],
+            "both declared orientations survive the rebuild"
+        );
     }
 
     #[test]

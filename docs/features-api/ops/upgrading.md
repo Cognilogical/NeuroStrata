@@ -34,9 +34,13 @@ current binary can open them; no #68 schema or lifecycle change is assumed.
   then swaps the names. The migration reports `pk_rebuilt = true`; the original
   tables are renamed aside until the replacement passes validation, and an
   interrupted swap is resumed or rolled back on the next open before a fresh
-  `Memory` table can be created. A rebuild that cannot copy every row or edge
-  fails loudly with `LegacyPrimaryKeyMigrationError` and leaves the source
-  tables untouched.
+  `Memory` table can be created. Relationship tables keep the endpoint kinds
+  they were declared with: a table that does not touch `Memory` is left
+  completely untouched, and a table mixing `Memory` with other endpoints is
+  recreated with every connection, the `Memory` side rebound to the rebuilt
+  row and the other side still bound by its own primary key. A rebuild that
+  cannot copy every row or edge, or cannot represent an endpoint, fails loudly
+  and leaves the source tables untouched.
 - **NULL namespaces.** `metadata.namespace` is checked first, then the trusted
   structural owner: a generation-scoped id (`namespace::generation::path`) or
   the single qualified row that shares its logical path in exactly one
