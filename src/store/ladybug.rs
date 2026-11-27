@@ -1618,6 +1618,13 @@ pub struct LadybugStore {
     legacy_aliases: std::sync::RwLock<HashMap<String, String>>,
     /// Whether `legacy_aliases` has been read from the store this process.
     legacy_aliases_loaded: std::sync::atomic::AtomicBool,
+    /// The publication epoch this handle last loaded its alias map at. A
+    /// different process-wide epoch means another handle repointed aliases.
+    legacy_alias_epoch_loaded: std::sync::atomic::AtomicU64,
+    /// Test-only: bump the publication epoch once after the alias read so the
+    /// stale-load rejection path can be exercised deterministically.
+    #[cfg(test)]
+    legacy_alias_load_race: std::sync::atomic::AtomicUsize,
     /// Test-only: number of `load_legacy_aliases` calls that must pretend to
     /// fail transiently. Proves the failed load leaves `legacy_aliases_loaded`
     /// false so the next upsert retries instead of caching an empty map.
@@ -5012,6 +5019,9 @@ impl LadybugStore {
             store_state: Arc::new(std::sync::Mutex::new(None)),
             legacy_aliases: std::sync::RwLock::new(HashMap::new()),
             legacy_aliases_loaded: std::sync::atomic::AtomicBool::new(false),
+            legacy_alias_epoch_loaded: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            legacy_alias_load_race: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             legacy_alias_load_failures: std::sync::atomic::AtomicUsize::new(0),
             migration_report: Arc::new(std::sync::Mutex::new(None)),
@@ -5127,9 +5137,14 @@ impl LadybugStore {
             namespace,
             logical_path_in_namespace(requested_id, namespace),
         );
+        let epoch = LEGACY_ALIAS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
         if !self
             .legacy_aliases_loaded
             .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .legacy_alias_epoch_loaded
+                .load(std::sync::atomic::Ordering::Acquire)
+                != epoch
         {
             self.load_legacy_aliases().await?;
         }
@@ -5147,6 +5162,9 @@ impl LadybugStore {
     /// The next lookup re-derives the map from the store — the cache is a
     /// denormalization, never the source of truth.
     fn invalidate_legacy_aliases(&self) {
+        let epoch = LEGACY_ALIAS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        self.legacy_alias_epoch_loaded
+            .store(epoch, std::sync::atomic::Ordering::Release);
         self.legacy_aliases_loaded
             .store(false, std::sync::atomic::Ordering::Release);
         self.legacy_aliases
@@ -5222,6 +5240,10 @@ impl LadybugStore {
         // `with_conn` runs on a 'static thread, so capture the provenance as a
         // plain bool rather than borrowing `self` into the closure.
         let open_verified = self.open_provenance.is_verified();
+        // Snapshot the epoch before reading. If a publication repoints aliases
+        // while this read is in flight, the map describes a state that no
+        // longer exists and must not be installed as current.
+        let epoch_at_start = LEGACY_ALIAS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
         let loaded = self
             .with_conn(move |conn| {
                 let mut pairs = Vec::new();
@@ -5249,6 +5271,12 @@ impl LadybugStore {
                         // but an unverified recovery open must never mutate
                         // persistent state from its unauthenticated view.
                         if open_verified {
+                            // A pre-init write can reach a legacy row whose
+                            // namespace lives only in metadata. Recover those
+                            // owners before deriving aliases, or the first
+                            // qualified upsert creates a duplicate the later
+                            // init has to reconcile.
+                            migrate_null_namespaces(conn)?;
                             migrate_legacy_id_aliases(conn)?;
                         }
                         for row in conn.query(query)? {
@@ -5271,10 +5299,27 @@ impl LadybugStore {
                 Ok(aliases)
             })
             .await?;
+        #[cfg(test)]
+        if self
+            .legacy_alias_load_race
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            self.legacy_alias_load_race
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            LEGACY_ALIAS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        if epoch_at_start != LEGACY_ALIAS_EPOCH.load(std::sync::atomic::Ordering::Acquire) {
+            // A publication won the race. Leave the cache unloaded so the next
+            // lookup re-reads the store instead of serving the stale map.
+            return Ok(());
+        }
         *self
             .legacy_aliases
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = loaded;
+        self.legacy_alias_epoch_loaded
+            .store(epoch_at_start, std::sync::atomic::Ordering::Release);
         self.legacy_aliases_loaded
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -9748,6 +9793,10 @@ impl LadybugStore {
         Vec<crate::fts::LexicalDoc>,
         Vec<crate::graph_read::related::EdgeSpec>,
     )> {
+        // Quarantine is recovery-only: an export must never carry isolated rows.
+        if namespace == QUARANTINE_NAMESPACE {
+            return Ok((Vec::new(), Vec::new()));
+        }
         self.init(namespace).await?;
         let ns_owned = namespace.to_string();
         let warn_ns = ns_owned.clone();
@@ -9881,7 +9930,16 @@ fn memory_table_ddl(dimensions: usize) -> (String, [&'static str; 5]) {
 /// Quarantine is a namespace, not a separate table: the row keeps its id,
 /// content and edges, and every ordinary read stays scoped away from it. No
 /// row is ever deleted by the store-open migration.
-pub const QUARANTINE_NAMESPACE: &str = "_quarantine";
+/// Bumped by every alias rewrite so every open handle can detect that its
+/// cached alias map predates a publication on a different handle.
+static LEGACY_ALIAS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Internal, collision-resistant namespace for rows whose owner could not be
+/// proven. A plain `_quarantine` name used to be a legal tenant namespace, so
+/// reserving it verbatim would hide pre-existing tenant data after an upgrade.
+/// The long engine-internal name makes an accidental tenant collision
+/// implausible while keeping quarantine rows queryable by an operator.
+pub const QUARANTINE_NAMESPACE: &str = "__neurostrata_migration_quarantine_408_b76e9591";
 
 /// One column as `CALL table_info('Memory')` reports it (`#408`).
 ///
@@ -10719,25 +10777,31 @@ fn staging_marker_state(
 /// discarded would be resurrected. A store that never began a generation has
 /// no counter row, so an ordinary qualified re-ingest keeps alias resolution.
 fn generation_is_closed(conn: &Connection, namespace: &str, generation: u64) -> Result<bool> {
-    let counter = conn
-        .query(&format!(
-            "MATCH (g:IngestGeneration) WHERE g.id = '{}' RETURN g.counter",
-            escape_ladybug_string(namespace)
-        ))?
-        .next()
-        .and_then(|row| format!("{}", row[0]).parse::<u64>().ok())
-        .unwrap_or(0);
-    if generation == 0 || generation > counter {
+    if generation == 0 {
         return Ok(false);
     }
-    let active = conn
-        .query(&format!(
-            "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation = {} RETURN g.id LIMIT 1",
-            escape_ladybug_string(namespace),
-            generation
-        ))?
-        .next()
-        .is_some();
+    // Counters live under the bare namespace while each source's active
+    // pointer lives under `generation_key(namespace, source_key)`. A scoped id
+    // does not name its source, so consult every pointer in the namespace:
+    // the counter is the maximum any source has issued, and the generation is
+    // open only while some source still names it as active. A store that
+    // never began a generation has no rows and keeps alias resolution.
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' RETURN g.counter, g.active_generation",
+        escape_ladybug_string(namespace)
+    );
+    let mut counter = 0u64;
+    let mut active = false;
+    for row in conn.query(&query)? {
+        let issued = format!("{}", row[0]).parse::<u64>().unwrap_or(0);
+        counter = counter.max(issued);
+        if format!("{}", row[1]).parse::<u64>().ok() == Some(generation) {
+            active = true;
+        }
+    }
+    if generation > counter {
+        return Ok(false);
+    }
     Ok(!active)
 }
 
@@ -10875,6 +10939,25 @@ fn catalog_tables(conn: &Connection) -> Result<HashMap<String, bool>> {
         }
     }
     Ok(tables)
+}
+
+/// Retire a migration-owned table by renaming it aside. Engine DDL is
+/// auto-commit, so a rename is the only reversible catalog operation: no
+/// table is ever dropped and an operator can still inspect the archived copy.
+fn retire_artifact(conn: &Connection, table: &str) -> Result<()> {
+    if !table_exists_checked(conn, table)? {
+        return Ok(());
+    }
+    let stamp = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let mut archive = format!("{table}__archived408_{stamp}");
+    let present = catalog_tables(conn)?;
+    if present.contains_key(&archive) {
+        archive = format!("{archive}_{}", present.len());
+    }
+    conn.query(&format!("ALTER TABLE {table} RENAME TO {archive}"))?;
+    Ok(())
 }
 
 /// Refuse any artifact name the catalog already owns. A collision must fail
@@ -11040,13 +11123,13 @@ fn clear_rebuild_artifacts(conn: &Connection) -> Result<()> {
         .iter()
         .filter(|(artifact, _, _)| artifact != REBUILD_COMMIT_SENTINEL)
         .collect();
-    fn drop_present(
+    fn retire_present(
         conn: &Connection,
         present: &HashMap<String, bool>,
         artifact: &str,
     ) -> Result<()> {
         if present.contains_key(artifact) {
-            conn.query(&format!("DROP TABLE {artifact}"))?;
+            retire_artifact(conn, artifact)?;
         }
         Ok(())
     }
@@ -11061,7 +11144,7 @@ fn clear_rebuild_artifacts(conn: &Connection) -> Result<()> {
                 if matches!(phase.as_str(), "backup" | "scratch")
                     && present.get(artifact) == Some(&is_rel)
                 {
-                    drop_present(conn, &present, artifact)?;
+                    retire_present(conn, &present, artifact)?;
                     present.remove(artifact);
                 }
             }
@@ -11074,7 +11157,7 @@ fn clear_rebuild_artifacts(conn: &Connection) -> Result<()> {
     // 1. Scratch relationship tables were never part of the store.
     for (artifact, _, phase) in &physical {
         if phase == "scratch" && present.get(artifact) == Some(&true) {
-            drop_present(conn, &present, artifact)?;
+            retire_present(conn, &present, artifact)?;
             present.remove(artifact);
         }
     }
@@ -11086,7 +11169,7 @@ fn clear_rebuild_artifacts(conn: &Connection) -> Result<()> {
             && present.get(artifact) == Some(&true)
             && present.get(original) == Some(&true)
         {
-            drop_present(conn, &present, original)?;
+            retire_present(conn, &present, original)?;
             present.remove(original);
         }
     }
@@ -11096,14 +11179,14 @@ fn clear_rebuild_artifacts(conn: &Connection) -> Result<()> {
             && present.get(artifact) == Some(&false)
             && present.get(original) == Some(&false)
         {
-            drop_present(conn, &present, original)?;
+            retire_present(conn, &present, original)?;
             present.remove(original);
         }
     }
     // 4. Scratch node tables were never part of the store.
     for (artifact, _, phase) in &physical {
         if phase == "scratch" && present.get(artifact) == Some(&false) {
-            drop_present(conn, &present, artifact)?;
+            retire_present(conn, &present, artifact)?;
             present.remove(artifact);
         }
     }
@@ -11714,15 +11797,15 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
         return Err(error);
     }
 
-    // Backups are only dropped once the swapped-in tables pass validation. A
-    // failure here leaves harmless duplicate catalogs, not a broken store.
+    // Backups are retired once the swapped-in tables pass validation. A
+    // failure here leaves harmless archived catalogs, not a broken store.
     for rel in &relationships {
         let backup = legacy_rel_table(&rel.table);
-        if let Err(error) = conn.query(&format!("DROP TABLE {backup}")) {
+        if let Err(error) = retire_artifact(conn, &backup) {
             tracing::warn!("legacy backup relationship table {backup} still present: {error}");
         }
     }
-    if let Err(error) = conn.query(&format!("DROP TABLE {LEGACY_NODE_TABLE}")) {
+    if let Err(error) = retire_artifact(conn, LEGACY_NODE_TABLE) {
         tracing::warn!("legacy backup node table still present: {error}");
     }
     conn.query(&format!("MATCH (a:{REBUILD_STATE_TABLE}) DETACH DELETE a"))?;
@@ -13703,7 +13786,9 @@ impl VectorStore for LadybugStore {
         // captured here so the closure stays `FnOnce + Send + 'static`.
         let dimensions = self.dimensions;
         let zero_vec = zero_vector_str(dimensions);
-        let lexical_doc = Self::lexical_doc(&namespace, &id, &payload);
+        // Keep a payload copy: the lexical id must be the one the write turn
+        // actually chose, which can differ from the id resolved before it.
+        let lexical_payload = payload.clone();
         let refresh_ont_after_upsert = payload.memory_type == "action_type"
             || id == crate::registry::registry_row_id(&namespace);
         let ns_for_post_refresh = namespace.clone();
@@ -13753,9 +13838,12 @@ impl VectorStore for LadybugStore {
                                 generation,
                                 namespace
                             ),
-                            // An in-flight staging row keeps its scoped id: an
-                            // alias must not redirect it onto the live row.
-                            StagingMarkerState::Fresh => {}
+                            // A marker can appear after the async lookup above.
+                            // The staged row must keep the requested scoped id
+                            // or `abort_generation` cannot discard the write.
+                            StagingMarkerState::Fresh => {
+                                write_id = requested_id.clone();
+                            }
                             // No marker: an older binary may have written a
                             // generation-scoped id directly. Re-read the alias
                             // inside this turn; `legacy_alias_in_conn` refuses
@@ -14163,8 +14251,9 @@ impl VectorStore for LadybugStore {
             })
         })
         .await;
-        if outcome.is_ok() {
-            self.lexical_apply_doc(lexical_doc);
+        if let Ok(report) = &outcome {
+            let doc = Self::lexical_doc(&ns_for_post_refresh, &report.id, &lexical_payload);
+            self.lexical_apply_doc(doc);
             if refresh_ont_after_upsert {
                 self.refresh_ontology(&ns_for_post_refresh).await;
             }
@@ -14665,6 +14754,9 @@ impl VectorStore for LadybugStore {
     }
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
+        if namespace == QUARANTINE_NAMESPACE {
+            anyhow::bail!("namespace '{QUARANTINE_NAMESPACE}' is reserved for store migration");
+        }
         let namespace = namespace.to_string();
         let id = id.to_string();
         // A qualified id for a row an older binary wrote bare must delete that
@@ -17543,6 +17635,11 @@ impl LadybugStore {
         exclude_ids: &[String],
         limit: usize,
     ) -> Result<MultiFormMemoryRetrieval> {
+        // `_quarantine` rows are isolated for recovery; ordinary file reads
+        // must not surface them to a caller who merely names that namespace.
+        if namespace == QUARANTINE_NAMESPACE {
+            anyhow::bail!("namespace '{QUARANTINE_NAMESPACE}' is reserved for store migration");
+        }
         let mut hits: Vec<crate::graph_read::memories_for_file::MemoryHit> = Vec::new();
         let mut candidate_truncated = false;
         let mut any_success = false;
@@ -17679,6 +17776,16 @@ impl GraphRead for LadybugStore {
         cursor: Option<&crate::graph_read::related::Cursor>,
         cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy,
     ) -> Result<crate::graph_read::related::RelatedResult> {
+        if namespace == QUARANTINE_NAMESPACE {
+            return Ok(crate::graph_read::related::RelatedResult {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                evidence: Vec::new(),
+                total: 0,
+                truncated: false,
+                next_cursor: None,
+            });
+        }
         let namespace = namespace.to_string();
         let seed = seed.to_string();
         // Spec §6: `related` consumes the ontology's relation expansion — each
@@ -38698,6 +38805,9 @@ impl LadybugStore {
         &self,
         namespace: &str,
     ) -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
+        if namespace == QUARANTINE_NAMESPACE {
+            return Ok(Vec::new());
+        }
         let namespace_owned = namespace.to_string();
         self.with_conn(move |conn: &Connection| -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
             let safe_ns = escape_ladybug_string(&namespace_owned);
@@ -43541,6 +43651,278 @@ mod store_migration {
             )
             .await,
             0
+        );
+    }
+
+    // PR #456 follow-up: quarantine isolation, alias freshness, non-destructive
+    // rebuilds, and generation-scoped write identity.
+
+    #[tokio::test]
+    async fn quarantined_rows_cannot_be_deleted_through_the_ordinary_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("orphan-row", None, "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let predicate = format!("m.namespace = '{QUARANTINE_NAMESPACE}'");
+        assert_eq!(count_memory(&store, &predicate).await, 1);
+        assert!(
+            store
+                .delete(QUARANTINE_NAMESPACE, "orphan-row")
+                .await
+                .is_err(),
+            "an ordinary delete must not reach a recovery-only row"
+        );
+        assert_eq!(count_memory(&store, &predicate).await, 1);
+    }
+
+    #[tokio::test]
+    async fn quarantine_is_hidden_from_ordinary_export_and_edge_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("orphan-row", None, "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let (docs, edges) = store
+            .export_wasm_snapshot(QUARANTINE_NAMESPACE, false)
+            .await
+            .expect("export path stays callable");
+        assert!(docs.is_empty() && edges.is_empty());
+        assert!(store
+            .list_edges(QUARANTINE_NAMESPACE)
+            .await
+            .expect("edge path stays callable")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tenant_named_like_the_old_quarantine_literal_keeps_its_rows() {
+        const LEGACY_TENANT: &str = "_quarantine";
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("tenant-row", Some(LEGACY_TENANT), "{}")],
+        );
+        let store = open(&db);
+        store.init(LEGACY_TENANT).await.expect("legacy store opens");
+        let (_, payload) = store
+            .get(LEGACY_TENANT, "tenant-row")
+            .await
+            .expect("ordinary lookup")
+            .expect("pre-existing tenant data survives the upgrade");
+        assert_eq!(payload.content, "content-tenant-row");
+    }
+
+    #[tokio::test]
+    async fn a_pre_init_upsert_finds_a_metadata_named_null_namespace_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("legacy-file", None, r#"{"namespace":"alpha"}"#)],
+        );
+        let store = open(&db);
+        store
+            .upsert(
+                "alpha",
+                "alpha::legacy-file",
+                vec![0.0; DIMS],
+                row_payload("updated"),
+            )
+            .await
+            .expect("a write before init resolves the legacy row");
+        assert_eq!(count_memory(&store, "m.namespace = 'alpha'").await, 1);
+    }
+
+    #[tokio::test]
+    async fn conflicting_metadata_cannot_expose_a_row_to_another_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("legacy-file", None, r#"{"namespace":"beta"}"#),
+                &insert_row("alpha::legacy-file", Some("alpha"), "{}"),
+            ],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert_eq!(count_memory(&store, "m.namespace = 'beta'").await, 0);
+        let predicate = format!("m.namespace = '{QUARANTINE_NAMESPACE}'");
+        assert_eq!(count_memory(&store, &predicate).await, 1);
+    }
+
+    #[tokio::test]
+    async fn rebuild_retires_its_backup_instead_of_dropping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[&insert_row("legacy-file", Some("alpha"), "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert!(store.last_migration_report().expect("report").pk_rebuilt);
+        let archived = store
+            .with_conn(|conn| {
+                let mut names = Vec::new();
+                for row in conn.query("CALL show_tables() RETURN *")? {
+                    if let Some(lbug::Value::String(name)) = row.get(1) {
+                        names.push(name.clone());
+                    }
+                }
+                Ok(names)
+            })
+            .await
+            .expect("catalog read");
+        assert!(
+            archived
+                .iter()
+                .any(|name| name.starts_with(&format!("{LEGACY_NODE_TABLE}__archived408_"))),
+            "the backup stays in the catalog under an archived name: {archived:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aborted_scoped_id_never_rewrites_the_live_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let generation = store
+            .begin_generation("alpha", "src")
+            .await
+            .expect("generation begins");
+        store
+            .abort_generation("alpha", "src", generation)
+            .await
+            .expect("generation aborts");
+        let stale = format!("alpha::{generation}::src/main.rs");
+        store
+            .upsert("alpha", &stale, vec![0.0; DIMS], row_payload("stale"))
+            .await
+            .expect("the stale retry is isolated");
+        let (_, payload) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("live lookup")
+            .expect("live row exists");
+        assert_eq!(payload.content, "content-src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn a_bare_id_starting_with_its_namespace_keeps_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("alpha::src/main.rs", Some("alpha"), "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        store
+            .upsert(
+                "alpha",
+                "alpha::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("updated"),
+            )
+            .await
+            .expect("re-ingest the qualified identity");
+        assert_eq!(count_memory(&store, "m.namespace = 'alpha'").await, 1);
+        let (_, payload) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("qualified lookup")
+            .expect("the legacy row owns its qualified identity");
+        assert_eq!(payload.content, "updated");
+    }
+
+    #[tokio::test]
+    async fn a_cached_alias_is_revalidated_after_another_handle_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        store
+            .load_legacy_aliases()
+            .await
+            .expect("cache the pre-publication alias");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs")
+        );
+        // The engine forbids two `Database` handles in one process, so model
+        // the other handle's publication by repointing the stored alias and
+        // bumping the process-wide epoch exactly as that handle would.
+        store
+            .with_conn(|conn| {
+                conn.query(
+                    "MATCH (a:LegacyIdAlias {canonical_id: 'alpha::src/main.rs'}) \
+                     SET a.id = 'alpha::9::src/main.rs'",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("alias repointed");
+        LEGACY_ALIAS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        assert_eq!(
+            store
+                .resolve_legacy_alias("alpha", "alpha::src/main.rs")
+                .await
+                .expect("revalidated lookup")
+                .as_deref(),
+            Some("alpha::9::src/main.rs")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_load_racing_a_publication_is_not_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        store
+            .legacy_alias_load_race
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        store
+            .load_legacy_aliases()
+            .await
+            .expect("the read itself succeeds");
+        assert!(
+            !store
+                .legacy_aliases_loaded
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a map that raced a publication stays unloaded"
         );
     }
 }
