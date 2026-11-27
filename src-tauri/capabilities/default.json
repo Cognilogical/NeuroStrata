@@ -9,8 +9,6 @@
     {
       "identifier": "shell:allow-open",
       "allow": [
-        { "url": "^vscode://.*" },
-        { "url": "^cursor://.*" },
         { "url": "^https?://.*" }
       ]
     }

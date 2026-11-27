@@ -8,19 +8,20 @@
 use serde_json::Value;
 use std::path::PathBuf;
 
-/// The exact CSP the visualizer ships: script and style are same-origin only
-/// (inline styles are the single retained exception), images may be data URLs,
-/// and the only permitted network target is the loopback daemon.
-const EXPECTED_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343 ipc: http://ipc.localhost; form-action 'self'";
+/// The exact five-directive CSP from issue #413: script and style are
+/// same-origin only (inline styles are the single retained exception), images
+/// may be data URLs, and the only permitted network target is the loopback
+/// daemon.
+const EXPECTED_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343";
 
-/// URL patterns the scoped `shell:allow-open` capability may allow. These map
-/// one-to-one to the schemes `open_external` accepts in `src-tauri/src/main.rs`.
-const EXPECTED_OPEN_PATTERNS: [&str; 3] = ["^cursor://.*", "^https?://.*", "^vscode://.*"];
+/// URL patterns the scoped `shell:allow-open` capability may allow. Only web
+/// links remain: the shipped capability carries no branded editor schemes.
+const EXPECTED_OPEN_PATTERNS: [&str; 1] = ["^https?://.*"];
 
-/// Patterns that must never reappear: `^file://.*` and `^/.*` turn the opener
-/// into an arbitrary local-file/executable launcher, and `^obsidian://.*` is
-/// not emitted by any shipped web-ui feature.
-const FORBIDDEN_OPEN_PATTERNS: [&str; 3] = ["^file://.*", "^/.*", "^obsidian://.*"];
+/// Patterns that must never reappear: they turn the opener into an arbitrary
+/// local-file/executable launcher. Branded editor deep-link schemes are also
+/// excluded: the visualizer emits only web links.
+const FORBIDDEN_OPEN_PATTERNS: [&str; 2] = ["^file://.*", "^/.*"];
 
 fn config_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
@@ -76,6 +77,22 @@ fn directive_tokens(policy: &str, name: &str) -> Vec<String> {
         .unwrap_or_else(|| panic!("CSP has no {name} directive: {policy}"))
 }
 
+/// Names of every directive present in a policy, in source order.
+fn directive_names(policy: &str) -> Vec<String> {
+    policy
+        .split(';')
+        .map(str::trim)
+        .filter(|directive| !directive.is_empty())
+        .map(|directive| {
+            directive
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect()
+}
+
 /// Every `url` pattern across scoped `shell:allow-open` entries.
 fn scoped_open_patterns(permissions: &[Value]) -> Vec<String> {
     let mut patterns = Vec::new();
@@ -116,18 +133,8 @@ fn csp_is_set_and_strict() {
         .collect();
     assert_eq!(
         directives.len(),
-        6,
-        "the CSP must contain exactly six directives: {actual}"
-    );
-
-    // `form-action` never falls back to `default-src` (CSP spec / MDN:
-    // "Not setting this allows anything"), so it must be pinned explicitly
-    // or a compromised renderer could submit form data to a remote host
-    // despite the loopback-only `connect-src`.
-    assert_eq!(
-        directive_tokens(&actual, "form-action"),
-        vec!["'self'".to_string()],
-        "form-action must be 'self'"
+        5,
+        "the CSP must contain exactly five directives: {actual}"
     );
 }
 
@@ -216,6 +223,16 @@ fn dev_csp_permits_vite_hmr_without_loosening_production_csp() {
         "production CSP must not carry the dev-server origin: {prod}"
     );
     let dev = dev_csp();
+    // Compare the whole directive set, not just values: an extra directive
+    // such as `worker-src https:` must fail the pin instead of going unnoticed.
+    let mut dev_names = directive_names(&dev);
+    dev_names.sort();
+    let mut prod_names = directive_names(&prod);
+    prod_names.sort();
+    assert_eq!(
+        dev_names, prod_names,
+        "devCsp must contain exactly the production directives, with no additions"
+    );
     let mut tokens = directive_tokens(&dev, "connect-src");
     tokens.sort();
     let mut expected = directive_tokens(&prod, "connect-src");
@@ -227,13 +244,7 @@ fn dev_csp_permits_vite_hmr_without_loosening_production_csp() {
         "devCsp connect-src must be the production set plus only the Vite HMR origins"
     );
     // Every non-connect directive stays identical to production.
-    for name in [
-        "default-src",
-        "script-src",
-        "style-src",
-        "img-src",
-        "form-action",
-    ] {
+    for name in ["default-src", "script-src", "style-src", "img-src"] {
         assert_eq!(
             directive_tokens(&dev, name),
             directive_tokens(&prod, name),
@@ -247,19 +258,12 @@ fn daemon_connect_src_is_loopback_only() {
     let policy = csp();
     let mut tokens = directive_tokens(&policy, "connect-src");
     tokens.sort();
-    // `ipc:` / `http://ipc.localhost` are Tauri's local IPC transport
-    // endpoints (the official Tauri CSP example lists both in
-    // `connect-src`): without them the webview rejects `invoke` calls and
-    // every command-backed feature fails. Neither is a remote host.
-    let mut expected = vec![
-        "'self'".to_string(),
-        "http://127.0.0.1:34343".to_string(),
-        "ipc:".to_string(),
-        "http://ipc.localhost".to_string(),
-    ];
+    // Issue #413 allows exactly same-origin and the loopback daemon: no IPC
+    // transport tokens and no remote hosts belong in the shipped policy.
+    let mut expected = vec!["'self'".to_string(), "http://127.0.0.1:34343".to_string()];
     expected.sort();
     assert_eq!(
         tokens, expected,
-        "connect-src must allow only same-origin, the loopback daemon, and the local Tauri IPC transport"
+        "connect-src must allow only same-origin and the loopback daemon"
     );
 }

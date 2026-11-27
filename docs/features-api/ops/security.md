@@ -14,7 +14,7 @@
 | **Cypher / SPARQL Injection**                      | Strict string escaping (backslashes escaped prior to quotes) and validated identifier checks across all LadybugDB Cypher and SPARQL (`spargebra` / `sparopt`) queries.                                                                                                                                      | `src/store/ladybug.rs`, `src/rdf/sparql.rs`                        |
 | **Destructive Agent Hallucinations**               | Zero destructive MCP tools: `delete`, `move`, and `restore` do not exist on the MCP JSON-RPC surface and can only be invoked by an operator via the CLI.                                                                                                                                                    | `src/server.rs`, `src/main.rs`                                     |
 | **Unsafe Shell / Action Execution**                | Prefrontal Cortex intercepts candidate actions via `neurostrata_guard_validate`, evaluates semantic guard rules, and supports Podman-sandboxed verification.                                                                                                                                                | `src/guard/`                                                       |
-| **Webview Code Injection / Unbounded URL Opening** | A strict six-directive Content Security Policy plus a single, scoped `shell:allow-open` capability covering only `vscode://`, `cursor://`, and `http(s)://` URLs.                                                                                                                                          | `src-tauri/tauri.conf.json`, `src-tauri/capabilities/default.json` |
+| **Webview Code Injection / Unbounded URL Opening** | A strict five-directive Content Security Policy plus a single, scoped `shell:allow-open` capability covering only web (`http(s)://`) links.                                                                                                                                                                    | `src-tauri/tauri.conf.json`, `src-tauri/capabilities/default.json` |
 
 ---
 
@@ -61,19 +61,18 @@ The Tauri desktop shell renders graph content that originates from ingested repo
 
 ### 6.1 Shipped CSP
 
-`src-tauri/tauri.conf.json` pins exactly six directives:
+`src-tauri/tauri.conf.json` pins exactly five directives:
 
 ```text
-default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343 ipc: http://ipc.localhost; form-action 'self'
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343
 ```
 
 - `default-src 'self'` and `script-src 'self'` deny remote and inline scripts, so injected memory text cannot execute as code.
 - `style-src 'self' 'unsafe-inline'` is the single retained relaxation: the bundled UI applies computed inline styles (graph highlighting and layout), which do not execute script.
 - `img-src 'self' data:` permits bundled art and inline `data:` images while rejecting remote image beacons.
-- `connect-src 'self' http://127.0.0.1:34343 ipc: http://ipc.localhost` is deliberately loopback/local-only: the only network peer the webview may reach is the local NeuroStrata daemon, so a compromised renderer cannot exfiltrate graph or memory data to a remote host. `ipc:` and `http://ipc.localhost` are Tauri's local IPC transport endpoints (both appear in Tauri's own CSP example); without them the webview rejects `invoke` requests and every command-backed UI feature fails. Neither reaches a remote host.
-- `form-action 'self'` restricts form submissions to the app's own origin. It is stated explicitly because `form-action` does not fall back to `default-src`: without it, form submissions to remote endpoints would be unrestricted despite the loopback-only `connect-src`.
+- `connect-src 'self' http://127.0.0.1:34343` is deliberately loopback-only: the only network peer the webview may reach is the local NeuroStrata daemon, so a compromised renderer cannot exfiltrate graph or memory data to a remote host.
 
-`tests/tauri_config_shape.rs` pins the policy byte-for-byte (including the `connect-src` token set), so a future edit that widens the CSP fails CI instead of silently shipping.
+`tests/tauri_config_shape.rs` pins the policy byte-for-byte (including the exact directive count and `connect-src` token set), so a future edit that widens the CSP fails CI instead of silently shipping.
 
 ### 6.2 Scoped `shell:allow-open`
 
@@ -81,13 +80,11 @@ default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src
 
 ```json
 [
-  { "url": "^vscode://.*" },
-  { "url": "^cursor://.*" },
   { "url": "^https?://.*" }
 ]
 ```
 
-These are the only schemes the web UI emits when handing a file or link to an editor or browser, matching the allowlist in `open_external` (`src-tauri/src/main.rs`). The previously duplicated bare `"shell:allow-open"` entry and the `^file://.*`, `^/.*`, and `^obsidian://.*` patterns are removed: they turned the opener into an arbitrary local-file or executable launcher reachable from untrusted node content. `src-tauri/gen/schemas/capabilities.json` mirrors this capability and is kept in sync.
+The only retained target is the web: links the visualizer emits for documentation and external references. The previously duplicated bare `"shell:allow-open"` entry, the `^file://.*` and `^/.*` local-launch patterns, and branded editor deep-link schemes are removed: they turned the opener into an arbitrary local-file or executable launcher reachable from untrusted node content. `src-tauri/gen/schemas/capabilities.json` mirrors this capability and is kept in sync.
 
 `plugins.shell.open` is `false` in `src-tauri/tauri.conf.json`: external URLs go through `open_external`, whose Rust allowlist is the enforced gate, so plugin-shell's own `open` command stays disabled and `tests/tauri_config_shape.rs` pins the key to `false` (absence would be read as `true` by tauri-plugin-shell).
 
