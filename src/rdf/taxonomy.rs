@@ -1312,10 +1312,31 @@ pub fn thesis_row_id(namespace: &str, version: u64) -> String {
     format!("thesis-{}--v{version}", taxonomy_namespace_token(namespace))
 }
 
+/// Escape a literal slug that would otherwise be indistinguishable from the
+/// content-addressed fallback. The hash spelling is exactly `h` + 32 lowercase
+/// hex; a literal slug with that shape is prefixed with `h2h-`, and a literal
+/// slug already starting with `h2h-` escapes that marker as `h2h-2d-`. The
+/// encoding is injective, so a hashed id can never alias a literal slug.
+fn encode_concept_slug(slug: &str) -> String {
+    if let Some(rest) = slug.strip_prefix("h2h-") {
+        return format!("h2h-2d-{rest}");
+    }
+    let bytes = slug.as_bytes();
+    if bytes.len() == 33
+        && bytes[0] == b'h'
+        && bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+    {
+        return format!("h2h-{slug}");
+    }
+    slug.to_string()
+}
+
 /// Deterministic, namespace-qualified row ID for a SKOS concept version.
 pub fn concept_row_id(namespace: &str, slug: &str, version: u64) -> String {
     let token = taxonomy_namespace_token(namespace);
-    let raw = format!("concept-{token}--{slug}-v{version}");
+    let raw = format!("concept-{token}--{}-v{version}", encode_concept_slug(slug));
     if raw.len() <= 128 {
         return raw;
     }
@@ -1323,7 +1344,10 @@ pub fn concept_row_id(namespace: &str, slug: &str, version: u64) -> String {
     // only when the combined id would overflow; ordinary slugs stay readable.
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(slug.as_bytes());
-    format!("concept-{token}--h{}-v{version}", &hex::encode(digest)[..32])
+    format!(
+        "concept-{token}--h{}-v{version}",
+        &hex::encode(digest)[..32]
+    )
 }
 
 async fn execute_set_thesis(
@@ -3840,6 +3864,24 @@ mod tests {
             crate::domain::validate_id(&id).unwrap_or_else(|error| {
                 panic!("long taxonomy input produced an invalid id: {error}")
             });
+        }
+    }
+
+    #[test]
+    fn hashed_concept_slugs_never_alias_literal_slugs() {
+        let ns = "a".repeat(64);
+        let hashed = concept_row_id(&ns, &"s".repeat(64), 1);
+        let literal = concept_row_id(&ns, "h9791065143e72360c9cff795b7d2a808", 1);
+        assert_ne!(hashed, literal, "literal hash-shaped slug must be escaped");
+        assert!(hashed.contains("--h"), "long slug takes the hashed path");
+        let escaped = encode_concept_slug("h9791065143e72360c9cff795b7d2a808");
+        assert!(escaped.starts_with("h2h-"), "{escaped}");
+        assert_ne!(
+            escaped,
+            encode_concept_slug("h2h-h9791065143e72360c9cff795b7d2a808")
+        );
+        for id in [hashed, literal] {
+            crate::domain::validate_id(&id).expect("generated id stays valid");
         }
     }
 

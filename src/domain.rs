@@ -101,9 +101,11 @@ fn namespace_rule_reason(ns: &str) -> Option<String> {
     if !ns.is_ascii() {
         return Some("must contain only ASCII characters".to_string());
     }
+    // DR-1 allows a leading '-' or '_'; only a leading '.' is refused (it
+    // would read as a path step). The remaining characters are checked below.
     let first = ns.chars().next().expect("length checked above");
-    if !first.is_ascii_alphanumeric() {
-        return Some("must start with an ASCII letter or digit".to_string());
+    if first == '.' {
+        return Some("must not start with '.'".to_string());
     }
     if let Some(ch) = ns
         .chars()
@@ -118,10 +120,9 @@ fn namespace_rule_reason(ns: &str) -> Option<String> {
 }
 
 /// Validate a namespace under DR-1: 1 to 64 ASCII characters from
-/// `[A-Za-z0-9._-]`, starting with an ASCII letter or digit. `:` is banned so
-/// a `<namespace>::<path>` id always splits unambiguously, and a leading
-/// digit-or-letter keeps a namespace from being read as a CLI option (`-x`)
-/// or a path step (`.`, `..`).
+/// `[A-Za-z0-9._-]`, never starting with `.`. `:` is banned so a
+/// `<namespace>::<path>` id always splits unambiguously; a leading `-` or
+/// `_` is explicitly allowed, while a leading `.` would read as a path step.
 pub fn validate_namespace(ns: &str) -> Result<(), ValidationError> {
     match namespace_rule_reason(ns) {
         None => Ok(()),
@@ -141,10 +142,10 @@ fn bare_id_rule_reason(id: &str) -> Option<String> {
     }
     if let Some(ch) = id
         .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-' | '~')))
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')))
     {
         return Some(format!(
-            "contains disallowed character {:?}; allowed: A-Z a-z 0-9 . _ : - ~",
+            "contains disallowed character {:?}; allowed: A-Z a-z 0-9 . _ : -",
             ch
         ));
     }
@@ -193,6 +194,57 @@ pub fn validate_id(id: &str) -> Result<(), ValidationError> {
             id.escape_debug()
         ))),
     }
+}
+
+/// Read/address compatibility for rows persisted before DR-1. New writes
+/// always use the strict validator; this one only accepts shapes the old
+/// code could actually store (colon-bearing namespace names), so an existing
+/// marker or memory stays addressable while new writes remain strict.
+pub fn validate_namespace_for_read(ns: &str) -> Result<(), ValidationError> {
+    if validate_namespace(ns).is_ok() {
+        return Ok(());
+    }
+    let detail = if ns.is_empty() {
+        "must not be empty".to_string()
+    } else if ns.chars().count() > MAX_NAMESPACE_CHARS * 4 {
+        format!("must be at most {} characters", MAX_NAMESPACE_CHARS * 4)
+    } else if let Some(ch) = ns
+        .chars()
+        .find(|c| matches!(c, '/' | '\\' | '\'' | '"') || c.is_control())
+    {
+        format!("contains disallowed character {ch:?}")
+    } else {
+        return Ok(());
+    };
+    Err(ValidationError::Namespace(format!(
+        "'{}' is not an addressable namespace: {detail}",
+        ns.escape_debug()
+    )))
+}
+
+/// Read/address compatibility for rows persisted before DR-2. A legacy bare
+/// path id such as `file:src/lib.rs` can still be read and rated, but a new
+/// write with that shape is refused by [`validate_id`].
+pub fn validate_id_for_read(id: &str) -> Result<(), ValidationError> {
+    if validate_id(id).is_ok() {
+        return Ok(());
+    }
+    let detail = if id.is_empty() {
+        "must not be empty".to_string()
+    } else if id.chars().count() > MAX_ID_CHARS * 4 {
+        format!("must be at most {} characters", MAX_ID_CHARS * 4)
+    } else if let Some(ch) = id
+        .chars()
+        .find(|c| matches!(c, '\'' | '"' | '\\') || c.is_control())
+    {
+        format!("contains disallowed character {ch:?}")
+    } else {
+        return Ok(());
+    };
+    Err(ValidationError::Id(format!(
+        "'{}' is not an addressable id: {detail}",
+        id.escape_debug()
+    )))
 }
 
 #[cfg(test)]
@@ -245,7 +297,17 @@ mod tests {
     #[test]
     fn valid_namespaces_accepted() {
         let longest = "n".repeat(64);
-        for ok in ["a", "A1_b.c-d", "global", "NeuroStrata", longest.as_str()] {
+        for ok in [
+            "a",
+            "A1_b.c-d",
+            "global",
+            "NeuroStrata",
+            "-abc",
+            "_abc",
+            "-",
+            "_",
+            longest.as_str(),
+        ] {
             assert!(validate_namespace(ok).is_ok(), "{ok:?}");
         }
     }
@@ -257,8 +319,6 @@ mod tests {
             " ",
             &"n".repeat(65),
             ".abc",
-            "-abc",
-            "_abc",
             "a:b",
             "team:proj",
             "a b",
@@ -304,6 +364,7 @@ mod tests {
             too_long.as_str(),
             "a b",
             "a/b",
+            "a~b",
             "a$b",
             "é",
             "a\nb",

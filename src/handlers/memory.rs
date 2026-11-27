@@ -22,11 +22,12 @@ pub async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) ->
         None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the namespace the memory lives in.".to_string(),
     };
     // Format validation must precede any store access: resolve_namespace lists
-    // the catalog, so a rejected namespace would otherwise reach the store.
-    if let Err(e) = crate::domain::validate_namespace(namespace) {
+    // the catalog. Read compatibility accepts namespaces and bare path ids
+    // that earlier releases persisted; new writes still use the strict rules.
+    if let Err(e) = crate::domain::validate_namespace_for_read(namespace) {
         return e.to_string();
     }
-    if let Err(e) = crate::domain::validate_id(id) {
+    if let Err(e) = crate::domain::validate_id_for_read(id) {
         return e.to_string();
     }
     let namespace = crate::server::resolve_namespace(&store, namespace).await;

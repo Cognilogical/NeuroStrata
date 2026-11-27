@@ -10598,8 +10598,33 @@ impl VectorStore for LadybugStore {
         // unambiguous. Qualified targets are left untouched.
         // DR-1/DR-2 before any store access: a malformed address is refused
         // here even when a caller bypassed the server or task surface.
-        crate::domain::validate_namespace(namespace)?;
-        crate::domain::validate_id(id)?;
+        let strict = (|| {
+            crate::domain::validate_namespace(namespace)?;
+            crate::domain::validate_id(id)?;
+            if let Some(pos) = id.find(crate::domain::NAMESPACE_SEPARATOR) {
+                let prefix = &id[..pos];
+                if prefix != namespace {
+                    return Err(crate::domain::ValidationError::Id(format!(
+                        "'{}' names namespace '{}' but the row belongs to '{}'",
+                        id.escape_debug(),
+                        prefix.escape_debug(),
+                        namespace.escape_debug()
+                    )));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(reason) = strict {
+            // Legacy rows written before DR-1/DR-2 remain updatable (feedback,
+            // edits) only when the address has a legacy-valid shape AND the
+            // row already exists. A new write with a legacy shape stays refused.
+            if crate::domain::validate_namespace_for_read(namespace).is_err()
+                || crate::domain::validate_id_for_read(id).is_err()
+                || !matches!(self.get(namespace, id).await, Ok(Some(_)))
+            {
+                return Err(reason.into());
+            }
+        }
         let namespace = namespace.to_string();
         // First-write race guard: on a pristine store, refuse the first
         // write if the configured model changed since this process
@@ -36178,6 +36203,29 @@ impl LadybugStore {
             .map_err(|e| ActionError::Storage(e.to_string()))?;
         for w in &batch.writes {
             crate::domain::validate_id(&w.id).map_err(|e| ActionError::Storage(e.to_string()))?;
+        }
+        // Expected heads and edge endpoints are query keys too. Validating
+        // only the staged row ids lets a malformed reference reach a Cypher
+        // query, and an unmatched EnsurePresent can commit row writes while
+        // silently skipping the requested edge.
+        for head in &batch.expected_heads {
+            let ids: Vec<&str> = match head {
+                ExpectedHead::ActiveRow { row_id, .. }
+                | ExpectedHead::AbsentOrInactive { row_id }
+                | ExpectedHead::RowFingerprint { row_id, .. } => vec![row_id.as_str()],
+                ExpectedHead::EdgeState { source, target, .. } => {
+                    vec![source.as_str(), target.as_str()]
+                }
+                ExpectedHead::UniqueActionSlug { .. } => Vec::new(),
+            };
+            for id in ids {
+                crate::domain::validate_id(id).map_err(|e| ActionError::Storage(e.to_string()))?;
+            }
+        }
+        for ed in &batch.edge_deltas {
+            for id in [&ed.source, &ed.target] {
+                crate::domain::validate_id(id).map_err(|e| ActionError::Storage(e.to_string()))?;
+            }
         }
         let ns = namespace.to_string();
         self.guard_first_write()

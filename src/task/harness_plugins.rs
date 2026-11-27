@@ -2624,7 +2624,7 @@ fn refuse_symlink_components(root: &Path, path: &Path) -> std::io::Result<()> {
 /// Write `contents` to `path` through a temporary file in the same folder and
 /// a rename, so a reader (a git hook running `namespace resolve`) sees the old
 /// file or the new one, never a half-written one.
-fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
     // One lock for every config in this process: a refresh touches a handful,
     // and serializing them is simpler and safer than a per-path lock table.
     let _guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

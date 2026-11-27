@@ -1018,6 +1018,21 @@ fn strip_history_edge_declarations(metadata: &mut serde_json::Value) {
 }
 
 /// A failed history rollback must be surfaced, never treated as success.
+/// A history id stays readable when the head id is short enough, otherwise
+/// the bare prefix is content-addressed. Without this, a note id accepted on
+/// initial import (up to 128 chars) grows past DR-2's cap once the history
+/// marker and UUID are appended, so the note can never be updated.
+fn vault_history_id(note_id: &str) -> String {
+    const TAIL_LEN: usize = ".vault-history.".len() + 36; // UUID v4 text form
+    let mut prefix = note_id.to_string();
+    if prefix.len() + TAIL_LEN > crate::domain::MAX_ID_CHARS {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(note_id.as_bytes());
+        prefix = format!("h{}", &hex::encode(digest)[..32]);
+    }
+    format!("{prefix}.vault-history.{}", uuid::Uuid::new_v4())
+}
+
 fn cleanup_orphan_error(history_id: &str, cleanup_err: &str) -> String {
     format!(
         "ORPHAN HISTORY: could not roll back history row {history_id} after a head write failure: {cleanup_err}"
@@ -1449,7 +1464,7 @@ pub async fn import_vault_with_limits(
             }
             // `visible_to` / `eligibility` (and any future structured field)
             // already came across in the wholesale copy above.
-            let history_id = format!("{}.vault-history.{}", note.id, uuid::Uuid::new_v4());
+            let history_id = vault_history_id(&note.id);
             retire_metadata(&mut prior.metadata, &note.id, now);
             strip_history_edge_declarations(&mut prior.metadata);
             metadata["supersedes"] = serde_json::json!(history_id);
