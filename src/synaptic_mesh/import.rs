@@ -51,7 +51,7 @@ use super::manifest::Trust;
 use super::record::{
     Lifecycle, LifecycleState, MeshRecord, RdfBlock, Relationship, MESH_RECORD_SCHEMA_VERSION,
 };
-use super::storage::MeshStorage;
+use super::storage::{run, run_ok, MeshStorage};
 use crate::traits::{Embedder, MemoryPayload, VectorStore};
 
 /// The on-disk schema version of the accepted-head cursor file.
@@ -328,14 +328,10 @@ fn format_apply_report(mesh_id: &str, report: &ApplyReport) -> String {
 /// EMPTY (a normal "team inbox not yet filled" state, answered with a
 /// courtesy instead of a merge error); `Some(true)`/`None` = pull will do
 /// real work or will fail loudly. Mirrors mesh_service's private probe; the
-/// behavior cannot drift because both feeds `storage.pull()`.
+/// behavior cannot drift because both feed `storage.pull()` through the one
+/// bounded funnel.
 fn remote_refs_present(root: &Path) -> Option<bool> {
-    let out = std::process::Command::new("git")
-        .args(["ls-remote", "--refs", "origin", "HEAD"])
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .ok()?;
+    let out = run(root, &["ls-remote", "--refs", "origin", "HEAD"]).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -665,7 +661,7 @@ pub fn write_cursor(mesh_root: &Path, mesh_id: &str, head: &str) -> anyhow::Resu
 
 /// HEAD of the checkout, `Ok(None)` while the branch is unborn.
 pub fn current_head(mesh_root: &Path) -> anyhow::Result<Option<String>> {
-    let out = git(mesh_root, &["rev-parse", "--verify", "-q", "HEAD"])?;
+    let out = run(mesh_root, &["rev-parse", "--verify", "-q", "HEAD"])?;
     if out.status.success() {
         Ok(Some(
             String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -2617,10 +2613,9 @@ fn scan_bundles_and_patches(mesh_root: &Path) -> Vec<(PathBuf, MeshRecord)> {
     bundled_records
 }
 
-// --- git plumbing (fail-soft, non-interactive; mirrors storage.rs) --------
+// --- git plumbing (fail-soft, non-interactive; shared storage.rs funnel) ---
 
-/// The checkout's dirty porcelain paths (`git status --porcelain`, run like
-/// storage.rs runs git: non-interactive, std::process::Command). An EMPTY
+/// The checkout's dirty porcelain paths (`git status --porcelain`). An EMPTY
 /// result is the only green light for a replay pass.
 fn dirty_checkout_paths(mesh_root: &Path) -> anyhow::Result<Vec<String>> {
     let out = run_ok(mesh_root, &["status", "--porcelain"])?;
@@ -2630,29 +2625,6 @@ fn dirty_checkout_paths(mesh_root: &Path) -> anyhow::Result<Vec<String>> {
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect())
-}
-
-fn git(root: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .with_context(|| format!("git {} could not be executed", args.join(" ")))
-}
-
-/// Prefer using `run_ok` from storage.rs / mesh_service.rs where they exist.
-fn run_ok(root: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
-    let out = git(root, args)?;
-    if out.status.success() {
-        return Ok(out);
-    }
-    anyhow::bail!(
-        "git {} failed ({}): {}",
-        args.join(" "),
-        out.status,
-        String::from_utf8_lossy(&out.stderr).trim()
-    )
 }
 
 /// Program Task 3 (c): classify procedure rows written before stamping
@@ -7359,5 +7331,46 @@ mod tests {
             (0, 0),
             "idempotent: nothing left to classify"
         );
+    }
+
+    /// Import's git plumbing is the shared bounded funnel, not a private
+    /// copy: a hung git must fail here too, fast, naming the bound.
+    #[cfg(unix)]
+    #[test]
+    fn current_head_is_bounded_by_the_shared_git_timeout() {
+        use crate::synaptic_mesh::storage::git_test_support::{
+            assert_reaped, read_pid, EnvRestore, GitShim,
+        };
+        use std::time::{Duration, Instant};
+
+        let _env = crate::daemon::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "neurostrata-mesh-import-hang-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pid_file = root.join("git.pid");
+        let shim = GitShim::install("import-hang", &pid_file);
+        let _path = shim.activate();
+        let _timeout = EnvRestore::set("NEUROSTRATA_GIT_TIMEOUT_SECS", "1");
+        std::fs::write(root.join(".hang-git"), b"").unwrap();
+
+        let started = Instant::now();
+        let err = current_head(&root).expect_err("a hung git must surface as an error");
+        let elapsed = started.elapsed();
+        let msg = format!("{err:#}");
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the bound must fire fast, took {elapsed:?}"
+        );
+        assert!(
+            msg.contains("timed out after 1s"),
+            "the shared funnel's timeout error must surface, got: {msg}"
+        );
+        assert_reaped(read_pid(&pid_file));
     }
 }
