@@ -10464,32 +10464,58 @@ impl RenameLog {
 /// failure anywhere leaves the original data and topology available.
 fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
     clear_rebuild_artifacts(conn)?;
-    let mut columns = migration_column_specs(conn)?;
-    let id_index = match columns.iter().position(|(name, _)| name == "id") {
-        Some(index) => index,
-        None => {
-            columns.insert(0, ("id".to_string(), "STRING".to_string()));
-            0
-        }
+    let source_columns = migration_column_specs(conn)?;
+    let source_has_id = source_columns.iter().any(|(name, _)| name == "id");
+    let mut columns = source_columns.clone();
+    let id_index = if source_has_id {
+        columns
+            .iter()
+            .position(|(name, _)| name == "id")
+            .expect("source id column survives into the rebuilt schema")
+    } else {
+        // The id is synthesized from the source rows, so it is not a source
+        // property and must not appear in the RETURN projection below.
+        columns.insert(0, ("id".to_string(), "STRING".to_string()));
+        0
     };
     for required in ["namespace", "metadata"] {
         if !columns.iter().any(|(name, _)| name == required) {
             columns.push((required.to_string(), "STRING".to_string()));
         }
     }
-    let field_index = |name: &str| columns.iter().position(|(column, _)| column == name);
     let names: Vec<String> = columns.iter().map(|(name, _)| name.clone()).collect();
-    let return_list = names
+    let field_index = |name: &str| columns.iter().position(|(column, _)| column == name);
+    // Project only properties that exist in the source. The synthesized id and
+    // any newly added required columns have no source value to read; the former
+    // is derived from namespace/content/metadata after the rows are collected.
+    let projection: Vec<(String, usize)> = source_columns
         .iter()
-        .map(|name| format!("m.{name}"))
+        .map(|(name, _)| {
+            let target = columns
+                .iter()
+                .position(|(column, _)| column == name)
+                .expect("every source column survives into the rebuilt schema");
+            (name.clone(), target)
+        })
+        .collect();
+    let return_list = projection
+        .iter()
+        .map(|(name, _)| format!("m.{name}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let source_id_position = if source_has_id {
+        projection.iter().position(|(name, _)| name == "id")
+    } else {
+        None
+    };
     let mut stored: Vec<(Option<String>, Vec<Option<String>>)> = Vec::new();
     for row in conn.query(&format!("MATCH (m:Memory) RETURN {return_list}"))? {
-        let legacy_id = migration_value_string(row.get(id_index));
-        let literals = (0..columns.len())
-            .map(|index| migration_literal(row.get(index)))
-            .collect();
+        let legacy_id = source_id_position
+            .and_then(|position| migration_value_string(row.get(position)));
+        let mut literals = vec![None; columns.len()];
+        for (position, (_, target)) in projection.iter().enumerate() {
+            literals[*target] = migration_literal(row.get(position));
+        }
         stored.push((legacy_id, literals));
     }
     // A derived id must not depend on the engine's scan order.
@@ -38414,6 +38440,49 @@ mod store_migration {
         assert_ne!(a, other, "namespace is part of the identity");
         assert_ne!(a, next, "duplicate occurrences get distinct ids");
         assert!(a.starts_with("derived-"));
+    }
+
+    /// A legacy table with no `id` property at all: the synthetic id must be
+    /// derived after reading only the properties the source actually has.
+    #[tokio::test]
+    async fn a_legacy_table_without_an_id_column_gets_derived_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let ddl = format!(
+            "CREATE NODE TABLE Memory (namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{DIMS}], name STRING, PRIMARY KEY(name))"
+        );
+        let legacy_row = |name: &str| {
+            format!(
+                "CREATE (:Memory {{namespace: 'alpha', content: 'content-{name}', user_id: 'auto-ingestor', memory_type: 'file', agent_name: 'unknown', location: 'src/main.rs', location_lines: '', metadata: 'legacy-meta', embedding: [0.0,0.0,0.0,0.0], name: '{name}'}})"
+            )
+        };
+        seed(&db, &ddl, &[&legacy_row("first"), &legacy_row("second")]);
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.pk_rebuilt, "the id-less table was rebuilt");
+        assert_eq!(report.skipped_reason, None);
+        assert_eq!(count_memory(&store, "true").await, 2);
+
+        let ids: Vec<String> = store
+            .with_conn(|conn| {
+                let mut ids = Vec::new();
+                for row in conn.query("MATCH (m:Memory) RETURN m.id")? {
+                    if let Some(lbug::Value::String(id)) = row.first() {
+                        ids.push(id.clone());
+                    }
+                }
+                Ok(ids)
+            })
+            .await
+            .expect("id query");
+        assert_eq!(ids.len(), 2);
+        assert!(
+            ids.iter().all(|id| id.starts_with("derived-")),
+            "ids are derived from the source rows: {ids:?}"
+        );
+        assert_ne!(ids[0], ids[1], "distinct content yields distinct ids");
     }
 
     #[tokio::test]
