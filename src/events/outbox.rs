@@ -49,6 +49,20 @@
 //! from churning. Compaction preserves `base_seq`, so the sequence never
 //! restarts at 1 and can never collide with an offset that outlived the
 //! entries.
+//!
+//! ## The pending ceiling
+//!
+//! Compaction reclaims only acknowledged entries, so it cannot bound a file
+//! whose subscriber never acknowledges: every durable emit would fail
+//! delivery and leave one more pending line. The second bound is a
+//! per-class ceiling on unacknowledged entries
+//! ([`MAX_PENDING_ENTRIES_PER_CLASS`]). Once a class's pending count
+//! reaches it, an append is refused *before any write* -- no sequence
+//! consumed, no bytes, no mirror entry -- so a checked emit fails cleanly
+//! instead of feeding a wedged consumer, and the lossy `emit` falls back to
+//! its queue. Acknowledging the backlog lowers the count and appends
+//! resume; the ceiling bounds each class separately, so a stuck mesh
+//! subscriber never silences the audit trail.
 
 use super::ThalamicPulse;
 use serde::{Deserialize, Serialize};
@@ -71,6 +85,18 @@ pub(crate) const RUNTIME_COMPACTION_INTERVAL: u64 = 32;
 /// this set (and to the offsets file) forever. Dropping the oldest entries is
 /// safe under at-least-once: they redeliver and the consumer absorbs them.
 const MAX_OUT_OF_ORDER_ACKS: usize = 4096;
+
+/// Per-class ceiling on unacknowledged entries. Compaction reclaims only
+/// acknowledged entries, so a subscriber that never acknowledges would
+/// otherwise grow the entries file and its in-memory mirror without bound:
+/// every durable emit fails delivery and leaves one more pending line. At
+/// the ceiling an append is refused outright -- no sequence consumed, no
+/// bytes written, nothing to roll back -- and a checked emit fails cleanly.
+/// The number is deliberately generous: a healthy subscriber's backlog
+/// drains in seconds, and a backlog this deep means the class's subscriber
+/// is gone or wedged, which is an operator problem a growing file would
+/// only hide.
+pub const MAX_PENDING_ENTRIES_PER_CLASS: usize = 10_000;
 
 /// The append-only entries file, inside the outbox directory.
 pub const OUTBOX_FILE_NAME: &str = "event-outbox.jsonl";
@@ -252,6 +278,16 @@ pub enum EventOutboxError {
     /// mesh subscriber is registered to consume and acknowledge the pulse, so
     /// a checked emit cannot claim durable recording.
     MeshUnavailable,
+    /// The class's unacknowledged backlog has reached the configured
+    /// ceiling, so the append was refused before any write: no sequence
+    /// consumed, no bytes, no mirror entry. A checked emit fails cleanly on
+    /// this error instead of feeding a subscriber that never acknowledges;
+    /// acknowledging the backlog lowers the count and appends resume.
+    BacklogFull {
+        class: EventClass,
+        pending: usize,
+        ceiling: usize,
+    },
     /// A filesystem operation failed.
     Io(std::io::Error),
     /// An entry could not be encoded or decoded.
@@ -273,6 +309,17 @@ impl fmt::Display for EventOutboxError {
                 f,
                 "mesh durability is required but no mesh subscriber is wired, so the pulse was not durably recorded"
             ),
+            EventOutboxError::BacklogFull {
+                class,
+                pending,
+                ceiling,
+            } => write!(
+                f,
+                "event outbox backlog full: class '{}' holds {} unacknowledged entries (ceiling {}); the pulse was not recorded. Its subscriber must acknowledge pending deliveries before appends resume.",
+                class.as_str(),
+                pending,
+                ceiling
+            ),
             EventOutboxError::Io(err) => write!(f, "event outbox io error: {err}"),
             EventOutboxError::Serde(err) => {
                 write!(f, "event outbox serialization error: {err}")
@@ -286,7 +333,8 @@ impl std::error::Error for EventOutboxError {
         match self {
             EventOutboxError::Poisoned
             | EventOutboxError::RecursionRefused
-            | EventOutboxError::MeshUnavailable => None,
+            | EventOutboxError::MeshUnavailable
+            | EventOutboxError::BacklogFull { .. } => None,
             EventOutboxError::Io(err) => Some(err),
             EventOutboxError::Serde(err) => Some(err),
         }
@@ -429,6 +477,17 @@ impl Inner {
     fn is_acked(&self, entry: &OutboxEntry) -> bool {
         entry.seq <= self.offsets.get(entry.class) || self.acked(entry.class).contains(&entry.seq)
     }
+
+    /// How many of this class's entries are still unacknowledged: the
+    /// backlog the pending ceiling bounds. Corrupt/opaque lines are not
+    /// counted -- this reader refuses to manage them by design and keeps
+    /// them verbatim for compaction regardless.
+    fn pending_count(&self, class: EventClass) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.class == class && !self.is_acked(entry))
+            .count()
+    }
 }
 
 /// The durable outbox over one directory. `Send + Sync` by construction (one
@@ -437,6 +496,10 @@ impl Inner {
 pub struct EventOutbox {
     dir: PathBuf,
     max_bytes: u64,
+    /// Per-class ceiling on pending entries (see
+    /// [`MAX_PENDING_ENTRIES_PER_CLASS`]). Appends are refused at or above
+    /// it.
+    max_pending: usize,
     inner: Mutex<Inner>,
 }
 
@@ -601,13 +664,24 @@ impl EventOutbox {
     /// a torn tail, load the entries, recover the sequence base, and run
     /// startup compaction against the default [`MAX_OUTBOX_BYTES`] cap.
     pub fn open(dir: &Path) -> Result<Self, EventOutboxError> {
-        Self::open_with_max_bytes(dir, MAX_OUTBOX_BYTES)
+        Self::open_with_limits(dir, MAX_OUTBOX_BYTES, MAX_PENDING_ENTRIES_PER_CLASS)
     }
 
     /// [`EventOutbox::open`] with an explicit compaction cap. Production uses
     /// the default; tests use a small cap to exercise the size rule without
     /// writing eight megabytes.
     pub fn open_with_max_bytes(dir: &Path, max_bytes: u64) -> Result<Self, EventOutboxError> {
+        Self::open_with_limits(dir, max_bytes, MAX_PENDING_ENTRIES_PER_CLASS)
+    }
+
+    /// [`EventOutbox::open`] with explicit compaction and pending ceilings.
+    /// Production uses the defaults; tests use small ceilings to exercise
+    /// the backlog refusal without writing ten thousand entries.
+    pub fn open_with_limits(
+        dir: &Path,
+        max_bytes: u64,
+        max_pending: usize,
+    ) -> Result<Self, EventOutboxError> {
         create_private_dir(dir)?;
         let path = dir.join(OUTBOX_FILE_NAME);
         // Create (and tighten) the entries file now so no reader ever races a
@@ -654,6 +728,7 @@ impl EventOutbox {
         let outbox = Self {
             dir: dir.to_path_buf(),
             max_bytes,
+            max_pending,
             inner: Mutex::new(Inner {
                 next_seq: base_seq + 1,
                 base_seq,
@@ -716,6 +791,18 @@ impl EventOutbox {
         let mut inner = self.lock()?;
         if inner.poisoned {
             return Err(EventOutboxError::Poisoned);
+        }
+        // The pending ceiling: compaction cannot reclaim a backlog whose
+        // subscriber never acknowledges, so refuse at the bound -- before any
+        // write, so the refusal is clean (no sequence consumed, no bytes, no
+        // mirror entry, nothing to roll back).
+        let pending = inner.pending_count(class);
+        if pending >= self.max_pending {
+            return Err(EventOutboxError::BacklogFull {
+                class,
+                pending,
+                ceiling: self.max_pending,
+            });
         }
         let mut file = open_private_append(&self.entries_path())?;
         self.append_locked(&mut inner, class, pulse, &mut file, capture)
@@ -1617,5 +1704,75 @@ mod tests {
             .append(EventClass::Mesh, &created("m44"))
             .expect("append after reopen");
         assert_eq!(next, 44);
+    }
+
+    /// The pending ceiling: a class whose subscriber never acknowledges would
+    /// otherwise grow the entries file and its in-memory mirror without
+    /// bound, because compaction only reclaims acknowledged entries. At the
+    /// ceiling the append is refused cleanly -- no bytes, no mirror entry, no
+    /// sequence consumed -- and an acknowledgment brings appends back.
+    #[test]
+    fn appends_fast_fail_once_a_class_reaches_its_pending_ceiling() {
+        let dir = scratch("pending-ceiling");
+        let path = dir.join(OUTBOX_FILE_NAME);
+        let outbox = EventOutbox::open_with_limits(&dir, MAX_OUTBOX_BYTES, 2)
+            .expect("the outbox opens with a two-entry pending ceiling");
+        outbox
+            .append(EventClass::Mesh, &created("m1"))
+            .expect("first pending entry");
+        outbox
+            .append(EventClass::Mesh, &created("m2"))
+            .expect("second pending entry");
+
+        let refused = outbox
+            .append(EventClass::Mesh, &created("m3"))
+            .expect_err("the ceiling refuses the third append");
+        match refused {
+            EventOutboxError::BacklogFull {
+                class,
+                pending,
+                ceiling,
+            } => {
+                assert_eq!(class, EventClass::Mesh);
+                assert_eq!(pending, 2);
+                assert_eq!(ceiling, 2);
+            }
+            other => panic!("expected BacklogFull, got {other:?}"),
+        }
+
+        // The refusal is clean: the file and the mirror are unchanged.
+        let text = std::fs::read_to_string(&path).expect("read the entries file");
+        assert_eq!(text.lines().count(), 2, "no line was appended");
+        assert_eq!(
+            ids(&outbox.pending(EventClass::Mesh)),
+            vec!["m1".to_string(), "m2".to_string()]
+        );
+
+        // The ceiling is per class: a wedged mesh subscriber never silences
+        // the audit trail.
+        outbox
+            .append(EventClass::Audit, &guarded("a3"))
+            .expect("audit appends while mesh is at its ceiling");
+
+        // An acknowledgment lowers the backlog and appends resume; the
+        // refused append consumed no sequence (audit took seq 3).
+        outbox
+            .advance(EventClass::Mesh, 1)
+            .expect("acknowledge the first entry");
+        let seq = outbox
+            .append(EventClass::Mesh, &created("m4"))
+            .expect("appends resume below the ceiling");
+        assert_eq!(seq, 4, "the refused append consumed no sequence");
+
+        // The backlog is at the ceiling again (m2 and m4 pending), so the
+        // next append refuses once more: the ceiling tracks the live count,
+        // not a one-shot latch.
+        let refused_again = outbox
+            .append(EventClass::Mesh, &created("m5"))
+            .expect_err("two pending entries are at the ceiling again");
+        assert!(
+            matches!(refused_again, EventOutboxError::BacklogFull { .. }),
+            "the refusal is the documented BacklogFull error: {refused_again:?}"
+        );
     }
 }

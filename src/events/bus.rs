@@ -2614,6 +2614,104 @@ mod tests {
         );
     }
 
+    /// A mesh-class subscriber that never succeeds -- and so never
+    /// acknowledges: the standing shape of a mesh whose remote is wedged.
+    struct AlwaysFailMesh {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl MemorySubscriber for AlwaysFailMesh {
+        fn name(&self) -> &'static str {
+            "mesh_outbox"
+        }
+
+        async fn handle(
+            &self,
+            event: &ThalamicPulse,
+            _token: &RecursionToken,
+            _ctx: &SubscriberContext<'_>,
+        ) -> Result<(), SubscriberError> {
+            let ThalamicPulse::Created { id, .. } = event else {
+                return Ok(());
+            };
+            self.seen
+                .lock()
+                .expect("always-fail log poisoned")
+                .push(id.clone());
+            Err(anyhow!("simulated permanent mesh failure"))
+        }
+    }
+
+    /// The pending ceiling end to end: with the mesh subscriber permanently
+    /// failing, every checked emit fails delivery and leaves one more
+    /// pending entry, so a growing backlog is the subscriber's failure, not
+    /// a reason to grow the file forever. Past the ceiling the emit itself
+    /// fast-fails cleanly -- the pulse is never recorded and never
+    /// dispatched -- and the error names the wedge instead of hiding it
+    /// behind an ever-larger outbox.
+    #[tokio::test]
+    async fn a_checked_emit_fast_fails_once_the_pending_ceiling_is_crossed() {
+        let dir = outbox_dir("bus-pending-ceiling");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let outbox =
+            EventOutbox::open_with_limits(&dir, crate::events::outbox::MAX_OUTBOX_BYTES, 2)
+                .expect("the outbox opens with a two-entry pending ceiling");
+        let bus = ThalamicBus::with_outbox(8, outbox, OutboxConfig::default());
+        bus.register(Box::new(AlwaysFailMesh { seen: seen.clone() }));
+
+        let token = RecursionToken::root();
+        bus.emit_checked(created_pulse("m1"), &token)
+            .expect("seq 1 appends");
+        bus.emit_checked(created_pulse("m2"), &token)
+            .expect("seq 2 appends");
+        wait_until("both deliveries attempted", || {
+            seen.lock().expect("always-fail log poisoned").len() >= 2
+        })
+        .await;
+
+        let refused = bus
+            .emit_checked(created_pulse("m3"), &token)
+            .expect_err("the ceiling refuses the third durable append");
+        assert!(
+            matches!(refused, EventOutboxError::BacklogFull { .. }),
+            "the refusal is the documented BacklogFull error: {refused:?}"
+        );
+
+        // Nothing was appended for the refused pulse: the file keeps exactly
+        // the two wedged entries, the mirror agrees, and the subscriber never
+        // heard about m3.
+        let outbox = bus.outbox().expect("outbox attached");
+        let pending_ids: Vec<String> = outbox
+            .pending(EventClass::Mesh)
+            .iter()
+            .map(|entry| match &entry.pulse {
+                ThalamicPulse::Created { id, .. } => id.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            pending_ids,
+            vec!["m1".to_string(), "m2".to_string()],
+            "the refused emit left no durable record"
+        );
+        let entries_text =
+            std::fs::read_to_string(dir.join("event-outbox.jsonl")).expect("read entries file");
+        assert_eq!(
+            entries_text.lines().count(),
+            2,
+            "the entries file no longer grows without bound"
+        );
+        assert!(
+            !seen
+                .lock()
+                .expect("always-fail log poisoned")
+                .iter()
+                .any(|id| id == "m3"),
+            "the refused pulse never reached the subscriber"
+        );
+    }
+
     /// A single push can evict several lossy pulses when the queue already
     /// holds durable entries above the lossy bound. Every evicted pulse must
     /// be counted, so the metrics invariant still holds.
