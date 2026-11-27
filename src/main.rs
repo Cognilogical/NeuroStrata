@@ -2451,10 +2451,12 @@ fn take_daemon_lock(db_path: &std::path::Path) -> anyhow::Result<std::fs::File> 
             None if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            None => return Err(anyhow::anyhow!(
+            None => {
+                return Err(anyhow::anyhow!(
                 "Another NeuroStrata daemon, or a CLI command working on the store, holds {:?}.",
                 db_path
-            )),
+            ))
+            }
         }
     }
 }
@@ -3956,6 +3958,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cli_root_registry_refuses_a_pristine_store_without_an_embedder() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let _env = crate::daemon::project_root_env_test_lock();
         let old_home = std::env::var_os("HOME");
         let old_model = std::env::var_os("NEUROSTRATA_MODEL");
@@ -5982,6 +5985,7 @@ mod tests {
     /// guard's restart guidance forever.
     #[tokio::test]
     async fn fallback_add_on_pristine_store_adopts_configured_model_and_writes() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let root =
@@ -6085,6 +6089,7 @@ mod tests {
     /// the pristine record is adopted.
     #[tokio::test]
     async fn fallback_edit_on_pristine_labelled_store_adopts_and_edits() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let root =
@@ -6212,6 +6217,7 @@ mod tests {
     /// as ingest performs it.
     #[tokio::test]
     async fn fallback_ingest_on_pristine_store_adopts_configured_model_and_writes() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let root =
@@ -6315,6 +6321,7 @@ mod tests {
     /// arms perform them.
     #[tokio::test]
     async fn fallback_write_arms_prepare_store_before_mutating() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
         let root =

@@ -58,15 +58,11 @@ async fn search_inner(
     exact: bool,
     search_mode: crate::traits::SearchMode,
 ) -> Result<DomainSearchOutcome> {
-    // Every vector search funnels through
-    // here, including the paths that never init (the fallback CLI's
-    // chat ask): a data-bearing store refuses a query embedded under
-    // a different model than the one its vectors were recorded with.
-    // Lexical search embeds nothing and does not pass through here.
-    store.check_data_bearing_identity()?;
-    // #409: the in-store marker is the identity that survives a copy
-    // without its sidecar; a mismatch refuses the vector query.
-    store.check_embedding_marker_identity().await?;
+    // The identity gate runs inside the same store turn as the distance
+    // query below, not in a separate turn: a concurrent first marker write
+    // between an early check and the query would let the query score vectors
+    // in the wrong embedding space (#457 re-review).
+    let identity_gate = store.identity_gate();
     let search_mode = if std::env::var("NEUROSTRATA_HYBRID_SEARCH")
         .map(|v| {
             matches!(
@@ -228,6 +224,9 @@ async fn search_inner(
     let metric_ns = namespace.clone();
     let outcome = store
         .with_conn(move |conn| {
+            // Atomic with the query: no other writer can change the marker
+            // between validation and scoring.
+            identity_gate.check(conn)?;
             let safe_ns = escape_ladybug_string(&namespace);
             let vec_str = format!(
                 "[{}]",
@@ -1617,9 +1616,9 @@ pub struct LadybugStore {
     /// The most recent open-time row-identity audit (#409). `None` until the
     /// first successful `init` runs it.
     last_row_identity_audit: Arc<std::sync::Mutex<Option<RowIdentityAudit>>>,
-    /// Once-only guard: concurrent callers reaching the first-init path must
-    /// not each run (and log) the same whole-store audit (#409 re-review).
-    audit_ran: Arc<std::sync::atomic::AtomicBool>,
+    /// In-flight guard only; the completed audit is `last_row_identity_audit`.
+    /// Cleared on cancellation, so a later init retries (#457 re-review).
+    audit_running: Arc<std::sync::atomic::AtomicBool>,
     /// Test-only fault injection for the marker write (#409): set before the
     /// first upsert to prove a failed marker write refuses the vector.
     #[cfg(test)]
@@ -4670,6 +4669,20 @@ pub struct RowIdentityAudit {
     pub mismatch_counts: std::collections::BTreeMap<RowIdentityMismatchKind, usize>,
     /// Some findings were counted but not retained.
     pub mismatches_truncated: bool,
+    /// Concurrent writes were observed during the keyset walk: rows inserted
+    /// at or before the cursor may have been missed.
+    pub concurrent_writes: bool,
+}
+
+/// Clears the audit's in-flight flag when the async function is cancelled at
+/// an await. A plain `AtomicBool` latch set before the awaits would strand the
+/// store with no audit result forever (#457 re-review).
+struct AuditInFlight<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for AuditInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Read the single persisted marker, or `None` when the table does not exist
@@ -4704,27 +4717,39 @@ fn read_store_identity_marker(conn: &Connection) -> Result<Option<StoreIdentityM
             )
         }
     };
-    let string_at = |index: usize| match row.get(index) {
+    // Every descriptor field is required. Coercing a missing or wrongly
+    // typed field to "" would present a half-marker as a usable identity
+    // and let an unbound store vector-work with no trustworthy producer
+    // (#457 re-review).
+    let required_string = |index: usize, field: &'static str| -> Result<String> {
+        match row.get(index) {
+            Some(lbug::Value::String(value)) => Ok(value.clone()),
+            _ => anyhow::bail!(
+                "the persisted embedding marker is unreadable: {field} is missing or not a string"
+            ),
+        }
+    };
+    let optional_string = |index: usize| match row.get(index) {
         Some(lbug::Value::String(value)) => Some(value.clone()),
         _ => None,
     };
     Ok(Some(StoreIdentityMarker {
         marker_version,
-        provider: string_at(1).unwrap_or_default(),
-        model: string_at(2).unwrap_or_default(),
-        revision: string_at(3).unwrap_or_default(),
+        provider: required_string(1, "provider")?,
+        model: required_string(2, "model")?,
+        revision: required_string(3, "revision")?,
         dims,
-        normalization: string_at(5).unwrap_or_default(),
-        preprocessing: string_at(6).unwrap_or_default(),
-        distance_metric: string_at(7).unwrap_or_default(),
-        recorded_at: string_at(8).unwrap_or_default(),
-        adopted_from_provider: string_at(9),
-        adopted_from_model: string_at(10),
+        normalization: required_string(5, "normalization")?,
+        preprocessing: required_string(6, "preprocessing")?,
+        distance_metric: required_string(7, "distance_metric")?,
+        recorded_at: required_string(8, "recorded_at")?,
+        adopted_from_provider: optional_string(9),
+        adopted_from_model: optional_string(10),
         adopted_from_dims: match row.get(11) {
             Some(lbug::Value::Int64(dims)) if *dims >= 0 => Some(*dims as usize),
             _ => None,
         },
-        adopted_at: string_at(12),
+        adopted_at: optional_string(12),
     }))
 }
 
@@ -4830,6 +4855,16 @@ fn audit_row_identity_page(
     Ok(page)
 }
 
+/// Total `Memory` row count, used as a witness for concurrent writes during
+/// the keyset audit. `None` when the count query yields no row.
+fn memory_row_count(conn: &Connection) -> Result<Option<i64>> {
+    let mut rows = conn.query("MATCH (m:Memory) RETURN count(m)")?;
+    Ok(rows.next().and_then(|row| match row.get(0) {
+        Some(lbug::Value::Int64(count)) => Some(*count),
+        _ => None,
+    }))
+}
+
 /// A string cell (or `None` for a `NULL`/missing cell).
 fn row_text(value: Option<&lbug::Value>) -> String {
     match value {
@@ -4878,6 +4913,109 @@ fn marker_sidecar_disagreement_refusal(
     .into()
 }
 
+/// The identity gate run inside the *same* store turn as a vector query.
+/// Checking the marker in one turn and querying in another lets a concurrent
+/// first write change the embedding space between the two (#457 re-review),
+/// so callers clone this handle into the query closure.
+#[derive(Clone)]
+struct VectorIdentityGate {
+    store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+    local_path: PathBuf,
+    serving: Option<crate::traits::EmbeddingDescriptor>,
+    embed_config_dir: PathBuf,
+    dimensions: usize,
+}
+
+impl VectorIdentityGate {
+    fn check(&self, conn: &Connection) -> Result<()> {
+        let cached = self
+            .store_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(CachedStoreState::Unparseable(reason)) = &cached {
+            return Err(crate::model_choice::store_state_unparseable_error(
+                &self.local_path,
+                reason,
+            ));
+        }
+        let marker = read_store_identity_marker(conn)?;
+        if let Some(existing) = &marker {
+            if existing.marker_version != STORE_IDENTITY_MARKER_VERSION {
+                anyhow::bail!(
+                    "refusing to use this store: its persisted embedding marker has version {}, but this build understands version {}. Upgrade or repair the marker before searching or writing; the open itself is not blocked.",
+                    existing.marker_version,
+                    STORE_IDENTITY_MARKER_VERSION
+                );
+            }
+        }
+        let persisted = marker.as_ref().map(|existing| existing.descriptor());
+        let recorded = match &cached {
+            Some(CachedStoreState::Recorded(recorded)) => Some(recorded),
+            _ => None,
+        };
+        if let Some(persisted) = &persisted {
+            if let Some(recorded) = recorded {
+                if !persisted.compatible(&recorded.descriptor) {
+                    return Err(marker_sidecar_disagreement_refusal(
+                        &self.local_path,
+                        persisted,
+                        &recorded.descriptor,
+                    ));
+                }
+            }
+        }
+
+        // A current descriptor is trustworthy only when a serving embedder is
+        // bound or an explicit configuration resolves. With neither, a
+        // persisted identity cannot be compared, so vector work fails closed.
+        let current = match &self.serving {
+            Some(serving) => Some(serving.clone()),
+            None if self.embed_config_dir.join("embedders.json").is_file() => Some(
+                configured_embedding_descriptor_in(&self.embed_config_dir, self.dimensions)?,
+            ),
+            None => None,
+        };
+
+        match (persisted, recorded, current) {
+            (Some(persisted), _, Some(current)) => {
+                if !persisted.compatible(&current) {
+                    return Err(persisted_marker_refusal(&persisted, &current));
+                }
+            }
+            (Some(_), _, None) => {
+                anyhow::bail!(
+                    "refusing to use this store: its persisted embedding marker cannot be compared to a current descriptor (no serving embedder and no resolvable configuration)"
+                );
+            }
+            (None, Some(recorded), Some(current)) => {
+                if !recorded.descriptor.compatible(&current) {
+                    return Err(
+                        EmbeddingIdentityRefusal::between(&recorded.descriptor, &current).into(),
+                    );
+                }
+            }
+            (None, Some(recorded), None) if recorded.has_data => {
+                anyhow::bail!(
+                    "refusing to search vectors in a data-bearing store: no current descriptor is available to compare with its recorded identity"
+                );
+            }
+            (None, None, _) => {
+                // No marker and no sidecar: only a store with no real vectors
+                // may be used. Rows of unknown provenance must not be searched
+                // under this process's model (#457 re-review).
+                if store_has_real_vector(conn)? {
+                    anyhow::bail!(
+                        "refusing to search vectors in a data-bearing store with no persisted embedding marker and no trustworthy sidecar identity"
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 /// A clonable handle to the marker write that must land inside the first
 /// vector's writer turn (#409), built at upsert entry.
 #[derive(Clone)]
@@ -4911,6 +5049,11 @@ impl FirstWriteMarker {
     /// is written. A marker write failure propagates, so the upsert refuses
     /// with zero vectors landed.
     fn ensure_written_before_first_vector(&self, conn: &Connection) -> Result<()> {
+        // Metadata-only zero vectors embed nothing: bypass every identity
+        // check and write no marker at all (#457 re-review).
+        if self.skip_identity {
+            return Ok(());
+        }
         // A direct upsert can target a store that predates this build and
         // never ran `init`: its `Memory` table exists but `StoreIdentity`
         // does not. Create the table before reading or MERGE-ing the marker
@@ -4949,11 +5092,6 @@ impl FirstWriteMarker {
                 "refusing to write vectors: the store has no persisted embedding marker and this process can resolve no embedding identity (no serving or configured descriptor)"
             );
         };
-        // Synthetic (all-zero) rows name no embedder: they must not pin the
-        // store to a model the first real vector may contradict.
-        if self.skip_identity {
-            return Ok(());
-        }
         // Pre-existing rows belong to a legacy store. Their producer can
         // only be named by a trustworthy record (the parseable sidecar),
         // never by a matching width or by an unavailable catalog (#409
@@ -5109,6 +5247,13 @@ impl StoreIdentityAdoption {
 /// scan is logged as `partial: true` so a truncated walk is never mistaken for
 /// a full-table survey.
 fn log_row_identity_audit(audit: &RowIdentityAudit) {
+    if audit.concurrent_writes {
+        // A keyset walk has no snapshot: an insert at or before the cursor
+        // is invisible to later pages, so the result is not an all-clear.
+        tracing::warn!(
+            "row identity audit: concurrent writes observed — the result is potentially incomplete; rows inserted at or before the cursor were not surveyed"
+        );
+    }
     if audit.truncated {
         // A partial survey is a finding in its own right: rows after the
         // cursor were not visited, so "no mismatch" would be a false all-clear.
@@ -5686,7 +5831,7 @@ impl LadybugStore {
             store_state: Arc::new(std::sync::Mutex::new(None)),
             census_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_row_identity_audit: Arc::new(std::sync::Mutex::new(None)),
-            audit_ran: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            audit_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             store_identity_write_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -5775,6 +5920,17 @@ impl LadybugStore {
         configured_embedding_descriptor_in(&self.embed_config_dir, self.dimensions)
     }
 
+    /// The conn-local identity gate handle for this store.
+    fn identity_gate(&self) -> VectorIdentityGate {
+        VectorIdentityGate {
+            store_state: Arc::clone(&self.store_state),
+            local_path: self.local_path.clone(),
+            serving: self.serving_descriptor(),
+            embed_config_dir: self.embed_config_dir.clone(),
+            dimensions: self.dimensions,
+        }
+    }
+
     /// The first-write marker handle for this store (see
     /// [`FirstWriteMarker`]): the serving descriptor this process writes
     /// under plus the configured-descriptor inputs.
@@ -5836,47 +5992,13 @@ impl LadybugStore {
     /// [`LadybugStore::check_data_bearing_identity`] this check needs no
     /// sidecar: the DB copy alone carries the identity.
     async fn check_embedding_marker_identity(&self) -> Result<()> {
-        let Some(marker) = self.read_store_identity_marker_bounded().await? else {
-            return Ok(());
-        };
-        if marker.marker_version != STORE_IDENTITY_MARKER_VERSION {
-            anyhow::bail!(
-                "refusing to use this store: its persisted embedding marker has version {}, but this build understands version {}. Upgrade or repair the marker before searching or writing; the open itself is not blocked.",
-                marker.marker_version,
-                STORE_IDENTITY_MARKER_VERSION
-            );
-        }
-        let persisted = marker.descriptor();
-        let cached = self.cached_store_state();
-        if let CachedStoreState::Recorded(recorded) = &cached {
-            if !persisted.compatible(&recorded.descriptor) {
-                return Err(marker_sidecar_disagreement_refusal(
-                    &self.local_path,
-                    &persisted,
-                    &recorded.descriptor,
-                ));
-            }
-        }
-        if let Some(serving) = self.serving_descriptor() {
-            if !persisted.compatible(&serving) {
-                return Err(persisted_marker_refusal(&persisted, &serving));
-            }
-        } else if self.embed_config_dir.join("embedders.json").is_file() {
-            // No serving descriptor means a vector operation can only claim
-            // the configured model, whatever the sidecar says: a recorded
-            // sidecar agreeing with the marker does not authorize a changed
-            // configuration to mix spaces (#409 re-review). Requiring an
-            // explicit config file keeps override stores with no config
-            // directory out of this comparison.
-            if let Ok(configured) =
-                configured_embedding_descriptor_in(&self.embed_config_dir, self.dimensions)
-            {
-                if !persisted.compatible(&configured) {
-                    return Err(persisted_marker_refusal(&persisted, &configured));
-                }
-            }
-        }
-        Ok(())
+        let gate = self.identity_gate();
+        bounded(
+            "checking the persisted embedding marker",
+            write_timeout(),
+            self.with_conn(move |conn| gate.check(conn)),
+        )
+        .await
     }
 
     /// Record an adoption marker for a data-bearing legacy store on a verified
@@ -5901,15 +6023,25 @@ impl LadybugStore {
     /// the first successful `init` (#409). Failures are logged; the open has
     /// already succeeded and is never undone by the audit.
     async fn audit_row_identity_at_init(&self) {
-        // Only one successful init per store runs the survey. Two callers can
-        // both see `schema_ready == false`; without this latch each would
-        // page the whole table and log a duplicate audit.
+        // A completed audit is the only permanent reason to skip. An
+        // in-flight audit suppresses a concurrent duplicate, but the guard
+        // releases it on cancellation so a later init can retry (#457
+        // re-review).
         if self
-            .audit_ran
+            .last_row_identity_audit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return;
+        }
+        if self
+            .audit_running
             .swap(true, std::sync::atomic::Ordering::AcqRel)
         {
             return;
         }
+        let _in_flight = AuditInFlight(&self.audit_running);
         let started = std::time::Instant::now();
         let mut audit = RowIdentityAudit {
             started_at: chrono::Utc::now().to_rfc3339(),
@@ -5920,7 +6052,16 @@ impl LadybugStore {
             mismatches: Vec::new(),
             mismatch_counts: std::collections::BTreeMap::new(),
             mismatches_truncated: false,
+            concurrent_writes: false,
         };
+        // Keyset pagination has no snapshot. A row count before and after the
+        // walk is a cheap witness: if it changed, an insert or delete landed
+        // mid-survey and the result cannot be an all-clear (#457 re-review).
+        let start_count = self
+            .with_conn(|conn| memory_row_count(conn))
+            .await
+            .ok()
+            .flatten();
         let mut after_id: Option<String> = None;
         let mut retained: std::collections::BTreeMap<RowIdentityMismatchKind, usize> =
             std::collections::BTreeMap::new();
@@ -5953,11 +6094,13 @@ impl LadybugStore {
             };
             let page_len = page.len();
             let mut last_id: Option<String> = None;
+            let mut classified = 0usize;
             for (id, namespace, user_id) in page {
                 if started.elapsed() >= ROW_IDENTITY_AUDIT_BUDGET {
                     audit.truncated = true;
                     break;
                 }
+                classified += 1;
                 last_id = Some(id.clone());
                 if let Some(kind) = classify_row_identity(&id, &namespace, &user_id) {
                     *audit.mismatch_counts.entry(kind).or_insert(0) += 1;
@@ -5972,7 +6115,9 @@ impl LadybugStore {
                     }
                 }
             }
-            audit.scanned += page_len;
+            // Only rows actually classified count as surveyed, not every row
+            // fetched in a page the budget cut short (#457 re-review).
+            audit.scanned += classified;
             audit.mismatches_truncated =
                 audit.mismatch_counts.values().sum::<usize>() > audit.mismatches.len();
             if audit.truncated || page_len < ROW_IDENTITY_AUDIT_PAGE_SIZE {
@@ -5983,6 +6128,17 @@ impl LadybugStore {
                 None => break,
             }
         }
+        let end_count = self
+            .with_conn(|conn| memory_row_count(conn))
+            .await
+            .ok()
+            .flatten();
+        audit.concurrent_writes = match (start_count, end_count) {
+            (Some(before), Some(after)) => before != after,
+            // Without a witness, conservatively report the walk as
+            // potentially incomplete rather than claim an all-clear.
+            _ => true,
+        };
         audit.elapsed_ms = started.elapsed().as_millis() as u64;
         log_row_identity_audit(&audit);
         *self
@@ -11291,6 +11447,10 @@ impl VectorStore for LadybugStore {
             if let Err(e) = self.migrate_locked_unknown_data_bearing_store_state().await {
                 tracing::warn!("data-bearing LockedUnknown migration failed during init: {e}");
             }
+            // #457 re-review: a first init cancelled after the schema latch
+            // may have skipped the audit. The call is idempotent and skips
+            // itself once a completed result exists, so retry it here.
+            self.audit_row_identity_at_init().await;
             return Ok(());
         }
 
@@ -11649,21 +11809,30 @@ impl VectorStore for LadybugStore {
         // store is open). Checked before any engine write, so a refused
         // upsert lands nothing.
         self.guard_first_write()?;
-        // The same entry point refuses a
-        // write under a serving descriptor different from a
-        // data-bearing store's recorded one — the vector paths that
-        // never init (the fallback CLI's direct upserts) are covered
-        // here rather than at init.
-        self.check_data_bearing_identity()?;
-        // #409: the store's own persisted marker refuses vector work under a
-        // different embedding space even when the sidecar is gone, and
-        // refuses when the marker and sidecar disagree.
-        self.check_embedding_marker_identity().await?;
+        // Metadata-only writes carry no vector: they must neither consult
+        // the marker identity nor fail for an unresolvable model
+        // (#457 re-review). Real vectors keep every gate below.
+        if !skip_identity {
+            // The same entry point refuses a
+            // write under a serving descriptor different from a
+            // data-bearing store's recorded one — the vector paths that
+            // never init (the fallback CLI's direct upserts) are covered
+            // here rather than at init.
+            self.check_data_bearing_identity()?;
+            // #409: the store's own persisted marker refuses vector work under a
+            // different embedding space even when the sidecar is gone, and
+            // refuses when the marker and sidecar disagree.
+            self.check_embedding_marker_identity().await?;
+        }
 
         // The first-data flip handle, snapshotted at entry: one clone
         // moves into the write closure below, so the task that commits
         // the first write records the transition itself.
-        let first_write_flip = self.first_write_flip(skip_identity);
+        // A metadata-only row is still a row: the sidecar's data-bearing
+        // flip is preserved. Only the persisted *embedding identity* marker
+        // is skipped, since a zero vector names no producer (#457
+        // re-review).
+        let first_write_flip = self.first_write_flip(false);
         // #409: the marker write shares that writer turn: it lands before
         // the first vector MERGE, and a failure refuses the upsert with zero
         // vectors written.
@@ -12053,7 +12222,10 @@ impl VectorStore for LadybugStore {
             })();
             match write {
                 Ok(()) => {
-                    conn.query("COMMIT")?;
+                    if let Err(error) = conn.query("COMMIT") {
+                        let _ = conn.query("ROLLBACK");
+                        return Err(anyhow::anyhow!("transaction commit failed: {error}"));
+                    }
                 }
                 Err(error) => {
                     let _ = conn.query("ROLLBACK");
@@ -12631,11 +12803,11 @@ impl VectorStore for LadybugStore {
         vector: Vec<f32>,
         query: crate::traits::RawDistanceQuery,
     ) -> Result<Vec<crate::traits::RawDistanceCandidate>> {
-        // This path runs ARRAY_DISTANCE too: a query vector from another
-        // embedding space would return misleading candidates and drive a
-        // wrong deduplication decision. Gate it on the persisted marker
-        // before the query, like every other vector search (#409 re-review).
-        self.check_embedding_marker_identity().await?;
+        // This path runs ARRAY_DISTANCE too. The marker and sidecar checks
+        // must share the query's store turn, otherwise a concurrent first
+        // marker write can change the embedding space in between (#457
+        // re-review).
+        let identity_gate = self.identity_gate();
         let scope = query.scope;
         let limit = query.limit;
         let namespace = namespace.to_string();
@@ -12647,6 +12819,7 @@ impl VectorStore for LadybugStore {
         };
 
         self.with_conn(move |conn| {
+            identity_gate.check(conn)?;
             let safe_ns = escape_ladybug_string(&namespace);
             let vec_str = format!(
                 "[{}]",
@@ -27617,6 +27790,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn store_state_sidecar_records_pristine_then_flips_on_first_upsert() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("flip", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -27656,6 +27830,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn store_state_failed_upsert_does_not_flip() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("failed-upsert", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -27700,6 +27875,7 @@ eurostrata\src\daemon.rs",
         // held turn deadlocks the upsert before its write task exists,
         // and a write still queued when its deadline fires is dropped
         // with the timed future, never committed.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("flip-timeout", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -27763,6 +27939,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn store_state_has_data_is_monotonic_across_delete_and_reinit() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("monotonic", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -27804,6 +27981,7 @@ eurostrata\src\daemon.rs",
         // first, which is where config-keyed adoption disarmed this
         // guard; that path is covered by
         // store_state_same_instance_reinit_after_pick_does_not_adopt_and_upsert_refuses.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("race", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -27848,6 +28026,7 @@ eurostrata\src\daemon.rs",
         // recorded descriptor to the picked model, disarming the guard
         // for the write that followed. Serving-keyed adoption must
         // leave the record untouched, and the write must refuse.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("reinit-after-pick", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -27923,6 +28102,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn store_state_post_pick_instance_adopts_serving_descriptor_and_first_write_passes() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("reopen-new-model", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -27973,6 +28153,7 @@ eurostrata\src\daemon.rs",
 
     #[test]
     fn configured_descriptor_for_remote_entry_matches_remote_serving_shape() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("remote-configured", "BGESmallENV15");
         write_remote_embedders_config(&fx.config_dir, Some("RemoteModel"));
@@ -28012,6 +28193,7 @@ eurostrata\src\daemon.rs",
 
     #[test]
     fn configured_descriptor_resolves_unrecognized_name_to_the_serving_name() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("unrecognized-config", "UnrecognizedModel");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -28032,6 +28214,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn unrecognized_configured_name_records_fresh_store_and_accepts_first_write() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("unrecognized-fresh", "UnrecognizedModel");
         let serving = serving_descriptor_dims(crate::embed::FALLBACK_LOCAL_MODEL_NAME, 4);
@@ -28059,6 +28242,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn pristine_record_under_unrecognized_name_is_adopted_by_fallback_server() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("unrecognized-pristine", "UnrecognizedModel");
         crate::model_choice::write_store_state_identity(
@@ -28092,6 +28276,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn remote_switch_on_pristine_store_adopts_and_first_write_passes() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("remote-switch", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -28155,6 +28340,7 @@ eurostrata\src\daemon.rs",
         // the configured model — and the record must be that descriptor
         // verbatim, never the "local-fastembed" placeholder the
         // in-memory registry records.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("provenance", "MultilingualE5Small");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -28172,6 +28358,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn store_state_non_serving_open_never_adopts() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("non-serving", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -28223,6 +28410,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn store_state_serving_config_mismatch_at_open_does_not_adopt() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("mismatch-at-open", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -28274,6 +28462,7 @@ eurostrata\src\daemon.rs",
         // state built on disk by a serving instance, then faced by a
         // second instance whose upsert — with no intervening init —
         // must refuse. The guard never rewrites the record.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let cases: [(&str, &str, &str, &str); 3] = [
             // A process serving the old model after a pick landed.
@@ -28361,6 +28550,7 @@ eurostrata\src\daemon.rs",
         // The setup pair at its real
         // width. FP32 and Q are both 768, so only an identity check —
         // never the width backstop — can refuse this switch.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fp32_dims = crate::embed::default_acceptable_embedders()
             .iter()
@@ -28437,6 +28627,7 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn data_bearing_reopen_under_recorded_model_succeeds() {
         // The refusal must not fire on the legitimate path.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-legit-reopen").await;
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -28471,6 +28662,7 @@ eurostrata\src\daemon.rs",
         // The identity refusal precedes the width backstop — a
         // different-width switch reports the identity error, not an
         // engine/FLOAT error.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-width-switch").await;
         write_embedders_config(&fx.config_dir, "GTEBaseENV15");
@@ -28500,6 +28692,7 @@ eurostrata\src\daemon.rs",
         // descriptor against the remote record and lock the owner out;
         // the serving-keyed check accepts the identical remote S, and
         // the unbound (backup-shaped) open.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("a5-remote-record", "BGESmallENV15");
         let blank = LadybugStore::for_testing(&fx.db, 4)
@@ -28550,6 +28743,7 @@ eurostrata\src\daemon.rs",
         // The S == None allow-list under a changed config —
         // backup (construct, no init, export) and direct_report (init,
         // no serving descriptor) both succeed and never move R.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-unbound-opens").await;
         let sidecar_before = sidecar_identity(&fx.db);
@@ -28594,6 +28788,7 @@ eurostrata\src\daemon.rs",
         // under a mismatched serving descriptor; an unbound upsert of
         // a vector read back from the store itself (NormalizeMetadata's
         // shape) succeeds under a changed config.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-initless-paths").await;
 
@@ -28653,6 +28848,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn unparseable_sidecar_refuses_init_and_is_not_reclassified() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("unparseable-init", "BGESmallENV15");
         // A valid pristine sidecar exists before the store is built;
@@ -28699,6 +28895,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn wrong_version_sidecar_refuses_init_and_is_not_stamped_over() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         // The fixture's sidecar is created by a prior, dropped
         // instance; the test store below never inits before the
@@ -28744,6 +28941,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn unparseable_sidecar_refuses_upsert_without_init() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("unparseable-upsert").await;
         // No serving descriptor and never init'ed: the unbound
@@ -28812,6 +29010,7 @@ eurostrata\src\daemon.rs",
     async fn registry_records_serving_descriptor_when_bound() {
         // A bound init records S in the registry — S verifies,
         // the legacy placeholder does not.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("a5-registry-serving", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -28841,6 +29040,7 @@ eurostrata\src\daemon.rs",
         // An unbound init of a recorded store seeds the
         // registry from R — R verifies, the (changed) configured
         // descriptor does not.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-registry-recorded").await;
         write_embedders_config(&fx.config_dir, "GTEBaseENV15");
@@ -28876,6 +29076,7 @@ eurostrata\src\daemon.rs",
         // With NEUROSTRATA_MODEL unset, the placeholder the old
         // init recorded ("local-fastembed") must not verify after a
         // bound init of a feature-created store.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("a5-registry-no-placeholder", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -28900,6 +29101,7 @@ eurostrata\src\daemon.rs",
         // sidecar ever written) opens, writes, and searches under a
         // changed config exactly as it did before the feature — and
         // no sidecar is backfilled, at open or at first write.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("a5-locked-unknown", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 4)
@@ -28948,6 +29150,7 @@ eurostrata\src\daemon.rs",
         // The width backstop is unchanged for pre-sidecar
         // stores — a different width fails at vector use with the
         // engine's error, never with the identity refusal.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("a5-locked-unknown-width", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 4)
@@ -29031,6 +29234,7 @@ eurostrata\src\daemon.rs",
         assert!(!OpenProvenance::UnverifiedWalReplay.is_verified());
         assert!(!OpenProvenance::DiscardedUnreadableWal.is_verified());
 
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("open-provenance-normal", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -29174,6 +29378,7 @@ eurostrata\src\daemon.rs",
         // unrecorded for the life of the instance. The fast path
         // now retries the upgrade when serving is bound, matches
         // the configuration, and the open is verified.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("fastpath-retry-latched", "BGESmallENV15");
 
@@ -29433,6 +29638,7 @@ eurostrata\src\daemon.rs",
         // a LockedUnknown store, serving == configured, with a row
         // now landed in the window — and invoke the stamp step
         // directly, exactly as init does.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("cond3-stamp-reattest", "BGESmallENV15");
 
@@ -29531,6 +29737,7 @@ eurostrata\src\daemon.rs",
         //     pre-fix shape: attest in the turn, stamp after the
         //     `.await` from a parked flag) fails the empty-store leg,
         //     because the unit then leaves the store unstamped.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
 
         // Row leg: the state the window produces — LockedUnknown,
@@ -29647,6 +29854,7 @@ eurostrata\src\daemon.rs",
         // Both orders are sound, so the invariant below — never a
         // pristine record over a landed row — holds deterministically
         // with the stamp inside the turn.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("p1-stamp-window", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 4)
@@ -29903,6 +30111,7 @@ eurostrata\src\daemon.rs",
         // it is the arm upstream issue #69 measured recovering 0 of 6
         // records. The checksum-mismatch and WAL-discard arms set the
         // same recovery flag in `with_system_config`.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("cond1-recovery-wal-rows", "BGESmallENV15");
 
@@ -29976,6 +30185,7 @@ eurostrata\src\daemon.rs",
         // LockedUnknown. That is intended conservatism: a recovery
         // open cannot distinguish this store from one whose WAL-only
         // rows it failed to recover, so neither may be upgraded.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("cond1-recovery-empty", "BGESmallENV15");
         let creator = LadybugStore::for_testing(&fx.db, 8)
@@ -30143,6 +30353,7 @@ eurostrata\src\daemon.rs",
     /// (stale) health back over the newer file.
     #[tokio::test]
     async fn first_data_write_preserves_health_recorded_after_the_cache_loaded() {
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("a5-flip-health", "BGESmallENV15");
         // The sidecar a previous process left behind: pristine identity plus
@@ -32187,6 +32398,7 @@ eurostrata\src\daemon.rs",
         // `maintain_store_state` (which would rewrite the sidecar
         // descriptor to the serving descriptor on the sole basis
         // of the sidecar's has_data=false claim).
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("cond1-recovery-pristine", "BGESmallENV15");
         std::fs::write(
@@ -32288,6 +32500,7 @@ eurostrata\src\daemon.rs",
         // the physical FLOAT column to the serving width (the engine
         // attests the table is empty) before the descriptor is
         // adopted, so the first write under the pick lands.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("fwidth-reconcile", "NomicEmbedTextV15");
         std::fs::write(
@@ -32355,6 +32568,7 @@ eurostrata\src\daemon.rs",
         // must refuse the mismatched open with a truthful error and
         // leave the store byte-untouched — never alter a table the
         // engine attests is not empty.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("fwidth-stale-label", "BGESmallENV15");
         std::fs::write(
@@ -32445,6 +32659,7 @@ eurostrata\src\daemon.rs",
         // The fallback binding setter — a store constructed
         // unbound refuses after being bound to a different model, and
         // passes after being bound to the recorded one.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-setter").await;
 
@@ -32516,6 +32731,7 @@ eurostrata\src\daemon.rs",
         // the write committed FP32 vectors and the flip recorded FP32
         // as the data-bearing identity, after which the restart under
         // the chosen Q model refused to open the store at all.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let dims = 768;
         let fx = store_state_fixture("t5-q-pick-during-first-start", "NomicEmbedTextV15Q");
@@ -32612,6 +32828,7 @@ eurostrata\src\daemon.rs",
         // sound — when serving == configured, the serving descriptor
         // (the model that produced the vectors) is what the flip
         // records.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("a5-flip-prefers-serving", "BGESmallENV15");
         let store = LadybugStore::for_testing(&fx.db, 4)
@@ -32688,6 +32905,7 @@ eurostrata\src\daemon.rs",
         // (serving bound, serving == configured) on the still-empty
         // store records the pristine identity, and the store is
         // enforceable afterwards exactly like a Recorded store.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("t4-direct-report-first", "BGESmallENV15");
 
@@ -32770,6 +32988,7 @@ eurostrata\src\daemon.rs",
         // to end: the restart records the pristine identity under
         // the chosen model, and writes are accepted and recorded
         // under that identity.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = store_state_fixture("t4-refused-write-restart", "GTEBaseENV15");
 
@@ -32860,6 +33079,7 @@ eurostrata\src\daemon.rs",
         // LockedUnknown, outside the identity refusal's protection.
         // The round trip must preserve Recorded{has_data, R}, and the
         // identity refusal must still fire on the restored store.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("a5-backup-round-trip").await;
         let opener = LadybugStore::for_testing(&fx.db, 4)
@@ -32940,6 +33160,7 @@ eurostrata\src\daemon.rs",
         // into the new checksums, and restored as the wrong identity.
         // Reusing a snapshot directory for a pre-sidecar store must
         // leave a snapshot that carries no sidecar at all.
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = without_model_env();
         let fx = data_bearing_store_fixture("t5-reuse-recorded").await;
         let out = fx.root.join("snapshot");
@@ -37160,21 +37381,34 @@ impl LadybugStore {
         }
         self.guard_first_write()
             .map_err(|e| ActionError::Storage(e.to_string()))?;
-        self.check_data_bearing_identity()
-            .map_err(|e| ActionError::Storage(e.to_string()))?;
-        // #409: the batched path writes vector-carrying `Memory` rows too, so
-        // it owes the same marker gate — but only when the batch actually
-        // carries rows. An edge-only batch embeds nothing and must not be
-        // rejected for a marker disagreement it cannot violate (#409
-        // re-review).
-        if !batch.writes.is_empty() {
+        // Metadata-only batches embed nothing and bypass identity checks.
+        if batch
+            .writes
+            .iter()
+            .any(|write| write.vector.iter().any(|component| *component != 0.0))
+        {
+            self.check_data_bearing_identity()
+                .map_err(|e| ActionError::Storage(e.to_string()))?;
+        }
+        // A batch owes identity gates only for rows that actually carry a
+        // real vector. Edge-only batches and all-zero metadata writes embed
+        // nothing: they must neither be refused by a marker disagreement nor
+        // pin the store to a model that produced no vectors (#457 re-review).
+        let has_vector = batch
+            .writes
+            .iter()
+            .any(|write| write.vector.iter().any(|component| *component != 0.0));
+        if has_vector {
             self.check_embedding_marker_identity()
                 .await
                 .map_err(|e| ActionError::Storage(e.to_string()))?;
         }
 
+        // Metadata-only batches still flip the sidecar to data-bearing: the
+        // row exists. Only the persisted embedding marker is skipped (#457
+        // re-review).
         let first_write_flip = self.first_write_flip(false);
-        let first_write_marker = self.first_write_marker(false);
+        let first_write_marker = self.first_write_marker(!has_vector);
         let now_ts = crate::rdf::action::current_action_timestamp();
         let ontology = self.get_ontology(&ns);
 
@@ -37533,7 +37767,7 @@ impl LadybugStore {
                     // matching the single-row upsert's contract. An edge-only
                     // or otherwise empty batch writes no vector and must not
                     // pin the store to this process's embedder.
-                    if !writes.is_empty() {
+                    if has_vector {
                         first_write_marker
                             .ensure_written_before_first_vector(conn)
                             .map_err(|e| ActionError::Storage(e.to_string()))?;
@@ -37801,9 +38035,9 @@ mod store_identity {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            // Only a temp root this fixture created may be removed. Real
-            // stores are never in scope: refuse anything not directly under
-            // the process temp dir with our unique prefix (#409 re-review).
+            // The root holds ladybug.db: never remove that directory. Only
+            // the fixture's own config directory is cleaned up; the DB
+            // directory is left intact (#457 re-review).
             let temp_root = std::env::temp_dir();
             let name = self
                 .root
@@ -37814,7 +38048,7 @@ mod store_identity {
                 && name.starts_with("ns-store-identity-")
                 && self.root != temp_root
             {
-                let _ = std::fs::remove_dir_all(&self.root);
+                let _ = std::fs::remove_dir_all(&self.config_dir);
             }
         }
     }
@@ -37923,15 +38157,17 @@ mod store_identity {
         drop(store);
     }
 
-    /// Remove exactly the one known marker row (never a bulk table delete),
-    /// leaving a database that predates the persisted marker while its
-    /// sidecar still records data-bearing identity: the legacy store the
-    /// adoption path must record.
-    async fn strip_marker_row(fx: &Fixture) {
-        let store = open(fx, "BGESmallENV15");
+    /// Build a data-bearing legacy store additively: init creates only the
+    /// schema, a directly inserted row carries a real vector, and the
+    /// sidecar records data-bearing identity. No persisted marker is ever
+    /// written, so no destructive SQL `DELETE` is needed to simulate the
+    /// pre-marker store the adoption path must record (#457 re-review).
+    async fn legacy_data_bearing_store(fx: &Fixture, id: &str, user_id: &str, dims: usize) {
+        let store = open_with_dims(fx, "BGESmallENV15", dims);
+        store.init("probe").await.expect("init the legacy fixture");
+        let components = vec!["0.2"; dims].join(", ");
         let query = format!(
-            "MATCH (s:StoreIdentity {{id: '{}'}}) DELETE s",
-            STORE_IDENTITY_ID
+            "CREATE (m:Memory {{id: '{id}', namespace: 'probe', content: 'a 409 row', user_id: '{user_id}', memory_type: 'fact', agent_name: 'a', location: '', location_lines: '', metadata: '{{}}', embedding: [{components}]}})"
         );
         store
             .with_conn(move |conn| {
@@ -37939,8 +38175,13 @@ mod store_identity {
                 Ok(())
             })
             .await
-            .expect("drop the marker row");
+            .expect("insert the legacy data-bearing row");
         drop(store);
+        crate::model_choice::write_store_state_identity(
+            &fx.db,
+            &crate::model_choice::StoreState::new(true, serving_with_dims("BGESmallENV15", dims)),
+        )
+        .expect("record the legacy data-bearing sidecar");
     }
 
     #[tokio::test]
@@ -38120,8 +38361,7 @@ mod store_identity {
     #[tokio::test]
     async fn legacy_adoption_is_recorded_as_marker_provenance() {
         let fx = fixture("legacy-adoption");
-        seeded_store(&fx, "m1", "owner").await;
-        strip_marker_row(&fx).await;
+        legacy_data_bearing_store(&fx, "m1", "owner", 4).await;
 
         let store = open(&fx, "BGESmallENV15");
         store.init("probe").await.expect("verified open adopts");
@@ -38144,8 +38384,7 @@ mod store_identity {
     #[tokio::test]
     async fn an_adopted_marker_survives_sidecar_loss() {
         let fx = fixture("adopted-survives");
-        seeded_store(&fx, "m1", "owner").await;
-        strip_marker_row(&fx).await;
+        legacy_data_bearing_store(&fx, "m1", "owner", 4).await;
         {
             let adopter = open(&fx, "BGESmallENV15");
             adopter.init("probe").await.expect("adoption open");
@@ -38306,6 +38545,71 @@ mod store_identity {
             .expect("an edge-only batch embeds nothing and is not gated by the vector marker");
     }
 
+    #[tokio::test]
+    async fn a_metadata_only_batch_bypasses_the_identity_gate() {
+        let fx = fixture("metadata-batch");
+        seeded_store(&fx, "m1", "owner").await;
+        std::fs::remove_file(crate::model_choice::store_state_path(&fx.db))
+            .expect("lose the sidecar so only the marker carries identity");
+
+        let store = open(&fx, "NomicEmbedTextV15");
+        store.init("probe").await.expect("open under another model");
+        let mut batch = one_row_batch("m2");
+        batch.writes[0].vector = vec![0.0; 4];
+        store
+            .commit_action_batch("probe", batch)
+            .await
+            .expect("a zero-vector batch embeds nothing and is not gated by a conflicting marker");
+        assert_eq!(row_count(&store).await, 2, "the metadata row landed");
+    }
+
+    #[tokio::test]
+    async fn a_marker_with_a_non_string_descriptor_field_refuses_vector_work() {
+        let fx = fixture("malformed-marker");
+        seeded_store(&fx, "m1", "owner").await;
+        {
+            let store = open(&fx, "BGESmallENV15");
+            store
+                .with_conn(|conn| {
+                    conn.query(&format!(
+                        "MATCH (s:StoreIdentity {{id: '{}'}}) SET s.model = NULL",
+                        STORE_IDENTITY_ID
+                    ))?;
+                    Ok(())
+                })
+                .await
+                .expect("corrupt one required marker field");
+        }
+
+        let store = open(&fx, "BGESmallENV15");
+        let error = store
+            .search("probe", vector(), 5, false, false)
+            .await
+            .expect_err("a half-readable marker is not a usable identity");
+        assert!(
+            format!("{error:#}").contains("unreadable"),
+            "the refusal names the malformed marker: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_data_bearing_store_without_identity_refuses_search() {
+        let fx = fixture("unidentified-search");
+        legacy_data_bearing_store(&fx, "m1", "owner", 4).await;
+        std::fs::remove_file(crate::model_choice::store_state_path(&fx.db))
+            .expect("no sidecar and no marker");
+
+        let store = open(&fx, "BGESmallENV15");
+        let error = store
+            .search("probe", vector(), 5, false, false)
+            .await
+            .expect_err("vectors of unknown provenance are never searched");
+        assert!(
+            format!("{error:#}").contains("no trustworthy sidecar identity"),
+            "the refusal names the missing identity: {error:#}"
+        );
+    }
+
     /// A minimal one-row kinetic write set: exactly the shape
     /// `commit_action_batch` commits, no expected heads required.
     fn one_row_batch(id: &str) -> crate::rdf::action::ActionWriteSet {
@@ -38393,8 +38697,7 @@ mod store_identity {
     #[tokio::test]
     async fn absent_sidecar_legacy_store_records_no_guessed_identity() {
         let fx = fixture("legacy-absent-sidecar");
-        seeded_store(&fx, "m1", "owner").await;
-        strip_marker_row(&fx).await;
+        legacy_data_bearing_store(&fx, "m1", "owner", 4).await;
         std::fs::remove_file(crate::model_choice::store_state_path(&fx.db))
             .expect("lose the sidecar so the legacy store records nothing");
 
@@ -38571,24 +38874,7 @@ mod store_identity {
         // A data-bearing legacy store: an 8-wide row, a sidecar recording its
         // identity, and no in-store marker — exactly the store a verified
         // open would adopt from the sidecar.
-        {
-            let seeder = open_with_dims(&fx, "BGESmallENV15", 8);
-            seeder.init("probe").await.expect("init the seeding store");
-            seeder
-                .upsert("probe", "legacy-1", vec![0.2; 8], payload("owner"))
-                .await
-                .expect("seed a data-bearing legacy row");
-            seeder
-                .with_conn(|conn| {
-                    conn.query(&format!(
-                        "MATCH (s:StoreIdentity {{id: '{}'}}) DELETE s",
-                        STORE_IDENTITY_ID
-                    ))?;
-                    Ok(())
-                })
-                .await
-                .expect("strip the marker row to make the store legacy");
-        }
+        legacy_data_bearing_store(&fx, "legacy-1", "owner", 8).await;
         assert!(
             crate::model_choice::store_state_path(&fx.db).exists(),
             "precondition: the sidecar records the data-bearing identity"
@@ -38638,8 +38924,7 @@ mod store_identity {
     #[tokio::test]
     async fn a_failed_adoption_is_non_fatal_and_retried() {
         let fx = fixture("adoption-retry");
-        seeded_store(&fx, "m1", "owner").await;
-        strip_marker_row(&fx).await;
+        legacy_data_bearing_store(&fx, "m1", "owner", 4).await;
 
         {
             let failing = open(&fx, "BGESmallENV15");

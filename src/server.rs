@@ -15145,6 +15145,7 @@ mod tests {
     #[tokio::test]
     async fn add_write_half_in_same_process_after_pick_refuses() {
         use crate::store::LadybugStore;
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
 
@@ -15224,6 +15225,7 @@ mod tests {
     #[tokio::test]
     async fn add_write_half_refusal_reaches_caller_with_restart_to_apply_text() {
         use crate::store::LadybugStore;
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
 
@@ -15300,6 +15302,7 @@ mod tests {
     #[tokio::test]
     async fn add_write_half_non_guard_upsert_error_keeps_generic_message() {
         use crate::store::LadybugStore;
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
 
@@ -15353,6 +15356,7 @@ mod tests {
     #[tokio::test]
     async fn add_write_half_init_identity_refusal_reaches_caller_verbatim() {
         use crate::store::LadybugStore;
+        let _model_env = crate::model_choice::model_env_test_lock();
         let previous = std::env::var("NEUROSTRATA_MODEL").ok();
         std::env::remove_var("NEUROSTRATA_MODEL");
 
