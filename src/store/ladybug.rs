@@ -1879,6 +1879,7 @@ fn resolve_store_limits(
     configured_max_db_bytes: Option<u64>,
     env_pool: Option<&str>,
     env_cap: Option<&str>,
+    env_pool_mb: Option<&str>,
 ) -> (StoreLimits, Vec<String>) {
     let mut notes = Vec::new();
 
@@ -1893,7 +1894,26 @@ fn resolve_store_limits(
                 configured_pool
             }
         },
-        None => configured_pool,
+        None => {
+            // One-release compatibility: an old deployment that only names
+            // NEUROSTRATA_BUFFER_POOL_MB keeps its pool when the byte variable
+            // is absent and the config does not name a byte pool (#453).
+            match env_pool_mb
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                Some(mb) if configured_pool_bytes.is_none() => {
+                    notes.push(format!(
+                        "NEUROSTRATA_BUFFER_POOL_MB is deprecated; using {} bytes; \
+                         set NEUROSTRATA_BUFFER_POOL_BYTES instead",
+                        mb.saturating_mul(1024 * 1024)
+                    ));
+                    mb.saturating_mul(1024 * 1024)
+                }
+                _ => configured_pool,
+            }
+        }
     };
     if pool != 0 && pool < MIN_BUFFER_POOL_BYTES {
         notes.push(format!(
@@ -1948,11 +1968,15 @@ fn resolved_store_limits() -> StoreLimits {
     let (configured_pool, configured_cap) = configured_store_limits();
     let env_pool = std::env::var("NEUROSTRATA_BUFFER_POOL_BYTES").ok();
     let env_cap = std::env::var("NEUROSTRATA_MAX_DB_BYTES").ok();
+    // Deprecated fallback, honoured only when the byte variable is absent and
+    // the config does not name a byte pool (#453 review).
+    let env_pool_mb = std::env::var("NEUROSTRATA_BUFFER_POOL_MB").ok();
     let (limits, notes) = resolve_store_limits(
         configured_pool,
         configured_cap,
         env_pool.as_deref(),
         env_cap.as_deref(),
+        env_pool_mb.as_deref(),
     );
     BUFFER_POOL_BYTES_IN_USE.store(
         limits.buffer_pool_bytes,
@@ -2048,12 +2072,24 @@ fn engine_config_for(limits: StoreLimits, current_store_bytes: u64) -> SystemCon
 
 /// The store's current on-disk footprint: the database plus both write-ahead
 /// log sides, measured from the filesystem so an uncheckpointed write counts.
+/// Errors are returned, never read as zero: on the admission path a failed
+/// measurement must refuse a capped write, not admit it (#453 review).
+fn measure_store_bytes_at(local_path: &std::path::Path) -> std::io::Result<u64> {
+    let db_bytes = match std::fs::metadata(local_path) {
+        Ok(metadata) => metadata.len(),
+        // A fresh store has no database file yet; that is a real zero.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e),
+    };
+    let (active, frozen) = try_wal_pair_sizes(local_path)?;
+    Ok(db_bytes.saturating_add(active).saturating_add(frozen))
+}
+
+/// Lenient measurement for open/config and tests: an unmeasurable store is
+/// reported as empty there because those paths do not admit writes. The
+/// admission path uses [`measure_store_bytes_at`] and fails closed.
 fn current_store_bytes_at(local_path: &std::path::Path) -> u64 {
-    let db_bytes = std::fs::metadata(local_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    let (active, frozen) = wal_pair_sizes(local_path);
-    db_bytes.saturating_add(active).saturating_add(frozen)
+    measure_store_bytes_at(local_path).unwrap_or(0)
 }
 
 /// Inclusive boundary: a write that lands exactly on the cap fits; one byte
@@ -2062,27 +2098,46 @@ fn would_exceed_cap(current: u64, incoming: u64, cap: u64) -> bool {
     cap != 0 && current.saturating_add(incoming) > cap
 }
 
-/// Refuse before any write, naming both the current size and the cap so the
-/// operator can archive, prune, or raise the cap deliberately.
+/// Sidecar lock for the byte-cap admission. The in-process writer turn only
+/// orders clones of one `LadybugStore`; a second handle (or a second process)
+/// has its own turn, so the check needs an OS-held file lock to be
+/// authoritative across handles too (#453 review).
+fn cap_lock_path_for(local_path: &std::path::Path) -> std::path::PathBuf {
+    local_path.with_extension("store-cap.lock")
+}
+
+/// Refuse before any write, naming both the current size and the cap. The only
+/// supported remedies are raising the cap or deleting one hallucinated id via
+/// the CLI; bulk deletion and DB removal are never suggested (#453 review).
 fn store_full_error(current: u64, incoming: u64, cap: u64) -> anyhow::Error {
     anyhow::anyhow!(
         "ERROR [STORE_FULL]: the store holds {current} bytes and this write needs about \
-         {incoming} more, past the {cap} byte max_db_bytes cap; archive or prune memories, or \
-         raise store.max_db_bytes (NEUROSTRATA_MAX_DB_BYTES) and restart"
+         {incoming} more, past the {cap} byte max_db_bytes cap; raise store.max_db_bytes \
+         (NEUROSTRATA_MAX_DB_BYTES) and restart. If a specific row is a known hallucination, \
+         delete only that single id with `neurostrata-mcp delete`; bulk deletion and removing \
+         the store are not supported"
     )
 }
 
-/// Conservative row-size estimate for the pre-write check: the vector's floats,
-/// the row's text fields, and its serialized metadata, plus a small fixed
-/// overhead for engine bookkeeping.
+/// One database page of headroom per row (#453): a fixed 256-byte allowance
+/// under-counted page, index and WAL growth, so an estimate that fit could
+/// still push the exact byte boundary past the cap.
+const ROW_OVERHEAD_BYTES: u64 = 4096;
+/// Embedding index bookkeeping in addition to the four stored bytes per float.
+const VECTOR_INDEX_BYTES_PER_FLOAT: u64 = 8;
+/// One graph edge row plus its provenance columns.
+const EDGE_ROW_OVERHEAD_BYTES: u64 = 256;
+
+/// Conservative row-size estimate for the pre-write check: the vector's floats
+/// and index entry, every persisted text field, serialized metadata, and a
+/// full page of engine bookkeeping.
 fn estimate_memory_write_bytes(
     vector_len: usize,
     id: &str,
     namespace: &str,
     payload: &MemoryPayload,
 ) -> u64 {
-    const ROW_OVERHEAD_BYTES: u64 = 256;
-    let vector = (vector_len as u64).saturating_mul(4);
+    let vector = (vector_len as u64).saturating_mul(4 + VECTOR_INDEX_BYTES_PER_FLOAT);
     let id = id.len() as u64;
     let namespace = namespace.len() as u64;
     let content = payload.content.len() as u64;
@@ -2108,12 +2163,70 @@ fn estimate_memory_write_bytes(
         .saturating_add(ROW_OVERHEAD_BYTES)
 }
 
+/// Estimate for an ordinary row write whose fields are known as plain strings
+/// (counters, access counts, metric samples, intake receipts).
+fn estimate_field_row_bytes(fields: &[&str]) -> u64 {
+    fields.iter().fold(ROW_OVERHEAD_BYTES, |total, field| {
+        total.saturating_add(field.len() as u64)
+    })
+}
+
+/// A `governs` stub is a full Memory row with a zero embedding, not just an
+/// edge: account for it before the write, not after (#453 review).
+fn estimate_stub_row_bytes(dimensions: usize, namespace: &str, declared: &str) -> u64 {
+    let path = crate::parser::ingest::normalize_node_path(declared);
+    let stub_id = crate::parser::ingest::qualified_id(namespace, &path);
+    let metadata = serde_json::json!({ "stub": true, "absolute_path": path });
+    let metadata_len = serde_json::to_vec(&metadata)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or(0);
+    (dimensions as u64)
+        .saturating_mul(4 + VECTOR_INDEX_BYTES_PER_FLOAT)
+        .saturating_add(stub_id.len() as u64)
+        .saturating_add(namespace.len() as u64)
+        .saturating_add(declared.len() as u64)
+        .saturating_add(metadata_len)
+        .saturating_add(ROW_OVERHEAD_BYTES)
+}
+
+/// Full byte cost of one upsert: the row after canonicalization/enrichment,
+/// every declared edge row with provenance, and every stub node it may
+/// materialize (#453 review).
+fn estimate_upsert_write_bytes(
+    vector_len: usize,
+    id: &str,
+    namespace: &str,
+    payload: &MemoryPayload,
+    dimensions: usize,
+) -> u64 {
+    let mut total = estimate_memory_write_bytes(vector_len, id, namespace, payload);
+    for spec in edge_specs(&payload.metadata) {
+        total = total
+            .saturating_add(spec.rel_type.len() as u64)
+            .saturating_add(spec.target_id.len() as u64)
+            .saturating_add(id.len() as u64)
+            .saturating_add(EDGE_ROW_OVERHEAD_BYTES);
+        if spec.rel_type == "GOVERNS"
+            && payload.memory_type == "rule"
+            && !spec
+                .target_id
+                .contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+        {
+            total = total.saturating_add(estimate_stub_row_bytes(
+                dimensions,
+                namespace,
+                &spec.target_id,
+            ));
+        }
+    }
+    total
+}
+
 fn estimate_action_write_bytes(
     writes: &[crate::rdf::action::StagedMemoryWrite],
     edge_deltas: &[crate::rdf::action::EdgeDelta],
     namespace: &str,
 ) -> u64 {
-    const EDGE_OVERHEAD_BYTES: u64 = 64;
     let rows = writes.iter().fold(0u64, |total, write| {
         total.saturating_add(estimate_memory_write_bytes(
             write.vector.len(),
@@ -2127,7 +2240,7 @@ fn estimate_action_write_bytes(
             .saturating_add(edge.source.len() as u64)
             .saturating_add(edge.relation.len() as u64)
             .saturating_add(edge.target.len() as u64)
-            .saturating_add(EDGE_OVERHEAD_BYTES)
+            .saturating_add(EDGE_ROW_OVERHEAD_BYTES)
     })
 }
 
@@ -2335,7 +2448,7 @@ mod store_limits_tests {
     const MIB: u64 = 1024 * 1024;
 
     fn limits(pool: Option<u64>, cap: Option<u64>) -> (StoreLimits, Vec<String>) {
-        resolve_store_limits(pool, cap, None, None)
+        resolve_store_limits(pool, cap, None, None, None)
     }
 
     #[test]
@@ -2345,13 +2458,14 @@ mod store_limits_tests {
             Some(1024 * MIB),
             Some("805306368"),
             Some("2147483648"),
+            None,
         );
         assert_eq!(resolved.buffer_pool_bytes, 768 * MIB);
         assert_eq!(resolved.max_db_bytes, 2048 * MIB);
         assert!(notes.is_empty(), "{notes:?}");
 
         let (resolved, notes) =
-            resolve_store_limits(Some(512 * MIB), None, Some(" 671088640 "), Some(""));
+            resolve_store_limits(Some(512 * MIB), None, Some(" 671088640 "), Some(""), None);
         assert_eq!(resolved.buffer_pool_bytes, 640 * MIB);
         assert_eq!(resolved.max_db_bytes, 0);
         assert!(notes.is_empty(), "{notes:?}");
@@ -2364,6 +2478,7 @@ mod store_limits_tests {
             Some(1024 * MIB),
             Some("lots"),
             Some("2GiB"),
+            None,
         );
         assert_eq!(resolved.buffer_pool_bytes, 512 * MIB);
         assert_eq!(resolved.max_db_bytes, 1024 * MIB);
@@ -2387,8 +2502,13 @@ mod store_limits_tests {
         assert_eq!(resolved.max_db_bytes, 0);
         assert!(notes.is_empty(), "{notes:?}");
 
-        let (resolved, notes) =
-            resolve_store_limits(Some(1024 * MIB), Some(1024 * MIB), Some("0"), Some("0"));
+        let (resolved, notes) = resolve_store_limits(
+            Some(1024 * MIB),
+            Some(1024 * MIB),
+            Some("0"),
+            Some("0"),
+            None,
+        );
         assert_eq!(
             resolved.buffer_pool_bytes, 0,
             "0 hands the pool to the engine"
@@ -2467,6 +2587,118 @@ mod store_limits_tests {
         .unwrap();
         let loaded = crate::config::Config::load_from(&path).unwrap();
         assert_eq!(loaded.store.buffer_pool_bytes, Some(768 * MIB));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PR #453 review: deployments that still set the old megabyte environment
+    /// variable must keep their pool when the byte variable is absent. The byte
+    /// variable still wins whenever it is set.
+    #[test]
+    fn the_legacy_megabyte_environment_fills_in_when_the_byte_variable_is_absent() {
+        let (resolved, notes) = resolve_store_limits(None, None, None, None, Some("768"));
+        assert_eq!(resolved.buffer_pool_bytes, 768 * MIB);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("NEUROSTRATA_BUFFER_POOL_MB")),
+            "{notes:?}"
+        );
+
+        let (resolved, notes) =
+            resolve_store_limits(None, None, Some("536870912"), None, Some("768"));
+        assert_eq!(
+            resolved.buffer_pool_bytes,
+            512 * MIB,
+            "the byte variable wins"
+        );
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.contains("NEUROSTRATA_BUFFER_POOL_MB")),
+            "{notes:?}"
+        );
+    }
+
+    /// PR #453 review: assert the value that reaches the engine, not just the
+    /// pure backstop helper. `SystemConfig` has no getters, so its Debug form
+    /// is the observable surface of the config passed to `Database`.
+    #[test]
+    fn with_limits_on_installs_the_backstop_and_pool_in_the_engine_config() {
+        let limits = StoreLimits {
+            buffer_pool_bytes: 512 * MIB,
+            max_db_bytes: 20 * MIB,
+        };
+        let cfg = with_limits_on(SystemConfig::default(), limits, 24 * MIB);
+        let shown = format!("{cfg:?}");
+        assert!(
+            shown.contains(&format!("max_db_size: {}", 32 * MIB)),
+            "the engine must receive the computed backstop: {shown}"
+        );
+        assert!(
+            shown.contains(&format!("buffer_pool_size: {}", 512 * MIB)),
+            "the engine must receive the resolved pool: {shown}"
+        );
+    }
+
+    /// PR #453 review: the deprecation warning must be emitted by the load
+    /// path itself, not only returned by the migration helper.
+    #[test]
+    fn load_from_emits_the_deprecation_warning_exactly_once() {
+        struct WarningSink(std::sync::Mutex<Vec<String>>);
+        impl tracing::Subscriber for WarningSink {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() <= tracing::Level::WARN
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+                tracing::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                struct Visitor<'a>(&'a mut Vec<String>);
+                impl tracing::field::Visit for Visitor<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0.push(format!("{value:?}"));
+                        }
+                    }
+                }
+                if let Ok(mut messages) = self.0.lock() {
+                    event.record(&mut Visitor(&mut messages));
+                }
+            }
+            fn enter(&self, _: &tracing::Id) {}
+            fn exit(&self, _: &tracing::Id) {}
+        }
+
+        let dir = std::env::temp_dir().join(format!("ns-store-warn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"db_path":"test.db","storage_hygiene":{"buffer_pool_mb":768}}"#,
+        )
+        .unwrap();
+
+        crate::config::reset_legacy_pool_warning_for_tests();
+        let sink = WarningSink(std::sync::Mutex::new(Vec::new()));
+        let loaded = tracing::subscriber::with_default(sink, || {
+            crate::config::Config::load_from(&path).unwrap()
+        });
+        assert_eq!(loaded.store.buffer_pool_bytes, Some(768 * MIB));
+        let captured = crate::config::take_legacy_warning_for_tests();
+        assert_eq!(
+            captured.iter().filter(|m| m.contains("deprecated")).count(),
+            1,
+            "the load path must warn once: {captured:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -3420,14 +3652,21 @@ fn observe_wal_side(
     }
 }
 
-/// True byte sizes of both WAL sides, taken at one instant.
-fn wal_pair_sizes(local_path: &std::path::Path) -> (u64, u64) {
-    let len = |side: WalSide| {
-        std::fs::metadata(side.path(local_path))
-            .map(|m| m.len())
-            .unwrap_or(0)
+/// True byte sizes of both WAL sides at one instant. An absent side is zero;
+/// any other stat error is returned so capped admission cannot treat a live
+/// WAL as smaller than it is (#453 review).
+fn try_wal_pair_sizes(local_path: &std::path::Path) -> std::io::Result<(u64, u64)> {
+    let len = |side: WalSide| match std::fs::metadata(side.path(local_path)) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
     };
-    (len(WalSide::Active), len(WalSide::Frozen))
+    Ok((len(WalSide::Active)?, len(WalSide::Frozen)?))
+}
+
+/// Lenient WAL sizes for the accounting and checkpoint paths.
+fn wal_pair_sizes(local_path: &std::path::Path) -> (u64, u64) {
+    try_wal_pair_sizes(local_path).unwrap_or((0, 0))
 }
 
 fn wal_side_set(side: WalSide) -> crate::store::wal_accounting::SideSet {
@@ -5875,6 +6114,7 @@ impl LadybugStore {
         let max_db_bytes = self.max_db_bytes;
         let cap_refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let refused_flag = Arc::clone(&cap_refused);
+        let cap_lock_path = incoming_bytes.map(|_| cap_lock_path_for(&local_path));
 
         let outcome = bounded(what, write_timeout(), async move {
             // One writer at a time, because the engine refuses the second
@@ -5885,20 +6125,60 @@ impl LadybugStore {
             // has been started yet.
             let mut turn = write_lock.lock_owned().await;
 
-            // The authoritative cap check: this turn is exclusive, so the
-            // current bytes cannot change between the check and the write
-            // below because of another writer of this process.
+            // Serialize the measurement against every handle and process that
+            // honours this cap. The in-process turn alone cannot order a second
+            // `LadybugStore` opened on the same path (#453 review). The guard
+            // lives until the end of this future, so it covers the write too.
+            let _cap_guard = if let Some(lock_path) = cap_lock_path {
+                match tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+                    let file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .read(true)
+                        .write(true)
+                        .open(&lock_path)?;
+                    fs2::FileExt::lock_exclusive(&file)?;
+                    Ok(file)
+                })
+                .await
+                {
+                    Ok(Ok(file)) => Some(file),
+                    Ok(Err(e)) => {
+                        return Err(anyhow::anyhow!(
+                            "ERROR [STORE_FULL]: cannot hold the cross-process cap lock ({e})"
+                        ))
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "ERROR [STORE_FULL]: the cap-lock task failed ({e})"
+                        ))
+                    }
+                }
+            } else {
+                None
+            };
+
+            // The authoritative cap check: both the turn and the file lock are
+            // exclusive, so the current bytes cannot change between the check
+            // and the write below.
             if let Some(incoming) = incoming_bytes {
-                let current = current_store_bytes_at(&local_path);
+                // Fail closed: an unreadable database or WAL must never be
+                // treated as empty at the admission point (#453 review).
+                let current = measure_store_bytes_at(&local_path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "ERROR [STORE_FULL]: cannot measure the store before a capped \
+                         write ({e}); refusing rather than assuming it is empty"
+                    )
+                })?;
                 if would_exceed_cap(current, incoming, max_db_bytes) {
                     refused_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     return Err(store_full_error(current, incoming, max_db_bytes));
                 }
             }
 
-            // The turn orders our own writers; the background checkpoint and
-            // any other process are outside it, so a refusal can still arrive.
-            // Those clear in milliseconds, so wait and try again rather than
+            // The turn orders our own writers and the file lock orders every
+            // other handle that honours the cap. A background checkpoint can
+            // still collide at the engine, so wait and retry rather than
             // handing the caller a failure it can do nothing about.
             let mut attempt = 0;
             loop {
@@ -9354,7 +9634,7 @@ impl LadybugStore {
     /// Refuse before any write when the incoming row would carry the store
     /// past `max_db_bytes` (#414). A cap of 0 never refuses.
     fn ensure_store_has_room(&self, incoming_bytes: u64) -> Result<()> {
-        let current = self.current_store_bytes();
+        let current = measure_store_bytes_at(&self.local_path)?;
         if would_exceed_cap(current, incoming_bytes, self.max_db_bytes) {
             return Err(store_full_error(current, incoming_bytes, self.max_db_bytes));
         }
@@ -9717,7 +9997,19 @@ impl LadybugStore {
             // the write takes ownership, so query_metrics sees one continuous
             // series across the flush boundary.
             let _merged = self.metrics.range(&key, 0, i64::MAX, &samples);
-            self.write_with_deadline("flushing time-series metrics", move |conn| {
+            // #453: a metrics flush inserts a new node per sample, so it must
+            // pay for its rows at admission like any other growing write.
+            let incoming = samples.iter().fold(0u64, |total, sample| {
+                let labels =
+                    serde_json::to_string(&sample.labels).unwrap_or_else(|_| "{}".to_string());
+                total.saturating_add(estimate_field_row_bytes(&[
+                    &sample.id, &ns, &kind_str, &name, &labels,
+                ]))
+            });
+            self.write_with_deadline_within_cap(
+                "flushing time-series metrics",
+                Some(incoming),
+                move |conn| {
                 let safe_ns = escape_ladybug_string(&ns);
                 let safe_kind = escape_ladybug_string(&kind_str);
                 let safe_name = escape_ladybug_string(&name);
@@ -9733,7 +10025,8 @@ impl LadybugStore {
                     conn.query(&q)?;
                 }
                 Ok(())
-            })
+            },
+            )
             .await?;
             self.metrics.mark_flushed(&key, max_seq);
             total_written += count;
@@ -10924,12 +11217,6 @@ impl VectorStore for LadybugStore {
         if namespace.trim().is_empty() {
             anyhow::bail!("namespace must be non-empty");
         }
-        // #414: refuse before any engine write when this row would carry the
-        // store past max_db_bytes, so a refused upsert lands nothing. This
-        // early check is advisory; the authoritative one runs inside the
-        // writer turn below (Fix 2B).
-        let incoming_bytes = estimate_memory_write_bytes(vector.len(), id, &namespace, &payload);
-        self.ensure_store_has_room(incoming_bytes)?;
         // First-write race guard: on a pristine store, refuse the first
         // write if the configured model changed since this process
         // recorded the store's descriptor (a setup pick landed while the
@@ -11251,6 +11538,12 @@ impl VectorStore for LadybugStore {
         // The stub materializer needs the embedding width for its zero vector;
         // captured here so the closure stays `FnOnce + Send + 'static`.
         let dimensions = self.dimensions;
+        // #414/#453: estimate AFTER canonicalization/enrichment so the facets,
+        // mentions, declared edges and stub nodes actually written are all
+        // counted. The authoritative cap check runs inside the writer turn.
+        let incoming_bytes =
+            estimate_upsert_write_bytes(vector.len(), &id, &namespace, &payload, dimensions);
+        self.ensure_store_has_room(incoming_bytes)?;
         let zero_vec = zero_vector_str(dimensions);
         let lexical_doc = Self::lexical_doc(&namespace, &id, &payload);
         let refresh_ont_after_upsert = payload.memory_type == "action_type"
@@ -11689,7 +11982,13 @@ impl VectorStore for LadybugStore {
         let namespace = namespace.to_string();
         let id = id.to_string();
         let key = key.to_string();
-        self.write_with_deadline("recording a metadata counter", move |conn| {
+        // #453: a metadata counter rewrite is a growing write; it shares the
+        // byte-cap admission instead of slipping through as maintenance.
+        let incoming = estimate_field_row_bytes(&[&namespace, &id, &key]);
+        self.write_with_deadline_within_cap(
+            "recording a metadata counter",
+            Some(incoming),
+            move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_id = escape_ladybug_string(&id);
             let read = format!(
@@ -11721,7 +12020,8 @@ impl VectorStore for LadybugStore {
             );
             conn.query(&write)?;
             Ok(())
-        })
+        },
+        )
         .await
     }
 
@@ -12916,7 +13216,13 @@ impl VectorStore for LadybugStore {
     async fn begin_generation(&self, namespace: &str, source_key: &str) -> Result<u64> {
         let namespace = namespace.to_string();
         let source_key = source_key.to_string();
-        self.write_with_deadline("beginning a staging generation", move |conn| {
+        // #453: a begin creates the generation and pointer rows, so it is a
+        // growing write subject to the byte cap.
+        let incoming = estimate_field_row_bytes(&[&namespace, &source_key]).saturating_mul(3);
+        self.write_with_deadline_within_cap(
+            "beginning a staging generation",
+            Some(incoming),
+            move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_sk = escape_ladybug_string(&source_key);
 
@@ -12991,7 +13297,8 @@ impl VectorStore for LadybugStore {
             conn.query(&staging)?;
 
             Ok(next)
-        })
+        },
+        )
         .await
     }
 
@@ -13550,7 +13857,10 @@ impl VectorStore for LadybugStore {
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()> {
         let namespace = namespace.to_string();
         let id = id.to_string();
-        self.write_with_deadline("counting a read", move |conn| {
+        // #453: retrieval rewrites a metadata column, so this is a metered
+        // write too -- it cannot bypass the store cap as maintenance.
+        let incoming = estimate_field_row_bytes(&[&namespace, &id]);
+        self.write_with_deadline_within_cap("counting a read", Some(incoming), move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_id = escape_ladybug_string(&id);
 
@@ -16306,7 +16616,23 @@ impl crate::traits::IntakeStore for LadybugStore {
 
         // Transactional write: receipt + candidates atomically
         let candidates_clone = candidates.clone();
-        self.write_with_deadline("creating intake receipt and candidates", move |conn| {
+        // #453: the receipt and every candidate are real inserted rows; pay
+        // for all of them at admission instead of bypassing the cap.
+        let mut incoming =
+            estimate_field_row_bytes(&[&receipt_id, &namespace, &intents_json, &text, &now]);
+        for cand in &candidates {
+            incoming = incoming.saturating_add(estimate_field_row_bytes(&[
+                &cand.id,
+                &cand.receipt_id,
+                &cand.title,
+                cand.description.as_deref().unwrap_or(""),
+                &cand.created_at,
+            ]));
+        }
+        self.write_with_deadline_within_cap(
+            "creating intake receipt and candidates",
+            Some(incoming),
+            move |conn| {
             // Insert receipt
             let receipt_query = format!(
                 "MERGE (r:IntakeReceipt {{id: '{}'}})
@@ -16367,7 +16693,8 @@ impl crate::traits::IntakeStore for LadybugStore {
             }
 
             Ok(())
-        })
+        },
+        )
         .await
         .map_err(|e| format!("Failed to create intake receipt: {}", e))?;
 
@@ -16607,7 +16934,17 @@ impl crate::traits::IntakeStore for LadybugStore {
         let task_id_for_closure = task_id.clone();
         let cas_version = request.cas_version;
 
-        self.write_with_deadline("resolving intake candidate", move |conn| {
+        // #453: a disposition rewrite is a growing metadata write, not a
+        // maintenance deletion; it goes through the byte-cap admission.
+        let incoming = estimate_field_row_bytes(&[
+            &namespace,
+            &candidate_id,
+            task_id.as_deref().unwrap_or(""),
+        ]);
+        self.write_with_deadline_within_cap(
+            "resolving intake candidate",
+            Some(incoming),
+            move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_cand_id = escape_ladybug_string(&candidate_id);
             let safe_disposition = escape_ladybug_string(&format!("{:?}", disposition).to_lowercase());
@@ -16741,7 +17078,8 @@ impl crate::traits::IntakeStore for LadybugStore {
                 task_created: disposition == crate::task::intake::Disposition::Created,
                 task_id: task_id_for_closure.clone(),
             })
-        })
+        },
+        )
         .await
         .map_err(|e| format!("Failed to resolve candidate: {}", e))
     }
@@ -18634,6 +18972,112 @@ eurostrata\src\daemon.rs",
             store.current_store_bytes() <= cap,
             "the admitted write left the store above its cap"
         );
+    }
+
+    /// PR #453 review: an upsert that materialises stub `governs` targets and
+    /// edges must pay for them at admission, not only for the submitted row.
+    #[test]
+    fn estimates_include_generated_stubs_edges_and_provenance() {
+        let plain = retired_test_payload("rule", "agent", json!({}));
+        let base = estimate_upsert_write_bytes(4, "rule-id", "probe", &plain, 4);
+        let mut declaring = plain.clone();
+        declaring.metadata = json!({
+            "governs": ["src/one.rs", "src/two.rs", "src/three.rs"],
+            "related_to": ["probe::other"]
+        });
+        let with_generated = estimate_upsert_write_bytes(4, "rule-id", "probe", &declaring, 4);
+        assert!(
+            with_generated > base + 6 * 1024,
+            "three stub rows plus four edges must be counted: {base} -> {with_generated}"
+        );
+    }
+
+    /// PR #453 review: an unreadable database or WAL stat must not be read as
+    /// zero bytes on the admission path.
+    #[test]
+    fn a_failed_size_measurement_is_an_error_not_zero() {
+        let root = tempfile::tempdir().unwrap();
+        let blocker = root.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("ladybug.db");
+        assert!(
+            measure_store_bytes_at(&path).is_err(),
+            "an ENOTDIR stat must surface as an error"
+        );
+        assert_eq!(
+            current_store_bytes_at(&path),
+            0,
+            "the lenient open/test wrapper stays lenient"
+        );
+    }
+
+    /// PR #453 review: ordinary growing writes (counters among them) share the
+    /// cap admission instead of bypassing it through a `None` estimate.
+    #[tokio::test]
+    async fn an_ordinary_counter_write_is_refused_when_the_store_is_full() {
+        use crate::traits::VectorStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("counter.db");
+        let seed = capped_test_store(&path, 0).await;
+        seed.upsert(
+            "probe",
+            "seed-row",
+            vec![0.0; 4],
+            retired_test_payload("fact", "agent", json!({})),
+        )
+        .await
+        .expect("uncapped seed write");
+        drop(seed);
+
+        // Half the current footprint guarantees the next metered write is
+        // over the cap regardless of what the reopen checkpointed.
+        let cap = current_store_bytes_at(&path) / 2;
+        let store = capped_test_store(&path, cap).await;
+        let err = store
+            .increment_access_count("probe", "seed-row")
+            .await
+            .expect_err("a counter write with no headroom must be refused");
+        assert!(err.to_string().contains("STORE_FULL"), "{err}");
+    }
+
+    /// PR #453 review: the refusal must not recommend broad deletion.
+    #[test]
+    fn the_cap_error_permits_only_individual_hallucination_deletes() {
+        let text = store_full_error(100, 20, 110).to_string();
+        assert!(text.contains("STORE_FULL"), "{text}");
+        assert!(text.contains("neurostrata-mcp delete"), "{text}");
+        assert!(text.contains("hallucination"), "{text}");
+        assert!(
+            !text.to_lowercase().contains("prune"),
+            "generic pruning advice is not a supported remedy: {text}"
+        );
+    }
+
+    /// PR #453 review: the cap check must be exclusive across handles and
+    /// processes, not only across clones sharing one in-process write lock.
+    #[test]
+    fn the_cap_guard_lock_excludes_a_second_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = cap_lock_path_for(&dir.path().join("store.db"));
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap()
+        };
+        let first = open();
+        fs2::FileExt::lock_exclusive(&first).unwrap();
+        let second = open();
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&second).is_err(),
+            "a second handle must not pass the cap while the first holds the guard"
+        );
+        drop(first);
+        fs2::FileExt::lock_exclusive(&second).unwrap();
     }
 
     /// Task 2: TaskStore and OntologyStore round-trip against a temporary

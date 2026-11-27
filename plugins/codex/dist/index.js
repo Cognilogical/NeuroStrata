@@ -2572,7 +2572,7 @@ export function flushPendingDaemonAdvisory() {
 /** Pull the daemon memory advisory out of the error/diagnostic channel.
  * Only text carrying the marker is inspected — memory payloads and result
  * rows are never matched, so a memory that merely discusses
- * `NEUROSTRATA_BUFFER_POOL_MB` cannot synthesize an advisory. Returns the
+ * `NEUROSTRATA_BUFFER_POOL_BYTES` cannot synthesize an advisory. Returns the
  * guidance string once per 10-minute window, or `null` when already shown
  * or absent. */
 export function extractDaemonMemoryAdvisory(errorChannelText, nowMs = Date.now()) {
@@ -2588,7 +2588,7 @@ export function extractDaemonMemoryAdvisory(errorChannelText, nowMs = Date.now()
     return [
         '[NeuroStrata — DAEMON MEMORY ADVISORY]',
         'The daemon reports buffer-pool or RSS pressure.',
-        "Raise NEUROSTRATA_BUFFER_POOL_MB (or the daemon's configured buffer pool) and restart the daemon; repeated advisories are suppressed for 10 minutes."
+        "Raise NEUROSTRATA_BUFFER_POOL_BYTES (or the daemon's configured store.buffer_pool_bytes) and restart the daemon; repeated advisories are suppressed for 10 minutes."
     ].join(' ');
 }
 const sessionEpochs = new Map();

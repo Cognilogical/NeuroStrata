@@ -115,9 +115,11 @@ pub(crate) fn legacy_buffer_pool_migration(raw: &serde_json::Value) -> Option<(u
         .get("storage_hygiene")?
         .get("buffer_pool_mb")?
         .as_u64()?;
+    // JSON `null` is an absent setting, not an override (#453 review).
     if raw
         .get("store")
         .and_then(|store| store.get("buffer_pool_bytes"))
+        .and_then(serde_json::Value::as_u64)
         .is_some()
     {
         return None;
@@ -131,6 +133,45 @@ pub(crate) fn legacy_buffer_pool_migration(raw: &serde_json::Value) -> Option<(u
              future release)"
         ),
     ))
+}
+
+/// Emit the one-time deprecation warning from the load path itself, and keep
+/// the text where a test can prove the warning was actually emitted (#453).
+static LEGACY_POOL_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static LEGACY_POOL_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn emit_legacy_pool_warning(warning: &str) {
+    if LEGACY_POOL_WARNED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+    {
+        tracing::warn!("{warning}");
+        if let Ok(mut emitted) = LEGACY_POOL_WARNINGS.lock() {
+            emitted.push(warning.to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_legacy_pool_warning_for_tests() {
+    LEGACY_POOL_WARNED.store(false, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut emitted) = LEGACY_POOL_WARNINGS.lock() {
+        emitted.clear();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn take_legacy_warning_for_tests() -> Vec<String> {
+    LEGACY_POOL_WARNINGS
+        .lock()
+        .map(|mut emitted| std::mem::take(&mut *emitted))
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -282,8 +323,7 @@ impl Config {
         let raw: serde_json::Value = serde_json::from_str(&content)?;
         if let Some((bytes, warning)) = legacy_buffer_pool_migration(&raw) {
             config.store.buffer_pool_bytes = Some(bytes);
-            static LEGACY_POOL_WARNED: std::sync::Once = std::sync::Once::new();
-            LEGACY_POOL_WARNED.call_once(|| tracing::warn!("{warning}"));
+            emit_legacy_pool_warning(&warning);
         }
 
         if config.db_path.is_dir() {
@@ -760,6 +800,28 @@ mod tests {
         assert_eq!(bare.store, StoreConfig::default());
         assert!(bare.store.buffer_pool_bytes.is_none());
         assert!(bare.store.max_db_bytes.is_none());
+    }
+
+    /// PR #453 review: JSON `null` is an absent setting, not an explicit
+    /// override. A legacy deployment that writes `"buffer_pool_bytes": null`
+    /// must still get its `buffer_pool_mb` value migrated (#414).
+    #[test]
+    fn a_null_byte_setting_does_not_hide_the_legacy_pool() {
+        let raw: serde_json::Value = serde_json::from_str(
+            r#"{"store":{"buffer_pool_bytes":null},"storage_hygiene":{"buffer_pool_mb":768}}"#,
+        )
+        .unwrap();
+        let migrated = super::legacy_buffer_pool_migration(&raw)
+            .expect("null byte setting leaves the legacy key in force");
+        assert_eq!(migrated.0, 768 * 1024 * 1024);
+        assert!(migrated.1.contains("deprecated"), "{}", migrated.1);
+
+        // A real numeric byte value still wins over the legacy key.
+        let explicit: serde_json::Value = serde_json::from_str(
+            r#"{"store":{"buffer_pool_bytes":123},"storage_hygiene":{"buffer_pool_mb":768}}"#,
+        )
+        .unwrap();
+        assert!(super::legacy_buffer_pool_migration(&explicit).is_none());
     }
 
     #[test]

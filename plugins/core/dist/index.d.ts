@@ -436,7 +436,7 @@ export declare function flushPendingDaemonAdvisory(): string | null;
 /** Pull the daemon memory advisory out of the error/diagnostic channel.
  * Only text carrying the marker is inspected — memory payloads and result
  * rows are never matched, so a memory that merely discusses
- * `NEUROSTRATA_BUFFER_POOL_MB` cannot synthesize an advisory. Returns the
+ * `NEUROSTRATA_BUFFER_POOL_BYTES` cannot synthesize an advisory. Returns the
  * guidance string once per 10-minute window, or `null` when already shown
  * or absent. */
 export declare function extractDaemonMemoryAdvisory(errorChannelText: string | null | undefined, nowMs?: number): string | null;
