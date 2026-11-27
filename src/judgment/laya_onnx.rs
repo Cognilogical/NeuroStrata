@@ -68,11 +68,16 @@ impl LayaOnnxProvider {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         };
-        let model_version = non_empty("bundle_version")
-            .or_else(|| non_empty("model_version"))
+        // Promotion records the candidate identity (`model_version` for
+        // built-in training, `version` for legacy bundles) as active. Report
+        // that same identifier so a promoted bundle can actually gate; fall
+        // back to a declared `bundle_version` when no candidate identity is
+        // present rather than fabricating one.
+        let model_version = non_empty("model_version")
             .or_else(|| non_empty("version"))
+            .or_else(|| non_empty("bundle_version"))
             .ok_or_else(|| {
-                anyhow!("Bundle manifest declares no bundle_version, model_version or version")
+                anyhow!("Bundle manifest declares no model_version, version or bundle_version")
             })?
             .to_string();
 
@@ -200,6 +205,44 @@ impl LayaOnnxProvider {
         self.inference_session.as_ref()
     }
 
+    /// Validate a downloaded bundle before reporting a successful fetch.
+    /// `load` would reject an unversioned bundle later, so refuse it here
+    /// instead of handing callers an unusable artifact.
+    fn validate_fetched_bundle(target_path: &Path) -> Result<()> {
+        let manifest_path = target_path.join("manifest.json");
+        if !manifest_path.exists() {
+            return Err(anyhow!("Downloaded Laya bundle is missing manifest.json"));
+        }
+        if !target_path.join("model.onnx").exists() {
+            return Err(anyhow!(
+                "Downloaded Laya bundle at {} is missing model.onnx",
+                target_path.display()
+            ));
+        }
+        let text = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| anyhow!("Cannot read downloaded manifest: {e}"))?;
+        let manifest: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow!("Bad downloaded manifest JSON: {e}"))?;
+        let non_empty = |key: &str| {
+            manifest
+                .get(key)
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        if non_empty("model_version")
+            .or_else(|| non_empty("version"))
+            .or_else(|| non_empty("bundle_version"))
+            .is_none()
+        {
+            return Err(anyhow!(
+                "Downloaded Laya bundle at {} declares no non-empty model_version, version or bundle_version",
+                target_path.display()
+            ));
+        }
+        Ok(())
+    }
+
     /// Fetch a pinned Laya model bundle by model identifier.
     /// Downloads from the registry-defined URL and verifies the SHA-256 checksum
     /// before writing to the target directory, ensuring supply-chain integrity.
@@ -215,21 +258,7 @@ impl LayaOnnxProvider {
         })
         .await??;
 
-        // Do not fabricate a manifest: the downloaded bundle must be complete.
-        let manifest_path = target_path.join("manifest.json");
-        if !manifest_path.exists() {
-            return Err(anyhow!("Downloaded Laya bundle is missing manifest.json"));
-        }
-
-        // The bundle must contain the ONNX model itself: a download with a
-        // manifest but no model.onnx is unusable to the inference session,
-        // so fail loudly here instead of producing a half-usable bundle.
-        if !target_path.join("model.onnx").exists() {
-            return Err(anyhow!(
-                "Downloaded Laya bundle at {} is missing model.onnx",
-                target_path.display()
-            ));
-        }
+        Self::validate_fetched_bundle(&target_path)?;
 
         println!(
             "Laya model '{}' fetched and verified to '{}'",
@@ -633,6 +662,62 @@ mod tests {
             "0.4.14-bridge",
             "serving must report the manifest's declared bundle_version, not a fabricated one"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn laya_reports_promoted_candidate_identity() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let dir = std::env::temp_dir().join(format!("ns-laya-promoted-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Promotion records `model_version` as active; a different declared
+        // bundle_version must not leave the promoted bundle shadow-only.
+        let manifest = serde_json::json!({
+            "embedder_id": "laya",
+            "bundle_version": "0.4.14-bridge",
+            "model_version": "candidate-7",
+            "calibration_tier": "GoldShipped"
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
+        let p = LayaOnnxProvider::load(&dir, sem).expect("promoted bundle loads");
+        assert_eq!(p.model_version(), "candidate-7");
+        assert!(p.may_block(Some("candidate-7"), true));
+        assert!(!p.may_block(Some("0.4.14-bridge"), true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_validation_refuses_unversioned_bundle() {
+        let dir = std::env::temp_dir().join(format!("ns-laya-fetch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{"embedder_id":"laya", "version":"   "}"#,
+        )
+        .unwrap();
+        let err = LayaOnnxProvider::validate_fetched_bundle(&dir)
+            .expect_err("unversioned download must be refused before success is reported");
+        assert!(format!("{err}").contains("non-empty"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_validation_accepts_versioned_bundle() {
+        let dir = std::env::temp_dir().join(format!("ns-laya-fetch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{"embedder_id":"laya", "version":"v1"}"#,
+        )
+        .unwrap();
+        assert!(LayaOnnxProvider::validate_fetched_bundle(&dir).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

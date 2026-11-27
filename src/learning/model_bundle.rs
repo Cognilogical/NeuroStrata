@@ -20,9 +20,9 @@ impl ModelBundle {
     /// Load a bundle from `bundle_dir`, reading its `manifest.json`.
     ///
     /// The bundle's version is the one its manifest declares
-    /// (`bundle_version`, falling back to `model_version`) — never a string
-    /// minted by this loader. A bundle whose manifest is missing,
-    /// unparsable, or declares no version is refused.
+    /// (`bundle_version`, falling back to `model_version` then legacy
+    /// `version`) — never a string minted by this loader. A bundle whose
+    /// manifest is missing, unparsable, or declares no version is refused.
     pub fn load(bundle_dir: &Path, embedder_id: &str) -> Result<Self> {
         let root = bundle_dir.to_path_buf();
         let manifest_path = root.join("manifest.json");
@@ -46,8 +46,11 @@ impl ModelBundle {
         };
         let version = non_empty("bundle_version")
             .or_else(|| non_empty("model_version"))
+            .or_else(|| non_empty("version"))
             .ok_or_else(|| {
-                anyhow::anyhow!("Bundle manifest declares no bundle_version or model_version")
+                anyhow::anyhow!(
+                    "Bundle manifest declares no bundle_version, model_version or version"
+                )
             })?
             .to_string();
         let mut calibration_tier = crate::judgment::CalibrationTier::ProxyInternal;
@@ -156,12 +159,28 @@ mod tests {
 
     #[test]
     fn bundle_load_rejects_empty_or_whitespace_version() {
+        // Unrelated fields stay valid so only the version assertion decides
+        // the outcome; a missing embedder_id or model.onnx must not mask it.
         for (label, manifest) in [
-            ("empty-bundle-version", r#"{"bundle_version":""}"#),
-            ("blank-bundle-version", r#"{"bundle_version":"   "}"#),
-            ("blank-model-version", r#"{"model_version":" \t "}"#),
+            (
+                "empty-bundle-version",
+                r#"{"bundle_version":"","embedder_id":"test-embedder"}"#,
+            ),
+            (
+                "blank-bundle-version",
+                r#"{"bundle_version":"   ","embedder_id":"test-embedder"}"#,
+            ),
+            (
+                "blank-model-version",
+                r#"{"model_version":" \t ","embedder_id":"test-embedder"}"#,
+            ),
+            (
+                "blank-version",
+                r#"{"version":"   ","embedder_id":"test-embedder"}"#,
+            ),
         ] {
             let dir = temp_bundle_with_manifest(label, Some(manifest));
+            fs::write(dir.join("model.onnx"), b"fake").unwrap();
             let res = ModelBundle::load(&dir, "test-embedder");
             assert!(
                 res.is_err(),
@@ -174,8 +193,21 @@ mod tests {
 
     #[test]
     fn bundle_load_fails_without_a_manifest() {
+        // The fixture is otherwise complete: only manifest.json is absent.
         let dir = temp_bundle_with_manifest("nomanifest", None);
+        fs::write(dir.join("model.onnx"), b"fake").unwrap();
+        fs::write(dir.join("embedder_id"), b"test-embedder").unwrap();
         assert!(ModelBundle::load(&dir, "test-embedder").is_err());
+    }
+
+    #[test]
+    fn bundle_load_accepts_legacy_version_field() {
+        let dir = temp_bundle_with_manifest(
+            "legacyversion",
+            Some(r#"{"version":"0.3.7-legacy","embedder_id":"test-embedder"}"#),
+        );
+        let bundle = ModelBundle::load(&dir, "test-embedder").unwrap();
+        assert_eq!(bundle.version, "0.3.7-legacy");
     }
 
     fn temp_bundle(name: &str) -> PathBuf {
