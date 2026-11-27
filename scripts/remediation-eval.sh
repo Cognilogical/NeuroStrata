@@ -15,16 +15,39 @@ if [ "${1:-}" = "--json" ]; then
   out=${2:?--json needs a path}
 fi
 
-# Invalidate the requested evidence before doing any work. A run that fails
-# early (dirty tree, unknown suite, failed command) must never leave a prior
-# PASS at the documented path for a caller to mistake for this run's verdict.
-if [ -n "$out" ] && [ -e "$out" ]; then
-  rm -f -- "$out"
-fi
-
 root=$(git rev-parse --show-toplevel)
+root_abs=$(realpath -m -- "$root")
 registry=${EVAL_REGISTRY:-$root/eval/registry.json}
-[ -f "$registry" ] || { echo "registry not found: $registry" >&2; exit 2; }
+registry_abs=$(realpath -m -- "$registry")
+[ -f "$registry_abs" ] || { echo "registry not found: $registry" >&2; exit 2; }
+
+if [ -n "$out" ]; then
+  out_abs=$(realpath -m -- "$out")
+  script_abs=$(realpath -m -- "$root/scripts/remediation-eval.sh")
+  registry_dir=$(dirname "$registry_abs")
+  # Resolve before removing anything: an output naming the active registry
+  # (or another protected repository input) must be rejected, not deleted.
+  case "$out_abs" in
+    "$registry_abs"|"$registry_dir"|"$script_abs"|"$root_abs"|"$root_abs/.git"|"$root_abs/.git"/*)
+      echo "refusing --json path that collides with a protected repository input: $out" >&2
+      exit 2
+      ;;
+  esac
+
+  # Coordinate invalidation and publication per output path. Two runs aimed
+  # at one path must not interleave so that a failed run's caller reads a PASS
+  # published by the other run after the failure invalidated the path.
+  lock_dir=$(git -C "$root" rev-parse --git-path remediation-eval-locks)
+  mkdir -p "$lock_dir"
+  lock_key=$(printf '%s' "$out_abs" | cksum | awk '{print $1}')
+  exec {lock_fd}>"$lock_dir/$lock_key.lock"
+  flock -x "$lock_fd"
+
+  # A run that fails early must never leave a prior PASS at this path.
+  if [ -e "$out_abs" ]; then
+    rm -f -- "$out_abs"
+  fi
+fi
 
 if [ "${EVAL_ALLOW_DIRTY:-0}" != "1" ]; then
   if ! git -C "$root" diff --quiet || ! git -C "$root" diff --cached --quiet; then
@@ -33,18 +56,23 @@ if [ "${EVAL_ALLOW_DIRTY:-0}" != "1" ]; then
   fi
 fi
 
-entry=$(jq -c --arg s "$suite" '.suites[$s] // empty' "$registry")
+entry=$(jq -c --arg s "$suite" '.suites[$s] // empty' "$registry_abs")
 [ -n "$entry" ] || { echo "unknown suite: $suite" >&2; exit 2; }
 
 commands=()
-while IFS= read -r line; do commands+=("$line"); done < <(jq -r --arg s "$suite" '.suites[$s].commands[]' "$registry")
+while IFS= read -r line; do commands+=("$line"); done < <(jq -r --arg s "$suite" '.suites[$s].commands[]' "$registry_abs")
 expected=()
-while IFS= read -r line; do expected+=("$line"); done < <(jq -r --arg s "$suite" '.suites[$s].tests[]' "$registry")
+while IFS= read -r line; do expected+=("$line"); done < <(jq -r --arg s "$suite" '.suites[$s].tests[]' "$registry_abs")
 [ "${#expected[@]}" -gt 0 ] || { echo "suite has no expected tests: $suite" >&2; exit 2; }
 
 commit=$(git -C "$root" rev-parse HEAD)
 log=$(mktemp)
-trap 'rm -f "$log"' EXIT
+tmp_out=""
+cleanup() {
+  [ -z "$log" ] || rm -f -- "$log"
+  [ -z "$tmp_out" ] || rm -f -- "$tmp_out"
+}
+trap cleanup EXIT
 
 passed=0
 failed=0
@@ -80,7 +108,7 @@ for name in "${expected[@]}"; do
   fi
 done
 
-threshold_ignored=$(jq -r --arg s "$suite" '.suites[$s].thresholds.ignored // 0' "$registry")
+threshold_ignored=$(jq -r --arg s "$suite" '.suites[$s].thresholds.ignored // 0' "$registry_abs")
 if [ "$ignored" -ne "$threshold_ignored" ]; then
   echo "ignored count $ignored != required $threshold_ignored" >&2
   exit 1
@@ -97,15 +125,15 @@ result=$(jq -n \
   --argjson failed "$failed" \
   --argjson ignored "$ignored" \
   --argjson expected "$(printf '%s\n' "${expected[@]}" | jq -R . | jq -s .)" \
-  --argjson thresholds "$(jq -c --arg s "$suite" '.suites[$s].thresholds' "$registry")" \
+  --argjson thresholds "$(jq -c --arg s "$suite" '.suites[$s].thresholds' "$registry_abs")" \
   '{suite:$suite, commit:$commit, passed:$passed, failed:$failed, ignored:$ignored, expected:$expected, thresholds:$thresholds, verdict:(if $failed==0 and $ignored==0 then "PASS" else "FAIL" end)}')
 
 if [ -n "$out" ]; then
-  mkdir -p "$(dirname "$out")"
-  tmp_out=$(mktemp "$(dirname "$out")/.$(basename "$out").XXXXXX")
-  trap 'rm -f "$log" "$tmp_out"' EXIT
+  mkdir -p "$(dirname "$out_abs")"
+  tmp_out=$(mktemp "$(dirname "$out_abs")/.$(basename "$out_abs").XXXXXX")
   printf '%s\n' "$result" > "$tmp_out"
-  mv -f -- "$tmp_out" "$out"
+  mv -f -- "$tmp_out" "$out_abs"
+  tmp_out=""
   echo "wrote $out"
 else
   printf '%s\n' "$result"

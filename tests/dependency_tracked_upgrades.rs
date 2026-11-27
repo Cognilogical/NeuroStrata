@@ -20,6 +20,10 @@ use serde_yaml::Value as YamlValue;
 /// Values this gate enforces and the decision record must repeat verbatim.
 /// Keeping them in one place makes a record-vs-gate drift a single-point edit.
 const OXIRI_BAND: (u64, u64) = (0, 2);
+/// Exact locked releases, not just bands: a patch bump still changes what CI
+/// resolves, so the decision record pins these specific versions (#339).
+const SPAREVAL_VERSION: &str = "0.2.9";
+const OXIRI_VERSION: &str = "0.2.11";
 const BASE_IMAGE: &str = "ubuntu:24.04";
 const ICU_PACKAGE: &str = "libicu74";
 const TYPESCRIPT_PIN: &str = "~6.0.3";
@@ -272,6 +276,214 @@ fn relative(path: &Path) -> String {
         .to_string()
 }
 
+/// All versions of a crate in the lockfile. Comparing a band instead of the
+/// exact release lets a patch bump slip past the gate unnoticed.
+fn locked_versions(lock: &toml::Value, name: &str) -> Vec<String> {
+    lock_packages(lock)
+        .iter()
+        .filter(|package| package_name(package) == name)
+        .map(package_version)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn is_action_descriptor(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("action.yml" | "action.yaml")
+    )
+}
+
+/// Local composite actions are workflow code: a tracked `uses` inside one is
+/// executed just like a `uses` in a workflow, so it must join the scan.
+fn action_descriptor_paths() -> Vec<PathBuf> {
+    let directory = repo_path(".github/actions");
+    if !directory.is_dir() {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    collect_files(&directory, &mut paths);
+    paths.retain(|path| is_action_descriptor(path));
+    paths.sort();
+    paths
+}
+
+/// Is this file CI/build configuration that could invoke the deferred image?
+/// Named directories and well-known build filenames cover consumers that live
+/// outside `.github` and `scripts`; docs and source are deliberately excluded.
+fn is_ci_config(path: &Path) -> bool {
+    let components: Vec<String> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(str::to_owned)
+        .collect();
+    const EXCLUDED_DIRS: [&str; 5] = [".git", "target", "node_modules", "dist", ".NeuroStrata"];
+    if components
+        .iter()
+        .any(|part| EXCLUDED_DIRS.contains(&part.as_str()))
+    {
+        return false;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_top_level = components
+        .first()
+        .is_some_and(|part| part == ".github" || part == "scripts");
+    if is_top_level {
+        return true;
+    }
+    const CI_DIRS: [&str; 6] = ["ci", ".ci", "build", ".build", "infra", ".devcontainer"];
+    let parent_dirs = &components[..components.len().saturating_sub(1)];
+    if parent_dirs
+        .iter()
+        .any(|part| CI_DIRS.contains(&part.as_str()))
+    {
+        return true;
+    }
+    let is_build_file = name.starts_with("dockerfile")
+        || name.starts_with("docker-compose")
+        || name.starts_with("makefile")
+        || name == "justfile"
+        || name.starts_with("taskfile")
+        || name.ends_with(".mk")
+        || name.ends_with(".nix")
+        || name == "action.yml"
+        || name == "action.yaml";
+    is_build_file || (components.len() == 1 && (name.ends_with(".yml") || name.ends_with(".yaml")))
+}
+
+/// Walk the repository for every CI/build config, so a consumer added in a
+/// new CI location cannot escape the no-consumer gate.
+fn ci_paths() -> Vec<PathBuf> {
+    fn walk(root: &Path, out: &mut Vec<PathBuf>) {
+        let entries =
+            fs::read_dir(root).unwrap_or_else(|error| panic!("read {}: {error}", root.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|error| panic!("read entry in {}: {error}", root.display()))
+                .path();
+            if path.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                if matches!(
+                    name,
+                    ".git" | "target" | "node_modules" | "dist" | ".NeuroStrata"
+                ) {
+                    continue;
+                }
+                walk(&path, out);
+            } else if is_ci_config(Path::new(&relative(&path))) {
+                out.push(path);
+            }
+        }
+    }
+    let root = repo_path("");
+    let mut paths = Vec::new();
+    walk(&root, &mut paths);
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// `FROM` accepts option flags such as `--platform=` before the image name.
+fn from_image(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .skip(1)
+        .find(|token| !token.starts_with("--"))
+        .map(str::to_owned)
+}
+
+/// Parse Dockerfile stages once: global `ARG` before the first `FROM` is
+/// legal and is not a stage directive; continuation lines are already joined.
+fn dockerfile_stages(raw: &str) -> Vec<(String, Vec<String>)> {
+    let mut stages: Vec<(String, Vec<String>)> = Vec::new();
+    for line in dockerfile_logical_lines(raw) {
+        if is_instruction(&line, "FROM") {
+            let image = from_image(&line)
+                .unwrap_or_else(|| panic!("Dockerfile.base FROM has no image: {line:?}"));
+            stages.push((image, Vec::new()));
+        } else if is_instruction(&line, "ARG") && stages.is_empty() {
+            // Global build arguments precede the first stage without error.
+            continue;
+        } else if let Some((_, directives)) = stages.last_mut() {
+            directives.push(line);
+        } else {
+            panic!("Dockerfile.base has a non-ARG directive before its first FROM: {line:?}");
+        }
+    }
+    stages
+}
+
+/// Shell `#` comments only start at a word boundary and never inside quotes.
+fn strip_shell_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut word_boundary = true;
+    for (index, character) in line.char_indices() {
+        match quote {
+            Some(open) => {
+                if character == open {
+                    quote = None;
+                }
+                word_boundary = character.is_whitespace();
+            }
+            None => {
+                if character == '\'' || character == '"' {
+                    quote = Some(character);
+                    word_boundary = false;
+                } else if character == '#' && word_boundary {
+                    return &line[..index];
+                } else {
+                    word_boundary = character.is_whitespace();
+                }
+            }
+        }
+    }
+    line
+}
+
+/// Recognize an actual `apt`/`apt-get install <package>` command, ignoring
+/// shell comments, `echo`, and other mentions of the package. Options may
+/// appear before `install` (`apt-get -y install ...` is valid).
+fn apt_installs_package(command: &str, package: &str) -> bool {
+    let command = strip_shell_comment(command);
+    for part in command.split([';', '|', '&']) {
+        let tokens: Vec<&str> = part
+            .split_whitespace()
+            .map(|token| token.trim_matches(['\'', '"']))
+            .filter(|token| !token.is_empty())
+            .collect();
+        let mut at = 0;
+        if tokens.first() == Some(&"sudo") {
+            at = 1;
+        }
+        while tokens.get(at).is_some_and(|token| token.contains('=')) {
+            at += 1;
+        }
+        let Some(binary) = tokens.get(at) else {
+            continue;
+        };
+        if *binary != "apt-get" && *binary != "apt" {
+            continue;
+        }
+        let Some(install_at) = tokens[at + 1..]
+            .iter()
+            .position(|token| *token == "install")
+        else {
+            continue;
+        };
+        let arguments = &tokens[at + 1 + install_at + 1..];
+        if arguments.contains(&package) {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_full_sha(reference: &str) -> bool {
     reference.len() == 40
         && reference
@@ -315,49 +527,89 @@ fn dockerfile_logical_lines(raw: &str) -> Vec<String> {
     logical
 }
 
-/// Recursively collect every `uses:` value from a parsed workflow document.
-/// Structural parsing covers sequence spacing, flow-style mappings, quoted
-/// keys, and folded/block scalars that a line scanner silently skips.
-fn collect_yaml_uses(value: &YamlValue, out: &mut Vec<String>) {
-    if let Some(mapping) = value.as_mapping() {
-        for (key, child) in mapping {
-            if key.as_str() == Some("uses") {
-                if let Some(uses) = child.as_str() {
-                    out.push(uses.trim().to_owned());
-                }
-            }
-            collect_yaml_uses(child, out);
+/// Only step `uses` declarations are executed as actions. Nested data such
+/// as `with.uses` is not an action reference and must not be collected.
+fn collect_step_uses(steps: &YamlValue, out: &mut Vec<String>) {
+    let Some(sequence) = steps.as_sequence() else {
+        return;
+    };
+    for step in sequence {
+        let Some(mapping) = step.as_mapping() else {
+            continue;
+        };
+        if let Some(uses) = mapping.get("uses").and_then(|value| value.as_str()) {
+            out.push(uses.trim().to_owned());
         }
-    } else if let Some(sequence) = value.as_sequence() {
-        for child in sequence {
-            collect_yaml_uses(child, out);
+    }
+}
+
+/// A reusable-workflow job declares `uses` at job level; its `steps` (if any)
+/// are ordinary action steps. Only those two forms execute GitHub Actions.
+fn collect_job_uses(job: &YamlValue, out: &mut Vec<String>) {
+    let Some(mapping) = job.as_mapping() else {
+        return;
+    };
+    if let Some(uses) = mapping.get("uses").and_then(|value| value.as_str()) {
+        out.push(uses.trim().to_owned());
+    }
+    if let Some(steps) = mapping.get("steps") {
+        collect_step_uses(steps, out);
+    }
+}
+
+/// Collect executable `uses` declarations from a workflow or composite
+/// action descriptor: workflow jobs and their steps, plus `runs.steps`.
+fn collect_yaml_uses(value: &YamlValue, out: &mut Vec<String>) {
+    let Some(root) = value.as_mapping() else {
+        return;
+    };
+    if let Some(jobs) = root.get("jobs").and_then(|value| value.as_mapping()) {
+        for (_, job) in jobs {
+            collect_job_uses(job, out);
+        }
+    }
+    if let Some(runs) = root.get("runs").and_then(|value| value.as_mapping()) {
+        if let Some(steps) = runs.get("steps") {
+            collect_step_uses(steps, out);
         }
     }
 }
 
 /// Pair a `uses` target with its version annotation. Folded scalars keep the
 /// `# vN.N.N` text inside the value; ordinary steps write it as a YAML
-/// comment, which the parser strips, so recover it from the source line.
+/// comment on the same source line, which the parser strips. Only that exact
+/// line may supply the annotation — a nearby unrelated comment is not
+/// evidence for this reference.
 fn version_annotation(raw: &str, target: &str) -> Option<String> {
-    let lines: Vec<&str> = raw.lines().collect();
-    for (index, line) in lines.iter().enumerate() {
-        if !line.contains(target) {
+    let mut annotations: Vec<Option<String>> = Vec::new();
+    for line in raw.lines() {
+        let Some(position) = line.find(target) else {
+            continue;
+        };
+        let before = &line[..position];
+        if !before.contains("uses") || !before.contains(':') {
             continue;
         }
-        for candidate in lines.iter().skip(index).take(4) {
-            let comment = candidate
-                .split_once('#')
-                .map(|(_, rest)| rest)
-                .unwrap_or("");
-            if let Some(token) = comment
+        let after = &line[position + target.len()..];
+        let comment = after.split_once('#').map(|(_, rest)| rest).unwrap_or("");
+        annotations.push(
+            comment
                 .split_whitespace()
                 .find(|token| token.starts_with('v') || token.starts_with('V'))
-            {
-                return Some(token.to_owned());
-            }
-        }
+                .map(str::to_owned),
+        );
     }
-    None
+    if annotations.is_empty() || annotations.iter().any(Option::is_none) {
+        return None;
+    }
+    let mut distinct: Vec<String> = annotations.into_iter().flatten().collect();
+    distinct.sort();
+    distinct.dedup();
+    if distinct.len() == 1 {
+        distinct.pop()
+    } else {
+        None
+    }
 }
 
 /// Every tracked-action reference in a workflow, structurally parsed.
@@ -380,18 +632,25 @@ fn workflow_action_references(path: &Path) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-/// Every `typescript` declaration in a manifest, from both dependency maps.
+/// Every `typescript` declaration in a manifest. Peer and optional ranges
+/// are executable constraints too, so a conflicting compiler there must be
+/// as visible as one in `dependencies` or `devDependencies`.
 fn typescript_declarations(document: &serde_json::Value) -> Vec<String> {
-    ["dependencies", "devDependencies"]
-        .iter()
-        .filter_map(|section| {
-            document
-                .get(*section)
-                .and_then(|dependencies| dependencies.get("typescript"))
-                .and_then(|value| value.as_str())
-        })
-        .map(|value| value.trim().to_owned())
-        .collect()
+    [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ]
+    .iter()
+    .filter_map(|section| {
+        document
+            .get(*section)
+            .and_then(|dependencies| dependencies.get("typescript"))
+            .and_then(|value| value.as_str())
+    })
+    .map(|value| value.trim().to_owned())
+    .collect()
 }
 
 #[test]
@@ -418,14 +677,14 @@ fn tracked_upgrades_decision_record_names_all_four() {
     // the tests below must therefore appear verbatim in the record.
     let recorded = [
         format!("root pin `{}.{}`", OXIRI_BAND.0, OXIRI_BAND.1),
-        "`spareval 0.2.9` edge `0.2.11`".to_owned(),
+        format!("`spareval {SPAREVAL_VERSION}` edge `{OXIRI_VERSION}`"),
         format!("`{BASE_IMAGE}` + `{ICU_PACKAGE}`"),
         format!("`{TYPESCRIPT_PIN}` in all 8 manifests"),
         format!(
             "upload `{}`, download `{}`, checkout `{}`",
             TRACKED_ACTIONS[0].version, TRACKED_ACTIONS[1].version, TRACKED_ACTIONS[2].version
         ),
-        "**Blocked** by `spareval 0.2.9`".to_owned(),
+        format!("**Blocked** by `spareval {SPAREVAL_VERSION}`"),
         "**Deferred** to Ubuntu 26.04 LTS".to_owned(),
         "**Deferred** to TypeScript 7.1".to_owned(),
         "**Landed** in #340".to_owned(),
@@ -491,6 +750,13 @@ fn oxiri_pin_matches_the_spareval_dependency_edge() {
         pin_band.0,
         pin_band.1
     );
+    for version in &pinned_band_packages {
+        assert_eq!(
+            *version, OXIRI_VERSION,
+            "Cargo.lock resolves {OXIRI} {version} in the pinned band, but the decision record pins {OXIRI_VERSION}; \
+             a patch bump is a tracked upgrade and must update the gate and record together (#339)"
+        );
+    }
 
     // Inspect every spareval entry and every oxiri edge it declares, not
     // just the first of each.
@@ -502,6 +768,14 @@ fn oxiri_pin_matches_the_spareval_dependency_edge() {
         !sparevals.is_empty(),
         "Cargo.lock has no {SPAREVAL} package"
     );
+    for spareval in &sparevals {
+        let version = package_version(spareval);
+        assert_eq!(
+            version, SPAREVAL_VERSION,
+            "Cargo.lock resolves {SPAREVAL} {version}, but the decision record pins {SPAREVAL_VERSION}; \
+             a patch bump is a tracked upgrade and must update the gate and record together (#339)"
+        );
+    }
 
     for spareval in sparevals {
         let spareval_version = package_version(spareval).to_owned();
@@ -538,6 +812,11 @@ fn oxiri_pin_matches_the_spareval_dependency_edge() {
                 edge.trim_start_matches(OXIRI).trim().to_owned()
             };
             let edge_parsed = Version::parse(&edge_version);
+            assert_eq!(
+                edge_version, OXIRI_VERSION,
+                "{SPAREVAL} {spareval_version} depends on {OXIRI} {edge_version}, but the decision record pins {OXIRI_VERSION}; \
+                 a patch bump must update the gate and record together (#339)"
+            );
 
             assert!(
                 packages.iter().any(|package| {
@@ -568,24 +847,10 @@ fn dockerfile_base_stays_on_ubuntu_24_04_lts() {
     let dockerfile = read_relative("Dockerfile.base");
     // Check every stage, not just the first: a later stage on a different
     // base would build from an unrecorded image while an earlier stage still
-    // satisfies a first-FROM-only gate. Continuations are joined and
-    // instruction names are matched case-insensitively as Docker does.
-    let active = dockerfile_logical_lines(&dockerfile);
-    let mut stages: Vec<(String, Vec<String>)> = Vec::new();
-    for line in active {
-        if is_instruction(&line, "FROM") {
-            let image = line
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or_else(|| panic!("Dockerfile.base FROM has no image: {line:?}"))
-                .to_owned();
-            stages.push((image, Vec::new()));
-        } else if let Some((_, directives)) = stages.last_mut() {
-            directives.push(line);
-        } else {
-            panic!("Dockerfile.base has a directive before its first FROM: {line:?}");
-        }
-    }
+    // satisfies a first-FROM-only gate. The parser joins continuations,
+    // matches instruction casing as Docker does, skips `FROM --platform=`
+    // options, and allows global `ARG` before the first stage.
+    let stages = dockerfile_stages(&dockerfile);
     assert!(
         !stages.is_empty(),
         "Dockerfile.base has no active FROM directive"
@@ -597,13 +862,11 @@ fn dockerfile_base_stays_on_ubuntu_24_04_lts() {
             "Dockerfile.base stage {} builds from {image:?}; every active stage must stay on {BASE_IMAGE} until the 26.04 LTS migration in #339 is unblocked",
             index + 1
         );
-        let installs_icu = directives.iter().any(|line| {
-            is_instruction(line, "RUN")
-                && (line.contains("apt-get install") || line.contains("apt install"))
-                && line
-                    .split(|character: char| character.is_ascii_whitespace() || character == '&')
-                    .any(|token| token == ICU_PACKAGE)
-        });
+        // A real apt install command, not a comment or an `echo` mentioning
+        // the package. Options such as `-y` may precede `install`.
+        let installs_icu = directives
+            .iter()
+            .any(|line| is_instruction(line, "RUN") && apt_installs_package(line, ICU_PACKAGE));
         assert!(
             installs_icu,
             "Dockerfile.base stage {} must install {ICU_PACKAGE} in an active RUN/apt directive; a different package means the base image moved",
@@ -614,47 +877,14 @@ fn dockerfile_base_stays_on_ubuntu_24_04_lts() {
 
 #[test]
 fn dockerfile_base_has_no_ci_consumer() {
-    let mut files = Vec::new();
-    // All of .github covers workflows, reusable local actions, and CI config;
-    // scripts covers the build helpers. A workflow can delegate to a local
-    // action that references the deferred image, so scanning only the two
-    // original directories lets that indirect consumer escape the gate.
-    for directory in [".github", "scripts"] {
-        let root = repo_path(directory);
-        if root.is_dir() {
-            collect_files(&root, &mut files);
-        }
-    }
-    // Root-level build configurations can also invoke the image directly.
-    let root = repo_path("");
-    for entry in
-        fs::read_dir(&root).unwrap_or_else(|error| panic!("read {}: {error}", root.display()))
-    {
-        let path = entry
-            .unwrap_or_else(|error| panic!("read entry in {}: {error}", root.display()))
-            .path();
-        if !path.is_file() {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("")
-            .to_owned();
-        let lower = name.to_ascii_lowercase();
-        let is_build_config = lower.starts_with("dockerfile")
-            || lower.starts_with("docker-compose")
-            || lower == "makefile"
-            || lower == "justfile"
-            || lower.starts_with("taskfile")
-            || lower.ends_with(".mk")
-            || lower.ends_with(".nix");
-        if is_build_config {
-            files.push(path);
-        }
-    }
-    files.sort();
-    files.dedup();
+    // Scan CI/build configuration across the repository, not just a fixed
+    // list of directories: a consumer added in `ci/`, a root YAML pipeline,
+    // or a new build config must still fail the no-consumer gate.
+    let files = ci_paths();
+    assert!(
+        !files.is_empty(),
+        "no CI/build configuration found to scan for Dockerfile.base consumers"
+    );
 
     let offenders: Vec<String> = files
         .iter()
@@ -756,7 +986,11 @@ fn typescript_pins_are_6_0_3_across_plugins_and_web_ui() {
 fn artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned() {
     let mut seen = [0_usize; TRACKED_ACTIONS.len()];
 
-    for path in workflow_paths() {
+    let mut paths = workflow_paths();
+    // Local composite actions execute workflow steps too; a tracked `uses`
+    // inside one must be pinned exactly like a workflow reference.
+    paths.extend(action_descriptor_paths());
+    for path in paths {
         // Parse YAML structurally: line scanning skips valid forms such as
         // extra spacing after the dash, folded scalars, flow-style mappings,
         // and whitespace before the `uses` colon. Every tracked reference in
@@ -824,7 +1058,7 @@ fn artifact_actions_are_upload_v7_download_v8_and_checkout_sha_pinned() {
     for tracked in &TRACKED_ACTIONS {
         assert!(
             seen[tracked.slot] > 0,
-            "no {} step found in .github/workflows/*.yml; #339 expects at least one SHA-pinned {} reference",
+            "no {} step found in .github/workflows/*.yml or .github/actions/*/action.y*ml; #339 expects at least one SHA-pinned {} reference",
             tracked.name,
             tracked.version
         );
@@ -863,7 +1097,7 @@ fn dockerfile_logical_lines_join_continuations_and_match_case_insensitively() {
 
 #[test]
 fn yaml_uses_collection_covers_all_valid_forms() {
-    let yaml = "steps:\n  -   uses: actions/checkout@one # v7.0.1\n  - name: Folded\n    uses: >-\n      actions/upload-artifact@two\n  - { uses: 'actions/download-artifact@three', name: Fetch }\n  - uses : actions/checkout@four # v7.0.1\n";
+    let yaml = "jobs:\n  build:\n    steps:\n      -   uses: actions/checkout@one # v7.0.1\n      - name: Folded\n        uses: >-\n          actions/upload-artifact@two\n      - { uses: 'actions/download-artifact@three', name: Fetch }\n      - uses : actions/checkout@four # v7.0.1\n";
     let document: YamlValue = serde_yaml::from_str(yaml).expect("valid YAML fixture");
     let mut uses = Vec::new();
     collect_yaml_uses(&document, &mut uses);
@@ -884,14 +1118,140 @@ fn yaml_uses_collection_covers_all_valid_forms() {
 }
 
 #[test]
-fn typescript_declarations_collect_both_dependency_sections() {
+fn version_annotation_uses_only_its_own_uses_line() {
+    // A nearby comment on another line is not evidence for this reference.
+    let raw = "steps:\n  - uses: actions/checkout@abc\n    name: step\n# v7.0.1\n";
+    assert_eq!(
+        version_annotation(raw, "actions/checkout@abc"),
+        None,
+        "an action with no inline annotation must fail even when a neighbouring line carries the expected version"
+    );
+    let annotated = "steps:\n  - uses: actions/checkout@abc # v7.0.1\n";
+    assert_eq!(
+        version_annotation(annotated, "actions/checkout@abc").as_deref(),
+        Some("v7.0.1"),
+        "the annotation on the same uses line must still be found"
+    );
+}
+
+#[test]
+fn apt_installs_package_parses_options_and_ignores_non_commands() {
+    assert!(apt_installs_package(
+        "apt-get update && apt-get -y install --no-install-recommends libicu74",
+        "libicu74"
+    ));
+    assert!(apt_installs_package(
+        "apt -qq install libicu74 ca-certificates",
+        "libicu74"
+    ));
+    assert!(!apt_installs_package(
+        "# apt-get install libicu74",
+        "libicu74"
+    ));
+    assert!(!apt_installs_package(
+        "echo 'apt-get install libicu74'",
+        "libicu74"
+    ));
+    assert!(!apt_installs_package("apt-get remove libicu74", "libicu74"));
+}
+
+#[test]
+fn locked_versions_exposes_patch_drift() {
+    let lock: toml::Value = toml::from_str(
+        "[[package]]\nname = \"spareval\"\nversion = \"0.2.10\"\n\
+         [[package]]\nname = \"oxiri\"\nversion = \"0.2.11\"\n",
+    )
+    .expect("valid lock fixture");
+    assert_eq!(
+        locked_versions(&lock, "spareval"),
+        ["0.2.10"],
+        "a patch bump must be visible so the exact recorded version can be asserted"
+    );
+}
+
+#[test]
+fn action_descriptor_paths_recognize_composite_descriptors() {
+    assert!(is_action_descriptor(Path::new(
+        ".github/actions/setup/action.yml"
+    )));
+    assert!(is_action_descriptor(Path::new(
+        ".github/actions/setup/action.yaml"
+    )));
+    assert!(!is_action_descriptor(Path::new(".github/workflows/ci.yml")));
+}
+
+#[test]
+fn is_ci_config_covers_external_ci_locations() {
+    for path in [
+        ".github/actions/setup/action.yml",
+        "ci/build.yml",
+        ".ci/verify.yaml",
+        "build/Dockerfile.custom",
+        "Dockerfile.build",
+        "Makefile",
+    ] {
+        assert!(
+            is_ci_config(Path::new(path)),
+            "{path} is a CI/build config and must be scanned for Dockerfile.base consumers"
+        );
+    }
+    for path in [
+        "docs/superpowers/specs/record.md",
+        "tests/dependency_tracked_upgrades.rs",
+        "src/main.rs",
+    ] {
+        assert!(
+            !is_ci_config(Path::new(path)),
+            "{path} is not a CI consumer; scanning it would produce false positives"
+        );
+    }
+}
+
+#[test]
+fn typescript_declarations_collect_all_dependency_sections() {
     let document: serde_json::Value = serde_json::from_str(
-        r#"{"dependencies":{"typescript":"7.0.0"},"devDependencies":{"typescript":"~6.0.3"}}"#,
+        r#"{"dependencies":{"typescript":"7.0.0"},"devDependencies":{"typescript":"~6.0.3"},"peerDependencies":{"typescript":"^7.0.0"},"optionalDependencies":{"typescript":"6.1.0"}}"#,
     )
     .expect("valid JSON fixture");
     assert_eq!(
         typescript_declarations(&document),
-        ["7.0.0", "~6.0.3"],
-        "a conflicting runtime pin must be visible to the gate"
+        ["7.0.0", "~6.0.3", "^7.0.0", "6.1.0"],
+        "peer and optional ranges are executable constraints too and must be visible to the gate"
+    );
+}
+
+#[test]
+fn from_image_skips_platform_options() {
+    assert_eq!(
+        from_image("FROM --platform=linux/amd64 ubuntu:24.04"),
+        Some("ubuntu:24.04".to_owned())
+    );
+    assert_eq!(
+        from_image("from ubuntu:24.04"),
+        Some("ubuntu:24.04".to_owned())
+    );
+}
+
+#[test]
+fn dockerfile_stages_allow_global_arg() {
+    let raw = "ARG BASE_IMAGE=ubuntu:24.04\n\
+               from --platform=linux/amd64 ubuntu:24.04\n\
+               run apt-get -y install libicu74\n";
+    let stages = dockerfile_stages(raw);
+    assert_eq!(stages.len(), 1, "global ARG must not be treated as a stage");
+    assert_eq!(stages[0].0, "ubuntu:24.04");
+    assert_eq!(stages[0].1.len(), 1);
+}
+
+#[test]
+fn yaml_uses_collection_ignores_nested_data_fields() {
+    let yaml = "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@real # v7.0.1\n        with:\n          uses: actions/checkout@data # v1\n  call:\n    uses: actions/checkout@reusable # v7.0.1\n    with:\n      uses: actions/checkout@noise # v1\n";
+    let document: YamlValue = serde_yaml::from_str(yaml).expect("valid YAML fixture");
+    let mut uses = Vec::new();
+    collect_yaml_uses(&document, &mut uses);
+    assert_eq!(
+        uses,
+        ["actions/checkout@real", "actions/checkout@reusable"],
+        "only executable step and reusable-job uses declarations are action references"
     );
 }
