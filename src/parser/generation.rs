@@ -52,6 +52,24 @@ pub fn generation_key(namespace: &str, source_key: &str) -> String {
     format!("{}{}{}", namespace, NAMESPACE_SEPARATOR, source_key)
 }
 
+/// Unambiguous provenance for the owner of a staged publication.
+///
+/// `generation_key` joins with `::`, which is also legal inside a namespace,
+/// so lookalike owners (`("probe", "sub::src")` and `("probe::sub", "src")`)
+/// collide on one pointer row. Length-prefixing each segment keeps their lease
+/// ids distinct, letting recovery tell which owner actually published the
+/// pending generation instead of collapsing the two into one.
+pub fn stage_lease_id(namespace: &str, source_key: &str, generation: u64) -> String {
+    format!(
+        "{}:{}+{}:{}@{}",
+        namespace.len(),
+        namespace,
+        source_key.len(),
+        source_key,
+        generation
+    )
+}
+
 /// Splits a generation-scoped id back into its three segments.
 ///
 /// Returns `None` for anything that is not generation-scoped: a bare path
@@ -182,6 +200,27 @@ pub fn symbol_id(path: &str, kind: &str, name: &str, span_sha256: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_lease_id_keeps_lookalike_namespaces_distinct() {
+        // The separator is legal inside a namespace, so these two owner pairs
+        // share a generation_key. Their stage leases must still differ or a
+        // recovery could hand one owner's pending relink to the other.
+        let owner = ("probe", "sub::src");
+        let lookalike = ("probe::sub", "src");
+        assert_eq!(
+            generation_key(owner.0, owner.1),
+            generation_key(lookalike.0, lookalike.1)
+        );
+        assert_ne!(
+            stage_lease_id(owner.0, owner.1, 7),
+            stage_lease_id(lookalike.0, lookalike.1, 7)
+        );
+        assert_eq!(
+            stage_lease_id(owner.0, owner.1, 7),
+            stage_lease_id(owner.0, owner.1, 7)
+        );
+    }
 
     #[test]
     fn a_generation_scoped_id_round_trips() {

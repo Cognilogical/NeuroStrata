@@ -10543,6 +10543,11 @@ impl VectorStore for LadybugStore {
                 "ALTER TABLE IngestGeneration ADD active_generation INT64",
                 "ALTER TABLE IngestGeneration ADD counter INT64",
                 "ALTER TABLE IngestGeneration ADD previous_generation INT64",
+                // Crash-recovery markers must be declared columns: LadybugDB
+                // binds `g.<property>` against the table schema and refuses a
+                // marker that was only ever introduced through a SET clause.
+                "ALTER TABLE IngestGeneration ADD relink_pending BOOLEAN",
+                "ALTER TABLE IngestGeneration ADD stage_lease_id STRING",
             ] {
                 if let Err(e) = conn.query(stmt) {
                     tracing::debug!("schema DDL query note: {e}");
@@ -12752,6 +12757,11 @@ impl VectorStore for LadybugStore {
         let namespace = namespace.to_string();
         let refresh_ns = namespace.clone();
         let source_key = source_key.to_string();
+        // Record who owns this pending relink. The pointer key alone is not
+        // enough: `::` is legal inside a namespace, so lookalike owners share
+        // one row and only an unambiguous lease id can attribute the marker.
+        let lease = crate::parser::generation::stage_lease_id(&namespace, &source_key, generation);
+        let safe_lease = escape_ladybug_string(&lease);
         self.write_with_deadline("publishing a staging generation", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_sk = escape_ladybug_string(&source_key);
@@ -12779,7 +12789,7 @@ impl VectorStore for LadybugStore {
             #[cfg(test)]
             publication_phase_barrier("precommit", generation);
             let write = format!(
-                "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {generation}, g.previous_generation = {previous}, g.relink_pending = true ON MATCH SET g.active_generation = {generation}, g.previous_generation = {previous}, g.relink_pending = true"
+                "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {generation}, g.previous_generation = {previous}, g.relink_pending = true, g.stage_lease_id = '{safe_lease}' ON MATCH SET g.active_generation = {generation}, g.previous_generation = {previous}, g.relink_pending = true, g.stage_lease_id = '{safe_lease}'"
             );
             conn.query(&write)?;
             // Only this generation's staging row: an overlapping ingest's
@@ -12854,16 +12864,45 @@ impl VectorStore for LadybugStore {
             &namespace,
             &source_key,
         ));
+        let read_ns = namespace.clone();
+        let read_sk = source_key.clone();
         let pending = self
             .with_conn(move |conn| {
                 let read = format!(
-                    "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.relink_pending"
+                    "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.relink_pending, g.stage_lease_id, g.active_generation, g.namespace, g.source_key"
                 );
-                Ok(conn
-                    .query(&read)?
-                    .next()
-                    .map(|row| format!("{}", row[0]).eq_ignore_ascii_case("true"))
-                    .unwrap_or(false))
+                let Some(row) = conn.query(&read)?.next() else {
+                    return Ok(false);
+                };
+                if !format!("{}", row[0]).eq_ignore_ascii_case("true") {
+                    return Ok(false);
+                }
+                let stored_lease = format!("{}", row[1]);
+                let active = format!("{}", row[2]).parse::<i64>().unwrap_or(0).max(0) as u64;
+                if stored_lease.is_empty() {
+                    // A pointer written before stage leases existed carries only
+                    // its owner columns. Keep those recoverable, but still
+                    // refuse a lookalike namespace claiming the same row.
+                    let stored_ns = format!("{}", row[3]);
+                    let stored_sk = format!("{}", row[4]);
+                    if stored_ns != read_ns || stored_sk != read_sk {
+                        anyhow::bail!(
+                            "lease provenance mismatch: '{read_ns}'/'{read_sk}' cannot recover a pending relink owned by '{stored_ns}'/'{stored_sk}'"
+                        );
+                    }
+                } else {
+                    // The lease id is length-prefixed, so a colliding lookalike
+                    // cannot forge the active generation's provenance.
+                    let expected = crate::parser::generation::stage_lease_id(
+                        &read_ns, &read_sk, active,
+                    );
+                    if stored_lease != expected {
+                        anyhow::bail!(
+                            "lease provenance mismatch: stage lease does not belong to the active generation for '{read_ns}'/'{read_sk}'"
+                        );
+                    }
+                }
+                Ok(true)
             })
             .await?;
         if !pending {
@@ -32677,6 +32716,50 @@ eurostrata\src\daemon.rs",
             .unwrap()
             .results;
         assert_eq!(result_ids(&tantivy), vec![id]);
+    }
+
+    #[tokio::test]
+    async fn stage_lease_recovery_refuses_a_lookalike_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("stage-lease.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+        let owner_ns = "probe";
+        let owner_src = "sub::src";
+        let lookalike_ns = "probe::sub";
+        let lookalike_src = "src";
+        assert_eq!(
+            crate::parser::ingest::generation_key(owner_ns, owner_src),
+            crate::parser::ingest::generation_key(lookalike_ns, lookalike_src),
+            "these owner pairs must actually collide on the derived pointer key"
+        );
+        let generation = store.begin_generation(owner_ns, owner_src).await.unwrap();
+        store
+            .publish_generation(owner_ns, owner_src, generation)
+            .await
+            .unwrap();
+
+        let refused = store
+            .recover_pending_relink(lookalike_ns, lookalike_src)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("lease provenance"),
+            "lookalike namespace must not claim the pending relink: {refused}"
+        );
+
+        // The provenance-bearing owner can still recover; once the marker is
+        // clear a second recovery is a no-op.
+        store
+            .recover_pending_relink(owner_ns, owner_src)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .recover_pending_relink(owner_ns, owner_src)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
