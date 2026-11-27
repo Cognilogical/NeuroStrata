@@ -15,6 +15,28 @@ use tantivy::schema::{
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use crate::traits::MemoryPayload;
+use serde_json::Value;
+
+/// Search-visibility predicate for the `archived` tombstone.
+///
+/// This is intentionally wider than the write/API predicate in
+/// [`crate::handlers::archive_memory::is_archived`], which stays strict
+/// (`metadata.archived == true`): the writer owns one canonical shape, while
+/// the index and every read backstop must also recognize the legacy integer
+/// representation some rows still carry. A literal `true` or any non-zero
+/// integer is archived; `false`, zero, strings, arrays, objects, and null are
+/// not. See issue #404.
+pub(crate) fn archived_flag(metadata: &Value) -> bool {
+    match metadata.get("archived") {
+        Some(Value::Bool(flag)) => *flag,
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .map(|value| value != 0)
+            .or_else(|| number.as_u64().map(|value| value != 0))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
 
 // v3 switches `content`, `symbol`, and `location` to the `"code_text"` custom
 // code-aware sub-tokenizer analyzer (`neurostrata-5xjo`).
@@ -575,17 +597,7 @@ impl TantivyLexicalIndex {
             0
         };
         doc.add_i64(self.has_valid_to_f, has_valid_to);
-        let archived: i64 = if payload
-            .metadata
-            .get("archived")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            != 0
-        {
-            1
-        } else {
-            0
-        };
+        let archived: i64 = i64::from(archived_flag(&payload.metadata));
         doc.add_i64(self.archived_f, archived);
         doc.add_i64(self.generation_f, Self::generation_of_id(id));
 
@@ -709,17 +721,7 @@ impl TantivyLexicalIndex {
                     0
                 };
                 doc.add_i64(self.has_valid_to_f, has_valid_to);
-                let archived: i64 = if payload
-                    .metadata
-                    .get("archived")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-                    != 0
-                {
-                    1
-                } else {
-                    0
-                };
+                let archived: i64 = i64::from(archived_flag(&payload.metadata));
                 doc.add_i64(self.archived_f, archived);
                 doc.add_i64(self.generation_f, Self::generation_of_id(id));
                 w.add_document(doc)?;
@@ -1622,6 +1624,93 @@ mod tests {
                 hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
             );
         }
+    }
+
+    /// #404: the search-visibility tombstone predicate must recognize both the
+    /// boolean form written by `archive_memory` and the legacy integer form.
+    /// The upsert path is the live-write route; an archived row must never
+    /// consume a TopDocs slot there.
+    #[test]
+    fn archived_bool_and_int_both_excluded_from_upsert_index() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+
+        let mut bool_archived = dummy_payload("upsertarchiveneedle bool tombstone", None);
+        bool_archived.metadata = json!({"valid_from": 0, "archived": true});
+        idx.upsert_memory("ns", "bool-archived", &bool_archived)
+            .unwrap();
+
+        let mut int_archived = dummy_payload("upsertarchiveneedle int tombstone", None);
+        int_archived.metadata = json!({"valid_from": 0, "archived": 1});
+        idx.upsert_memory("ns", "int-archived", &int_archived)
+            .unwrap();
+
+        idx.upsert_memory(
+            "ns",
+            "visible",
+            &dummy_payload("upsertarchiveneedle visible row", None),
+        )
+        .unwrap();
+
+        let default_page = idx
+            .search("ns", "upsertarchiveneedle", 10, true, false, None)
+            .unwrap();
+        let default_ids: Vec<&str> = default_page.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            default_ids,
+            vec!["visible"],
+            "both archived representations must stay off the default page, got {default_ids:?}"
+        );
+
+        let escape_hatch = idx
+            .search("ns", "upsertarchiveneedle", 10, true, true, None)
+            .unwrap();
+        let escape_ids: std::collections::BTreeSet<&str> =
+            escape_hatch.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            escape_ids.contains("bool-archived") && escape_ids.contains("int-archived"),
+            "include_archived must still find both tombstone shapes, got {escape_ids:?}"
+        );
+    }
+
+    /// #404: the rebuild path must agree with upsert. It previously read only
+    /// `as_i64()`, so `{"archived": true}` rows were indexed as live after any
+    /// rebuild even though the upsert path saw no integer.
+    #[test]
+    fn archived_bool_and_int_both_excluded_from_rebuild() {
+        let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+
+        let mut bool_archived = dummy_payload("rebuildarchiveneedle bool tombstone", None);
+        bool_archived.metadata = json!({"valid_from": 0, "archived": true});
+        let mut int_archived = dummy_payload("rebuildarchiveneedle int tombstone", None);
+        int_archived.metadata = json!({"valid_from": 0, "archived": 1});
+        let visible = dummy_payload("rebuildarchiveneedle visible row", None);
+
+        let rows = vec![
+            ("ns".to_string(), "bool-archived".to_string(), bool_archived),
+            ("ns".to_string(), "int-archived".to_string(), int_archived),
+            ("ns".to_string(), "visible".to_string(), visible),
+        ];
+        idx.rebuild(&rows).unwrap();
+
+        let default_page = idx
+            .search("ns", "rebuildarchiveneedle", 10, true, false, None)
+            .unwrap();
+        let default_ids: Vec<&str> = default_page.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            default_ids,
+            vec!["visible"],
+            "rebuilt tombstones must stay off the default page, got {default_ids:?}"
+        );
+
+        let escape_hatch = idx
+            .search("ns", "rebuildarchiveneedle", 10, true, true, None)
+            .unwrap();
+        let escape_ids: std::collections::BTreeSet<&str> =
+            escape_hatch.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            escape_ids.contains("bool-archived") && escape_ids.contains("int-archived"),
+            "include_archived must still find both rebuilt tombstone shapes, got {escape_ids:?}"
+        );
     }
 
     #[test]

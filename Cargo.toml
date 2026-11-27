@@ -84,6 +84,7 @@ fastembed = { version = "7", default-features = false, features = [
     "hf-hub-rustls-tls",
 ] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 futures = "0.3.34"
 dirs = "7.0.0"
