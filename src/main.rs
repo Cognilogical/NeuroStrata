@@ -3538,6 +3538,22 @@ fn print_learn_control(req: crate::learning::control::LearningControlRequest) {
     }
 }
 
+/// One async lock per normalized candidate version. Two `learn train`
+/// commands whose versions differ only by whitespace target the same
+/// directory; their artifact writes and promotion must not interleave.
+static TRAIN_VERSION_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn train_lock_for(version: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let map =
+        TRAIN_VERSION_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(version.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Build the dedup dataset, train a candidate, evaluate it fail-closed, and
 /// promote it when the real eval report carries numeric metrics.
 async fn run_learn_train(version: &str) -> anyhow::Result<()> {
@@ -3545,6 +3561,13 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
     // identity and promotion persists this exact string for the gating
     // exact-match, so all three must see the same normalized version.
     let version = crate::learning::trainer::normalize_version(version);
+    if version.is_empty() {
+        return Err(anyhow::anyhow!(
+            "learn train requires a non-blank version; refusing before writing any candidate artifacts"
+        ));
+    }
+    let version_lock = train_lock_for(&version);
+    let _version_guard = version_lock.lock().await;
     let root = crate::learning::control::default_learning_dir();
     let paths = crate::judgment::laya_onnx::LearningPaths::new(root.clone());
     let mgr = crate::judgment::laya_onnx::LearningRuntimeManager::new(paths.clone());
@@ -3594,6 +3617,14 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
 
     let bundle = crate::learning::model_bundle::ModelBundle::load(&candidate_dir, "laya")?;
 
+    // A report score alone cannot qualify promotion: both the evaluated
+    // candidate and the bundle that will be served must be the requested one.
+    crate::learning::trainer::assert_candidate_identity(&version, &eval_report, &bundle.version)?;
+
+    // Serialize the manifest read-modify-write with `learn control rollback`.
+    let manifest_lock = crate::learning::trainer::active_manifest_lock(&paths.root_dir());
+    let _manifest_guard = manifest_lock.lock().unwrap_or_else(|e| e.into_inner());
+
     // Promote in the active manifest and persist it.
     let manifest_path = paths.root_dir().join("active_manifest.json");
     let mut manifest: crate::learning::trainer::ActiveManifest = if manifest_path.exists() {
@@ -3615,6 +3646,7 @@ async fn run_learn_train(version: &str) -> anyhow::Result<()> {
     } else {
         crate::learning::trainer::ActiveManifest::default()
     };
+    crate::learning::trainer::normalize_manifest_versions(&mut manifest);
     trainer.promote(&mut manifest, &version, score)?;
     job_state = trainer.transition(
         &job_state,
@@ -3867,6 +3899,16 @@ async fn run_list(read: &ReadSource, namespace: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whitespace_equivalent_versions_share_one_train_lock() {
+        let normalized = |raw: &str| crate::learning::trainer::normalize_version(raw);
+        let first = train_lock_for(&normalized("  v1  "));
+        let second = train_lock_for(&normalized("v1"));
+        let other = train_lock_for(&normalized("v2"));
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
 
     #[test]
     fn fallback_read_only_command_census_is_explicit() {

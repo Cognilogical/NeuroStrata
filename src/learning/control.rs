@@ -90,7 +90,12 @@ fn load_manifest(root: &Path) -> ActiveManifest {
         .map_err(anyhow::Error::from)
         .and_then(|raw| serde_json::from_str::<ActiveManifest>(&raw).map_err(anyhow::Error::from))
     {
-        Ok(manifest) => manifest,
+        Ok(mut manifest) => {
+            // Older runs persisted untrimmed active versions; normalize them
+            // so a previously promoted model still gates after upgrade.
+            crate::learning::trainer::normalize_manifest_versions(&mut manifest);
+            manifest
+        }
         Err(e) => {
             tracing::warn!(
                 "failed to load {} ({}); defaulting to a fresh ActiveManifest",
@@ -112,6 +117,10 @@ pub fn apply_control_at(
         return Err("purge_observations is rejected while running".to_string());
     }
     std::fs::create_dir_all(root).map_err(|e| format!("learning dir {}: {}", root.display(), e))?;
+    // Promotion and rollback both read-modify-write active_manifest.json;
+    // serialize them through the shared per-root lock.
+    let manifest_lock = crate::learning::trainer::active_manifest_lock(root);
+    let _manifest_guard = manifest_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut status = load_status(root);
     let mut manifest = load_manifest(root);
 
@@ -214,6 +223,26 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn legacy_active_version_is_normalized_on_load() {
+        let root = temp_root();
+        std::fs::write(
+            root.join("active_manifest.json"),
+            serde_json::json!({
+                "active_version": "  v-legacy  ",
+                "previous_good_version": " v-old ",
+                "candidate_version": null,
+                "shadow_version": null,
+                "provider_mode": "none"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let manifest = load_manifest(&root);
+        assert_eq!(manifest.active_version.as_deref(), Some("v-legacy"));
+        assert_eq!(manifest.previous_good_version.as_deref(), Some("v-old"));
     }
 
     #[test]

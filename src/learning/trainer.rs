@@ -1,6 +1,8 @@
 //! Local training loop for Laya-based deduplication candidates.
+use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -129,6 +131,66 @@ pub fn normalize_version(raw: &str) -> ModelVersion {
     raw.trim().to_string()
 }
 
+/// Trim a persisted version, treating a blank value as absent. Older training
+/// runs persisted untrimmed active versions; normalization at load time keeps
+/// the standalone-write gate working after upgrade.
+pub fn normalize_optional_version(raw: Option<ModelVersion>) -> Option<ModelVersion> {
+    raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// Normalize every version field in a manifest loaded from disk.
+pub fn normalize_manifest_versions(manifest: &mut ActiveManifest) {
+    manifest.active_version = normalize_optional_version(manifest.active_version.take());
+    manifest.previous_good_version =
+        normalize_optional_version(manifest.previous_good_version.take());
+    manifest.candidate_version = normalize_optional_version(manifest.candidate_version.take());
+    manifest.shadow_version = normalize_optional_version(manifest.shadow_version.take());
+}
+
+/// One process-wide lock per learning root. Promotion and rollback both do a
+/// read-modify-write of `active_manifest.json`; without a shared lock their
+/// writes can clobber one another and lose the last control action.
+static ACTIVE_MANIFEST_LOCKS: OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, Arc<std::sync::Mutex<()>>>>,
+> = OnceLock::new();
+
+pub fn active_manifest_lock(root: &Path) -> Arc<std::sync::Mutex<()>> {
+    let key: std::path::PathBuf = root.components().collect();
+    let map = ACTIVE_MANIFEST_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(key)
+        .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Promotion is only legal when the report that supplied the score and the
+/// bundle that will be served both declare the exact requested identity.
+pub fn assert_candidate_identity(
+    version: &ModelVersion,
+    report: &EvaluationReport,
+    bundle_version: &str,
+) -> Result<()> {
+    let expected = version.trim();
+    if expected.is_empty() {
+        return Err(anyhow!("Promotion refused: empty requested version"));
+    }
+    if report.candidate.trim() != expected {
+        return Err(anyhow!(
+            "Promotion refused: evaluation report candidate '{}' is not the requested version '{}'",
+            report.candidate,
+            expected
+        ));
+    }
+    if bundle_version.trim() != expected {
+        return Err(anyhow!(
+            "Promotion refused: candidate bundle version '{}' is not the requested version '{}'",
+            bundle_version,
+            expected
+        ));
+    }
+    Ok(())
+}
+
 /// Local training runtime wrapper used by the coordinator.
 pub struct Trainer {
     runtime: Arc<LocalTrainingRuntime>,
@@ -143,6 +205,11 @@ impl Trainer {
     /// Delegates to the provisioned `laya-train` executable when available;
     /// never fabricates a success marker.
     pub async fn train_candidate(&self, version: &ModelVersion) -> Result<()> {
+        // A blank identity would join to the candidates directory itself and
+        // overwrite shared artifacts, so refuse before creating any path.
+        if version.trim().is_empty() {
+            return Err(anyhow!("Training refused: blank candidate version"));
+        }
         if self.runtime.python.exists() && self.runtime.laya_train.exists() {
             // Delegate to external laya-train runtime.
             let mut cmd = tokio::process::Command::new(&self.runtime.laya_train);
@@ -548,19 +615,85 @@ mod tests {
     }
 
     #[test]
+    fn normalize_version_trims_directly() {
+        // Assert the CLI-boundary normalizer itself: checking only the value
+        // that promote persists would let a broken normalizer pass.
+        assert_eq!(normalize_version("  v-trimmed  "), "v-trimmed");
+        assert!(normalize_version("   ").is_empty());
+    }
+
+    #[test]
     fn promote_normalizes_whitespace_version() {
+        let normalized = normalize_version("  v-trimmed  ");
+        assert_eq!(normalized, "v-trimmed");
         let mut manifest = ActiveManifest::default();
         let t = Trainer::new(Arc::new(LocalTrainingRuntime {
             python: PathBuf::from("python"),
             laya_train: PathBuf::from("laya-train"),
             model_cache: PathBuf::from(".cache/laya"),
         }));
-        t.promote(&mut manifest, &normalize_version("  v-trimmed  "), 0.9)
-            .unwrap();
+        t.promote(&mut manifest, &normalized, 0.9).unwrap();
         // The provider trims the manifest identity, so active_version must be
         // the trimmed value for the exact-match gate to fire.
         assert_eq!(manifest.active_version.as_deref(), Some("v-trimmed"));
         assert!(t.promote(&mut manifest, &"   ".to_string(), 0.9).is_err());
+    }
+
+    #[test]
+    fn promotion_requires_report_and_bundle_identity_match() {
+        let report = EvaluationReport {
+            candidate: "v-real".to_string(),
+            suites: vec![SuiteReport {
+                name: "gold".to_string(),
+                metrics: serde_json::json!({"score": 0.9}),
+            }],
+        };
+        assert!(assert_candidate_identity(&"v-real".to_string(), &report, "v-real").is_ok());
+        // A different candidate's score cannot qualify this bundle.
+        assert!(assert_candidate_identity(&"v-real".to_string(), &report, "v-other").is_err());
+        let mut other = report.clone();
+        other.candidate = "v-other".to_string();
+        assert!(assert_candidate_identity(&"v-real".to_string(), &other, "v-real").is_err());
+        assert!(assert_candidate_identity(&"   ".to_string(), &report, "v-real").is_err());
+    }
+
+    #[test]
+    fn normalize_manifest_versions_trims_legacy_active() {
+        let mut manifest = ActiveManifest {
+            active_version: Some("  v-legacy  ".to_string()),
+            previous_good_version: Some(" v-old ".to_string()),
+            candidate_version: Some(" ".to_string()),
+            shadow_version: None,
+            provider_mode: "none".to_string(),
+        };
+        normalize_manifest_versions(&mut manifest);
+        assert_eq!(manifest.active_version.as_deref(), Some("v-legacy"));
+        assert_eq!(manifest.previous_good_version.as_deref(), Some("v-old"));
+        assert_eq!(manifest.candidate_version, None);
+    }
+
+    #[test]
+    fn active_manifest_lock_is_shared_per_root() {
+        let first = active_manifest_lock(PathBuf::from("/tmp/ns-manifest-lock").as_path());
+        let second = active_manifest_lock(PathBuf::from("/tmp/ns-manifest-lock/").as_path());
+        let other = active_manifest_lock(PathBuf::from("/tmp/ns-other-lock").as_path());
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[tokio::test]
+    async fn train_candidate_rejects_blank_version_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = Trainer::new(Arc::new(LocalTrainingRuntime {
+            python: PathBuf::from("/nonexistent/python"),
+            laya_train: PathBuf::from("/nonexistent/laya-train"),
+            model_cache: tmp.path().to_path_buf(),
+        }));
+        assert!(t.train_candidate(&"   ".to_string()).await.is_err());
+        assert!(
+            std::fs::read_dir(tmp.path().join("candidates")).is_err(),
+            "blank version must not create a candidate directory"
+        );
     }
 
     #[test]

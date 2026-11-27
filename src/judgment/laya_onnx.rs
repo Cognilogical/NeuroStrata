@@ -35,6 +35,19 @@ pub fn resolve_manifest_identity(manifest: &serde_json::Value) -> Option<String>
         .map(str::to_string)
 }
 
+/// Journal written before an installed bundle is set aside. `target` is a
+/// symlink into a content directory, so normal replacement is one atomic
+/// rename; the journal exists only for the legacy real-directory conversion,
+/// where the target is briefly moved, and lets a later fetch or load finish
+/// or roll back an interrupted conversion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SwapJournal {
+    version: u32,
+    target_name: String,
+    new_content: String,
+    old_content: Option<String>,
+}
+
 /// A `JudgmentProvider` for Laya ONNX models loaded and validated by the
 /// runtime system. Inference is performed locally via ONNX Runtime with
 /// `spawn_blocking` to avoid blocking the async runtime.
@@ -62,6 +75,11 @@ impl LayaOnnxProvider {
     /// semaphore. Validates the bundle layout (manifest, checkpoint paths,
     /// embedder identity) before attaching.
     pub fn load(bundle_dir: &Path, semaphore: Arc<Semaphore>) -> Result<Self> {
+        // A process may have stopped between set-aside and re-link of a legacy
+        // bundle; serve the recovered artifact instead of a missing target.
+        if let Err(e) = Self::recover_interrupted_swap(bundle_dir) {
+            tracing::warn!(?e, "could not recover interrupted Laya bundle swap");
+        }
         let canonical = std::fs::canonicalize(bundle_dir)?;
         let manifest_path = canonical.join("manifest.json");
         if !manifest_path.exists() {
@@ -210,8 +228,8 @@ impl LayaOnnxProvider {
     }
 
     /// Validate a downloaded bundle before reporting a successful fetch.
-    /// `load` would reject an unversioned bundle later, so refuse it here
-    /// instead of handing callers an unusable artifact.
+    /// Both loaders require a declared identity and a string embedder id, so
+    /// refuse a staged bundle that either would reject later.
     fn validate_fetched_bundle(target_path: &Path) -> Result<()> {
         let manifest_path = target_path.join("manifest.json");
         if !manifest_path.exists() {
@@ -233,7 +251,94 @@ impl LayaOnnxProvider {
                 target_path.display()
             ));
         }
+        if manifest
+            .get("embedder_id")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            return Err(anyhow!(
+                "Downloaded Laya bundle at {} declares no non-empty string embedder_id",
+                target_path.display()
+            ));
+        }
         Ok(())
+    }
+
+    fn bundle_parent(target: &Path) -> &Path {
+        target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
+
+    fn bundle_target_name(target: &Path) -> String {
+        target
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "bundle".to_string())
+    }
+
+    fn swap_journal_path(parent: &Path, name: &str) -> PathBuf {
+        parent.join(format!(".{name}.swap.json"))
+    }
+
+    fn write_swap_journal(parent: &Path, name: &str, journal: &SwapJournal) -> Result<()> {
+        let tmp = parent.join(format!(".{name}.swap-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, serde_json::to_string(journal)?)?;
+        std::fs::rename(&tmp, Self::swap_journal_path(parent, name))?;
+        Ok(())
+    }
+
+    /// Point `target` at a sibling content directory with one atomic symlink
+    /// rename. Readers following `target` always see a complete bundle.
+    fn point_target_to_content(parent: &Path, target: &Path, content_name: &str) -> Result<()> {
+        let link = parent.join(format!(
+            ".{}.link-{}",
+            Self::bundle_target_name(target),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(content_name, &link)
+            .map_err(|e| anyhow!("Cannot create replacement bundle link: {e}"))?;
+        std::fs::rename(&link, target).map_err(|e| {
+            let _ = std::fs::remove_file(&link);
+            anyhow!(
+                "Cannot atomically replace bundle at {}: {e}",
+                target.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Build an error that names the preserved backup when restoring the
+    /// installed bundle fails; never let a missing target look like success.
+    fn restore_failure(
+        target: &Path,
+        backup: &Path,
+        install_err: anyhow::Error,
+        restore_err: Option<anyhow::Error>,
+    ) -> anyhow::Error {
+        let base = format!(
+            "Cannot install staged bundle at {}: {install_err}",
+            target.display()
+        );
+        match restore_err {
+            None => anyhow!("{base}; legacy bundle restored from {}", backup.display()),
+            Some(re) => anyhow!(
+                "{base}; FAILED to restore legacy bundle from {}: {re}; backup preserved at {} for manual recovery",
+                backup.display(),
+                backup.display()
+            ),
+        }
+    }
+
+    fn finish_swap_cleanup(parent: &Path, name: &str, old_content: Option<&str>) {
+        if let Some(old) = old_content.filter(|o| !o.is_empty()) {
+            let _ = std::fs::remove_dir_all(parent.join(old));
+        }
+        let _ = std::fs::remove_file(Self::swap_journal_path(parent, name));
     }
 
     /// Validate a fully staged bundle, then swap it into `target`. Never
@@ -244,52 +349,158 @@ impl LayaOnnxProvider {
         Self::swap_bundle_dirs(staging, target)
     }
 
-    /// Rename-based replacement. The old target is held as a backup and
-    /// restored if the final rename fails, so there is no window in which a
-    /// caller observes a half-installed bundle.
+    /// Replace the bundle by re-pointing a symlink, so `target` is never
+    /// absent and a crash cannot strand an installed bundle. A legacy real
+    /// directory is journaled before being set aside; the journal lets a
+    /// later fetch or load finish or roll back the conversion.
     fn swap_bundle_dirs(staging: &Path, target: &Path) -> Result<()> {
-        if !target.exists() {
-            std::fs::rename(staging, target).map_err(|e| {
-                anyhow!("Cannot install staged bundle at {}: {e}", target.display())
-            })?;
-            return Ok(());
-        }
-        let name = target
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "bundle".to_string());
-        let backup = target.with_file_name(format!(".{name}.backup-{}", uuid::Uuid::new_v4()));
-        let _ = std::fs::remove_dir_all(&backup);
-        std::fs::rename(target, &backup).map_err(|e| {
-            anyhow!(
-                "Cannot set aside existing bundle at {}: {e}",
-                target.display()
-            )
-        })?;
-        if let Err(e) = std::fs::rename(staging, target) {
-            let _ = std::fs::rename(&backup, target);
+        let parent = Self::bundle_parent(target);
+        let name = Self::bundle_target_name(target);
+        let content_name = format!(".{name}.content-{}", uuid::Uuid::new_v4());
+        let content = parent.join(&content_name);
+        if !staging.is_dir() {
             return Err(anyhow!(
-                "Cannot install staged bundle at {}: {e}",
-                target.display()
+                "Cannot install staged bundle: staging dir {} is missing",
+                staging.display()
             ));
         }
-        let _ = std::fs::remove_dir_all(&backup);
-        Ok(())
+        std::fs::rename(staging, &content)
+            .map_err(|e| anyhow!("Cannot promote staged bundle to {}: {e}", content.display()))?;
+
+        match std::fs::symlink_metadata(target) {
+            Ok(md) if md.file_type().is_symlink() => {
+                // Swap is one atomic rename; the old target stays readable
+                // until the new link is in place, and a crash only leaks an
+                // orphan content directory.
+                let old_content = std::fs::read_link(target)
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .filter(|n| n != &content_name);
+                let journal = SwapJournal {
+                    version: 1,
+                    target_name: name.clone(),
+                    new_content: content_name.clone(),
+                    old_content: old_content.clone(),
+                };
+                Self::write_swap_journal(parent, &name, &journal)?;
+                if let Err(e) = Self::point_target_to_content(parent, target, &content_name) {
+                    let _ = std::fs::remove_dir_all(&content);
+                    let _ = std::fs::remove_file(Self::swap_journal_path(parent, &name));
+                    return Err(e);
+                }
+                Self::finish_swap_cleanup(parent, &name, old_content.as_deref());
+                Ok(())
+            }
+            Ok(md) if md.is_dir() => {
+                // Legacy layout: journal before the target is set aside.
+                let old_name = format!(".{name}.legacy-{}", uuid::Uuid::new_v4());
+                let backup = parent.join(&old_name);
+                let journal = SwapJournal {
+                    version: 1,
+                    target_name: name.clone(),
+                    new_content: content_name.clone(),
+                    old_content: Some(old_name.clone()),
+                };
+                Self::write_swap_journal(parent, &name, &journal)?;
+                if let Err(e) = std::fs::rename(target, &backup) {
+                    let _ = std::fs::remove_file(Self::swap_journal_path(parent, &name));
+                    let _ = std::fs::remove_dir_all(&content);
+                    return Err(anyhow!(
+                        "Cannot set aside legacy bundle at {}: {e}",
+                        target.display()
+                    ));
+                }
+                if let Err(install_err) =
+                    Self::point_target_to_content(parent, target, &content_name)
+                {
+                    let restore = std::fs::rename(&backup, target);
+                    return Err(Self::restore_failure(
+                        target,
+                        &backup,
+                        install_err,
+                        restore.err().map(anyhow::Error::from),
+                    ));
+                }
+                let _ = std::fs::remove_dir_all(&backup);
+                let _ = std::fs::remove_file(Self::swap_journal_path(parent, &name));
+                Ok(())
+            }
+            _ => {
+                // No installed bundle: a single symlink creation.
+                Self::point_target_to_content(parent, target, &content_name)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Complete or roll back a swap interrupted by a process stop, so a
+    /// reader never finds the configured bundle path missing.
+    pub(crate) fn recover_interrupted_swap(target: &Path) -> Result<()> {
+        let parent = Self::bundle_parent(target);
+        let name = Self::bundle_target_name(target);
+        let journal_path = Self::swap_journal_path(parent, &name);
+        if !journal_path.exists() {
+            return Ok(());
+        }
+        let text = match std::fs::read_to_string(&journal_path) {
+            Ok(t) => t,
+            Err(_) => return Ok(()),
+        };
+        let journal: SwapJournal = match serde_json::from_str::<SwapJournal>(&text) {
+            Ok(j) if j.version == 1 => j,
+            _ => return Ok(()),
+        };
+        match std::fs::symlink_metadata(target) {
+            Ok(md) if md.file_type().is_symlink() => {
+                // A link resolving to a complete bundle means the swap
+                // finished; only stale backup/journal cleanup remains.
+                if target.join("manifest.json").exists() && target.join("model.onnx").exists() {
+                    Self::finish_swap_cleanup(parent, &name, journal.old_content.as_deref());
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let new = parent.join(&journal.new_content);
+                let old = journal
+                    .old_content
+                    .as_ref()
+                    .map(|o| parent.join(o))
+                    .filter(|p| p.is_dir());
+                if new.is_dir() {
+                    Self::point_target_to_content(parent, target, &journal.new_content)?;
+                    Self::finish_swap_cleanup(parent, &name, journal.old_content.as_deref());
+                    Ok(())
+                } else if let Some(old) = old {
+                    let old_name = old
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    Self::point_target_to_content(parent, target, &old_name)?;
+                    Self::finish_swap_cleanup(parent, &name, None);
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        "Interrupted bundle swap at {} has no recoverable content (journal {})",
+                        target.display(),
+                        journal_path.display()
+                    ))
+                }
+            }
+            _ => {
+                // A legacy real directory is still usable; drop stale journal.
+                let _ = std::fs::remove_file(&journal_path);
+                Ok(())
+            }
+        }
     }
 
     /// Blocking half of `fetch_model`. One exclusive lock per target covers
     /// the entire download-validate-swap sequence so concurrent fetches can
     /// neither interleave files nor replace each other's result.
     fn fetch_model_blocking(model_id: &str, target: &Path) -> Result<()> {
-        let parent = target
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
+        let parent = Self::bundle_parent(target);
         std::fs::create_dir_all(parent)?;
-        let name = target
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "bundle".to_string());
+        let name = Self::bundle_target_name(target);
         use fs2::FileExt;
         let lock = std::fs::OpenOptions::new()
             .create(true)
@@ -299,6 +510,7 @@ impl LayaOnnxProvider {
             .open(parent.join(format!(".{name}.fetch.lock")))?;
         lock.lock_exclusive()?;
         let result = (|| {
+            Self::recover_interrupted_swap(target)?;
             let staging = parent.join(format!(".{name}.staging-{}", uuid::Uuid::new_v4()));
             let _ = std::fs::remove_dir_all(&staging);
             std::fs::create_dir_all(&staging)?;
@@ -902,8 +1114,129 @@ mod tests {
             .expect("valid downloaded bundle installs");
         let manifest = std::fs::read_to_string(target.join("manifest.json")).unwrap();
         assert!(manifest.contains("new-v2"));
+        // A successful fetch must install a usable bundle, not just a new
+        // manifest: the downloaded model bytes have to be present and loadable.
+        assert_eq!(
+            std::fs::read(target.join("model.onnx")).unwrap(),
+            b"new-model"
+        );
+        assert!(
+            std::fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a validated fetch installs through a symlink so target never disappears"
+        );
+        LayaOnnxProvider::load(&target, std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+            .expect("installed bundle must be loadable");
         assert!(staging_leftovers(&root).is_empty());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn invalid_fetch_missing_embedder_preserves_installed_bundle() {
+        let root = std::env::temp_dir().join(format!("ns-fetch-embedder-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        local_registry_with_bundle(&root, r#"{"model_version":"new-v2"}"#);
+        let target = root.join("bundle");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            target.join("manifest.json"),
+            r#"{"embedder_id":"laya","model_version":"installed-v1"}"#,
+        )
+        .unwrap();
+        std::fs::write(target.join("model.onnx"), b"installed-model").unwrap();
+        std::fs::copy(root.join("registry.json"), target.join("registry.json")).unwrap();
+
+        assert!(
+            LayaOnnxProvider::fetch_model("laya-test", target.to_str().unwrap())
+                .await
+                .is_err()
+        );
+        assert!(std::fs::read_to_string(target.join("manifest.json"))
+            .unwrap()
+            .contains("installed-v1"));
+        assert_eq!(
+            std::fs::read(target.join("model.onnx")).unwrap(),
+            b"installed-model"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn interrupted_legacy_swap_recovers_installed_bundle() {
+        let root = std::env::temp_dir().join(format!("ns-swap-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("bundle");
+        // Simulate a crash after the legacy target was set aside but before
+        // the symlink was installed: journal present, target absent, new
+        // content fully validated.
+        std::fs::create_dir_all(root.join(".bundle.content-recovered")).unwrap();
+        std::fs::write(
+            root.join(".bundle.content-recovered/manifest.json"),
+            r#"{"embedder_id":"laya","model_version":"new-v2"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".bundle.content-recovered/model.onnx"),
+            b"new-model",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".bundle.swap.json"),
+            serde_json::json!({
+                "version": 1,
+                "target_name": "bundle",
+                "new_content": ".bundle.content-recovered",
+                "old_content": ".bundle.legacy-old"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        LayaOnnxProvider::recover_interrupted_swap(&target).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("manifest.json")).unwrap(),
+            r#"{"embedder_id":"laya","model_version":"new-v2"}"#
+        );
+        assert_eq!(
+            std::fs::read(target.join("model.onnx")).unwrap(),
+            b"new-model"
+        );
+        assert!(!root.join(".bundle.swap.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_staging_never_removes_installed_bundle() {
+        let root = std::env::temp_dir().join(format!("ns-swap-safe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("bundle");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("model.onnx"), b"installed-model").unwrap();
+        assert!(LayaOnnxProvider::swap_bundle_dirs(&root.join("absent"), &target).is_err());
+        assert_eq!(
+            std::fs::read(target.join("model.onnx")).unwrap(),
+            b"installed-model"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failed_restore_names_preserved_backup() {
+        let target = PathBuf::from("/tmp/ns-bundle/bundle");
+        let backup = PathBuf::from("/tmp/ns-bundle/.bundle.legacy-old");
+        let err = LayaOnnxProvider::restore_failure(
+            &target,
+            &backup,
+            anyhow!("install failed"),
+            Some(anyhow!("restore failed")),
+        );
+        let msg = format!("{err:?}");
+        assert!(msg.contains("install failed"));
+        assert!(msg.contains("restore failed"));
+        assert!(msg.contains(".bundle.legacy-old"));
+        assert!(msg.contains("manual recovery"));
     }
 
     #[tokio::test]
