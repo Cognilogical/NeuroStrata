@@ -604,6 +604,39 @@
         "ignored": 0
       }
     },
+    "guard-sandbox-hardening": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp guard::sandbox::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "guard::sandbox::tests::sandbox_image_is_digest_pinned_and_never_latest",
+        "guard::sandbox::tests::sandbox_args_pin_the_hardening_set",
+        "guard::sandbox::tests::forbidden_working_directories_are_refused",
+        "guard::sandbox::tests::exact_home_directory_is_refused_but_descendants_are_allowed",
+        "guard::sandbox::tests::a_project_working_directory_is_allowed",
+        "guard::sandbox::tests::a_timed_out_run_kills_and_reaps_its_child",
+        "guard::sandbox::tests::a_large_payload_to_a_child_that_never_reads_stdin_times_out_and_reaps",
+        "guard::sandbox::tests::unknown_home_fails_closed",
+        "guard::sandbox::tests::a_descendant_holding_a_pipe_does_not_hang_the_verdict",
+        "guard::sandbox::tests::stalled_cleanup_child_is_killed_and_reaped",
+        "guard::sandbox::tests::mount_cwd_revalidation_detects_a_swapped_symlink",
+        "guard::sandbox::tests::sandbox_concurrency_is_bounded",
+        "guard::sandbox::tests::post_kill_reap_is_bounded",
+        "guard::sandbox::tests::sync_removal_failure_is_a_cleanup_failure",
+        "guard::sandbox::tests::permit_is_held_until_container_cleanup_finishes",
+        "guard::sandbox::tests::bounded_sync_removal_kills_a_stalled_cleanup_child",
+        "guard::sandbox::tests::workspace_scope_refuses_paths_outside_the_project_root",
+        "guard::sandbox::tests::effective_concurrency_bounds_aggregate_memory",
+        "guard::sandbox::tests::unsupported_action_types_are_approved_fail_open",
+        "guard::sandbox::tests::pipe_read_errors_are_reported_with_partial_output",
+        "guard::sandbox::tests::registry_suite_membership_is_checked_not_global_contains",
+        "guard::sandbox::tests::available_permits_are_not_counted_as_queue_waiters",
+        "guard::sandbox::tests::sandbox_args_make_root_read_only_and_bound_scratch"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "graphql-semantics": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp graphql::tests -- --test-threads=1"
