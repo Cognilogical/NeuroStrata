@@ -624,7 +624,7 @@
         "ingest_jobs::tests::poisoned_lock_returns_error_not_panic",
         "events::bus::tests::poisoned_queue_degrades_not_panics",
         "events::bus::tests::poisoned_registry_degrades_not_panics",
-        "events::bus::tests::poisoned_registry_snapshot_skips_one_pulse_not_the_dispatcher",
+        "events::bus::tests::poisoned_registry_snapshot_skips_one_pulse_not_the_dispatcher"
       ],
       "thresholds": {
         "ignored": 0
@@ -645,7 +645,7 @@
         "tests::rust_log_filter_is_honored",
         "tests::unparsable_rust_log_falls_back_to_info",
         "tests::final_checkpoint_report_is_the_exit_report_whole_content",
-        "tests::restore_holds_target_open_lock_until_database_and_provenance_are_installed",
+        "tests::restore_holds_target_open_lock_until_database_and_provenance_are_installed"
       ],
       "thresholds": {
         "ignored": 0
