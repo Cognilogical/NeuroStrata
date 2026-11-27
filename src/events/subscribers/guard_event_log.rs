@@ -23,7 +23,8 @@
 //! than of *calls* -- and the retry is usually the interesting part.
 
 use crate::events::{
-    MemorySubscriber, RecursionToken, SubscriberContext, SubscriberError, ThalamicPulse,
+    DurableDelivery, EventClass, MemorySubscriber, RecursionToken, SubscriberContext,
+    SubscriberError, ThalamicPulse,
 };
 use crate::traits::MemoryPayload;
 use async_trait::async_trait;
@@ -96,7 +97,7 @@ impl MemorySubscriber for GuardEventLog {
         ctx.store
             .upsert(
                 namespace,
-                &audit_id(),
+                &audit_id(ctx.delivery),
                 vec![0.0; self.dimensions],
                 audit_payload(
                     namespace,
@@ -113,11 +114,19 @@ impl MemorySubscriber for GuardEventLog {
     }
 }
 
-/// One row's id. A fresh v4 per call, so two calls that share a `trace_id`
-/// still get two rows: `upsert` MERGEs on id, and the id is the only thing
-/// standing between a retry and a silently overwritten audit trail.
-fn audit_id() -> String {
-    format!("{GUARD_EVENT_ID_PREFIX}::{}", uuid::Uuid::new_v4())
+/// One row's id. A durable delivery gets an id derived from its generation and
+/// sequence, so a replay after the upsert but before the offset advance MERGEs
+/// into the same row instead of creating a second one. The lossy path keeps a
+/// fresh v4 per call: two calls sharing a `trace_id` are still two rows.
+fn audit_id(delivery: Option<DurableDelivery>) -> String {
+    match delivery {
+        Some(DurableDelivery {
+            class: EventClass::Audit,
+            generation,
+            seq,
+        }) => format!("{GUARD_EVENT_ID_PREFIX}::{generation}::{seq}"),
+        _ => format!("{GUARD_EVENT_ID_PREFIX}::{}", uuid::Uuid::new_v4()),
+    }
 }
 
 /// The audit row: what was decided, about what, and on whose call.

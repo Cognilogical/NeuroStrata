@@ -65,6 +65,12 @@ use std::sync::{Mutex, MutexGuard};
 /// a long-running daemon grow the outbox past its cap.
 pub(crate) const RUNTIME_COMPACTION_INTERVAL: u64 = 32;
 
+/// Bound on out-of-order acknowledgments held for a class. With a permanently
+/// failing early entry, every later success would otherwise add a sequence to
+/// this set (and to the offsets file) forever. Dropping the oldest entries is
+/// safe under at-least-once: they redeliver and the consumer absorbs them.
+const MAX_OUT_OF_ORDER_ACKS: usize = 4096;
+
 /// The append-only entries file, inside the outbox directory.
 pub const OUTBOX_FILE_NAME: &str = "event-outbox.jsonl";
 
@@ -141,6 +147,10 @@ pub struct DurableDelivery {
     pub class: EventClass,
     /// The entry's position in the single cross-class sequence.
     pub seq: u64,
+    /// Instance identity of the outbox that assigned `seq`. A recreated outbox
+    /// restarts at 1; without this a fresh delivery can collide with a stale
+    /// committed marker or audit row from the old instance.
+    pub generation: u64,
 }
 
 /// One durable entry: the outbox line format.
@@ -247,6 +257,11 @@ struct Offsets {
     /// sequence never restarts at 1.
     #[serde(default)]
     base_seq: u64,
+    /// Persisted instance id. Fresh when the outbox is first created; stable
+    /// across restarts, so delivery identities cannot be reused by a later
+    /// outbox that happens to start its sequence at the same number.
+    #[serde(default)]
+    generation: u64,
     /// The highest contiguous acknowledged sequence for the class: every
     /// class entry at or below it is acknowledged.
     #[serde(default)]
@@ -267,6 +282,7 @@ impl Default for Offsets {
         Self {
             v: FORMAT_VERSION,
             base_seq: 0,
+            generation: 0,
             audit: 0,
             mesh: 0,
             audit_acked: Vec::new(),
@@ -327,6 +343,9 @@ struct Inner {
     poisoned: bool,
     /// Complete but corrupt lines skipped at open.
     corrupt_skipped: u64,
+    /// Lines this version cannot interpret. Kept verbatim and rewritten by
+    /// compaction so an older reader cannot delete newer-version records.
+    opaque_lines: Vec<Vec<u8>>,
 }
 
 impl Inner {
@@ -449,39 +468,55 @@ fn repair_torn_tail(path: &Path, bytes: &[u8]) -> Result<usize, EventOutboxError
 /// Parse the clean prefix into entries, skipping and counting complete lines
 /// that are not valid UTF-8, not JSON, not an `OutboxEntry`, or not the current
 /// format version. One bad line never fails the open.
-fn parse_entries(bytes: &[u8], path: &Path) -> (Vec<OutboxEntry>, u64) {
+fn parse_entries(bytes: &[u8], path: &Path) -> (Vec<OutboxEntry>, u64, u64, Vec<Vec<u8>>) {
     let mut entries = Vec::new();
     let mut corrupt = 0u64;
+    let mut corrupt_high_seq = 0u64;
+    // Raw lines this reader cannot interpret are kept verbatim. Compaction may
+    // rewrite the file, but it must never silently delete a record written by a
+    // newer reader: the sequence belongs to the whole deployment, not to one
+    // binary's struct definition.
+    let mut opaque_lines: Vec<Vec<u8>> = Vec::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
         }
-        let parsed = std::str::from_utf8(line)
-            .map_err(|err| err.to_string())
-            .and_then(|text| {
-                serde_json::from_str::<OutboxEntry>(text).map_err(|err| err.to_string())
-            });
+        let text = std::str::from_utf8(line).ok();
+        let parsed = text.and_then(|text| serde_json::from_str::<OutboxEntry>(text).ok());
         match parsed {
-            Ok(entry) if entry.v == FORMAT_VERSION => entries.push(entry),
-            Ok(entry) => {
+            Some(entry) if entry.v == FORMAT_VERSION => entries.push(entry),
+            Some(entry) => {
                 tracing::warn!(
-                    "event outbox: skipping an entry with unsupported version {} in {}",
+                    "event outbox: keeping an entry with unsupported version {} in {}",
                     entry.v,
                     path.display()
                 );
                 corrupt += 1;
+                corrupt_high_seq = corrupt_high_seq.max(entry.seq);
+                opaque_lines.push(line.to_vec());
             }
-            Err(err) => {
+            None => {
+                // A corrupt line can still carry the sequence that was handed
+                // to the mesh before the bus lost its own offset write. That
+                // sequence must stay retired even though its payload is gone.
+                if let Some(seq) = text.and_then(|text| {
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .ok()
+                        .and_then(|value| value.get("seq").and_then(|seq| seq.as_u64()))
+                }) {
+                    corrupt_high_seq = corrupt_high_seq.max(seq);
+                }
                 tracing::warn!(
-                    "event outbox: skipping a corrupt line in {}: {err}",
+                    "event outbox: skipping a corrupt line in {} (kept verbatim for compaction)",
                     path.display()
                 );
                 corrupt += 1;
+                opaque_lines.push(line.to_vec());
             }
         }
     }
     entries.sort_by_key(|entry| entry.seq);
-    (entries, corrupt)
+    (entries, corrupt, corrupt_high_seq, opaque_lines)
 }
 
 impl EventOutbox {
@@ -496,18 +531,32 @@ impl EventOutbox {
     /// the default; tests use a small cap to exercise the size rule without
     /// writing eight megabytes.
     pub fn open_with_max_bytes(dir: &Path, max_bytes: u64) -> Result<Self, EventOutboxError> {
-        std::fs::create_dir_all(dir)?;
+        create_private_dir(dir)?;
         let path = dir.join(OUTBOX_FILE_NAME);
-        if !path.exists() {
-            // Create it now so no reader ever races a missing file.
-            File::create(&path)?;
-        }
+        // Create (and tighten) the entries file now so no reader ever races a
+        // missing file and no old world-readable mode survives an upgrade.
+        // The directory entry must be durable too, not just the file's data.
+        let _probe = open_private_append(&path)?;
+        sync_dir(dir);
         let mut offsets = read_offsets(dir);
+        // A missing (zero) generation identifies a fresh instance: stamp and
+        // persist it before any append so a recreated outbox cannot reuse
+        // delivery identities an older instance already committed.
+        let mut generation_changed = offsets.generation == 0;
+        if generation_changed {
+            let random = uuid::Uuid::now_v7().as_u128() as u64;
+            offsets.generation = if random == 0 { 1 } else { random };
+        }
         let raw = std::fs::read(&path)?;
         let clean_len = repair_torn_tail(&path, &raw)?;
-        let (entries, corrupt_skipped) = parse_entries(&raw[..clean_len], &path);
+        let (entries, corrupt_skipped, corrupt_high_seq, opaque_lines) =
+            parse_entries(&raw[..clean_len], &path);
         let max_entry = entries.iter().map(|entry| entry.seq).max().unwrap_or(0);
-        let base_seq = offsets.high_water().max(max_entry);
+        let base_seq = offsets
+            .high_water()
+            .max(max_entry)
+            .max(corrupt_high_seq);
+        generation_changed |= offsets.base_seq != base_seq;
         offsets.base_seq = base_seq;
         let audit_acked: BTreeSet<u64> = offsets
             .audit_acked
@@ -521,6 +570,13 @@ impl EventOutbox {
             .copied()
             .filter(|seq| *seq > offsets.mesh)
             .collect();
+        // Persist the generation and the recovered high-water mark now. A
+        // crash before the first append must not forget either one: the corrupt
+        // line's sequence stays retired, and the generation stays this
+        // instance's identity.
+        if generation_changed {
+            write_offsets(dir, offsets.clone())?;
+        }
         let outbox = Self {
             dir: dir.to_path_buf(),
             max_bytes,
@@ -534,6 +590,7 @@ impl EventOutbox {
                 advances_since_compaction: 0,
                 poisoned: false,
                 corrupt_skipped,
+                opaque_lines,
             }),
         };
         let skipped = outbox.corrupt_entries_skipped();
@@ -573,10 +630,7 @@ impl EventOutbox {
         if inner.poisoned {
             return Err(EventOutboxError::Poisoned);
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.entries_path())?;
+        let mut file = open_private_append(&self.entries_path())?;
         self.append_locked(&mut inner, class, pulse, &mut file)
     }
 
@@ -614,7 +668,13 @@ impl EventOutbox {
         inner.entries.push(entry);
         inner.next_seq = seq + 1;
         inner.base_seq = inner.base_seq.max(seq);
-        inner.offsets.base_seq = inner.offsets.base_seq.max(inner.base_seq);
+        // Persist the high-water mark with the append, not only at the next
+        // offset advance: a corrupt tail then cannot make a later instance
+        // reuse a sequence the mesh already committed.
+        let mut offsets = inner.offsets.clone();
+        offsets.base_seq = offsets.base_seq.max(inner.base_seq);
+        write_offsets(&self.dir, offsets.clone())?;
+        inner.offsets = offsets;
         Ok(seq)
     }
 
@@ -653,6 +713,27 @@ impl EventOutbox {
             .collect()
     }
 
+    /// At most `limit` unacknowledged entries for `class`, in sequence order.
+    /// Startup replay and dispatcher top-up use this instead of materialising
+    /// the whole backlog before applying a cap.
+    pub fn pending_limited(&self, class: EventClass, limit: usize) -> Vec<OutboxEntry> {
+        let inner = match self.lock() {
+            Ok(inner) => inner,
+            Err(_) => return Vec::new(),
+        };
+        let offset = inner.offsets.get(class);
+        let acked = inner.acked(class);
+        inner
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.class == class && entry.seq > offset && !acked.contains(&entry.seq)
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
     /// The last sequence this class acknowledged.
     #[cfg(test)]
     pub fn offset(&self, class: EventClass) -> u64 {
@@ -669,6 +750,14 @@ impl EventOutbox {
             Ok(inner) => inner.base_seq.max(inner.offsets.base_seq),
             Err(_) => 0,
         }
+    }
+
+    /// This outbox instance's persisted generation. Combined with a delivery
+    /// sequence it forms an identity a recreated outbox cannot collide with.
+    pub fn generation(&self) -> u64 {
+        self.lock()
+            .map(|inner| inner.offsets.generation)
+            .unwrap_or(0)
     }
 
     /// Complete but corrupt lines skipped by the last [`EventOutbox::open`].
@@ -721,6 +810,9 @@ impl EventOutbox {
         }
         .max(current);
         acked.retain(|acked_seq| *acked_seq > new_offset);
+        while acked.len() > MAX_OUT_OF_ORDER_ACKS {
+            acked.pop_first();
+        }
 
         let mut offsets = inner.offsets.clone();
         offsets.set(class, new_offset);
@@ -784,11 +876,17 @@ impl EventOutbox {
             .collect();
         let tmp_path = self.dir.join(format!("{OUTBOX_FILE_NAME}.tmp"));
         {
-            let mut file = File::create(&tmp_path)?;
+            let mut file = create_private_file(&tmp_path)?;
             for entry in &kept {
                 let mut line = serde_json::to_vec(entry)?;
                 line.push(b'\n');
                 file.write_all(&line)?;
+            }
+            // Never silently delete a line this reader could not interpret:
+            // it may be a newer-format record whose sequence is still live.
+            for line in &inner.opaque_lines {
+                file.write_all(line)?;
+                file.write_all(b"\n")?;
             }
             file.sync_all()?;
         }
@@ -851,7 +949,7 @@ fn read_offsets(dir: &Path) -> Offsets {
 fn write_offsets(dir: &Path, offsets: Offsets) -> Result<(), EventOutboxError> {
     let tmp_path = dir.join(format!("{OFFSETS_FILE_NAME}.tmp"));
     {
-        let mut file = File::create(&tmp_path)?;
+        let mut file = create_private_file(&tmp_path)?;
         file.write_all(serde_json::to_string(&offsets)?.as_bytes())?;
         file.sync_all()?;
     }
@@ -866,6 +964,55 @@ fn sync_dir(dir: &Path) {
     if let Ok(handle) = File::open(dir) {
         let _ = handle.sync_all();
     }
+}
+
+/// Create the outbox directory owner-only on Unix. A typical umask would
+/// otherwise leave audit JSONL world-readable.
+fn create_private_dir(dir: &Path) -> Result<(), EventOutboxError> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Open an append-only JSONL file with owner-only permissions, tightening an
+/// existing file too (it may predate this hardening or have a loose umask).
+fn open_private_append(path: &Path) -> Result<File, EventOutboxError> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+/// Create a replacement/temporary file with owner-only permissions.
+fn create_private_file(path: &Path) -> Result<File, EventOutboxError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 #[cfg(test)]

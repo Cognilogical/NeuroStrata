@@ -50,6 +50,17 @@ fn is_derived_metadata(meta: &JsonValue) -> bool {
 struct CaptureStamp {
     ts: i64,
     bus_seq: Option<u64>,
+    generation: u64,
+}
+
+impl CaptureStamp {
+    /// Per-effect dedup key: instance generation, delivery sequence, and the
+    /// semantic leg of a multi-entry pulse. `Superseded`'s retirement and
+    /// replacement legs therefore cannot suppress one another on replay.
+    fn bus_key(&self, leg: &str) -> Option<String> {
+        self.bus_seq
+            .map(|seq| format!("{}:{}:{}", self.generation, seq, leg))
+    }
 }
 
 /// Tees shareable mutations into the outbox and wakes the worker.
@@ -93,47 +104,18 @@ impl MemorySubscriber for MeshOutbox {
         _token: &RecursionToken,
         ctx: &SubscriberContext<'_>,
     ) -> Result<(), SubscriberError> {
-        // A durable delivery carries the bus outbox sequence that produced it.
-        // If this sequence is still pending in the mesh outbox, a previous
-        // attempt's append landed and only the bus offset write was lost: a
-        // replay must not append a second copy.
-        let bus_seq = ctx
+        // A durable delivery carries the instance generation and bus sequence
+        // that produced it. Dedup is per captured effect, never per pulse: a
+        // crash between the two appends of a `Superseded` pulse must not make
+        // the survivor suppress its missing sibling on replay.
+        let delivery = ctx
             .delivery
-            .filter(|delivery| delivery.class == crate::events::EventClass::Mesh)
-            .map(|delivery| delivery.seq);
+            .filter(|delivery| delivery.class == crate::events::EventClass::Mesh);
         let stamp = CaptureStamp {
             ts: ctx.ts,
-            bus_seq,
+            bus_seq: delivery.map(|delivery| delivery.seq),
+            generation: delivery.map(|delivery| delivery.generation).unwrap_or(0),
         };
-        if let Some(seq) = bus_seq {
-            // A committed (drained) entry is no longer pending, but a replay
-            // can still arrive after a crash between the worker's commit and
-            // the bus offset write. The committed sidecar is that memory.
-            if self
-                .outbox
-                .is_bus_seq_committed(seq)
-                .map_err(anyhow::Error::msg)?
-            {
-                tracing::debug!(
-                    seq,
-                    "mesh outbox: skipping a durable delivery already committed to the mesh"
-                );
-                return Ok(());
-            }
-            let already_pending = self
-                .outbox
-                .pending()
-                .map_err(anyhow::Error::msg)?
-                .iter()
-                .any(|entry| entry.bus_seq == Some(seq));
-            if already_pending {
-                tracing::debug!(
-                    seq,
-                    "mesh outbox: skipping an already-captured durable delivery"
-                );
-                return Ok(());
-            }
-        }
         let mut entries: Vec<OutboxEntry> = Vec::new();
         match event {
             ThalamicPulse::Created { id, namespace, .. } => {
@@ -147,7 +129,8 @@ impl MemorySubscriber for MeshOutbox {
                     } else {
                         OP_CREATED
                     };
-                    if let Some(entry) = self.entry(op, id, namespace, payload, None, stamp)
+                    if let Some(entry) =
+                        self.entry(op, id, namespace, payload, None, stamp, "created")
                     {
                         entries.push(entry);
                     }
@@ -169,6 +152,7 @@ impl MemorySubscriber for MeshOutbox {
                         payload,
                         Some(new_id.clone()),
                         stamp,
+                        "retire",
                     ) {
                         entries.push(entry);
                     }
@@ -179,7 +163,9 @@ impl MemorySubscriber for MeshOutbox {
                     } else {
                         OP_CREATED
                     };
-                    if let Some(entry) = self.entry(op, new_id, namespace, payload, None, stamp) {
+                    if let Some(entry) =
+                        self.entry(op, new_id, namespace, payload, None, stamp, "replace")
+                    {
                         entries.push(entry);
                     }
                 }
@@ -187,7 +173,7 @@ impl MemorySubscriber for MeshOutbox {
             ThalamicPulse::Archived { id, namespace } => {
                 if let Some(payload) = self.read(ctx, namespace, id).await? {
                     if let Some(entry) =
-                        self.entry(OP_ARCHIVED, id, namespace, payload, None, stamp)
+                        self.entry(OP_ARCHIVED, id, namespace, payload, None, stamp, "archived")
                     {
                         entries.push(entry);
                     }
@@ -200,7 +186,41 @@ impl MemorySubscriber for MeshOutbox {
         if entries.is_empty() {
             return Ok(());
         }
+        // Dedup each captured effect independently. A durable replay after a
+        // crash between two legs finds only one of them captured and must still
+        // append the missing one.
+        let pending = if stamp.bus_seq.is_some() {
+            self.outbox.pending().map_err(anyhow::Error::msg)?
+        } else {
+            Vec::new()
+        };
         for entry in entries {
+            let already = match &entry.bus_key {
+                Some(key) => {
+                    self.outbox
+                        .is_bus_key_committed(key)
+                        .map_err(anyhow::Error::msg)?
+                        || pending
+                            .iter()
+                            .any(|seen| seen.bus_key.as_deref() == Some(key.as_str()))
+                }
+                None => match entry.bus_seq {
+                    Some(seq) => {
+                        self.outbox
+                            .is_bus_seq_committed(seq)
+                            .map_err(anyhow::Error::msg)?
+                            || pending.iter().any(|seen| seen.bus_seq == Some(seq))
+                    }
+                    None => false,
+                },
+            };
+            if already {
+                tracing::debug!(
+                    id = %entry.id,
+                    "mesh outbox: captured effect already recorded, skipping"
+                );
+                continue;
+            }
             self.outbox.append(&entry).map_err(anyhow::Error::msg)?;
         }
         self.wake.notify_one();
@@ -235,6 +255,7 @@ impl MeshOutbox {
         payload: MemoryPayload,
         superseded_by: Option<String>,
         stamp: CaptureStamp,
+        leg: &str,
     ) -> Option<OutboxEntry> {
         // Structural rows are strictly local (spec §"Sharing boundary"),
         // mirroring the exclusion `server::set_metadata` applies: AST-ingest
@@ -263,8 +284,18 @@ impl MeshOutbox {
         if is_derived_metadata(&payload.metadata) {
             return None;
         }
+        // When a durable delivery identifies this effect, derive its id from
+        // that identity: a replay after a lost write produces the same id and
+        // the worker's idempotent apply collapses the two. Undelivered captures
+        // keep a fresh v7 id because they have no stable identity to derive
+        // from.
+        let bus_key = stamp.bus_key(leg);
+        let stable_op_id = match &bus_key {
+            Some(key) => uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, key.as_bytes()),
+            None => uuid::Uuid::now_v7(),
+        };
         Some(OutboxEntry {
-            stable_op_id: uuid::Uuid::now_v7(),
+            stable_op_id,
             op: op.to_string(),
             id: id.to_string(),
             namespace: namespace.to_string(),
@@ -275,6 +306,7 @@ impl MeshOutbox {
             ts: stamp.ts,
             epoch: self.epoch,
             bus_seq: stamp.bus_seq,
+            bus_key,
         })
     }
 }
@@ -791,6 +823,7 @@ mod tests {
             delivery: Some(DurableDelivery {
                 class: EventClass::Mesh,
                 seq: 7,
+                generation: 1,
             }),
         };
 
@@ -849,6 +882,7 @@ mod tests {
             delivery: Some(DurableDelivery {
                 class: EventClass::Mesh,
                 seq: 7,
+                generation: 1,
             }),
         };
 
@@ -962,6 +996,7 @@ impl MeshOutbox {
                     // Reconciliation is not a bus delivery: its idempotency
                     // basis is the existing mesh file, not a sequence.
                     bus_seq: None,
+                    bus_key: None,
                 };
                 outbox.append(&entry).map_err(|e| format!("{}", e))?;
                 re_emitted += 1;

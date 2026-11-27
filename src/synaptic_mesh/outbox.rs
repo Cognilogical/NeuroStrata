@@ -174,17 +174,89 @@ pub struct OutboxEntry {
     /// before).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bus_seq: Option<u64>,
+    /// Generation-scoped, per-effect identity of the durable delivery. A
+    /// `Superseded` pulse emits two entries with the same `bus_seq`; the
+    /// retirement and replacement legs carry different keys so a crash between
+    /// their appends cannot suppress either on replay. `serde(default)` keeps
+    /// pre-hardening WAL lines readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus_key: Option<String>,
 }
 
 /// Serialises `append` and `mark_committed` so a compaction can never lose an
 /// entry an append landed mid-flight (see module docs' "Concurrency").
 static OUTBOX_LOCK: Mutex<()> = Mutex::new(());
 
+/// Owner-only directory creation and file modes on Unix. Audit and mesh WALs
+/// carry memory content and must not be readable by other local users.
+fn create_private_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("outbox dir {} could not be created: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("outbox dir {} could not be tightened: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+fn open_private_append(path: &Path) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("outbox WAL {} could not be opened: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("outbox WAL {} could not be tightened: {e}", path.display()))?;
+    }
+    Ok(file)
+}
+
+fn create_private_file(path: &Path) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("outbox tmp {} could not be created: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("outbox tmp {} could not be tightened: {e}", path.display()))?;
+    }
+    Ok(file)
+}
+
+/// Best-effort parent-directory sync so a rename survives a power loss.
+fn sync_dir(dir: &Path) {
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
 /// The committed-sequence sidecar's shape (see [`COMMITTED_SEQ_FILE_NAME`]).
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CommittedSeqs {
     #[serde(default)]
     seqs: Vec<u64>,
+    /// Generation-scoped per-leg keys (see [`OutboxEntry::bus_key`]). Older
+    /// sidecars carry only `seqs` and keep working through the legacy check.
+    #[serde(default)]
+    keys: Vec<String>,
 }
 
 /// The outbox directory for a mesh checkout: `<mesh_dir>.outbox`, a sibling of
@@ -207,14 +279,10 @@ impl Outbox {
     /// makes the file's directory entry durable independently of the first
     /// append.
     pub fn open(dir: &Path) -> Result<Self, String> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("outbox dir {} could not be created: {e}", dir.display()))?;
+        create_private_dir(dir)?;
         let wal = dir.join(OUTBOX_FILE_NAME);
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal)
-            .map_err(|e| format!("outbox WAL {} could not be opened: {e}", wal.display()))?;
+        let _probe = open_private_append(&wal)?;
+        sync_dir(dir);
         Ok(Self {
             dir: dir.to_path_buf(),
         })
@@ -231,7 +299,15 @@ impl Outbox {
         // Idempotency across a commit: the worker may have drained this
         // sequence (and recorded it in the committed sidecar) before the bus
         // wrote its offset. Re-appending would duplicate the mesh record.
-        if let Some(seq) = entry.bus_seq {
+        if let Some(key) = &entry.bus_key {
+            if self.is_bus_key_committed(key)? {
+                tracing::debug!(
+                    key,
+                    "mesh outbox: skipping an append for an already-committed delivery leg"
+                );
+                return Ok(());
+            }
+        } else if let Some(seq) = entry.bus_seq {
             if self.is_bus_seq_committed(seq)? {
                 tracing::debug!(
                     seq,
@@ -244,44 +320,85 @@ impl Outbox {
             .map_err(|e| format!("outbox entry could not be serialised: {e}"))?;
         line.push('\n');
         let wal = self.dir.join(OUTBOX_FILE_NAME);
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal)
-            .map_err(|e| format!("outbox WAL {} could not be opened: {e}", wal.display()))?;
-        file.write_all(line.as_bytes())
-            .map_err(|e| format!("outbox WAL append failed: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("outbox WAL sync failed: {e}"))?;
+        // A previous failed append can have left a fragment without its final
+        // newline. `pending` ignores it; appending after it would glue two
+        // records into one corrupt line. Truncate back to the last complete
+        // newline while holding the process-global lock.
+        let bytes = std::fs::read(&wal)
+            .map_err(|e| format!("outbox WAL {} could not be read: {e}", wal.display()))?;
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            let clean_len = bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal)
+                .map_err(|e| format!("outbox WAL {} could not be repaired: {e}", wal.display()))?;
+            file.set_len(clean_len as u64)
+                .map_err(|e| format!("outbox WAL truncate failed: {e}"))?;
+            file.sync_all()
+                .map_err(|e| format!("outbox WAL repair sync failed: {e}"))?;
+            tracing::warn!(
+                "mesh outbox: truncated {} trailing byte(s) from an incomplete append",
+                bytes.len() - clean_len
+            );
+        }
+        let mut file = open_private_append(&wal)?;
+        let prior_len = file
+            .metadata()
+            .map_err(|e| format!("outbox WAL metadata failed: {e}"))?
+            .len();
+        if let Err(error) = file
+            .write_all(line.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            // Roll back the partial line so a retry starts at a clean boundary
+            // instead of relying on this truncate-on-next-append repair.
+            let _ = file.set_len(prior_len);
+            let _ = file.sync_all();
+            return Err(format!("outbox WAL append failed: {error}"));
+        }
         Ok(())
     }
 
     /// The committed `bus_seq` window, read tolerantly: a missing or corrupt
     /// sidecar reads as empty, which falls back to `pending` dedup and the
     /// worker's record-level idempotency rather than failing the write.
-    fn read_committed_seqs(&self) -> Vec<u64> {
+    fn read_committed(&self) -> CommittedSeqs {
         let path = self.dir.join(COMMITTED_SEQ_FILE_NAME);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CommittedSeqs::default(),
             Err(e) => {
                 tracing::warn!(
                     "outbox committed-seq file {} unreadable ({e}); treating the window as empty",
                     path.display()
                 );
-                return Vec::new();
+                return CommittedSeqs::default();
             }
         };
         match serde_json::from_str::<CommittedSeqs>(&text) {
-            Ok(committed) => committed.seqs,
+            Ok(committed) => committed,
             Err(e) => {
                 tracing::warn!(
                     "outbox committed-seq file {} unparseable ({e}); treating the window as empty",
                     path.display()
                 );
-                Vec::new()
+                CommittedSeqs::default()
             }
         }
+    }
+
+    fn read_committed_seqs(&self) -> Vec<u64> {
+        self.read_committed().seqs
+    }
+
+    /// Whether this generation-scoped per-leg key was already drained. A
+    /// replay of one leg cannot suppress its sibling: keys are distinct.
+    pub fn is_bus_key_committed(&self, key: &str) -> Result<bool, String> {
+        Ok(self.read_committed().keys.iter().any(|seen| seen == key))
     }
 
     /// Whether `seq` was committed (drained) by the worker. The subscriber
@@ -295,27 +412,30 @@ impl Outbox {
     /// Record committed `bus_seq`s durably. The caller holds [`OUTBOX_LOCK`].
     /// The window is sorted, deduplicated, and capped to the most recent
     /// [`MAX_COMMITTED_SEQS`].
-    fn record_committed_locked(&self, seqs: &[u64]) -> Result<(), String> {
-        if seqs.is_empty() {
+    fn record_committed_locked(&self, seqs: &[u64], keys: &[String]) -> Result<(), String> {
+        if seqs.is_empty() && keys.is_empty() {
             return Ok(());
         }
-        let mut all = self.read_committed_seqs();
-        all.extend_from_slice(seqs);
-        all.sort_unstable();
-        all.dedup();
-        if all.len() > MAX_COMMITTED_SEQS {
-            all.drain(0..all.len() - MAX_COMMITTED_SEQS);
+        let mut committed = self.read_committed();
+        committed.seqs.extend_from_slice(seqs);
+        committed.seqs.sort_unstable();
+        committed.seqs.dedup();
+        committed.keys.extend_from_slice(keys);
+        committed.keys.sort();
+        committed.keys.dedup();
+        if committed.seqs.len() > MAX_COMMITTED_SEQS {
+            let excess = committed.seqs.len() - MAX_COMMITTED_SEQS;
+            committed.seqs.drain(0..excess);
         }
-        let payload = serde_json::to_string(&CommittedSeqs { seqs: all })
+        if committed.keys.len() > MAX_COMMITTED_SEQS {
+            let excess = committed.keys.len() - MAX_COMMITTED_SEQS;
+            committed.keys.drain(0..excess);
+        }
+        let payload = serde_json::to_string(&committed)
             .map_err(|e| format!("outbox committed-seq encoding failed: {e}"))?;
         let tmp = self.dir.join(format!("{COMMITTED_SEQ_FILE_NAME}.tmp"));
         {
-            let mut file = std::fs::File::create(&tmp).map_err(|e| {
-                format!(
-                    "outbox committed-seq tmp {} could not be created: {e}",
-                    tmp.display()
-                )
-            })?;
+            let mut file = create_private_file(&tmp)?;
             file.write_all(payload.as_bytes())
                 .map_err(|e| format!("outbox committed-seq write failed: {e}"))?;
             file.sync_all()
@@ -323,6 +443,7 @@ impl Outbox {
         }
         std::fs::rename(&tmp, self.dir.join(COMMITTED_SEQ_FILE_NAME))
             .map_err(|e| format!("outbox committed-seq rename failed: {e}"))?;
+        sync_dir(&self.dir);
         Ok(())
     }
 
@@ -395,12 +516,16 @@ impl Outbox {
             .lock()
             .map_err(|_| "outbox lock poisoned".to_string())?;
         let pending = self.pending()?;
-        let committed_seqs: Vec<u64> = pending
+        let committed: Vec<&OutboxEntry> = pending
             .iter()
             .filter(|e| ids.contains(&e.stable_op_id))
-            .filter_map(|e| e.bus_seq)
             .collect();
-        self.record_committed_locked(&committed_seqs)?;
+        let committed_seqs: Vec<u64> = committed.iter().filter_map(|e| e.bus_seq).collect();
+        let committed_keys: Vec<String> = committed
+            .iter()
+            .filter_map(|e| e.bus_key.clone())
+            .collect();
+        self.record_committed_locked(&committed_seqs, &committed_keys)?;
         let remaining: Vec<OutboxEntry> = pending
             .into_iter()
             .filter(|e| !ids.contains(&e.stable_op_id))
@@ -408,8 +533,7 @@ impl Outbox {
         let wal = self.dir.join(OUTBOX_FILE_NAME);
         let tmp = self.dir.join(format!("{OUTBOX_FILE_NAME}.tmp"));
         {
-            let mut file = std::fs::File::create(&tmp)
-                .map_err(|e| format!("outbox tmp {} could not be created: {e}", tmp.display()))?;
+            let mut file = create_private_file(&tmp)?;
             for entry in &remaining {
                 let mut line = serde_json::to_string(entry)
                     .map_err(|e| format!("outbox entry could not be serialised: {e}"))?;
@@ -421,6 +545,7 @@ impl Outbox {
                 .map_err(|e| format!("outbox compaction sync failed: {e}"))?;
         }
         std::fs::rename(&tmp, &wal).map_err(|e| format!("outbox compaction rename failed: {e}"))?;
+        sync_dir(&self.dir);
         Ok(())
     }
 
@@ -433,10 +558,7 @@ impl Outbox {
         let mut line = serde_json::to_string(frame)?;
         line.push('\n');
         let wal = self.dir.join(FRAME_WAL_FILE_NAME);
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal)?;
+        let mut file = open_private_append(&wal).map_err(anyhow::Error::msg)?;
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
         Ok(frame.seq)
@@ -539,6 +661,7 @@ mod tests {
             ts: 1_700_000_000,
             epoch: 1,
             bus_seq: None,
+            bus_key: None,
         }
     }
 

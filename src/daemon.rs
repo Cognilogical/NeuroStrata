@@ -559,7 +559,34 @@ pub(crate) fn build_thalamic_bus(
     dimensions: usize,
     project_root: impl Into<PathBuf>,
 ) -> Arc<ThalamicBus> {
-    build_thalamic_bus_at(vector_store, dimensions, project_root, event_outbox_dir())
+    match event_outbox_dir() {
+        Ok(dir) => build_thalamic_bus_at(vector_store, dimensions, project_root, dir),
+        Err(err) => {
+            // No home and no safe owner-only fallback: never replay a durable
+            // file a different local user could have planted under /tmp.
+            tracing::error!(
+                "no safe durable event outbox location: {err}; audit and mesh events stay on the lossy bounded queue"
+            );
+            let bus = Arc::new(ThalamicBus::new(BUS_CAPACITY));
+            register_default_subscribers(&bus, vector_store, dimensions, project_root);
+            bus
+        }
+    }
+}
+
+fn register_default_subscribers(
+    bus: &Arc<ThalamicBus>,
+    vector_store: Arc<dyn VectorStore>,
+    dimensions: usize,
+    project_root: impl Into<PathBuf>,
+) {
+    bus.attach_store(vector_store);
+    bus.register(Box::new(EpisodicPointerEcho::new(project_root)));
+    bus.register(Box::new(ExportFreshnessDirty::new(dimensions)));
+    bus.register(Box::new(GuardEventLog::new(dimensions)));
+    bus.register(Box::new(
+        crate::events::subscribers::PostIngestNormalize::new(),
+    ));
 }
 
 /// [`build_thalamic_bus`] with an explicit outbox directory. Production
@@ -585,13 +612,7 @@ fn build_thalamic_bus_at(
             Arc::new(ThalamicBus::new(BUS_CAPACITY))
         }
     };
-    bus.attach_store(vector_store);
-    bus.register(Box::new(EpisodicPointerEcho::new(project_root)));
-    bus.register(Box::new(ExportFreshnessDirty::new(dimensions)));
-    bus.register(Box::new(GuardEventLog::new(dimensions)));
-    bus.register(Box::new(
-        crate::events::subscribers::PostIngestNormalize::new(),
-    ));
+    register_default_subscribers(&bus, vector_store, dimensions, project_root);
     bus
 }
 
@@ -606,33 +627,87 @@ const EVENT_OUTBOX_DIR_ENV: &str = "NEUROSTRATA_EVENT_OUTBOX_DIR";
 /// Under `cargo test` an unset variable yields a fresh process-scoped temp
 /// directory per bus, so a test binary never reads or writes the operator's
 /// real outbox and parallel tests cannot replay each other's entries.
-fn event_outbox_dir() -> PathBuf {
+fn event_outbox_dir() -> Result<PathBuf, String> {
     if let Ok(val) = std::env::var(EVENT_OUTBOX_DIR_ENV) {
         if !val.trim().is_empty() {
-            return PathBuf::from(val);
+            return Ok(PathBuf::from(val));
         }
     }
     #[cfg(test)]
     {
-        std::env::temp_dir().join(format!(
-            "neurostrata-test-event-outbox-{}-{}",
+        Ok(std::env::temp_dir().join(format!(
+            "neurostrata-test-event-outbox-{}-{}-{}",
+            current_uid(),
             std::process::id(),
             uuid::Uuid::now_v7()
-        ))
+        )))
     }
     #[cfg(not(test))]
     {
         if let Ok(config) = crate::config::Config::from_default_path() {
             if let Some(parent) = config.db_path.parent() {
-                return parent.join("event-outbox");
+                return Ok(parent.join("event-outbox"));
             }
         }
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".config")
-            .join("neurostrata")
-            .join("event-outbox")
+        if let Some(home) = dirs::home_dir() {
+            return Ok(home
+                .join(".config")
+                .join("neurostrata")
+                .join("event-outbox"));
+        }
+        // No home: never use a predictable shared-temp path. A durable WAL
+        // there could be planted by another local user and replayed into the
+        // mesh. Create a UID-scoped, owner-only directory instead and refuse
+        // one that already exists with a foreign owner or loose permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+            let dir = std::env::temp_dir().join(format!(
+                "neurostrata-{}-event-outbox",
+                current_uid()
+            ));
+            match std::fs::metadata(&dir) {
+                Ok(meta) => {
+                    if !meta.is_dir() || meta.uid() != current_uid() || meta.mode() & 0o077 != 0 {
+                        return Err(format!(
+                            "refusing insecure shared outbox directory {}",
+                            dir.display()
+                        ));
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    let mut builder = std::fs::DirBuilder::new();
+                    builder.mode(0o700);
+                    builder.create(&dir).map_err(|e| {
+                        format!("could not create owner-only outbox directory {}: {e}", dir.display())
+                    })?;
+                    let meta = std::fs::metadata(&dir).map_err(|e| e.to_string())?;
+                    if meta.uid() != current_uid() || meta.mode() & 0o077 != 0 {
+                        return Err(format!(
+                            "refusing insecure shared outbox directory {}",
+                            dir.display()
+                        ));
+                    }
+                }
+                Err(err) => return Err(format!("cannot inspect outbox directory {}: {err}", dir.display())),
+            }
+            return Ok(dir);
+        }
+        #[cfg(not(unix))]
+        {
+            Err("no home directory and no owner-only fallback for the event outbox".to_string())
+        }
     }
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
 }
 
 /// Env var naming the project the daemon serves.
