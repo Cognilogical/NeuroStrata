@@ -10220,10 +10220,8 @@ fn migrate_legacy_id_aliases(conn: &Connection) -> Result<usize> {
         }
     }
 
-    let mut rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = Vec::new();
-    for row in conn
-        .query("MATCH (m:Memory) RETURN m.id, m.namespace, m.user_id, COALESCE(m.metadata, '')")?
-    {
+    let mut rows: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    for row in conn.query("MATCH (m:Memory) RETURN m.id, m.namespace, COALESCE(m.metadata, '')")? {
         let Some(id) = migration_value_string(row.first()) else {
             continue;
         };
@@ -10231,7 +10229,6 @@ fn migrate_legacy_id_aliases(conn: &Connection) -> Result<usize> {
             id,
             migration_value_string(row.get(1)),
             migration_value_string(row.get(2)),
-            migration_value_string(row.get(3)),
         ));
     }
     rows.sort_by(|left, right| left.0.cmp(&right.0));
@@ -10242,7 +10239,7 @@ fn migrate_legacy_id_aliases(conn: &Connection) -> Result<usize> {
     // its alias. Doing so would make a later qualified re-ingest resolve onto
     // the bare row and leave the scoped row stale (bare+scoped coexistence).
     let mut scoped_identities: HashSet<String> = HashSet::new();
-    for (id, namespace, _, metadata) in &rows {
+    for (id, namespace, metadata) in &rows {
         let Some(namespace) = namespace else {
             continue;
         };
@@ -10261,18 +10258,19 @@ fn migrate_legacy_id_aliases(conn: &Connection) -> Result<usize> {
     }
 
     let mut recorded = 0usize;
-    for (id, namespace, user_id, metadata) in rows {
+    for (id, namespace, metadata) in rows {
         let Some(namespace) = namespace else {
             continue;
         };
         if namespace == QUARANTINE_NAMESPACE {
             continue;
         }
-        // Only ingested rows are re-ingested by identity; an agent-written
-        // memory carries its own stable id and needs no alias. Imported rows
-        // with foreign mesh provenance or private eligibility are protected:
-        // a qualified re-ingest must not overwrite them through an alias.
-        if user_id.as_deref() != Some("auto-ingestor") || row_is_protected(metadata.as_deref()) {
+        // Identity is structural, not provenance-based: every bare legacy id
+        // owns its qualified identity regardless of which older binary wrote
+        // it (user_id varies across versions). Imported rows with foreign mesh
+        // provenance or private eligibility remain protected — a qualified
+        // re-ingest must not overwrite content this process does not own.
+        if row_is_protected(metadata.as_deref()) {
             continue;
         }
         // A generation-scoped id is already a current-binary identity.
@@ -38125,6 +38123,21 @@ mod store_migration {
         )
     }
 
+    fn insert_row_as(id: &str, namespace: Option<&str>, metadata: &str, user_id: &str) -> String {
+        let namespace = namespace
+            .map(|ns| format!(", namespace: '{}'", escape_ladybug_string(ns)))
+            .unwrap_or_default();
+        format!(
+            "CREATE (:Memory {{id: '{}'{namespace}, content: 'content-{}', user_id: '{}', memory_type: 'file', agent_name: 'unknown', location: '{}', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0], name: 'n-{}'}})",
+            escape_ladybug_string(id),
+            escape_ladybug_string(id),
+            escape_ladybug_string(user_id),
+            escape_ladybug_string(id),
+            escape_ladybug_string(metadata),
+            escape_ladybug_string(id),
+        )
+    }
+
     fn open(path: &Path) -> LadybugStore {
         LadybugStore::for_testing(path, DIMS).expect("legacy store opens")
     }
@@ -38483,6 +38496,37 @@ mod store_migration {
             "ids are derived from the source rows: {ids:?}"
         );
         assert_ne!(ids[0], ids[1], "distinct content yields distinct ids");
+    }
+
+    /// Identity is structural, not provenance-based: a legacy bare row written
+    /// by an older binary with a different user_id still owns its qualified
+    /// identity and must be aliased. Qualified/current rows are never aliased.
+    #[tokio::test]
+    async fn a_legacy_bare_row_with_an_older_user_id_is_aliased() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row_as("src/main.rs", Some("alpha"), "{}", "older-binary"),
+                &insert_row_as("alpha::src/lib.rs", Some("alpha"), "{}", "older-binary"),
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.aliases_recorded, 1);
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs"),
+            "the older bare row owns its qualified identity"
+        );
+        assert!(
+            alias_target(&store, "alpha::src/lib.rs").await.is_none(),
+            "a qualified row is already current and is not aliased"
+        );
     }
 
     #[tokio::test]
