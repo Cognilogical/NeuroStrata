@@ -130,7 +130,7 @@ _Example:_
 neurostrata-mcp ingest ./src my-rust-project
 ```
 
-Namespaces that begin with `__neurostrata_ingest_stage__` are reserved for internal staging. Both `ingest` and `ingest-scip` refuse them before the directory or index is read, before the fallback store is prepared, and before `NEUROSTRATA_CLEAR_BEFORE_INGEST` can clear any stored rows.
+Namespaces that begin with `__neurostrata_ingest_stage__` are reserved for internal staging. Both `ingest` and `ingest-scip` refuse them before the directory or index is read, before the fallback store is prepared, and before `NEUROSTRATA_CLEAR_BEFORE_INGEST` can clear any stored rows. The dry-run form applies the same refusal before walking the tree, so a reserved destination is never probed. Once an ingest has started, a refusal or failure is recorded as failed in the enrichment registry instead of being left active until the stale-lock timeout.
 
 ### `project-context` & `export-graph`
 

@@ -622,6 +622,16 @@ pub trait VectorStore: Send + Sync + AsAny {
         Ok(())
     }
 
+    /// Whether this store implements [`VectorStore::publish_generation_cas`]
+    /// as one database-atomic conditional write. Stores that answer `false`
+    /// ingest through the unconditional generation methods instead; that
+    /// fallback is safe for a single writer but offers no protection against a
+    /// concurrent publisher. A custom backend serving concurrent writers must
+    /// override both this predicate and the CAS method.
+    async fn supports_atomic_publication(&self) -> bool {
+        false
+    }
+
     /// Atomically flip the active pointer to `target` only while it still
     /// names `expected`. Return the generation actually displaced on success
     /// (`None` when a newer publication landed first, so the caller must not
@@ -629,7 +639,9 @@ pub trait VectorStore: Send + Sync + AsAny {
     /// turn: a check-then-publish default can overwrite a concurrent publish
     /// and is deliberately absent. `pending` selects the relink marker on the
     /// resulting pointer — set for `target` on a fresh publication or a
-    /// rollback that must be retried, cleared on a normal rollback.
+    /// rollback that must be retried, cleared on a normal rollback. Backends
+    /// that cannot provide this operation leave [`Self::supports_atomic_publication`]
+    /// at its default and are routed around this method by ingest.
     async fn publish_generation_cas(
         &self,
         namespace: &str,

@@ -2012,6 +2012,49 @@ async fn run_consumer(
     })
 }
 
+/// Record a refused or failed ingest on the registry. `enrichment_start` has
+/// already marked the run as running, so every early return after it must fail
+/// the run explicitly or the registry keeps reporting it as active until the
+/// stale-lock timeout.
+async fn fail_enrichment(
+    vector_store: &Arc<dyn VectorStore>,
+    embedder: &Arc<dyn Embedder>,
+    namespace: &str,
+    error: &str,
+) {
+    if let Err(fail) =
+        crate::registry::enrichment_fail(vector_store, Some(embedder), namespace, "ingest", error)
+            .await
+    {
+        tracing::warn!("enrichment registry update failed: {fail}");
+    }
+}
+
+/// Publish through the store's atomic conditional seam when it has one.
+/// Backends that cannot implement compare-and-swap keep working through the
+/// unconditional generation methods: their fallback is safe for one writer and
+/// is documented as such, while a concurrent publisher needs the CAS override.
+async fn publish_for_ingest(
+    vector_store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    source_key: &str,
+    expected: u64,
+    target: u64,
+    pending: bool,
+    fallback_displaced: u64,
+) -> anyhow::Result<Option<u64>> {
+    if vector_store.supports_atomic_publication().await {
+        vector_store
+            .publish_generation_cas(namespace, source_key, expected, target, pending)
+            .await
+    } else {
+        vector_store
+            .publish_generation(namespace, source_key, target)
+            .await?;
+        Ok(Some(fallback_displaced))
+    }
+}
+
 pub async fn ingest_directory(
     dir_path: &Path,
     schema: &ParserSchema,
@@ -2087,9 +2130,10 @@ pub async fn ingest_directory(
             // A lookalike owner shares the derived pointer key but not the
             // lease. Staging here would later overwrite the real owner's
             // pointer and generation state: refuse before any staging.
-            return Err(anyhow::anyhow!(
-                "refusing to ingest namespace '{namespace}' source '{source_key}': {e}"
-            ));
+            let message =
+                format!("refusing to ingest namespace '{namespace}' source '{source_key}': {e}");
+            fail_enrichment(&vector_store, &embedder, namespace, &message).await;
+            return Err(anyhow::anyhow!(message));
         }
         recovery_failed = true;
         tracing::warn!(
@@ -2734,47 +2778,21 @@ pub async fn ingest_directory(
     let displaced_generation = if unchanged {
         None
     } else {
-        let expected = match vector_store.active_generation(namespace, &source_key).await {
-            Ok(active) => active,
-            Err(e) => {
-                // Without an expected value there is no safe compare: refuse
-                // before touching the pointer, and clean up staging exactly
-                // like a publish failure.
-                if let Err(abort) = vector_store
-                    .abort_generation(namespace, &source_key, generation)
-                    .await
-                {
-                    eprintln!(
-                        "Failed to abort staging generation {} of namespace {}: {}",
-                        generation, namespace, abort
-                    );
-                }
-                // `enrichment_start` already marked this run as running. Fail
-                // it before returning, or the registry reports a stale active
-                // ingest until the lock expires (review finding on the read
-                // error branch).
-                if let Err(fail) = crate::registry::enrichment_fail(
-                    &vector_store,
-                    Some(&embedder),
-                    namespace,
-                    "ingest",
-                    &e.to_string(),
-                )
-                .await
-                {
-                    tracing::warn!("enrichment registry update failed: {fail}");
-                }
-                return Err(anyhow::anyhow!(
-                    "stored the nodes of namespace {} but could not read its previous active generation before publishing generation {}: {}",
-                    namespace,
-                    generation,
-                    e
-                ));
-            }
-        };
-        match vector_store
-            .publish_generation_cas(namespace, &source_key, expected, generation, true)
-            .await
+        // The expectation is the generation this ingest staged FROM, captured
+        // before staging. Rereading the pointer here would let a concurrent
+        // publication that landed after the snapshot become the expectation,
+        // so a stale publisher would be accepted over the newer tree.
+        let expected = prev_gen;
+        match publish_for_ingest(
+            &vector_store,
+            namespace,
+            &source_key,
+            expected,
+            generation,
+            true,
+            prev_gen,
+        )
+        .await
         {
             Ok(Some(displaced)) => Some(displaced),
             Ok(None) => {
@@ -2789,28 +2807,86 @@ pub async fn ingest_directory(
                         generation, namespace, abort
                     );
                 }
-                return Err(anyhow::anyhow!(
+                let message = format!(
                     "stored the nodes of namespace {} but generation {} is stale: a newer generation published first, so the staged nodes were discarded and the newer tree left active",
-                    namespace,
-                    generation
-                ));
+                    namespace, generation
+                );
+                fail_enrichment(&vector_store, &embedder, namespace, &message).await;
+                return Err(anyhow::anyhow!(message));
             }
             Err(e) => {
-                if let Err(abort) = vector_store
-                    .abort_generation(namespace, &source_key, generation)
-                    .await
-                {
-                    eprintln!(
-                        "Failed to abort staging generation {} of namespace {}: {}",
-                        generation, namespace, abort
-                    );
+                // The pointer flip may have committed before the call failed
+                // (a staging-row delete or the client deadline can fail after
+                // the write). Aborting generation N while it is active clears
+                // the pointer and leaves readers with no tree. Reconcile first:
+                // only a confirmed-unpublished generation may be aborted.
+                let mut note: String;
+                match vector_store.active_generation(namespace, &source_key).await {
+                    Ok(active) if active == generation => {
+                        match publish_for_ingest(
+                            &vector_store,
+                            namespace,
+                            &source_key,
+                            generation,
+                            prev_gen,
+                            true,
+                            generation,
+                        )
+                        .await
+                        {
+                            Ok(Some(_)) => {
+                                note = format!(
+                                    "; publication had committed, so the pointer was restored to generation {prev_gen} with relink recovery pending before the failed generation was discarded"
+                                );
+                                if let Err(abort) = vector_store
+                                    .abort_generation(namespace, &source_key, generation)
+                                    .await
+                                {
+                                    note.push_str(&format!(
+                                        "; could not discard staging generation {generation}: {abort}"
+                                    ));
+                                }
+                            }
+                            Ok(None) => {
+                                note = "; a newer generation owns the pointer, so neither it nor the failed generation was touched".to_string();
+                            }
+                            Err(restore) => {
+                                note = format!(
+                                    "; could not restore generation {prev_gen}: {restore}; the active pointer was left intact"
+                                );
+                            }
+                        }
+                    }
+                    Ok(active) if active == expected => {
+                        note = format!(
+                            "; the pointer still names the expected generation {expected}, so the failed generation was discarded"
+                        );
+                        if let Err(abort) = vector_store
+                            .abort_generation(namespace, &source_key, generation)
+                            .await
+                        {
+                            note.push_str(&format!(
+                                "; could not discard staging generation {generation}: {abort}"
+                            ));
+                        }
+                    }
+                    Ok(active) => {
+                        note = format!(
+                            "; generation {active} is active, so neither it nor generation {generation} was touched"
+                        );
+                    }
+                    Err(status) => {
+                        note = format!(
+                            "; the active generation could not be read ({status}), so generation {generation} was not aborted"
+                        );
+                    }
                 }
-                return Err(anyhow::anyhow!(
-                    "stored the nodes of namespace {} but could not make generation {} active: {}",
-                    namespace,
-                    generation,
-                    e
-                ));
+                let message = format!(
+                    "stored the nodes of namespace {} but could not make generation {} active: {}{}",
+                    namespace, generation, e, note
+                );
+                fail_enrichment(&vector_store, &embedder, namespace, &message).await;
+                return Err(anyhow::anyhow!(message));
             }
         }
     };
@@ -2850,10 +2926,22 @@ pub async fn ingest_directory(
             // worker. When it did, the edges it wrote belong to the generation
             // we are about to abandon, so the restored generation must be
             // relinked before rollback can be reported complete.
-            let relink_committed = vector_store
+            // An inconclusive status probe (deadline, lock still held by the
+            // timed-out relink worker) cannot be read as "did not commit".
+            // Treat it as uncertain and leave recovery pending on the restored
+            // tree instead of handing back edges that may never be reconciled.
+            let relink_committed = match vector_store
                 .relink_committed_for(namespace, &source_key, generation)
                 .await
-                .unwrap_or(false);
+            {
+                Ok(committed) => committed,
+                Err(status_error) => {
+                    tracing::warn!(
+                        "could not determine whether generation {generation} relinked ({status_error}); treating it as committed so the restored generation keeps its recovery marker"
+                    );
+                    true
+                }
+            };
             match displaced_generation {
                 Some(displaced) if displaced > 0 => {
                     // Restore only while this ingest's published generation is
@@ -5773,6 +5861,9 @@ use super::x;"#;
         /// on every ingest, and failing that one would abort the ingest in
         /// `run_consumer` instead of exercising the carry-forward pass.
         upsert_marker: &'static str,
+        /// When set, this double models a custom backend that cannot provide
+        /// atomic conditional publication and must use the legacy fallback.
+        legacy_publication: bool,
     }
 
     impl CarryFailingStore {
@@ -5851,6 +5942,13 @@ use super::x;"#;
                 .await
         }
 
+        async fn supports_atomic_publication(&self) -> bool {
+            if self.legacy_publication {
+                return false;
+            }
+            self.inner.supports_atomic_publication().await
+        }
+
         async fn publish_generation_cas(
             &self,
             namespace: &str,
@@ -5859,6 +5957,9 @@ use super::x;"#;
             target: u64,
             pending: bool,
         ) -> anyhow::Result<Option<u64>> {
+            if self.legacy_publication {
+                anyhow::bail!("this backend has no atomic conditional publication");
+            }
             self.inner
                 .publish_generation_cas(namespace, source_key, expected, target, pending)
                 .await
@@ -6063,6 +6164,10 @@ use super::x;"#;
                 .await
         }
 
+        async fn supports_atomic_publication(&self) -> bool {
+            self.inner.supports_atomic_publication().await
+        }
+
         async fn publish_generation_cas(
             &self,
             namespace: &str,
@@ -6257,6 +6362,10 @@ use super::x;"#;
             self.inner
                 .publish_generation(namespace, source_key, generation)
                 .await
+        }
+
+        async fn supports_atomic_publication(&self) -> bool {
+            self.inner.supports_atomic_publication().await
         }
 
         async fn publish_generation_cas(
@@ -6771,6 +6880,7 @@ use super::x;"#;
             fault,
             summary_calls: std::sync::atomic::AtomicUsize::new(0),
             upsert_marker: "hello.rs",
+            legacy_publication: false,
         });
         let store: Arc<dyn VectorStore> = failing.clone();
         store.init("carry-ns").await.expect("create the schema");
@@ -6904,6 +7014,7 @@ use super::x;"#;
             fault: CarryFault::Summary,
             summary_calls: std::sync::atomic::AtomicUsize::new(0),
             upsert_marker: "hello.rs",
+            legacy_publication: false,
         });
         let store: Arc<dyn VectorStore> = failing.clone();
         store.init("probe").await.expect("create the schema");
@@ -7552,6 +7663,58 @@ use super::x;"#;
                 "the skipped directory itself must be rejected: {path}"
             );
         }
+    }
+
+    /// A custom backend that cannot offer atomic publication must still ingest
+    /// through the unconditional `publish_generation` fallback instead of
+    /// failing outright or silently skipping generation publication.
+    #[tokio::test]
+    async fn custom_backend_without_cas_uses_publication_fallback() {
+        let tmp = std::env::temp_dir().join(format!("ns-legacy-backend-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+        std::fs::write(tmp.join("hello.rs"), "fn main() {}").expect("write file");
+        let db =
+            std::env::temp_dir().join(format!("ns-legacy-backend-db-{}", uuid::Uuid::new_v4()));
+        let inner: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        let store = Arc::new(CarryFailingStore {
+            inner: inner.clone(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fault: CarryFault::Upsert,
+            summary_calls: std::sync::atomic::AtomicUsize::new(0),
+            upsert_marker: "never-matches",
+            legacy_publication: true,
+        });
+        let store: Arc<dyn VectorStore> = store;
+        store.init("legacy-ns").await.expect("create schema");
+        let schema = ParserSchema::load(include_str!("../schema.json")).expect("schema");
+        ingest_directory(
+            &tmp,
+            &schema,
+            Arc::new(ZeroEmbedder),
+            store.clone(),
+            "legacy-ns",
+            None,
+            &[],
+        )
+        .await
+        .expect("ingest via fallback when backend has no CAS");
+        let key = source_key_for(&tmp);
+        assert_eq!(
+            store
+                .active_generation("legacy-ns", &key)
+                .await
+                .expect("read active gen"),
+            1,
+            "generation published through the fallback path"
+        );
+        let id = generation_scoped_id("legacy-ns", 1, "hello.rs");
+        assert!(
+            store.get("legacy-ns", &id).await.expect("read").is_some(),
+            "source row landed in generation 1"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&db).ok();
     }
 
     /// Review on #386: `\server\share\repo\x` (rooted, no drive) is not

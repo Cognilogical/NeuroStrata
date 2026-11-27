@@ -3370,6 +3370,32 @@ async fn run_ingest_dry_run(
     schema_path: Option<&str>,
     dry_run_mode: &str,
 ) -> anyhow::Result<()> {
+    run_ingest_dry_run_with(
+        namespace,
+        dir,
+        schema_path,
+        dry_run_mode,
+        |path, schema, mode| async move {
+            crate::parser::ingest::dry_run_directory(&path, &schema, &mode).await
+        },
+    )
+    .await
+}
+
+/// Same dry-run path with an injectable tree walk. The injection exists so a
+/// test can observe whether the walk was invoked; the reserved-destination
+/// refusal still runs before any schema read or filesystem access.
+async fn run_ingest_dry_run_with<F, Fut>(
+    namespace: &str,
+    dir: &str,
+    schema_path: Option<&str>,
+    dry_run_mode: &str,
+    walk: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(std::path::PathBuf, crate::parser::schema::ParserSchema, String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<String>>,
+{
     reject_reserved_ingest_destination(namespace)?;
     let dir_str = cli_ingest_root(dir);
     let dir_path_owned = std::path::PathBuf::from(&dir_str);
@@ -3388,8 +3414,7 @@ async fn run_ingest_dry_run(
             return Err(e.into());
         }
     };
-    let report =
-        crate::parser::ingest::dry_run_directory(&dir_path_owned, &schema, dry_run_mode).await?;
+    let report = walk(dir_path_owned, schema, dry_run_mode.to_string()).await?;
     println!("Namespace: {}", namespace);
     println!("{}", report);
     Ok(())
@@ -3941,11 +3966,19 @@ mod tests {
         ));
         let missing_str = missing.to_str().expect("utf-8 path");
 
-        let error = run_ingest_dry_run(
+        // Inject the tree walk so an actual probe is observable: the missing
+        // directory alone would stay missing even if the walk ran first.
+        let probed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_flag = probed.clone();
+        let error = run_ingest_dry_run_with(
             "  __NEUROSTRATA_INGEST_STAGE__probe ",
             missing_str,
             None,
             "estimate",
+            move |_, _, _| {
+                probe_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(String::new()) }
+            },
         )
         .await
         .expect_err("a reserved destination is refused");
@@ -3955,6 +3988,10 @@ mod tests {
                 .to_string()
                 .contains("ingest destination uses the reserved internal staging namespace"),
             "the refusal names the reserved staging namespace: {error}"
+        );
+        assert!(
+            !probed.load(std::sync::atomic::Ordering::SeqCst),
+            "the refusal must happen before the dry-run tree walk is invoked"
         );
         assert!(
             !missing.exists(),
