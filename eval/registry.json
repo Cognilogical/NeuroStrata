@@ -617,6 +617,25 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "graphql-semantics": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp graphql::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "graphql::tests::multi_field_query_returns_every_root_field",
+        "graphql::tests::aliased_root_fields_use_alias_as_response_key",
+        "graphql::tests::t3_o2_unreferenced_variable_first_does_not_paginate",
+        "graphql::tests::t3_o4_definition_default_is_not_honoured",
+        "graphql::tests::t3_o5_string_first_variable_yields_default",
+        "graphql::tests::t3_o7_int_variable_id_returns_row_42",
+        "graphql::tests::t4_o6_cursor_provenance_edge_resumes_root_restarts",
+        "graphql::tests::f2_domain_registry_row_absent_from_memories_search_and_memory_by_id",
+        "graphql::tests::f2_domain_registry_row_consumes_no_page_slot_and_no_null_edge"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }
