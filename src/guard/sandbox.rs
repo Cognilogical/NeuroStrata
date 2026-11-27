@@ -32,12 +32,33 @@ pub const SANDBOX_IMAGE: &str = concat!(
 /// How long a sandboxed evaluation may run before the container is killed.
 const SANDBOX_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Process-wide ceiling on simultaneous sandbox runs. Each container can
+/// reserve 512 MiB and 256 pids; excess requests queue on this semaphore
+/// instead of exhausting the host or the container engine.
+pub(crate) const SANDBOX_MAX_CONCURRENT_RUNS: usize = 8;
+
+static SANDBOX_CONCURRENCY: std::sync::OnceLock<tokio::sync::Semaphore> =
+    std::sync::OnceLock::new();
+
+fn sandbox_concurrency() -> &'static tokio::sync::Semaphore {
+    SANDBOX_CONCURRENCY.get_or_init(|| tokio::sync::Semaphore::new(SANDBOX_MAX_CONCURRENT_RUNS))
+}
+
 /// Host paths a guarded action's working directory may never sit under: the
 /// sandbox mounts the directory read-only at `/workspace`, so anything here
 /// would be exposed to the evaluated payload. `/` (the filesystem root) is
 /// handled separately because every absolute path starts with it.
 const FORBIDDEN_WORKING_DIRECTORIES: &[&str] = &[
-    "/etc", "/home", "/var/run", "/run", "/private/var/run", "/root", "/sys", "/dev", "/proc", "/boot",
+    "/etc",
+    "/home",
+    "/var/run",
+    "/run",
+    "/private/var/run",
+    "/root",
+    "/sys",
+    "/dev",
+    "/proc",
+    "/boot",
 ];
 
 /// Sensitive directories directly under a user's home. A checkout under the
@@ -184,7 +205,7 @@ impl SandboxEvaluator {
 
         info!("Executing sandbox evaluation using engine: {}", engine);
 
-        evaluate_with_timeout(&engine, &cwd_str, payload, SANDBOX_TIMEOUT).await
+        evaluate_with_timeout(&engine, cwd, &cwd_str, payload, SANDBOX_TIMEOUT).await
     }
 }
 
@@ -237,36 +258,92 @@ pub(crate) fn working_directory_refusal_with_home(
     {
         return Some(dir.to_string());
     }
-    if let Some(home) = home {
-        // The home directory itself, and any ancestor of it (for example
-        // `/Users`), would expose every sibling home and credential tree.
-        if cwd == home || home.starts_with(cwd) {
-            return Some(home.to_string_lossy().into_owned());
-        }
-        // A checkout under home stays mountable, but credential and runtime
-        // state under home does not. Match whole components after the home
-        // prefix so `.sshrc` remains an ordinary project file.
-        for child in SENSITIVE_HOME_CHILDREN {
-            let sensitive = home.join(child);
-            if cwd == sensitive || cwd.starts_with(&sensitive) {
-                return Some(sensitive.to_string_lossy().into_owned());
-            }
+    // Fail closed: without a resolvable home the exact-home and sensitive
+    // child rules below cannot be evaluated, so a caller-supplied cwd such as
+    // `/Users/alice` could be mounted even though it is the user's home.
+    let Some(home) = home else {
+        return Some(
+            "<home directory could not be determined; refusing sandbox mount>".to_string(),
+        );
+    };
+    // The home directory itself, and any ancestor of it (for example
+    // `/Users`), would expose every sibling home and credential tree.
+    if cwd == home || home.starts_with(cwd) {
+        return Some(home.to_string_lossy().into_owned());
+    }
+    // A checkout under home stays mountable, but credential and runtime
+    // state under home does not. Match whole components after the home
+    // prefix so `.sshrc` remains an ordinary project file.
+    for child in SENSITIVE_HOME_CHILDREN {
+        let sensitive = home.join(child);
+        if cwd == sensitive || cwd.starts_with(&sensitive) {
+            return Some(sensitive.to_string_lossy().into_owned());
         }
     }
     None
 }
 
+/// Resolve the working directory again immediately before `podman run` and
+/// require the same canonical target that passed validation. `Err` carries
+/// the reason the caller must reject rather than mount.
+fn revalidate_mount_cwd(original: &str, validated: &str) -> Result<String, String> {
+    let resolved = std::fs::canonicalize(original)
+        .map_err(|e| format!("working directory disappeared before launch: {original} ({e})"))?
+        .to_string_lossy()
+        .into_owned();
+    if resolved != validated {
+        return Err(format!(
+            "working directory changed between validation and launch: {validated} -> {resolved}"
+        ));
+    }
+    if let Some(refused) = working_directory_refusal(&resolved) {
+        return Err(format!(
+            "mount target refused at launch: {resolved} ({refused})"
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Evaluate a payload in the sandbox, mapping a timeout to a rejection only
 /// after the child has been killed and reaped.
+///
+/// Launch-time revalidation narrows the check-to-mount window but cannot close
+/// it in user space: the kernel resolves `podman`'s bind mount after this
+/// check, so a process with write access to a parent directory may still swap
+/// a component in that gap. Closing it fully needs a pinned directory handle
+/// (`openat`/`O_PATH`), which the `podman run` CLI cannot express. The residual
+/// OS-level TOCTOU is documented in `docs/features-api/ops/security.md`.
 async fn evaluate_with_timeout(
     engine: &str,
+    original_cwd: &str,
     cwd: &str,
     payload: &str,
     limit: Duration,
 ) -> anyhow::Result<ValidateVerdict> {
     let start = std::time::Instant::now();
+
+    // One process-wide permit per live run, held across spawn/timeout/cleanup
+    // so concurrent validations cannot collectively exhaust the host.
+    let _permit = sandbox_concurrency()
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("sandbox concurrency semaphore closed"))?;
+
+    let cwd_for_mount = match revalidate_mount_cwd(original_cwd, cwd) {
+        Ok(path) => path,
+        Err(reason) => {
+            return Ok(ValidateVerdict::DeterministicReject {
+                reasons: vec![format!("Security violation: {reason}")],
+                constraints: vec![
+                    "Never mount a working directory that changed or cannot be revalidated at launch."
+                        .to_string(),
+                ],
+            });
+        }
+    };
+
     let container = format!("neurostrata-sandbox-{}", uuid::Uuid::new_v4());
-    let child = sandbox_command(engine, cwd, &container).spawn()?;
+    let child = sandbox_command(engine, &cwd_for_mount, &container).spawn()?;
     let outcome = match run_child_with_timeout_named(
         child,
         payload,
@@ -407,8 +484,8 @@ async fn run_child_with_timeout_named(
     limit: Duration,
     container: Option<(&str, String)>,
 ) -> std::io::Result<RunOutcome> {
-    let stdout_task = tokio::spawn(read_pipe(child.stdout.take()));
-    let stderr_task = tokio::spawn(read_pipe(child.stderr.take()));
+    let mut stdout_task = tokio::spawn(read_pipe(child.stdout.take()));
+    let mut stderr_task = tokio::spawn(read_pipe(child.stderr.take()));
 
     let wait = timeout(limit, async {
         if let Some(mut stdin) = child.stdin.take() {
@@ -477,25 +554,67 @@ async fn run_child_with_timeout_named(
             // Killing the `podman run` client does not stop the container it
             // created. Remove it by the name passed to `--name`.
             if let Some((engine, name)) = container {
-                let removal = tokio::process::Command::new(engine)
+                let mut cleanup = tokio::process::Command::new(engine);
+                cleanup
                     .args(["rm", "-f", &name])
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                match tokio::time::timeout(Duration::from_secs(2), removal).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => {
-                        warn!("Sandbox timeout: failed to remove container {name}: {e}");
+                    .stderr(Stdio::null());
+                match cleanup_with_timeout(cleanup, Duration::from_secs(2)).await {
+                    Ok(outcome) if outcome.timed_out => {
+                        warn!("Sandbox timeout: container cleanup for {name} exceeded its deadline; killed and reaped the cleanup child");
                     }
-                    Err(_) => {
-                        warn!("Sandbox timeout: container cleanup for {name} exceeded 2s");
-                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("Sandbox timeout: failed to remove container {name}: {e}"),
                 }
             }
             stdout_task.abort();
             stderr_task.abort();
             Ok(RunOutcome::TimedOut)
+        }
+    }
+}
+
+/// Outcome of a deadline-bounded cleanup subprocess.
+struct CleanupOutcome {
+    pid: Option<u32>,
+    timed_out: bool,
+}
+
+/// Spawn a container-removal subprocess that cannot outlive its deadline.
+/// `kill_on_drop` is a backstop; on timeout the child is explicitly killed
+/// and reaped so a stalled `podman rm` leaves neither a live process nor a
+/// zombie after the verdict.
+async fn cleanup_with_timeout(
+    mut cmd: tokio::process::Command,
+    limit: Duration,
+) -> std::io::Result<CleanupOutcome> {
+    let mut child = cmd.kill_on_drop(true).spawn()?;
+    let pid = child.id();
+    match timeout(limit, child.wait()).await {
+        Ok(status) => {
+            status?;
+            Ok(CleanupOutcome {
+                pid,
+                timed_out: false,
+            })
+        }
+        Err(_) => {
+            if let Err(e) = child.start_kill() {
+                warn!("Sandbox cleanup: failed to kill stalled cleanup child {pid:?}: {e}");
+            }
+            const CLEANUP_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+            match timeout(CLEANUP_REAP_TIMEOUT, child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!("Sandbox cleanup: failed to reap child {pid:?}: {e}"),
+                Err(_) => warn!(
+                    "Sandbox cleanup: child {pid:?} did not exit within {CLEANUP_REAP_TIMEOUT:?}"
+                ),
+            }
+            Ok(CleanupOutcome {
+                pid,
+                timed_out: true,
+            })
         }
     }
 }
@@ -622,11 +741,7 @@ mod tests {
             );
         }
 
-        for cwd in [
-            "/etcetera",
-            "/homework",
-            "/work/project",
-        ] {
+        for cwd in ["/etcetera", "/homework", "/work/project"] {
             assert_eq!(
                 working_directory_refusal(cwd),
                 None,
@@ -653,11 +768,12 @@ mod tests {
             None,
             "a project checkout under home stays a valid working directory"
         );
-        // No home known (e.g. HOME/USERPROFILE unset): the exact-home rule
-        // cannot fire, but the forbidden list still does.
-        assert_eq!(
-            working_directory_refusal_with_home("/Users/alice", None),
-            None
+        // No home known (e.g. HOME/USERPROFILE unset): the exact-home and
+        // sensitive-child rules cannot be evaluated, so fail closed rather
+        // than mounting a directory that may be the caller's home.
+        assert!(
+            working_directory_refusal_with_home("/Users/alice", None).is_some(),
+            "an unresolved home must fail closed"
         );
         assert_eq!(
             working_directory_refusal_with_home("/etc", Some(home)).as_deref(),
@@ -690,6 +806,16 @@ mod tests {
             None,
             "component equality, not a string prefix"
         );
+    }
+
+    #[test]
+    fn unknown_home_fails_closed() {
+        for cwd in ["/Users/alice", "/work/project", "/Users/alice/project"] {
+            assert!(
+                working_directory_refusal_with_home(cwd, None).is_some(),
+                "an unresolved home must refuse the mount: {cwd}"
+            );
+        }
     }
 
     #[test]
@@ -855,6 +981,91 @@ mod tests {
         };
         assert_eq!(fail_out.status.code(), Some(7));
         assert_eq!(String::from_utf8_lossy(&fail_out.stderr).trim(), "bad");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_cleanup_child_is_killed_and_reaped() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let started = std::time::Instant::now();
+        let outcome = cleanup_with_timeout(cmd, Duration::from_millis(200))
+            .await
+            .expect("run bounded cleanup");
+        assert!(outcome.timed_out, "a stalled cleanup must hit its deadline");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cleanup returns promptly after the deadline"
+        );
+        let pid = outcome.pid.expect("cleanup child pid");
+        let status = std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run kill -0");
+        assert!(
+            !status.success(),
+            "stalled cleanup child {pid} must be killed and reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mount_cwd_revalidation_detects_a_swapped_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_a = dir.path().join("a");
+        let real_b = dir.path().join("b");
+        std::fs::create_dir_all(&real_a).expect("create a");
+        std::fs::create_dir_all(&real_b).expect("create b");
+        let link = dir.path().join("workspace");
+        std::os::unix::fs::symlink(&real_a, &link).expect("symlink to a");
+
+        let original = link.to_string_lossy().into_owned();
+        let validated = std::fs::canonicalize(&link)
+            .expect("canonicalize link")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            revalidate_mount_cwd(&original, &validated).as_deref(),
+            Ok(validated.as_str())
+        );
+
+        // Swap the symlink after validation: the mount target is no longer
+        // the directory the refusal check inspected.
+        std::fs::remove_file(&link).expect("remove link");
+        std::os::unix::fs::symlink(&real_b, &link).expect("symlink to b");
+        let err = revalidate_mount_cwd(&original, &validated).unwrap_err();
+        assert!(
+            err.contains("changed between validation and launch"),
+            "symlink swap must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn sandbox_concurrency_is_bounded() {
+        assert_eq!(SANDBOX_MAX_CONCURRENT_RUNS, 8);
+        let sem = sandbox_concurrency();
+        let available = sem.available_permits();
+        assert!(
+            available <= SANDBOX_MAX_CONCURRENT_RUNS,
+            "never more than the configured ceiling"
+        );
+        let held: Vec<_> = (0..available)
+            .filter_map(|_| sem.try_acquire().ok())
+            .collect();
+        assert!(
+            sem.try_acquire().is_err(),
+            "every permit is held; an extra run must wait"
+        );
+        drop(held);
+        assert!(
+            sem.try_acquire().is_ok(),
+            "permits are released after a run"
+        );
     }
 
     #[test]
