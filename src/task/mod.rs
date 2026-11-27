@@ -923,6 +923,10 @@ fn persist_active_session_file_with_home(
     }
     let ns_dir = project_root.join(".NeuroStrata");
     let session_path = ns_dir.join("active_session.json");
+    let _file_lock = match session_file_flock(&session_path) {
+        Ok(lock) => lock,
+        Err(_) => return,
+    };
     let mut active: Map<String, Value> = std::fs::read_to_string(&session_path)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -1109,6 +1113,24 @@ fn seed_expand_next_hops(namespace: &str, seeds: &[String], edges: &[Value]) -> 
 static SESSION_FILE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// Cross-process advisory lock for one project's `active_session.json`. The
+/// Node hook runner reads and rewrites the same file in a separate process;
+/// the in-process [`SESSION_FILE_LOCK`] alone cannot serialize it.
+fn session_file_flock(session_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use fs2::FileExt;
+    let lock_path = session_path.with_extension("json.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
 /// The task id the session file at `project_root` currently names, if any,
 /// and the session id written with it.
 fn session_file_task_id(project_root: &std::path::Path) -> Option<(String, Option<String>)> {
@@ -1171,8 +1193,23 @@ pub(crate) async fn refresh_active_session_file(
     candidate: Option<&str>,
 ) {
     let _session_guard = SESSION_FILE_LOCK.lock().await;
-    if let Some(claimed) = claimed {
-        persist_active_session_file(project_root, namespace, golden_rules, Some(claimed));
+    if let Some((claimed_id, claimed_payload)) = claimed {
+        // A completion may land between the claim's save and this lock. Re-read
+        // under the lock and persist only while the row is still the in-progress
+        // claim this session just wrote.
+        let claimed_session = claimed_payload
+            .metadata
+            .get("task")
+            .and_then(|t| t.get("session_id"))
+            .and_then(|v| v.as_str());
+        match in_progress_task(store, namespace, claimed_id).await {
+            Ok(Some(task)) if file_names_current_claim(claimed_session, &task) => {
+                let fresh = task_payload_without_retired_entries(store, namespace, &task.payload).await;
+                persist_active_session_file(project_root, namespace, golden_rules, Some((claimed_id, &fresh)));
+            }
+            Ok(_) => {}
+            Err(()) => return,
+        }
         return;
     }
     let mut active: Option<Task> = None;
@@ -1258,6 +1295,10 @@ pub(crate) async fn clear_finished_task_from_session_file(
     let mut row: Option<Result<Option<Task>, ()>> = None;
     for root in roots {
         let session_path = root.join(".NeuroStrata").join("active_session.json");
+        let _file_lock = match session_file_flock(&session_path) {
+            Ok(lock) => lock,
+            Err(_) => continue,
+        };
         let Some(mut active) = std::fs::read_to_string(&session_path)
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -3344,6 +3385,25 @@ pub async fn handle_task_update(
     }
     if from == Status::InProgress && task.status() != Status::InProgress {
         clear_finished_task_from_session_file(&store, &namespace, &id, &session_roots).await;
+    } else if from != Status::InProgress && task.status() == Status::InProgress {
+        if let Some(root) = task
+            .task_field("worktree")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| caller_session_root(&args))
+        {
+            let golden = collect_golden_rules(&store, &namespace, None).await;
+            refresh_active_session_file(
+                &store,
+                &root,
+                &namespace,
+                &golden,
+                Some((&id, &task.payload)),
+                Some(&id),
+            )
+            .await;
+        }
     }
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("update-{}", id))

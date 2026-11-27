@@ -33,6 +33,7 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
+import { spawnSync } from 'node:child_process'
 
 // ──────────────────────────────────────────────────────────────────────
 // Configuration
@@ -759,6 +760,63 @@ function safeProjectStateDir(
   }
 }
 
+function writeSessionDirsWithLock(
+  sessionPath: string,
+  sessionId: string,
+  cwd: string
+): boolean {
+  const script = [
+    'import json, os, sys, tempfile',
+    'try:',
+    '    import fcntl',
+    'except Exception:',
+    '    sys.exit(2)',
+    'path, session_id, cwd, keep = sys.argv[1:5]',
+    'keep = int(keep)',
+    'lock_path = path + ".lock"',
+    'os.makedirs(os.path.dirname(lock_path), exist_ok=True)',
+    'with open(lock_path, "a+") as lock:',
+    '    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)',
+    '    state = {}',
+    '    try:',
+    '        with open(path, "r", encoding="utf-8") as f:',
+    '            parsed = json.load(f)',
+    '        if isinstance(parsed, dict):',
+    '            state = parsed',
+    '        else:',
+    '            sys.exit(3)',
+    '    except FileNotFoundError:',
+    '        pass',
+    '    except Exception:',
+    '        sys.exit(3)',
+    '    dirs = state.get("claude_session_dirs")',
+    '    if not isinstance(dirs, dict):',
+    '        dirs = {}',
+    '    kept = [(k, v) for k, v in dirs.items() if k != session_id and isinstance(k, str) and isinstance(v, str)]',
+    '    kept.append((session_id, cwd))',
+    '    state["claude_session_dirs"] = dict(kept[-keep:])',
+    '    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".active_session.", suffix=".tmp")',
+    '    try:',
+    '        with os.fdopen(fd, "w", encoding="utf-8") as f:',
+    '            json.dump(state, f, indent=2)',
+    '            f.flush()',
+    '            os.fsync(f.fileno())',
+    '        os.replace(tmp, path)',
+    '    except Exception:',
+    '        try:',
+    '            os.unlink(tmp)',
+    '        except Exception:',
+    '            pass',
+    '        raise',
+  ].join('\n')
+  const res = spawnSync(
+    'python3',
+    [ '-c', script, sessionPath, sessionId, cwd, String(CLAUDE_SESSION_DIRS_KEEP) ],
+    { encoding: 'utf8' }
+  )
+  return res.status === 0
+}
+
 /**
  * The project folder a CLI hook runner resolves its namespace from. Claude
  * Code starts a new hook process per event, and the event's `cwd` follows
@@ -795,34 +853,78 @@ export function resolveHookProjectDir(
   // Refuse a linked/non-project state directory before touching the file at
   // all: reading it can seed a session from another checkout (#378 F8).
   if (!safeProjectStateDir(root, stateDir, sessionPath)) return cwd
-  let state: Record<string, unknown> = {}
-  let unparsable = false
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(sessionPath, 'utf8'))
-    if (
-      typeof parsed === 'object' &&
-      parsed !== null &&
-      !Array.isArray(parsed)
-    ) {
-      state = parsed as Record<string, unknown>
-    } else {
-      unparsable = true
+  const readSessionState = (): {
+    state: Record<string, unknown>
+    unparsable: boolean
+    mtimeMs: number
+  } => {
+    let state: Record<string, unknown> = {}
+    let unparsable = false
+    let mtimeMs = -1
+    try {
+      mtimeMs = statSync(sessionPath).mtimeMs
+      const parsed: unknown = JSON.parse(readFileSync(sessionPath, 'utf8'))
+      if (
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        !Array.isArray(parsed)
+      ) {
+        state = parsed as Record<string, unknown>
+      } else {
+        unparsable = true
+      }
+    } catch (err) {
+      unparsable = (err as { code?: string })?.code !== 'ENOENT'
     }
-  } catch (err) {
-    unparsable = (err as { code?: string })?.code !== 'ENOENT'
+    return { state, unparsable, mtimeMs }
   }
+  let { state, unparsable, mtimeMs } = readSessionState()
   const dirs = asRecord(state.claude_session_dirs)
   const recorded = asString(dirs[sessionId])
   if (asString(event?.hook_event_name) === 'SessionStart') {
     if (recorded) return recorded
     // Only where NeuroStrata state already lives; never create it here.
     if (!isDirectory(stateDir) || unparsable) return cwd
-    const kept = Object.entries(dirs).filter(([id]) => id !== sessionId)
-    kept.push([sessionId, cwd])
-    state.claude_session_dirs = Object.fromEntries(
-      kept.slice(-CLAUDE_SESSION_DIRS_KEEP)
-    )
-    writeJsonAtomically(sessionPath, state)
+    if (writeSessionDirsWithLock(sessionPath, sessionId, cwd)) {
+      return cwd
+    }
+    const mergeSessionDir = (current: Record<string, unknown>): Record<string, unknown> => {
+      const currentDirs = asRecord(current.claude_session_dirs)
+      const kept = Object.entries(currentDirs).filter(([id]) => id !== sessionId)
+      kept.push([sessionId, cwd])
+      return {
+        ...current,
+        claude_session_dirs: Object.fromEntries(
+          kept.slice(-CLAUDE_SESSION_DIRS_KEEP)
+        )
+      }
+    }
+    // Fallback when no python3/fcntl is available: re-read before write so a
+    // concurrent daemon update is less likely to be clobbered.
+    try {
+      const currentMtime = existsSync(sessionPath) ? statSync(sessionPath).mtimeMs : -1
+      if (currentMtime !== mtimeMs) {
+        const reread = readSessionState()
+        if (!reread.unparsable) {
+          state = reread.state
+          mtimeMs = reread.mtimeMs
+        }
+      }
+    } catch {
+      // best effort: write the merged state we have
+    }
+    writeJsonAtomically(sessionPath, mergeSessionDir(state))
+    try {
+      const afterMtime = existsSync(sessionPath) ? statSync(sessionPath).mtimeMs : -1
+      if (afterMtime !== mtimeMs) {
+        const reread = readSessionState()
+        if (!reread.unparsable) {
+          writeJsonAtomically(sessionPath, mergeSessionDir(reread.state))
+        }
+      }
+    } catch {
+      // best effort
+    }
     return cwd
   }
   return recorded ?? cwd
