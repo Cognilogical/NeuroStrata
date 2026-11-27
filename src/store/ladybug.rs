@@ -2149,8 +2149,9 @@ fn estimate_field_row_bytes(fields: &[&str]) -> u64 {
 
 /// Conservative WAL growth for a mutation that deletes or rewrites existing
 /// rows: every touched row gets a page, plus the identifier strings the
-/// statement carries. Used by maintenance admission; true recovery bookkeeping
-/// stays on the unmetered writer (#453 re-review).
+/// statement carries. Used by maintenance admission and by the rollback
+/// backfill; only writes that must survive an already-over-cap store use the
+/// exempt recovery path (#453 re-review).
 fn estimate_maintenance_wal_bytes(fields: &[&str], rows: usize) -> u64 {
     fields.iter().fold(
         ROW_OVERHEAD_BYTES.saturating_mul(rows.max(1) as u64),
@@ -8694,18 +8695,32 @@ impl LadybugStore {
         // value is current.
         if !backfill.is_empty() {
             let ns_backfill = namespace.to_string();
-            self.write_with_deadline_unmetered("recording recovered rollback targets", move |conn| {
-                for (source, generation) in backfill.iter() {
-                    let key = crate::parser::ingest::generation_key(&ns_backfill, source);
-                    let query = format!(
-                        "MATCH (g:IngestGeneration) WHERE g.id = '{}' AND g.previous_generation = 0 SET g.previous_generation = {}",
-                        escape_ladybug_string(&key),
-                        generation
-                    );
-                    conn.query(&query)?;
-                }
-                Ok(())
-            })
+            // Each recovered target rewrites one pointer row. Count every
+            // statement's identifier and generation digits, not a single flat
+            // allowance, so a large backfill cannot slip under the cap.
+            let mut fields: Vec<String> = Vec::with_capacity(backfill.len() * 2);
+            for (source, generation) in &backfill {
+                fields.push(crate::parser::ingest::generation_key(&ns_backfill, source));
+                fields.push(generation.to_string());
+            }
+            let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+            let incoming = estimate_maintenance_wal_bytes(&field_refs, backfill.len());
+            self.write_with_deadline_within_cap(
+                "recording recovered rollback targets",
+                Some(incoming),
+                move |conn| {
+                    for (source, generation) in backfill.iter() {
+                        let key = crate::parser::ingest::generation_key(&ns_backfill, source);
+                        let query = format!(
+                            "MATCH (g:IngestGeneration) WHERE g.id = '{}' AND g.previous_generation = 0 SET g.previous_generation = {}",
+                            escape_ladybug_string(&key),
+                            generation
+                        );
+                        conn.query(&query)?;
+                    }
+                    Ok(())
+                },
+            )
             .await?;
         }
         for generation in generations.iter().rev().take(keep) {
@@ -34713,6 +34728,88 @@ eurostrata\src\daemon.rs",
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// PR #453 re-review: recording recovered rollback targets is itself a
+    /// growing write. With no headroom it must be refused with the cap-specific
+    /// error and leave the pointers untouched; essential recovery still works
+    /// on the full store, and the same backfill runs once headroom exists.
+    #[tokio::test]
+    async fn rollback_backfill_is_admitted_against_the_cap_without_blocking_recovery() {
+        use crate::traits::VectorStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("backfill-cap.lbug");
+        let seed = capped_test_store(&path, 0).await;
+        seed.init("gen").await.unwrap();
+        publish_fixture_generation(&seed, "gen", "source-a", &[("src/a.rs", "a one")]).await;
+        let a2 =
+            publish_fixture_generation(&seed, "gen", "source-a", &[("src/a.rs", "a two")]).await;
+        // An upgraded store has the column but no recorded target.
+        seed.with_conn(|conn| {
+            conn.query(
+                "MATCH (g:IngestGeneration) WHERE g.namespace = 'gen' SET g.previous_generation = 0",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        drop(seed);
+
+        async fn previous_values(store: &LadybugStore) -> Vec<u64> {
+            store
+                .with_conn(|conn| {
+                    let mut rows = conn.query(
+                        "MATCH (g:IngestGeneration) WHERE g.namespace = 'gen' RETURN g.previous_generation",
+                    )?;
+                    let mut values = Vec::new();
+                    while let Some(row) = rows.next() {
+                        values.push(format!("{}", row[0]).parse::<u64>().unwrap_or(0));
+                    }
+                    Ok(values)
+                })
+                .await
+                .unwrap()
+        }
+
+        let full = current_store_bytes_at(&path);
+        let capped = capped_test_store(&path, full).await;
+        let err = capped
+            .prune_generations("gen", 2)
+            .await
+            .expect_err("rollback backfill with no headroom must be refused");
+        assert!(err.to_string().contains("STORE_FULL"), "{err}");
+        let after = previous_values(&capped).await;
+        assert!(
+            after.iter().all(|value| *value == 0),
+            "a refused backfill must land nothing: {after:?}"
+        );
+
+        // Required recovery stays possible on a store at its cap.
+        capped
+            .init("gen")
+            .await
+            .expect("idempotent schema recovery still works at the cap");
+        capped
+            .delete(
+                "gen",
+                &crate::parser::ingest::generation_scoped_id("gen", a2, "src/a.rs"),
+            )
+            .await
+            .expect("single-id recovery delete still works at the cap");
+        drop(capped);
+
+        // With headroom the backfill is admitted and records the target.
+        let with_room = capped_test_store(&path, full + 256 * 1024).await;
+        with_room
+            .prune_generations("gen", 2)
+            .await
+            .expect("rollback backfill admitted when headroom exists");
+        let recorded = previous_values(&with_room).await;
+        assert!(
+            recorded.iter().any(|value| *value != 0),
+            "the recovered rollback target must be persisted: {recorded:?}"
+        );
     }
 
     /// Prune's delete rechecks the rollback target inside its own write turn;
