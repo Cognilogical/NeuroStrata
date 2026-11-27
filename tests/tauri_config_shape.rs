@@ -36,6 +36,20 @@ fn read_json(rel: &str) -> Value {
     serde_json::from_str(&read_text(rel)).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
 }
 
+/// Source slice between two markers, so a literal elsewhere in the file cannot
+/// satisfy an assertion about a particular function.
+fn region<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+    let from = src
+        .find(start)
+        .unwrap_or_else(|| panic!("missing start marker {start:?}"))
+        + start.len();
+    let to = src[from..]
+        .find(end)
+        .unwrap_or_else(|| panic!("missing end marker {end:?}"))
+        + from;
+    &src[from..to]
+}
+
 fn csp() -> String {
     let conf = read_json("src-tauri/tauri.conf.json");
     match conf.pointer("/app/security/csp").and_then(Value::as_str) {
@@ -301,28 +315,99 @@ fn daemon_connect_src_is_loopback_only() {
 #[test]
 fn open_external_delegates_to_shared_policy() {
     let src = read_text("src-tauri/src/main.rs");
-    let validation = src
-        .find("url_policy::is_allowed_external_url")
-        .expect("open_external must call the shared URL validator");
-    let opener = src
-        .find("open::that(")
-        .expect("open_external must still hand allowed targets to the OS");
+    let body = region(&src, "fn open_external(url: String)", "#[tauri::command]");
     assert!(
-        validation < opener,
-        "URL validation must happen before any target is opened"
+        body.contains("url_policy::open_external_with("),
+        "the command must guard every OS handoff through the shared validator"
     );
     assert!(
-        src.contains("url_policy::native_editor_path"),
-        "native editor links must be resolved through the validated path helper"
+        !body.contains("open::that(&url)"),
+        "no raw URL may bypass the validated handoff"
     );
+    assert!(
+        !body.contains("url_policy::is_allowed_external_url"),
+        "a bare boolean check is not a guard: the result must gate the handoff"
+    );
+    // Allowed/rejected behavior is exercised in tests/tauri_url_policy.rs;
+    // here we pin that the production command is wired to that behavior.
 }
 
 #[test]
 fn ui_emits_native_editor_links() {
     let ui = read_text("web-ui/src/components/UIPanel.tsx");
+    let builder = region(
+        &ui,
+        "const encodePath = (p: string) =>",
+        "\n  const handleOpenInEditor",
+    );
     assert!(
-        ui.contains("neurostrata-editor://file/"),
-        "the editor action must emit the native, non-branded editor deep link"
+        builder.contains("neurostrata-editor://file/"),
+        "the builder itself must emit the native, non-branded editor deep link"
+    );
+    assert!(
+        builder.contains("encodeURIComponent"),
+        "path segments must be encoded so reserved characters are not URL syntax"
+    );
+    let action = region(
+        &ui,
+        "const handleOpenInEditor = () =>",
+        "\n  // Candy glassmorphism",
+    );
+    assert!(
+        action.contains("editorUrl("),
+        "the editor action must actually call the builder"
+    );
+    let state = region(&ui, "const [editor, setEditor]", "\n  const [openError");
+    assert!(
+        state.contains("neurostrata_editor") && state.contains("neurostrata_editor_profile"),
+        "an upgraded installation's saved editor choice must be migrated"
+    );
+}
+
+#[test]
+fn navigation_policy_guards_webview_without_widening_csp() {
+    let src = read_text("src-tauri/src/main.rs");
+    let setup = region(&src, "tauri::Builder::default()", ".invoke_handler(");
+    assert!(
+        setup.contains(".on_navigation(") && setup.contains("url_policy::is_allowed_navigation("),
+        "offsite form submissions and navigations must be blocked in the webview"
+    );
+    let policy = csp();
+    assert!(
+        !policy.contains("form-action"),
+        "CSP must stay at five directives"
+    );
+    assert!(
+        !policy.contains("ipc"),
+        "CSP must keep loopback-only connect-src"
+    );
+    let doc = read_text("docs/features-api/ops/security.md");
+    assert!(
+        doc.contains("postMessage"),
+        "docs must explain the IPC fallback"
+    );
+    assert!(
+        doc.contains("navigation guard"),
+        "docs must explain the form barrier"
+    );
+}
+
+#[test]
+fn native_editor_launch_works_without_registered_handler() {
+    let src = read_text("src-tauri/src/main.rs");
+    let launcher = region(
+        &src,
+        "fn launch_editor(",
+        "#[tauri::command]\nfn open_external",
+    );
+    assert!(
+        launcher.contains("NEUROSTRATA_EDITOR_PRIMARY")
+            && launcher.contains("NEUROSTRATA_EDITOR_ALTERNATE"),
+        "both editor profiles must have an ordinary-installation launcher"
+    );
+    assert!(
+        launcher.contains("open::that("),
+        "fall back to the OS file opener when no launcher is configured"
     );
 }
 

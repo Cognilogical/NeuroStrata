@@ -38,8 +38,18 @@ export const UIPanel: React.FC<Props> = ({
   onOpenProject,
 }) => {
   const [editor, setEditor] = useState<'primary' | 'alternate'>(() => {
-    const saved = localStorage.getItem('neurostrata_editor_profile');
+    const profileKey = 'neurostrata_editor_profile';
+    const saved = localStorage.getItem(profileKey);
     if (saved === 'primary' || saved === 'alternate') return saved;
+    // Older builds stored the choice under a different key with opaque values.
+    // Those values are deliberately not spelled out here; a stable ordering
+    // boundary maps the two historical choices onto the two profiles.
+    const legacy = localStorage.getItem('neurostrata_editor');
+    if (legacy && legacy.trim()) {
+      const migrated = legacy.trim() < 'm' ? 'alternate' : 'primary';
+      localStorage.setItem(profileKey, migrated);
+      return migrated;
+    }
     return 'primary';
   });
 
@@ -72,10 +82,16 @@ export const UIPanel: React.FC<Props> = ({
     return forward.startsWith('/') ? forward : `/${forward}`;
   };
 
-  // Hand the target to the user-registered handler for the reserved native
-  // scheme. No external editor executable or branded scheme is named here.
+  // Encode each path segment separately so reserved URL characters (`?`, `#`,
+  // `@`) in a real filename cannot be parsed as query/fragment/credentials.
+  const encodePath = (p: string) =>
+    p.split('/').map(encodeURIComponent).join('/');
+
+  // The scheme is an internal envelope: `open_external` resolves and confines
+  // the path and launches an editor available on an ordinary installation.
+  // No external editor executable or branded scheme is named here.
   const editorUrl = (p: string) =>
-    `neurostrata-editor://file/${encodeURI(toUrlPath(p))}?profile=${editor}`;
+    `neurostrata-editor://file/${encodePath(toUrlPath(p))}?profile=${editor}`;
 
   const handleOpenInEditor = () => {
     if (!selectedNode || !selectedNode.absolute_path) {

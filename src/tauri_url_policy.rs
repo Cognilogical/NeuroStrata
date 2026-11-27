@@ -5,6 +5,8 @@
 //! compile the same file directly, making validation changes observable even
 //! when the GUI crate itself is not built.
 
+use std::path::Path;
+
 /// The reserved, non-branded scheme used for file-backed editor deep links.
 pub const NATIVE_EDITOR_SCHEME: &str = "neurostrata-editor://";
 
@@ -90,4 +92,110 @@ pub fn native_editor_path(url: &str) -> Result<&str, &'static str> {
         return Err("dot segment in editor path");
     }
     Ok(path)
+}
+
+/// Profile carried by an editor link. Call only on a link that has passed
+/// `native_editor_path`, which guarantees the query is one of `PROFILES`.
+pub fn native_editor_profile(url: &str) -> &'static str {
+    match url.split_once('?').map(|(_, query)| query) {
+        Some(profile) if profile == PROFILES[1] => "alternate",
+        _ => "primary",
+    }
+}
+
+/// Resolve a target end-to-end: validate it, confine native editor links to the
+/// active project, and only then call the OS handoff. Keeping the handoff behind
+/// this function makes "validation happened" testable behavior rather than a
+/// source-text claim about where a call appears.
+pub fn open_external_with<F>(
+    url: &str,
+    project_root: Option<&str>,
+    handoff: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&str) -> Result<(), String>,
+{
+    if !url.starts_with(NATIVE_EDITOR_SCHEME) {
+        if !is_allowed_external_url(url) {
+            return Err(format!(
+                "Refusing to open '{url}': target failed URL policy"
+            ));
+        }
+        return handoff(url);
+    }
+
+    let encoded_path = native_editor_path(url)?;
+    let root = project_root.ok_or("no active project: editor targets are confined to a project")?;
+    let decoded = percent_decode(encoded_path)?;
+    if decoded.contains('\0') || decoded.chars().any(char::is_control) {
+        return Err("control character in editor path".to_string());
+    }
+    if !path_is_within_root(&decoded, root)? {
+        return Err(format!(
+            "Refusing to open '{decoded}': editor targets must be inside the active project"
+        ));
+    }
+    handoff(&decoded)
+}
+
+/// Canonicalize both paths so symlinks and `..` cannot escape the project.
+pub fn path_is_within_root(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<bool, String> {
+    let target = std::fs::canonicalize(path.as_ref())
+        .map_err(|e| format!("cannot resolve editor target: {e}"))?;
+    let project = std::fs::canonicalize(root.as_ref())
+        .map_err(|e| format!("cannot resolve project root: {e}"))?;
+    Ok(target.starts_with(project))
+}
+
+fn percent_decode(value: &str) -> Result<String, String> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err("truncated percent escape in editor path".to_string());
+            }
+            let Some(hi) = nibble(bytes[i + 1]) else {
+                return Err("invalid percent escape in editor path".to_string());
+            };
+            let Some(lo) = nibble(bytes[i + 2]) else {
+                return Err("invalid percent escape in editor path".to_string());
+            };
+            decoded.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| "editor path is not UTF-8".to_string())
+}
+
+/// Webview navigations (including form submissions) are confined to the app's
+/// own origin, the loopback daemon, and the dev server in debug builds. This is
+/// a second, behavior-level barrier: issue #413's CSP stays byte-exact, with no
+/// `form-action` directive added to it.
+pub fn is_allowed_navigation(url: &str, dev: bool) -> bool {
+    fn on_origin(url: &str, origin: &str) -> bool {
+        url.strip_prefix(origin).map_or(false, |rest| {
+            rest.is_empty()
+                || rest.starts_with('/')
+                || rest.starts_with('?')
+                || rest.starts_with('#')
+        })
+    }
+    on_origin(url, "tauri://localhost")
+        || on_origin(url, "http://tauri.localhost")
+        || on_origin(url, "https://tauri.localhost")
+        || on_origin(url, "http://127.0.0.1:34343")
+        || (dev && on_origin(url, "http://localhost:5173"))
 }
