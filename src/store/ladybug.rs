@@ -1617,6 +1617,9 @@ pub struct LadybugStore {
     /// The most recent open-time row-identity audit (#409). `None` until the
     /// first successful `init` runs it.
     last_row_identity_audit: Arc<std::sync::Mutex<Option<RowIdentityAudit>>>,
+    /// Once-only guard: concurrent callers reaching the first-init path must
+    /// not each run (and log) the same whole-store audit (#409 re-review).
+    audit_ran: Arc<std::sync::atomic::AtomicBool>,
     /// Test-only fault injection for the marker write (#409): set before the
     /// first upsert to prove a failed marker write refuses the vector.
     #[cfg(test)]
@@ -4572,18 +4575,6 @@ impl StoreIdentityMarker {
         marker
     }
 
-    /// A legacy store's identity adopted with no record to read it from: the
-    /// serving descriptor is recorded as *this* open's best witness, and the
-    /// `NULL` provenance says so instead of pretending the store declared it.
-    fn adopted_without_provenance(
-        descriptor: &crate::traits::EmbeddingDescriptor,
-        adopted_at: String,
-    ) -> Self {
-        let mut marker = Self::from_descriptor(descriptor);
-        marker.adopted_at = Some(adopted_at);
-        marker
-    }
-
     fn from_descriptor(descriptor: &crate::traits::EmbeddingDescriptor) -> Self {
         Self {
             marker_version: STORE_IDENTITY_MARKER_VERSION,
@@ -4624,12 +4615,15 @@ pub const ROW_IDENTITY_AUDIT_BUDGET: std::time::Duration = std::time::Duration::
 /// Rows per audit page.
 pub const ROW_IDENTITY_AUDIT_PAGE_SIZE: usize = 500;
 
-/// How many mismatching ids of each kind an audit log line shows.
+/// How many mismatching ids of each kind an audit log line shows, and how
+/// many findings of a kind the audit retains. Total counts are kept
+/// separately, so a fast scan of a badly broken store cannot grow the
+/// returned vector without bound (#409 re-review).
 pub const ROW_IDENTITY_AUDIT_LOG_SAMPLE: usize = 3;
 
 /// The three ways a `Memory` row's id can contradict the namespace the row
 /// claims (#409).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RowIdentityMismatchKind {
     /// A generation-scoped id (`<namespace>::<generation>::<path>`) whose
     /// namespace segment is not the row's namespace.
@@ -4670,7 +4664,12 @@ pub struct RowIdentityAudit {
     pub scanned: usize,
     /// The budget ran out before the whole table was paged through.
     pub truncated: bool,
+    /// Bounded per-kind samples, never one entry per bad row.
     pub mismatches: Vec<RowIdentityMismatch>,
+    /// Exact count of findings per kind, including ones not retained.
+    pub mismatch_counts: std::collections::BTreeMap<RowIdentityMismatchKind, usize>,
+    /// Some findings were counted but not retained.
+    pub mismatches_truncated: bool,
 }
 
 /// Read the single persisted marker, or `None` when the table does not exist
@@ -4798,80 +4797,37 @@ fn classify_row_identity(
     None
 }
 
-/// Page through `Memory` within `budget`, collecting rows whose id contradicts
-/// their namespace. Read-only and bounded: it stops at the budget boundary and
-/// reports `truncated` rather than overrunning the open.
-fn audit_row_identity(
+/// One keyset page of the row-identity audit. Each page is a separate store
+/// turn: a page that outlives its deadline releases the writer lock when its
+/// blocking task finishes, instead of holding it for the rest of the survey.
+/// Keyset, not SKIP: a concurrent insert or delete before an offset would
+/// shift later pages and silently skip or repeat rows.
+fn audit_row_identity_page(
     conn: &Connection,
-    started: std::time::Instant,
-    budget: std::time::Duration,
-) -> Result<RowIdentityAudit> {
-    let started_at = chrono::Utc::now().to_rfc3339();
-    let mut mismatches = Vec::new();
-    let mut scanned = 0usize;
-    let mut truncated = false;
-    // Keyset, not SKIP: a concurrent insert or delete before an offset would
-    // shift later pages and silently skip or repeat rows. The last id visited
-    // is a stable cursor under concurrent changes.
-    let mut after_id: Option<String> = None;
-    loop {
-        if started.elapsed() >= budget {
-            truncated = true;
-            break;
-        }
-        let query = match &after_id {
-            Some(after) => format!(
-                "MATCH (m:Memory) WHERE m.id > '{}' RETURN m.id, m.namespace, m.user_id \
-                 ORDER BY m.id LIMIT {}",
-                escape_ladybug_string(after),
-                ROW_IDENTITY_AUDIT_PAGE_SIZE
-            ),
-            None => format!(
-                "MATCH (m:Memory) RETURN m.id, m.namespace, m.user_id \
-                 ORDER BY m.id LIMIT {}",
-                ROW_IDENTITY_AUDIT_PAGE_SIZE
-            ),
-        };
-        let rows = conn.query(&query)?;
-        let mut page = 0usize;
-        let mut last_id: Option<String> = None;
-        for row in rows {
-            // The budget starts before the caller waits for its turn, so a
-            // long page query or row walk must not overrun it either.
-            if started.elapsed() >= budget {
-                truncated = true;
-                break;
-            }
-            page += 1;
-            let id = row_text(row.first());
-            let namespace = row_text(row.get(1));
-            let user_id = row_text(row.get(2));
-            last_id = Some(id.clone());
-            if let Some(kind) = classify_row_identity(&id, &namespace, &user_id) {
-                mismatches.push(RowIdentityMismatch {
-                    id,
-                    namespace,
-                    kind,
-                });
-            }
-        }
-        scanned += page;
-        if truncated || page < ROW_IDENTITY_AUDIT_PAGE_SIZE {
-            break;
-        }
-        match last_id {
-            Some(id) => after_id = Some(id),
-            None => break,
-        }
+    after_id: Option<&str>,
+) -> Result<Vec<(String, String, String)>> {
+    let query = match after_id {
+        Some(after) => format!(
+            "MATCH (m:Memory) WHERE m.id > '{}' RETURN m.id, m.namespace, m.user_id \
+             ORDER BY m.id LIMIT {}",
+            escape_ladybug_string(after),
+            ROW_IDENTITY_AUDIT_PAGE_SIZE
+        ),
+        None => format!(
+            "MATCH (m:Memory) RETURN m.id, m.namespace, m.user_id \
+             ORDER BY m.id LIMIT {}",
+            ROW_IDENTITY_AUDIT_PAGE_SIZE
+        ),
+    };
+    let mut page = Vec::with_capacity(ROW_IDENTITY_AUDIT_PAGE_SIZE);
+    for row in conn.query(&query)? {
+        page.push((
+            row_text(row.first()),
+            row_text(row.get(1)),
+            row_text(row.get(2)),
+        ));
     }
-    Ok(RowIdentityAudit {
-        started_at,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-        budget_ms: budget.as_millis() as u64,
-        scanned,
-        truncated,
-        mismatches,
-    })
+    Ok(page)
 }
 
 /// A string cell (or `None` for a `NULL`/missing cell).
@@ -4929,6 +4885,11 @@ struct FirstWriteMarker {
     serving: Option<crate::traits::EmbeddingDescriptor>,
     embed_config_dir: PathBuf,
     dimensions: usize,
+    /// The only trustworthy evidence a pre-existing row's producer can
+    /// have: a parseable store-state sidecar. Width alone is not provenance.
+    provenance: Option<crate::traits::EmbeddingDescriptor>,
+    /// Metadata-only synthetic vectors must not name an embedding model.
+    skip_identity: bool,
     #[cfg(test)]
     fail_write: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -4988,29 +4949,42 @@ impl FirstWriteMarker {
                 "refusing to write vectors: the store has no persisted embedding marker and this process can resolve no embedding identity (no serving or configured descriptor)"
             );
         };
-        // Rows without a marker belong to a legacy store, not to this first
-        // vector. Pinning the configured descriptor to them without physical
-        // width evidence would fabricate a producer and later refuse the real
-        // model; leave such a store unmarked for the verified-open adoption
-        // path instead (#409).
-        if let Ok(facts) = inspect_memory_embedding_and_count(conn) {
-            if facts.row_count().unwrap_or(0) > 0 {
-                let Some(width) = facts.physical_width() else {
-                    return Ok(());
-                };
-                if width != descriptor.dims {
-                    return Ok(());
-                }
-            }
+        // Synthetic (all-zero) rows name no embedder: they must not pin the
+        // store to a model the first real vector may contradict.
+        if self.skip_identity {
+            return Ok(());
         }
+        // Pre-existing rows belong to a legacy store. Their producer can
+        // only be named by a trustworthy record (the parseable sidecar),
+        // never by a matching width or by an unavailable catalog (#409
+        // re-review). Fail closed instead of fabricating an identity.
+        let facts = inspect_memory_embedding_and_count(conn).map_err(|e| {
+            anyhow::anyhow!(
+                "refusing to write vectors: cannot attest whether the store is empty ({e})"
+            )
+        })?;
+        let marker = if facts.row_count().unwrap_or(0) > 0 && store_has_real_vector(conn)? {
+            let Some(prov) = &self.provenance else {
+                anyhow::bail!(
+                    "refusing to write vectors: this data-bearing store has no persisted embedding marker and no trustworthy producer record (store-state sidecar); a matching embedding width is not identity. Open under the model that produced the rows or start a new store."
+                );
+            };
+            if facts.physical_width() != Some(prov.dims) {
+                anyhow::bail!(
+                    "refusing to write vectors: the store's {} FLOAT rows contradict the recorded identity's {} dimensions",
+                    facts.physical_width().unwrap_or(0),
+                    prov.dims
+                );
+            }
+            StoreIdentityMarker::adopted_from_sidecar(prov, chrono::Utc::now().to_rfc3339())
+        } else {
+            StoreIdentityMarker::written_with_first_vector(&descriptor)
+        };
         #[cfg(test)]
         if self.fail_write.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("injected StoreIdentity marker write failure");
         }
-        write_store_identity_marker(
-            conn,
-            &StoreIdentityMarker::written_with_first_vector(&descriptor),
-        )
+        write_store_identity_marker(conn, &marker)
     }
 }
 
@@ -5021,9 +4995,6 @@ impl FirstWriteMarker {
 struct StoreIdentityAdoption {
     store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
     local_path: PathBuf,
-    serving: Option<crate::traits::EmbeddingDescriptor>,
-    embed_config_dir: PathBuf,
-    dimensions: usize,
     #[cfg(test)]
     fail_write: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -5065,9 +5036,10 @@ impl StoreIdentityAdoption {
             }
         };
         let rows = facts.row_count().unwrap_or(0);
-        if rows <= 0 {
-            // A store with no data has no producer to record yet: the first
-            // vector's writer turn writes the marker.
+        if rows <= 0 || !store_has_real_vector(conn)? {
+            // No embedder-produced vector has landed yet (rows may be
+            // metadata-only zero vectors), so there is no producer to adopt:
+            // the first real vector writes the marker.
             return Ok(false);
         }
         let Some(physical_width) = facts.physical_width() else {
@@ -5079,35 +5051,34 @@ impl StoreIdentityAdoption {
             );
             return Ok(false);
         };
-        let adopted_at = chrono::Utc::now().to_rfc3339();
+        // Only a parseable store-state sidecar is trustworthy provenance for
+        // rows this process did not write. Width matches and absent evidence
+        // are not identity: guessing here would pin a false producer and
+        // later refuse the model that actually made the vectors (#409
+        // re-review).
         let marker = match self.cached_store_state() {
-            CachedStoreState::Recorded(recorded) => Some(
-                StoreIdentityMarker::adopted_from_sidecar(&recorded.descriptor, adopted_at),
+            CachedStoreState::Recorded(recorded) => StoreIdentityMarker::adopted_from_sidecar(
+                &recorded.descriptor,
+                chrono::Utc::now().to_rfc3339(),
             ),
             CachedStoreState::Unparseable(reason) => {
                 tracing::warn!(
-                    "not adopting an embedding marker from the unparseable store-state sidecar: {reason}"
+                    "embedding-marker adoption skipped: the store-state sidecar is unparseable: {reason}"
                 );
-                None
+                return Ok(false);
             }
-            _ => {
-                let descriptor = match &self.serving {
-                    Some(serving) => Some(serving.clone()),
-                    None => {
-                        configured_embedding_descriptor_in(&self.embed_config_dir, self.dimensions)
-                            .ok()
+            other => {
+                tracing::debug!(
+                    "embedding-marker adoption skipped: no trustworthy producer record for this data-bearing store ({})",
+                    match other {
+                        CachedStoreState::LockedUnknown => "sidecar absent",
+                        CachedStoreState::FreshUnrecorded => "store unrecorded",
+                        CachedStoreState::Recorded(_) => "recorded",
+                        CachedStoreState::Unparseable(_) => "unparseable",
                     }
-                };
-                descriptor.map(|descriptor| {
-                    StoreIdentityMarker::adopted_without_provenance(&descriptor, adopted_at)
-                })
+                );
+                return Ok(false);
             }
-        };
-        let Some(marker) = marker else {
-            tracing::debug!(
-                "embedding-marker adoption skipped: the data-bearing store records no identity and this process serves none"
-            );
-            return Ok(false);
         };
         if marker.dims != physical_width {
             tracing::debug!(
@@ -5155,30 +5126,37 @@ fn log_row_identity_audit(audit: &RowIdentityAudit) {
         );
         return;
     }
+    if audit.mismatches_truncated {
+        tracing::warn!(
+            "row identity audit: finding samples capped at {} per kind ({} finding(s) counted); full ids are not retained",
+            ROW_IDENTITY_AUDIT_LOG_SAMPLE,
+            audit.mismatch_counts.values().sum::<usize>()
+        );
+    }
     for kind in [
         RowIdentityMismatchKind::ScopedNamespace,
         RowIdentityMismatchKind::ForeignQualified,
         RowIdentityMismatchKind::UnqualifiedIngested,
     ] {
-        let matching: Vec<&RowIdentityMismatch> = audit
-            .mismatches
-            .iter()
-            .filter(|mismatch| mismatch.kind == kind)
-            .collect();
-        if matching.is_empty() {
+        let Some(count) = audit.mismatch_counts.get(&kind).copied() else {
+            continue;
+        };
+        if count == 0 {
             continue;
         }
         // An id comes from a caller-supplied row and can contain newlines or
         // terminal control characters; escape them so a sampled id cannot
         // forge additional log lines (#409).
-        let sample: Vec<String> = matching
+        let sample: Vec<String> = audit
+            .mismatches
             .iter()
+            .filter(|mismatch| mismatch.kind == kind)
             .take(ROW_IDENTITY_AUDIT_LOG_SAMPLE)
             .map(|mismatch| mismatch.id.escape_default().to_string())
             .collect();
         tracing::warn!(
             "row identity audit: {} row(s) report {} (sample of up to {}: {}). Reported only; the store opened unchanged.",
-            matching.len(),
+            count,
             kind.label(),
             ROW_IDENTITY_AUDIT_LOG_SAMPLE,
             sample.join(", ")
@@ -5200,6 +5178,10 @@ struct FirstWriteFlip {
     serving: Option<crate::traits::EmbeddingDescriptor>,
     embed_config_dir: PathBuf,
     dimensions: usize,
+    /// Metadata-only zero vectors are not embedder output: flipping the
+    /// sidecar to data-bearing under this model would pin a producer that
+    /// never produced a vector.
+    skip_identity: bool,
 }
 
 impl FirstWriteFlip {
@@ -5243,6 +5225,9 @@ impl FirstWriteFlip {
     /// write is logged loudly and the in-memory state still flips, so
     /// this process keeps treating the store as data-bearing.
     fn flip_store_state_to_data(&self) {
+        if self.skip_identity {
+            return;
+        }
         match self.cached_store_state() {
             CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
                 recorded.has_data = true;
@@ -5487,20 +5472,28 @@ impl LockedUnknownMigration {
         // every vector operation. Leave the sidecar exactly as found and
         // keep the marker, so reopening with the model that actually
         // produced the vectors still identifies the store.
-        if let Some(marker) = read_store_identity_marker(conn)? {
-            let persisted = marker.descriptor();
-            if !persisted.compatible(&self.serving) {
-                tracing::warn!(
-                    "not recording a data-bearing store-state sidecar: the store's persisted embedding marker records model '{}' (provider '{}', {} dims), but this process serves model '{}' (provider '{}', {} dims); the marker is preserved so an open under the recorded model can still identify the store",
-                    persisted.model,
-                    persisted.provider,
-                    persisted.dims,
-                    self.serving.model,
-                    self.serving.provider,
-                    self.serving.dims
-                );
-                return Ok(false);
-            }
+        // Width and a serving descriptor are not provenance. With no
+        // persisted marker and no sidecar there is no trustworthy record of
+        // who produced these rows, so recording one here would fabricate an
+        // identity that later refuses the real model (#409 re-review).
+        let Some(marker) = read_store_identity_marker(conn)? else {
+            tracing::warn!(
+                "not recording a data-bearing store-state sidecar: this store holds vectors but has no persisted embedding marker; width and the serving model are not identity"
+            );
+            return Ok(false);
+        };
+        let persisted = marker.descriptor();
+        if !persisted.compatible(&self.serving) {
+            tracing::warn!(
+                "not recording a data-bearing store-state sidecar: the store's persisted embedding marker records model '{}' (provider '{}', {} dims), but this process serves model '{}' (provider '{}', {} dims); the marker is preserved so an open under the recorded model can still identify the store",
+                persisted.model,
+                persisted.provider,
+                persisted.dims,
+                self.serving.model,
+                self.serving.provider,
+                self.serving.dims
+            );
+            return Ok(false);
         }
         let state = crate::model_choice::StoreState::new(true, self.serving.clone());
         match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
@@ -5693,6 +5686,7 @@ impl LadybugStore {
             store_state: Arc::new(std::sync::Mutex::new(None)),
             census_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_row_identity_audit: Arc::new(std::sync::Mutex::new(None)),
+            audit_ran: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             store_identity_write_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
@@ -5784,11 +5778,17 @@ impl LadybugStore {
     /// The first-write marker handle for this store (see
     /// [`FirstWriteMarker`]): the serving descriptor this process writes
     /// under plus the configured-descriptor inputs.
-    fn first_write_marker(&self) -> FirstWriteMarker {
+    fn first_write_marker(&self, skip_identity: bool) -> FirstWriteMarker {
+        let provenance = match self.cached_store_state() {
+            CachedStoreState::Recorded(recorded) => Some(recorded.descriptor),
+            _ => None,
+        };
         FirstWriteMarker {
             serving: self.serving_descriptor(),
             embed_config_dir: self.embed_config_dir.clone(),
             dimensions: self.dimensions,
+            provenance,
+            skip_identity,
             #[cfg(test)]
             fail_write: Arc::clone(&self.store_identity_write_failure),
         }
@@ -5817,13 +5817,26 @@ impl LadybugStore {
         self.with_conn(read_store_identity_marker).await
     }
 
+    /// The marker read used on write paths. The turn-lock wait and the query
+    /// are bounded by the write deadline, so a stuck engine releases the
+    /// caller with the normal busy/deadline error instead of leaving every
+    /// later write waiting on an unbounded read (#409 re-review).
+    async fn read_store_identity_marker_bounded(&self) -> Result<Option<StoreIdentityMarker>> {
+        bounded(
+            "reading the persisted embedding marker",
+            write_timeout(),
+            self.read_store_identity_marker(),
+        )
+        .await
+    }
+
     /// Refuse vector work when the store's persisted marker disagrees with
     /// this process's serving descriptor, or when the marker and the
     /// store-state sidecar both name an identity and disagree. Unlike
     /// [`LadybugStore::check_data_bearing_identity`] this check needs no
     /// sidecar: the DB copy alone carries the identity.
     async fn check_embedding_marker_identity(&self) -> Result<()> {
-        let Some(marker) = self.read_store_identity_marker().await? else {
+        let Some(marker) = self.read_store_identity_marker_bounded().await? else {
             return Ok(());
         };
         if marker.marker_version != STORE_IDENTITY_MARKER_VERSION {
@@ -5848,14 +5861,13 @@ impl LadybugStore {
             if !persisted.compatible(&serving) {
                 return Err(persisted_marker_refusal(&persisted, &serving));
             }
-        } else if matches!(&cached, CachedStoreState::LockedUnknown)
-            && self.embed_config_dir.join("embedders.json").is_file()
-        {
-            // No serving descriptor and no sidecar: after a sidecar loss the
-            // configured model is the only identity a vector operation could
-            // claim, so a changed configuration must not silently mix spaces
-            // (#409). Requiring an explicit config file keeps test/override
-            // stores (with no config directory) out of this comparison.
+        } else if self.embed_config_dir.join("embedders.json").is_file() {
+            // No serving descriptor means a vector operation can only claim
+            // the configured model, whatever the sidecar says: a recorded
+            // sidecar agreeing with the marker does not authorize a changed
+            // configuration to mix spaces (#409 re-review). Requiring an
+            // explicit config file keeps override stores with no config
+            // directory out of this comparison.
             if let Ok(configured) =
                 configured_embedding_descriptor_in(&self.embed_config_dir, self.dimensions)
             {
@@ -5876,9 +5888,6 @@ impl LadybugStore {
         let adoption = StoreIdentityAdoption {
             store_state: Arc::clone(&self.store_state),
             local_path: self.local_path.clone(),
-            serving: self.serving_descriptor(),
-            embed_config_dir: self.embed_config_dir.clone(),
-            dimensions: self.dimensions,
             #[cfg(test)]
             fail_write: Arc::clone(&self.store_identity_write_failure),
         };
@@ -5892,44 +5901,108 @@ impl LadybugStore {
     /// the first successful `init` (#409). Failures are logged; the open has
     /// already succeeded and is never undone by the audit.
     async fn audit_row_identity_at_init(&self) {
-        // Start the clock before waiting for the store's single turn: time
-        // spent queued behind a writer is part of the audit budget, and the
-        // bounded wrapper releases this caller at the deadline. The audit
-        // closure sees the same start, so it stops with the time that remains.
+        // Only one successful init per store runs the survey. Two callers can
+        // both see `schema_ready == false`; without this latch each would
+        // page the whole table and log a duplicate audit.
+        if self
+            .audit_ran
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         let started = std::time::Instant::now();
-        let result = bounded(
-            "the row identity audit",
-            ROW_IDENTITY_AUDIT_BUDGET,
-            self.with_conn(move |conn| {
-                audit_row_identity(conn, started, ROW_IDENTITY_AUDIT_BUDGET)
-            }),
-        )
-        .await;
-        match result {
-            Ok(audit) => {
-                log_row_identity_audit(&audit);
-                *self
-                    .last_row_identity_audit
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(audit);
+        let mut audit = RowIdentityAudit {
+            started_at: chrono::Utc::now().to_rfc3339(),
+            elapsed_ms: 0,
+            budget_ms: ROW_IDENTITY_AUDIT_BUDGET.as_millis() as u64,
+            scanned: 0,
+            truncated: false,
+            mismatches: Vec::new(),
+            mismatch_counts: std::collections::BTreeMap::new(),
+            mismatches_truncated: false,
+        };
+        let mut after_id: Option<String> = None;
+        let mut retained: std::collections::BTreeMap<RowIdentityMismatchKind, usize> =
+            std::collections::BTreeMap::new();
+        loop {
+            let remaining = ROW_IDENTITY_AUDIT_BUDGET.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                audit.truncated = true;
+                break;
             }
-            Err(e) => {
-                tracing::warn!("row identity audit could not run; the store opened unchanged: {e}");
+            let cursor = after_id.clone();
+            // Each page is its own store turn. A page that outlives the
+            // deadline releases that turn when its blocking task finishes;
+            // no further page is issued after the budget expires, so the
+            // audit cannot keep later work queued behind it.
+            let page = match bounded(
+                "a row identity audit page",
+                remaining,
+                self.with_conn(move |conn| audit_row_identity_page(conn, cursor.as_deref())),
+            )
+            .await
+            {
+                Ok(page) => page,
+                Err(e) => {
+                    tracing::warn!(
+                        "row identity audit stopped early; the store opened unchanged: {e}"
+                    );
+                    audit.truncated = true;
+                    break;
+                }
+            };
+            let page_len = page.len();
+            let mut last_id: Option<String> = None;
+            for (id, namespace, user_id) in page {
+                if started.elapsed() >= ROW_IDENTITY_AUDIT_BUDGET {
+                    audit.truncated = true;
+                    break;
+                }
+                last_id = Some(id.clone());
+                if let Some(kind) = classify_row_identity(&id, &namespace, &user_id) {
+                    *audit.mismatch_counts.entry(kind).or_insert(0) += 1;
+                    let kept = retained.entry(kind).or_insert(0);
+                    if *kept < ROW_IDENTITY_AUDIT_LOG_SAMPLE {
+                        *kept += 1;
+                        audit.mismatches.push(RowIdentityMismatch {
+                            id,
+                            namespace,
+                            kind,
+                        });
+                    }
+                }
+            }
+            audit.scanned += page_len;
+            audit.mismatches_truncated =
+                audit.mismatch_counts.values().sum::<usize>() > audit.mismatches.len();
+            if audit.truncated || page_len < ROW_IDENTITY_AUDIT_PAGE_SIZE {
+                break;
+            }
+            match last_id {
+                Some(id) => after_id = Some(id),
+                None => break,
             }
         }
+        audit.elapsed_ms = started.elapsed().as_millis() as u64;
+        log_row_identity_audit(&audit);
+        *self
+            .last_row_identity_audit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(audit);
     }
 
     /// The first-write flip handle for this store (see [`FirstWriteFlip`]):
     /// a snapshot of the flip's inputs taken at upsert entry — the shared
     /// store-state cache, the sidecar path, the serving descriptor this
     /// process writes under, and the configured-descriptor inputs.
-    fn first_write_flip(&self) -> FirstWriteFlip {
+    fn first_write_flip(&self, skip_identity: bool) -> FirstWriteFlip {
         FirstWriteFlip {
             store_state: Arc::clone(&self.store_state),
             local_path: self.local_path.clone(),
             serving: self.serving_descriptor(),
             embed_config_dir: self.embed_config_dir.clone(),
             dimensions: self.dimensions,
+            skip_identity,
         }
     }
 
@@ -6021,10 +6094,7 @@ impl LadybugStore {
     /// both `init` call sites (the schema-ready fast path and the
     /// post-closure call) are covered.
     async fn maintain_store_state(&self) {
-        let marker = match self
-            .with_conn(|conn| read_store_identity_marker(conn))
-            .await
-        {
+        let marker = match self.read_store_identity_marker_bounded().await {
             Ok(marker) => marker,
             Err(error) => {
                 // Without the marker we cannot tell whether rewriting the
@@ -6036,9 +6106,37 @@ impl LadybugStore {
                 return;
             }
         };
+        // A stale pristine sidecar over data-bearing rows is exactly the
+        // state a failed adoption leaves behind. Rewriting it to this
+        // process's serving model would overwrite the rows' real identity
+        // before the next open can retry adoption (#409 re-review).
+        let data_bearing_without_marker = if marker.is_none() {
+            match bounded(
+                "checking whether the store is data-bearing",
+                write_timeout(),
+                self.with_conn(|conn| {
+                    let facts = inspect_memory_embedding_and_count(conn)?;
+                    Ok(facts.row_count().unwrap_or(0) > 0 && store_has_real_vector(conn)?)
+                }),
+            )
+            .await
+            {
+                Ok(has_rows) => has_rows,
+                Err(error) => {
+                    tracing::warn!(
+                        "store-state sidecar maintenance skipped: cannot attest whether the store holds rows: {error}"
+                    );
+                    return;
+                }
+            }
+        } else {
+            false
+        };
         match self.cached_store_state() {
             CachedStoreState::Recorded(recorded)
-                if !recorded.has_data && self.open_provenance.is_verified() =>
+                if !recorded.has_data
+                    && self.open_provenance.is_verified()
+                    && !data_bearing_without_marker =>
             {
                 if let Some(serving) = self.serving_descriptor() {
                     // A persisted marker already names the vectors' producer.
@@ -6068,7 +6166,7 @@ impl LadybugStore {
                     }
                 }
             }
-            CachedStoreState::FreshUnrecorded => {
+            CachedStoreState::FreshUnrecorded if !data_bearing_without_marker => {
                 if let Some(serving) = self.serving_descriptor() {
                     if self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
@@ -6372,7 +6470,7 @@ impl LadybugStore {
     /// committing write task performs it (see `upsert`); this entry
     /// point delegates to a handle built from `&self`.
     fn flip_store_state_to_data(&self) {
-        self.first_write_flip().flip_store_state_to_data();
+        self.first_write_flip(false).flip_store_state_to_data();
     }
 
     /// The legacy placeholder identity: the last
@@ -10555,6 +10653,36 @@ fn inspect_memory_embedding_and_count(conn: &Connection) -> Result<MemoryCatalog
     Ok(MemoryCatalogFacts { embedding, count })
 }
 
+/// Whether any row holds a real (non-all-zero) embedding. Metadata-only
+/// pointers are written with a zero vector and must not count as data from
+/// an embedding space when the store's producer is established (#409
+/// re-review). The probe is capped; an oversized scan is treated as
+/// data-bearing so an unknown store fails closed.
+fn store_has_real_vector(conn: &Connection) -> Result<bool> {
+    const PROBE_LIMIT: usize = 5000;
+    for (seen, row) in conn
+        .query(&format!(
+            "MATCH (m:Memory) RETURN m.embedding LIMIT {}",
+            PROBE_LIMIT + 1
+        ))?
+        .enumerate()
+    {
+        if seen >= PROBE_LIMIT {
+            return Ok(true);
+        }
+        if let Some(lbug::Value::Array(_, vals) | lbug::Value::List(_, vals)) = row.first() {
+            for value in vals {
+                match value {
+                    lbug::Value::Float(f) if *f != 0.0 => return Ok(true),
+                    lbug::Value::Double(d) if *d != 0.0 => return Ok(true),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// The shared drop/recreate write leg both width reconciliations
 /// perform (#83): drop the `Memory` node table and its five rel
 /// tables and recreate them from the caller's DDL strings (the rel
@@ -11503,6 +11631,9 @@ impl VectorStore for LadybugStore {
         vector: Vec<f32>,
         payload: MemoryPayload,
     ) -> Result<crate::traits::UpsertReport> {
+        // A zero vector carries metadata only: it is not embedder output and
+        // must not record a producer identity (#409 re-review).
+        let skip_identity = vector.iter().all(|component| *component == 0.0);
         // AC3: canonicalize resolvable targets at write time via KnownIds::resolve.
         // Fetch known symbol ids for this namespace and rewrite unqualified edge
         // targets in payload.metadata to their qualified (resolved) form when
@@ -11532,11 +11663,11 @@ impl VectorStore for LadybugStore {
         // The first-data flip handle, snapshotted at entry: one clone
         // moves into the write closure below, so the task that commits
         // the first write records the transition itself.
-        let first_write_flip = self.first_write_flip();
+        let first_write_flip = self.first_write_flip(skip_identity);
         // #409: the marker write shares that writer turn: it lands before
         // the first vector MERGE, and a failure refuses the upsert with zero
         // vectors written.
-        let first_write_marker = self.first_write_marker();
+        let first_write_marker = self.first_write_marker(skip_identity);
 
         // Every upsert is one sample of the MemoryCount series for the
         // namespace; anomalies surface through the rolling detector.
@@ -12500,6 +12631,11 @@ impl VectorStore for LadybugStore {
         vector: Vec<f32>,
         query: crate::traits::RawDistanceQuery,
     ) -> Result<Vec<crate::traits::RawDistanceCandidate>> {
+        // This path runs ARRAY_DISTANCE too: a query vector from another
+        // embedding space would return misleading candidates and drive a
+        // wrong deduplication decision. Gate it on the persisted marker
+        // before the query, like every other vector search (#409 re-review).
+        self.check_embedding_marker_identity().await?;
         let scope = query.scope;
         let limit = query.limit;
         let namespace = namespace.to_string();
@@ -15095,6 +15231,8 @@ impl OntologyStore for LadybugStore {
         id: &str,
         payload: &MemoryPayload,
     ) -> Result<()> {
+        // A zero vector is a metadata-only pointer, not embedder output:
+        // `upsert` detects it and records no producer identity.
         self.upsert(namespace, id, vec![0.0; self.dimensions], payload.clone())
             .await
             .map(|_| ())
@@ -37025,15 +37163,18 @@ impl LadybugStore {
         self.check_data_bearing_identity()
             .map_err(|e| ActionError::Storage(e.to_string()))?;
         // #409: the batched path writes vector-carrying `Memory` rows too, so
-        // it owes the store the same marker identity gate as the single-row
-        // upsert: a store whose persisted marker names a different embedding
-        // space must refuse before the transaction opens.
-        self.check_embedding_marker_identity()
-            .await
-            .map_err(|e| ActionError::Storage(e.to_string()))?;
+        // it owes the same marker gate — but only when the batch actually
+        // carries rows. An edge-only batch embeds nothing and must not be
+        // rejected for a marker disagreement it cannot violate (#409
+        // re-review).
+        if !batch.writes.is_empty() {
+            self.check_embedding_marker_identity()
+                .await
+                .map_err(|e| ActionError::Storage(e.to_string()))?;
+        }
 
-        let first_write_flip = self.first_write_flip();
-        let first_write_marker = self.first_write_marker();
+        let first_write_flip = self.first_write_flip(false);
+        let first_write_marker = self.first_write_marker(false);
         let now_ts = crate::rdf::action::current_action_timestamp();
         let ontology = self.get_ontology(&ns);
 
@@ -37660,7 +37801,21 @@ mod store_identity {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
+            // Only a temp root this fixture created may be removed. Real
+            // stores are never in scope: refuse anything not directly under
+            // the process temp dir with our unique prefix (#409 re-review).
+            let temp_root = std::env::temp_dir();
+            let name = self
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if self.root.parent() == Some(temp_root.as_path())
+                && name.starts_with("ns-store-identity-")
+                && self.root != temp_root
+            {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
         }
     }
 
@@ -37768,14 +37923,19 @@ mod store_identity {
         drop(store);
     }
 
-    /// Drop the in-store marker row, leaving a database that predates the
-    /// persisted marker while its sidecar still records data-bearing identity:
-    /// the legacy store the adoption path must record.
+    /// Remove exactly the one known marker row (never a bulk table delete),
+    /// leaving a database that predates the persisted marker while its
+    /// sidecar still records data-bearing identity: the legacy store the
+    /// adoption path must record.
     async fn strip_marker_row(fx: &Fixture) {
         let store = open(fx, "BGESmallENV15");
+        let query = format!(
+            "MATCH (s:StoreIdentity {{id: '{}'}}) DELETE s",
+            STORE_IDENTITY_ID
+        );
         store
-            .with_conn(|conn| {
-                conn.query("MATCH (s:StoreIdentity) DELETE s")?;
+            .with_conn(move |conn| {
+                conn.query(&query)?;
                 Ok(())
             })
             .await
@@ -38090,6 +38250,62 @@ mod store_identity {
         assert!(audit.elapsed_ms <= 2_000, "the audit stays bounded");
     }
 
+    #[tokio::test]
+    async fn audit_caps_retained_findings_but_counts_them_all() {
+        let fx = fixture("audit-capped-findings");
+        for n in 0..6 {
+            seeded_store(&fx, &format!("foreign::src/lib-{n}.rs"), "auto-ingestor").await;
+        }
+
+        let store = open(&fx, "BGESmallENV15");
+        store.init("probe").await.expect("first init audits");
+        let audit = store
+            .last_row_identity_audit()
+            .expect("the audit ran on first init");
+        assert_eq!(
+            audit
+                .mismatch_counts
+                .get(&RowIdentityMismatchKind::ForeignQualified),
+            Some(&6),
+            "every finding is counted exactly"
+        );
+        assert!(
+            audit.mismatches.len() <= ROW_IDENTITY_AUDIT_LOG_SAMPLE,
+            "only a bounded sample is retained: {} findings",
+            audit.mismatches.len()
+        );
+        assert!(
+            audit.mismatches_truncated,
+            "sample truncation is reported separately from scan truncation"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edge_only_batch_ignores_a_marker_disagreement() {
+        let fx = fixture("edge-only-batch");
+        seeded_store(&fx, "m1", "owner").await;
+        std::fs::remove_file(crate::model_choice::store_state_path(&fx.db))
+            .expect("lose the sidecar so only the marker carries identity");
+
+        let store = open(&fx, "NomicEmbedTextV15");
+        store.init("probe").await.expect("open under another model");
+        let batch = crate::rdf::action::ActionWriteSet {
+            expected_heads: Vec::new(),
+            writes: Vec::new(),
+            edge_deltas: vec![crate::rdf::action::EdgeDelta {
+                source: "m1".into(),
+                relation: "RELATES_TO".into(),
+                target: "m1".into(),
+                existed_before: false,
+                op: crate::rdf::action::EdgeMutationOp::EnsurePresent,
+            }],
+        };
+        store
+            .commit_action_batch("probe", batch)
+            .await
+            .expect("an edge-only batch embeds nothing and is not gated by the vector marker");
+    }
+
     /// A minimal one-row kinetic write set: exactly the shape
     /// `commit_action_batch` commits, no expected heads required.
     fn one_row_batch(id: &str) -> crate::rdf::action::ActionWriteSet {
@@ -38175,7 +38391,7 @@ mod store_identity {
     }
 
     #[tokio::test]
-    async fn absent_sidecar_legacy_adoption_records_no_provenance() {
+    async fn absent_sidecar_legacy_store_records_no_guessed_identity() {
         let fx = fixture("legacy-absent-sidecar");
         seeded_store(&fx, "m1", "owner").await;
         strip_marker_row(&fx).await;
@@ -38183,24 +38399,117 @@ mod store_identity {
             .expect("lose the sidecar so the legacy store records nothing");
 
         let store = open(&fx, "BGESmallENV15");
-        store.init("probe").await.expect("verified open adopts");
+        store
+            .init("probe")
+            .await
+            .expect("verified open still succeeds");
 
+        assert!(
+            store
+                .read_store_identity_marker()
+                .await
+                .expect("read marker")
+                .is_none(),
+            "no sidecar is no provenance: width and serving model are not identity"
+        );
+        let error = store
+            .upsert("probe", "m2", vector(), payload("owner"))
+            .await
+            .expect_err("writing vectors into an unidentified data-bearing store is refused");
+        assert!(
+            format!("{error:#}").contains("no trustworthy"),
+            "the refusal names the missing provenance: {error:#}"
+        );
+        assert_eq!(row_count(&store).await, 1, "no unidentified vector lands");
+    }
+
+    #[tokio::test]
+    async fn raw_distance_queries_check_the_persisted_marker() {
+        let fx = fixture("raw-distance-marker");
+        seeded_store(&fx, "m1", "owner").await;
+        std::fs::remove_file(crate::model_choice::store_state_path(&fx.db))
+            .expect("lose the sidecar so only the marker carries identity");
+
+        let store = open(&fx, "NomicEmbedTextV15");
+        store.init("probe").await.expect("open under another model");
+        let query = crate::traits::RawDistanceQuery {
+            scope: crate::traits::DedupCandidateScope::Domain,
+            limit: 5,
+        };
+        let error = store
+            .nearest_by_raw_distance("probe", vector(), query)
+            .await
+            .expect_err("a raw-distance query under another model is refused");
+        assert!(
+            format!("{error:#}").contains("persisted embedding marker"),
+            "the raw-distance refusal names the marker: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_model_change_is_refused_even_with_a_recorded_sidecar() {
+        let fx = fixture("configured-change-recorded");
+        seeded_store(&fx, "m1", "owner").await;
+
+        // Unbound process, sidecar and marker agree on A; only the
+        // configuration now names a different model.
+        write_embedders(&fx, "NomicEmbedTextV15", 4);
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("reopen")
+            .with_embed_config_dir(&fx.config_dir);
+        store.init("probe").await.expect("open is not blocked");
+        let error = store
+            .search("probe", vector(), 5, false, false)
+            .await
+            .expect_err("a configured model change cannot silently mix spaces");
+        assert!(
+            format!("{error:#}").contains("persisted embedding marker"),
+            "the refusal names the marker/configured mismatch: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_vector_pointers_do_not_pin_an_embedding_model() {
+        let fx = fixture("placeholder-no-identity");
+        {
+            let store = open(&fx, "BGESmallENV15");
+            store.init("probe").await.expect("init");
+            crate::traits::OntologyStore::put_scoped_memory(
+                &store,
+                "probe",
+                "pointer-1",
+                &payload("owner"),
+            )
+            .await
+            .expect("metadata-only pointer lands");
+            assert!(
+                store
+                    .read_store_identity_marker()
+                    .await
+                    .expect("read marker")
+                    .is_none(),
+                "a zero vector records no producer"
+            );
+            assert_eq!(row_count(&store).await, 1);
+        }
+        // With the stale pristine sidecar gone, a real vector under a new
+        // model may establish the store's identity: the pointer was not
+        // treated as embedder output.
+        std::fs::remove_file(crate::model_choice::store_state_path(&fx.db))
+            .expect("remove pristine sidecar");
+        write_embedders(&fx, "NomicEmbedTextV15", 4);
+        let store = open(&fx, "NomicEmbedTextV15");
+        store.init("probe").await.expect("reopen under new model");
+        store
+            .upsert("probe", "real-1", vector(), payload("owner"))
+            .await
+            .expect("the first real vector records this model");
         let marker = store
             .read_store_identity_marker()
             .await
-            .expect("read adopted marker")
-            .expect("a data-bearing legacy store records its adopted identity");
-        assert_eq!(marker.descriptor(), serving("BGESmallENV15"));
-        assert_eq!(
-            marker.adopted_from_provider, None,
-            "adoption with no sidecar must not fabricate provenance"
-        );
-        assert_eq!(marker.adopted_from_model, None);
-        assert_eq!(marker.adopted_from_dims, None);
-        assert!(
-            marker.adopted_at.is_some(),
-            "the adoption is still stamped with when it was recorded"
-        );
+            .expect("read marker")
+            .expect("real vector pins the model");
+        assert_eq!(marker.model, "NomicEmbedTextV15");
     }
 
     #[tokio::test]
@@ -38271,7 +38580,10 @@ mod store_identity {
                 .expect("seed a data-bearing legacy row");
             seeder
                 .with_conn(|conn| {
-                    conn.query("MATCH (s:StoreIdentity) DELETE s")?;
+                    conn.query(&format!(
+                        "MATCH (s:StoreIdentity {{id: '{}'}}) DELETE s",
+                        STORE_IDENTITY_ID
+                    ))?;
                     Ok(())
                 })
                 .await
