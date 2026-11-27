@@ -4765,17 +4765,19 @@ pub async fn handle_task_complete(
     }
 
     if !edge {
-        let failed = rollback_completion(
-            &store,
-            &namespace,
-            &id,
-            &[],
-            &linked_before,
-            &inline_created,
-            &dedup_linked_id,
-        )
-        .await;
-        return Err(with_rollback_failures(blocked_message(&id), &failed));
+        // A refusal is not a failure, and it deliberately rolls back nothing.
+        // The extraction write above landed and stays, exactly as the pinned
+        // contract (`a_lock_2_refusal_after_the_inline_write_emits_nothing`)
+        // records: "the write itself did land". The refusal's own message
+        // tells the caller to retry, and the lesson's `extracted_from` edge
+        // is what Path 1 completes against on that retry -- deleting it here
+        // would make the instructed retry rewrite (or dedup-block on) the
+        // same lesson. `rollback_completion` is for the operational failures
+        // around this site -- list re-read, transition, follow-up mid-loop,
+        // parent save -- never for the gate's own refusal, which is the one
+        // case where the store keeps what a completion wrote while the task
+        // itself does not move.
+        return Err(blocked_message(&id));
     }
 
     // Emit site 3. "The task gave way to the lesson" -- the same `Superseded`
