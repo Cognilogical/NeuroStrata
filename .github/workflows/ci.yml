@@ -229,6 +229,13 @@ jobs:
         shell: bash
         run: bash scripts/remediation-eval.sh dependency-advisory
 
+      # The tracked-upgrades suite checks the registry's expected test names,
+      # so a removed, renamed, or ignored gate test fails CI here instead of
+      # hiding behind a green generic cargo test run.
+      - name: Tracked-upgrades eval suite
+        shell: bash
+        run: bash scripts/remediation-eval.sh tracked-upgrades
+
   # Full binary suite on the other two platforms, report-only: a platform
   # regression shows up on the PR without blocking the merge on a runner this
   # project cannot reproduce locally. The ubuntu test job above is the gate.

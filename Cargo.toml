@@ -230,3 +230,9 @@ debug = false
 name = "dependency_integrity"
 path = "tests/dependency_integrity.rs"
 
+# Tracked-upgrade eval contract: offline drift gate for the four deferred or
+# already-landed upgrade decisions recorded under #339.
+[[test]]
+name = "dependency_tracked_upgrades"
+path = "tests/dependency_tracked_upgrades.rs"
+
