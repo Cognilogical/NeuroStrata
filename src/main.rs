@@ -2198,6 +2198,30 @@ async fn probe_daemon() -> DaemonProbe {
 /// process exits -- cleanly, killed or crashed -- so a held lock proves the
 /// daemon is still there, and a free one proves it is gone.
 fn daemon_lock_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    // Canonicalize the parent directory so equivalent spellings of the
+    // same store (`a/../a/ladybug.store`, a symlinked directory, a `.`
+    // component) derive one lock file: flock is per-file, so two
+    // spellings of the lock path would be two different locks and a
+    // daemon could open the store while a restore holds its lock. The
+    // store file itself need not exist yet (a restore takes the lock
+    // before installing it), so only the parent is canonicalized and
+    // the file name is carried over verbatim. A parent that cannot be
+    // canonicalized yet (it does not exist) falls back to the verbatim
+    // spelling; `open_daemon_lock` creates that parent, and later
+    // callers canonicalize it once it exists.
+    if let Some(file_name) = db_path.file_name() {
+        let mut lock_name = file_name.to_owned();
+        lock_name.push(".daemon.lock");
+        let parent = db_path.parent().unwrap_or_else(|| std::path::Path::new(""));
+        let parent = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+            return canonical_parent.join(std::path::PathBuf::from(lock_name));
+        }
+    }
     let mut path = db_path.as_os_str().to_owned();
     path.push(".daemon.lock");
     std::path::PathBuf::from(path)
@@ -3446,7 +3470,6 @@ fn install_pre_commit_hook(root: &std::path::Path) -> anyhow::Result<std::path::
 /// Written while the lock is still held, so the report is in place before
 /// `shutdown` can see the lock go.
 fn record_final_checkpoint(db_path: &std::path::Path, outcome: &anyhow::Result<()>) {
-    use std::io::Write;
     if DAEMON_LOCK.get().is_none() {
         return;
     }
@@ -3454,11 +3477,23 @@ fn record_final_checkpoint(db_path: &std::path::Path, outcome: &anyhow::Result<(
         Ok(()) => FINAL_CHECKPOINT_OK.to_string(),
         Err(e) => format!("error: {}", e),
     };
-    let report = format!("{}\n{}", std::process::id(), report);
     // A current daemon's own report supersedes any legacy report parked by
     // an earlier takeover; leaving it would let a later shutdown read a
     // checkpoint from a daemon that is long gone.
     let _ = std::fs::remove_file(daemon_legacy_report_path(db_path));
+    write_final_checkpoint_report(db_path, &report);
+    // Still holding the lock: no other daemon has written its id yet. With the
+    // id gone, the next daemon reads as starting until it writes its own,
+    // instead of as this one.
+    let _ = std::fs::remove_file(daemon_pid_path(db_path));
+}
+
+/// Replace the exit report with `<pid>\n<report>` as its whole content.
+/// `File::create` truncates, so a shorter report never inherits the tail of a
+/// longer earlier one; `sync_all` makes it durable before `shutdown` reads it.
+fn write_final_checkpoint_report(db_path: &std::path::Path, report: &str) {
+    use std::io::Write;
+    let report = format!("{}\n{}", std::process::id(), report);
     let path = daemon_exit_report_path(db_path);
     let written = std::fs::File::create(&path).and_then(|mut file| {
         file.write_all(report.as_bytes())
@@ -3470,10 +3505,6 @@ fn record_final_checkpoint(db_path: &std::path::Path, outcome: &anyhow::Result<(
             path.display()
         );
     }
-    // Still holding the lock: no other daemon has written its id yet. With the
-    // id gone, the next daemon reads as starting until it writes its own,
-    // instead of as this one.
-    let _ = std::fs::remove_file(daemon_pid_path(db_path));
 }
 
 /// Read-only queries against the store, transparently proxied to the daemon
@@ -4315,6 +4346,41 @@ mod tests {
             }
             other => panic!("expected Run, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn equivalent_store_spellings_share_one_daemon_lock_path() {
+        let root = std::env::temp_dir().join(format!("ns-lock-canon-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("store")).unwrap();
+        let direct = root.join("store").join("ladybug.db");
+        let dotted = root.join(".").join("store").join("ladybug.db");
+        let detoured = root
+            .join("store")
+            .join("..")
+            .join("store")
+            .join("ladybug.db");
+        assert_eq!(
+            daemon_lock_path(&direct),
+            daemon_lock_path(&dotted),
+            "a `.` spelling derives the same lock file"
+        );
+        assert_eq!(
+            daemon_lock_path(&direct),
+            daemon_lock_path(&detoured),
+            "a `..` spelling derives the same lock file"
+        );
+        // The lock for one spelling excludes a holder through another.
+        let held = try_take_store_lock(&direct)
+            .expect("the lock file can be opened")
+            .expect("the first holder takes the lock");
+        assert!(
+            try_take_store_lock(&detoured)
+                .expect("the lock file can be probed")
+                .is_none(),
+            "the detoured spelling probes the same, held lock"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -6532,6 +6598,31 @@ mod tests {
     }
 
     #[test]
+    fn restore_copy_rejects_bytes_changed_after_verification() {
+        // Verification passes, then the snapshot member changes before the
+        // copy stages it: the staged copy must be re-hashed against the
+        // verified checksums and the changed bytes must not be installed.
+        let (root, snapshot_dir) = restore_verify_fixture("toctou");
+        ensure_snapshot_verified(&snapshot_dir).expect("a valid snapshot verifies");
+        std::fs::write(snapshot_dir.join("ladybug.store"), b"changed-db!").unwrap();
+
+        let target = root.join("target").join("ladybug.store");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let err = copy_snapshot_into_place(&snapshot_dir, &target)
+            .expect_err("bytes changed after verification are refused");
+        assert!(
+            err.to_string().contains("unverified bytes")
+                || err.to_string().contains("does not match"),
+            "the refusal names the checksum mismatch: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "the unverified bytes are not installed at the target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn restore_verify_rejects_missing_manifest() {
         let (root, snapshot_dir) = restore_verify_fixture("no-manifest");
         std::fs::remove_file(snapshot_dir.join("manifest.json")).unwrap();
@@ -7484,6 +7575,327 @@ mod tests {
             "{report:?}"
         );
     }
+
+    /// The writer the logging tests hand the fmt layer in the stderr slot.
+    /// Production passes `std::io::stderr`; a capture buffer lets a test
+    /// read exactly what an operator would see without touching the
+    /// process's real stderr.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    static GLOBAL_TRACING_CAPTURE: std::sync::OnceLock<CapturedLog> = std::sync::OnceLock::new();
+    static GLOBAL_TRACING_INIT: std::sync::Once = std::sync::Once::new();
+
+    /// The capture buffer behind the process-global subscriber installed
+    /// through the production path ([`init_tracing_with_writer`], the
+    /// function [`init_tracing`] delegates to with `std::io::stderr`).
+    /// The global default can only be installed once per process, so
+    /// every test that exercises it shares this one installation and
+    /// distinguishes its own events by a unique marker. Callers hold the
+    /// `RUST_LOG` lock (via `RustLogRestore`) so the filter installed is
+    /// the default `info` filter.
+    fn globally_installed_log_capture() -> &'static CapturedLog {
+        let captured = GLOBAL_TRACING_CAPTURE.get_or_init(CapturedLog::default);
+        GLOBAL_TRACING_INIT.call_once(|| {
+            let sink = captured.clone();
+            init_tracing_with_writer(move || sink.clone());
+        });
+        captured
+    }
+
+    /// Serializes the tests that set `RUST_LOG` (the environment is
+    /// process-global) and restores the caller's prior value on drop.
+    struct RustLogRestore {
+        prior: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl RustLogRestore {
+        fn set(value: Option<&str>) -> Self {
+            let lock = crate::daemon::project_root_env_test_lock();
+            let prior = std::env::var_os("RUST_LOG");
+            match value {
+                Some(v) => std::env::set_var("RUST_LOG", v),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+            Self { prior, _lock: lock }
+        }
+    }
+
+    impl Drop for RustLogRestore {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var("RUST_LOG", v),
+                None => std::env::remove_var("RUST_LOG"),
+            }
+        }
+    }
+
+    #[test]
+    fn tracing_output_reaches_stderr() {
+        // Default filter: info (no `RUST_LOG` set).
+        let _env = RustLogRestore::set(None);
+        // The event below is emitted with no `with_default` wrapper: it
+        // dispatches to the subscriber installed globally through the
+        // production install path, whose writer slot production fills
+        // with `std::io::stderr`. If `init_tracing` failed to install
+        // the global subscriber, or installed it over the wrong writer
+        // or filter, this capture would not see the event.
+        let captured = globally_installed_log_capture();
+        // The production entry point itself also runs, and running it
+        // twice in one process is not an error: a re-exec'd helper or an
+        // embedded caller must never panic on the one-shot global. (Once
+        // a global is installed these are no-ops, so they cannot disturb
+        // the capture installed above.)
+        init_tracing();
+        init_tracing();
+
+        tracing::info!("tracing_output_reaches_stderr marker");
+        let text = captured.text();
+        assert!(
+            text.contains("tracing_output_reaches_stderr marker"),
+            "the info event lands in the stderr slot: {text}"
+        );
+        assert!(
+            text.contains("INFO"),
+            "the default filter admits info, formatted with its level: {text}"
+        );
+        assert!(
+            !text.contains('\u{1b}'),
+            "the stderr sink is plain text, with ANSI escapes off: {text}"
+        );
+    }
+
+    #[test]
+    fn stdout_carries_no_log_output() {
+        let _env = RustLogRestore::set(None);
+        // The globally installed subscriber (production install path;
+        // its writer slot is the stderr slot production fills with
+        // `std::io::stderr`) is the only log writer in play: the event
+        // below is emitted bare, with no `with_default` wrapper, so it
+        // goes wherever the global subscriber sends it.
+        let captured = globally_installed_log_capture();
+        // A plain buffer plays stdout, written the way the stdio loop
+        // writes a protocol frame.
+        let mut stdout_role: Vec<u8> = Vec::new();
+        stdout_role.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":1}\n");
+        tracing::info!("stdout_carries_no_log_output marker");
+        assert_eq!(
+            String::from_utf8(stdout_role).unwrap(),
+            "{\"jsonrpc\":\"2.0\",\"id\":1}\n",
+            "stdout carries protocol bytes only -- no log output"
+        );
+        assert!(
+            captured
+                .text()
+                .contains("stdout_carries_no_log_output marker"),
+            "the log line went to the stderr slot instead"
+        );
+    }
+
+    #[test]
+    fn rust_log_filter_is_honored() {
+        let _env = RustLogRestore::set(Some("error"));
+        let captured = CapturedLog::default();
+        let sink = captured.clone();
+        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("rust_log_filter_is_honored info marker");
+            tracing::error!("rust_log_filter_is_honored error marker");
+        });
+        let text = captured.text();
+        assert!(
+            text.contains("rust_log_filter_is_honored error marker"),
+            "the error event passes the RUST_LOG=error filter: {text}"
+        );
+        assert!(
+            !text.contains("rust_log_filter_is_honored info marker"),
+            "the info event is suppressed by RUST_LOG=error: {text}"
+        );
+    }
+
+    #[test]
+    fn unparsable_rust_log_falls_back_to_info() {
+        // `lolwut` is not a level, so the directive is invalid and the
+        // parser errors: the fallback must yield the `info` default -- not a
+        // bricked startup, and not a permissive filter that lets everything
+        // through.
+        let _env = RustLogRestore::set(Some("neurostrata_mcp=lolwut"));
+        let captured = CapturedLog::default();
+        let sink = captured.clone();
+        let subscriber = tracing_fmt_subscriber(move || sink.clone(), tracing_env_filter());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("unparsable_rust_log_falls_back_to_info info marker");
+            tracing::debug!("unparsable_rust_log_falls_back_to_info debug marker");
+        });
+        let text = captured.text();
+        assert!(
+            text.contains("unparsable_rust_log_falls_back_to_info info marker"),
+            "the info event passes the fallback filter: {text}"
+        );
+        assert!(
+            !text.contains("unparsable_rust_log_falls_back_to_info debug marker"),
+            "the debug event is suppressed -- the fallback is info, not trace: {text}"
+        );
+    }
+
+    #[test]
+    fn final_checkpoint_report_is_the_exit_report_whole_content() {
+        let root =
+            std::env::temp_dir().join(format!("ns-exit-report-content-{}", uuid::Uuid::new_v4()));
+        let db = root.join("ladybug.db");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Longer stale bytes, then a shorter report: a truncate-then-write
+        // must leave exactly the new report, never the old tail after it.
+        std::fs::write(
+            daemon_exit_report_path(&db),
+            b"error: an earlier, longer report",
+        )
+        .unwrap();
+        write_final_checkpoint_report(&db, FINAL_CHECKPOINT_OK);
+        assert_eq!(
+            std::fs::read_to_string(daemon_exit_report_path(&db)).unwrap(),
+            format!("{}\n{}", std::process::id(), FINAL_CHECKPOINT_OK),
+            "the exit report is the pid line plus the report, and nothing else"
+        );
+
+        write_final_checkpoint_report(&db, "error: the checkpoint failed");
+        assert_eq!(
+            std::fs::read_to_string(daemon_exit_report_path(&db)).unwrap(),
+            format!("{}\nerror: the checkpoint failed", std::process::id()),
+            "a shorter report leaves no tail of the previous, longer one"
+        );
+        assert!(
+            !daemon_lock_path(&db).exists(),
+            "the final checkpoint report never shares the lock file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn await_restore_barrier(path: &std::path::Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the restore barrier {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn restore_holds_target_open_lock_until_database_and_provenance_are_installed() {
+        // A snapshot with a database bytes file and a store-state sidecar is
+        // enough to make the install window observable: the sidecar is the
+        // recorded provenance a concurrent opener must not see missing (or
+        // unverified) before the restore releases the target.
+        let (root, snapshot) = restore_verify_fixture("restore-lock");
+        std::fs::write(
+            snapshot.join("ladybug.store.store-state.json"),
+            b"{\"version\":1}",
+        )
+        .unwrap();
+        crate::storage::snapshot::write_checksums(&snapshot).unwrap();
+        let target = root.join("target").join("ladybug.store");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+        restore_test_barrier::arm(&target, &root);
+        let snapshot_for_thread = snapshot.clone();
+        let target_for_thread = target.clone();
+        let restore = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(restore_snapshot_into(
+                    &snapshot_for_thread,
+                    &target_for_thread,
+                ))
+        });
+
+        // Phase 1: the lock is taken before the destination is re-checked,
+        // so a restore already excludes every other opener while the target
+        // does not exist yet.
+        await_restore_barrier(&root.join("restore-locked-entered"));
+        assert!(
+            !target.exists(),
+            "the target is not installed before the copy starts"
+        );
+        assert!(
+            try_take_store_lock(&target)
+                .expect("the lock file can be probed")
+                .is_none(),
+            "the restore owns the target lock before the database exists"
+        );
+        std::fs::write(root.join("restore-locked-release"), b"go").unwrap();
+
+        // Phase 2: database and provenance are installed, and the restore
+        // still holds the lock through the post-install verification.
+        await_restore_barrier(&root.join("restore-installed-entered"));
+        assert_eq!(
+            std::fs::read(&target).expect("the database is installed"),
+            b"snapshot-db"
+        );
+        assert!(
+            crate::model_choice::store_state_path(&target).exists(),
+            "the store-state provenance sidecar is installed with the database"
+        );
+        assert!(
+            try_take_store_lock(&target)
+                .expect("the lock file can be probed")
+                .is_none(),
+            "the restore still owns the lock after database and provenance are installed"
+        );
+        std::fs::write(root.join("restore-installed-release"), b"go").unwrap();
+
+        // Phase 3: verification is about to run (the store open and the
+        // namespace listing). The lock must still be held at this phase
+        // boundary: a restore that released the lock after installation
+        // but before verification would let a concurrent opener observe
+        // the store mid-verification, and this probe is what catches it.
+        await_restore_barrier(&root.join("restore-verifying-entered"));
+        assert!(
+            try_take_store_lock(&target)
+                .expect("the lock file can be probed")
+                .is_none(),
+            "the restore still owns the lock while verification is in progress"
+        );
+        std::fs::write(root.join("restore-verifying-release"), b"go").unwrap();
+
+        let outcome = restore.join().expect("the restore thread does not panic");
+        assert!(
+            outcome.is_err(),
+            "the fixture's database bytes are not an openable store"
+        );
+        assert!(
+            try_take_store_lock(&target)
+                .expect("the lock file can be probed")
+                .is_some(),
+            "the target lock is released once the restore finishes, even on failure"
+        );
+
+        restore_test_barrier::disarm();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// Where every CLI HTTP call goes. A constant because `bus-metrics` names it
@@ -7867,6 +8279,7 @@ fn copy_snapshot_into_place(
 
     // Step A: stage every member the snapshot carries beside the target.
     let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let mut staged_from: Vec<std::path::PathBuf> = Vec::new();
     for (index, (from, to)) in members.iter().enumerate() {
         if index > 0 && !from.exists() {
             continue;
@@ -7880,6 +8293,58 @@ fn copy_snapshot_into_place(
             return Err(e.into());
         }
         staged.push((to.clone(), stage));
+        staged_from.push(from.clone());
+    }
+
+    // Step A1: re-hash the staged copies against the verified checksums
+    // before anything is committed. `ensure_snapshot_verified` ran before
+    // the copy, so a member changed (or swapped) between verification and
+    // staging would otherwise be installed as bytes that were never
+    // verified. A snapshot with no `checksums.json` has no verified set to
+    // compare against (the real restore path refuses such a snapshot in
+    // `ensure_snapshot_verified`); direct callers with no checksum file
+    // keep the previous behaviour.
+    let checksums_path = snapshot_dir.join("checksums.json");
+    if checksums_path.exists() {
+        let staged_check = (|| -> anyhow::Result<()> {
+            let raw = std::fs::read_to_string(&checksums_path)?;
+            let checksums: crate::storage::snapshot::SnapshotChecksums =
+                serde_json::from_str(&raw)?;
+            for (from, (_, stage)) in staged_from.iter().zip(staged.iter()) {
+                let name = from
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let expected: Option<&String> = match name.as_str() {
+                    "ladybug.store" => Some(&checksums.ladybug_store_sha256),
+                    "ladybug.store.wal" => checksums.wal_sha256.as_ref(),
+                    "ladybug.store.wal.checkpoint" => checksums.wal_checkpoint_sha256.as_ref(),
+                    "ladybug.store.store-state.json" => checksums.store_state_sha256.as_ref(),
+                    "ladybug.store.shadow" => checksums.shadow_sha256.as_ref(),
+                    "ladybug.store.pinned.tmp" => checksums.pinned_sha256.as_ref(),
+                    _ => None,
+                };
+                let Some(expected) = expected else {
+                    return Err(anyhow::anyhow!(
+                        "the staged {name} has no recorded checksum to verify against; a snapshot member with no verified checksum must not be installed"
+                    ));
+                };
+                let actual = crate::storage::snapshot::sha256_file(stage)
+                    .map_err(|e| anyhow::anyhow!("could not hash the staged {name}: {e}"))?;
+                if actual != *expected {
+                    return Err(anyhow::anyhow!(
+                        "the staged {name} does not match the verified snapshot checksum (expected {expected}, got {actual}); the snapshot member changed after verification, refusing to install unverified bytes"
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = staged_check {
+            for (_, staged_path) in &staged {
+                let _ = std::fs::remove_file(staged_path);
+            }
+            return Err(e);
+        }
     }
 
     // Step A2: stash any pre-existing companion aside so the commit can
@@ -7941,6 +8406,149 @@ fn copy_snapshot_into_place(
     Ok(())
 }
 
+/// Restore a snapshot into a new target and return the namespaces it holds.
+///
+/// The target's store lock is taken after the parent directory exists and
+/// before the destination is re-checked, and it is held through the copy, the
+/// post-install verification open, and the namespace listing. A concurrent
+/// daemon or CLI command therefore cannot observe a half-restored store: the
+/// database, its WAL under the snapshot's role, the checkpoint shadow and
+/// pinned marker, and the store-state provenance sidecar are all installed
+/// while the lock is held.
+async fn restore_snapshot_into(
+    dir: &std::path::Path,
+    target: &std::path::Path,
+) -> anyhow::Result<Vec<String>> {
+    let snapshot = dir.join("ladybug.store");
+    if !snapshot.exists() {
+        return Err(anyhow::anyhow!(
+            "{:?} does not look like a snapshot: no ladybug.store inside it.",
+            dir
+        ));
+    }
+    if let Err(e) = ensure_snapshot_verified(dir) {
+        return Err(anyhow::anyhow!("Snapshot verification failed: {}", e));
+    }
+    // Resolved before the copy so a bad configuration leaves the target
+    // untouched instead of parking a database no later step can open.
+    let dimensions = embed::configured_dimensions()?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Taken before the destination re-check and held to the end of this
+    // function: the whole install is one locked window.
+    let Some(_lock) = try_take_store_lock(target)? else {
+        return Err(anyhow::anyhow!(
+            "another NeuroStrata process is using {:?}; refusing to restore into a store in use",
+            target
+        ));
+    };
+    #[cfg(test)]
+    restore_test_barrier::hit(target, "locked");
+    if target.exists() {
+        return Err(anyhow::anyhow!(
+            "{:?} already exists, and restoring into it would mean replacing what it holds. Restore into a new path instead: neurostrata-mcp restore <backup-dir> --into <new-db-path>",
+            target
+        ));
+    }
+
+    copy_snapshot_into_place(dir, target)?;
+    #[cfg(test)]
+    restore_test_barrier::hit(target, "installed");
+
+    // The verification window opens here: the lock must still be held when
+    // the verification open and namespace listing run below, not only at
+    // the moment the copy finished. The barrier lets the test probe the
+    // lock at exactly this phase boundary.
+    #[cfg(test)]
+    restore_test_barrier::hit(target, "verifying");
+
+    // Opened only after the copy, to verify the restored store reads back and
+    // to report what it holds, all while the lock is still held.
+    let vector_store: Arc<dyn VectorStore> =
+        match LadybugStore::new(target.to_string_lossy().to_string(), dimensions) {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                // The snapshot verified, but the store it placed will not open.
+                // Leaving it at the target would park an unopenable store where
+                // a live one was expected, so roll the copy back entirely (issue
+                // #87); the snapshot itself is untouched and the restore can be
+                // retried.
+                roll_back_failed_restore(target);
+                return Err(e);
+            }
+        };
+
+    let namespaces = match vector_store.list_namespaces().await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("restore list_namespaces check failed: {e}");
+            Vec::new()
+        }
+    };
+    Ok(namespaces)
+}
+
+/// Remove the database and every companion a failed restore may have
+/// installed, in either WAL role plus the checkpoint state (#209): a failed
+/// restore leaves the target absent rather than parking an unopenable partial
+/// set.
+fn roll_back_failed_restore(target: &std::path::Path) {
+    let _ = std::fs::remove_file(target);
+    for suffix in [".wal", ".wal.checkpoint", ".shadow", ".pinned.tmp"] {
+        let mut companion = target.as_os_str().to_os_string();
+        companion.push(suffix);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(companion));
+    }
+    let _ = std::fs::remove_file(crate::model_choice::store_state_path(target));
+}
+
+/// A test-only rendezvous inside [`restore_snapshot_into`]: it marks a phase
+/// and blocks until the test releases it, so the test can inspect the target
+/// (and probe its lock) while the restore still owns it. `cfg(test)` keeps it
+/// out of production builds.
+#[cfg(test)]
+mod restore_test_barrier {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static ARMED: Mutex<Option<(PathBuf, PathBuf)>> = Mutex::new(None);
+
+    pub(super) fn arm(target: &Path, root: &Path) {
+        *ARMED.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((target.to_path_buf(), root.to_path_buf()));
+    }
+
+    pub(super) fn disarm() {
+        *ARMED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    pub(super) fn hit(target: &Path, phase: &str) {
+        let armed = {
+            let armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
+            armed.clone()
+        };
+        let Some((armed_target, root)) = armed else {
+            return;
+        };
+        if armed_target != target {
+            return;
+        }
+        let entered = root.join(format!("restore-{phase}-entered"));
+        let release = root.join(format!("restore-{phase}-release"));
+        std::fs::write(&entered, b"entered").expect("write the restore barrier marker");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !release.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the restore lock test never released the {phase} barrier"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 /// The format version and WAL role a snapshot recorded in its manifest
 /// (#209).
 ///
@@ -7976,7 +8584,60 @@ fn snapshot_version_and_wal_kind(
     ))
 }
 
+/// Install the process-wide `tracing` subscriber on stderr.
+///
+/// Stdout is the MCP stdio channel: a log line there would corrupt the
+/// protocol, so every event goes to stderr. Installed as the first thing
+/// `main` does, before the runtime and every mode dispatch, so the daemon,
+/// the stdio proxy, and every CLI command share one subscriber. A second
+/// install (an embedded caller, a re-exec'd helper) is a no-op rather than a
+/// panic.
+fn init_tracing() {
+    init_tracing_with_writer(std::io::stderr);
+}
+
+/// Install the global subscriber over `writer`. Production passes
+/// `std::io::stderr` (see [`init_tracing`]); the tests pass a capture
+/// buffer in the same slot, so they exercise this global installation —
+/// the subscriber a bare `tracing::info!` in production code actually
+/// dispatches to — rather than a one-off `with_default` subscriber.
+/// A second install is a no-op rather than a panic: the global default
+/// can only be set once per process.
+fn init_tracing_with_writer<W>(writer: W)
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    let subscriber = tracing_fmt_subscriber(writer, tracing_env_filter());
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// The startup filter: `RUST_LOG` when it parses, `info` otherwise. An
+/// unparsable value is an operator typo, not a reason to brick startup or to
+/// go silent.
+fn tracing_env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// The fmt subscriber over an arbitrary writer: production passes
+/// `std::io::stderr`; the tests pass a capture buffer in the same slot. ANSI
+/// is off so a captured or redirected log stays plain text.
+fn tracing_fmt_subscriber<W>(
+    writer: W,
+    filter: tracing_subscriber::EnvFilter,
+) -> impl tracing::Subscriber + Send + Sync + 'static
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_env_filter(filter)
+        .finish()
+}
+
 fn main() -> anyhow::Result<()> {
+    init_tracing();
     let runtime = runtime()?;
     runtime.block_on(run())
 }
@@ -8783,73 +9444,13 @@ async fn run() -> anyhow::Result<()> {
                 // place BEFORE any engine opens it -- an open engine maps the
                 // file it was created with, and copying under a live handle is
                 // exactly the memory-unsafety class the backup bug came from.
+                // `restore_snapshot_into` keeps the copy, the target's store
+                // lock, and the post-install verification in one locked window.
                 let config = Config::from_default_path()?;
                 let target = into
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| config.db_path.clone());
-
-                if target.exists() {
-                    eprintln!("{:?} already exists, and restoring into it would mean replacing what it holds.", target);
-                    eprintln!("Restore into a new path instead: neurostrata-mcp restore <backup-dir> --into <new-db-path>");
-                    eprintln!("Then point db_path in ~/.config/neurostrata/config.json at it once you have checked it.");
-                    std::process::exit(1);
-                }
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-
-                let snapshot = std::path::Path::new(&dir).join("ladybug.store");
-                if !snapshot.exists() {
-                    eprintln!(
-                        "{:?} does not look like a snapshot: no ladybug.store inside it.",
-                        dir
-                    );
-                    std::process::exit(1);
-                }
-                if let Err(e) = ensure_snapshot_verified(std::path::Path::new(&dir)) {
-                    eprintln!("Snapshot verification failed: {}", e);
-                    std::process::exit(1);
-                }
-                copy_snapshot_into_place(std::path::Path::new(&dir), &target)?;
-
-                // Opened only after the copy, to verify the restored store
-                // reads back and to report what it holds.
-                let vector_store: Arc<dyn VectorStore> = match LadybugStore::new(
-                    target.to_string_lossy().to_string(),
-                    embed::configured_dimensions()?,
-                ) {
-                    Ok(store) => Arc::new(store),
-                    Err(e) => {
-                        // The snapshot verified, but the store it placed
-                        // will not open — leaving it at the target would
-                        // park an unopenable store where a live one was
-                        // expected. Roll the copy back entirely so a
-                        // failed restore leaves the target absent (issue
-                        // #87); the snapshot itself is untouched and the
-                        // restore can be retried.
-                        let _ = std::fs::remove_file(&target);
-                        // Every companion the restore set may have placed,
-                        // in either WAL role plus the checkpoint state (#209):
-                        // a failed restore leaves the target absent rather
-                        // than parking an unopenable partial set.
-                        for suffix in [".wal", ".wal.checkpoint", ".shadow", ".pinned.tmp"] {
-                            let mut companion = target.as_os_str().to_os_string();
-                            companion.push(suffix);
-                            let _ = std::fs::remove_file(std::path::PathBuf::from(companion));
-                        }
-                        let _ =
-                            std::fs::remove_file(crate::model_choice::store_state_path(&target));
-                        return Err(e);
-                    }
-                };
-
-                let namespaces = match vector_store.list_namespaces().await {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::warn!("restore list_namespaces check failed: {e}");
-                        Vec::new()
-                    }
-                };
+                let namespaces = restore_snapshot_into(std::path::Path::new(&dir), &target).await?;
                 println!("Restored {} into {:?}", dir, target);
                 if !namespaces.is_empty() {
                     println!(
