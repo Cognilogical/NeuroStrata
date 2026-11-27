@@ -7994,6 +7994,14 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
         }
     };
 
+    // DR-2 is the address grammar; UUID is only the storage spelling. A
+    // malformed string is a typed ID refusal, decided before the UUID parser
+    // and before resolve_namespace lists the catalog. The handler's error
+    // contract is the JSON envelope, so the typed refusal travels inside it.
+    if let Err(e) = crate::domain::validate_id(&memory_id) {
+        return serde_json::json!({"ok":false,"valid":false,"violations":[e.to_string()]})
+            .to_string();
+    }
     let id = match Uuid::parse_str(&memory_id) {
         Ok(u) => u,
         Err(e) => return serde_json::json!({"ok":false,"valid":false,"violations":[format!("invalid memory_id: {e}")]}).to_string(),
@@ -17743,6 +17751,93 @@ mod tests {
             0,
             "a DR-2-malformed memory_id must not consult the namespace catalog"
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_validation_refuses_a_dr2_malformed_memory_id_before_catalog_access() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let text = handle_validate_canonical_rdf(
+            &json!({ "namespace": "probe", "memory_id": "bad id" }),
+            store,
+        )
+        .await;
+        let reply: Value =
+            serde_json::from_str(&text).expect("canonical validation error is JSON");
+        assert_eq!(reply["ok"], json!(false), "{text}");
+        assert_eq!(reply["valid"], json!(false), "{text}");
+        let violations = reply["violations"]
+            .as_array()
+            .expect("violations is an array");
+        assert_eq!(violations.len(), 1, "{text}");
+        let violation = violations[0].as_str().expect("violation is a string");
+        assert!(violation.starts_with("ERROR [ID]"), "{text}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a DR-2-malformed memory_id must not consult the namespace catalog"
+        );
+        assert_eq!(
+            mock.get_calls(),
+            0,
+            "a DR-2-malformed memory_id must not reach a row read"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_validation_refuses_a_non_uuid_memory_id_before_store_access() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let text = handle_validate_canonical_rdf(
+            &json!({ "namespace": "probe", "memory_id": "not-a-uuid" }),
+            store,
+        )
+        .await;
+        let reply: Value =
+            serde_json::from_str(&text).expect("canonical validation error is JSON");
+        assert_eq!(reply["ok"], json!(false), "{text}");
+        assert_eq!(reply["valid"], json!(false), "{text}");
+        let violations = reply["violations"]
+            .as_array()
+            .expect("violations is an array");
+        assert_eq!(violations.len(), 1, "{text}");
+        let violation = violations[0].as_str().expect("violation is a string");
+        assert!(violation.contains("invalid memory_id"), "{text}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a non-UUID memory_id must not consult the namespace catalog"
+        );
+        assert_eq!(
+            mock.get_calls(),
+            0,
+            "a non-UUID memory_id must not reach a row read"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_validation_accepts_a_valid_memory_id_unchanged() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut p = payload("canonical validation probe");
+        p.metadata = serde_json::json!({ "created_at": "2026-01-01T00:00:00+00:00" });
+        let vector = StubEmbedder.embed("canonical validation probe").await.unwrap();
+        store
+            .upsert("probe", &id, vector, p)
+            .await
+            .expect("seed row");
+        let text = handle_validate_canonical_rdf(
+            &json!({ "namespace": "probe", "memory_id": id }),
+            store,
+        )
+        .await;
+        let reply: Value = serde_json::from_str(&text).expect("canonical validation reply is JSON");
+        assert_eq!(reply["ok"], json!(true), "{text}");
+        assert_eq!(reply["valid"], json!(true), "{text}");
+        assert_eq!(reply["memory_id"], json!(id), "{text}");
+        assert_eq!(mock.list_namespaces_calls(), 1, "the valid path resolves once");
+        assert_eq!(mock.get_calls(), 1, "the valid path reads the row exactly once");
     }
 
     #[tokio::test]
