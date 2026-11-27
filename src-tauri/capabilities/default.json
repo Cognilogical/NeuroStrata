@@ -9,6 +9,7 @@
     {
       "identifier": "shell:allow-open",
       "allow": [
+        { "url": "^neurostrata-editor://.*" },
         { "url": "^https?://.*" }
       ]
     }

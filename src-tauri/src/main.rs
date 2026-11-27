@@ -227,10 +227,11 @@ fn namespace_for(project_path: &str) -> String {
 /// this one was mistaken for all three.
 #[tauri::command]
 fn open_external(url: String) -> Result<(), String> {
-    // Only schemes the visualizer actually emits. An unrestricted opener
-    // reachable from the webview would run whatever a memory's content asked
-    // for, and node content is not ours.
-    const ALLOWED: [&str; 4] = ["vscode://", "cursor://", "https://", "http://"];
+    // Only web schemes. Editor deep links are intentionally not launchable:
+    // the capability may declare the native editor scheme, but an unrestricted
+    // opener reachable from the webview would run whatever a memory's content
+    // asked for, and node content is not ours.
+    const ALLOWED: [&str; 2] = ["https://", "http://"];
     if !ALLOWED.iter().any(|s| url.starts_with(s)) {
         return Err(format!(
             "Refusing to open '{}': only {} are allowed.",
