@@ -1879,21 +1879,49 @@ fn resolve_store_limits(
     configured_max_db_bytes: Option<u64>,
     env_pool: Option<&str>,
     env_cap: Option<&str>,
+    legacy_env_pool_mb: Option<&str>,
 ) -> (StoreLimits, Vec<String>) {
     let mut notes = Vec::new();
 
     let configured_pool = configured_pool_bytes.unwrap_or(DEFAULT_BUFFER_POOL_BYTES);
     let mut pool = match env_pool.map(str::trim).filter(|v| !v.is_empty()) {
-        Some(value) => match value.parse::<u64>() {
-            Ok(bytes) => bytes,
-            Err(_) => {
+        Some(value) => {
+            if let Some(mb) = legacy_env_pool_mb.map(str::trim).filter(|v| !v.is_empty()) {
                 notes.push(format!(
-                    "NEUROSTRATA_BUFFER_POOL_BYTES={value:?} is not a number of bytes; using {configured_pool} from the config"
+                    "NEUROSTRATA_BUFFER_POOL_MB={mb:?} is deprecated and ignored because \
+                     NEUROSTRATA_BUFFER_POOL_BYTES is set; remove the old variable"
                 ));
-                configured_pool
             }
+            match value.parse::<u64>() {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    notes.push(format!(
+                        "NEUROSTRATA_BUFFER_POOL_BYTES={value:?} is not a number of bytes; using {configured_pool} from the config"
+                    ));
+                    configured_pool
+                }
+            }
+        }
+        None => match legacy_env_pool_mb.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) => match value.parse::<u64>() {
+                Ok(mb) => {
+                    notes.push(format!(
+                        "NEUROSTRATA_BUFFER_POOL_MB={value:?} is deprecated; using {} bytes; \
+                         replace it with NEUROSTRATA_BUFFER_POOL_BYTES",
+                        mb.saturating_mul(1024 * 1024)
+                    ));
+                    mb.saturating_mul(1024 * 1024)
+                }
+                Err(_) => {
+                    notes.push(format!(
+                        "NEUROSTRATA_BUFFER_POOL_MB={value:?} is not a number of megabytes; \
+                         using {configured_pool} from the config"
+                    ));
+                    configured_pool
+                }
+            },
+            None => configured_pool,
         },
-        None => configured_pool,
     };
     if pool != 0 && pool < MIN_BUFFER_POOL_BYTES {
         notes.push(format!(
@@ -1948,11 +1976,13 @@ fn resolved_store_limits() -> StoreLimits {
     let (configured_pool, configured_cap) = configured_store_limits();
     let env_pool = std::env::var("NEUROSTRATA_BUFFER_POOL_BYTES").ok();
     let env_cap = std::env::var("NEUROSTRATA_MAX_DB_BYTES").ok();
+    let legacy_env_pool_mb = std::env::var("NEUROSTRATA_BUFFER_POOL_MB").ok();
     let (limits, notes) = resolve_store_limits(
         configured_pool,
         configured_cap,
         env_pool.as_deref(),
         env_cap.as_deref(),
+        legacy_env_pool_mb.as_deref(),
     );
     BUFFER_POOL_BYTES_IN_USE.store(
         limits.buffer_pool_bytes,
@@ -2079,7 +2109,33 @@ fn would_exceed_cap(current: u64, incoming: u64, cap: u64) -> bool {
 /// has its own turn, so the check needs an OS-held file lock to be
 /// authoritative across handles too (#453 review).
 fn cap_lock_path_for(local_path: &std::path::Path) -> std::path::PathBuf {
-    local_path.with_extension("store-cap.lock")
+    canonical_store_path(local_path).with_extension("store-cap.lock")
+}
+
+/// Resolve symlinks and `..` components before deriving a shared sidecar
+/// path. A database that does not exist yet has no canonical form, so the
+/// nearest existing ancestor is resolved and the missing tail appended; two
+/// aliases of a fresh store then still agree on one lock.
+fn canonical_store_path(local_path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(local_path) {
+        return canonical;
+    }
+    let mut ancestor = local_path.parent();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(dir) = ancestor {
+        if let Ok(base) = std::fs::canonicalize(dir) {
+            let mut resolved = base;
+            for part in tail.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        if let Some(name) = dir.file_name() {
+            tail.push(name.to_os_string());
+        }
+        ancestor = dir.parent();
+    }
+    local_path.to_path_buf()
 }
 
 /// Refuse before any write, naming both the current size and the cap. The only
@@ -2157,6 +2213,12 @@ fn estimate_maintenance_wal_bytes(fields: &[&str], rows: usize) -> u64 {
         ROW_OVERHEAD_BYTES.saturating_mul(rows.max(1) as u64),
         |total, field| total.saturating_add(field.len() as u64),
     )
+}
+
+/// A bulk delete pays for every row it removes and every edge detached from
+/// those rows, not for one nominal row (#453 re-review).
+fn estimate_bulk_delete_bytes(fields: &[&str], rows: u64, edges: u64) -> u64 {
+    estimate_maintenance_wal_bytes(fields, rows.saturating_add(edges).max(1) as usize)
 }
 
 /// Conservative cost of replaying `targets` edge rows plus the metadata
@@ -2238,6 +2300,7 @@ fn estimate_upsert_write_bytes(
             .saturating_add(spec.rel_type.len() as u64)
             .saturating_add(spec.target_id.len() as u64)
             .saturating_add(id.len() as u64)
+            .saturating_add(namespace.len() as u64)
             .saturating_add(EDGE_ROW_OVERHEAD_BYTES);
         // The write repeats the declaration and resolution strings (and the
         // source path and hash) in `metadata.edge_sources` on the declarer.
@@ -2298,6 +2361,7 @@ fn estimate_action_write_bytes(
             .saturating_add(edge.source.len() as u64)
             .saturating_add(edge.relation.len() as u64)
             .saturating_add(edge.target.len() as u64)
+            .saturating_add(namespace.len() as u64)
             .saturating_add(EDGE_ROW_OVERHEAD_BYTES)
     });
     // Every payload-declared edge whose target already exists is materialized
@@ -2326,6 +2390,7 @@ fn estimate_action_write_bytes(
                     .saturating_add(spec.rel_type.len() as u64)
                     .saturating_add(spec.target_id.len() as u64)
                     .saturating_add(write.id.len() as u64)
+                    .saturating_add(namespace.len() as u64)
                     .saturating_add(ROW_OVERHEAD_BYTES)
                     .saturating_add(EDGE_ROW_OVERHEAD_BYTES)
                     .saturating_add(
@@ -2541,7 +2606,7 @@ mod store_limits_tests {
     const MIB: u64 = 1024 * 1024;
 
     fn limits(pool: Option<u64>, cap: Option<u64>) -> (StoreLimits, Vec<String>) {
-        resolve_store_limits(pool, cap, None, None)
+        resolve_store_limits(pool, cap, None, None, None)
     }
 
     #[test]
@@ -2551,13 +2616,14 @@ mod store_limits_tests {
             Some(1024 * MIB),
             Some("805306368"),
             Some("2147483648"),
+            None,
         );
         assert_eq!(resolved.buffer_pool_bytes, 768 * MIB);
         assert_eq!(resolved.max_db_bytes, 2048 * MIB);
         assert!(notes.is_empty(), "{notes:?}");
 
         let (resolved, notes) =
-            resolve_store_limits(Some(512 * MIB), None, Some(" 671088640 "), Some(""));
+            resolve_store_limits(Some(512 * MIB), None, Some(" 671088640 "), Some(""), None);
         assert_eq!(resolved.buffer_pool_bytes, 640 * MIB);
         assert_eq!(resolved.max_db_bytes, 0);
         assert!(notes.is_empty(), "{notes:?}");
@@ -2570,6 +2636,7 @@ mod store_limits_tests {
             Some(1024 * MIB),
             Some("lots"),
             Some("2GiB"),
+            None,
         );
         assert_eq!(resolved.buffer_pool_bytes, 512 * MIB);
         assert_eq!(resolved.max_db_bytes, 1024 * MIB);
@@ -2593,8 +2660,13 @@ mod store_limits_tests {
         assert_eq!(resolved.max_db_bytes, 0);
         assert!(notes.is_empty(), "{notes:?}");
 
-        let (resolved, notes) =
-            resolve_store_limits(Some(1024 * MIB), Some(1024 * MIB), Some("0"), Some("0"));
+        let (resolved, notes) = resolve_store_limits(
+            Some(1024 * MIB),
+            Some(1024 * MIB),
+            Some("0"),
+            Some("0"),
+            None,
+        );
         assert_eq!(
             resolved.buffer_pool_bytes, 0,
             "0 hands the pool to the engine"
@@ -2639,21 +2711,26 @@ mod store_limits_tests {
         assert_eq!(other, "Parser exception: nope");
     }
 
-    /// PR #453 re-review: bytes only. A megabyte value is neither a config
-    /// value nor an environment fallback; no warning tries to resurrect it.
+    /// PR #453 re-review: an existing deployment's legacy megabyte environment
+    /// variable stays effective with a warning, but never overrides the byte
+    /// variable. No legacy value is silently dropped.
     #[test]
-    fn a_megabyte_pool_value_is_not_a_byte_pool() {
-        let resolved: crate::config::Config = serde_json::from_str(
-            r#"{"db_path":"test.db","storage_hygiene":{"buffer_pool_mb":768}}"#,
-        )
-        .unwrap();
-        assert_eq!(resolved.store.buffer_pool_bytes, None);
-
-        let (limits, notes) = resolve_store_limits(None, None, None, None);
-        assert_eq!(limits.buffer_pool_bytes, DEFAULT_BUFFER_POOL_BYTES);
+    fn a_legacy_megabyte_env_value_is_honored_with_guidance() {
+        let (limits, notes) = resolve_store_limits(None, None, None, None, Some("768"));
+        assert_eq!(limits.buffer_pool_bytes, 768 * MIB);
         assert!(
-            notes.iter().all(|n| !n.contains("BUFFER_POOL_MB")),
+            notes
+                .iter()
+                .any(|n| n.contains("NEUROSTRATA_BUFFER_POOL_MB")),
             "{notes:?}"
+        );
+
+        let (limits, notes) =
+            resolve_store_limits(Some(512 * MIB), None, Some("805306368"), None, Some("768"));
+        assert_eq!(limits.buffer_pool_bytes, 768 * MIB);
+        assert!(
+            notes.iter().any(|n| n.contains("ignored")),
+            "the shadowed legacy variable must be named: {notes:?}"
         );
     }
 
@@ -5793,6 +5870,13 @@ impl LadybugStore {
         if !self.serving_matches_configured(&serving) {
             return Ok(false);
         }
+        // The migration writes an identity sidecar and can grow the WAL;
+        // an under-cap store must refuse it rather than cross the cap.
+        let incoming = estimate_field_row_bytes(&[
+            &self.local_path.to_string_lossy(),
+            &format!("{serving:?}"),
+            &self.dimensions.to_string(),
+        ]);
         let migration = LockedUnknownMigration {
             store_state: Arc::clone(&self.store_state),
             local_path: self.local_path.clone(),
@@ -5800,8 +5884,9 @@ impl LadybugStore {
             dimensions: self.dimensions,
         };
         let outcome = self
-            .write_with_deadline_unmetered(
+            .write_with_deadline_within_cap(
                 "migrating a data-bearing LockedUnknown store",
+                Some(incoming),
                 move |conn| migration.migrate_data_bearing(conn),
             )
             .await?;
@@ -8511,6 +8596,52 @@ impl LadybugStore {
             .await
     }
 
+    /// Length of the metadata column a counter write will rewrite in full.
+    /// A failed read is an error: admission must not estimate it as empty.
+    async fn metadata_len_for_estimate(&self, namespace: &str, id: &str) -> Result<u64> {
+        let safe_ns = escape_ladybug_string(namespace);
+        let safe_id = escape_ladybug_string(id);
+        self.with_conn(move |conn| {
+            let query = format!(
+                "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id = '{safe_id}' \
+                 RETURN m.metadata"
+            );
+            let mut rows = conn.query(&query)?;
+            Ok(rows
+                .next()
+                .map(|row| format!("{}", row[0]).len() as u64)
+                .unwrap_or(0))
+        })
+        .await
+    }
+
+    /// Count the rows a delete predicate will remove and the edges attached
+    /// to them. The counts feed a conservative admission estimate before the
+    /// write; a read failure propagates rather than shrinking the estimate.
+    async fn count_delete_targets(&self, predicate: &str) -> Result<(u64, u64)> {
+        let predicate = predicate.to_string();
+        self.with_conn(move |conn| {
+            let count = |query: String| -> Result<u64> {
+                let mut rows = conn.query(&query)?;
+                Ok(rows
+                    .next()
+                    .map(|row| format!("{}", row[0]).parse::<u64>().unwrap_or(0))
+                    .unwrap_or(0))
+            };
+            let rows = count(format!(
+                "MATCH (m:Memory) WHERE {predicate} RETURN count(*)"
+            ))?;
+            let outgoing = count(format!(
+                "MATCH (m:Memory)-[r]->(:Memory) WHERE {predicate} RETURN count(*)"
+            ))?;
+            let incoming = count(format!(
+                "MATCH (:Memory)-[r]->(m:Memory) WHERE {predicate} RETURN count(*)"
+            ))?;
+            Ok((rows, outgoing.saturating_add(incoming)))
+        })
+        .await
+    }
+
     async fn delete_generation_inner(
         &self,
         namespace: &str,
@@ -8521,7 +8652,12 @@ impl LadybugStore {
             anyhow::bail!("generation 0 is not generation-scoped");
         }
         let namespace_owned = namespace.to_string();
-        let incoming = estimate_maintenance_wal_bytes(&[&namespace], 1);
+        let safe_ns = escape_ladybug_string(namespace);
+        let prefix = crate::parser::ingest::generation_scoped_id(namespace, generation, "");
+        let safe_prefix = escape_ladybug_string(&prefix);
+        let predicate = format!("m.namespace = '{safe_ns}' AND m.id STARTS WITH '{safe_prefix}'");
+        let (rows, edges) = self.count_delete_targets(&predicate).await?;
+        let incoming = estimate_bulk_delete_bytes(&[namespace, &prefix], rows, edges);
         self.write_with_deadline_recovery("pruning a superseded generation", incoming, move |conn| {
             // Both checks run INSIDE the write turn. A publication or rollback
             // (`publish_generation`) takes the same writer lock, so it cannot
@@ -12053,7 +12189,9 @@ impl VectorStore for LadybugStore {
         let key = key.to_string();
         // #453: a metadata counter rewrite is a growing write; it shares the
         // byte-cap admission instead of slipping through as maintenance.
-        let incoming = estimate_field_row_bytes(&[&namespace, &id, &key]);
+        let metadata_len = self.metadata_len_for_estimate(&namespace, &id).await?;
+        let incoming =
+            estimate_field_row_bytes(&[&namespace, &id, &key]).saturating_add(metadata_len);
         self.write_with_deadline_within_cap(
             "recording a metadata counter",
             Some(incoming),
@@ -12534,7 +12672,12 @@ impl VectorStore for LadybugStore {
         let id = id.to_string();
         let index_namespace = namespace.clone();
         let index_id = id.clone();
-        let incoming = estimate_maintenance_wal_bytes(&[&namespace, &id], 1);
+        let safe_ns_for_estimate = escape_ladybug_string(&namespace);
+        let safe_id_for_estimate = escape_ladybug_string(&id);
+        let predicate =
+            format!("m.namespace = '{safe_ns_for_estimate}' AND m.id = '{safe_id_for_estimate}'");
+        let (rows, edges) = self.count_delete_targets(&predicate).await?;
+        let incoming = estimate_bulk_delete_bytes(&[&namespace, &id], rows, edges);
         let outcome =
             self.write_with_deadline_recovery("deleting a memory", incoming, move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
@@ -12590,7 +12733,7 @@ impl VectorStore for LadybugStore {
         let (id, from, to) = (id.to_string(), from.to_string(), to.to_string());
         let incoming = estimate_maintenance_wal_bytes(&[&id, &from, &to], 1);
         let outcome =
-            self.write_with_deadline_recovery("moving a memory", incoming, move |conn| {
+            self.write_with_deadline_within_cap("moving a memory", Some(incoming), move |conn| {
             // One statement, so there is no moment at which the memory exists in
             // neither namespace, and the row keeps its id, vector and edges.
             // VERIFY the row actually sat in `from` before claiming the move:
@@ -12778,19 +12921,27 @@ impl VectorStore for LadybugStore {
         let namespace = namespace.to_string();
         let id = id.to_string();
         let rel_type = rel_type.to_string();
-        let namespace_key = namespace.clone();
-        let id_key = id.clone();
-        let rel_type_key = rel_type.clone();
-        let keep_for_reconcile = keep.to_vec();
         let keep_owned = keep.to_vec();
         let declared_owned = declared.to_vec();
-        let incoming = estimate_edge_targets_bytes(&rel_type, &id, keep.iter().map(String::as_str));
+        // Rebinding and stale-edge reconciliation are ONE admitted write: a
+        // refused second phase must not leave the first phase's edges behind.
+        let incoming = estimate_edge_targets_bytes(&rel_type, &id, keep.iter().map(String::as_str))
+            .saturating_add(estimate_edge_targets_bytes(
+                &rel_type,
+                &id,
+                keep.iter().map(String::as_str),
+            ))
+            .saturating_add(estimate_maintenance_wal_bytes(
+                &[&namespace, &id, &rel_type],
+                1,
+            ));
         let created = self
             .write_with_deadline_within_cap(
                 "rebinding declared edges",
                 Some(incoming),
                 move |conn| {
                     if keep_owned.is_empty() {
+                        reconcile_declared_edges_on(conn, &namespace, &id, &rel_type, &keep_owned)?;
                         return Ok(0);
                     }
                     let safe_ns = escape_ladybug_string(&namespace);
@@ -12924,11 +13075,10 @@ impl VectorStore for LadybugStore {
                             }
                         }
                     }
+                    reconcile_declared_edges_on(conn, &namespace, &id, &rel_type, &keep_owned)?;
                     Ok(created)
                 },
             )
-            .await?;
-        self.reconcile_declared_edges(&namespace_key, &id_key, &rel_type_key, &keep_for_reconcile)
             .await?;
         Ok(created)
     }
@@ -13304,9 +13454,12 @@ impl VectorStore for LadybugStore {
     async fn clear_ingested(&self, namespace: &str) -> Result<()> {
         let namespace = namespace.to_string();
         let index_namespace = namespace.clone();
+        let safe_ns = escape_ladybug_string(&namespace);
+        let predicate = format!("m.namespace = '{safe_ns}' AND m.user_id = 'auto-ingestor'");
+        let (rows, edges) = self.count_delete_targets(&predicate).await?;
         // Strict admission: bulk ingest deletion is not a remedy for a full
         // store. Only raising the cap or a specific-id delete is supported.
-        let incoming = estimate_maintenance_wal_bytes(&[&namespace], 1);
+        let incoming = estimate_bulk_delete_bytes(&[&namespace], rows, edges);
         let outcome = self.write_with_deadline_within_cap(
             "clearing the ingested rows",
             Some(incoming),
@@ -13480,7 +13633,13 @@ impl VectorStore for LadybugStore {
         let namespace = namespace.to_string();
         let refresh_ns = namespace.clone();
         let source_key = source_key.to_string();
-        let incoming = estimate_maintenance_wal_bytes(&[&namespace, &source_key], 2);
+        let safe_ns_for_estimate = escape_ladybug_string(&namespace);
+        let prefix = crate::parser::ingest::generation_scoped_id(&namespace, generation, "");
+        let safe_prefix = escape_ladybug_string(&prefix);
+        let predicate =
+            format!("m.namespace = '{safe_ns_for_estimate}' AND m.id STARTS WITH '{safe_prefix}'");
+        let (rows, edges) = self.count_delete_targets(&predicate).await?;
+        let incoming = estimate_bulk_delete_bytes(&[&namespace, &prefix], rows, edges);
         self.write_with_deadline_recovery("aborting a staging generation", incoming, move |conn| {
             // A staged node's id is `ns::<generation>::<path>`, so every row of
             // this generation shares the prefix. The namespace predicate keeps
@@ -13982,7 +14141,8 @@ impl VectorStore for LadybugStore {
         let id = id.to_string();
         // #453: retrieval rewrites a metadata column, so this is a metered
         // write too -- it cannot bypass the store cap as maintenance.
-        let incoming = estimate_field_row_bytes(&[&namespace, &id]);
+        let metadata_len = self.metadata_len_for_estimate(&namespace, &id).await?;
+        let incoming = estimate_field_row_bytes(&[&namespace, &id]).saturating_add(metadata_len);
         self.write_with_deadline_within_cap("counting a read", Some(incoming), move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_id = escape_ladybug_string(&id);
@@ -16750,7 +16910,30 @@ impl crate::traits::IntakeStore for LadybugStore {
                 &cand.title,
                 cand.description.as_deref().unwrap_or(""),
                 &cand.created_at,
+                &cand.updated_at,
+                &cand.candidate_kind,
+                &cand.kind,
+                &format!("{:?}", cand.review_state),
+                &format!("{:?}", cand.disposition),
+                cand.task_id.as_deref().unwrap_or(""),
+                cand.category.as_deref().unwrap_or(""),
+                cand.extractor_fingerprint.as_deref().unwrap_or(""),
             ]));
+            // These three columns are serialized JSON written verbatim; a
+            // large payload or provenance span must be paid for at admission.
+            for value in [
+                serde_json::to_string(&cand.payload).unwrap_or_default(),
+                cand.source_span
+                    .as_ref()
+                    .and_then(|v| serde_json::to_string(v).ok())
+                    .unwrap_or_default(),
+                cand.provenance
+                    .as_ref()
+                    .and_then(|v| serde_json::to_string(v).ok())
+                    .unwrap_or_default(),
+            ] {
+                incoming = incoming.saturating_add(value.len() as u64);
+            }
         }
         self.write_with_deadline_within_cap(
             "creating intake receipt and candidates",
@@ -19102,16 +19285,35 @@ eurostrata\src\daemon.rs",
     #[test]
     fn estimates_include_generated_stubs_edges_and_provenance() {
         let plain = retired_test_payload("rule", "agent", json!({}));
-        let base = estimate_upsert_write_bytes(4, "rule-id", "probe", &plain, 4, &[]);
-        let mut declaring = plain.clone();
-        declaring.metadata = json!({
-            "governs": ["src/one.rs", "src/two.rs", "src/three.rs"],
-            "related_to": ["probe::other"]
-        });
-        let with_generated = estimate_upsert_write_bytes(4, "rule-id", "probe", &declaring, 4, &[]);
+        let mut two = plain.clone();
+        two.metadata = json!({"governs": ["src/one.rs", "src/two.rs"]});
+        let mut three = plain.clone();
+        three.metadata = json!({"governs": ["src/one.rs", "src/two.rs", "src/three.rs"]});
+        let two_bytes = estimate_upsert_write_bytes(4, "rule-id", "probe", &two, 4, &[]);
+        let three_bytes = estimate_upsert_write_bytes(4, "rule-id", "probe", &three, 4, &[]);
         assert!(
-            with_generated > base + 6 * 1024,
-            "three stub rows plus four edges must be counted: {base} -> {with_generated}"
+            three_bytes - two_bytes >= estimate_stub_row_bytes(4, "probe", "src/three.rs"),
+            "one extra declared target must pay for its own stub row: {two_bytes} -> {three_bytes}"
+        );
+
+        let none = estimate_upsert_write_bytes(4, "rule-id", "probe", &plain, 4, &[]);
+        let one = estimate_upsert_write_bytes(
+            4,
+            "rule-id",
+            "probe",
+            &plain,
+            4,
+            &["probe::one".to_string()],
+        );
+        assert!(
+            one - none
+                >= "RELATES_TO".len() as u64
+                    + "rule-id".len() as u64
+                    + "probe::one".len() as u64
+                    + EDGE_ROW_OVERHEAD_BYTES
+                    + ROW_OVERHEAD_BYTES
+                    + "probe".len() as u64,
+            "one generated mention must pay for its edge and namespace: {none} -> {one}"
         );
     }
 
@@ -19131,6 +19333,103 @@ eurostrata\src\daemon.rs",
             current_store_bytes_at(&path),
             0,
             "the lenient open/test wrapper stays lenient"
+        );
+    }
+
+    /// PR #453 re-review: the stat failure must be exercised through the
+    /// admission path, not only through the measurement helper. A stat that
+    /// fails has to refuse the write with STORE_FULL, never read as zero.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_stat_refuses_a_capped_write_through_admission() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("stat-failure.lbug");
+        let store = capped_test_store(&path, 100 * 1024 * 1024).await;
+        std::fs::remove_file(&path).unwrap();
+        symlink("stat-failure.lbug", &path).unwrap();
+
+        let err = store
+            .write_with_deadline_within_cap("write with broken stats", Some(1), |_| Ok(()))
+            .await
+            .expect_err("a failed measurement must refuse the capped write");
+        assert!(err.to_string().contains("STORE_FULL"), "{err}");
+    }
+
+    /// PR #453 re-review: the sidecar lock must be derived from the canonical
+    /// database path. Two aliases of one file that produce different lock
+    /// paths let both processes pass the size check before either writes.
+    #[test]
+    fn cap_lock_is_shared_across_path_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = root.path().join("aliased.lbug");
+        std::fs::write(&real, b"").unwrap();
+        let dotted = dir.join("..").join("aliased.lbug");
+        assert_eq!(
+            cap_lock_path_for(&real),
+            cap_lock_path_for(&dotted),
+            "a .. alias must not get a second cap lock"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = root.path().join("link.lbug");
+            symlink(&real, &link).unwrap();
+            assert_eq!(
+                cap_lock_path_for(&real),
+                cap_lock_path_for(&link),
+                "a symlink alias must not get a second cap lock"
+            );
+        }
+    }
+
+    /// PR #453 re-review: namespace bytes are persisted on every emitted
+    /// edge, so a long namespace has to raise the estimate once per edge.
+    #[test]
+    fn long_namespaces_raise_the_estimate_for_every_declared_edge() {
+        use crate::rdf::action::StagedMemoryWrite;
+
+        let short_ns = "n";
+        let long_ns = "n".repeat(1024);
+        let metadata = json!({"related_to": ["probe::a", "probe::b", "probe::c"]});
+        let upsert_short = estimate_upsert_write_bytes(
+            4,
+            "id",
+            short_ns,
+            &retired_test_payload("fact", "agent", metadata.clone()),
+            4,
+            &[],
+        );
+        let upsert_long = estimate_upsert_write_bytes(
+            4,
+            "id",
+            &long_ns,
+            &retired_test_payload("fact", "agent", metadata),
+            4,
+            &[],
+        );
+        assert!(
+            upsert_long >= upsert_short + 3 * (long_ns.len() - short_ns.len()) as u64,
+            "each declared edge must pay for the stored namespace: {upsert_short} -> {upsert_long}"
+        );
+
+        let write = StagedMemoryWrite {
+            id: "action-row".to_string(),
+            vector: vec![0.0; 4],
+            payload: retired_test_payload(
+                "fact",
+                "agent",
+                json!({"related_to": ["probe::a", "probe::b", "probe::c"]}),
+            ),
+        };
+        let action_short = estimate_action_write_bytes(std::slice::from_ref(&write), &[], short_ns);
+        let action_long = estimate_action_write_bytes(std::slice::from_ref(&write), &[], &long_ns);
+        assert!(
+            action_long >= action_short + 3 * (long_ns.len() - short_ns.len()) as u64,
+            "each action edge must pay for the stored namespace: {action_short} -> {action_long}"
         );
     }
 
@@ -19294,12 +19593,18 @@ eurostrata\src\daemon.rs",
     async fn capped_writes_serialize_admission_while_a_write_is_detached() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("two-admissions.db");
-        let store = capped_test_store(&path, 0).await;
+        let seed = capped_test_store(&path, 0).await;
+        drop(seed);
+        // Cap BELOW the current size. Checking before the writer turn would
+        // refuse immediately with STORE_FULL while the first writer is still
+        // detached; a check inside the turn must wait for it instead.
+        let current = current_store_bytes_at(&path);
+        let store = capped_test_store(&path, current.saturating_sub(1)).await;
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
 
-        let held = store.write_with_deadline_within_cap("first admission", Some(1), move |_| {
+        let held = store.write_with_deadline_recovery("first admission", 1, move |_| {
             let _ = started_tx.send(());
             let _ = release.lock().unwrap().recv();
             Ok(())
@@ -19320,14 +19625,105 @@ eurostrata\src\daemon.rs",
         let (held_result, queued_result) = tokio::join!(held, queued);
         held_result.expect("the held write completes");
         assert!(
-            queued_result.is_err(),
-            "a second admission must wait for the first write to finish"
+            matches!(queued_result, Err(ref e) if e.to_string().contains("elapsed")),
+            "the second admission must wait in the writer turn, not refuse \
+             from a stale pre-flight measurement: {queued_result:?}"
         );
 
-        store
+        let err = store
             .write_with_deadline_within_cap("later admission", Some(1), |_| Ok(()))
             .await
-            .expect("admission works again once the first write finished");
+            .expect_err("a strict write refuses once the writer turn is free");
+        assert!(err.to_string().contains("STORE_FULL"), "{err}");
+    }
+
+    /// PR #453 re-review: a bulk delete detaches every edge attached to the
+    /// removed rows, so the estimate must scale with both counts.
+    #[test]
+    fn bulk_delete_estimate_counts_rows_and_attached_edges() {
+        let one = estimate_bulk_delete_bytes(&["probe"], 1, 0);
+        let many = estimate_bulk_delete_bytes(&["probe"], 40, 0);
+        let with_edges = estimate_bulk_delete_bytes(&["probe"], 40, 60);
+        assert!(
+            many > one,
+            "each removed row must be paid for: {one} -> {many}"
+        );
+        assert!(
+            with_edges > many,
+            "attached edges must be paid for: {many} -> {with_edges}"
+        );
+    }
+
+    /// PR #453 re-review: relocating a memory is a growing write, not
+    /// maintenance; it must be refused when it would cross the cap.
+    #[tokio::test]
+    async fn a_relocation_is_admitted_against_the_cap() {
+        use crate::traits::VectorStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("relocate-cap.db");
+        let seed = capped_test_store(&path, 0).await;
+        seed.upsert(
+            "from",
+            "movable",
+            vec![0.0; 4],
+            retired_test_payload("fact", "agent", json!({})),
+        )
+        .await
+        .expect("uncapped seed write");
+        drop(seed);
+
+        let cap = current_store_bytes_at(&path);
+        let store = capped_test_store(&path, cap).await;
+        let err = store
+            .relocate("movable", "from", "to")
+            .await
+            .expect_err("relocation past the cap must be refused");
+        assert!(err.to_string().contains("STORE_FULL"), "{err}");
+        assert!(
+            store.get("from", "movable").await.unwrap().is_some(),
+            "the refused relocation moved the row"
+        );
+        assert!(
+            store.get("to", "movable").await.unwrap().is_none(),
+            "the refused relocation created a destination row"
+        );
+    }
+
+    /// PR #453 re-review: counters rewrite the full metadata column, so the
+    /// admission estimate measures it instead of assuming an empty value.
+    #[tokio::test]
+    async fn a_rewrite_estimate_includes_the_existing_metadata_column() {
+        use crate::traits::VectorStore;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("metadata-rewrite.db");
+        let store = capped_test_store(&path, 0).await;
+        let note = "x".repeat(4096);
+        store
+            .upsert(
+                "probe",
+                "meta-row",
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({ "note": note })),
+            )
+            .await
+            .expect("seed write");
+        let measured = store
+            .metadata_len_for_estimate("probe", "meta-row")
+            .await
+            .expect("metadata is readable");
+        assert!(
+            measured >= note.len() as u64,
+            "the full metadata column must be counted: {measured}"
+        );
+        assert_eq!(
+            store
+                .metadata_len_for_estimate("probe", "missing")
+                .await
+                .expect("a missing row is not a read failure"),
+            0
+        );
     }
 
     /// PR #453 re-review: fixed row allowances alone must not make the edge
@@ -19369,9 +19765,40 @@ eurostrata\src\daemon.rs",
         );
         let short_bytes = estimate_upsert_write_bytes(4, "rule-id", "probe", &short, 4, &[]);
         let long_bytes = estimate_upsert_write_bytes(4, "rule-id", "probe", &long, 4, &[]);
+        let short_target = "probe::x";
+        let long_target = format!("probe::{}", "t".repeat(200));
+        let short_prov = EdgeProvenanceSource::from_row(
+            &short.metadata,
+            &short.location,
+            &short.location_lines,
+            &short.content,
+        );
+        let (_, short_entry) = edge_provenance_entry(
+            "rule-id",
+            "RELATES_TO",
+            0,
+            short_target,
+            short_target,
+            "self_to_target",
+            &short_prov,
+        );
+        let (_, long_entry) = edge_provenance_entry(
+            "rule-id",
+            "RELATES_TO",
+            0,
+            &long_target,
+            &long_target,
+            "self_to_target",
+            &short_prov,
+        );
+        let prov_delta = serde_json::to_vec(&long_entry).unwrap().len() as u64
+            - serde_json::to_vec(&short_entry).unwrap().len() as u64;
+        let meta_delta = estimate_memory_write_bytes(4, "rule-id", "probe", &long)
+            - estimate_memory_write_bytes(4, "rule-id", "probe", &short);
         assert!(
-            long_bytes >= short_bytes + 390,
-            "a long declared target and its provenance must count: {short_bytes} -> {long_bytes}"
+            long_bytes - short_bytes
+                >= meta_delta + prov_delta + (long_target.len() - short_target.len()) as u64,
+            "a long declared target must pay for provenance, not only metadata and target bytes: {short_bytes} -> {long_bytes}"
         );
     }
 

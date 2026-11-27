@@ -50,6 +50,10 @@ pub struct StorageHygieneConfig {
     pub checkpoint_interval_secs: u64,
     pub wal_warn_bytes: u64,
     pub snapshot_retention_count: usize,
+    /// Deprecated megabyte pool knob, kept only so an existing config can be
+    /// migrated (with a warning) to `store.buffer_pool_bytes` on load.
+    #[serde(default)]
+    pub buffer_pool_mb: Option<u64>,
 }
 
 impl Default for StorageHygieneConfig {
@@ -58,6 +62,7 @@ impl Default for StorageHygieneConfig {
             checkpoint_interval_secs: 2,
             wal_warn_bytes: 64 * 1024 * 1024,
             snapshot_retention_count: 5,
+            buffer_pool_mb: None,
         }
     }
 }

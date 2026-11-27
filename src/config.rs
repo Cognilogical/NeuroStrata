@@ -92,8 +92,8 @@ impl Default for DeduplicationConfig {
 }
 
 /// Byte-denominated store settings (#414). Both values are in bytes so the
-/// buffer pool and the size cap are commensurable and there is no second,
-/// megabyte-denominated pool knob.
+/// buffer pool and the size cap are commensurable. The older megabyte knob is
+/// deprecated and migrated on load, never used as a second live setting.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct StoreConfig {
@@ -104,6 +104,27 @@ pub struct StoreConfig {
     /// Hard cap on the store's on-disk bytes (database plus write-ahead log).
     /// `None` or `Some(0)` means no cap.
     pub max_db_bytes: Option<u64>,
+}
+
+/// Load-path guidance for the deprecated megabyte knob. The migration itself
+/// happens in `load_from`; this helper keeps the warning text testable and
+/// makes sure neither case is silently dropped.
+fn legacy_pool_guidance(config: &Config) -> Vec<String> {
+    let Some(mb) = config.storage_hygiene.buffer_pool_mb else {
+        return Vec::new();
+    };
+    if config.store.buffer_pool_bytes.is_some() {
+        vec![format!(
+            "storage_hygiene.buffer_pool_mb={mb} is deprecated and ignored because \
+             store.buffer_pool_bytes is set; remove the old key"
+        )]
+    } else {
+        vec![format!(
+            "storage_hygiene.buffer_pool_mb={mb} is deprecated; migrating it to \
+             store.buffer_pool_bytes={} bytes; replace the old key in the config",
+            mb.saturating_mul(1024 * 1024)
+        )]
+    }
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -249,6 +270,16 @@ impl Config {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Could not read config at {}", path.display()))?;
         let mut config: Config = serde_json::from_str(&content)?;
+
+        for note in legacy_pool_guidance(&config) {
+            tracing::warn!("{note}");
+        }
+        if config.store.buffer_pool_bytes.is_none() {
+            if let Some(mb) = config.storage_hygiene.buffer_pool_mb {
+                config.store.buffer_pool_bytes = Some(mb.saturating_mul(1024 * 1024));
+                config.storage_hygiene.buffer_pool_mb = None;
+            }
+        }
 
         if config.db_path.is_dir() {
             config.db_path = config.db_path.join("ladybug.db");
@@ -726,17 +757,37 @@ mod tests {
         assert!(bare.store.max_db_bytes.is_none());
     }
 
-    /// Bytes only: a megabyte key or a `null` byte value cannot configure the
-    /// buffer pool. The bytes key is the sole setting (#453 re-review).
+    /// PR #453 re-review: an existing deployment's megabyte key is not
+    /// silently ignored. It migrates to the byte setting with a load-path
+    /// warning, and an explicit byte value wins with its own warning.
     #[test]
-    fn a_megabyte_config_key_does_not_configure_the_pool() {
-        let config: Config = serde_json::from_str(
-            r#"{"db_path":"test.db","store":{"buffer_pool_bytes":null},"storage_hygiene":{"buffer_pool_mb":768}}"#,
+    fn a_legacy_megabyte_pool_key_is_migrated_with_guidance() {
+        let dir = temp_dir("legacy-pool");
+        let path = dir.join("config.json");
+        let legacy = r#"{"db_path":"test.db","store":{"buffer_pool_bytes":null},"storage_hygiene":{"buffer_pool_mb":768}}"#;
+        fs::write(&path, legacy).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.store.buffer_pool_bytes, Some(768 * 1024 * 1024));
+        assert_eq!(
+            config.storage_hygiene.buffer_pool_mb, None,
+            "the migrated key must not be applied twice"
+        );
+
+        let raw: Config = serde_json::from_str(legacy).unwrap();
+        let notes = legacy_pool_guidance(&raw);
+        assert!(
+            notes.iter().any(|note| note.contains("migrating")),
+            "the migration must be announced: {notes:?}"
+        );
+
+        let both: Config = serde_json::from_str(
+            r#"{"db_path":"test.db","store":{"buffer_pool_bytes":536870912},"storage_hygiene":{"buffer_pool_mb":768}}"#,
         )
         .unwrap();
-        assert_eq!(
-            config.store.buffer_pool_bytes, None,
-            "the removed megabyte key must not become a byte pool"
+        let notes = legacy_pool_guidance(&both);
+        assert!(
+            notes.iter().any(|note| note.contains("ignored")),
+            "an overridden legacy key must not be silently dropped: {notes:?}"
         );
     }
 
