@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use crate::parser::ingest::IngestObserver;
 use crate::parser::schema::ParserSchema;
 use crate::traits::{Embedder, VectorStore};
+use crate::util::lock_or_err;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,7 +189,13 @@ impl IngestJobs {
         };
 
         let mut rx = {
-            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut jobs = match lock_or_err(&self.jobs) {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    tracing::error!("IngestJobs::run: jobs registry mutex is poisoned: {error}");
+                    return Err(error.into());
+                }
+            };
 
             if let Some(running) = attach_to_running(&jobs, namespace, &canonical_dir)? {
                 running
@@ -265,13 +272,31 @@ impl IngestJobs {
     /// and exited mid-walk, and the runtime dropped the walk after it had
     /// cleared the namespace but before it had rebuilt or relinked it.
     pub async fn wait_idle(&self, limit: std::time::Duration) -> bool {
-        let receivers: Vec<watch::Receiver<IngestProgress>> = self
-            .jobs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect();
+        // Snapshot into owned values in a finished statement: the jobs
+        // guard is !Send, so it must be dropped before any await below,
+        // otherwise this future cannot be sent to `tokio::spawn` callers.
+        let receivers: Option<Vec<watch::Receiver<IngestProgress>>> = match lock_or_err(&self.jobs)
+        {
+            Ok(jobs) => Some(jobs.values().cloned().collect()),
+            Err(error) => {
+                tracing::error!("IngestJobs::wait_idle: jobs registry mutex is poisoned: {error}");
+                None
+            }
+        };
+        let receivers = match receivers {
+            Some(receivers) => receivers,
+            None => {
+                // A poisoned registry cannot confirm idleness, but returning
+                // at once would shortcut the caller's shutdown budget to
+                // zero and drop a detached walk that might still finish in
+                // that window (the walk owns its progress channel; only the
+                // registry snapshot is lost). Wait the budget out, then
+                // report not-idle: the caller warns and proceeds exactly as
+                // it does for a walk that outlives its limit.
+                tokio::time::sleep(limit).await;
+                return false;
+            }
+        };
 
         let all_finished = async move {
             for mut rx in receivers {
@@ -400,6 +425,54 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "another namespace starts its own"
+        );
+    }
+
+    /// Both registry readers must treat poisoning as a failed operation: the
+    /// `Result`-returning `run` propagates it, and `wait_idle` degrades to
+    /// false. Neither may recover the registry and start a walk against
+    /// half-mutated state.
+    #[tokio::test]
+    async fn poisoned_lock_returns_error_not_panic() {
+        let jobs = Arc::new(IngestJobs::new());
+        let poisoner = Arc::clone(&jobs);
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.jobs.lock().expect("jobs registry lock");
+            panic!("poison the ingest jobs registry on purpose");
+        });
+        assert!(handle.join().is_err(), "the poisoner must unwind");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let schema = ParserSchema {
+            languages: HashMap::new(),
+        };
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::guard::testkit::StubEmbedder);
+        let store: Arc<dyn VectorStore> = Arc::new(crate::guard::testkit::MockStore::new());
+
+        let error = jobs
+            .run(
+                "poisoned-ns",
+                dir.path().to_str().expect("utf-8 temp path"),
+                schema,
+                embedder,
+                store,
+            )
+            .await
+            .expect_err("run must propagate the poisoned-lock error");
+        assert!(
+            error.to_string().contains("poisoned"),
+            "run error must name poisoning: {error}"
+        );
+        let wait_started = std::time::Instant::now();
+        assert!(
+            !jobs.wait_idle(std::time::Duration::from_millis(50)).await,
+            "wait_idle must degrade to false on a poisoned registry"
+        );
+        assert!(
+            wait_started.elapsed() >= std::time::Duration::from_millis(40),
+            "wait_idle on a poisoned registry must wait out the caller's \
+             budget, not shortcut shutdown to zero: {:?}",
+            wait_started.elapsed()
         );
     }
 }

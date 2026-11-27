@@ -608,6 +608,28 @@
         "ignored": 0
       }
     },
+    "lock-poison-policy": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp util::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp learning::blob_store::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp recall_metrics::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp ingest_jobs::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp events::bus::tests -- --test-threads=1"
+      ],
+      "tests": [
+        "util::tests::helper_locks_a_healthy_mutex",
+        "util::tests::helper_maps_poison_to_error",
+        "learning::blob_store::tests::poisoned_lock_returns_error_not_panic",
+        "recall_metrics::tests::poisoned_lock_returns_error_not_panic",
+        "ingest_jobs::tests::poisoned_lock_returns_error_not_panic",
+        "events::bus::tests::poisoned_queue_degrades_not_panics",
+        "events::bus::tests::poisoned_registry_degrades_not_panics",
+        "events::bus::tests::poisoned_registry_snapshot_skips_one_pulse_not_the_dispatcher"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "daemon-logging": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp tests::tracing_output_reaches_stderr -- --exact --test-threads=1",

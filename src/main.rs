@@ -64,6 +64,7 @@ mod telemetry;
 mod time_series;
 mod tools;
 mod traits;
+mod util;
 mod vault_ld;
 mod workflow;
 

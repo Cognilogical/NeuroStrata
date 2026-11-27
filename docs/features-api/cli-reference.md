@@ -340,6 +340,19 @@ neurostrata-mcp doc-gate [--root <path>] [--json]
 - **Exit `1`:** Manifest violation (missing required files, prohibited substrings, surface-diff failures).
 - `--json`: Machine-readable report for CI integration.
 
+#### Poisoned-lock policy
+
+In the subsystems converted under #415 — the blob store (`src/learning/blob_store.rs`), recall
+metrics (`src/recall_metrics.rs`), ingest jobs (`src/ingest_jobs.rs`), and the event bus
+(`src/events/bus.rs`) — shared state is acquired through `lock_or_err` in `src/util.rs`. In those
+subsystems a poisoned lock (a thread panicked while holding it) never panics the daemon and never
+adopts the half-mutated payload: `Result`-returning operations fail with `LockPoisoned`, and
+non-`Result` operations degrade that one operation (for example, a poisoned event-bus registry
+snapshot skips one pulse while the dispatcher keeps running). Every poison emits `tracing::error!`
+naming the site. This policy does not yet cover the daemon's other shared-state locks (for example
+`src/buffer.rs`, the lexical index, and `TimeSeriesStore`), which still recover the guarded payload
+via `into_inner()`; converting them is follow-up work, not a guarantee this page makes today.
+
 ### `workflow`
 
 Queries and manipulates the pluggable workflow lifecycle state machine and connector (`GitWorkflowConnector`, `ManifestWorkflowConnector`).
