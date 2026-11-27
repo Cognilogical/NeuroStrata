@@ -677,7 +677,7 @@ fn retirement_visible(doc: &LexicalDoc, now: i64, as_of: Option<i64>) -> bool {
     }
 }
 
-fn domain_matches(doc: &LexicalDoc, domains: &[String]) -> bool {
+pub(crate) fn domain_matches(doc: &LexicalDoc, domains: &[String]) -> bool {
     domains.is_empty()
         || domains
             .iter()

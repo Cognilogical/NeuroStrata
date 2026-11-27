@@ -1954,6 +1954,13 @@ mod tests {
         let idx = TantivyLexicalIndex::open_in_ram().unwrap();
         let p = dummy_payload("fish and chips or peas supper", None);
         idx.upsert_memory("ns", "bool-row", &p).unwrap();
+        // Seed a row containing the literal word `or` plus one that does
+        // not, so a single-term `OR` query proves the word is indexed as
+        // text rather than consumed as empty query syntax.
+        idx.upsert_memory("ns", "or-row", &dummy_payload("or connective token", None))
+            .unwrap();
+        idx.upsert_memory("ns", "chips-row", &dummy_payload("chips only token", None))
+            .unwrap();
         for q in ["AND", "chips OR peas"] {
             let hits = idx
                 .search("ns", q, 10, true, true, None)
@@ -1964,13 +1971,37 @@ mod tests {
                 hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
             );
         }
+        let hits = idx
+            .search("ns", "OR", 10, true, true, None)
+            .expect("a boolean word must parse as an ordinary literal term");
+        assert!(
+            hits.iter().any(|h| h.id == "or-row"),
+            "OR must match a row containing the literal word, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            !hits.iter().any(|h| h.id == "chips-row"),
+            "OR must not be consumed as an empty operator that matches every row, got: {:?}",
+            hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn test_search_parser_hostile_leading_plus_minus_are_literal() {
         let idx = TantivyLexicalIndex::open_in_ram().unwrap();
+        // `mutex-row` carries `Mutex` in its symbol but never the text
+        // `+Mutex`, so matching it proves no must-match operator survived.
         idx.upsert_memory("ns", "mutex-row", &mutex_payload())
             .unwrap();
+        // Prove the neutralization itself: every token handed to Tantivy is
+        // quote-wrapped, so a leading `+`/`-` can never be read as syntax.
+        let neutralized = quote_tokenized_query(&tokenize_code_for_tantivy("+Mutex"));
+        assert!(
+            neutralized
+                .split_whitespace()
+                .all(|term| term.starts_with('"') && term.ends_with('"')),
+            "leading '+' must stay inside a quoted literal, got: {neutralized:?}"
+        );
         for q in ["+Mutex", "-Mutex"] {
             let hits = idx
                 .search("ns", q, 10, true, true, None)

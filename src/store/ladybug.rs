@@ -7472,11 +7472,21 @@ const STRUCTURAL_MEMORY_TYPES: [&str; 10] = [
 /// These are applied BEFORE the candidate budget is spent.
 
 fn is_archived(metadata: &Value) -> bool {
-    metadata
-        .get("archived")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    // The archive tombstone is written as boolean `true`, but older rows
+    // carry an integer flag. Both mean archived; any other shape does not.
+    match metadata.get("archived") {
+        Some(value) => {
+            value.as_bool() == Some(true)
+                || value.as_i64().map(|n| n != 0).unwrap_or(false)
+                || value.as_u64().map(|n| n != 0).unwrap_or(false)
+        }
+        None => false,
+    }
 }
+
+/// Upper bound on hydrated lexical candidates. Widening stops here so a
+/// query whose hits are all rejected cannot scan the whole index.
+const MAX_LEXICAL_SCAN_ROWS: usize = 1024;
 
 /// Row-class predicates for filtering at the store seam.
 /// These are applied BEFORE the candidate budget is spent.
@@ -11480,7 +11490,7 @@ impl VectorStore for LadybugStore {
             }
         }
         let expanded_domains: Vec<String> = expanded.into_iter().collect();
-        let options = crate::fts::SearchOptions {
+        let mut options = crate::fts::SearchOptions {
             now: chrono::Utc::now().timestamp(),
             as_of: None,
             include_tasks,
@@ -11490,51 +11500,81 @@ impl VectorStore for LadybugStore {
             fuzzy_max_distance: fuzzy_max_distance.min(2),
             limit,
         };
-        let outcome = self
-            .lexical
-            .read()
-            .expect("lexical index lock")
-            .search(namespace, query, &options);
-
-        let mut results = Vec::with_capacity(outcome.hits.len());
-        for hit in outcome.hits {
-            let Some((_, payload)) = self.get(namespace, &hit.id).await? else {
-                continue;
-            };
-            if !active.reaches_source(
-                &hit.id,
-                namespace,
-                &payload.memory_type,
-                row_source_key(&payload.metadata),
-            ) {
-                continue;
+        // Hydration vetoes (generation reachability, ACL, retirement and
+        // the stale-index backstops) can drop hits after the index has
+        // already filled the page. Fetch a wider window and grow it only
+        // while rejects keep starving the page; the cap bounds the work.
+        let cap = MAX_LEXICAL_SCAN_ROWS.max(limit);
+        let mut window = limit.saturating_mul(4).max(limit).min(cap);
+        let mut results = Vec::with_capacity(limit);
+        let mut seen = std::collections::HashSet::new();
+        let mut domain_filter_applied;
+        loop {
+            options.limit = window;
+            let outcome = self
+                .lexical
+                .read()
+                .expect("lexical index lock")
+                .search(namespace, query, &options);
+            let fetched = outcome.hits.len();
+            domain_filter_applied = outcome.domain_filter_applied;
+            for hit in outcome.hits {
+                if results.len() >= limit {
+                    break;
+                }
+                if !seen.insert(hit.id.clone()) {
+                    continue;
+                }
+                let Some((_, payload)) = self.get(namespace, &hit.id).await? else {
+                    continue;
+                };
+                if !active.reaches_source(
+                    &hit.id,
+                    namespace,
+                    &payload.memory_type,
+                    row_source_key(&payload.metadata),
+                ) {
+                    continue;
+                }
+                // Backstop, composed with the generation-reachability check
+                // above: the fts query verdict trusted the index doc; a
+                // stale/corrupt index doc must not surface a row the stored
+                // payload excludes. Re-derive the doc from the hydrated
+                // payload through the store's own conversion and apply the
+                // query path's own verdict function under the same options.
+                let derived = Self::lexical_doc(namespace, &hit.id, &payload);
+                if !crate::fts::doc_visible(&derived, &options) {
+                    continue;
+                }
+                // The index doc may carry stale domain metadata while the
+                // hydrated payload is the truth. Apply the same domain
+                // predicate the fts query path uses, except when the
+                // documented no-domain-hits fallback disabled the filter.
+                if domain_filter_applied && !crate::fts::domain_matches(&derived, &options.domains)
+                {
+                    continue;
+                }
+                results.push(SearchResult {
+                    id: hit.id,
+                    score: hit.score,
+                    payload,
+                    evidence: Some(vec![crate::traits::SearchEvidence {
+                        kind: crate::traits::EvidenceKind::DirectMatch,
+                        path: Vec::new(),
+                        explanation: "This memory matched the lexical query.".to_string(),
+                        derivation: vec!["lexical-inhouse".to_string()],
+                    }]),
+                });
             }
-            // Backstop, composed with the generation-reachability check
-            // above: the fts query verdict trusted the index doc; a
-            // stale/corrupt index doc must not surface a row the stored
-            // payload excludes. Re-derive the doc from the hydrated
-            // payload through the store's own conversion and apply the
-            // query path's own verdict function under the same options.
-            let derived = Self::lexical_doc(namespace, &hit.id, &payload);
-            if !crate::fts::doc_visible(&derived, &options) {
-                continue;
+            if results.len() >= limit || fetched < window || window >= cap {
+                break;
             }
-            results.push(SearchResult {
-                id: hit.id,
-                score: hit.score,
-                payload,
-                evidence: Some(vec![crate::traits::SearchEvidence {
-                    kind: crate::traits::EvidenceKind::DirectMatch,
-                    path: Vec::new(),
-                    explanation: "This memory matched the lexical query.".to_string(),
-                    derivation: vec!["lexical-inhouse".to_string()],
-                }]),
-            });
+            window = window.saturating_mul(2).min(cap);
         }
 
         Ok(crate::traits::LexicalSearchOutcome {
             results,
-            domain_filter_applied: outcome.domain_filter_applied,
+            domain_filter_applied,
         })
     }
 
@@ -33383,6 +33423,10 @@ eurostrata\src\daemon.rs",
                 "corrupt-archived",
                 retired_test_payload("fact", "owner", json!({"archived": true})),
             ),
+            "archived-int" => (
+                "corrupt-archived-int",
+                retired_test_payload("fact", "owner", json!({"archived": 1})),
+            ),
             "valid_to" => (
                 "corrupt-valid-to",
                 retired_test_payload("fact", "owner", json!({"valid_to": 1})),
@@ -33410,7 +33454,7 @@ eurostrata\src\daemon.rs",
         match class {
             "visible_to" => doctored.visible_to = Vec::new(),
             "registry" => doctored.registry = false,
-            "archived" => doctored.archived = false,
+            "archived" | "archived-int" => doctored.archived = false,
             "valid_to" => {
                 doctored.valid_to = Some(chrono::Utc::now().timestamp() + 3600);
             }
@@ -33423,6 +33467,30 @@ eurostrata\src\daemon.rs",
             .write()
             .expect("lexical index lock")
             .upsert(doctored);
+        // Pin the precondition: the doctored index doc must actually be
+        // matched by the raw lexical query. Without this assertion the
+        // backstop tests would pass vacuously if the query never reached
+        // the corrupted row at all.
+        let raw_options = crate::fts::SearchOptions {
+            principal: "admin".to_string(),
+            include_tasks: true,
+            include_archived: true,
+            limit: 10,
+            ..crate::fts::SearchOptions::default()
+        };
+        let raw_ids = store
+            .lexical
+            .read()
+            .expect("lexical index lock")
+            .search("probe", "corrupttoken", &raw_options)
+            .hits
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>();
+        assert!(
+            raw_ids.iter().any(|raw_id| raw_id == id),
+            "doctored index doc for class {class} must be matched by the raw query before the backstop can be tested, got: {raw_ids:?}"
+        );
         let outcome = store
             .search_lexical("probe", "corrupttoken", 10, false, false, &[], "bob", 2)
             .await
@@ -33481,6 +33549,114 @@ eurostrata\src\daemon.rs",
         assert!(
             ids.is_empty(),
             "visible_to-corrupted row must not surface via search_lexical, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_integer_archived_index_corruption() {
+        let ids = corrupted_index_search_ids("archived-int").await;
+        assert!(
+            ids.is_empty(),
+            "integer-archived row must be an archived tombstone even when its index doc says otherwise, got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_backstop_domain_index_corruption() {
+        let store = retired_test_store().await;
+        let id = "corrupt-domain";
+        let mut payload = retired_test_payload("fact", "owner", json!({"domain": "alpha"}));
+        payload.content = "domaincorrupttoken row".to_string();
+        store
+            .upsert("probe", id, vec![0.0; 4], payload.clone())
+            .await
+            .unwrap();
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let mut doctored = LadybugStore::lexical_doc("probe", id, &payload);
+        doctored.domains = vec!["beta".to_string()];
+        store
+            .lexical
+            .write()
+            .expect("lexical index lock")
+            .upsert(doctored);
+        let raw_options = crate::fts::SearchOptions {
+            domains: vec!["beta".to_string()],
+            limit: 10,
+            ..crate::fts::SearchOptions::default()
+        };
+        let raw_ids = store
+            .lexical
+            .read()
+            .expect("lexical index lock")
+            .search("probe", "domaincorrupttoken", &raw_options)
+            .hits
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect::<Vec<_>>();
+        assert!(
+            raw_ids.iter().any(|raw_id| raw_id == id),
+            "doctored domain index doc must be matched by the raw query, got: {raw_ids:?}"
+        );
+        let outcome = store
+            .search_lexical(
+                "probe",
+                "domaincorrupttoken",
+                10,
+                false,
+                false,
+                &["beta".to_string()],
+                "admin",
+                2,
+            )
+            .await
+            .expect("lexical search as admin");
+        assert!(
+            outcome.results.is_empty(),
+            "row stored in domain alpha must not surface for a beta domain query, got: {:?}",
+            outcome
+                .results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_backfills_page_after_hydration_rejects() {
+        let store = retired_test_store().await;
+        for i in 0..8 {
+            let id = format!("overfetch-{i}");
+            let archived = i < 5;
+            let mut payload = retired_test_payload("fact", "owner", json!({"archived": archived}));
+            payload.content = "overfetchtoken candidate row".to_string();
+            store
+                .upsert("probe", &id, vec![0.0; 4], payload.clone())
+                .await
+                .unwrap();
+            store.ensure_lexical_loaded("probe").await.unwrap();
+            if archived {
+                let mut doctored = LadybugStore::lexical_doc("probe", &id, &payload);
+                doctored.archived = false;
+                store
+                    .lexical
+                    .write()
+                    .expect("lexical index lock")
+                    .upsert(doctored);
+            }
+        }
+        let outcome = store
+            .search_lexical("probe", "overfetchtoken", 2, false, false, &[], "admin", 2)
+            .await
+            .expect("lexical search as admin");
+        assert_eq!(
+            outcome.results.len(),
+            2,
+            "hydration rejects must backfill from lower-ranked candidates, got: {:?}",
+            outcome
+                .results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
         );
     }
 
