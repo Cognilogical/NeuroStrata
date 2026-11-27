@@ -223,6 +223,37 @@
         "ignored": 0
       }
     },
+    "store-open-migration": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::store_migration -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::store_migration::a_legacy_row_without_namespace_is_recovered_from_its_metadata",
+        "store::ladybug::store_migration::a_row_with_no_recoverable_namespace_is_quarantined",
+        "store::ladybug::store_migration::neither_null_namespace_recovery_nor_quarantine_blocks_the_open",
+        "store::ladybug::store_migration::a_primary_key_backfill_fails_loud_instead_of_half_migrating",
+        "store::ladybug::store_migration::a_legacy_bare_id_is_found_by_identity_after_migration_not_duplicated",
+        "store::ladybug::store_migration::migration_is_skipped_on_an_unverified_recovery_open",
+        "store::ladybug::store_migration::migration_is_idempotent_across_two_opens",
+        "store::ladybug::store_migration::a_staged_generation_upsert_leaves_the_legacy_bare_row_untouched",
+        "store::ladybug::store_migration::a_transient_alias_load_failure_is_retried_on_the_next_upsert",
+        "store::ladybug::store_migration::a_scoped_counterpart_suppresses_the_legacy_alias",
+        "store::ladybug::store_migration::a_bare_id_matching_two_namespaces_is_quarantined",
+        "store::ladybug::store_migration::a_superseded_legacy_id_repoints_to_each_new_generation",
+        "store::ladybug::store_migration::a_modern_publication_records_no_alias_of_its_own",
+        "store::ladybug::store_migration::a_protected_null_namespace_row_with_corroborated_owner_is_recovered",
+        "store::ladybug::store_migration::a_protected_null_namespace_row_with_conflicting_owner_is_untouched",
+        "store::ladybug::store_migration::a_protected_bare_legacy_row_is_aliased_for_reads_but_not_writes",
+        "store::ladybug::store_migration::a_protected_bare_legacy_row_cannot_be_deleted_through_its_alias",
+        "store::ladybug::store_migration::a_protected_legacy_row_can_be_stewarded_by_its_exact_id",
+        "store::ladybug::store_migration::row_is_protected_distinguishes_external_origin_from_local_annotations",
+        "store::ladybug::store_migration::a_legacy_primary_key_rebuild_preserves_non_memory_relationships",
+        "store::ladybug::store_migration::a_legacy_primary_key_rebuild_preserves_mixed_memory_relationships"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "wal-zero-record": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp wal_accounting -- --test-threads=1",

@@ -58,6 +58,15 @@ async fn search_inner(
     exact: bool,
     search_mode: crate::traits::SearchMode,
 ) -> Result<DomainSearchOutcome> {
+    // `_quarantine` is a recovery-only namespace: no ordinary vector search
+    // path may scan or return rows whose owner could not be recovered.
+    if namespace == QUARANTINE_NAMESPACE {
+        return Ok(DomainSearchOutcome {
+            results: Vec::new(),
+            mode: crate::traits::DomainMatchMode::Vector,
+            incomplete: false,
+        });
+    }
     // Every vector search funnels through
     // here, including the paths that never init (the fallback CLI's
     // chat ask): a data-bearing store refuses a query embedded under
@@ -1592,6 +1601,28 @@ pub struct LadybugStore {
     /// use. The sidecar is the setup-time model choice's lock record:
     /// see `crate::model_choice::store_has_data`.
     store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+    /// In-memory `LegacyIdAlias` map (`#408`): a generation-agnostic canonical
+    /// identity (`<namespace>::<logical path>`) to the stored row id an older
+    /// binary wrote. Loaded lazily before the first `upsert`, so re-ingesting a
+    /// qualified id merges onto the legacy row instead of duplicating it.
+    legacy_aliases: std::sync::RwLock<HashMap<String, String>>,
+    /// Whether `legacy_aliases` has been read from the store this process.
+    legacy_aliases_loaded: std::sync::atomic::AtomicBool,
+    /// The publication epoch this handle last loaded its alias map at. A
+    /// different process-wide epoch means another handle repointed aliases.
+    legacy_alias_epoch_loaded: std::sync::atomic::AtomicU64,
+    /// Test-only: bump the publication epoch once after the alias read so the
+    /// stale-load rejection path can be exercised deterministically.
+    #[cfg(test)]
+    legacy_alias_load_race: std::sync::atomic::AtomicUsize,
+    /// Test-only: number of `load_legacy_aliases` calls that must pretend to
+    /// fail transiently. Proves the failed load leaves `legacy_aliases_loaded`
+    /// false so the next upsert retries instead of caching an empty map.
+    #[cfg(test)]
+    legacy_alias_load_failures: std::sync::atomic::AtomicUsize,
+    /// The report of this process's store-open migration (`#408`), retained
+    /// after `init` so callers and tests can inspect what the open did.
+    migration_report: Arc<std::sync::Mutex<Option<MigrationReport>>>,
     /// The number of `linked_files` census queries this store has run.
     ///
     /// The census used to cost one query per 128 hit ids, so the total work
@@ -4992,6 +5023,14 @@ impl LadybugStore {
             db_preexisting,
             open_provenance,
             store_state: Arc::new(std::sync::Mutex::new(None)),
+            legacy_aliases: std::sync::RwLock::new(HashMap::new()),
+            legacy_aliases_loaded: std::sync::atomic::AtomicBool::new(false),
+            legacy_alias_epoch_loaded: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            legacy_alias_load_race: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_alias_load_failures: std::sync::atomic::AtomicUsize::new(0),
+            migration_report: Arc::new(std::sync::Mutex::new(None)),
             census_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             form_scans: Arc::default(),
@@ -5047,6 +5086,249 @@ impl LadybugStore {
     /// on [`OpenProvenance::is_verified`].
     pub fn open_provenance(&self) -> OpenProvenance {
         self.open_provenance
+    }
+
+    /// What this process's store-open migration did, if `init` has run
+    /// (`#408`). `None` before the first successful or refused open.
+    pub fn last_migration_report(&self) -> Option<MigrationReport> {
+        self.migration_report
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Test-only: force the open provenance so the unverified-recovery skip
+    /// can be exercised without manufacturing a damaged WAL.
+    #[cfg(test)]
+    pub(crate) fn with_open_provenance_for_test(mut self, open_provenance: OpenProvenance) -> Self {
+        self.open_provenance = open_provenance;
+        self
+    }
+
+    /// Test-only: the key that scopes a fault plan to this store's database.
+    #[cfg(test)]
+    pub(crate) fn test_fault_key(&self) -> usize {
+        store_fault_key(&self.db)
+    }
+
+    /// Resolve `requested_id` to the legacy row that already owns its logical
+    /// path in `namespace` (`#408`), if any.
+    ///
+    /// A generation-scoped id belonging to an in-flight staging generation is
+    /// never resolved: that row must keep its scoped id so `abort_generation`
+    /// can delete it without having mutated the live legacy bare row. Only a
+    /// non-staged qualified re-ingest collapses onto the legacy identity.
+    async fn resolve_legacy_alias(
+        &self,
+        namespace: &str,
+        requested_id: &str,
+    ) -> Result<Option<String>> {
+        if let Some((scoped_namespace, generation, _)) =
+            crate::parser::generation::split_scoped_id(requested_id)
+        {
+            if scoped_namespace == namespace {
+                if self.is_staging_generation(namespace, generation).await {
+                    return Ok(None);
+                }
+                let namespace = namespace.to_string();
+                if self
+                    .with_conn(move |conn| generation_is_closed(conn, &namespace, generation))
+                    .await?
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        let canonical_id = crate::parser::ingest::qualified_id(
+            namespace,
+            logical_path_in_namespace(requested_id, namespace),
+        );
+        let epoch = LEGACY_ALIAS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        if !self
+            .legacy_aliases_loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .legacy_alias_epoch_loaded
+                .load(std::sync::atomic::Ordering::Acquire)
+                != epoch
+        {
+            self.load_legacy_aliases().await?;
+        }
+        let aliases = self
+            .legacy_aliases
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(aliases
+            .get(&canonical_id)
+            .cloned()
+            .filter(|stored_id| stored_id != requested_id))
+    }
+
+    /// Forget the cached alias map after a generation publication rewrote it.
+    /// The next lookup re-derives the map from the store — the cache is a
+    /// denormalization, never the source of truth.
+    fn invalidate_legacy_aliases(&self) {
+        let epoch = LEGACY_ALIAS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        self.legacy_alias_epoch_loaded
+            .store(epoch, std::sync::atomic::Ordering::Release);
+        self.legacy_aliases_loaded
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.legacy_aliases
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    /// Whether `generation` of `namespace` is an in-flight staging generation
+    /// allocated by `begin_generation` and not yet published or aborted.
+    ///
+    /// An abandoned marker (older than [`STAGING_TTL_SECS`]) is ignored, as it
+    /// is elsewhere. If the check itself cannot answer, the id is treated as
+    /// staged: leaving a row isolated is recoverable by `abort_generation`,
+    /// while mutating the live bare row is not.
+    async fn is_staging_generation(&self, namespace: &str, generation: u64) -> bool {
+        let namespace = namespace.to_string();
+        let checked = self
+            .with_conn(move |conn| {
+                let query = format!(
+                    "MATCH (s:StagingGeneration) WHERE s.namespace = '{}' AND s.generation = {} RETURN s.created_at",
+                    escape_ladybug_string(&namespace),
+                    generation
+                );
+                match conn.query(&query) {
+                    Ok(rows) => {
+                        let now = chrono::Utc::now().timestamp();
+                        Ok(rows.into_iter().any(|row| {
+                            let created_at = format!("{}", row[0]).parse::<i64>().unwrap_or(0);
+                            now.saturating_sub(created_at) <= STAGING_TTL_SECS
+                        }))
+                    }
+                    Err(error) => {
+                        let message = error.to_string().to_lowercase();
+                        if message.contains("does not exist") || message.contains("not found") {
+                            // No staging table: this store cannot have an
+                            // in-flight staging generation.
+                            Ok(false)
+                        } else {
+                            Err(error.into())
+                        }
+                    }
+                }
+            })
+            .await;
+        match checked {
+            Ok(staged) => staged,
+            Err(error) => {
+                tracing::warn!("staging generation check failed, treating id as staged: {error}");
+                true
+            }
+        }
+    }
+
+    /// Load the `LegacyIdAlias` table into memory once per process.
+    ///
+    /// A missing table is not an empty answer: a direct upsert can reach a
+    /// legacy store before `init` ran, so the alias table is created and
+    /// populated here before it is read. A query failure is a hard error —
+    /// caching an empty map would make the next write create a duplicate row
+    /// beside the legacy one it should have updated.
+    async fn load_legacy_aliases(&self) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .legacy_alias_load_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            self.legacy_alias_load_failures
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("legacy id alias load failed (injected transient failure)");
+        }
+        // `with_conn` runs on a 'static thread, so capture the provenance as a
+        // plain bool rather than borrowing `self` into the closure.
+        let open_verified = self.open_provenance.is_verified();
+        // Snapshot the epoch before reading. If a publication repoints aliases
+        // while this read is in flight, the map describes a state that no
+        // longer exists and must not be installed as current.
+        let epoch_at_start = LEGACY_ALIAS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let loaded = self
+            .with_conn(move |conn| {
+                let mut pairs = Vec::new();
+                let query = "MATCH (a:LegacyIdAlias) RETURN a.canonical_id, a.id";
+                match conn.query(query) {
+                    Ok(rows) => {
+                        for row in rows {
+                            if let (
+                                Some(lbug::Value::String(canonical_id)),
+                                Some(lbug::Value::String(id)),
+                            ) = (row.get(0), row.get(1))
+                            {
+                                pairs.push((canonical_id.clone(), id.clone()));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string().to_lowercase();
+                        if !(message.contains("does not exist") || message.contains("not found")) {
+                            return Err(error.into());
+                        }
+                        // A legacy store that has not been through `init` yet
+                        // builds the table from the rows themselves so the very
+                        // first qualified upsert resolves the bare identity —
+                        // but an unverified recovery open must never mutate
+                        // persistent state from its unauthenticated view.
+                        if open_verified {
+                            // A pre-init write can reach a legacy row whose
+                            // namespace lives only in metadata. Recover those
+                            // owners before deriving aliases, or the first
+                            // qualified upsert creates a duplicate the later
+                            // init has to reconcile.
+                            migrate_null_namespaces(conn)?;
+                            migrate_legacy_id_aliases(conn)?;
+                        }
+                        for row in conn.query(query)? {
+                            if let (
+                                Some(lbug::Value::String(canonical_id)),
+                                Some(lbug::Value::String(id)),
+                            ) = (row.get(0), row.get(1))
+                            {
+                                pairs.push((canonical_id.clone(), id.clone()));
+                            }
+                        }
+                    }
+                }
+
+                // The cache is shared by reads and writes, so it includes
+                // protected aliases: qualified reads must find sovereign rows
+                // rather than miss them. Write paths re-check the target in
+                // their writer turn (`legacy_alias_in_conn`) and refuse it.
+                let aliases = pairs.into_iter().collect::<HashMap<_, _>>();
+                Ok(aliases)
+            })
+            .await?;
+        #[cfg(test)]
+        if self
+            .legacy_alias_load_race
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            self.legacy_alias_load_race
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            LEGACY_ALIAS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        if epoch_at_start != LEGACY_ALIAS_EPOCH.load(std::sync::atomic::Ordering::Acquire) {
+            // A publication won the race. Leave the cache unloaded so the next
+            // lookup re-reads the store instead of serving the stale map.
+            return Ok(());
+        }
+        *self
+            .legacy_aliases
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = loaded;
+        self.legacy_alias_epoch_loaded
+            .store(epoch_at_start, std::sync::atomic::Ordering::Release);
+        self.legacy_aliases_loaded
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// Bind (or replace) the serving descriptor after construction,
@@ -5671,6 +5953,10 @@ impl LadybugStore {
     {
         ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
+            // Bind this engine turn to the store's test-only fault plan, if one
+            // is armed. Compiled out of production builds.
+            #[cfg(test)]
+            let _fault_scope = fault_injection::bind(store_fault_key(&db));
             // The engine runs here, on a blocking-pool thread, and a fault
             // in it is the crash this daemon is known for. The crash handler
             // needs an alternate signal stack bigger than the one the
@@ -8383,6 +8669,10 @@ impl LadybugStore {
         let user_id = user_id.map(|v| v.to_string());
         let memory_type = memory_type.map(|v| v.to_string());
         let metadata_contains = metadata_contains.map(|v| v.to_string());
+        // `_quarantine` is reachable only through the explicit recovery path.
+        if namespace == QUARANTINE_NAMESPACE {
+            return Ok(Vec::new());
+        }
         self.with_conn(move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
 
@@ -9397,6 +9687,13 @@ impl LadybugStore {
         principal: &str,
         include_code_ast: bool,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
+        // Recovery-only rows must not enter the disk-backed tenant index.
+        if namespace == QUARANTINE_NAMESPACE {
+            return Ok(crate::traits::LexicalSearchOutcome {
+                results: Vec::new(),
+                domain_filter_applied: false,
+            });
+        }
         self.init(namespace).await?;
         if self
             .tantivy_lexical
@@ -9619,6 +9916,10 @@ impl LadybugStore {
         Vec<crate::fts::LexicalDoc>,
         Vec<crate::graph_read::related::EdgeSpec>,
     )> {
+        // Quarantine is recovery-only: an export must never carry isolated rows.
+        if namespace == QUARANTINE_NAMESPACE {
+            return Ok((Vec::new(), Vec::new()));
+        }
         self.init(namespace).await?;
         let ns_owned = namespace.to_string();
         let warn_ns = ns_owned.clone();
@@ -9745,6 +10046,2334 @@ fn memory_table_ddl(dimensions: usize) -> (String, [&'static str; 5]) {
             create_depends_table,
         ],
     )
+}
+
+/// The namespace a row with no recoverable owner is moved into (`#408`).
+///
+/// Quarantine is a namespace, not a separate table: the row keeps its id,
+/// content and edges, and every ordinary read stays scoped away from it. No
+/// row is ever deleted by the store-open migration.
+/// Bumped by every alias rewrite so every open handle can detect that its
+/// cached alias map predates a publication on a different handle.
+static LEGACY_ALIAS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Internal, collision-resistant namespace for rows whose owner could not be
+/// proven. A plain `_quarantine` name used to be a legal tenant namespace, so
+/// reserving it verbatim would hide pre-existing tenant data after an upgrade.
+/// The long engine-internal name makes an accidental tenant collision
+/// implausible while keeping quarantine rows queryable by an operator.
+pub const QUARANTINE_NAMESPACE: &str = "__neurostrata_migration_quarantine_408_b76e9591";
+
+/// One column as `CALL table_info('Memory')` reports it (`#408`).
+///
+/// The engine's own cell 4 is the primary-key flag; the migration decision is
+/// expressed over this shape so it can be pinned without a PK-less table,
+/// which lbug 0.22.3 refuses to create at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub is_primary_key: bool,
+}
+
+/// Whether a `Memory` catalog needs the primary-key leg of the store-open
+/// migration (`#408`): `id` must be the table's ONLY primary-key column. A
+/// composite key that merely contains `id` is not a uniqueness contract keyed
+/// by id — reads and `MERGE` would still match on the whole tuple — so it is
+/// rebuilt as well.
+pub fn needs_primary_key_rebuild(columns: &[ColumnInfo]) -> bool {
+    let mut primary_keys = columns.iter().filter(|column| column.is_primary_key);
+    !matches!(primary_keys.next(), Some(column) if column.name == "id")
+        || primary_keys.next().is_some()
+}
+
+/// Legacy type kept for callers that still pattern-match a refused open.
+///
+/// A foreign primary key is no longer fatal: the store-open migration copies
+/// the table into a new `Memory` keyed by `id` (see
+/// [`rebuild_memory_table_with_id_key`]). The typed error remains part of the
+/// public surface so older diagnostics keep compiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyPrimaryKeyMigrationError {
+    pub detail: String,
+}
+
+impl std::fmt::Display for LegacyPrimaryKeyMigrationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "legacy store migration refused the open: {}",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for LegacyPrimaryKeyMigrationError {}
+
+/// Keep the typed refusal at the top of the error chain, so a caller can tell
+/// a primary-key migration failure from any other open failure even when the
+/// underlying engine error arrived as a plain `anyhow` error (#13).
+fn legacy_primary_key_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<LegacyPrimaryKeyMigrationError>()
+        .is_some()
+    {
+        return error;
+    }
+    LegacyPrimaryKeyMigrationError {
+        detail: error.to_string(),
+    }
+    .into()
+}
+
+/// Test-only fault injection for failure paths that the public surface cannot
+/// reach (a second engine error during a rollback, a catalog probe failure).
+/// Entirely compiled out of production builds: [`fault_injected`] expands to
+/// `false`, so the guarded blocks are dead code.
+///
+/// Plans are keyed by the store's database allocation, and bound to the
+/// blocking thread that runs the engine, so a fault armed by one test never
+/// affects a concurrently running test.
+#[cfg(test)]
+mod fault_injection {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Fault {
+        /// `PublicationJournal::rollback` cannot restore its recorded changes.
+        JournalRollback,
+        /// Only the bare-row half of a journal rollback fails; alias restores
+        /// still run. Models a heterogeneous partial rollback (#M1).
+        JournalBareRowRollback,
+        /// The atomic `rolled_back` + pointer-restore commit fails.
+        AtomicRollbackCommit,
+        /// Clearing the publication marker after a successful rollback fails.
+        MarkerClearAfterRollback,
+        /// The publication reconciliation step fails (a transient engine error
+        /// after the pointer flip, before the staging row is cleared).
+        PublicationReconcile,
+        /// The pre-MERGE old-alias snapshot read fails.
+        AliasSnapshotRead,
+        /// `abort_generation` cannot restore the generation pointer.
+        AbortPointerRestore,
+        /// The rebuild ledger's existence probe fails with a real error.
+        RebuildLedgerProbe,
+    }
+
+    type Plan = Arc<Mutex<Vec<Fault>>>;
+
+    fn plans() -> &'static Mutex<HashMap<usize, Plan>> {
+        static PLANS: OnceLock<Mutex<HashMap<usize, Plan>>> = OnceLock::new();
+        PLANS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn arm(key: usize, faults: &[Fault]) {
+        plans()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, Arc::new(Mutex::new(faults.to_vec())));
+    }
+
+    pub fn disarm(key: usize) {
+        plans()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+    }
+
+    thread_local! {
+        /// The plan bound to this thread while it runs one store's engine work.
+        static CURRENT: RefCell<Option<Plan>> = const { RefCell::new(None) };
+    }
+
+    /// Binds the current thread to `key`'s plan until it drops, restoring the
+    /// previous binding (nested engine work on one thread).
+    pub struct Bound(Option<Plan>);
+
+    impl Drop for Bound {
+        fn drop(&mut self) {
+            CURRENT.with(|current| *current.borrow_mut() = self.0.take());
+        }
+    }
+
+    pub fn bind(key: usize) -> Bound {
+        let plan = plans()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned();
+        let previous = CURRENT.with(|current| current.replace(plan));
+        Bound(previous)
+    }
+
+    pub fn armed(fault: Fault) -> bool {
+        CURRENT.with(|current| {
+            current
+                .borrow()
+                .as_ref()
+                .map(|plan| {
+                    plan.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .contains(&fault)
+                })
+                .unwrap_or(false)
+        })
+    }
+}
+
+/// The key that scopes a test fault plan to one store's database allocation.
+#[cfg(test)]
+fn store_fault_key(db: &Arc<Database>) -> usize {
+    Arc::as_ptr(db) as usize
+}
+
+/// Whether the named test fault is armed. Production builds expand this to
+/// `false`, so no fault hook has any cost or effect outside `cfg(test)`.
+macro_rules! fault_injected {
+    ($fault:ident) => {{
+        #[cfg(test)]
+        {
+            fault_injection::armed(fault_injection::Fault::$fault)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }};
+}
+
+/// What the store-open migration did (`#408`).
+///
+/// `run` is false only when the migration was skipped before touching the
+/// store (no pre-existing table, or an unverified recovery open). Every count
+/// is the number of rows/aliases changed by this open, so a second open over
+/// the same store reports zeroes while still reporting `run = true`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MigrationReport {
+    pub run: bool,
+    pub pk_rebuilt: bool,
+    pub null_namespace_recovered: usize,
+    pub quarantined: usize,
+    pub aliases_recorded: usize,
+    pub skipped_reason: Option<String>,
+}
+
+/// The Memory columns `CALL table_info('Memory')` reports.
+fn inspect_memory_columns(conn: &Connection) -> Result<Vec<ColumnInfo>> {
+    let mut columns = Vec::new();
+    for row in conn.query("CALL table_info('Memory') RETURN *")? {
+        let Some(lbug::Value::String(name)) = row.get(1) else {
+            continue;
+        };
+        columns.push(ColumnInfo {
+            name: name.clone(),
+            is_primary_key: matches!(row.get(4), Some(lbug::Value::Bool(true))),
+        });
+    }
+    Ok(columns)
+}
+
+fn migration_value_string(value: Option<&lbug::Value>) -> Option<String> {
+    match value {
+        Some(lbug::Value::String(text)) if !text.is_empty() => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// The journal's view of a property: `None` means the engine returned NULL or
+/// no cell, `Some("")` is a genuine empty string. Collapsing the two would let a
+/// rollback turn a NULL property into `''` (#M1, recommended #1).
+fn journal_property(value: Option<&lbug::Value>) -> Option<String> {
+    match value {
+        Some(lbug::Value::String(text)) => Some(text.clone()),
+        None | Some(lbug::Value::Null(_)) => None,
+        Some(other) => Some(format!("{other}")),
+    }
+}
+
+/// Render a journaled optional string as a Cypher literal, keeping NULL.
+fn journal_literal(value: Option<&String>) -> String {
+    match value {
+        Some(text) => format!("'{}'", escape_ladybug_string(text)),
+        None => "NULL".to_string(),
+    }
+}
+
+/// A `metadata.namespace` value is the row's own stated owner. Issue #408
+/// requires a NULL-namespace row that names a namespace in metadata to be
+/// RESTORED to that namespace, so a well-formed value is accepted directly;
+/// only rows with no recoverable namespace at all are quarantined. Malformed
+/// values — empty, reserved, qualified, or containing separators/control
+/// characters — cannot name a tenant namespace and are rejected.
+fn namespace_from_metadata(raw: &str) -> Option<String> {
+    let metadata: Value = serde_json::from_str(raw).ok()?;
+    metadata
+        .get("namespace")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|namespace| {
+            !namespace.is_empty()
+                && *namespace != QUARANTINE_NAMESPACE
+                && namespace.len() <= 128
+                && !namespace.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+                && !namespace
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace())
+        })
+        .map(str::to_string)
+}
+
+/// Strip a known namespace prefix before reading a logical path. A legacy bare
+/// path may itself contain `::`; treating its first separator as a namespace
+/// would truncate the identity and mis-scope the row (`#408`).
+fn logical_path_in_namespace<'a>(id: &'a str, namespace: &str) -> &'a str {
+    let prefix = format!("{namespace}{}", crate::parser::ingest::NAMESPACE_SEPARATOR);
+    let Some(rest) = id.strip_prefix(&prefix) else {
+        return id;
+    };
+    if let Some(second) = rest.find(crate::parser::ingest::NAMESPACE_SEPARATOR) {
+        if rest[..second].parse::<u64>().is_ok() {
+            return &rest[second + crate::parser::ingest::NAMESPACE_SEPARATOR.len()..];
+        }
+    }
+    rest
+}
+
+/// Whether a row carries provenance that makes it a protected import: foreign
+/// mesh provenance (`metadata.mesh`) or private eligibility. Such a row must
+/// never become the target of a legacy alias — a qualified re-ingest would
+/// overwrite content this process does not own.
+/// External mesh provenance or private eligibility makes a row sovereign.
+/// Local mesh annotations (conflict/update/lifecycle metadata) do not: taxonomy
+/// and other in-process stewards must still be able to maintain those rows.
+fn row_is_protected(metadata: Option<&str>) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    let Ok(metadata) = serde_json::from_str::<Value>(metadata) else {
+        // Corrupt provenance must fail closed: an unparseable metadata string
+        // cannot prove the row is safe to overwrite.
+        return !metadata.trim().is_empty();
+    };
+    let external_mesh = metadata
+        .get("mesh")
+        .and_then(Value::as_object)
+        .and_then(|mesh| mesh.get("origin"))
+        .and_then(Value::as_str)
+        .map_or(false, |origin| {
+            origin.eq_ignore_ascii_case("foreign") || origin.eq_ignore_ascii_case("mesh-import")
+        });
+    external_mesh
+        || metadata
+            .get("eligibility")
+            .and_then(Value::as_str)
+            .map_or(false, |value| value.eq_ignore_ascii_case("private"))
+}
+
+/// Whether a row declares that a surface other than ingestion owns it. The
+/// vault import owns its exact bare note ids (`metadata.vault_source`,
+/// PR #363), so a published generation whose logical path happens to match a
+/// note id must never archive or rebind that note. Recognition stays broad —
+/// the store-open migration still records a bare vault row's identity alias —
+/// but taking the row away from its namespace is not recognition, it is
+/// loss of the note's tenant visibility.
+fn row_is_foreign_surface(metadata: Option<&str>) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    let Ok(metadata) = serde_json::from_str::<Value>(metadata) else {
+        return false;
+    };
+    metadata
+        .get("vault_source")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether a legacy identity alias is already recorded for `canonical_id`.
+/// Publication reconciliation uses this to keep an existing bridge pointed
+/// at the generation that currently owns the path. A missing alias table
+/// means no bridge exists anywhere.
+fn legacy_alias_exists(conn: &Connection, canonical_id: &str) -> Result<bool> {
+    match conn.query(&format!(
+        "MATCH (a:LegacyIdAlias {{canonical_id: '{}'}}) RETURN a.id LIMIT 1",
+        escape_ladybug_string(canonical_id)
+    )) {
+        Ok(mut rows) => Ok(rows.next().is_some()),
+        Err(error) => {
+            let message = error.to_string().to_lowercase();
+            if message.contains("does not exist") || message.contains("not found") {
+                Ok(false)
+            } else {
+                Err(error.into())
+            }
+        }
+    }
+}
+
+/// Whether a bare row archived by a publication of `(generation, scoped_id)`
+/// is still in `_quarantine`.
+///
+/// Recovery uses this as bridge evidence when a partial rollback restored an
+/// alias's absence but could not restore the bare row: the quarantined row's
+/// `superseded_by_generation` / `quarantine.scoped_id` record proves this
+/// generation superseded that legacy identity, so the alias may be rebuilt
+/// without inventing one for a staged path that never had a bare predecessor.
+fn quarantined_superseded_row_exists(
+    conn: &Connection,
+    generation: u64,
+    scoped_id: &str,
+) -> Result<bool> {
+    let query = format!(
+        "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.metadata",
+        escape_ladybug_string(QUARANTINE_NAMESPACE)
+    );
+    for row in conn.query(&query)? {
+        let Some(lbug::Value::String(raw)) = row.first() else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
+        if metadata.get("archived").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        if metadata
+            .get("superseded_by_generation")
+            .and_then(Value::as_u64)
+            != Some(generation)
+        {
+            continue;
+        }
+        let quarantine = metadata.get("quarantine");
+        if quarantine
+            .and_then(|quarantine| quarantine.get("reason"))
+            .and_then(Value::as_str)
+            != Some("superseded_by_generation")
+        {
+            continue;
+        }
+        if quarantine
+            .and_then(|quarantine| quarantine.get("scoped_id"))
+            .and_then(Value::as_str)
+            == Some(scoped_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The one namespace that unambiguously owns `bare_id`, when exactly one other
+/// row's qualified id carries the same logical path (`#408`). The candidate
+/// must actually be qualified by its own namespace; a bare row with the same
+/// path is not ownership evidence.
+fn unique_namespace_for_bare_id(id: &str, rows: &[(String, Option<String>)]) -> Option<String> {
+    let logical_path = id;
+    let mut namespaces: HashSet<&str> = HashSet::new();
+    for (other_id, namespace) in rows {
+        if other_id == id {
+            continue;
+        }
+        let Some(namespace) = namespace else {
+            continue;
+        };
+        if *namespace == QUARANTINE_NAMESPACE {
+            continue;
+        }
+        if !crate::parser::ingest::is_qualified(namespace, other_id) {
+            continue;
+        }
+        if logical_path_in_namespace(other_id, namespace) == logical_path {
+            namespaces.insert(namespace.as_str());
+        }
+    }
+    if namespaces.len() == 1 {
+        namespaces.into_iter().next().map(str::to_string)
+    } else {
+        None
+    }
+}
+
+fn set_memory_namespace(conn: &Connection, id: &str, namespace: &str) -> Result<()> {
+    conn.query(&format!(
+        "MATCH (m:Memory {{id: '{}'}}) SET m.namespace = '{}'",
+        escape_ladybug_string(id),
+        escape_ladybug_string(namespace)
+    ))?;
+    Ok(())
+}
+
+fn set_memory_metadata(conn: &Connection, id: &str, metadata: &str) -> Result<()> {
+    conn.query(&format!(
+        "MATCH (m:Memory {{id: '{}'}}) SET m.metadata = '{}'",
+        escape_ladybug_string(id),
+        escape_ladybug_string(metadata)
+    ))?;
+    Ok(())
+}
+
+/// One engine turn for both halves of a quarantine. Two separate `SET`s can be
+/// torn by a crash, leaving a non-NULL row with no record of why it moved; a
+/// single `SET` cannot be half-applied by this store's auto-commit writes.
+fn quarantine_row(conn: &Connection, id: &str, metadata: &str) -> Result<()> {
+    conn.query(&format!(
+        "MATCH (m:Memory {{id: '{}'}}) SET m.namespace = '{}', m.metadata = '{}'",
+        escape_ladybug_string(id),
+        escape_ladybug_string(QUARANTINE_NAMESPACE),
+        escape_ladybug_string(metadata)
+    ))?;
+    Ok(())
+}
+
+fn quarantined_metadata(raw: Option<&str>, id: &str) -> String {
+    let parsed = raw.and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    let mut metadata = parsed.clone().unwrap_or_else(|| serde_json::json!({}));
+    if !metadata.is_object() {
+        metadata = serde_json::json!({ "original_metadata": metadata });
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        let mut quarantine = serde_json::json!({
+            "reason": "unrecoverable_namespace",
+            "original_id": id,
+        });
+        // An unparseable legacy value is evidence, not garbage: keep the raw
+        // bytes so an operator can still recover what the row used to hold.
+        if parsed.is_none() {
+            if let Some(raw) = raw {
+                if !raw.trim().is_empty() {
+                    quarantine["raw_metadata"] = Value::String(raw.to_string());
+                }
+            }
+        }
+        object.insert("quarantine".to_string(), quarantine);
+    }
+    metadata.to_string()
+}
+
+/// Metadata stamped on a legacy bare row when a published generation takes
+/// ownership of its logical path. The row is moved out of the tenant namespace
+/// (so ordinary reads and re-ingests cannot see or overwrite it) but its id,
+/// content and edges stay intact for recovery.
+fn superseded_metadata(raw: Option<&str>, generation: u64, scoped_id: &str) -> String {
+    let mut metadata = raw
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !metadata.is_object() {
+        metadata = serde_json::json!({ "original_metadata": metadata });
+    }
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert("archived".to_string(), Value::Bool(true));
+        object.insert(
+            "superseded_by_generation".to_string(),
+            Value::Number(generation.into()),
+        );
+        object.insert(
+            "quarantine".to_string(),
+            serde_json::json!({
+                "reason": "superseded_by_generation",
+                "scoped_id": scoped_id,
+            }),
+        );
+    }
+    metadata.to_string()
+}
+
+/// Recover every `NULL` namespace in two passes (`#408`):
+///
+/// Pass 1 recovers identities that carry their owner in the row's own scoped
+/// id. Pass 2 re-reads the namespace map and only then resolves bare rows —
+/// first from the namespace the row states in metadata (issue #408 requires
+/// metadata-named rows to be restored), then from a unique qualified sibling
+/// recovered in pass 1. Only rows with no recoverable namespace are quarantined,
+/// atomically with their reason recorded in metadata. Protected imports remain
+/// sovereign: they are recovered only when structural evidence corroborates
+/// their metadata, and otherwise stay untouched rather than being quarantined.
+fn migrate_null_namespaces(conn: &Connection) -> Result<(usize, usize)> {
+    let columns = inspect_memory_columns(conn)?;
+    if !columns.iter().any(|column| column.name == "namespace") {
+        conn.query("ALTER TABLE Memory ADD namespace STRING")?;
+    }
+    // Quarantine always needs a metadata column to carry its reason. A legacy
+    // table without one gets it here, before any row is moved.
+    if !columns.iter().any(|column| column.name == "metadata") {
+        conn.query("ALTER TABLE Memory ADD metadata STRING")?;
+    }
+
+    let mut pending: Vec<(String, Option<String>, bool)> = Vec::new();
+    for row in conn
+        .query("MATCH (m:Memory) WHERE m.namespace IS NULL RETURN m.id, COALESCE(m.metadata, '')")?
+    {
+        let Some(id) = migration_value_string(row.first()) else {
+            continue;
+        };
+        let metadata = migration_value_string(row.get(1));
+        // Protected imports are sovereign: their metadata is never rewritten
+        // and an unproven row is never quarantined. They still participate in
+        // recovery when trusted structural evidence corroborates ownership.
+        let protected = row_is_protected(metadata.as_deref());
+        pending.push((id, metadata, protected));
+    }
+    if pending.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // Read every namespace before resolving: a bare row can then be
+    // corroborated by a unique qualified sibling in this same pass.
+    let mut all_rows: Vec<(String, Option<String>)> = Vec::new();
+    for row in conn.query("MATCH (m:Memory) RETURN m.id, m.namespace")? {
+        let Some(id) = migration_value_string(row.first()) else {
+            continue;
+        };
+        all_rows.push((id, migration_value_string(row.get(1))));
+    }
+
+    let mut recovered = 0usize;
+    let mut quarantined = 0usize;
+    for (id, metadata, protected) in pending {
+        // Check metadata.namespace FIRST — #408 restores a row that names its
+        // owner in metadata. Metadata is caller-controlled, though, so it is
+        // only proof when no trusted structural evidence contradicts it: a
+        // scoped id or a unique qualified sibling both authenticate ownership.
+        // A conflicting claim quarantines the row instead of exposing it under
+        // a tenant that never owned it.
+        let declared = metadata.as_deref().and_then(namespace_from_metadata);
+        let scoped = split_scoped_id(&id).map(|(namespace, _, _)| namespace);
+        let sibling = if scoped.is_none() {
+            unique_namespace_for_bare_id(&id, &all_rows)
+        } else {
+            None
+        };
+        let trusted = scoped.or(sibling);
+        let resolved = if protected {
+            // A protected import's namespace is never inferred from metadata
+            // alone: an unverified claim must not move it into another tenant.
+            // Structural corroboration is required, and a conflict leaves the
+            // sovereign row untouched (not quarantined).
+            match (declared, trusted) {
+                (Some(declared), Some(trusted)) if declared == trusted => Some(declared),
+                _ => None,
+            }
+        } else {
+            match (declared, trusted) {
+                (Some(declared), Some(trusted)) if declared == trusted => Some(declared),
+                (Some(declared), None) => Some(declared),
+                (None, Some(trusted)) => Some(trusted),
+                (Some(_), Some(_)) => None,
+                (None, None) => None,
+            }
+        };
+        match resolved {
+            Some(namespace) => {
+                set_memory_namespace(conn, &id, &namespace)?;
+                recovered += 1;
+            }
+            None if protected => {
+                // Sovereign import: leave its NULL namespace and metadata
+                // exactly as the older binary wrote them.
+            }
+            None => {
+                let record = quarantined_metadata(metadata.as_deref(), &id);
+                quarantine_row(conn, &id, &record)?;
+                quarantined += 1;
+            }
+        }
+    }
+    Ok((recovered, quarantined))
+}
+
+/// `LegacyIdAlias (id, namespace, canonical_id)` (`#408`): the canonical,
+/// generation-agnostic identity (`<namespace>::<logical path>`) of a row an
+/// older binary wrote as a bare id. `id` is that stored row -- keeping it is
+/// what preserves the row's edges -- and `upsert` resolves a qualified request
+/// through this map before its `MERGE`.
+///
+/// A bare row is only aliased when no scoped/canonical row already owns the
+/// identity: with bare+scoped coexistence the scoped row is the current-binary
+/// target, and an alias on the bare row would divert writes away from it.
+fn migrate_legacy_id_aliases(conn: &Connection) -> Result<usize> {
+    if let Err(error) = conn.query(
+        "CREATE NODE TABLE LegacyIdAlias (id STRING, namespace STRING, canonical_id STRING, PRIMARY KEY (canonical_id))",
+    ) {
+        if !format!("{error}").to_lowercase().contains("already exists") {
+            return Err(error.into());
+        }
+    }
+
+    let mut existing: HashSet<String> = HashSet::new();
+    for row in conn.query("MATCH (a:LegacyIdAlias) RETURN a.canonical_id")? {
+        if let Some(canonical_id) = migration_value_string(row.first()) {
+            existing.insert(canonical_id);
+        }
+    }
+
+    let mut rows: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    for row in conn.query("MATCH (m:Memory) RETURN m.id, m.namespace, COALESCE(m.metadata, '')")? {
+        let Some(id) = migration_value_string(row.first()) else {
+            continue;
+        };
+        rows.push((
+            id,
+            migration_value_string(row.get(1)),
+            migration_value_string(row.get(2)),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+
+    // Canonical identities already owned by a scoped/canonical row: a
+    // generation-scoped (`ns::7::path`) or namespace-qualified (`ns::path`)
+    // id is a current-binary identity, and a bare row must not be recorded as
+    // its alias. Doing so would make a later qualified re-ingest resolve onto
+    // the bare row and leave the scoped row stale (bare+scoped coexistence).
+    let mut scoped_identities: HashSet<String> = HashSet::new();
+    for (id, namespace, _) in &rows {
+        let Some(namespace) = namespace else {
+            continue;
+        };
+        if namespace == QUARANTINE_NAMESPACE {
+            continue;
+        }
+        // A protected qualified row still owns its canonical identity for
+        // suppression purposes: the bare row must not be aliased onto it, even
+        // though the protected row itself is never an alias target.
+        if !crate::parser::ingest::is_qualified(namespace, id) {
+            // A legacy bare id derives its canonical identity below; it does
+            // not itself own a scoped identity.
+            continue;
+        }
+        scoped_identities.insert(crate::parser::ingest::qualified_id(
+            namespace,
+            logical_path_in_namespace(id, namespace),
+        ));
+    }
+
+    let mut recorded = 0usize;
+    for (id, namespace, metadata) in rows {
+        let Some(namespace) = namespace else {
+            continue;
+        };
+        if namespace == QUARANTINE_NAMESPACE {
+            continue;
+        }
+        // Identity is structural, not provenance-based: every bare legacy id
+        // owns its qualified identity regardless of which older binary wrote
+        // it (user_id varies across versions). Protected rows are aliased so
+        // qualified reads find them instead of creating a duplicate; the
+        // writer-turn resolver refuses to modify a protected alias target.
+        // A row a foreign surface owns (a vault import note carries
+        // `metadata.vault_source`) owns its exact id outright: no alias is
+        // recorded for it, so a qualified ingest of the same path writes its
+        // own row instead of being redirected onto — and overwriting —
+        // content another surface owns.
+        if row_is_foreign_surface(metadata.as_deref()) {
+            continue;
+        }
+        // Only a generation-scoped id (`ns::7::path`) is already a current
+        // binary identity. A legacy bare path may itself start with `ns::`;
+        // that is a logical path, not a scoped id, and still needs its alias.
+        if crate::parser::generation::split_scoped_id(&id).is_some() {
+            continue;
+        }
+        let canonical_id = crate::parser::ingest::qualified_id(
+            &namespace,
+            logical_path_in_namespace(&id, &namespace),
+        );
+        if canonical_id == id {
+            continue;
+        }
+        // A scoped/canonical row now owns this identity. Retire any earlier
+        // alias so the in-memory map cannot keep redirecting qualified writes
+        // onto the superseded bare row after the next reload. A failed delete
+        // is fatal: an alias left active would keep diverting writes.
+        if scoped_identities.contains(&canonical_id) {
+            let delete = format!(
+                "MATCH (a:LegacyIdAlias {{canonical_id: '{}'}}) DELETE a",
+                escape_ladybug_string(&canonical_id)
+            );
+            conn.query(&delete)?;
+            existing.remove(&canonical_id);
+            continue;
+        }
+        if existing.contains(&canonical_id) {
+            continue;
+        }
+        conn.query(&format!(
+            "MERGE (a:LegacyIdAlias {{canonical_id: '{}'}}) ON CREATE SET a.id = '{}', a.namespace = '{}'",
+            escape_ladybug_string(&canonical_id),
+            escape_ladybug_string(&id),
+            escape_ladybug_string(&namespace)
+        ))?;
+        existing.insert(canonical_id);
+        recorded += 1;
+    }
+    Ok(recorded)
+}
+
+/// The property names and catalog type strings of `Memory`, used verbatim when
+/// a legacy table is copied so no column (e.g. `name` on an older binary) is
+/// silently dropped by the rebuild.
+fn migration_column_specs(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut columns = Vec::new();
+    for row in conn.query("CALL table_info('Memory') RETURN *")? {
+        let Some(lbug::Value::String(name)) = row.get(1) else {
+            continue;
+        };
+        let ty = match row.get(2) {
+            Some(lbug::Value::String(ty)) => ty.clone(),
+            _ => "STRING".to_string(),
+        };
+        columns.push((name.clone(), ty));
+    }
+    Ok(columns)
+}
+
+/// Render one engine value as a Cypher literal. `None` means a NULL property,
+/// which the copy omits rather than spelling as an empty string.
+fn migration_literal(value: Option<&lbug::Value>) -> Option<String> {
+    match value {
+        None | Some(lbug::Value::Null(_)) => None,
+        Some(lbug::Value::String(text)) => Some(format!("'{}'", escape_ladybug_string(text))),
+        Some(lbug::Value::Int64(number)) => Some(number.to_string()),
+        Some(lbug::Value::Double(number)) => Some(number.to_string()),
+        Some(lbug::Value::Float(number)) => Some(number.to_string()),
+        Some(lbug::Value::Bool(flag)) => Some(flag.to_string()),
+        Some(lbug::Value::Array(_, values)) | Some(lbug::Value::List(_, values)) => {
+            // A NULL entry is data: dropping it would shorten the list and
+            // shift every entry after it (#4). `NULL` is the Cypher spelling
+            // the engine accepts in both a list and a fixed-width array.
+            let parts: Vec<String> = values
+                .iter()
+                .map(|value| migration_literal(Some(value)).unwrap_or_else(|| "NULL".to_string()))
+                .collect();
+            Some(format!("[{}]", parts.join(",")))
+        }
+        Some(other) => Some(format!("'{}'", escape_ladybug_string(&format!("{other}")))),
+    }
+}
+
+/// The freshness of a staging marker, checked inside the writer turn so a
+/// concurrent `begin_generation` cannot change the answer after resolution.
+enum StagingMarkerState {
+    Fresh,
+    Expired,
+    Absent,
+}
+
+fn staging_marker_state(
+    conn: &Connection,
+    namespace: &str,
+    generation: u64,
+) -> Result<StagingMarkerState> {
+    let query = format!(
+        "MATCH (s:StagingGeneration) WHERE s.namespace = '{}' AND s.generation = {} RETURN s.created_at",
+        escape_ladybug_string(namespace),
+        generation
+    );
+    match conn.query(&query) {
+        Ok(mut rows) => {
+            let Some(row) = rows.next() else {
+                return Ok(StagingMarkerState::Absent);
+            };
+            let created_at = format!("{}", row[0]).parse::<i64>().unwrap_or(0);
+            let now = chrono::Utc::now().timestamp();
+            Ok(if now.saturating_sub(created_at) <= STAGING_TTL_SECS {
+                StagingMarkerState::Fresh
+            } else {
+                StagingMarkerState::Expired
+            })
+        }
+        Err(error) => {
+            let message = error.to_string().to_lowercase();
+            if message.contains("does not exist") || message.contains("not found") {
+                Ok(StagingMarkerState::Absent)
+            } else {
+                Err(error.into())
+            }
+        }
+    }
+}
+
+/// A generation whose counter was allocated but whose pointer no longer names
+/// it is closed: it was aborted or superseded. Its scoped ids must never fall
+/// through a legacy alias onto the live bare row, or a write the generation
+/// discarded would be resurrected. A store that never began a generation has
+/// no counter row, so an ordinary qualified re-ingest keeps alias resolution.
+fn generation_is_closed(conn: &Connection, namespace: &str, generation: u64) -> Result<bool> {
+    if generation == 0 {
+        return Ok(false);
+    }
+    // Counters live under the bare namespace while each source's active
+    // pointer lives under `generation_key(namespace, source_key)`. A scoped id
+    // does not name its source, so consult every pointer in the namespace:
+    // the counter is the maximum any source has issued, and the generation is
+    // open only while some source still names it as active. A store that
+    // never began a generation has no rows and keeps alias resolution.
+    let query = format!(
+        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' RETURN g.counter, g.active_generation",
+        escape_ladybug_string(namespace)
+    );
+    let mut counter = 0u64;
+    let mut active = false;
+    for row in conn.query(&query)? {
+        let issued = format!("{}", row[0]).parse::<u64>().unwrap_or(0);
+        counter = counter.max(issued);
+        if format!("{}", row[1]).parse::<u64>().ok() == Some(generation) {
+            active = true;
+        }
+    }
+    if generation > counter {
+        return Ok(false);
+    }
+    Ok(!active)
+}
+
+/// Re-read the alias inside the writer turn. A publication may have repointed
+/// it since the earlier async lookup; using a stale mapping writes to an
+/// archived row and leaves a duplicate identity visible.
+fn legacy_alias_in_conn(
+    conn: &Connection,
+    namespace: &str,
+    requested_id: &str,
+) -> Result<Option<String>> {
+    if let Some((scoped_namespace, generation, _)) =
+        crate::parser::generation::split_scoped_id(requested_id)
+    {
+        if scoped_namespace == namespace && generation_is_closed(conn, namespace, generation)? {
+            return Ok(None);
+        }
+    }
+    let canonical_id = crate::parser::ingest::qualified_id(
+        namespace,
+        logical_path_in_namespace(requested_id, namespace),
+    );
+    let query = format!(
+        "MATCH (a:LegacyIdAlias {{canonical_id: '{}'}}) RETURN a.id",
+        escape_ladybug_string(&canonical_id)
+    );
+    let rows = match conn.query(&query) {
+        Ok(rows) => rows,
+        Err(error) => {
+            let message = error.to_string().to_lowercase();
+            if message.contains("does not exist") || message.contains("not found") {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+    };
+    for row in rows {
+        let Some(lbug::Value::String(stored)) = row.first() else {
+            continue;
+        };
+        let protected = conn
+            .query(&format!(
+                "MATCH (m:Memory {{id: '{}'}}) RETURN COALESCE(m.metadata, '')",
+                escape_ladybug_string(stored)
+            ))?
+            .next()
+            .and_then(|row| migration_value_string(row.first()))
+            .map(|metadata| row_is_protected(Some(&metadata)))
+            .unwrap_or(false);
+        if protected && stored != requested_id {
+            anyhow::bail!(
+                "legacy row '{}' is protected; refusing to modify it through alias '{}'",
+                stored,
+                canonical_id
+            );
+        }
+        // Naming the protected row by its exact stored id is direct
+        // stewardship (taxonomy and other owners do this), not alias
+        // redirection; preserve that existing contract.
+        return Ok(Some(stored.clone()));
+    }
+    Ok(None)
+}
+
+/// A stable identity for one source row, built from every source property.
+/// Edges carry no internal row handle; they identify endpoints by these values,
+/// so a row-level map (not a legacy-id map) is required when ids are absent,
+/// NULL, or duplicated across distinct rows.
+fn migration_row_key(values: &[Option<String>]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for value in values {
+        hasher.update(value.as_deref().unwrap_or("<null>").as_bytes());
+        hasher.update(b"\0");
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Scratch catalog names owned by the rebuild. The legacy source is never
+/// overwritten until every copied row and edge has been counted and matched.
+const REBUILD_NODE_TABLE: &str = "Memory__rebuild408";
+const LEGACY_NODE_TABLE: &str = "Memory__legacy408";
+/// Migration-wide swap marker in the ledger. It is a phase, not a table:
+/// `committed` means every replacement was renamed and validated, so recovery
+/// must keep the swapped-in tables and only drop the backups. Its absence
+/// (or `swapping`) means the whole migration is rolled back as one unit.
+const REBUILD_COMMIT_SENTINEL: &str = "__swap_commit__";
+/// The only authority on which tables are migration artifacts. A suffix is
+/// never enough: a user-owned table may carry the same ending.
+const REBUILD_STATE_TABLE: &str = "RebuildState408";
+
+fn rebuild_rel_table(name: &str) -> String {
+    format!("{name}__rebuild408")
+}
+fn legacy_rel_table(name: &str) -> String {
+    format!("{name}__legacy408")
+}
+
+/// A fallible catalog existence probe. Only a genuine "no such table" answer
+/// reads as absent; every other catalog/transient error propagates, so callers
+/// that must fail closed do.
+fn table_exists_checked(conn: &Connection, table: &str) -> Result<bool> {
+    match conn.query(&format!("CALL table_info('{table}') RETURN *")) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            let message = error.to_string().to_lowercase();
+            if message.contains("does not exist") || message.contains("not found") {
+                Ok(false)
+            } else {
+                Err(error.into())
+            }
+        }
+    }
+}
+
+fn rebuild_state_table_exists(conn: &Connection) -> Result<bool> {
+    if fault_injected!(RebuildLedgerProbe) {
+        return Err(anyhow::anyhow!(
+            "injected rebuild ledger catalog probe failure"
+        ));
+    }
+    table_exists_checked(conn, REBUILD_STATE_TABLE)
+}
+
+/// The catalog's table names and kinds as one snapshot. Artifact names are
+/// preflighted against it before the ledger records them, so a user-owned table
+/// can never be claimed, renamed aside, or dropped by recovery.
+fn catalog_tables(conn: &Connection) -> Result<HashMap<String, bool>> {
+    let mut tables = HashMap::new();
+    for row in conn.query("CALL show_tables() RETURN *")? {
+        if let (Some(lbug::Value::String(name)), Some(lbug::Value::String(kind))) =
+            (row.get(1), row.get(2))
+        {
+            tables.insert(name.clone(), kind.to_ascii_lowercase().contains("rel"));
+        }
+    }
+    Ok(tables)
+}
+
+/// Retire a migration-owned table by renaming it aside. Engine DDL is
+/// auto-commit, so a rename is the only reversible catalog operation: no
+/// table is ever dropped and an operator can still inspect the archived copy.
+fn retire_artifact(conn: &Connection, table: &str) -> Result<()> {
+    if !table_exists_checked(conn, table)? {
+        return Ok(());
+    }
+    let stamp = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let mut archive = format!("{table}__archived408_{stamp}");
+    let present = catalog_tables(conn)?;
+    if present.contains_key(&archive) {
+        archive = format!("{archive}_{}", present.len());
+    }
+    conn.query(&format!("ALTER TABLE {table} RENAME TO {archive}"))?;
+    Ok(())
+}
+
+/// Refuse any artifact name the catalog already owns. A collision must fail
+/// before the ledger claims the table, otherwise recovery would treat a
+/// user-owned table as scratch space.
+fn ensure_artifact_names_free(
+    conn: &Connection,
+    artifacts: impl IntoIterator<Item = String>,
+    role: &str,
+) -> Result<()> {
+    let present = catalog_tables(conn)?;
+    for artifact in artifacts {
+        if present.contains_key(&artifact) {
+            anyhow::bail!(
+                "refusing the primary-key rebuild: the {role} artifact name {artifact} \
+                 already exists in the catalog and is not owned by this rebuild"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `^[A-Za-z_][A-Za-z0-9_]*$`: the only unquoted identifier shape the rebuild
+/// interpolates into `DROP TABLE`/`ALTER TABLE`. Anything else in the ledger is
+/// either corrupt or an injection attempt.
+fn is_safe_unquoted_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Validate one ledger row before any destructive DDL. A malformed row is a
+/// refusal, never a silent skip: skipping would forget a real artifact, and
+/// interpolating an unvalidated name would let the ledger redirect DDL.
+fn validate_rebuild_ledger_row(artifact: &str, original: &str, phase: &str) -> Result<()> {
+    if !is_safe_unquoted_identifier(artifact) {
+        anyhow::bail!("malformed rebuild ledger row: unsafe artifact name {artifact:?}");
+    }
+    if !is_safe_unquoted_identifier(original) {
+        anyhow::bail!("malformed rebuild ledger row: unsafe original table name {original:?}");
+    }
+    if artifact == REBUILD_COMMIT_SENTINEL {
+        // The sentinel is a migration-wide phase, not a physical table.
+        if original != "Memory" {
+            anyhow::bail!(
+                "malformed rebuild ledger row: the commit sentinel names original {original:?}"
+            );
+        }
+        if !matches!(phase, "swapping" | "committed") {
+            anyhow::bail!("malformed rebuild ledger row: the commit sentinel has phase {phase:?}");
+        }
+        return Ok(());
+    }
+    if !matches!(phase, "scratch" | "backup") {
+        anyhow::bail!("malformed rebuild ledger row: artifact {artifact} has phase {phase:?}");
+    }
+    Ok(())
+}
+
+/// Whether the rebuild ledger records any artifact at all. An unverified open
+/// must not create a fresh `Memory` table while one is pending: its view of the
+/// rows is unauthenticated, so it can neither resume nor roll back the swap.
+fn has_pending_rebuild_artifacts(conn: &Connection) -> Result<bool> {
+    if !rebuild_state_table_exists(conn)? {
+        return Ok(false);
+    }
+    Ok(conn
+        .query(&format!(
+            "MATCH (a:{REBUILD_STATE_TABLE}) RETURN a.artifact LIMIT 1"
+        ))?
+        .next()
+        .is_some())
+}
+
+fn ensure_rebuild_state_table(conn: &Connection) -> Result<()> {
+    if !rebuild_state_table_exists(conn)? {
+        conn.query(&format!(
+            "CREATE NODE TABLE {REBUILD_STATE_TABLE} (artifact STRING, original STRING, phase STRING, PRIMARY KEY (artifact))"
+        ))?;
+    }
+    Ok(())
+}
+
+/// Record a scratch or backup table explicitly when it is created. Recovery
+/// drops only names in this ledger, never names that merely look like artifacts.
+fn record_rebuild_artifact(
+    conn: &Connection,
+    artifact: &str,
+    original: &str,
+    phase: &str,
+) -> Result<()> {
+    ensure_rebuild_state_table(conn)?;
+    conn.query(&format!(
+        "MERGE (a:{REBUILD_STATE_TABLE} {{artifact: '{}'}}) ON CREATE SET a.original = '{}', a.phase = '{}' ON MATCH SET a.original = '{}', a.phase = '{}'",
+        escape_ladybug_string(artifact),
+        escape_ladybug_string(original),
+        escape_ladybug_string(phase),
+        escape_ladybug_string(original),
+        escape_ladybug_string(phase),
+    ))?;
+    Ok(())
+}
+
+/// Resume or roll back an interrupted rebuild before a fresh `Memory` table
+/// can be created. Without this, a crash between renames leaves the original
+/// table aside and the next open silently starts an empty store.
+fn recover_interrupted_rebuild(conn: &Connection) -> Result<()> {
+    if !rebuild_state_table_exists(conn)? {
+        return Ok(());
+    }
+    clear_rebuild_artifacts(conn)
+}
+
+/// Restore/drop only the tables this ledger says the rebuild created.
+///
+/// Recovery is migration-wide, never per table: the node swap and every
+/// relationship swap either all happened (the `__swap_commit__` sentinel says
+/// `committed`) or none of them may stand. A half-swapped store would keep
+/// rebuilt `Memory` rows behind edges that still describe the legacy rows, so
+/// an uncommitted ledger is rolled back as one unit — every swapped-in table
+/// dropped first, then every backup restored nodes-before-relationships.
+fn clear_rebuild_artifacts(conn: &Connection) -> Result<()> {
+    if !rebuild_state_table_exists(conn)? {
+        return Ok(());
+    }
+    let mut artifacts: Vec<(String, String, String)> = Vec::new();
+    for row in conn.query(&format!(
+        "MATCH (a:{REBUILD_STATE_TABLE}) RETURN a.artifact, a.original, a.phase"
+    ))? {
+        // A row the ledger cannot read is a refusal, never a silent skip: the
+        // skipped artifact would survive as an orphan while every ledger row is
+        // deleted below, and the names are interpolated into destructive DDL.
+        let (
+            Some(lbug::Value::String(artifact)),
+            Some(lbug::Value::String(original)),
+            Some(lbug::Value::String(phase)),
+        ) = (row.get(0), row.get(1), row.get(2))
+        else {
+            anyhow::bail!(
+                "malformed rebuild ledger row in {REBUILD_STATE_TABLE}: expected string \
+                 artifact/original/phase, got ({:?}, {:?}, {:?}); no artifact was dropped or renamed",
+                row.get(0),
+                row.get(1),
+                row.get(2)
+            );
+        };
+        validate_rebuild_ledger_row(artifact, original, phase)?;
+        artifacts.push((artifact.clone(), original.clone(), phase.clone()));
+    }
+    // One catalog snapshot is the authority for both existence and table kind.
+    // `table_info` is node-oriented and cannot describe a relationship backup,
+    // so a rel backup must not be declared absent because of the wrong probe.
+    let mut present = catalog_tables(conn)?;
+    let committed = artifacts
+        .iter()
+        .any(|(artifact, _, phase)| artifact == REBUILD_COMMIT_SENTINEL && phase == "committed");
+    // The sentinel is a ledger phase, not a physical table; never drop or
+    // rename a catalog entry by that name.
+    let physical: Vec<&(String, String, String)> = artifacts
+        .iter()
+        .filter(|(artifact, _, _)| artifact != REBUILD_COMMIT_SENTINEL)
+        .collect();
+    fn retire_present(
+        conn: &Connection,
+        present: &HashMap<String, bool>,
+        artifact: &str,
+    ) -> Result<()> {
+        if present.contains_key(artifact) {
+            retire_artifact(conn, artifact)?;
+        }
+        Ok(())
+    }
+
+    if committed {
+        // Every replacement was renamed and validated before the sentinel was
+        // written. The swapped-in tables are the truth; backups and leftover
+        // scratch tables are disposable. Relationships go first so no foreign
+        // key dangles while their node table is dropped.
+        for is_rel in [true, false] {
+            for (artifact, _, phase) in &physical {
+                if matches!(phase.as_str(), "backup" | "scratch")
+                    && present.get(artifact) == Some(&is_rel)
+                {
+                    retire_present(conn, &present, artifact)?;
+                    present.remove(artifact);
+                }
+            }
+        }
+        conn.query(&format!("MATCH (a:{REBUILD_STATE_TABLE}) DETACH DELETE a"))?;
+        return Ok(());
+    }
+
+    // Uncommitted: full migration-wide rollback.
+    // 1. Scratch relationship tables were never part of the store.
+    for (artifact, _, phase) in &physical {
+        if phase == "scratch" && present.get(artifact) == Some(&true) {
+            retire_present(conn, &present, artifact)?;
+            present.remove(artifact);
+        }
+    }
+    // 2. A rebuilt relationship table that already took the real name must go
+    // before its backup is restored; otherwise the two would coexist and the
+    // legacy edges would be replaced by the very rows being rolled back.
+    for (artifact, original, phase) in &physical {
+        if phase == "backup"
+            && present.get(artifact) == Some(&true)
+            && present.get(original) == Some(&true)
+        {
+            retire_present(conn, &present, original)?;
+            present.remove(original);
+        }
+    }
+    // 3. Same for a rebuilt `Memory` table that already took the real name.
+    for (artifact, original, phase) in &physical {
+        if phase == "backup"
+            && present.get(artifact) == Some(&false)
+            && present.get(original) == Some(&false)
+        {
+            retire_present(conn, &present, original)?;
+            present.remove(original);
+        }
+    }
+    // 4. Scratch node tables were never part of the store.
+    for (artifact, _, phase) in &physical {
+        if phase == "scratch" && present.get(artifact) == Some(&false) {
+            retire_present(conn, &present, artifact)?;
+            present.remove(artifact);
+        }
+    }
+    // 5. Restore the node backups first, so relationships can bind to them.
+    for (artifact, original, phase) in &physical {
+        if phase == "backup" && present.get(artifact) == Some(&false) {
+            conn.query(&format!("ALTER TABLE {artifact} RENAME TO {original}"))?;
+            present.remove(artifact);
+            present.insert(original.clone(), false);
+        }
+    }
+    // 6. Then restore the relationship backups.
+    for (artifact, original, phase) in &physical {
+        if phase == "backup" && present.get(artifact) == Some(&true) {
+            conn.query(&format!("ALTER TABLE {artifact} RENAME TO {original}"))?;
+            present.remove(artifact);
+            present.insert(original.clone(), true);
+        }
+    }
+    // 7. The ledger has served its purpose for this migration-wide decision.
+    conn.query(&format!("MATCH (a:{REBUILD_STATE_TABLE}) DETACH DELETE a"))?;
+    Ok(())
+}
+
+/// A stable primary key derived from the row's own namespace and content, not
+/// from its scan position. Rebuilding an id-less legacy table twice produces
+/// the same ids, and an identical row in two namespaces never collides.
+fn derived_legacy_id(namespace: &str, content: &str, metadata: &str, occurrence: usize) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"legacy-primary-key\0");
+    hasher.update(namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(content.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(metadata.as_bytes());
+    if occurrence > 0 {
+        hasher.update(b"\0");
+        hasher.update(occurrence.to_string().as_bytes());
+    }
+    format!("derived-{}", &hex::encode(hasher.finalize())[..16])
+}
+
+fn migration_node_count(conn: &Connection, table: &str) -> Result<usize> {
+    let mut rows = conn.query(&format!("MATCH (n:{table}) RETURN count(n)"))?;
+    Ok(rows
+        .next()
+        .and_then(|row| match row.first() {
+            Some(lbug::Value::Int64(count)) => Some(*count as usize),
+            _ => None,
+        })
+        .unwrap_or(0))
+}
+
+fn migration_rel_count(conn: &Connection, table: &str) -> Result<usize> {
+    let mut rows = conn.query(&format!("MATCH ()-[r:{table}]->() RETURN count(r)"))?;
+    Ok(rows
+        .next()
+        .and_then(|row| match row.first() {
+            Some(lbug::Value::Int64(count)) => Some(*count as usize),
+            _ => None,
+        })
+        .unwrap_or(0))
+}
+
+/// Rename log with a reverse-order rollback. Engine DDL is auto-commit, so a
+/// mid-swap error must undo every rename already applied before the source can
+/// be declared lost.
+struct RenameLog(Vec<(String, String)>);
+
+impl RenameLog {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn apply(&mut self, conn: &Connection, from: &str, to: &str) -> Result<()> {
+        conn.query(&format!("ALTER TABLE {from} RENAME TO {to}"))?;
+        self.0.push((from.to_string(), to.to_string()));
+        Ok(())
+    }
+
+    fn rollback(&mut self, conn: &Connection) {
+        for (from, to) in self.0.drain(..).rev() {
+            if let Err(error) = conn.query(&format!("ALTER TABLE {to} RENAME TO {from}")) {
+                tracing::warn!("rollback rename {to} -> {from} failed: {error}");
+            }
+        }
+    }
+}
+
+/// One endpoint of an edge the rebuild copies into a scratch relationship
+/// table. A `Memory` endpoint carries the row's new id in the rebuilt table;
+/// an endpoint on any other node table is bound by that table's own primary
+/// key, which the rebuild never touches.
+enum RebuildEndpoint {
+    /// The new id of a rebuilt `Memory` row.
+    Memory(String),
+    /// A row of an untouched node table, bound by its own primary key.
+    Keyed {
+        table: String,
+        key: String,
+        literal: String,
+    },
+}
+
+impl RebuildEndpoint {
+    /// The MATCH node pattern that binds this endpoint while the scratch
+    /// edges are copied: `(a:Memory__rebuild408 {id: '...'})` or
+    /// `(b:Task {task_id: 'T-101'})`.
+    fn pattern(&self, tag: &str) -> String {
+        match self {
+            RebuildEndpoint::Memory(id) => format!(
+                "({tag}:{REBUILD_NODE_TABLE} {{id: '{}'}})",
+                escape_ladybug_string(id)
+            ),
+            RebuildEndpoint::Keyed {
+                table,
+                key,
+                literal,
+            } => {
+                format!("({tag}:{table} {{{key}: {literal}}})")
+            }
+        }
+    }
+}
+
+/// One relationship table the rebuild recreates: its declared endpoint
+/// connections with `Memory` rewritten to the scratch node table, its
+/// property declarations, and the edges to copy.
+struct RebuildRelTable {
+    table: String,
+    connections: Vec<(String, String)>,
+    declarations: String,
+    edges: Vec<(
+        RebuildEndpoint,
+        RebuildEndpoint,
+        Vec<(String, Option<String>)>,
+    )>,
+}
+
+/// The declared endpoint connections of a relationship table, straight from
+/// the engine catalog: `((source table, destination table), (source primary
+/// key, destination primary key))` per connection. A rel table can declare
+/// several connections, and they are the only authority on which node tables
+/// its rows bind — guessing `Memory` endpoints for a table that declares
+/// others is how relationship rows get lost.
+fn rel_table_connections(
+    conn: &Connection,
+    table: &str,
+) -> Result<Vec<((String, String), (String, String))>> {
+    let mut connections = Vec::new();
+    for row in conn.query(&format!("CALL show_connection('{table}') RETURN *"))? {
+        let (
+            Some(lbug::Value::String(source)),
+            Some(lbug::Value::String(destination)),
+            Some(lbug::Value::String(source_key)),
+            Some(lbug::Value::String(destination_key)),
+        ) = (row.get(0), row.get(1), row.get(2), row.get(3))
+        else {
+            anyhow::bail!(
+                "relationship table {table} reported a connection the rebuild \
+                 cannot read; refusing the rebuild with the store untouched"
+            );
+        };
+        connections.push((
+            (source.clone(), destination.clone()),
+            (source_key.clone(), destination_key.clone()),
+        ));
+    }
+    Ok(connections)
+}
+
+/// Copy a legacy `Memory` table whose key is not solely `id` into a scratch
+/// table keyed by `id`. Every node and edge is copied and counted before the
+/// source tables are touched; the swap uses renames with a rollback log, so a
+/// failure anywhere leaves the original data and topology available.
+///
+/// Relationship tables keep the endpoint kinds they were declared with.
+/// Tables that never touch `Memory` are left completely untouched, and a
+/// table mixing `Memory` with other endpoints is recreated with every
+/// connection — the `Memory` side rebound to the rebuilt row, the other
+/// side still bound by its own primary key. Anything the rebuild cannot
+/// read or represent is refused loudly while the store is still untouched.
+fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
+    clear_rebuild_artifacts(conn)?;
+    let source_columns = migration_column_specs(conn)?;
+    let source_has_id = source_columns.iter().any(|(name, _)| name == "id");
+    let mut columns = source_columns.clone();
+    let id_index = if source_has_id {
+        columns
+            .iter()
+            .position(|(name, _)| name == "id")
+            .expect("source id column survives into the rebuilt schema")
+    } else {
+        // The id is synthesized from the source rows, so it is not a source
+        // property and must not appear in the RETURN projection below.
+        columns.insert(0, ("id".to_string(), "STRING".to_string()));
+        0
+    };
+    for required in ["namespace", "metadata"] {
+        if !columns.iter().any(|(name, _)| name == required) {
+            columns.push((required.to_string(), "STRING".to_string()));
+        }
+    }
+    let names: Vec<String> = columns.iter().map(|(name, _)| name.clone()).collect();
+    let field_index = |name: &str| columns.iter().position(|(column, _)| column == name);
+    // Project only properties that exist in the source. The synthesized id and
+    // any newly added required columns have no source value to read; the former
+    // is derived from namespace/content/metadata after the rows are collected.
+    let projection: Vec<(String, usize)> = source_columns
+        .iter()
+        .map(|(name, _)| {
+            let target = columns
+                .iter()
+                .position(|(column, _)| column == name)
+                .expect("every source column survives into the rebuilt schema");
+            (name.clone(), target)
+        })
+        .collect();
+    let return_list = projection
+        .iter()
+        .map(|(name, _)| format!("m.{name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source_id_position = if source_has_id {
+        projection.iter().position(|(name, _)| name == "id")
+    } else {
+        None
+    };
+    let mut stored: Vec<(Option<String>, Vec<Option<String>>)> = Vec::new();
+    for row in conn.query(&format!("MATCH (m:Memory) RETURN {return_list}"))? {
+        let legacy_id =
+            source_id_position.and_then(|position| migration_value_string(row.get(position)));
+        let mut literals = vec![None; columns.len()];
+        for (position, (_, target)) in projection.iter().enumerate() {
+            literals[*target] = migration_literal(row.get(position));
+        }
+        stored.push((legacy_id, literals));
+    }
+    // A derived id must not depend on the engine's scan order.
+    stored.sort_by(|left, right| left.1.cmp(&right.1));
+
+    let mut source_map: HashMap<String, String> = HashMap::new();
+    let mut used: HashSet<String> = HashSet::new();
+    for (_, (legacy_id, literals)) in stored.iter_mut().enumerate() {
+        // Key the row by its source-owned values only. Synthesized id and
+        // newly added namespace/metadata have no source counterpart and must
+        // not take part in the key used by the edge scan.
+        let source_values: Vec<Option<String>> = projection
+            .iter()
+            .map(|(_, target)| literals[*target].clone())
+            .collect();
+        let row_key = migration_row_key(&source_values);
+        let raw = |name: &str| {
+            field_index(name)
+                .and_then(|index| literals.get(index))
+                .and_then(|value| value.as_deref())
+                .unwrap_or("")
+        };
+        let candidate = legacy_id.as_deref().unwrap_or_default();
+        let base = if candidate.is_empty() {
+            derived_legacy_id(raw("namespace"), raw("content"), raw("metadata"), 0)
+        } else {
+            candidate.to_string()
+        };
+        let mut new_id = base.clone();
+        let mut occurrence = 1usize;
+        while used.contains(&new_id) {
+            new_id = if candidate.is_empty() {
+                derived_legacy_id(
+                    raw("namespace"),
+                    raw("content"),
+                    raw("metadata"),
+                    occurrence,
+                )
+            } else {
+                format!("{base}-copy{occurrence}")
+            };
+            occurrence += 1;
+        }
+        used.insert(new_id.clone());
+        source_map.insert(row_key, new_id.clone());
+        literals[id_index] = Some(format!("'{}'", escape_ladybug_string(&new_id)));
+    }
+
+    let width = source_columns.len();
+    let mut relationships: Vec<RebuildRelTable> = Vec::new();
+    let mut rel_tables: Vec<String> = Vec::new();
+    for row in conn.query("CALL show_tables() RETURN *")? {
+        let Some(lbug::Value::String(name)) = row.get(1) else {
+            continue;
+        };
+        let kind = match row.get(2) {
+            Some(lbug::Value::String(kind)) => kind.to_ascii_lowercase(),
+            _ => String::new(),
+        };
+        if kind.contains("rel") {
+            rel_tables.push(name.clone());
+        }
+    }
+    for table in &rel_tables {
+        let connections = rel_table_connections(conn, table)?;
+        if connections.is_empty() {
+            anyhow::bail!(
+                "relationship table {table} exposes no endpoint connections; \
+                 refusing the rebuild with the store untouched"
+            );
+        }
+        if !connections
+            .iter()
+            .any(|((source, destination), _)| source == "Memory" || destination == "Memory")
+        {
+            // No row of this table binds a Memory node, so nothing in it is
+            // affected by the node-table swap. It must stay exactly as the
+            // older binary left it: recreating it with Memory endpoints (or
+            // renaming the original aside) would destroy its rows.
+            tracing::info!(
+                "relationship table {table} has no Memory endpoint; \
+                 the rebuild leaves the table untouched"
+            );
+            continue;
+        }
+        let mut properties: Vec<(String, String)> = Vec::new();
+        for row in conn.query(&format!("CALL table_info('{table}') RETURN *"))? {
+            let Some(lbug::Value::String(name)) = row.get(1) else {
+                continue;
+            };
+            let ty = match row.get(2) {
+                Some(lbug::Value::String(ty)) => ty.clone(),
+                _ => "STRING".to_string(),
+            };
+            properties.push((name.clone(), ty));
+        }
+        let selects = properties
+            .iter()
+            .map(|(name, _)| format!("r.{name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let select = if selects.is_empty() {
+            String::new()
+        } else {
+            format!(", {selects}")
+        };
+        let mut edges = Vec::new();
+        for ((source, destination), (source_key, destination_key)) in &connections {
+            // Scan each connection with the labels it actually declares: a
+            // Memory endpoint is identified through every source property
+            // (ids may be absent, NULL, or duplicated), an endpoint on
+            // another node table through that table's own primary key.
+            let source_is_memory = source == "Memory";
+            let destination_is_memory = destination == "Memory";
+            let source_projection = if source_is_memory {
+                source_columns
+                    .iter()
+                    .map(|(name, _)| format!("a.{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                format!("a.{source_key}")
+            };
+            let destination_projection = if destination_is_memory {
+                source_columns
+                    .iter()
+                    .map(|(name, _)| format!("b.{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                format!("b.{destination_key}")
+            };
+            let endpoint_query = format!("{source_projection}, {destination_projection}{select}");
+            let source_width = if source_is_memory { width } else { 1 };
+            let destination_width = if destination_is_memory { width } else { 1 };
+            for row in conn.query(&format!(
+                "MATCH (a:{source})-[r:{table}]->(b:{destination}) RETURN {endpoint_query}"
+            ))? {
+                let from = if source_is_memory {
+                    let values: Vec<Option<String>> = (0..source_width)
+                        .map(|offset| migration_literal(row.get(offset)))
+                        .collect();
+                    RebuildEndpoint::Memory(
+                        source_map
+                            .get(&migration_row_key(&values))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                migration_value_string(row.get(0)).unwrap_or_default()
+                            }),
+                    )
+                } else {
+                    RebuildEndpoint::Keyed {
+                        table: source.clone(),
+                        key: source_key.clone(),
+                        literal: match migration_literal(row.get(0)) {
+                            Some(literal) => literal,
+                            None => anyhow::bail!(
+                                "endpoint {source} of relationship table {table} has no \
+                                 readable primary key; refusing the rebuild with the store \
+                                 untouched"
+                            ),
+                        },
+                    }
+                };
+                let to = if destination_is_memory {
+                    let values: Vec<Option<String>> = (source_width
+                        ..source_width + destination_width)
+                        .map(|offset| migration_literal(row.get(offset)))
+                        .collect();
+                    RebuildEndpoint::Memory(
+                        source_map
+                            .get(&migration_row_key(&values))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                migration_value_string(row.get(source_width)).unwrap_or_default()
+                            }),
+                    )
+                } else {
+                    RebuildEndpoint::Keyed {
+                        table: destination.clone(),
+                        key: destination_key.clone(),
+                        literal: match migration_literal(row.get(source_width)) {
+                            Some(literal) => literal,
+                            None => anyhow::bail!(
+                                "endpoint {destination} of relationship table {table} has no \
+                                 readable primary key; refusing the rebuild with the store \
+                                 untouched"
+                            ),
+                        },
+                    }
+                };
+                let values = properties
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, (name, _))| {
+                        (
+                            name.clone(),
+                            migration_literal(row.get(source_width + destination_width + offset)),
+                        )
+                    })
+                    .collect();
+                edges.push((from, to, values));
+            }
+        }
+        let declarations = properties
+            .iter()
+            .map(|(name, ty)| format!("{name} {ty}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let scratch_connections = connections
+            .iter()
+            .map(|((source, destination), _)| {
+                (
+                    if source == "Memory" {
+                        REBUILD_NODE_TABLE.to_string()
+                    } else {
+                        source.clone()
+                    },
+                    if destination == "Memory" {
+                        REBUILD_NODE_TABLE.to_string()
+                    } else {
+                        destination.clone()
+                    },
+                )
+            })
+            .collect();
+        relationships.push(RebuildRelTable {
+            table: table.clone(),
+            connections: scratch_connections,
+            declarations,
+            edges,
+        });
+    }
+
+    // Build the replacement under scratch names. Nothing here can affect the
+    // source tables: a failure simply leaves the legacy store as it was.
+    let ddl = format!(
+        "CREATE NODE TABLE {REBUILD_NODE_TABLE} ({}, PRIMARY KEY (id))",
+        columns
+            .iter()
+            .map(|(name, ty)| format!("{name} {ty}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    // Every scratch name is preflighted BEFORE the ledger claims it: recording a
+    // pre-existing user table as scratch would make recovery drop it (#M4).
+    let mut scratch_names = vec![REBUILD_NODE_TABLE.to_string()];
+    scratch_names.extend(
+        relationships
+            .iter()
+            .map(|rel| rebuild_rel_table(&rel.table)),
+    );
+    ensure_artifact_names_free(conn, scratch_names, "scratch")?;
+    // Record the scratch names BEFORE the engine creates them: a crash between
+    // the DDL and its ledger row would leave an unowned artifact behind, and
+    // recovery can safely skip a recorded name that was never created (#5).
+    record_rebuild_artifact(conn, REBUILD_NODE_TABLE, "Memory", "scratch")?;
+    conn.query(&ddl)?;
+
+    for (_, literals) in &stored {
+        let assignments = names
+            .iter()
+            .zip(literals.iter())
+            .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name}: {value}")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.query(&format!("CREATE (:{REBUILD_NODE_TABLE} {{{assignments}}})"))?;
+    }
+    for rel in &relationships {
+        // The scratch group keeps every declared connection, with `Memory`
+        // rewritten to the scratch node table; the rename swap restores the
+        // original endpoint names with it.
+        let connections = rel
+            .connections
+            .iter()
+            .map(|(source, destination)| format!("FROM {source} TO {destination}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if rel.declarations.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", rel.declarations)
+        };
+        let scratch = rebuild_rel_table(&rel.table);
+        record_rebuild_artifact(conn, &scratch, &rel.table, "scratch")?;
+        conn.query(&format!(
+            "CREATE REL TABLE {scratch} ({connections}{suffix})"
+        ))?;
+        for (from, to, values) in &rel.edges {
+            let from_pattern = from.pattern("a");
+            let to_pattern = to.pattern("b");
+            let assignments = values
+                .iter()
+                .filter_map(|(name, value)| value.as_ref().map(|value| format!("{name}: {value}")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let props = if assignments.is_empty() {
+                String::new()
+            } else {
+                format!(" {{{assignments}}}")
+            };
+            conn.query(&format!(
+                "MATCH {from_pattern}, {to_pattern} CREATE (a)-[:{scratch}{props}]->(b)"
+            ))?;
+        }
+    }
+
+    // Validate the complete replacement before touching the source.
+    let source_rows = stored.len();
+    let rebuilt_rows = migration_node_count(conn, REBUILD_NODE_TABLE)?;
+    if rebuilt_rows != source_rows {
+        anyhow::bail!(
+            "legacy rebuild copied {rebuilt_rows} of {source_rows} rows; original table left intact"
+        );
+    }
+    for rel in &relationships {
+        let copied = migration_rel_count(conn, &rebuild_rel_table(&rel.table))?;
+        if copied != rel.edges.len() {
+            anyhow::bail!(
+                "legacy rebuild copied {copied} of {} {} edges; original tables left intact",
+                rel.edges.len(),
+                rel.table
+            );
+        }
+    }
+
+    // Rename swap: originals are renamed aside (never dropped first), then the
+    // validated scratch tables take their names. Any error undoes every rename.
+    // The ledger is written BEFORE the first rename: a crash inside the swap
+    // must leave enough evidence for recovery to roll the whole migration back
+    // (absent `committed`) or to finish the cleanup (sentinel present).
+    let mut renames = RenameLog::new();
+    let swap = (|| -> Result<()> {
+        // Every backup name is preflighted before the ledger claims it: a
+        // user-owned `Memory__legacy408`/`<rel>__legacy408` would otherwise be
+        // renamed aside and later dropped or swapped over the real table (#M4).
+        let mut backup_names = vec![LEGACY_NODE_TABLE.to_string()];
+        backup_names.extend(relationships.iter().map(|rel| legacy_rel_table(&rel.table)));
+        ensure_artifact_names_free(conn, backup_names, "backup")?;
+        record_rebuild_artifact(conn, REBUILD_COMMIT_SENTINEL, "Memory", "swapping")?;
+        record_rebuild_artifact(conn, LEGACY_NODE_TABLE, "Memory", "backup")?;
+        for rel in &relationships {
+            record_rebuild_artifact(conn, &legacy_rel_table(&rel.table), &rel.table, "backup")?;
+        }
+        renames.apply(conn, "Memory", LEGACY_NODE_TABLE)?;
+        for rel in &relationships {
+            renames.apply(conn, &rel.table, &legacy_rel_table(&rel.table))?;
+        }
+        renames.apply(conn, REBUILD_NODE_TABLE, "Memory")?;
+        for rel in &relationships {
+            renames.apply(conn, &rebuild_rel_table(&rel.table), &rel.table)?;
+        }
+        if migration_node_count(conn, "Memory")? != source_rows {
+            anyhow::bail!("post-swap node count differs from the legacy source");
+        }
+        for rel in &relationships {
+            if migration_rel_count(conn, &rel.table)? != rel.edges.len() {
+                anyhow::bail!(
+                    "post-swap {} edge count differs from the legacy source",
+                    rel.table
+                );
+            }
+        }
+        // Every replacement is swapped in and validated: from here recovery
+        // must keep these tables and only discard the backups.
+        record_rebuild_artifact(conn, REBUILD_COMMIT_SENTINEL, "Memory", "committed")?;
+        Ok(())
+    })();
+    if let Err(error) = swap {
+        renames.rollback(conn);
+        return Err(error);
+    }
+
+    // Backups are retired once the swapped-in tables pass validation. A
+    // failure here leaves harmless archived catalogs, not a broken store.
+    for rel in &relationships {
+        let backup = legacy_rel_table(&rel.table);
+        if let Err(error) = retire_artifact(conn, &backup) {
+            tracing::warn!("legacy backup relationship table {backup} still present: {error}");
+        }
+    }
+    if let Err(error) = retire_artifact(conn, LEGACY_NODE_TABLE) {
+        tracing::warn!("legacy backup node table still present: {error}");
+    }
+    conn.query(&format!("MATCH (a:{REBUILD_STATE_TABLE}) DETACH DELETE a"))?;
+    Ok(())
+}
+
+/// Durable publication phase. The pointer flip and the reconciliation queries
+/// are separate engine turns, so a crash between them must be resumable before
+/// reads are served: the marker is written first and removed only last.
+const PUBLICATION_STATE_TABLE: &str = "IngestPublication408";
+
+fn publication_marker_id(namespace: &str, source_key: &str, generation: u64) -> String {
+    format!(
+        "{}::{}",
+        crate::parser::ingest::generation_key(namespace, source_key),
+        generation
+    )
+}
+
+fn ensure_publication_state(conn: &Connection) -> Result<()> {
+    if !table_exists_checked(conn, PUBLICATION_STATE_TABLE)? {
+        conn.query(&format!(
+            "CREATE NODE TABLE {PUBLICATION_STATE_TABLE} (id STRING, namespace STRING, source_key STRING, generation INT64, phase STRING, PRIMARY KEY (id))"
+        ))?;
+    }
+    Ok(())
+}
+
+fn mark_publication(
+    conn: &Connection,
+    namespace: &str,
+    source_key: &str,
+    generation: u64,
+) -> Result<()> {
+    ensure_publication_state(conn)?;
+    let id = escape_ladybug_string(&publication_marker_id(namespace, source_key, generation));
+    conn.query(&format!(
+        "MERGE (p:{PUBLICATION_STATE_TABLE} {{id: '{id}'}}) ON CREATE SET p.namespace = '{ns}', p.source_key = '{sk}', p.generation = {generation}, p.phase = 'reconciling' ON MATCH SET p.phase = 'reconciling'",
+        ns = escape_ladybug_string(namespace),
+        sk = escape_ladybug_string(source_key),
+    ))?;
+    Ok(())
+}
+
+fn clear_publication_marker(
+    conn: &Connection,
+    namespace: &str,
+    source_key: &str,
+    generation: u64,
+) -> Result<()> {
+    if !table_exists_checked(conn, PUBLICATION_STATE_TABLE)? {
+        return Ok(());
+    }
+    let id = escape_ladybug_string(&publication_marker_id(namespace, source_key, generation));
+    conn.query(&format!(
+        "MATCH (p:{PUBLICATION_STATE_TABLE} {{id: '{id}'}}) DELETE p"
+    ))?;
+    Ok(())
+}
+
+/// Whether this exact `(namespace, source_key, generation)` has a publication
+/// marker. A real catalog error propagates so callers that must fail closed do.
+fn publication_marker_exists(
+    conn: &Connection,
+    namespace: &str,
+    source_key: &str,
+    generation: u64,
+) -> Result<bool> {
+    if !table_exists_checked(conn, PUBLICATION_STATE_TABLE)? {
+        return Ok(false);
+    }
+    let id = escape_ladybug_string(&publication_marker_id(namespace, source_key, generation));
+    Ok(conn
+        .query(&format!(
+            "MATCH (p:{PUBLICATION_STATE_TABLE} {{id: '{id}'}}) RETURN p.phase"
+        ))?
+        .next()
+        .is_some())
+}
+
+/// What one reconciliation attempt changed, so a publication that fails after
+/// the pointer flip can put the previous generation back exactly as it was
+/// (#1). Only rows this attempt touched are recorded; recovery replays never
+/// journal, because their job is to finish a publication, not to undo one.
+#[derive(Default)]
+struct PublicationJournal {
+    /// `(bare id, old namespace, old metadata)` for every quarantined row.
+    /// `None` metadata was NULL, not an empty string.
+    bare_rows: Vec<(String, String, Option<String>)>,
+    /// `(canonical id, existed before, old id, old namespace)` per alias.
+    aliases: Vec<(String, bool, Option<String>, Option<String>)>,
+}
+
+impl PublicationJournal {
+    /// Undo every row and alias this attempt touched. Every restore is
+    /// attempted and the failures are aggregated: a partial rollback must never
+    /// be reported as success, because the caller then decides whether the
+    /// pointer may move at all (#M1).
+    fn rollback(&self, conn: &Connection) -> Result<()> {
+        let mut failures: Vec<String> = Vec::new();
+        for (bare_id, old_namespace, old_metadata) in &self.bare_rows {
+            if fault_injected!(JournalRollback) || fault_injected!(JournalBareRowRollback) {
+                failures.push(format!("bare row {bare_id}: injected rollback failure"));
+                continue;
+            }
+            let restore = format!(
+                "MATCH (m:Memory {{id: '{}'}}) SET m.namespace = '{}', m.metadata = {}",
+                escape_ladybug_string(bare_id),
+                escape_ladybug_string(old_namespace),
+                journal_literal(old_metadata.as_ref()),
+            );
+            if let Err(error) = conn.query(&restore) {
+                failures.push(format!("bare row {bare_id}: {error}"));
+            }
+        }
+        for (canonical_id, existed, old_id, old_namespace) in &self.aliases {
+            if fault_injected!(JournalRollback) {
+                failures.push(format!(
+                    "legacy alias {canonical_id}: injected rollback failure"
+                ));
+                continue;
+            }
+            let result = if *existed {
+                conn.query(&format!(
+                    "MERGE (a:LegacyIdAlias {{canonical_id: '{}'}}) SET a.id = {}, a.namespace = {}",
+                    escape_ladybug_string(canonical_id),
+                    journal_literal(old_id.as_ref()),
+                    journal_literal(old_namespace.as_ref()),
+                ))
+            } else {
+                conn.query(&format!(
+                    "MATCH (a:LegacyIdAlias {{canonical_id: '{}'}}) DELETE a",
+                    escape_ladybug_string(canonical_id)
+                ))
+            };
+            if let Err(error) = result {
+                failures.push(format!("legacy alias {canonical_id}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(anyhow::anyhow!(
+            "publication rollback could not restore {} journaled change(s): {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+    }
+}
+
+/// The reconciliation half of a publication. Idempotent: re-running it after
+/// an interrupted attempt re-points the alias, archives any bare row the
+/// interrupted pass left behind, and clears the staging marker; an
+/// already-archived bare row is no longer a candidate. An alias is recorded
+/// only for a path that superseded a genuine legacy bare row — a staged row
+/// with no bare predecessor owns its canonical identity directly.
+fn reconcile_publication(
+    conn: &Connection,
+    namespace: &str,
+    source_key: &str,
+    generation: u64,
+) -> Result<()> {
+    reconcile_publication_journaled(conn, namespace, source_key, generation, None)
+}
+
+fn reconcile_publication_journaled(
+    conn: &Connection,
+    namespace: &str,
+    source_key: &str,
+    generation: u64,
+    mut journal: Option<&mut PublicationJournal>,
+) -> Result<()> {
+    let safe_ns = escape_ladybug_string(namespace);
+    let safe_sk = escape_ladybug_string(source_key);
+    let prefix = crate::parser::ingest::generation_scoped_id(namespace, generation, "");
+    let staged_query = format!(
+        "MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' AND m.id STARTS WITH '{}' RETURN m.id",
+        escape_ladybug_string(&prefix)
+    );
+    let mut staged_rows = Vec::new();
+    for row in conn.query(&staged_query)? {
+        if let Some(lbug::Value::String(id)) = row.first() {
+            staged_rows.push(id.clone());
+        }
+    }
+    if !staged_rows.is_empty() {
+        if let Err(error) = conn.query("MATCH (a:LegacyIdAlias) RETURN a.canonical_id LIMIT 1") {
+            let message = error.to_string().to_lowercase();
+            if message.contains("does not exist") || message.contains("not found") {
+                migrate_legacy_id_aliases(conn)?;
+            } else {
+                return Err(error.into());
+            }
+        }
+    }
+    for scoped_id in staged_rows {
+        let Some(logical_path) = scoped_id.strip_prefix(&prefix) else {
+            continue;
+        };
+        let canonical_id = crate::parser::ingest::qualified_id(namespace, logical_path);
+        let candidates =
+            format!("MATCH (m:Memory) WHERE m.namespace = '{safe_ns}' RETURN m.id, m.metadata");
+        let mut bare_rows = Vec::new();
+        for row in conn.query(&candidates)? {
+            if let Some(lbug::Value::String(id)) = row.first() {
+                if id == &scoped_id || logical_path_in_namespace(id, namespace) != logical_path {
+                    continue;
+                }
+                // `None` is a NULL metadata column, not an empty string: the
+                // rollback must restore the exact prior property (#M1).
+                let metadata = journal_property(row.get(1));
+                // Only a genuine legacy bare row is archived. Protected rows,
+                // scoped rows of any generation, qualified rows and rows a
+                // foreign surface (e.g. the vault import) owns stay put.
+                if row_is_protected(metadata.as_deref())
+                    || row_is_foreign_surface(metadata.as_deref())
+                    || crate::parser::generation::split_scoped_id(id).is_some()
+                    || crate::parser::ingest::is_qualified(namespace, id)
+                {
+                    continue;
+                }
+                bare_rows.push((id.clone(), metadata));
+            }
+        }
+        // Point the legacy identity at the row that superseded it — when this
+        // publication archived the bare row that owned the path, or when an
+        // earlier publication already recorded the bridge and this generation
+        // is its new owner. The repoint happens BEFORE archiving the bare row,
+        // so an interrupted publication resumes cleanly: a crash between the
+        // statements leaves the alias already repointed and the bare row a
+        // live candidate the re-run can archive.
+        if !bare_rows.is_empty()
+            || legacy_alias_exists(conn, &canonical_id)?
+            || quarantined_superseded_row_exists(conn, generation, &scoped_id)?
+        {
+            if let Some(journal) = journal.as_deref_mut() {
+                // A read error must NOT read as "no alias": rollback would then
+                // delete a pre-existing alias the MERGE below merely repointed
+                // (#M2). Only a query that returns no row means absent.
+                //
+                // Tests corrupt the query itself (rather than short-circuiting
+                // here) so the engine produces the `Err` this `?` propagates.
+                #[cfg(test)]
+                let corrupt_snapshot =
+                    fault_injected!(AliasSnapshotRead) && legacy_alias_exists(conn, &canonical_id)?;
+                #[cfg(not(test))]
+                let corrupt_snapshot = false;
+                let snapshot_query = if corrupt_snapshot {
+                    "MATCH (a:NonExistentSnapshotTable408) RETURN a.id".to_string()
+                } else {
+                    format!(
+                        "MATCH (a:LegacyIdAlias {{canonical_id: '{}'}}) RETURN a.id, a.namespace",
+                        escape_ladybug_string(&canonical_id)
+                    )
+                };
+                let mut existing = conn.query(&snapshot_query).map_err(|error| {
+                    anyhow::anyhow!(
+                        "publication could not read the previous legacy alias for \
+                         {canonical_id}; refusing to repoint it: {error}"
+                    )
+                })?;
+                match existing.next() {
+                    Some(row) => {
+                        journal.aliases.push((
+                            canonical_id.clone(),
+                            true,
+                            journal_property(row.get(0)),
+                            journal_property(row.get(1)),
+                        ));
+                    }
+                    None => {
+                        journal
+                            .aliases
+                            .push((canonical_id.clone(), false, None, None));
+                    }
+                }
+            }
+            conn.query(&format!(
+                "MERGE (a:LegacyIdAlias {{canonical_id: '{}'}}) ON CREATE SET a.id = '{}', a.namespace = '{}' ON MATCH SET a.id = '{}', a.namespace = '{}'",
+                escape_ladybug_string(&canonical_id),
+                escape_ladybug_string(&scoped_id),
+                safe_ns,
+                escape_ladybug_string(&scoped_id),
+                safe_ns
+            ))?;
+            for (bare_id, raw) in bare_rows {
+                if let Some(journal) = journal.as_deref_mut() {
+                    journal
+                        .bare_rows
+                        .push((bare_id.clone(), namespace.to_string(), raw.clone()));
+                }
+                let metadata = superseded_metadata(raw.as_deref(), generation, &scoped_id);
+                conn.query(&format!(
+                    "MATCH (m:Memory {{id: '{}'}}) SET m.namespace = '{}', m.metadata = '{}'",
+                    escape_ladybug_string(&bare_id),
+                    escape_ladybug_string(QUARANTINE_NAMESPACE),
+                    escape_ladybug_string(&metadata)
+                ))?;
+            }
+        }
+        // A staged row whose path no legacy identity owns gets NO alias of
+        // its own. The alias is the bridge from a legacy bare row to
+        // wherever that row now lives; fabricating one for every staged path
+        // would redirect qualified reads, live-generation scoped reads, and
+        // bare-id writes onto this generation's row — deleted paths would
+        // resurrect through the previous generation, a retired stub's
+        // qualified id would find the real node, and a vault import of the
+        // same path would collide with an ingested node it does not own.
+    }
+    let clear_staging = format!(
+        "MATCH (s:StagingGeneration) WHERE s.namespace = '{safe_ns}' AND s.source_key = '{safe_sk}' AND s.generation = {generation} DELETE s"
+    );
+    if fault_injected!(PublicationReconcile) {
+        anyhow::bail!("injected reconciliation failure while publishing generation {generation}");
+    }
+    conn.query(&clear_staging)?;
+    Ok(())
+}
+
+/// Resume any publication whose phase marker survived a crash.
+///
+/// Two phases exist. `reconciling` is a publication interrupted between the
+/// pointer flip and its cleanup, and is completed forward. `rolled_back` is a
+/// publication whose rows were already restored by `publish_generation`: it must
+/// never be reconciled or advanced again, only its leftovers removed (#M1).
+fn recover_interrupted_publications(conn: &Connection) -> Result<()> {
+    if !table_exists_checked(conn, PUBLICATION_STATE_TABLE)? {
+        return Ok(());
+    }
+    let query = format!(
+        "MATCH (p:{PUBLICATION_STATE_TABLE}) WHERE p.phase = 'reconciling' OR p.phase = 'rolled_back' RETURN p.namespace, p.source_key, p.generation, p.phase"
+    );
+    let mut pending: Vec<(String, String, u64, String)> = Vec::new();
+    for row in conn.query(&query)? {
+        if let (
+            Some(lbug::Value::String(namespace)),
+            Some(lbug::Value::String(source_key)),
+            Some(lbug::Value::Int64(generation)),
+            Some(lbug::Value::String(phase)),
+        ) = (row.get(0), row.get(1), row.get(2), row.get(3))
+        {
+            pending.push((
+                namespace.clone(),
+                source_key.clone(),
+                *generation as u64,
+                phase.clone(),
+            ));
+        }
+    }
+    // Oldest generation first: a later marker for the same source must be
+    // replayed after the one it built on, and a stale marker must be
+    // recognised before it can roll the pointer back (#10).
+    pending.sort();
+    for (namespace, source_key, generation, phase) in pending {
+        let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+            &namespace,
+            &source_key,
+        ));
+        let read = format!(
+            "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.active_generation"
+        );
+        let active = conn
+            .query(&read)?
+            .next()
+            .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64)
+            .unwrap_or(0);
+        let clear_staging = format!(
+            "MATCH (s:StagingGeneration) WHERE s.namespace = '{}' AND s.source_key = '{}' AND s.generation = {generation} DELETE s",
+            escape_ladybug_string(&namespace),
+            escape_ladybug_string(&source_key)
+        );
+        if phase == "rolled_back" {
+            if active == generation {
+                // The atomic rollback commit writes `rolled_back` and restores
+                // the pointer in one statement, so this combination means the
+                // durable state was tampered with or torn. Reconciling or
+                // advancing from it would resurrect a generation the caller was
+                // told was rolled back: fail closed and leave everything alone.
+                anyhow::bail!(
+                    "publication marker for generation {generation} of source {source_key} \
+                     in namespace {namespace} says rolled_back, but the active pointer still \
+                     names that generation; refusing to reconcile or advance it"
+                );
+            }
+            conn.query(&clear_staging)?;
+            clear_publication_marker(conn, &namespace, &source_key, generation)?;
+            continue;
+        }
+        if active > generation {
+            // A newer generation is already active. Re-running this
+            // reconciliation would rebind its legacy identity and then move
+            // the pointer backwards; drop only this generation's leftovers.
+            conn.query(&clear_staging)?;
+            clear_publication_marker(conn, &namespace, &source_key, generation)?;
+            continue;
+        }
+        reconcile_publication(conn, &namespace, &source_key, generation)?;
+        if active < generation {
+            conn.query(&format!(
+                "MATCH (g:IngestGeneration {{id: '{pointer_id}'}}) SET g.active_generation = {generation}, g.previous_generation = {active}"
+            ))?;
+        }
+        clear_publication_marker(conn, &namespace, &source_key, generation)?;
+    }
+    Ok(())
+}
+
+/// Run the store-open migration once for this open (`#408`).
+///
+/// A foreign or composite primary key is rebuilt keyed by `id` so the store
+/// opens instead of refusing. The namespace and alias legs are recovery work,
+/// so their failures are reported in `skipped_reason` and never brick the open.
+fn migrate_legacy_store(conn: &Connection) -> Result<MigrationReport> {
+    let columns = inspect_memory_columns(conn)?;
+    let mut rebuilt = false;
+    if needs_primary_key_rebuild(&columns) {
+        rebuild_memory_table_with_id_key(conn).map_err(legacy_primary_key_error)?;
+        rebuilt = true;
+    }
+
+    let mut report = MigrationReport {
+        run: true,
+        pk_rebuilt: rebuilt,
+        ..MigrationReport::default()
+    };
+    match migrate_null_namespaces(conn) {
+        Ok((recovered, quarantined)) => {
+            report.null_namespace_recovered = recovered;
+            report.quarantined = quarantined;
+        }
+        Err(error) => {
+            report.skipped_reason = Some(format!("namespace_recovery_failed: {error}"));
+        }
+    }
+    match migrate_legacy_id_aliases(conn) {
+        Ok(recorded) => report.aliases_recorded = recorded,
+        Err(error) => {
+            let reason = format!("alias_recording_failed: {error}");
+            report.skipped_reason = Some(match report.skipped_reason.take() {
+                Some(existing) => format!("{existing}; {reason}"),
+                None => reason,
+            });
+        }
+    }
+    Ok(report)
 }
 
 /// The raw catalog facts the two width reconciliations consult
@@ -10350,6 +12979,97 @@ impl LadybugStore {
     }
 }
 
+impl LadybugStore {
+    /// Explicit recovery read for rows the store quarantined. Ordinary read
+    /// paths must not expose `_quarantine`; an operator-directed repair path
+    /// can still reach a specific row by id.
+    pub async fn get_quarantined(&self, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
+        self.get_row(QUARANTINE_NAMESPACE, id, true).await
+    }
+
+    async fn get_row(
+        &self,
+        namespace: &str,
+        id: &str,
+        include_quarantine: bool,
+    ) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
+        if namespace == QUARANTINE_NAMESPACE && !include_quarantine {
+            return Ok(None);
+        }
+        let aliased = if include_quarantine {
+            None
+        } else {
+            // A qualified read must find the row an older binary wrote bare,
+            // through the same alias the write path uses. A failed alias load
+            // is a read-side miss, not a reason to hide a direct row.
+            match self.resolve_legacy_alias(namespace, id).await {
+                Ok(aliased) => aliased,
+                Err(error) => {
+                    tracing::warn!("legacy alias lookup failed during read: {error}");
+                    None
+                }
+            }
+        };
+        let namespace = namespace.to_string();
+        let id = id.to_string();
+        let mut candidates = vec![id.clone()];
+        if let Some(aliased) = aliased {
+            if aliased != id {
+                candidates.push(aliased);
+            }
+        }
+        self.with_conn(move |conn| {
+            let safe_ns = escape_ladybug_string(&namespace);
+            for candidate in candidates {
+                let safe_id = escape_ladybug_string(&candidate);
+                let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, safe_id);
+                let mut result = conn.query(&query)?;
+                let Some(row) = result.next() else { continue };
+                let mut vec: Vec<f32> = Vec::new();
+                if let lbug::Value::Array(_, vals) | lbug::Value::List(_, vals) = &row[0] {
+                    for v in vals {
+                        if let lbug::Value::Float(f) = v {
+                            vec.push(*f);
+                        } else if let lbug::Value::Double(d) = v {
+                            vec.push(*d as f32);
+                        }
+                    }
+                }
+                let content: String = format!("{}", row[1]);
+                let uid: String = format!("{}", row[2]);
+                let memory_type: String = format!("{}", row[3]);
+                let agent_name: String = format!("{}", row[4]);
+                let location: String = format!("{}", row[5]);
+                let location_lines: String = format!("{}", row[6]);
+                let metadata_str: String = format!("{}", row[7]);
+                let metadata_val: Value = match serde_json::from_str(&metadata_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !metadata_str.trim().is_empty() {
+                            tracing::warn!("corrupt metadata JSON in store row: {e}");
+                        }
+                        Value::Null
+                    }
+                };
+                return Ok(Some((
+                    vec,
+                    MemoryPayload {
+                        content,
+                        user_id: uid,
+                        memory_type,
+                        agent_name: Some(agent_name),
+                        location,
+                        location_lines,
+                        metadata: metadata_val,
+                    },
+                )));
+            }
+            Ok(None)
+        })
+        .await
+    }
+}
+
 #[async_trait]
 impl VectorStore for LadybugStore {
     async fn init(&self, namespace: &str) -> Result<()> {
@@ -10464,16 +13184,141 @@ impl VectorStore for LadybugStore {
         let locked_unknown_attested_empty =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let locked_unknown_attested_flag = locked_unknown_attested_empty.clone();
+        // `#408`: the store-open migration runs once, inside the schema
+        // turn, and only when this open found a pre-existing Memory table.
+        // An unverified recovery open skips it completely: its view of the
+        // rows is unauthenticated, so migrating from it could rewrite rows
+        // the WAL has not replayed yet.
+        let migration_report_slot = Arc::clone(&self.migration_report);
+        let migration_open_verified = self.open_provenance.is_verified();
         // Use write_with_deadline so the write lock is held INSIDE the
         // spawn_blocking closure (see R5). Holding an async lock across
         // with_conn releases it on timeout while the C++ call is still running.
         let outcome = self.write_with_deadline("initializing schema", move |conn| {
 
+            // An interrupted rename swap must be resumed or rolled back before
+            // a fresh `Memory` table can be created; otherwise this open would
+            // silently serve an empty store and hide the legacy rows. An
+            // unverified recovery open has no authenticated view of the rows,
+            // so it must not repair (and thereby mutate) either ledger.
+            if migration_open_verified {
+                if let Err(error) = recover_interrupted_rebuild(conn) {
+                    let error = legacy_primary_key_error(error);
+                    if let Some(primary_key) =
+                        error.downcast_ref::<LegacyPrimaryKeyMigrationError>()
+                    {
+                        *migration_report_slot
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(MigrationReport {
+                                run: true,
+                                skipped_reason: Some(format!(
+                                    "primary_key: {}",
+                                    primary_key.detail
+                                )),
+                                ..MigrationReport::default()
+                            });
+                    }
+                    return Err(error);
+                }
+                recover_interrupted_publications(conn)?;
+            } else {
+                // An unverified open cannot authenticate the rows a resume or
+                // rollback would act on, and creating a fresh `Memory` table
+                // over a half-swapped store would hide the legacy data for
+                // good. Both a pending ledger and an unreadable one refuse
+                // (#2, #M3): a failed probe must never fail open into fresh
+                // `Memory` DDL.
+                match has_pending_rebuild_artifacts(conn) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        *migration_report_slot
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(MigrationReport {
+                                run: true,
+                                skipped_reason: Some(
+                                    "primary_key: interrupted rebuild requires a verified open before access"
+                                        .to_string(),
+                                ),
+                                ..MigrationReport::default()
+                            });
+                        return Err(LegacyPrimaryKeyMigrationError {
+                            detail: "interrupted primary-key rebuild requires a verified open before the store can be accessed".to_string(),
+                        }
+                        .into());
+                    }
+                    Err(error) => {
+                        let error = legacy_primary_key_error(error);
+                        if let Some(primary_key) =
+                            error.downcast_ref::<LegacyPrimaryKeyMigrationError>()
+                        {
+                            *migration_report_slot
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(MigrationReport {
+                                    run: true,
+                                    skipped_reason: Some(format!(
+                                        "primary_key: {}",
+                                        primary_key.detail
+                                    )),
+                                    ..MigrationReport::default()
+                                });
+                        }
+                        return Err(error);
+                    }
+                }
+            }
             let (create_node_table, create_rel_tables) = memory_table_ddl(dimensions);
+            let mut memory_table_preexisting = false;
             if let Err(e) = conn.query(&create_node_table) {
                 if !e.to_string().contains("already exists") {
                     return Err(e.into());
                 }
+                memory_table_preexisting = true;
+            }
+
+            if memory_table_preexisting {
+                let report = if migration_open_verified {
+                    match migrate_legacy_store(conn) {
+                        Ok(report) => report,
+                        Err(error) => {
+                            if let Some(primary_key) =
+                                error.downcast_ref::<LegacyPrimaryKeyMigrationError>()
+                            {
+                                *migration_report_slot
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    Some(MigrationReport {
+                                        run: true,
+                                        skipped_reason: Some(format!(
+                                            "primary_key: {}",
+                                            primary_key.detail
+                                        )),
+                                        ..MigrationReport::default()
+                                    });
+                            }
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    MigrationReport {
+                        run: false,
+                        skipped_reason: Some("unverified_open".to_string()),
+                        ..MigrationReport::default()
+                    }
+                };
+                *migration_report_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(report);
+            } else {
+                *migration_report_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MigrationReport {
+                    run: false,
+                    skipped_reason: Some("memory_table_created".to_string()),
+                    ..MigrationReport::default()
+                });
             }
 
             for ddl in create_rel_tables {
@@ -10724,6 +13569,11 @@ impl VectorStore for LadybugStore {
         if namespace.trim().is_empty() {
             anyhow::bail!("namespace must be non-empty");
         }
+        // `#408`: `_quarantine` is reserved for rows the store moved out of
+        // tenant scope. Ordinary writes must never be able to place a row there.
+        if namespace == QUARANTINE_NAMESPACE {
+            anyhow::bail!("namespace '_quarantine' is reserved for store migration");
+        }
         // First-write race guard: on a pristine store, refuse the first
         // write if the configured model changed since this process
         // recorded the store's descriptor (a setup pick landed while the
@@ -10752,7 +13602,20 @@ impl VectorStore for LadybugStore {
             1.0,
             std::collections::BTreeMap::new(),
         );
-        let id = id.to_string();
+        let mut id = id.to_string();
+        let requested_id = id.clone();
+        // `#408`: a qualified id from a re-ingest must land on the row an
+        // older binary wrote as a bare id, not create a second row. The
+        // alias table is consulted before any read or `MERGE` below so the
+        // whole write path sees the legacy row's stored identity.
+        if let Some(stored_id) = self.resolve_legacy_alias(&namespace, &id).await? {
+            tracing::debug!(
+                "store-open migration resolved memory id '{}' to legacy row '{}'",
+                id,
+                stored_id
+            );
+            id = stored_id;
+        }
         // Parse shape warnings from the ORIGINAL payload before the write.
         let mut payload = payload;
         // AC3: canonicalize resolvable (unqualified) edge targets at write time.
@@ -11046,7 +13909,9 @@ impl VectorStore for LadybugStore {
         // captured here so the closure stays `FnOnce + Send + 'static`.
         let dimensions = self.dimensions;
         let zero_vec = zero_vector_str(dimensions);
-        let lexical_doc = Self::lexical_doc(&namespace, &id, &payload);
+        // Keep a payload copy: the lexical id must be the one the write turn
+        // actually chose, which can differ from the id resolved before it.
+        let lexical_payload = payload.clone();
         let refresh_ont_after_upsert = payload.memory_type == "action_type"
             || id == crate::registry::registry_row_id(&namespace);
         let ns_for_post_refresh = namespace.clone();
@@ -11079,6 +13944,55 @@ impl VectorStore for LadybugStore {
             }
         }
         let outcome = self.write_with_deadline("writing a memory", move |conn| {
+            // Recheck alias resolution and staging ownership together inside
+            // the write turn. A publication can repoint the alias, and a
+            // concurrent `begin_generation` can create a marker, after the
+            // earlier async lookup. An expired marker is not an in-flight
+            // generation: writing through its alias would mutate the live row.
+            let id = {
+                let mut write_id = id.clone();
+                if let Some((scoped_namespace, generation, _)) =
+                    crate::parser::generation::split_scoped_id(&requested_id)
+                {
+                    if scoped_namespace == namespace {
+                        match staging_marker_state(conn, &namespace, generation)? {
+                            StagingMarkerState::Expired => anyhow::bail!(
+                                "generation {} of namespace '{}' has an expired staging marker; refusing to write",
+                                generation,
+                                namespace
+                            ),
+                            // A marker can appear after the async lookup above.
+                            // The staged row must keep the requested scoped id
+                            // or `abort_generation` cannot discard the write.
+                            StagingMarkerState::Fresh => {
+                                write_id = requested_id.clone();
+                            }
+                            // No marker: an older binary may have written a
+                            // generation-scoped id directly. Re-read the alias
+                            // inside this turn; `legacy_alias_in_conn` refuses
+                            // closed generations, so an aborted or superseded
+                            // id keeps its own identity instead of mutating the
+                            // live bare row.
+                            StagingMarkerState::Absent => {
+                                if let Some(stored) =
+                                    legacy_alias_in_conn(conn, &namespace, &requested_id)?
+                                {
+                                    write_id = stored;
+                                }
+                            }
+                        }
+                    } else if let Some(stored) =
+                        legacy_alias_in_conn(conn, &namespace, &requested_id)?
+                    {
+                        write_id = stored;
+                    }
+                } else if let Some(stored) =
+                    legacy_alias_in_conn(conn, &namespace, &requested_id)?
+                {
+                    write_id = stored;
+                }
+                write_id
+            };
 
             let safe_id = escape_ladybug_string(&id);
             let safe_ns = escape_ladybug_string(&namespace);
@@ -11460,8 +14374,9 @@ impl VectorStore for LadybugStore {
             })
         })
         .await;
-        if outcome.is_ok() {
-            self.lexical_apply_doc(lexical_doc);
+        if let Ok(report) = &outcome {
+            let doc = Self::lexical_doc(&ns_for_post_refresh, &report.id, &lexical_payload);
+            self.lexical_apply_doc(doc);
             if refresh_ont_after_upsert {
                 self.refresh_ontology(&ns_for_post_refresh).await;
             }
@@ -11580,6 +14495,14 @@ impl VectorStore for LadybugStore {
         principal: &str,
         fuzzy_max_distance: usize,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
+        // The lexical partition is keyed by namespace; `_quarantine` is
+        // recovery-only and must never be searchable as a tenant namespace.
+        if namespace == QUARANTINE_NAMESPACE {
+            return Ok(crate::traits::LexicalSearchOutcome {
+                results: Vec::new(),
+                domain_filter_applied: false,
+            });
+        }
         self.ensure_lexical_loaded(namespace).await?;
         // #149 C2.4: the in-memory partition is filtered at load, but a row
         // staged after that load (or left by a failed refresh) is re-checked
@@ -11954,13 +14877,38 @@ impl VectorStore for LadybugStore {
     }
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
+        if namespace == QUARANTINE_NAMESPACE {
+            anyhow::bail!("namespace '{QUARANTINE_NAMESPACE}' is reserved for store migration");
+        }
         let namespace = namespace.to_string();
         let id = id.to_string();
+        // A qualified id for a row an older binary wrote bare must delete that
+        // stored row, not report the qualified id missing.
+        let stored_id = match self.resolve_legacy_alias(&namespace, &id).await {
+            Ok(Some(aliased)) => Some(aliased),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!("legacy alias lookup failed during delete: {error}");
+                None
+            }
+        };
         let index_namespace = namespace.clone();
         let index_id = id.clone();
         let outcome = self.write_with_deadline("deleting a memory", move |conn| {
+            // Re-resolve inside the same writer turn as publication. The
+            // outer lookup preserves staging-generation semantics; this
+            // second lookup catches a repointed alias and refuses a protected
+            // target instead of deleting or missing it through a stale id.
+            let stored_id = if stored_id.is_some() {
+                match legacy_alias_in_conn(conn, &namespace, &id)? {
+                    Some(stored) => stored,
+                    None => id.clone(),
+                }
+            } else {
+                id.clone()
+            };
             let safe_ns = escape_ladybug_string(&namespace);
-            let safe_id = escape_ladybug_string(&id);
+            let safe_id = escape_ladybug_string(&stored_id);
 
             // A silent no-op on a missing id reads as success to the caller
             // (the CLI then reports a deletion that never happened), so
@@ -11979,14 +14927,20 @@ impl VectorStore for LadybugStore {
                 "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m",
                 safe_id, safe_ns
             ))?;
-            Ok(())
+            Ok(stored_id)
         })
         .await;
-        if outcome.is_ok() {
-            self.lexical_remove_doc(&index_namespace, &index_id);
-            self.refresh_ontology(&index_namespace).await;
+        match outcome {
+            Ok(stored_id) => {
+                self.lexical_remove_doc(&index_namespace, &index_id);
+                if stored_id != index_id {
+                    self.lexical_remove_doc(&index_namespace, &stored_id);
+                }
+                self.refresh_ontology(&index_namespace).await;
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
-        outcome
     }
 
     async fn relocate(&self, id: &str, from: &str, to: &str) -> Result<RelocateOutcome> {
@@ -12802,37 +15756,151 @@ impl VectorStore for LadybugStore {
         self.write_with_deadline("publishing a staging generation", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_sk = escape_ladybug_string(&source_key);
-            // The flip is one statement on this source's pointer row: the active
-            // pointer moves to `generation` and the previous generation's rows
-            // stay as history. Another source's pointer is untouched.
             let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
                 &namespace,
                 &source_key,
             ));
-            // The value the pointer holds now is this source's rollback
-            // target. Reading it in the same turn as the flip makes the pair
-            // (active, previous) one atomic update.
-            let read_active = format!(
-                "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.active_generation"
-            );
-            let previous = conn
-                .query(&read_active)?
-                .next()
-                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64)
-                .unwrap_or(0);
-            let write = format!(
-                "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {generation}, g.previous_generation = {previous} ON MATCH SET g.active_generation = {generation}, g.previous_generation = {previous}"
-            );
-            conn.query(&write)?;
-            // Only this generation's staging row: an overlapping ingest's
-            // row must stay protected.
-            let clear_staging = format!(
-                "MATCH (s:StagingGeneration) WHERE s.namespace = '{safe_ns}' AND s.source_key = '{safe_sk}' AND s.generation = {generation} DELETE s"
-            );
-            conn.query(&clear_staging)?;
+            // What this attempt changes, and the pointer it must put back if
+            // reconciliation fails after the flip (#1). A failed publication
+            // must leave the previous generation exactly as it was.
+            let mut journal = PublicationJournal::default();
+            let mut previous = 0u64;
+            let mut prior_previous = 0u64;
+            let mut flipped = false;
+            let outcome = (|| -> Result<()> {
+                // Persist the phase before the pointer flip so a crash midway is
+                // resumed on the next open instead of leaving stale aliases.
+                mark_publication(conn, &namespace, &source_key, generation)?;
+                // The flip is one statement on this source's pointer row: the
+                // active pointer moves to `generation` and the previous
+                // generation's rows stay as history. Another source's pointer
+                // is untouched. The pair (active, previous) is read and written
+                // in the same turn, so the rollback target is exact.
+                let read_active = format!(
+                    "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.active_generation, g.previous_generation"
+                );
+                if let Some(row) = conn.query(&read_active)?.next() {
+                    let parse = |cell: Option<&lbug::Value>| {
+                        cell.map(|value| format!("{value}").parse::<i64>().unwrap_or(0).max(0) as u64)
+                            .unwrap_or(0)
+                    };
+                    previous = parse(row.get(0));
+                    prior_previous = parse(row.get(1));
+                }
+                let write = format!(
+                    "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {generation}, g.previous_generation = {previous} ON MATCH SET g.active_generation = {generation}, g.previous_generation = {previous}"
+                );
+                conn.query(&write)?;
+                flipped = true;
+
+                // Archive only unprotected bare rows, repoint the canonical
+                // alias at the published scoped row, and clear this
+                // generation's marker. The whole sequence is replayable from
+                // the persisted phase above.
+                reconcile_publication_journaled(
+                    conn,
+                    &namespace,
+                    &source_key,
+                    generation,
+                    Some(&mut journal),
+                )?;
+                clear_publication_marker(conn, &namespace, &source_key, generation)?;
+                Ok(())
+            })();
+
+            if let Err(original) = outcome {
+                // Roll back the rows and aliases this attempt touched FIRST.
+                // A failed journal rollback must not move the pointer or remove
+                // the marker: the store is left in a state startup recovery can
+                // complete forward from, and it reports both failures (#M1).
+                if let Err(rollback_error) = journal.rollback(conn) {
+                    return Err(anyhow::anyhow!(
+                        "{original}; publication rollback failed and the reconciling marker \
+                         and pointer were left for startup recovery: {rollback_error}"
+                    ));
+                }
+                if !flipped {
+                    // The pointer never moved, so nothing durable needs undoing;
+                    // the only residue is the phase marker. If even that cannot
+                    // be removed, report it and let recovery publish forward —
+                    // the rows are intact, so that is safe.
+                    if let Err(clear_error) =
+                        clear_publication_marker(conn, &namespace, &source_key, generation)
+                    {
+                        return Err(anyhow::anyhow!(
+                            "{original}; publication never repointed generation {generation} \
+                             but its marker could not be cleared: {clear_error}"
+                        ));
+                    }
+                    return Err(original);
+                }
+                // The durable commit point for the rollback: `rolled_back` and
+                // the pointer restore are ONE statement, so a crash or failure
+                // can never leave a restored `rolled_back` marker with a pointer
+                // still on the failed generation (#M1, closes F1).
+                let marker_id = escape_ladybug_string(&publication_marker_id(
+                    &namespace,
+                    &source_key,
+                    generation,
+                ));
+                let restore = format!(
+                    "MATCH (p:{PUBLICATION_STATE_TABLE} {{id: '{marker_id}'}}), \
+                     (g:IngestGeneration {{id: '{pointer_id}'}}) \
+                     WHERE g.active_generation = {generation} \
+                     SET p.phase = 'rolled_back', \
+                     g.active_generation = {previous}, g.previous_generation = {prior_previous} \
+                     RETURN g.active_generation"
+                );
+                let restored = if fault_injected!(AtomicRollbackCommit) {
+                    Err(anyhow::anyhow!(
+                        "injected atomic rollback commit failure for generation {generation}"
+                    ))
+                } else {
+                    conn.query(&restore)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|mut rows| {
+                            if rows.next().is_some() {
+                                Ok(())
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "atomic publication rollback updated no row: the pointer \
+                                     for {pointer_id} no longer named generation {generation}"
+                                ))
+                            }
+                        })
+                };
+                if let Err(commit_error) = restored {
+                    // The pointer (guarded by `active_generation`) and the
+                    // marker are untouched, so the `reconciling` phase survives
+                    // and recovery reconciles this generation forward.
+                    return Err(anyhow::anyhow!(
+                        "{original}; publication rollback could not persist its rolled_back \
+                         phase: {commit_error}"
+                    ));
+                }
+                // Only a committed rollback may clear the marker. If this fails
+                // the `rolled_back` marker stays, which recovery only uses to
+                // clean up — never to reconcile or advance this generation.
+                if fault_injected!(MarkerClearAfterRollback) {
+                    return Err(anyhow::anyhow!(
+                        "{original}; publication rolled back to generation {previous} but its \
+                         marker could not be cleared: injected marker clear failure"
+                    ));
+                }
+                if let Err(clear_error) =
+                    clear_publication_marker(conn, &namespace, &source_key, generation)
+                {
+                    return Err(anyhow::anyhow!(
+                        "{original}; publication rolled back to generation {previous} but its \
+                         marker could not be cleared: {clear_error}"
+                    ));
+                }
+                return Err(original);
+            }
             Ok(())
         })
         .await?;
+        self.invalidate_legacy_aliases();
         self.refresh_lexical_after_pointer_change(&refresh_ns).await;
         Ok(())
     }
@@ -12847,6 +15915,41 @@ impl VectorStore for LadybugStore {
         let refresh_ns = namespace.clone();
         let source_key = source_key.to_string();
         self.write_with_deadline("aborting a staging generation", move |conn| {
+            // A publication marker means the durable state of this generation
+            // is owned by recovery: its rows may be half-reconciled and a
+            // failed rollback may already have left a `reconciling` phase for
+            // startup to finish forward. Deleting rows or clearing the marker
+            // here would strand that recovery, so refuse and change nothing
+            // (#M1).
+            if publication_marker_exists(conn, &namespace, &source_key, generation)? {
+                anyhow::bail!(
+                    "refusing to abort generation {generation} of source {source_key} in \
+                     namespace {namespace}: a publication marker owns its state and startup \
+                     recovery must finish it"
+                );
+            }
+            let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+                &namespace,
+                &source_key,
+            ));
+            // Defensive: if this source's pointer somehow already names the
+            // aborted generation (abort is normally pre-publish), restore the
+            // generation it replaced instead of hardcoding zero — a failed
+            // publication flips the pointer first, and dropping back to zero
+            // would hide the previous generation (#1). This runs BEFORE any row
+            // is deleted: a pointer restore that fails must not leave an empty
+            // generation active (#M1).
+            if fault_injected!(AbortPointerRestore) {
+                anyhow::bail!(
+                    "injected pointer restore failure while aborting generation {generation}; \
+                     no row was deleted"
+                );
+            }
+            let clear = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' AND g.active_generation = {generation} SET g.active_generation = COALESCE(g.previous_generation, 0)"
+            );
+            conn.query(&clear)?;
+
             // A staged node's id is `ns::<generation>::<path>`, so every row of
             // this generation shares the prefix. The namespace predicate keeps
             // a foreign row whose id happens to start with that prefix (a
@@ -12860,18 +15963,6 @@ impl VectorStore for LadybugStore {
             );
             conn.query(&query)?;
 
-            // Defensive: if this source's pointer somehow already names the
-            // aborted generation (abort is normally pre-publish), clear it so
-            // the superseded generation is never reachable.
-            let clear = format!(
-                "MATCH (g:IngestGeneration) WHERE g.id = '{}' AND g.active_generation = {} SET g.active_generation = 0",
-                escape_ladybug_string(&crate::parser::ingest::generation_key(
-                    &namespace,
-                    &source_key
-                )),
-                generation
-            );
-            conn.query(&clear)?;
             // Remove this generation's staging row (and only that one), so
             // retention is free to prune the discarded rows.
             let clear_staging = format!(
@@ -12976,71 +16067,7 @@ impl VectorStore for LadybugStore {
     }
 
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
-        let namespace = namespace.to_string();
-        let id = id.to_string();
-        self.with_conn(move |conn| {
-            let safe_ns = escape_ladybug_string(&namespace);
-            let safe_id = escape_ladybug_string(&id);
-
-            let query = format!("MATCH (m:Memory) WHERE m.namespace = '{}' AND m.id = '{}' RETURN m.embedding, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata", safe_ns, safe_id);
-
-            let mut result = conn.query(&query)?;
-
-            if let Some(row) = result.next() {
-                // The column is FLOAT[N], a fixed-size ARRAY, so the engine hands
-                // back Value::Array. Matching only Value::List meant this always
-                // returned an empty vector, and every caller that read a memory
-                // and wrote it back stored an embedding of length zero -- which
-                // the engine rejects, silently in /edit's case (bead
-                // neurostrata-vbj). Accept both: a LIST column would still parse.
-                let mut vec: Vec<f32> = Vec::new();
-                if let lbug::Value::Array(_, vals) | lbug::Value::List(_, vals) = &row[0] {
-                    for v in vals {
-                        if let lbug::Value::Float(f) = v {
-                            vec.push(*f);
-                        } else if let lbug::Value::Double(d) = v {
-                            vec.push(*d as f32);
-                        }
-                    }
-                }
-
-                let content: String = format!("{}", row[1]);
-                let uid: String = format!("{}", row[2]);
-                let memory_type: String = format!("{}", row[3]);
-                let agent_name: String = format!("{}", row[4]);
-                let location: String = format!("{}", row[5]);
-                let location_lines: String = format!("{}", row[6]);
-                let metadata_str: String = format!("{}", row[7]);
-
-                let metadata_val: Value = match serde_json::from_str(&metadata_str) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if !metadata_str.trim().is_empty() {
-                            tracing::warn!("corrupt metadata JSON in store row: {e}");
-                        }
-                        Value::Null
-                    }
-                };
-
-
-
-                return Ok(Some((
-                    vec,
-                    MemoryPayload {
-                        content,
-                        user_id: uid,
-                        memory_type,
-                        agent_name: Some(agent_name),
-                        location,
-                        location_lines,
-                        metadata: metadata_val,
-                    },
-                )));
-            }
-
-            Ok(None)
-        })
-        .await
+        self.get_row(namespace, id, false).await
     }
 
     async fn get_many(
@@ -13048,6 +16075,12 @@ impl VectorStore for LadybugStore {
         namespaces: &[&str],
         ids: &[String],
     ) -> Result<Vec<(String, MemoryPayload)>> {
+        // `_quarantine` is reserved: ordinary callers cannot bulk-read it.
+        let namespaces: Vec<&str> = namespaces
+            .iter()
+            .copied()
+            .filter(|namespace| *namespace != QUARANTINE_NAMESPACE)
+            .collect();
         if namespaces.is_empty() || ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -13058,10 +16091,33 @@ impl VectorStore for LadybugStore {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        // Include both the requested qualified ids and their legacy bare
+        // identities so a caller reading by qualified id sees the row its
+        // qualified upsert actually wrote.
+        let mut lookup_ids = ids.to_vec();
+        // Keep the caller's qualified id as the identity of the result: a
+        // qualified request resolved onto a legacy bare row must still come
+        // back under the id the caller asked for, or task cleanup cannot
+        // correlate the row with its task-block entry.
+        let mut requested_for: HashMap<String, String> = HashMap::new();
+        for id in ids {
+            for namespace in &namespaces {
+                match self.resolve_legacy_alias(namespace, id).await {
+                    Ok(Some(aliased)) if aliased != *id => {
+                        requested_for.insert(aliased.clone(), id.clone());
+                        lookup_ids.push(aliased);
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!("legacy alias lookup failed in get_many: {error}"),
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        lookup_ids.retain(|id| seen.insert(id.clone()));
         let query = format!(
             "MATCH (m:Memory) WHERE m.namespace IN [{}] AND m.id IN [{}] RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata",
-            quoted(namespaces.to_vec()),
-            quoted(ids.iter().map(String::as_str).collect()),
+            quoted(namespaces),
+            quoted(lookup_ids.iter().map(String::as_str).collect()),
         );
         self.with_conn(move |conn| {
             let mut out = Vec::new();
@@ -13073,8 +16129,10 @@ impl VectorStore for LadybugStore {
                     }
                     Value::Null
                 });
+                let stored_id = format!("{}", row[0]);
+                let returned_id = requested_for.get(&stored_id).cloned().unwrap_or(stored_id);
                 out.push((
-                    format!("{}", row[0]),
+                    returned_id,
                     MemoryPayload {
                         content: format!("{}", row[1]),
                         user_id: format!("{}", row[2]),
@@ -13099,7 +16157,11 @@ impl VectorStore for LadybugStore {
             let mut namespaces = Vec::new();
             while let Some(row) = result.next() {
                 if let lbug::Value::String(ns) = row[0].clone() {
-                    namespaces.push(ns);
+                    // Reserved migration namespace: never advertised to
+                    // ordinary callers as a tenant namespace.
+                    if ns != QUARANTINE_NAMESPACE {
+                        namespaces.push(ns);
+                    }
                 }
             }
 
@@ -13135,6 +16197,12 @@ impl VectorStore for LadybugStore {
             while let Some(row) = result_nodes.next() {
                 let id = if let lbug::Value::String(s) = &row[0] { s.clone() } else { continue };
                 let namespace = if let lbug::Value::String(s) = &row[1] { s.clone() } else { "global".to_string() };
+                // Recovery-only rows are never exported: their owner could not
+                // be established, so exposing them as tenant graph data is
+                // wrong even when `include_archived` is requested.
+                if namespace == QUARANTINE_NAMESPACE {
+                    continue;
+                }
                 let memory_type = if let lbug::Value::String(s) = &row[2] { s.clone() } else { "unknown".to_string() };
                 let content = if let lbug::Value::String(s) = &row[3] { s.clone() } else { "".to_string() };
                 let location = if let lbug::Value::String(s) = &row[4] { s.clone() } else { "".to_string() };
@@ -14692,6 +17760,11 @@ impl LadybugStore {
         exclude_ids: &[String],
         limit: usize,
     ) -> Result<MultiFormMemoryRetrieval> {
+        // `_quarantine` rows are isolated for recovery; ordinary file reads
+        // must not surface them to a caller who merely names that namespace.
+        if namespace == QUARANTINE_NAMESPACE {
+            anyhow::bail!("namespace '{QUARANTINE_NAMESPACE}' is reserved for store migration");
+        }
         let mut hits: Vec<crate::graph_read::memories_for_file::MemoryHit> = Vec::new();
         let mut candidate_truncated = false;
         let mut any_success = false;
@@ -14828,6 +17901,16 @@ impl GraphRead for LadybugStore {
         cursor: Option<&crate::graph_read::related::Cursor>,
         cross_namespace: &crate::graph_read::traversal::CrossNamespacePolicy,
     ) -> Result<crate::graph_read::related::RelatedResult> {
+        if namespace == QUARANTINE_NAMESPACE {
+            return Ok(crate::graph_read::related::RelatedResult {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                evidence: Vec::new(),
+                total: 0,
+                truncated: false,
+                next_cursor: None,
+            });
+        }
         let namespace = namespace.to_string();
         let seed = seed.to_string();
         // Spec §6: `related` consumes the ontology's relation expansion — each
@@ -36741,6 +39824,9 @@ impl LadybugStore {
         &self,
         namespace: &str,
     ) -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
+        if namespace == QUARANTINE_NAMESPACE {
+            return Ok(Vec::new());
+        }
         let namespace_owned = namespace.to_string();
         self.with_conn(move |conn: &Connection| -> Result<Vec<(String, String, String, Option<crate::rdf::EdgeProvenance>)>> {
             let safe_ns = escape_ladybug_string(&namespace_owned);
@@ -37718,4 +40804,4157 @@ fn conn_upsert_action_row(
         }
     }
     Ok(())
+}
+
+/// Store-open migration contract (`#408`, Wave 3 Step 3).
+///
+/// These tests pin the legacy-store behaviour at open: a NULL namespace is
+/// recovered (or quarantined), a table whose `id` is not the primary key fails
+/// loudly instead of half-migrating, a bare-id row is found by identity rather
+/// than duplicated, unverified recovery opens skip migration entirely, and a
+/// second open changes nothing.
+#[cfg(test)]
+mod store_migration {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+
+    const DIMS: usize = 4;
+
+    fn seed_config() -> SystemConfig {
+        SystemConfig::default()
+            .max_db_size(512 * 1024 * 1024)
+            .buffer_pool_size(64 * 1024 * 1024)
+            .throw_on_wal_replay_failure(true)
+    }
+
+    /// Create the legacy database exactly as an older binary would have left
+    /// it: raw DDL, raw rows, no store-open migration involved.
+    fn seed(path: &Path, ddl: &str, statements: &[&str]) {
+        let db = Database::new(path, seed_config()).expect("seed database opens");
+        let conn = Connection::new(&db).expect("seed connection opens");
+        conn.query(ddl).expect("seed schema");
+        for statement in statements {
+            conn.query(statement).expect("seed statement");
+        }
+        drop(conn);
+        drop(db);
+    }
+
+    fn memory_ddl(primary_key: &str) -> String {
+        format!(
+            "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{DIMS}], name STRING, PRIMARY KEY({primary_key}))"
+        )
+    }
+
+    fn memory_ddl_without_namespace() -> String {
+        format!(
+            "CREATE NODE TABLE Memory (id STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{DIMS}], name STRING, PRIMARY KEY(id))"
+        )
+    }
+
+    fn rel_table_ddl() -> &'static str {
+        "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, valid_from INT64, valid_to INT64, generation INT64, extractor STRING, confidence DOUBLE, evidence_id STRING, origin STRING)"
+    }
+
+    fn insert_row(id: &str, namespace: Option<&str>, metadata: &str) -> String {
+        let namespace = namespace
+            .map(|ns| format!(", namespace: '{}'", escape_ladybug_string(ns)))
+            .unwrap_or_default();
+        format!(
+            "CREATE (:Memory {{id: '{}'{namespace}, content: 'content-{}', user_id: 'auto-ingestor', memory_type: 'file', agent_name: 'unknown', location: '{}', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0], name: 'n-{}'}})",
+            escape_ladybug_string(id),
+            escape_ladybug_string(id),
+            escape_ladybug_string(id),
+            escape_ladybug_string(metadata),
+            escape_ladybug_string(id),
+        )
+    }
+
+    fn insert_row_as(id: &str, namespace: Option<&str>, metadata: &str, user_id: &str) -> String {
+        let namespace = namespace
+            .map(|ns| format!(", namespace: '{}'", escape_ladybug_string(ns)))
+            .unwrap_or_default();
+        format!(
+            "CREATE (:Memory {{id: '{}'{namespace}, content: 'content-{}', user_id: '{}', memory_type: 'file', agent_name: 'unknown', location: '{}', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0], name: 'n-{}'}})",
+            escape_ladybug_string(id),
+            escape_ladybug_string(id),
+            escape_ladybug_string(user_id),
+            escape_ladybug_string(id),
+            escape_ladybug_string(metadata),
+            escape_ladybug_string(id),
+        )
+    }
+
+    fn open(path: &Path) -> LadybugStore {
+        LadybugStore::for_testing(path, DIMS).expect("legacy store opens")
+    }
+    async fn count_memory(store: &LadybugStore, predicate: &str) -> i64 {
+        let query = format!("MATCH (m:Memory) WHERE {predicate} RETURN count(m)");
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&query)?;
+                Ok(rows
+                    .next()
+                    .and_then(|row| match row.first() {
+                        Some(lbug::Value::Int64(n)) => Some(*n),
+                        _ => None,
+                    })
+                    .unwrap_or(-1))
+            })
+            .await
+            .expect("count query")
+    }
+
+    async fn stored_namespace(store: &LadybugStore, id: &str) -> Option<String> {
+        let id = id.to_string();
+        store
+            .with_conn(move |conn| {
+                let query = format!(
+                    "MATCH (m:Memory) WHERE m.id = '{}' RETURN m.namespace",
+                    escape_ladybug_string(&id)
+                );
+                let mut rows = conn.query(&query)?;
+                Ok(rows.next().and_then(|row| match row.first() {
+                    Some(lbug::Value::String(ns)) => Some(ns.clone()),
+                    _ => None,
+                }))
+            })
+            .await
+            .expect("namespace query")
+    }
+
+    async fn stored_metadata(store: &LadybugStore, id: &str) -> Option<String> {
+        let id = id.to_string();
+        store
+            .with_conn(move |conn| {
+                let query = format!(
+                    "MATCH (m:Memory) WHERE m.id = '{}' RETURN m.metadata",
+                    escape_ladybug_string(&id)
+                );
+                let mut rows = conn.query(&query)?;
+                Ok(rows.next().and_then(|row| match row.first() {
+                    Some(lbug::Value::String(metadata)) => Some(metadata.clone()),
+                    _ => None,
+                }))
+            })
+            .await
+            .expect("metadata query")
+    }
+
+    async fn edge_count(store: &LadybugStore) -> i64 {
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query("MATCH ()-[r:RELATES_TO]->() RETURN count(r)")?;
+                Ok(rows
+                    .next()
+                    .and_then(|row| match row.first() {
+                        Some(lbug::Value::Int64(n)) => Some(*n),
+                        _ => None,
+                    })
+                    .unwrap_or(-1))
+            })
+            .await
+            .expect("edge count query")
+    }
+
+    async fn alias_target(store: &LadybugStore, canonical_id: &str) -> Option<String> {
+        let canonical_id = canonical_id.to_string();
+        store
+            .with_conn(move |conn| {
+                let query = format!(
+                    "MATCH (a:LegacyIdAlias {{canonical_id: '{}'}}) RETURN a.id",
+                    escape_ladybug_string(&canonical_id)
+                );
+                let mut rows = conn.query(&query)?;
+                Ok(rows.next().and_then(|row| match row.first() {
+                    Some(lbug::Value::String(id)) => Some(id.clone()),
+                    _ => None,
+                }))
+            })
+            .await
+            .expect("alias query")
+    }
+
+    async fn table_exists(store: &LadybugStore, table: &'static str) -> bool {
+        store
+            .with_conn(move |conn| {
+                Ok(conn
+                    .query(&format!("CALL table_info('{table}') RETURN *"))
+                    .is_ok())
+            })
+            .await
+            .expect("table_info query")
+    }
+
+    /// The declared endpoint kinds of a relationship table, as the engine
+    /// catalog reports them: one `(source, destination)` pair per connection.
+    async fn rel_endpoints(store: &LadybugStore, table: &str) -> Vec<(String, String)> {
+        let table = table.to_string();
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&format!("CALL show_connection('{table}') RETURN *"))?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    if let (
+                        Some(lbug::Value::String(source)),
+                        Some(lbug::Value::String(destination)),
+                    ) = (row.get(0), row.get(1))
+                    {
+                        out.push((source.clone(), destination.clone()));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .expect("show_connection query")
+    }
+
+    fn row_payload(content: &str) -> MemoryPayload {
+        MemoryPayload {
+            content: content.to_string(),
+            user_id: "auto-ingestor".to_string(),
+            memory_type: "file".to_string(),
+            agent_name: Some("unknown".to_string()),
+            location: "src/main.rs".to_string(),
+            location_lines: String::new(),
+            metadata: json!({}),
+        }
+    }
+
+    #[test]
+    fn the_primary_key_decision_reads_the_id_flag() {
+        let keyed_on_id = vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                is_primary_key: true,
+            },
+            ColumnInfo {
+                name: "namespace".to_string(),
+                is_primary_key: false,
+            },
+        ];
+        assert!(!needs_primary_key_rebuild(&keyed_on_id));
+        assert!(needs_primary_key_rebuild(&[
+            ColumnInfo {
+                name: "id".to_string(),
+                is_primary_key: false,
+            },
+            ColumnInfo {
+                name: "name".to_string(),
+                is_primary_key: true,
+            },
+        ]));
+        assert!(needs_primary_key_rebuild(&[ColumnInfo {
+            name: "name".to_string(),
+            is_primary_key: true,
+        }]));
+        assert!(needs_primary_key_rebuild(&[
+            ColumnInfo {
+                name: "id".to_string(),
+                is_primary_key: true,
+            },
+            ColumnInfo {
+                name: "name".to_string(),
+                is_primary_key: true,
+            },
+        ]));
+    }
+
+    #[tokio::test]
+    async fn a_legacy_row_without_namespace_is_recovered_from_its_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row(
+                "legacy-file",
+                None,
+                r#"{"namespace":"alpha","kept":"yes"}"#,
+            )],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("a legacy store opens");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.run);
+        assert!(!report.pk_rebuilt);
+        assert_eq!(report.null_namespace_recovered, 1);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(report.skipped_reason, None);
+
+        let (_, payload) = store
+            .get("alpha", "legacy-file")
+            .await
+            .expect("row lookup")
+            .expect("row recovered into the metadata namespace");
+        assert_eq!(payload.metadata["namespace"], json!("alpha"));
+        assert_eq!(payload.metadata["kept"], json!("yes"));
+    }
+
+    #[tokio::test]
+    async fn a_row_with_no_recoverable_namespace_is_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("orphan-row", None, r#"{"kept":1}"#)],
+        );
+
+        let store = open(&db);
+        store
+            .init("alpha")
+            .await
+            .expect("quarantine never blocks open");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.run);
+        assert_eq!(report.null_namespace_recovered, 0);
+        assert_eq!(report.quarantined, 1);
+
+        assert_eq!(
+            stored_namespace(&store, "orphan-row").await.as_deref(),
+            Some(QUARANTINE_NAMESPACE)
+        );
+        let (_, payload) = store
+            .get_quarantined("orphan-row")
+            .await
+            .expect("quarantined row lookup")
+            .expect("quarantined row still exists");
+        assert_eq!(payload.metadata["kept"], json!(1));
+        assert_eq!(
+            payload.metadata["quarantine"]["reason"],
+            json!("unrecoverable_namespace")
+        );
+    }
+
+    #[tokio::test]
+    async fn neither_null_namespace_recovery_nor_quarantine_blocks_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("recoverable", None, r#"{"namespace":"beta"}"#),
+                &insert_row("orphan-row", None, "{}"),
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("open completes");
+        let report = store.last_migration_report().expect("migration report");
+        // Issue #408: the metadata-named row is restored to `beta`; only the
+        // row with no recoverable namespace is quarantined.
+        assert_eq!(report.null_namespace_recovered, 1);
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(report.skipped_reason, None);
+
+        assert_eq!(count_memory(&store, "m.namespace IS NOT NULL").await, 2);
+        assert_eq!(count_memory(&store, "m.namespace = 'beta'").await, 1);
+        assert_eq!(
+            count_memory(&store, &format!("m.namespace = '{QUARANTINE_NAMESPACE}'")).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_primary_key_table_is_rebuilt_keyed_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[&insert_row("legacy-file", Some("alpha"), "{}")],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("the store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.pk_rebuilt, "the legacy key was rebuilt");
+        assert_eq!(report.skipped_reason, None);
+        drop(store);
+
+        let db = Database::new(&db, seed_config()).expect("reopen the rebuilt store");
+        let conn = Connection::new(&db).expect("connection");
+        let mut pk_columns = Vec::new();
+        for row in conn
+            .query("CALL table_info('Memory') RETURN *")
+            .expect("table_info")
+        {
+            let name = match row.get(1) {
+                Some(lbug::Value::String(name)) => name.clone(),
+                _ => continue,
+            };
+            let is_pk = matches!(row.get(4), Some(lbug::Value::Bool(true)));
+            if is_pk {
+                pk_columns.push(name);
+            }
+        }
+        assert_eq!(pk_columns, vec!["id".to_string()]);
+        let mut count = conn
+            .query("MATCH (m:Memory) RETURN count(m)")
+            .expect("count");
+        let row_count = count.next().and_then(|row| match row.first() {
+            Some(lbug::Value::Int64(n)) => Some(*n),
+            _ => None,
+        });
+        assert_eq!(row_count, Some(1));
+    }
+
+    /// The rebuild must preserve relationship topology. Scratch tables are
+    /// built and counted before the rename swap, so edges survive and no
+    /// migration scratch catalog is left behind.
+    #[tokio::test]
+    async fn a_legacy_primary_key_rebuild_preserves_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[
+                rel_table_ddl(),
+                &insert_row("src/main.rs", Some("alpha"), "{}"),
+                &insert_row("src/lib.rs", Some("alpha"), "{}"),
+                "MATCH (a:Memory {id: 'src/main.rs'}), (b:Memory {id: 'src/lib.rs'}) CREATE (a)-[:RELATES_TO {source: 'alpha'}]->(b)",
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.pk_rebuilt, "the legacy key was rebuilt");
+        assert_eq!(report.skipped_reason, None);
+        assert_eq!(count_memory(&store, "true").await, 2);
+        assert_eq!(edge_count(&store).await, 1, "edges survive the swap");
+    }
+
+    /// A relationship whose endpoints are not `Memory` nodes must survive the
+    /// legacy primary-key rebuild untouched. Recreating every relationship
+    /// table with `Memory` endpoints (or scanning it with `Memory` labels)
+    /// made such rows disappear and could stop the open outright; the
+    /// endpoint kinds an older binary declared are part of the store's data.
+    #[tokio::test]
+    async fn a_legacy_primary_key_rebuild_preserves_non_memory_relationships() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[
+                "CREATE NODE TABLE Task (task_id STRING, title STRING, PRIMARY KEY (task_id))",
+                "CREATE REL TABLE TaskDependsOn (FROM Task TO Task, reason STRING)",
+                &insert_row("src/main.rs", Some("alpha"), "{}"),
+                "CREATE (:Task {task_id: 'T-101', title: 'first'})",
+                "CREATE (:Task {task_id: 'T-102', title: 'second'})",
+                "MATCH (a:Task {task_id: 'T-101'}), (b:Task {task_id: 'T-102'}) CREATE (a)-[:TaskDependsOn {reason: 'blocks'}]->(b)",
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.pk_rebuilt, "the legacy key was rebuilt");
+        assert_eq!(report.skipped_reason, None);
+
+        let edges: Vec<(String, String, String)> = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (a:Task)-[r:TaskDependsOn]->(b:Task) RETURN a.task_id, b.task_id, r.reason",
+                )?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    if let (
+                        Some(lbug::Value::String(from)),
+                        Some(lbug::Value::String(to)),
+                        Some(lbug::Value::String(reason)),
+                    ) = (row.get(0), row.get(1), row.get(2))
+                    {
+                        out.push((from.clone(), to.clone(), reason.clone()));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .expect("task dependency query");
+        assert_eq!(
+            edges,
+            vec![(
+                "T-101".to_string(),
+                "T-102".to_string(),
+                "blocks".to_string()
+            )],
+            "the Task -> Task row survives with its endpoints and properties"
+        );
+        assert_eq!(
+            rel_endpoints(&store, "TaskDependsOn").await,
+            vec![("Task".to_string(), "Task".to_string())],
+            "the declared endpoint kinds are not rewritten to Memory"
+        );
+    }
+
+    /// A relationship with a `Memory` endpoint and a non-`Memory` endpoint
+    /// must survive the rebuild in both orientations: the Memory side rebinds
+    /// to the rebuilt row's id, the other endpoint keeps its own primary
+    /// key, and the relationship's properties stay attached.
+    #[tokio::test]
+    async fn a_legacy_primary_key_rebuild_preserves_mixed_memory_relationships() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[
+                "CREATE NODE TABLE Task (task_id STRING, title STRING, PRIMARY KEY (task_id))",
+                "CREATE REL TABLE TaskMention (FROM Memory TO Task, FROM Task TO Memory, source STRING)",
+                &insert_row("src/main.rs", Some("alpha"), "{}"),
+                "CREATE (:Task {task_id: 'T-101', title: 'first'})",
+                "MATCH (a:Memory {name: 'n-src/main.rs'}), (b:Task {task_id: 'T-101'}) CREATE (a)-[:TaskMention {source: 'alpha'}]->(b)",
+                "MATCH (a:Task {task_id: 'T-101'}), (b:Memory {name: 'n-src/main.rs'}) CREATE (a)-[:TaskMention {source: 'beta'}]->(b)",
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.pk_rebuilt, "the legacy key was rebuilt");
+        assert_eq!(report.skipped_reason, None);
+
+        let memory_first: Vec<(String, String, String)> = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (a:Memory)-[r:TaskMention]->(b:Task) RETURN a.id, b.task_id, r.source",
+                )?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    if let (
+                        Some(lbug::Value::String(id)),
+                        Some(lbug::Value::String(task)),
+                        Some(lbug::Value::String(source)),
+                    ) = (row.get(0), row.get(1), row.get(2))
+                    {
+                        out.push((id.clone(), task.clone(), source.clone()));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .expect("memory-to-task query");
+        assert_eq!(
+            memory_first,
+            vec![(
+                "src/main.rs".to_string(),
+                "T-101".to_string(),
+                "alpha".to_string()
+            )],
+            "the Memory -> Task row rebinds to the rebuilt Memory row"
+        );
+
+        let task_first: Vec<(String, String, String)> = store
+            .with_conn(|conn| {
+                let mut rows = conn.query(
+                    "MATCH (a:Task)-[r:TaskMention]->(b:Memory) RETURN a.task_id, b.id, r.source",
+                )?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    if let (
+                        Some(lbug::Value::String(task)),
+                        Some(lbug::Value::String(id)),
+                        Some(lbug::Value::String(source)),
+                    ) = (row.get(0), row.get(1), row.get(2))
+                    {
+                        out.push((task.clone(), id.clone(), source.clone()));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .expect("task-to-memory query");
+        assert_eq!(
+            task_first,
+            vec![(
+                "T-101".to_string(),
+                "src/main.rs".to_string(),
+                "beta".to_string()
+            )],
+            "the Task -> Memory row rebinds to the rebuilt Memory row"
+        );
+
+        let mut endpoints = rel_endpoints(&store, "TaskMention").await;
+        endpoints.sort();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("Memory".to_string(), "Task".to_string()),
+                ("Task".to_string(), "Memory".to_string()),
+            ],
+            "both declared orientations survive the rebuild"
+        );
+    }
+
+    #[test]
+    fn a_derived_legacy_id_is_stable_and_namespace_scoped() {
+        let a = derived_legacy_id("alpha", "content", "metadata", 0);
+        let b = derived_legacy_id("alpha", "content", "metadata", 0);
+        let other = derived_legacy_id("beta", "content", "metadata", 0);
+        let next = derived_legacy_id("alpha", "content", "metadata", 1);
+        assert_eq!(
+            a, b,
+            "the derived id is deterministic, not scan-order based"
+        );
+        assert_ne!(a, other, "namespace is part of the identity");
+        assert_ne!(a, next, "duplicate occurrences get distinct ids");
+        assert!(a.starts_with("derived-"));
+    }
+
+    /// A legacy table with no `id` property at all: the synthetic id must be
+    /// derived after reading only the properties the source actually has.
+    #[tokio::test]
+    async fn a_legacy_table_without_an_id_column_gets_derived_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let ddl = format!(
+            "CREATE NODE TABLE Memory (namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{DIMS}], name STRING, PRIMARY KEY(name))"
+        );
+        let legacy_row = |name: &str| {
+            format!(
+                "CREATE (:Memory {{namespace: 'alpha', content: 'content-{name}', user_id: 'auto-ingestor', memory_type: 'file', agent_name: 'unknown', location: 'src/main.rs', location_lines: '', metadata: 'legacy-meta', embedding: [0.0,0.0,0.0,0.0], name: '{name}'}})"
+            )
+        };
+        seed(&db, &ddl, &[&legacy_row("first"), &legacy_row("second")]);
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.pk_rebuilt, "the id-less table was rebuilt");
+        assert_eq!(report.skipped_reason, None);
+        assert_eq!(count_memory(&store, "true").await, 2);
+
+        let ids: Vec<String> = store
+            .with_conn(|conn| {
+                let mut ids = Vec::new();
+                for row in conn.query("MATCH (m:Memory) RETURN m.id")? {
+                    if let Some(lbug::Value::String(id)) = row.first() {
+                        ids.push(id.clone());
+                    }
+                }
+                Ok(ids)
+            })
+            .await
+            .expect("id query");
+        assert_eq!(ids.len(), 2);
+        assert!(
+            ids.iter().all(|id| id.starts_with("derived-")),
+            "ids are derived from the source rows: {ids:?}"
+        );
+        assert_ne!(ids[0], ids[1], "distinct content yields distinct ids");
+    }
+
+    /// Identity is structural, not provenance-based: a legacy bare row written
+    /// by an older binary with a different user_id still owns its qualified
+    /// identity and must be aliased. Qualified/current rows are never aliased.
+    #[tokio::test]
+    async fn a_legacy_bare_row_with_an_older_user_id_is_aliased() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row_as("src/main.rs", Some("alpha"), "{}", "older-binary"),
+                &insert_row_as("alpha::src/lib.rs", Some("alpha"), "{}", "older-binary"),
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.aliases_recorded, 1);
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs"),
+            "the older bare row owns its qualified identity"
+        );
+        assert!(
+            alias_target(&store, "alpha::src/lib.rs").await.is_none(),
+            "a qualified row is already current and is not aliased"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_bare_id_is_found_by_identity_after_migration_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                rel_table_ddl(),
+                &insert_row("src/main.rs", Some("alpha"), "{}"),
+                &insert_row("src/lib.rs", Some("alpha"), "{}"),
+                "MATCH (a:Memory {id: 'src/main.rs'}), (b:Memory {id: 'src/lib.rs'}) CREATE (a)-[:RELATES_TO {source: 'alpha'}]->(b)",
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.aliases_recorded, 2);
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs")
+        );
+
+        store
+            .upsert(
+                "alpha",
+                "alpha::7::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("updated"),
+            )
+            .await
+            .expect("re-ingesting the qualified id updates the legacy row");
+
+        assert_eq!(
+            count_memory(&store, "m.namespace = 'alpha'").await,
+            2,
+            "the qualified id must not create a duplicate row"
+        );
+        let (_, payload) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("legacy row lookup")
+            .expect("the legacy row is updated in place");
+        assert_eq!(payload.content, "updated");
+        let (_, aliased) = store
+            .get("alpha", "alpha::7::src/main.rs")
+            .await
+            .expect("qualified lookup")
+            .expect("the qualified id finds the aliased bare row");
+        assert_eq!(
+            aliased.content, "updated",
+            "the aliased row is the one the qualified upsert wrote"
+        );
+        assert_eq!(edge_count(&store).await, 1, "edges survive the migration");
+    }
+
+    #[tokio::test]
+    async fn migration_is_skipped_on_an_unverified_recovery_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("orphan-row", None, "{}")],
+        );
+
+        let store = open(&db).with_open_provenance_for_test(OpenProvenance::ChecksumConfigMismatch);
+        store
+            .init("alpha")
+            .await
+            .expect("recovery open still opens");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert!(!report.run);
+        assert_eq!(report.skipped_reason.as_deref(), Some("unverified_open"));
+        assert_eq!(stored_namespace(&store, "orphan-row").await, None);
+        assert!(!table_exists(&store, "LegacyIdAlias").await);
+    }
+
+    #[tokio::test]
+    async fn a_missing_namespace_column_is_added_and_a_scoped_id_recovers_its_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl_without_namespace(),
+            &["CREATE (:Memory {id: 'gamma::3::src/lib.rs', content: 'c', user_id: 'auto-ingestor', memory_type: 'file', agent_name: 'unknown', location: 'src/lib.rs', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0], name: 'n'})"],
+        );
+
+        let store = open(&db);
+        store.init("gamma").await.expect("open adds the column");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 1);
+        assert_eq!(
+            stored_namespace(&store, "gamma::3::src/lib.rs")
+                .await
+                .as_deref(),
+            Some("gamma")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_unique_qualified_match_recovers_a_bare_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("src/lib.rs", None, "{}"),
+                &insert_row("delta::9::src/lib.rs", Some("delta"), "{}"),
+            ],
+        );
+
+        let store = open(&db);
+        store.init("delta").await.expect("unique match recovers");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 1);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(
+            stored_namespace(&store, "src/lib.rs").await.as_deref(),
+            Some("delta")
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_is_idempotent_across_two_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("recoverable", None, r#"{"namespace":"alpha"}"#),
+                &insert_row("alpha::9::recoverable", Some("alpha"), "{}"),
+                &insert_row("bare-id", Some("alpha"), "{}"),
+            ],
+        );
+
+        let first = open(&db);
+        first.init("alpha").await.expect("first open migrates");
+        let first_report = first.last_migration_report().expect("first report");
+        assert_eq!(first_report.null_namespace_recovered, 1);
+        assert_eq!(first_report.aliases_recorded, 1);
+        drop(first);
+
+        let second = open(&db);
+        second
+            .init("alpha")
+            .await
+            .expect("second open re-runs safely");
+        let second_report = second.last_migration_report().expect("second report");
+        assert!(second_report.run);
+        assert_eq!(second_report.null_namespace_recovered, 0);
+        assert_eq!(second_report.quarantined, 0);
+        assert_eq!(second_report.aliases_recorded, 0);
+        assert_eq!(second_report.skipped_reason, None);
+        assert_eq!(count_memory(&second, "m.namespace IS NOT NULL").await, 3);
+        assert_eq!(count_memory(&second, "m.namespace = 'alpha'").await, 3);
+    }
+
+    /// Fix 1 (`#408`): a staged generation's upsert keeps its generation-scoped
+    /// id even when the logical path was written by an older binary as a bare
+    /// id. Rewriting it to the live bare row would let `abort_generation` leave
+    /// the mutation behind, so the staged row must be its own row.
+    #[tokio::test]
+    async fn a_staged_generation_upsert_leaves_the_legacy_bare_row_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs"),
+            "the migration records the legacy row's canonical identity"
+        );
+
+        let generation = store.begin_generation("alpha", "docs").await.unwrap();
+        let staged_id =
+            crate::parser::ingest::generation_scoped_id("alpha", generation, "src/main.rs");
+        store
+            .upsert(
+                "alpha",
+                &staged_id,
+                vec![0.0; DIMS],
+                row_payload("staged write"),
+            )
+            .await
+            .expect("a staged upsert lands");
+
+        let (_, bare) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("bare lookup")
+            .expect("the legacy row still exists");
+        assert_eq!(
+            bare.content, "content-src/main.rs",
+            "a staged write must not mutate the live legacy bare row"
+        );
+        assert!(
+            store
+                .get("alpha", &staged_id)
+                .await
+                .expect("staged lookup")
+                .is_some(),
+            "the staged row keeps its generation-scoped id"
+        );
+
+        store
+            .abort_generation("alpha", "docs", generation)
+            .await
+            .expect("abort discards the staged generation");
+        assert!(
+            store
+                .get("alpha", &staged_id)
+                .await
+                .expect("post-abort lookup")
+                .is_none(),
+            "abort removes the staged row"
+        );
+        let (_, bare) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("bare lookup after abort")
+            .expect("the legacy row survives the abort");
+        assert_eq!(
+            bare.content, "content-src/main.rs",
+            "the live bare row is untouched by the whole staged cycle"
+        );
+    }
+
+    /// A legacy identity bridge follows the generation that owns the path
+    /// now: gen 1 archives the bare row and repoints the qualified id at
+    /// itself, and a gen 2 re-ingest of the same path must repoint the
+    /// bridge again — never leave it frozen on a superseded generation.
+    #[tokio::test]
+    async fn a_superseded_legacy_id_repoints_to_each_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs"),
+            "the migration records the legacy row's canonical identity"
+        );
+
+        let first = store.begin_generation("alpha", "docs").await.unwrap();
+        let first_id = crate::parser::ingest::generation_scoped_id("alpha", first, "src/main.rs");
+        store
+            .upsert("alpha", &first_id, vec![0.0; DIMS], row_payload("gen one"))
+            .await
+            .expect("stage gen 1");
+        store
+            .publish_generation("alpha", "docs", first)
+            .await
+            .expect("publish gen 1");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some(first_id.as_str()),
+            "the bridge follows the generation that archived the bare row"
+        );
+        let (_, via_alias) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("qualified read")
+            .expect("gen 1 row found through the bridge");
+        assert_eq!(via_alias.content, "gen one");
+
+        let second = store.begin_generation("alpha", "docs").await.unwrap();
+        let second_id = crate::parser::ingest::generation_scoped_id("alpha", second, "src/main.rs");
+        store
+            .upsert("alpha", &second_id, vec![0.0; DIMS], row_payload("gen two"))
+            .await
+            .expect("stage gen 2");
+        store
+            .publish_generation("alpha", "docs", second)
+            .await
+            .expect("publish gen 2");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some(second_id.as_str()),
+            "each new generation repoints the legacy bridge at its own row"
+        );
+        let (_, via_alias) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("qualified read")
+            .expect("gen 2 row found through the bridge");
+        assert_eq!(via_alias.content, "gen two");
+    }
+
+    /// A publication in a store no legacy bare row ever touched must not
+    /// fabricate an identity bridge: the staged row's own scoped id is the
+    /// identity, and a path-level alias would redirect live-generation reads
+    /// and foreign-surface writes onto it.
+    #[tokio::test]
+    async fn a_modern_publication_records_no_alias_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fresh.lbug");
+        seed(&db, &memory_ddl("id"), &[]);
+
+        let store = open(&db);
+        store.init("alpha").await.expect("store opens");
+        let generation = store.begin_generation("alpha", "docs").await.unwrap();
+        let staged_id =
+            crate::parser::ingest::generation_scoped_id("alpha", generation, "src/main.rs");
+        store
+            .upsert(
+                "alpha",
+                &staged_id,
+                vec![0.0; DIMS],
+                row_payload("fresh write"),
+            )
+            .await
+            .expect("stage the row");
+        store
+            .publish_generation("alpha", "docs", generation)
+            .await
+            .expect("publish");
+
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await,
+            None,
+            "no legacy bare row existed, so no bridge is fabricated for the path"
+        );
+        let evidence_id = staged_id.clone();
+        let fabricated_evidence = store
+            .with_conn(move |conn| {
+                quarantined_superseded_row_exists(conn, generation, &evidence_id)
+            })
+            .await
+            .expect("quarantine evidence query");
+        assert!(
+            !fabricated_evidence,
+            "a staged row with no legacy bare predecessor leaves no quarantine evidence"
+        );
+        assert!(
+            store
+                .get("alpha", &staged_id)
+                .await
+                .expect("staged lookup")
+                .is_some(),
+            "the row keeps its own generation-scoped identity"
+        );
+    }
+
+    /// Fix 2 (`#408`): a transient alias-table read failure must not be cached
+    /// as an empty map. The next upsert retries the load and resolves the
+    /// legacy row instead of creating a duplicate.
+    #[tokio::test]
+    async fn a_transient_alias_load_failure_is_retried_on_the_next_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        store
+            .legacy_alias_load_failures
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+
+        store
+            .upsert(
+                "alpha",
+                "alpha::7::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("first attempt"),
+            )
+            .await
+            .expect_err("a failed alias load must fail closed on the write");
+        let (_, bare) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("bare lookup")
+            .expect("the legacy row still exists");
+        assert_eq!(
+            bare.content, "content-src/main.rs",
+            "the failed load must not resolve the alias"
+        );
+        assert_eq!(
+            count_memory(&store, "m.namespace = 'alpha'").await,
+            1,
+            "a failed load must not create a duplicate row"
+        );
+
+        store
+            .upsert(
+                "alpha",
+                "alpha::7::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("retried"),
+            )
+            .await
+            .expect("the retry loads the alias");
+        let (_, bare) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("bare lookup after retry")
+            .expect("the legacy row still exists");
+        assert_eq!(
+            bare.content, "retried",
+            "the retried load resolves the write onto the legacy row"
+        );
+    }
+
+    /// Fix 3 (`#408`): when a scoped/canonical counterpart already owns the
+    /// identity, recording the bare row as its alias would divert a later
+    /// qualified re-ingest away from the scoped row. The alias is skipped.
+    #[tokio::test]
+    async fn a_scoped_counterpart_suppresses_the_legacy_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("src/main.rs", Some("alpha"), "{}"),
+                &insert_row("alpha::src/main.rs", Some("alpha"), "{}"),
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert!(
+            alias_target(&store, "alpha::src/main.rs").await.is_none(),
+            "the scoped counterpart already owns the canonical identity"
+        );
+
+        store
+            .upsert(
+                "alpha",
+                "alpha::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("scoped update"),
+            )
+            .await
+            .expect("the qualified upsert lands");
+
+        let (_, scoped) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("scoped lookup")
+            .expect("the scoped row exists");
+        assert_eq!(scoped.content, "scoped update");
+        let (_, bare) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("bare lookup")
+            .expect("the bare row still exists");
+        assert_eq!(
+            bare.content, "content-src/main.rs",
+            "the bare row is not the alias target"
+        );
+        assert_eq!(
+            count_memory(&store, "m.namespace = 'alpha'").await,
+            2,
+            "the qualified re-ingest updates the scoped row, no duplicate"
+        );
+    }
+
+    /// Ambiguity quarantine (`#408`): a bare id whose only namespace evidence
+    /// is two different namespaces cannot be assigned to either, so it is
+    /// quarantined instead of guessed into one of them.
+    #[tokio::test]
+    async fn a_bare_id_matching_two_namespaces_is_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("src/main.rs", None, "{}"),
+                &insert_row("alpha::5::src/main.rs", Some("alpha"), "{}"),
+                &insert_row("beta::5::src/main.rs", Some("beta"), "{}"),
+            ],
+        );
+
+        let store = open(&db);
+        store
+            .init("alpha")
+            .await
+            .expect("an ambiguous bare id never blocks the open");
+
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 0);
+        assert_eq!(report.quarantined, 1);
+        assert_eq!(
+            stored_namespace(&store, "src/main.rs").await.as_deref(),
+            Some(QUARANTINE_NAMESPACE)
+        );
+        assert!(
+            store
+                .get(QUARANTINE_NAMESPACE, "src/main.rs")
+                .await
+                .expect("ordinary quarantine lookup is refused")
+                .is_none(),
+            "quarantine is reserved from ordinary reads"
+        );
+        assert!(
+            store
+                .get_quarantined("src/main.rs")
+                .await
+                .expect("recovery lookup")
+                .is_some(),
+            "the ambiguous row is still reachable through the recovery path"
+        );
+    }
+
+    /// A metadata claim that contradicts trusted structural ownership must not
+    /// expose the row under the tenant it names.
+    #[tokio::test]
+    async fn a_conflicting_metadata_claim_is_quarantined_not_exposed_to_another_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row(
+                "alpha::7::src/main.rs",
+                None,
+                r#"{"namespace":"beta"}"#,
+            )],
+        );
+
+        let store = open(&db);
+        store
+            .init("alpha")
+            .await
+            .expect("migration never blocks open");
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 0);
+        assert_eq!(report.quarantined, 1);
+
+        assert_eq!(
+            stored_namespace(&store, "alpha::7::src/main.rs")
+                .await
+                .as_deref(),
+            Some(QUARANTINE_NAMESPACE)
+        );
+        assert!(store
+            .get("beta", "alpha::7::src/main.rs")
+            .await
+            .expect("beta lookup")
+            .is_none());
+        assert!(store
+            .get_quarantined("alpha::7::src/main.rs")
+            .await
+            .expect("recovery lookup")
+            .is_some());
+    }
+
+    /// Foreign-mesh provenance makes the row sovereign: recovery may not
+    /// rewrite its namespace or quarantine it.
+    #[tokio::test]
+    async fn a_protected_null_namespace_row_is_never_rewritten_or_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row(
+                "imported-row",
+                None,
+                r#"{"namespace":"beta","mesh":{"origin":"foreign"}}"#,
+            )],
+        );
+
+        let store = open(&db);
+        store
+            .init("alpha")
+            .await
+            .expect("migration never blocks open");
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 0);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(stored_namespace(&store, "imported-row").await, None);
+        assert_eq!(
+            count_memory(&store, &format!("m.namespace = '{QUARANTINE_NAMESPACE}'")).await,
+            0
+        );
+    }
+
+    /// A protected NULL-namespace row whose scoped id corroborates the owner
+    /// named in metadata is recovered, but its metadata is left byte-identical.
+    #[tokio::test]
+    async fn a_protected_null_namespace_row_with_corroborated_owner_is_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let metadata = r#"{"namespace":"beta","mesh":{"origin":"foreign"},"kept":"yes"}"#;
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("beta::7::imported-row", None, metadata)],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 1);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(
+            stored_namespace(&store, "beta::7::imported-row")
+                .await
+                .as_deref(),
+            Some("beta")
+        );
+        assert_eq!(
+            stored_metadata(&store, "beta::7::imported-row")
+                .await
+                .as_deref(),
+            Some(metadata),
+            "recovery changes only the namespace, never protected metadata"
+        );
+    }
+
+    /// A protected row whose structural owner contradicts its metadata claim
+    /// is left exactly where the older binary put it, not moved into either
+    /// tenant and not quarantined.
+    #[tokio::test]
+    async fn a_protected_null_namespace_row_with_conflicting_owner_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let metadata = r#"{"namespace":"beta","mesh":{"origin":"foreign"}}"#;
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("alpha::7::imported-row", None, metadata)],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let report = store.last_migration_report().expect("migration report");
+        assert_eq!(report.null_namespace_recovered, 0);
+        assert_eq!(report.quarantined, 0);
+        assert_eq!(
+            stored_namespace(&store, "alpha::7::imported-row").await,
+            None
+        );
+        assert_eq!(
+            stored_metadata(&store, "alpha::7::imported-row")
+                .await
+                .as_deref(),
+            Some(metadata)
+        );
+    }
+
+    /// A crash between the two auto-committed renames must not make the store
+    /// look empty on the next open.
+    #[tokio::test]
+    async fn an_interrupted_primary_key_rebuild_is_resumed_on_the_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let legacy_ddl = memory_ddl("name").replace("TABLE Memory ", "TABLE Memory__legacy408 ");
+        let ledger_ddl = "CREATE NODE TABLE RebuildState408 (artifact STRING, original STRING, phase STRING, PRIMARY KEY (artifact))";
+        let scratch = "CREATE (:RebuildState408 {artifact: 'Memory__rebuild408', original: 'Memory', phase: 'scratch'})";
+        let backup = "CREATE (:RebuildState408 {artifact: 'Memory__legacy408', original: 'Memory', phase: 'backup'})";
+        let legacy_row = insert_row("legacy-file", Some("alpha"), "{}")
+            .replace("(:Memory", "(:Memory__legacy408");
+        seed(
+            &db,
+            &legacy_ddl,
+            &[ledger_ddl, scratch, backup, &legacy_row],
+        );
+
+        let store = open(&db);
+        store
+            .init("alpha")
+            .await
+            .expect("interrupted rebuild recovers");
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.pk_rebuilt);
+        assert_eq!(count_memory(&store, "true").await, 1);
+        assert!(store
+            .get("alpha", "legacy-file")
+            .await
+            .expect("recovered lookup")
+            .is_some());
+    }
+
+    /// Cleanup now follows the migration ledger, never a name suffix.
+    #[tokio::test]
+    async fn a_user_table_with_a_rebuild_suffix_survives_a_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[
+                "CREATE NODE TABLE UserNotes__rebuild408 (id STRING, note STRING, PRIMARY KEY (id))",
+                &insert_row("legacy-file", Some("alpha"), "{}"),
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert!(store.last_migration_report().expect("report").pk_rebuilt);
+        assert!(
+            table_exists(&store, "UserNotes__rebuild408").await,
+            "a user-owned table is never dropped because of its name"
+        );
+    }
+
+    /// Duplicate legacy ids must not collapse two distinct endpoints into one
+    /// rebuilt node.
+    #[tokio::test]
+    async fn duplicate_legacy_ids_map_each_row_to_its_own_edge_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let first = "CREATE (:Memory {id: 'dup', namespace: 'alpha', content: 'first', user_id: 'u', memory_type: 'file', agent_name: 'x', location: 'a', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0], name: 'first'})";
+        let second = "CREATE (:Memory {id: 'dup', namespace: 'alpha', content: 'second', user_id: 'u', memory_type: 'file', agent_name: 'x', location: 'b', location_lines: '', metadata: '{}', embedding: [0.0,0.0,0.0,0.0], name: 'second'})";
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[
+                rel_table_ddl(),
+                first,
+                second,
+                "MATCH (a:Memory {name: 'first'}), (b:Memory {name: 'second'}) CREATE (a)-[:RELATES_TO {source: 'alpha'}]->(b)",
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert_eq!(edge_count(&store).await, 1);
+        let endpoints: Vec<(String, String)> = store
+            .with_conn(|conn| {
+                let mut rows =
+                    conn.query("MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) RETURN a.id, b.id")?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    if let (Some(lbug::Value::String(a)), Some(lbug::Value::String(b))) =
+                        (row.get(0), row.get(1))
+                    {
+                        out.push((a.clone(), b.clone()));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .expect("endpoint query");
+        assert_eq!(endpoints.len(), 1);
+        assert_ne!(
+            endpoints[0].0, endpoints[0].1,
+            "each source row keeps its id"
+        );
+    }
+
+    /// A protected canonical row keeps its identity but is never an alias
+    /// target; the bare row must not be aliased onto it either.
+    #[tokio::test]
+    async fn a_protected_canonical_row_suppresses_the_bare_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("src/main.rs", Some("alpha"), "{}"),
+                &insert_row(
+                    "alpha::src/main.rs",
+                    Some("alpha"),
+                    r#"{"mesh":{"origin":"foreign"}}"#,
+                ),
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert!(
+            alias_target(&store, "alpha::src/main.rs").await.is_none(),
+            "the protected canonical row suppresses the alias"
+        );
+    }
+
+    #[test]
+    fn row_is_protected_distinguishes_external_origin_from_local_annotations() {
+        assert!(row_is_protected(Some(r#"{"mesh":{"origin":"foreign"}}"#)));
+        assert!(row_is_protected(Some(
+            r#"{"mesh":{"origin":"mesh-import"}}"#
+        )));
+        assert!(!row_is_protected(Some(r#"{"mesh":{"conflict":true}}"#)));
+        assert!(!row_is_protected(Some(r#"{"mesh":{"update_id":"u-1"}}"#)));
+        assert!(row_is_protected(Some(r#"{"eligibility":"private"}"#)));
+        assert!(row_is_protected(Some("not-json")));
+    }
+
+    /// A protected bare legacy row is aliased so qualified reads find it, but
+    /// the writer turn refuses to overwrite it through that identity.
+    #[tokio::test]
+    async fn a_protected_bare_legacy_row_is_aliased_for_reads_but_not_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row(
+                "src/main.rs",
+                Some("alpha"),
+                r#"{"mesh":{"origin":"foreign"},"kept":"yes"}"#,
+            )],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs")
+        );
+        let (_, before) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("qualified read")
+            .expect("protected legacy row found through its alias");
+        assert_eq!(before.content, "content-src/main.rs");
+
+        let error = store
+            .upsert(
+                "alpha",
+                "alpha::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("overwrite"),
+            )
+            .await
+            .expect_err("a protected alias target must not be overwritten");
+        assert!(error.to_string().contains("protected"), "{error}");
+        let (_, after) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("qualified read after refusal")
+            .expect("row remains");
+        assert_eq!(after.content, before.content);
+        assert_eq!(
+            count_memory(&store, "m.namespace = 'alpha'").await,
+            1,
+            "a refused re-ingest must not create a duplicate"
+        );
+    }
+
+    /// Direct stewardship by the exact stored id remains allowed; only an
+    /// alias that would redirect a different requested id is refused.
+    #[tokio::test]
+    async fn a_protected_legacy_row_can_be_stewarded_by_its_exact_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row(
+                "src/main.rs",
+                Some("alpha"),
+                r#"{"eligibility":"private"}"#,
+            )],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        store
+            .upsert(
+                "alpha",
+                "src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("stewarded"),
+            )
+            .await
+            .expect("the owner may update the exact protected row");
+        let (_, payload) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("direct read")
+            .expect("row remains");
+        assert_eq!(payload.content, "stewarded");
+    }
+
+    /// The read alias never authorizes deletion of sovereign content.
+    #[tokio::test]
+    async fn a_protected_bare_legacy_row_cannot_be_deleted_through_its_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row(
+                "src/main.rs",
+                Some("alpha"),
+                r#"{"mesh":{"origin":"foreign"}}"#,
+            )],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let error = store
+            .delete("alpha", "alpha::src/main.rs")
+            .await
+            .expect_err("a protected alias target must not be deleted");
+        assert!(error.to_string().contains("protected"), "{error}");
+        assert_eq!(
+            stored_namespace(&store, "src/main.rs").await.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_qualified_delete_removes_the_aliased_legacy_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert!(alias_target(&store, "alpha::src/main.rs").await.is_some());
+        store
+            .delete("alpha", "alpha::src/main.rs")
+            .await
+            .expect("qualified delete resolves the alias");
+        assert_eq!(count_memory(&store, "true").await, 0);
+    }
+
+    #[tokio::test]
+    async fn get_many_returns_the_requested_id_for_an_aliased_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let requested = "alpha::src/main.rs".to_string();
+        let rows = store
+            .get_many(&["alpha"], &[requested.clone()])
+            .await
+            .expect("get_many");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, requested);
+    }
+
+    #[tokio::test]
+    async fn quarantined_rows_are_invisible_to_ordinary_list_search_and_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("orphan-row", None, "{}")],
+        );
+
+        let store = open(&db);
+        store
+            .init("alpha")
+            .await
+            .expect("quarantine never blocks open");
+        assert_eq!(store.last_migration_report().unwrap().quarantined, 1);
+
+        assert!(store
+            .list(QUARANTINE_NAMESPACE, None, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .search(QUARANTINE_NAMESPACE, vec![0.0; DIMS], 10, false, false)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .get_many(&[QUARANTINE_NAMESPACE], &["orphan-row".to_string()])
+            .await
+            .unwrap()
+            .is_empty());
+        let graph = store
+            .export_graph(false, true, &std::collections::HashMap::new(), None)
+            .await
+            .expect("export");
+        assert!(
+            !graph.to_string().contains("orphan-row"),
+            "quarantined rows never enter an ordinary graph export"
+        );
+    }
+
+    /// An expired marker is not an in-flight generation: its scoped write must
+    /// be rejected instead of falling through to the live legacy row.
+    #[tokio::test]
+    async fn an_expired_staging_marker_rejects_a_generation_scoped_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(dir.path().join("staging.lbug"), DIMS).unwrap();
+        store.init("alpha").await.unwrap();
+        let generation = store.begin_generation("alpha", "source-a").await.unwrap();
+        let id = crate::parser::ingest::generation_scoped_id("alpha", generation, "src/a.rs");
+        let aged = chrono::Utc::now().timestamp() - STAGING_TTL_SECS - 60;
+        store
+            .with_conn(move |conn| {
+                conn.query(&format!(
+                    "MATCH (s:StagingGeneration) WHERE s.generation = {generation} SET s.created_at = {aged}"
+                ))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let error = store
+            .upsert("alpha", &id, vec![0.0; DIMS], row_payload("too late"))
+            .await
+            .expect_err("an expired staging marker rejects the write");
+        assert!(
+            error.to_string().contains("expired"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // PR #456 Wave 1 regression tests (#1, #2, #3, #4, #5, #10, #13).
+    // ---------------------------------------------------------------------
+
+    fn rel_ddl_named(table: &str, from: &str, to: &str) -> String {
+        format!("CREATE REL TABLE {table} (FROM {from} TO {to}, source STRING)")
+    }
+
+    fn insert_row_into(table: &str, id: &str, namespace: Option<&str>, metadata: &str) -> String {
+        insert_row(id, namespace, metadata).replace("(:Memory", &format!("(:{table}"))
+    }
+
+    fn rebuild_state_ddl() -> &'static str {
+        "CREATE NODE TABLE RebuildState408 (artifact STRING, original STRING, phase STRING, PRIMARY KEY (artifact))"
+    }
+
+    fn rebuild_state_row(artifact: &str, original: &str, phase: &str) -> String {
+        format!(
+            "CREATE (:RebuildState408 {{artifact: '{}', original: '{}', phase: '{}'}})",
+            escape_ladybug_string(artifact),
+            escape_ladybug_string(original),
+            escape_ladybug_string(phase)
+        )
+    }
+
+    async fn query_count(store: &LadybugStore, query: String) -> i64 {
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&query)?;
+                Ok(rows
+                    .next()
+                    .and_then(|row| match row.first() {
+                        Some(lbug::Value::Int64(n)) => Some(*n),
+                        _ => None,
+                    })
+                    .unwrap_or(-1))
+            })
+            .await
+            .expect("count query")
+    }
+
+    /// How many rebuild-ledger rows name `artifact`. A ledger that does not
+    /// exist at all has no such row: that is the expected #M4 outcome for a
+    /// collision refused before the first ledger write.
+    async fn rebuild_ledger_rows(store: &LadybugStore, artifact: &str) -> i64 {
+        let artifact = artifact.to_string();
+        store
+            .with_conn(move |conn| {
+                let query = format!(
+                    "MATCH (a:{REBUILD_STATE_TABLE}) WHERE a.artifact = '{}' RETURN count(a)",
+                    escape_ladybug_string(&artifact)
+                );
+                match conn.query(&query) {
+                    Ok(mut rows) => Ok(rows
+                        .next()
+                        .and_then(|row| match row.first() {
+                            Some(lbug::Value::Int64(n)) => Some(*n),
+                            _ => None,
+                        })
+                        .unwrap_or(-1)),
+                    Err(error)
+                        if error.to_string().to_lowercase().contains("does not exist")
+                            || error.to_string().to_lowercase().contains("not found") =>
+                    {
+                        Ok(0)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            })
+            .await
+            .expect("ledger query")
+    }
+
+    async fn stored_int(store: &LadybugStore, query: String, column: usize) -> Option<i64> {
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&query)?;
+                Ok(rows
+                    .next()
+                    .and_then(|row| format!("{}", row[column]).parse::<i64>().ok()))
+            })
+            .await
+            .expect("scalar query")
+    }
+
+    async fn stored_string(store: &LadybugStore, query: String) -> Option<String> {
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&query)?;
+                Ok(rows.next().and_then(|row| match row.first() {
+                    Some(lbug::Value::String(value)) => Some(value.clone()),
+                    _ => None,
+                }))
+            })
+            .await
+            .expect("string query")
+    }
+
+    /// A list-of-lists property, each inner list flattened to its string cells
+    /// with `None` for a NULL entry (recommended #3).
+    async fn stored_nested(store: &LadybugStore, query: String) -> Vec<Vec<Option<String>>> {
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&query)?;
+                let Some(row) = rows.next() else {
+                    return Ok(Vec::new());
+                };
+                let outer = match row.first() {
+                    Some(lbug::Value::List(_, values)) | Some(lbug::Value::Array(_, values)) => {
+                        values.clone()
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(outer
+                    .iter()
+                    .map(|value| match value {
+                        lbug::Value::List(_, inner) | lbug::Value::Array(_, inner) => inner
+                            .iter()
+                            .map(|cell| match cell {
+                                lbug::Value::Null(_) => None,
+                                lbug::Value::String(text) => Some(text.clone()),
+                                other => Some(format!("{other}")),
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                    .collect())
+            })
+            .await
+            .expect("nested query")
+    }
+
+    async fn stored_list(store: &LadybugStore, query: String) -> Vec<Option<String>> {
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&query)?;
+                let Some(row) = rows.next() else {
+                    return Ok(Vec::new());
+                };
+                let values = match row.first() {
+                    Some(lbug::Value::List(_, values)) | Some(lbug::Value::Array(_, values)) => {
+                        values.clone()
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(values
+                    .iter()
+                    .map(|value| match value {
+                        lbug::Value::Null(_) => None,
+                        lbug::Value::String(text) => Some(text.clone()),
+                        other => Some(format!("{other}")),
+                    })
+                    .collect())
+            })
+            .await
+            .expect("list query")
+    }
+
+    async fn edge_endpoints(store: &LadybugStore, table: &str) -> Vec<(String, String)> {
+        let table = table.to_string();
+        store
+            .with_conn(move |conn| {
+                let mut rows = conn.query(&format!(
+                    "MATCH (a:Memory)-[r:{table}]->(b:Memory) RETURN a.id, b.id"
+                ))?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next() {
+                    if let (Some(lbug::Value::String(a)), Some(lbug::Value::String(b))) =
+                        (row.get(0), row.get(1))
+                    {
+                        out.push((a.clone(), b.clone()));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .expect("endpoint query")
+    }
+
+    /// #2: an unverified recovery open must refuse a store whose ledger shows
+    /// an interrupted rebuild instead of creating a fresh `Memory` table.
+    #[tokio::test]
+    async fn an_unverified_open_refuses_a_pending_rebuild_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            rebuild_state_ddl(),
+            &[
+                &rebuild_state_row("Memory__rebuild408", "Memory", "scratch"),
+                &rebuild_state_row("Memory__legacy408", "Memory", "backup"),
+            ],
+        );
+
+        let store = open(&db).with_open_provenance_for_test(OpenProvenance::ChecksumConfigMismatch);
+        let error = store
+            .init("alpha")
+            .await
+            .expect_err("an unverified open refuses a pending rebuild");
+        assert!(
+            error
+                .downcast_ref::<LegacyPrimaryKeyMigrationError>()
+                .is_some(),
+            "unexpected error: {error}"
+        );
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.run);
+        assert_eq!(
+            report.skipped_reason.as_deref(),
+            Some("primary_key: interrupted rebuild requires a verified open before access")
+        );
+        assert!(
+            !table_exists(&store, "Memory").await,
+            "an unverified open must never create a fresh Memory table over an interrupted swap"
+        );
+    }
+
+    /// #3(a): a crash after the node swap but before the relationship swap
+    /// must roll back both sides together, preserving the legacy topology.
+    #[tokio::test]
+    async fn an_interrupted_swap_rolls_back_nodes_and_edges_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let legacy_ddl = memory_ddl("name").replace("TABLE Memory ", "TABLE Memory__legacy408 ");
+        let rebuilt_rel = rel_ddl_named("RELATES_TO", "Memory", "Memory");
+        let rebuild_rel = rel_ddl_named("RELATES_TO__rebuild408", "Memory", "Memory");
+        let legacy_rel = rel_ddl_named(
+            "RELATES_TO__legacy408",
+            "Memory__legacy408",
+            "Memory__legacy408",
+        );
+        let rebuilt_edge = "MATCH (a:Memory {id: 'a'}), (b:Memory {id: 'b'}) CREATE (a)-[:RELATES_TO {source: 'alpha'}]->(b)";
+        let scratch_edge = "MATCH (a:Memory {id: 'a'}), (b:Memory {id: 'b'}) CREATE (a)-[:RELATES_TO__rebuild408 {source: 'alpha'}]->(b)";
+        let legacy_edge = "MATCH (a:Memory__legacy408 {id: 'x'}), (b:Memory__legacy408 {id: 'y'}) CREATE (a)-[:RELATES_TO__legacy408 {source: 'alpha'}]->(b)";
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &rebuilt_rel,
+                &insert_row("a", Some("alpha"), "{}"),
+                &insert_row("b", Some("alpha"), "{}"),
+                rebuilt_edge,
+                &rebuild_rel,
+                scratch_edge,
+                &legacy_ddl,
+                &legacy_rel,
+                &insert_row_into("Memory__legacy408", "x", Some("alpha"), "{}"),
+                &insert_row_into("Memory__legacy408", "y", Some("alpha"), "{}"),
+                legacy_edge,
+                rebuild_state_ddl(),
+                &rebuild_state_row("Memory__rebuild408", "Memory", "scratch"),
+                &rebuild_state_row("Memory__legacy408", "Memory", "backup"),
+                &rebuild_state_row("RELATES_TO__rebuild408", "RELATES_TO", "scratch"),
+                &rebuild_state_row("RELATES_TO__legacy408", "RELATES_TO", "backup"),
+                &rebuild_state_row("__swap_commit__", "Memory", "swapping"),
+            ],
+        );
+
+        let store = open(&db);
+        store
+            .init("alpha")
+            .await
+            .expect("interrupted swap recovers");
+
+        assert_eq!(count_memory(&store, "true").await, 2);
+        let mut ids = edge_endpoints(&store, "RELATES_TO").await;
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![("x".to_string(), "y".to_string())],
+            "the rebuilt nodes and mismatched edges must both be rolled back"
+        );
+        assert_eq!(edge_count(&store).await, 1);
+        assert!(!table_exists(&store, "Memory__legacy408").await);
+        assert!(!table_exists(&store, "RELATES_TO__legacy408").await);
+        assert_eq!(
+            query_count(
+                &store,
+                "MATCH (a:RebuildState408) RETURN count(a)".to_string()
+            )
+            .await,
+            0,
+            "recovery clears the ledger it acted on"
+        );
+    }
+
+    /// #3(b): a committed swap (sentinel present) is never rolled back; the
+    /// remaining backups are dropped and the rebuilt tables keep serving.
+    #[tokio::test]
+    async fn a_committed_swap_drops_backups_without_rolling_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let legacy_ddl = memory_ddl("name").replace("TABLE Memory ", "TABLE Memory__legacy408 ");
+        let legacy_rel = rel_ddl_named(
+            "RELATES_TO__legacy408",
+            "Memory__legacy408",
+            "Memory__legacy408",
+        );
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &rel_ddl_named("RELATES_TO", "Memory", "Memory"),
+                &insert_row("a", Some("alpha"), "{}"),
+                &insert_row("b", Some("alpha"), "{}"),
+                "MATCH (a:Memory {id: 'a'}), (b:Memory {id: 'b'}) CREATE (a)-[:RELATES_TO {source: 'alpha'}]->(b)",
+                &legacy_ddl,
+                &legacy_rel,
+                &insert_row_into("Memory__legacy408", "x", Some("alpha"), "{}"),
+                rebuild_state_ddl(),
+                &rebuild_state_row("Memory__legacy408", "Memory", "backup"),
+                &rebuild_state_row("RELATES_TO__legacy408", "RELATES_TO", "backup"),
+                &rebuild_state_row("__swap_commit__", "Memory", "committed"),
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("committed swap recovers");
+
+        assert_eq!(count_memory(&store, "true").await, 2);
+        assert_eq!(edge_count(&store).await, 1);
+        assert_eq!(
+            edge_endpoints(&store, "RELATES_TO").await,
+            vec![("a".to_string(), "b".to_string())],
+            "a committed swap keeps the rebuilt topology"
+        );
+        assert!(!table_exists(&store, "Memory__legacy408").await);
+        assert!(!table_exists(&store, "RELATES_TO__legacy408").await);
+        assert_eq!(
+            query_count(
+                &store,
+                "MATCH (a:RebuildState408) RETURN count(a)".to_string()
+            )
+            .await,
+            0
+        );
+    }
+
+    /// #5: a ledger row whose table was never created cannot block recovery,
+    /// and a recorded scratch table is dropped with its ledger row.
+    #[tokio::test]
+    async fn a_recorded_scratch_without_a_table_recovers_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            rebuild_state_ddl(),
+            &[
+                &rebuild_state_row("Memory__rebuild408", "Memory", "scratch"),
+                &rebuild_state_row("RELATES_TO__rebuild408", "RELATES_TO", "scratch"),
+            ],
+        );
+
+        let store = open(&db);
+        store
+            .init("alpha")
+            .await
+            .expect("a missing scratch table never blocks the open");
+        assert!(
+            table_exists(&store, "Memory").await,
+            "the open creates the store it was going to create anyway"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                "MATCH (a:RebuildState408) RETURN count(a)".to_string()
+            )
+            .await,
+            0
+        );
+    }
+
+    /// #5: a recorded scratch table that does exist is removed with its row.
+    #[tokio::test]
+    async fn a_recorded_scratch_table_is_removed_with_its_ledger_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            rebuild_state_ddl(),
+            &[
+                "CREATE NODE TABLE Memory__rebuild408 (id STRING, note STRING, PRIMARY KEY (id))",
+                "CREATE (:Memory__rebuild408 {id: 'stray', note: 'left behind'})",
+                &rebuild_state_row("Memory__rebuild408", "Memory", "scratch"),
+            ],
+        );
+
+        let store = open(&db);
+        store
+            .init("alpha")
+            .await
+            .expect("a recorded scratch table is cleaned up");
+        assert!(!table_exists(&store, "Memory__rebuild408").await);
+        assert_eq!(
+            query_count(
+                &store,
+                "MATCH (a:RebuildState408) RETURN count(a)".to_string()
+            )
+            .await,
+            0
+        );
+    }
+
+    /// #4: NULL entries inside list/array properties survive the copy with
+    /// their positions and length intact.
+    #[tokio::test]
+    async fn null_list_entries_survive_the_primary_key_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let ddl = format!(
+            "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{DIMS}], name STRING, tags STRING[], PRIMARY KEY(name))"
+        );
+        let row = |id: &str, name: &str, tags: &str| {
+            format!(
+                "CREATE (:Memory {{id: '{}', namespace: 'alpha', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'x', location: 'a', location_lines: '', metadata: '{{}}', embedding: [0.0,0.0,0.0,0.0], name: '{}', tags: {}}})",
+                escape_ladybug_string(id),
+                escape_ladybug_string(name),
+                tags
+            )
+        };
+        seed(
+            &db,
+            &ddl,
+            &[
+                "CREATE REL TABLE RELATES_TO (FROM Memory TO Memory, source STRING, tags STRING[])",
+                &row("a", "n-a", "['keep', NULL, 'tail']"),
+                &row("b", "n-b", "['only']"),
+                "MATCH (a:Memory {name: 'n-a'}), (b:Memory {name: 'n-b'}) CREATE (a)-[:RELATES_TO {source: 'alpha', tags: ['edge', NULL]}]->(b)",
+            ],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+
+        let tags = stored_list(
+            &store,
+            "MATCH (m:Memory {id: 'a'}) RETURN m.tags".to_string(),
+        )
+        .await;
+        assert_eq!(
+            tags,
+            vec![Some("keep".to_string()), None, Some("tail".to_string())],
+            "a NULL entry keeps its position and the list keeps its length"
+        );
+        let edge_tags = stored_list(
+            &store,
+            "MATCH ()-[r:RELATES_TO]->() RETURN r.tags".to_string(),
+        )
+        .await;
+        assert_eq!(
+            edge_tags,
+            vec![Some("edge".to_string()), None],
+            "relationship list properties preserve NULL entries too"
+        );
+    }
+
+    /// #13: a rebuild failure keeps the typed refusal and the report that
+    /// explains it.
+    #[tokio::test]
+    async fn a_rebuild_failure_reports_a_typed_primary_key_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[
+                "CREATE NODE TABLE Memory__rebuild408 (id STRING, note STRING, PRIMARY KEY (id))",
+                &insert_row("legacy-file", Some("alpha"), "{}"),
+            ],
+        );
+
+        let store = open(&db);
+        let error = store
+            .init("alpha")
+            .await
+            .expect_err("the scratch-name collision refuses the rebuild");
+        assert!(
+            error
+                .downcast_ref::<LegacyPrimaryKeyMigrationError>()
+                .is_some(),
+            "unexpected error: {error}"
+        );
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.run);
+        assert!(
+            report
+                .skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("primary_key:"),
+            "unexpected report: {report:?}"
+        );
+    }
+
+    /// #10: replaying a stale publication marker must never roll the pointer
+    /// back from a newer active generation.
+    #[tokio::test]
+    async fn a_stale_publication_marker_never_rolls_back_a_newer_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("generations.lbug");
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store.init("alpha").await.unwrap();
+
+        let source = "source-a";
+        let first = store.begin_generation("alpha", source).await.unwrap();
+        store
+            .publish_generation("alpha", source, first)
+            .await
+            .unwrap();
+
+        store
+            .upsert(
+                "alpha",
+                "src/keep.rs",
+                vec![0.0; DIMS],
+                row_payload("legacy keep"),
+            )
+            .await
+            .unwrap();
+        let second = store.begin_generation("alpha", source).await.unwrap();
+        let second_row =
+            crate::parser::ingest::generation_scoped_id("alpha", second, "src/keep.rs");
+        store
+            .upsert(
+                "alpha",
+                &second_row,
+                vec![0.0; DIMS],
+                row_payload("second keep"),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("alpha", source, second)
+            .await
+            .unwrap();
+        assert_eq!(
+            alias_target(&store, "alpha::src/keep.rs").await.as_deref(),
+            Some(second_row.as_str())
+        );
+
+        let marker = publication_marker_id("alpha", source, first);
+        let staging = format!(
+            "{}::{}",
+            crate::parser::ingest::generation_key("alpha", source),
+            first
+        );
+        let seed_conn = marker.clone();
+        let staging_seed = staging.clone();
+        store
+            .with_conn(move |conn| {
+                conn.query(&format!(
+                    "CREATE (:{PUBLICATION_STATE_TABLE} {{id: '{}', namespace: 'alpha', source_key: 'source-a', generation: {first}, phase: 'reconciling'}})",
+                    escape_ladybug_string(&seed_conn)
+                ))?;
+                conn.query(&format!(
+                    "CREATE (:StagingGeneration {{id: '{}', namespace: 'alpha', source_key: 'source-a', generation: {first}, base_generation: 0, created_at: {}}})",
+                    escape_ladybug_string(&staging_seed),
+                    chrono::Utc::now().timestamp()
+                ))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        drop(store);
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store.init("alpha").await.unwrap();
+
+        assert_eq!(
+            stored_int(
+                &store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{}'}}) RETURN g.active_generation",
+                    escape_ladybug_string(&crate::parser::ingest::generation_key("alpha", source))
+                ),
+                0
+            )
+            .await,
+            Some(second as i64),
+            "the newer generation stays active"
+        );
+        assert_eq!(
+            alias_target(&store, "alpha::src/keep.rs").await.as_deref(),
+            Some(second_row.as_str()),
+            "the newer generation's alias is untouched"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                format!(
+                    "MATCH (p:{PUBLICATION_STATE_TABLE} {{id: '{}'}}) RETURN count(p)",
+                    escape_ladybug_string(&marker)
+                )
+            )
+            .await,
+            0,
+            "the stale marker is removed"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                format!(
+                    "MATCH (s:StagingGeneration {{id: '{}'}}) RETURN count(s)",
+                    escape_ladybug_string(&staging)
+                )
+            )
+            .await,
+            0,
+            "the stale staging row is removed"
+        );
+    }
+
+    /// #1: a publication whose reconciliation fails after the pointer flip
+    /// restores the previous generation, its rows, and the bare row it
+    /// quarantined.
+    #[tokio::test]
+    async fn a_failed_publication_restores_the_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("generations.lbug");
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store.init("alpha").await.unwrap();
+
+        let source = "source-a";
+        let first = store.begin_generation("alpha", source).await.unwrap();
+        let first_row = crate::parser::ingest::generation_scoped_id("alpha", first, "src/a.rs");
+        // `src/c.rs` gets a legacy alias from the first publication, so the
+        // failed second publication has an existing alias to restore.
+        let first_c = crate::parser::ingest::generation_scoped_id("alpha", first, "src/c.rs");
+        store
+            .upsert(
+                "alpha",
+                "src/c.rs",
+                vec![0.0; DIMS],
+                row_payload("legacy c"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "alpha",
+                &first_row,
+                vec![0.0; DIMS],
+                row_payload("first generation"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "alpha",
+                &first_c,
+                vec![0.0; DIMS],
+                row_payload("first generation c"),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("alpha", source, first)
+            .await
+            .unwrap();
+        assert_eq!(
+            alias_target(&store, "alpha::src/c.rs").await.as_deref(),
+            Some(first_c.as_str())
+        );
+
+        // A legacy bare row the next publication will archive and alias.
+        store
+            .upsert(
+                "alpha",
+                "src/b.rs",
+                vec![0.0; DIMS],
+                row_payload("legacy bare"),
+            )
+            .await
+            .unwrap();
+        let bare_metadata = stored_metadata(&store, "src/b.rs")
+            .await
+            .expect("the bare row keeps its enrichment metadata");
+        let second = store.begin_generation("alpha", source).await.unwrap();
+        let second_row = crate::parser::ingest::generation_scoped_id("alpha", second, "src/b.rs");
+        let second_c = crate::parser::ingest::generation_scoped_id("alpha", second, "src/c.rs");
+        store
+            .upsert(
+                "alpha",
+                &second_row,
+                vec![0.0; DIMS],
+                row_payload("second generation"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "alpha",
+                &second_c,
+                vec![0.0; DIMS],
+                row_payload("second generation c"),
+            )
+            .await
+            .unwrap();
+
+        // Break the final reconciliation statement so the publication fails
+        // after the pointer flip and after the bare row was quarantined.
+        store
+            .with_conn(|conn| {
+                conn.query("DROP TABLE StagingGeneration")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let error = store
+            .publish_generation("alpha", source, second)
+            .await
+            .expect_err("reconciliation cannot finish without its staging table");
+        assert!(
+            !error.to_string().is_empty(),
+            "the original error is returned: {error}"
+        );
+
+        let pointer =
+            escape_ladybug_string(&crate::parser::ingest::generation_key("alpha", source));
+        assert_eq!(
+            stored_int(
+                &store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{pointer}'}}) RETURN g.active_generation"
+                ),
+                0
+            )
+            .await,
+            Some(first as i64),
+            "the failed publication rolls the pointer back"
+        );
+        assert_eq!(
+            stored_int(
+                &store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{pointer}'}}) RETURN g.previous_generation"
+                ),
+                0
+            )
+            .await,
+            Some(0),
+            "the rollback restores the pre-flip previous generation"
+        );
+        assert_eq!(
+            alias_target(&store, "alpha::src/b.rs").await,
+            None,
+            "an alias created by the failed publication is removed"
+        );
+        assert_eq!(
+            alias_target(&store, "alpha::src/c.rs").await.as_deref(),
+            Some(first_c.as_str()),
+            "an alias the failed publication repointed is restored"
+        );
+        assert_eq!(
+            stored_namespace(&store, "src/b.rs").await.as_deref(),
+            Some("alpha"),
+            "the quarantined bare row is restored to its namespace"
+        );
+        assert_eq!(
+            stored_metadata(&store, "src/b.rs").await,
+            Some(bare_metadata),
+            "the quarantined bare row keeps its metadata"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                format!("MATCH (p:{PUBLICATION_STATE_TABLE}) RETURN count(p)")
+            )
+            .await,
+            0,
+            "the publication marker is cleared"
+        );
+
+        // The previous generation is still the readable one after a reopen.
+        drop(store);
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store.init("alpha").await.unwrap();
+        assert_eq!(
+            stored_int(
+                &store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{pointer}'}}) RETURN g.active_generation"
+                ),
+                0
+            )
+            .await,
+            Some(first as i64)
+        );
+        let (_, payload) = store
+            .get("alpha", &first_row)
+            .await
+            .expect("previous generation lookup")
+            .expect("the previous generation stays readable");
+        assert_eq!(payload.content, "first generation");
+        assert_eq!(
+            alias_target(&store, "alpha::src/c.rs").await.as_deref(),
+            Some(first_c.as_str()),
+            "the repair survives the reopen"
+        );
+
+        // Abort after a flip restores the recorded previous generation rather
+        // than hardcoding zero.
+        let abort_pointer = pointer.clone();
+        store
+            .with_conn(move |conn| {
+                conn.query(&format!(
+                    "MATCH (g:IngestGeneration {{id: '{abort_pointer}'}}) SET g.active_generation = 3, g.previous_generation = {first}"
+                ))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.abort_generation("alpha", source, 3).await.unwrap();
+        assert_eq!(
+            stored_int(
+                &store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{pointer}'}}) RETURN g.active_generation"
+                ),
+                0
+            )
+            .await,
+            Some(first as i64),
+            "abort restores COALESCE(previous_generation, 0)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // PR #456 Wave 2 remediation (`#M1`–`#M5`, recommended #1/#3/#4).
+    // ---------------------------------------------------------------------
+
+    /// A store with generation 1 published (`src/c.rs` aliased to it), a fresh
+    /// legacy bare row at `src/b.rs`, and generation 2 staged with a row for
+    /// each path: exactly the state a failing second publication starts from.
+    struct PublicationFixture {
+        store: LadybugStore,
+        pointer: String,
+        first: u64,
+        first_c: String,
+        second: u64,
+        second_row: String,
+        bare_metadata: Option<String>,
+    }
+
+    async fn publication_fixture(db: &Path) -> PublicationFixture {
+        let store = LadybugStore::for_testing(db, DIMS).unwrap();
+        store.init("alpha").await.unwrap();
+        let source = "source-a";
+        let first = store.begin_generation("alpha", source).await.unwrap();
+        let first_row = crate::parser::ingest::generation_scoped_id("alpha", first, "src/a.rs");
+        let first_c = crate::parser::ingest::generation_scoped_id("alpha", first, "src/c.rs");
+        store
+            .upsert(
+                "alpha",
+                "src/c.rs",
+                vec![0.0; DIMS],
+                row_payload("legacy c"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "alpha",
+                &first_row,
+                vec![0.0; DIMS],
+                row_payload("first generation"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "alpha",
+                &first_c,
+                vec![0.0; DIMS],
+                row_payload("first generation c"),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("alpha", source, first)
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "alpha",
+                "src/b.rs",
+                vec![0.0; DIMS],
+                row_payload("legacy bare"),
+            )
+            .await
+            .unwrap();
+        let bare_metadata = stored_metadata(&store, "src/b.rs").await;
+        let second = store.begin_generation("alpha", source).await.unwrap();
+        let second_row = crate::parser::ingest::generation_scoped_id("alpha", second, "src/b.rs");
+        let second_c = crate::parser::ingest::generation_scoped_id("alpha", second, "src/c.rs");
+        store
+            .upsert(
+                "alpha",
+                &second_row,
+                vec![0.0; DIMS],
+                row_payload("second generation"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "alpha",
+                &second_c,
+                vec![0.0; DIMS],
+                row_payload("second generation c"),
+            )
+            .await
+            .unwrap();
+        PublicationFixture {
+            pointer: escape_ladybug_string(&crate::parser::ingest::generation_key("alpha", source)),
+            store,
+            first,
+            first_c,
+            second,
+            second_row,
+            bare_metadata,
+        }
+    }
+
+    impl PublicationFixture {
+        async fn pointer_value(&self, column: &str) -> Option<i64> {
+            stored_int(
+                &self.store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{}'}}) RETURN g.{column}",
+                    self.pointer
+                ),
+                0,
+            )
+            .await
+        }
+
+        async fn marker_phase(&self) -> Option<String> {
+            stored_string(
+                &self.store,
+                format!(
+                    "MATCH (p:{PUBLICATION_STATE_TABLE} {{id: '{}'}}) RETURN p.phase",
+                    escape_ladybug_string(&publication_marker_id("alpha", "source-a", self.second))
+                ),
+            )
+            .await
+        }
+
+        async fn marker_count(&self) -> i64 {
+            query_count(
+                &self.store,
+                format!("MATCH (p:{PUBLICATION_STATE_TABLE}) RETURN count(p)"),
+            )
+            .await
+        }
+
+        async fn generation_row_count(&self, generation: u64) -> i64 {
+            let prefix = crate::parser::ingest::generation_scoped_id("alpha", generation, "");
+            query_count(
+                &self.store,
+                format!(
+                    "MATCH (m:Memory) WHERE m.namespace = 'alpha' AND m.id STARTS WITH '{}' RETURN count(m)",
+                    escape_ladybug_string(&prefix)
+                ),
+            )
+            .await
+        }
+    }
+
+    /// RAII fault plan for one store's engine work. Dropping the guard disarms
+    /// the plan, so a panicking assertion can never leave a stale plan behind
+    /// for a later store allocation.
+    struct FaultGuard {
+        key: usize,
+    }
+
+    impl FaultGuard {
+        fn arm(store: &LadybugStore, faults: &[fault_injection::Fault]) -> Self {
+            let key = store.test_fault_key();
+            fault_injection::arm(key, faults);
+            Self { key }
+        }
+    }
+
+    impl Drop for FaultGuard {
+        fn drop(&mut self) {
+            fault_injection::disarm(self.key);
+        }
+    }
+
+    /// `#M1`: a marker-clear failure AFTER the atomic rollback commit leaves the
+    /// pointer and aliases on the previous generation and a `rolled_back`
+    /// marker; the reopen only cleans that marker up and never reconciles or
+    /// advances the failed generation (Iceman F1).
+    #[tokio::test]
+    async fn a_marker_clear_failure_after_a_rolled_back_publication_recovers_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("generations.lbug");
+        let fixture = publication_fixture(&db).await;
+        let _faults = FaultGuard::arm(
+            &fixture.store,
+            &[
+                fault_injection::Fault::PublicationReconcile,
+                fault_injection::Fault::MarkerClearAfterRollback,
+            ],
+        );
+        let error = fixture
+            .store
+            .publish_generation("alpha", "source-a", fixture.second)
+            .await
+            .expect_err("the marker cannot be cleared");
+        assert!(
+            error.to_string().contains("marker could not be cleared"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fixture.pointer_value("active_generation").await,
+            Some(fixture.first as i64),
+            "the atomic rollback commit restores the previous generation"
+        );
+        assert_eq!(fixture.pointer_value("previous_generation").await, Some(0));
+        assert_eq!(
+            fixture.marker_phase().await.as_deref(),
+            Some("rolled_back"),
+            "the durable rollback phase survives the failed clear"
+        );
+        assert_eq!(
+            alias_target(&fixture.store, "alpha::src/b.rs").await,
+            None,
+            "an alias created by the failed publication is removed"
+        );
+        assert_eq!(
+            alias_target(&fixture.store, "alpha::src/c.rs")
+                .await
+                .as_deref(),
+            Some(fixture.first_c.as_str()),
+            "the previous generation's alias is restored"
+        );
+        assert_eq!(
+            stored_namespace(&fixture.store, "src/b.rs")
+                .await
+                .as_deref(),
+            Some("alpha"),
+            "the quarantined bare row is restored"
+        );
+        assert_eq!(
+            stored_metadata(&fixture.store, "src/b.rs").await,
+            fixture.bare_metadata
+        );
+
+        drop(_faults);
+        let second = fixture.second;
+        drop(fixture.store);
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store
+            .init("alpha")
+            .await
+            .expect("a rolled_back marker only cleans up");
+        assert_eq!(
+            stored_int(
+                &store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{}'}}) RETURN g.active_generation",
+                    fixture.pointer
+                ),
+                0
+            )
+            .await,
+            Some(fixture.first as i64),
+            "recovery never advances to the rolled-back generation"
+        );
+        assert_eq!(
+            alias_target(&store, "alpha::src/b.rs").await,
+            None,
+            "the rolled-back generation is never reconciled"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                format!("MATCH (p:{PUBLICATION_STATE_TABLE}) RETURN count(p)")
+            )
+            .await,
+            0,
+            "the rolled_back marker is cleared on reopen"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                format!(
+                    "MATCH (s:StagingGeneration) WHERE s.generation = {second} RETURN count(s)"
+                )
+            )
+            .await,
+            0,
+            "the rolled-back generation's staging row is discarded"
+        );
+    }
+
+    /// `#M1`: when the atomic rollback commit fails, the pointer stays on the
+    /// failed generation and the `reconciling` marker survives so `abort` must
+    /// refuse and startup recovery completes the publication forward.
+    #[tokio::test]
+    async fn an_atomic_rollback_commit_failure_leaves_recovery_to_finish_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("generations.lbug");
+        let fixture = publication_fixture(&db).await;
+        let _faults = FaultGuard::arm(
+            &fixture.store,
+            &[
+                fault_injection::Fault::PublicationReconcile,
+                fault_injection::Fault::AtomicRollbackCommit,
+            ],
+        );
+        let error = fixture
+            .store
+            .publish_generation("alpha", "source-a", fixture.second)
+            .await
+            .expect_err("the rollback commit cannot be persisted");
+        assert!(
+            error.to_string().contains("rolled_back phase"),
+            "the error carries both failures: {error}"
+        );
+        assert_eq!(
+            fixture.pointer_value("active_generation").await,
+            Some(fixture.second as i64),
+            "a failed rollback commit leaves the pointer on the failed generation"
+        );
+        assert_eq!(
+            fixture.pointer_value("previous_generation").await,
+            Some(fixture.first as i64)
+        );
+        assert_eq!(
+            fixture.marker_phase().await.as_deref(),
+            Some("reconciling"),
+            "the reconciling marker is retained for recovery"
+        );
+
+        let abort = fixture
+            .store
+            .abort_generation("alpha", "source-a", fixture.second)
+            .await
+            .expect_err("a publication marker refuses the abort");
+        assert!(
+            abort.to_string().contains("publication marker"),
+            "unexpected abort error: {abort}"
+        );
+        assert_eq!(
+            fixture.generation_row_count(fixture.second).await,
+            2,
+            "the refused abort deletes no generation rows"
+        );
+        assert_eq!(
+            fixture.marker_phase().await.as_deref(),
+            Some("reconciling"),
+            "the refused abort leaves the marker untouched"
+        );
+
+        drop(_faults);
+        drop(fixture.store);
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store
+            .init("alpha")
+            .await
+            .expect("recovery finishes the publication");
+        assert_eq!(
+            stored_int(
+                &store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{}'}}) RETURN g.active_generation",
+                    fixture.pointer
+                ),
+                0
+            )
+            .await,
+            Some(fixture.second as i64),
+            "forward recovery activates the interrupted generation"
+        );
+        assert_eq!(
+            alias_target(&store, "alpha::src/b.rs").await.as_deref(),
+            Some(fixture.second_row.as_str()),
+            "forward recovery repoints the legacy identity"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                format!("MATCH (p:{PUBLICATION_STATE_TABLE}) RETURN count(p)")
+            )
+            .await,
+            0
+        );
+    }
+
+    /// `#M1`: a journal rollback failure never restores the pointer and never
+    /// clears the marker; `abort` refuses and recovery repairs forward.
+    #[tokio::test]
+    async fn a_journal_rollback_failure_leaves_recovery_to_finish_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("generations.lbug");
+        let fixture = publication_fixture(&db).await;
+        let _faults = FaultGuard::arm(
+            &fixture.store,
+            &[
+                fault_injection::Fault::PublicationReconcile,
+                fault_injection::Fault::JournalRollback,
+            ],
+        );
+        let error = fixture
+            .store
+            .publish_generation("alpha", "source-a", fixture.second)
+            .await
+            .expect_err("the journal cannot be rolled back");
+        assert!(
+            error.to_string().contains("publication rollback failed"),
+            "the error carries both failures: {error}"
+        );
+        assert_eq!(
+            fixture.pointer_value("active_generation").await,
+            Some(fixture.second as i64),
+            "an incomplete journal rollback never restores the pointer"
+        );
+        assert_eq!(
+            fixture.pointer_value("previous_generation").await,
+            Some(fixture.first as i64)
+        );
+        assert_eq!(
+            fixture.marker_phase().await.as_deref(),
+            Some("reconciling"),
+            "the reconciling marker is retained for recovery"
+        );
+        let abort = fixture
+            .store
+            .abort_generation("alpha", "source-a", fixture.second)
+            .await
+            .expect_err("a publication marker refuses the abort");
+        assert!(
+            abort.to_string().contains("publication marker"),
+            "unexpected abort error: {abort}"
+        );
+        assert_eq!(
+            fixture.generation_row_count(fixture.second).await,
+            2,
+            "the refused abort deletes no generation rows"
+        );
+
+        drop(_faults);
+        drop(fixture.store);
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store
+            .init("alpha")
+            .await
+            .expect("recovery finishes the publication");
+        assert_eq!(
+            stored_int(
+                &store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{}'}}) RETURN g.active_generation",
+                    fixture.pointer
+                ),
+                0
+            )
+            .await,
+            Some(fixture.second as i64)
+        );
+        assert_eq!(
+            alias_target(&store, "alpha::src/b.rs").await.as_deref(),
+            Some(fixture.second_row.as_str())
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                format!("MATCH (p:{PUBLICATION_STATE_TABLE}) RETURN count(p)")
+            )
+            .await,
+            0
+        );
+    }
+
+    /// `#M1`: a selective bare-row rollback failure with a SUCCESSFUL alias
+    /// delete leaves a heterogeneous partial state — the bare row stays in
+    /// `_quarantine` while the alias this publication created is gone. Startup
+    /// recovery must rebuild that alias from the quarantined row's
+    /// `superseded_by_generation` record instead of fabricating nothing.
+    #[tokio::test]
+    async fn a_selective_bare_row_rollback_failure_still_recovers_the_alias_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("generations.lbug");
+        let fixture = publication_fixture(&db).await;
+        // `src/b.rs` is a genuine legacy bare row created after the first
+        // publication, so the second publication creates its alias from
+        // scratch instead of repointing an existing one.
+        assert_eq!(
+            alias_target(&fixture.store, "alpha::src/b.rs").await,
+            None,
+            "the fixture starts without an alias for the legacy bare row"
+        );
+
+        let faults = FaultGuard::arm(
+            &fixture.store,
+            &[
+                fault_injection::Fault::PublicationReconcile,
+                fault_injection::Fault::JournalBareRowRollback,
+            ],
+        );
+        let error = fixture
+            .store
+            .publish_generation("alpha", "source-a", fixture.second)
+            .await
+            .expect_err("the bare-row restore fails");
+        assert!(
+            error.to_string().contains("publication rollback failed"),
+            "the error aggregates both failures: {error}"
+        );
+        assert_eq!(
+            stored_namespace(&fixture.store, "src/b.rs")
+                .await
+                .as_deref(),
+            Some(QUARANTINE_NAMESPACE),
+            "the bare row is still quarantined: its restore failed"
+        );
+        let archived = stored_metadata(&fixture.store, "src/b.rs")
+            .await
+            .expect("the quarantined row keeps its metadata");
+        let archived: Value = serde_json::from_str(&archived).expect("quarantine metadata JSON");
+        assert_eq!(
+            archived
+                .get("superseded_by_generation")
+                .and_then(Value::as_u64),
+            Some(fixture.second),
+            "the quarantine record names the superseding generation"
+        );
+        assert_eq!(
+            archived
+                .get("quarantine")
+                .and_then(|quarantine| quarantine.get("scoped_id"))
+                .and_then(Value::as_str),
+            Some(fixture.second_row.as_str()),
+            "the quarantine record names the scoped row that superseded it"
+        );
+        assert_eq!(
+            alias_target(&fixture.store, "alpha::src/b.rs").await,
+            None,
+            "the new alias delete succeeded: the heterogeneous partial state exists"
+        );
+        assert_eq!(
+            fixture.pointer_value("active_generation").await,
+            Some(fixture.second as i64),
+            "the failed rollback leaves the pointer on the failed generation"
+        );
+        assert_eq!(
+            fixture.marker_phase().await.as_deref(),
+            Some("reconciling"),
+            "the reconciling marker survives for forward recovery"
+        );
+        let abort = fixture
+            .store
+            .abort_generation("alpha", "source-a", fixture.second)
+            .await
+            .expect_err("a publication marker refuses the abort");
+        assert!(
+            abort.to_string().contains("publication marker"),
+            "unexpected abort error: {abort}"
+        );
+        assert_eq!(
+            fixture.generation_row_count(fixture.second).await,
+            2,
+            "the refused abort deletes no generation rows"
+        );
+        assert_eq!(
+            fixture.marker_phase().await.as_deref(),
+            Some("reconciling"),
+            "the refused abort leaves the marker untouched"
+        );
+
+        drop(faults);
+        drop(fixture.store);
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store
+            .init("alpha")
+            .await
+            .expect("recovery reconstructs the bridge from the quarantine record");
+        assert_eq!(
+            alias_target(&store, "alpha::src/b.rs").await.as_deref(),
+            Some(fixture.second_row.as_str()),
+            "forward recovery rebuilds the legacy alias"
+        );
+        let (_, payload) = store
+            .get("alpha", "alpha::src/b.rs")
+            .await
+            .unwrap()
+            .expect("the qualified identity resolves to the active generation");
+        assert_eq!(
+            payload.content, "second generation",
+            "the alias reaches the active generation's content"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                format!("MATCH (p:{PUBLICATION_STATE_TABLE}) RETURN count(p)")
+            )
+            .await,
+            0,
+            "recovery clears the publication marker"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                format!(
+                    "MATCH (s:StagingGeneration) WHERE s.generation = {} RETURN count(s)",
+                    fixture.second
+                )
+            )
+            .await,
+            0,
+            "recovery clears the staging row"
+        );
+
+        let identity = format!(
+            "MATCH (m:Memory) WHERE m.id = 'src/b.rs' OR m.id = '{}' RETURN count(m)",
+            escape_ladybug_string(&fixture.second_row)
+        );
+        let before = query_count(&store, identity.clone()).await;
+        assert_eq!(
+            before, 2,
+            "only the quarantined bare row and the scoped row carry the identity"
+        );
+        store
+            .upsert(
+                "alpha",
+                "alpha::src/b.rs",
+                vec![0.0; DIMS],
+                row_payload("rewritten through the alias"),
+            )
+            .await
+            .unwrap();
+        let (_, payload) = store
+            .get("alpha", "alpha::src/b.rs")
+            .await
+            .unwrap()
+            .expect("the aliased row is still readable");
+        assert_eq!(payload.content, "rewritten through the alias");
+        assert_eq!(
+            query_count(&store, identity).await,
+            before,
+            "a qualified write resolves onto the existing row, creating no duplicate"
+        );
+    }
+
+    /// `#M1`: abort restores the pointer BEFORE deleting rows, so a pointer
+    /// restoration failure aborts the whole operation with the rows intact.
+    #[tokio::test]
+    async fn abort_restores_the_pointer_before_deleting_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("generations.lbug");
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store.init("alpha").await.unwrap();
+        let source = "source-a";
+        let first = store.begin_generation("alpha", source).await.unwrap();
+        let first_row = crate::parser::ingest::generation_scoped_id("alpha", first, "src/a.rs");
+        store
+            .upsert(
+                "alpha",
+                &first_row,
+                vec![0.0; DIMS],
+                row_payload("first generation"),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("alpha", source, first)
+            .await
+            .unwrap();
+        let second = store.begin_generation("alpha", source).await.unwrap();
+        let second_row = crate::parser::ingest::generation_scoped_id("alpha", second, "src/b.rs");
+        store
+            .upsert(
+                "alpha",
+                &second_row,
+                vec![0.0; DIMS],
+                row_payload("second generation"),
+            )
+            .await
+            .unwrap();
+        let pointer =
+            escape_ladybug_string(&crate::parser::ingest::generation_key("alpha", source));
+        let setup_pointer = pointer.clone();
+        store
+            .with_conn(move |conn| {
+                conn.query(&format!(
+                    "MATCH (g:IngestGeneration {{id: '{setup_pointer}'}}) SET g.active_generation = {second}, g.previous_generation = {first}"
+                ))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let _faults = FaultGuard::arm(&store, &[fault_injection::Fault::AbortPointerRestore]);
+        let error = store
+            .abort_generation("alpha", source, second)
+            .await
+            .expect_err("the pointer cannot be restored");
+        assert!(
+            error.to_string().contains("injected pointer restore"),
+            "unexpected error: {error}"
+        );
+        let prefix = crate::parser::ingest::generation_scoped_id("alpha", second, "");
+        assert_eq!(
+            query_count(
+                &store,
+                format!(
+                    "MATCH (m:Memory) WHERE m.namespace = 'alpha' AND m.id STARTS WITH '{}' RETURN count(m)",
+                    escape_ladybug_string(&prefix)
+                )
+            )
+            .await,
+            1,
+            "no row is deleted before the pointer restore succeeds"
+        );
+        assert_eq!(
+            stored_int(
+                &store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{pointer}'}}) RETURN g.active_generation"
+                ),
+                0
+            )
+            .await,
+            Some(second as i64)
+        );
+        drop(_faults);
+    }
+
+    /// `#M1`: a `rolled_back` marker whose generation is still active violates
+    /// the atomic rollback invariant, so the open fails closed instead of
+    /// silently clearing the marker.
+    #[tokio::test]
+    async fn a_rolled_back_marker_over_the_active_generation_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("generations.lbug");
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store.init("alpha").await.unwrap();
+        let source = "source-a";
+        let first = store.begin_generation("alpha", source).await.unwrap();
+        let first_row = crate::parser::ingest::generation_scoped_id("alpha", first, "src/a.rs");
+        store
+            .upsert(
+                "alpha",
+                &first_row,
+                vec![0.0; DIMS],
+                row_payload("first generation"),
+            )
+            .await
+            .unwrap();
+        store
+            .publish_generation("alpha", source, first)
+            .await
+            .unwrap();
+        let marker = publication_marker_id("alpha", source, first);
+        store
+            .with_conn(move |conn| {
+                conn.query(&format!(
+                    "CREATE (:{PUBLICATION_STATE_TABLE} {{id: '{}', namespace: 'alpha', source_key: 'source-a', generation: {first}, phase: 'rolled_back'}})",
+                    escape_ladybug_string(&marker)
+                ))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        drop(store);
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        let error = store
+            .init("alpha")
+            .await
+            .expect_err("the invariant violation fails closed");
+        assert!(
+            error.to_string().contains("rolled_back"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                format!("MATCH (p:{PUBLICATION_STATE_TABLE}) RETURN count(p)")
+            )
+            .await,
+            1,
+            "the marker is retained, never silently cleared"
+        );
+    }
+
+    /// Recommended #1: the journal restores a NULL metadata property as NULL,
+    /// never as an empty string, when a publication rolls back.
+    #[tokio::test]
+    async fn a_publication_rollback_restores_a_null_bare_metadata_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("generations.lbug");
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store.init("alpha").await.unwrap();
+        let source = "source-a";
+        let first = store.begin_generation("alpha", source).await.unwrap();
+        // A legacy bare row that carries no metadata property at all.
+        store
+            .with_conn(|conn| {
+                conn.query(&format!(
+                    "CREATE (:Memory {{id: 'src/n.rs', namespace: 'alpha', content: 'legacy', user_id: 'u', memory_type: 'file', agent_name: 'x', location: 'src/n.rs', location_lines: '', embedding: [{}]}})",
+                    vec!["0.0"; DIMS].join(",")
+                ))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_metadata(&store, "src/n.rs").await,
+            None,
+            "the fixture starts with a NULL metadata property"
+        );
+        let staged = crate::parser::ingest::generation_scoped_id("alpha", first, "src/n.rs");
+        store
+            .upsert("alpha", &staged, vec![0.0; DIMS], row_payload("staged"))
+            .await
+            .unwrap();
+        let _faults = FaultGuard::arm(&store, &[fault_injection::Fault::PublicationReconcile]);
+        store
+            .publish_generation("alpha", source, first)
+            .await
+            .expect_err("the reconciliation fails");
+        drop(_faults);
+        assert_eq!(
+            stored_namespace(&store, "src/n.rs").await.as_deref(),
+            Some("alpha"),
+            "the quarantined bare row is restored"
+        );
+        assert_eq!(
+            stored_metadata(&store, "src/n.rs").await,
+            None,
+            "a NULL metadata property is restored as NULL, not an empty string"
+        );
+    }
+
+    /// `#M2`: a real snapshot-query error propagates through the production
+    /// `?` before a PRE-EXISTING alias is repointed. The fault corrupts the
+    /// query only when an alias already exists, so the failure lands on the
+    /// alias this test asserts about — and an `.ok()` regression would read
+    /// the error as "no alias" and delete it instead.
+    #[tokio::test]
+    async fn an_alias_snapshot_read_failure_never_repoints_the_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("generations.lbug");
+        let fixture = publication_fixture(&db).await;
+        let _faults = FaultGuard::arm(&fixture.store, &[fault_injection::Fault::AliasSnapshotRead]);
+        let error = fixture
+            .store
+            .publish_generation("alpha", "source-a", fixture.second)
+            .await
+            .expect_err("the alias snapshot query fails");
+        let message = error.to_string();
+        assert!(
+            message.contains("could not read the previous legacy alias"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            message.to_lowercase().contains("does not exist")
+                || message.to_lowercase().contains("not found")
+                || message.contains("NonExistentSnapshotTable408"),
+            "the failure must be the engine's own query error: {error}"
+        );
+        assert_eq!(
+            alias_target(&fixture.store, "alpha::src/c.rs")
+                .await
+                .as_deref(),
+            Some(fixture.first_c.as_str()),
+            "the pre-existing alias is untouched"
+        );
+        assert_eq!(
+            fixture.pointer_value("active_generation").await,
+            Some(fixture.first as i64),
+            "the failed publication rolls the pointer back"
+        );
+        assert_eq!(fixture.marker_count().await, 0);
+        // The rollback still removes what the attempt created before the
+        // failing snapshot read.
+        assert_eq!(
+            alias_target(&fixture.store, "alpha::src/b.rs").await,
+            None,
+            "an alias created earlier in the same attempt is deleted"
+        );
+        assert_eq!(
+            stored_namespace(&fixture.store, "src/b.rs")
+                .await
+                .as_deref(),
+            Some("alpha"),
+            "the quarantined bare row is restored"
+        );
+        assert_eq!(
+            stored_metadata(&fixture.store, "src/b.rs").await,
+            fixture.bare_metadata
+        );
+    }
+
+    /// `#M3`: an unverified open with an unreadable rebuild ledger refuses with
+    /// the typed error and report instead of creating a fresh `Memory`.
+    #[tokio::test]
+    async fn an_unverified_open_refuses_an_unreadable_rebuild_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            "CREATE NODE TABLE RebuildState408 (note STRING, PRIMARY KEY(note))",
+            &[],
+        );
+        let store = open(&db).with_open_provenance_for_test(OpenProvenance::ChecksumConfigMismatch);
+        let error = store
+            .init("alpha")
+            .await
+            .expect_err("an unreadable ledger fails closed");
+        assert!(
+            error
+                .downcast_ref::<LegacyPrimaryKeyMigrationError>()
+                .is_some(),
+            "unexpected error: {error}"
+        );
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.run);
+        assert!(
+            report
+                .skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("primary_key:"),
+            "unexpected report: {report:?}"
+        );
+        assert!(
+            !table_exists(&store, "Memory").await,
+            "an unreadable ledger must never permit fresh Memory DDL"
+        );
+    }
+
+    /// `#M3`: a non-not-found catalog probe error fails closed in both the
+    /// verified and the unverified init path, and creates no `Memory` table.
+    #[tokio::test]
+    async fn a_failing_rebuild_ledger_probe_refuses_both_open_paths() {
+        for unverified in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("legacy.lbug");
+            seed(
+                &db,
+                "CREATE NODE TABLE Anchor (id STRING, PRIMARY KEY(id))",
+                &[],
+            );
+            let store = open(&db);
+            let store = if unverified {
+                store.with_open_provenance_for_test(OpenProvenance::ChecksumConfigMismatch)
+            } else {
+                store
+            };
+            let _faults = FaultGuard::arm(&store, &[fault_injection::Fault::RebuildLedgerProbe]);
+            let error = store
+                .init("alpha")
+                .await
+                .expect_err("a real probe error fails closed");
+            assert!(
+                error
+                    .downcast_ref::<LegacyPrimaryKeyMigrationError>()
+                    .is_some(),
+                "unverified={unverified}: {error}"
+            );
+            let report = store.last_migration_report().expect("migration report");
+            assert!(report.run);
+            assert!(
+                report
+                    .skipped_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("primary_key:"),
+                "unverified={unverified}: {report:?}"
+            );
+            assert!(
+                !table_exists(&store, "Memory").await,
+                "unverified={unverified}: a probe error must not permit Memory DDL"
+            );
+            drop(_faults);
+        }
+    }
+
+    /// `#M4`: a user-owned artifact name must be refused BEFORE the ledger
+    /// claims it, and must survive a second open too — for every scratch and
+    /// backup name the rebuild would record.
+    async fn assert_artifact_collision_survives_two_opens(artifact: &str, relationship: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let mut statements: Vec<String> = vec![
+            rel_table_ddl().to_string(),
+            insert_row("a", Some("alpha"), "{}"),
+            insert_row("b", Some("alpha"), "{}"),
+            "MATCH (a:Memory {id: 'a'}), (b:Memory {id: 'b'}) CREATE (a)-[:RELATES_TO {source: 'alpha'}]->(b)"
+                .to_string(),
+        ];
+        if relationship {
+            statements.push(format!(
+                "CREATE REL TABLE {artifact} (FROM Memory TO Memory, note STRING)"
+            ));
+            statements.push(format!(
+                "MATCH (a:Memory {{id: 'a'}}), (b:Memory {{id: 'b'}}) CREATE (a)-[:{artifact} {{note: 'keep'}}]->(b)"
+            ));
+        } else {
+            statements.push(format!(
+                "CREATE NODE TABLE {artifact} (id STRING, note STRING, PRIMARY KEY(id))"
+            ));
+            statements.push(format!("CREATE (:{artifact} {{id: 'user', note: 'keep'}})"));
+        }
+        let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
+        seed(&db, &memory_ddl("name"), &refs);
+
+        for open_index in 0..2 {
+            let store = open(&db);
+            let error = store
+                .init("alpha")
+                .await
+                .expect_err("the artifact name collision refuses the rebuild");
+            assert!(
+                error
+                    .downcast_ref::<LegacyPrimaryKeyMigrationError>()
+                    .is_some(),
+                "open {open_index} of {artifact}: {error}"
+            );
+            let report = store.last_migration_report().expect("migration report");
+            assert!(report.run);
+            assert!(
+                report
+                    .skipped_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("primary_key:"),
+                "open {open_index} of {artifact}: {report:?}"
+            );
+            let user_rows = if relationship {
+                query_count(
+                    &store,
+                    format!("MATCH ()-[r:{artifact}]->() RETURN count(r)"),
+                )
+                .await
+            } else {
+                query_count(&store, format!("MATCH (n:{artifact}) RETURN count(n)")).await
+            };
+            assert_eq!(
+                user_rows, 1,
+                "open {open_index} of {artifact}: the user table and its rows survive"
+            );
+            assert_eq!(
+                count_memory(&store, "true").await,
+                2,
+                "open {open_index} of {artifact}: the original Memory rows survive"
+            );
+            assert_eq!(
+                edge_count(&store).await,
+                1,
+                "open {open_index} of {artifact}: the original relationship survives"
+            );
+            assert_eq!(
+                rebuild_ledger_rows(&store, artifact).await,
+                0,
+                "open {open_index} of {artifact}: no ledger row claims the user table"
+            );
+            drop(store);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scratch_node_name_collision_survives_two_opens() {
+        assert_artifact_collision_survives_two_opens("Memory__rebuild408", false).await;
+    }
+
+    #[tokio::test]
+    async fn a_scratch_relationship_name_collision_survives_two_opens() {
+        assert_artifact_collision_survives_two_opens("RELATES_TO__rebuild408", true).await;
+    }
+
+    #[tokio::test]
+    async fn a_backup_node_name_collision_survives_two_opens() {
+        assert_artifact_collision_survives_two_opens("Memory__legacy408", false).await;
+    }
+
+    #[tokio::test]
+    async fn a_backup_relationship_name_collision_survives_two_opens() {
+        assert_artifact_collision_survives_two_opens("RELATES_TO__legacy408", true).await;
+    }
+
+    /// `#M5`: a ledger row whose `phase` is unreadable refuses the open and
+    /// performs no DDL, retaining both the ledger and the physical tables.
+    #[tokio::test]
+    async fn an_unreadable_rebuild_ledger_phase_refuses_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            rebuild_state_ddl(),
+            &[
+                "CREATE (:RebuildState408 {artifact: 'Memory__rebuild408', original: 'Memory'})",
+                "CREATE NODE TABLE Memory__rebuild408 (id STRING, note STRING, PRIMARY KEY(id))",
+                "CREATE (:Memory__rebuild408 {id: 'user', note: 'keep'})",
+            ],
+        );
+        let store = open(&db);
+        let error = store
+            .init("alpha")
+            .await
+            .expect_err("an unreadable ledger row refuses the open");
+        assert!(
+            error
+                .downcast_ref::<LegacyPrimaryKeyMigrationError>()
+                .is_some(),
+            "unexpected error: {error}"
+        );
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.run);
+        assert!(
+            report
+                .skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("primary_key:"),
+            "unexpected report: {report:?}"
+        );
+        assert!(
+            table_exists(&store, "Memory__rebuild408").await,
+            "a malformed ledger row must not authorize a DROP"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                "MATCH (a:Memory__rebuild408) RETURN count(a)".to_string()
+            )
+            .await,
+            1,
+            "the physical table keeps its rows"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                "MATCH (a:RebuildState408) RETURN count(a)".to_string()
+            )
+            .await,
+            1,
+            "the unreadable ledger row is never deleted"
+        );
+        assert!(
+            !table_exists(&store, "Memory").await,
+            "the refusal happens before any Memory DDL"
+        );
+    }
+
+    /// `#M5`: an unsafe identifier in the ledger is refused before any
+    /// destructive DDL; nothing is dropped, renamed, or forgotten.
+    #[tokio::test]
+    async fn an_unsafe_rebuild_ledger_identifier_refuses_the_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            rebuild_state_ddl(),
+            &[
+                "CREATE (:RebuildState408 {artifact: 'Memory; DROP TABLE Victim', original: 'Memory', phase: 'scratch'})",
+                "CREATE NODE TABLE Victim (id STRING, note STRING, PRIMARY KEY(id))",
+                "CREATE (:Victim {id: 'keep', note: 'keep'})",
+                "CREATE NODE TABLE Memory__rebuild408 (id STRING, note STRING, PRIMARY KEY(id))",
+                "CREATE (:Memory__rebuild408 {id: 'user', note: 'keep'})",
+            ],
+        );
+        let store = open(&db);
+        let error = store
+            .init("alpha")
+            .await
+            .expect_err("an unsafe ledger identifier refuses the open");
+        assert!(
+            error
+                .downcast_ref::<LegacyPrimaryKeyMigrationError>()
+                .is_some(),
+            "unexpected error: {error}"
+        );
+        let report = store.last_migration_report().expect("migration report");
+        assert!(report.run);
+        assert!(
+            report
+                .skipped_reason
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("primary_key:"),
+            "unexpected report: {report:?}"
+        );
+        assert_eq!(
+            query_count(&store, "MATCH (a:Victim) RETURN count(a)".to_string()).await,
+            1,
+            "the ledger cannot redirect a DROP at another table"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                "MATCH (a:Memory__rebuild408) RETURN count(a)".to_string()
+            )
+            .await,
+            1,
+            "no ALTER/DROP runs before the ledger is validated"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                "MATCH (a:RebuildState408) RETURN count(a)".to_string()
+            )
+            .await,
+            1,
+            "the invalid ledger row is retained"
+        );
+        assert!(!table_exists(&store, "Memory").await);
+    }
+
+    /// Recommended #3: fixed-width `FLOAT[4]` NULL entries and nested list NULLs
+    /// survive the primary-key rebuild exactly.
+    #[tokio::test]
+    async fn fixed_width_and_nested_list_nulls_survive_the_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        let ddl = format!(
+            "CREATE NODE TABLE Memory (id STRING, namespace STRING, content STRING, user_id STRING, memory_type STRING, agent_name STRING, location STRING, location_lines STRING, metadata STRING, embedding FLOAT[{DIMS}], name STRING, matrix STRING[][], PRIMARY KEY(name))"
+        );
+        seed(
+            &db,
+            &ddl,
+            &[
+                "CREATE (:Memory {id: 'a', namespace: 'alpha', content: 'c', user_id: 'u', memory_type: 'file', agent_name: 'x', location: 'a', location_lines: '', metadata: '{}', embedding: [1.0, NULL, 3.0, 4.0], name: 'n-a', matrix: [['x', NULL], ['y']]})",
+                "CREATE (:Memory {id: 'b', namespace: 'alpha', content: 'c2', user_id: 'u', memory_type: 'file', agent_name: 'x', location: 'b', location_lines: '', metadata: '{}', embedding: [5.0, 6.0, 7.0, 8.0], name: 'n-b', matrix: [['z']]})",
+            ],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+
+        let embedding = stored_list(
+            &store,
+            "MATCH (m:Memory {id: 'a'}) RETURN m.embedding".to_string(),
+        )
+        .await;
+        assert_eq!(
+            embedding.len(),
+            DIMS,
+            "a fixed-width array keeps every position"
+        );
+        assert_eq!(embedding[1], None, "the NULL entry keeps its position");
+        assert!(
+            embedding[0].is_some() && embedding[2].is_some() && embedding[3].is_some(),
+            "the non-NULL entries survive: {embedding:?}"
+        );
+        let matrix = stored_nested(
+            &store,
+            "MATCH (m:Memory {id: 'a'}) RETURN m.matrix".to_string(),
+        )
+        .await;
+        assert_eq!(
+            matrix,
+            vec![
+                vec![Some("x".to_string()), None],
+                vec![Some("y".to_string())],
+            ],
+            "nested lists keep their shape and NULL entries"
+        );
+    }
+
+    /// Recommended #3: multiple pending markers for one source replay in
+    /// ascending generation order, so each builds on the one before it.
+    #[tokio::test]
+    async fn multiple_pending_markers_replay_in_ascending_generation_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("generations.lbug");
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store.init("alpha").await.unwrap();
+        let source = "source-a";
+        let first = store.begin_generation("alpha", source).await.unwrap();
+        let first_row = crate::parser::ingest::generation_scoped_id("alpha", first, "src/a.rs");
+        store
+            .upsert(
+                "alpha",
+                &first_row,
+                vec![0.0; DIMS],
+                row_payload("first generation"),
+            )
+            .await
+            .unwrap();
+        let second = store.begin_generation("alpha", source).await.unwrap();
+        let second_row = crate::parser::ingest::generation_scoped_id("alpha", second, "src/b.rs");
+        store
+            .upsert(
+                "alpha",
+                &second_row,
+                vec![0.0; DIMS],
+                row_payload("second generation"),
+            )
+            .await
+            .unwrap();
+        // Both publications are pending, and neither staging row has been
+        // cleared: recovery must replay them oldest first.
+        let markers: Vec<String> = [first, second]
+            .iter()
+            .map(|generation| publication_marker_id("alpha", source, *generation))
+            .collect();
+        store
+            .with_conn(move |conn| {
+                ensure_publication_state(conn)?;
+                for (index, marker) in markers.iter().enumerate() {
+                    let generation = [first, second][index];
+                    conn.query(&format!(
+                        "CREATE (:{PUBLICATION_STATE_TABLE} {{id: '{}', namespace: 'alpha', source_key: 'source-a', generation: {generation}, phase: 'reconciling'}})",
+                        escape_ladybug_string(marker)
+                    ))?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        drop(store);
+        let store = LadybugStore::for_testing(&db, DIMS).unwrap();
+        store.init("alpha").await.unwrap();
+        let pointer =
+            escape_ladybug_string(&crate::parser::ingest::generation_key("alpha", source));
+        assert_eq!(
+            stored_int(
+                &store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{pointer}'}}) RETURN g.active_generation"
+                ),
+                0
+            )
+            .await,
+            Some(second as i64),
+            "the newest pending generation ends up active"
+        );
+        assert_eq!(
+            stored_int(
+                &store,
+                format!(
+                    "MATCH (g:IngestGeneration {{id: '{pointer}'}}) RETURN g.previous_generation"
+                ),
+                0
+            )
+            .await,
+            Some(first as i64),
+            "the previous pointer proves the markers replayed oldest first"
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                format!("MATCH (p:{PUBLICATION_STATE_TABLE}) RETURN count(p)")
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            query_count(
+                &store,
+                "MATCH (s:StagingGeneration) RETURN count(s)".to_string()
+            )
+            .await,
+            0
+        );
+    }
+
+    // PR #456 follow-up: quarantine isolation, alias freshness, non-destructive
+    // rebuilds, and generation-scoped write identity.
+
+    #[tokio::test]
+    async fn quarantined_rows_cannot_be_deleted_through_the_ordinary_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("orphan-row", None, "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let predicate = format!("m.namespace = '{QUARANTINE_NAMESPACE}'");
+        assert_eq!(count_memory(&store, &predicate).await, 1);
+        assert!(
+            store
+                .delete(QUARANTINE_NAMESPACE, "orphan-row")
+                .await
+                .is_err(),
+            "an ordinary delete must not reach a recovery-only row"
+        );
+        assert_eq!(count_memory(&store, &predicate).await, 1);
+    }
+
+    #[tokio::test]
+    async fn quarantine_is_hidden_from_ordinary_export_and_edge_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("orphan-row", None, "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let (docs, edges) = store
+            .export_wasm_snapshot(QUARANTINE_NAMESPACE, false)
+            .await
+            .expect("export path stays callable");
+        assert!(docs.is_empty() && edges.is_empty());
+        assert!(store
+            .list_edges(QUARANTINE_NAMESPACE)
+            .await
+            .expect("edge path stays callable")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_tenant_named_like_the_old_quarantine_literal_keeps_its_rows() {
+        const LEGACY_TENANT: &str = "_quarantine";
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("tenant-row", Some(LEGACY_TENANT), "{}")],
+        );
+        let store = open(&db);
+        store.init(LEGACY_TENANT).await.expect("legacy store opens");
+        let (_, payload) = store
+            .get(LEGACY_TENANT, "tenant-row")
+            .await
+            .expect("ordinary lookup")
+            .expect("pre-existing tenant data survives the upgrade");
+        assert_eq!(payload.content, "content-tenant-row");
+    }
+
+    #[tokio::test]
+    async fn a_pre_init_upsert_finds_a_metadata_named_null_namespace_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("legacy-file", None, r#"{"namespace":"alpha"}"#)],
+        );
+        let store = open(&db);
+        store
+            .upsert(
+                "alpha",
+                "alpha::legacy-file",
+                vec![0.0; DIMS],
+                row_payload("updated"),
+            )
+            .await
+            .expect("a write before init resolves the legacy row");
+        assert_eq!(count_memory(&store, "m.namespace = 'alpha'").await, 1);
+    }
+
+    #[tokio::test]
+    async fn conflicting_metadata_cannot_expose_a_row_to_another_tenant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[
+                &insert_row("legacy-file", None, r#"{"namespace":"beta"}"#),
+                &insert_row("alpha::legacy-file", Some("alpha"), "{}"),
+            ],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert_eq!(count_memory(&store, "m.namespace = 'beta'").await, 0);
+        let predicate = format!("m.namespace = '{QUARANTINE_NAMESPACE}'");
+        assert_eq!(count_memory(&store, &predicate).await, 1);
+    }
+
+    #[tokio::test]
+    async fn rebuild_retires_its_backup_instead_of_dropping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("name"),
+            &[&insert_row("legacy-file", Some("alpha"), "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert!(store.last_migration_report().expect("report").pk_rebuilt);
+        let archived = store
+            .with_conn(|conn| {
+                let mut names = Vec::new();
+                for row in conn.query("CALL show_tables() RETURN *")? {
+                    if let Some(lbug::Value::String(name)) = row.get(1) {
+                        names.push(name.clone());
+                    }
+                }
+                Ok(names)
+            })
+            .await
+            .expect("catalog read");
+        assert!(
+            archived
+                .iter()
+                .any(|name| name.starts_with(&format!("{LEGACY_NODE_TABLE}__archived408_"))),
+            "the backup stays in the catalog under an archived name: {archived:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aborted_scoped_id_never_rewrites_the_live_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        let generation = store
+            .begin_generation("alpha", "src")
+            .await
+            .expect("generation begins");
+        store
+            .abort_generation("alpha", "src", generation)
+            .await
+            .expect("generation aborts");
+        let stale = format!("alpha::{generation}::src/main.rs");
+        store
+            .upsert("alpha", &stale, vec![0.0; DIMS], row_payload("stale"))
+            .await
+            .expect("the stale retry is isolated");
+        let (_, payload) = store
+            .get("alpha", "src/main.rs")
+            .await
+            .expect("live lookup")
+            .expect("live row exists");
+        assert_eq!(payload.content, "content-src/main.rs");
+    }
+
+    #[tokio::test]
+    async fn a_bare_id_starting_with_its_namespace_keeps_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("alpha::src/main.rs", Some("alpha"), "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        store
+            .upsert(
+                "alpha",
+                "alpha::src/main.rs",
+                vec![0.0; DIMS],
+                row_payload("updated"),
+            )
+            .await
+            .expect("re-ingest the qualified identity");
+        assert_eq!(count_memory(&store, "m.namespace = 'alpha'").await, 1);
+        let (_, payload) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("qualified lookup")
+            .expect("the legacy row owns its qualified identity");
+        assert_eq!(payload.content, "updated");
+    }
+
+    #[tokio::test]
+    async fn a_cached_alias_is_revalidated_after_another_handle_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        store
+            .load_legacy_aliases()
+            .await
+            .expect("cache the pre-publication alias");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs")
+        );
+        // The engine forbids two `Database` handles in one process, so model
+        // the other handle's publication by repointing the stored alias and
+        // bumping the process-wide epoch exactly as that handle would.
+        store
+            .with_conn(|conn| {
+                conn.query(
+                    "MATCH (a:LegacyIdAlias {canonical_id: 'alpha::src/main.rs'}) \
+                     SET a.id = 'alpha::9::src/main.rs'",
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("alias repointed");
+        LEGACY_ALIAS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        assert_eq!(
+            store
+                .resolve_legacy_alias("alpha", "alpha::src/main.rs")
+                .await
+                .expect("revalidated lookup")
+                .as_deref(),
+            Some("alpha::9::src/main.rs")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_load_racing_a_publication_is_not_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        store
+            .legacy_alias_load_race
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        store
+            .load_legacy_aliases()
+            .await
+            .expect("the read itself succeeds");
+        assert!(
+            !store
+                .legacy_aliases_loaded
+                .load(std::sync::atomic::Ordering::Acquire),
+            "a map that raced a publication stays unloaded"
+        );
+    }
 }

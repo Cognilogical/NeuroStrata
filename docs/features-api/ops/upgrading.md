@@ -18,6 +18,60 @@ After upgrading to a build with the project marker, run `neurostrata-mcp hooks i
 
 ## How automatic upgrades work
 
+## Store-open migration for legacy rows
+
+Every open of an existing store runs one migration inside the schema turn.
+Namespace recovery and identity auditing never block the open on their own
+account. The deliberate exception is a primary-key rebuild that cannot copy or
+validate every row and relationship: that fails loudly, because serving a
+half-migrated store would risk data loss. No row or edge is deleted.
+
+This port is **independent of #68**: it does not depend on, sequence with, or
+block that work. It only normalizes already-present on-disk stores so the
+current binary can open them; no #68 schema or lifecycle change is assumed.
+
+- **Primary key.** When `CALL table_info('Memory')` does not report `id` as the
+  sole primary key, the open rebuilds the table keyed by `id` into scratch
+  tables, copies every row and relationship, validates the counts, and only
+  then swaps the names. The migration reports `pk_rebuilt = true`; the original
+  tables are renamed aside until the replacement passes validation, and an
+  interrupted swap is resumed or rolled back on the next open before a fresh
+  `Memory` table can be created. Relationship tables keep the endpoint kinds
+  they were declared with: a table that does not touch `Memory` is left
+  completely untouched, and a table mixing `Memory` with other endpoints is
+  recreated with every connection, the `Memory` side rebound to the rebuilt
+  row and the other side still bound by its own primary key. A rebuild that
+  cannot copy every row or edge, or cannot represent an endpoint, fails loudly
+  and leaves the source tables untouched.
+- **NULL namespaces.** `metadata.namespace` is checked first, then the trusted
+  structural owner: a generation-scoped id (`namespace::generation::path`) or
+  the single qualified row that shares its logical path in exactly one
+  namespace. When both exist and disagree, or when only an unverified metadata
+  claim exists against contradicting structural evidence, the row moves to
+  `_quarantine` instead of being exposed under a tenant that never owned it.
+  Imported rows with foreign mesh provenance or private eligibility are never
+  rewritten or quarantined. They participate in recovery only when trusted
+  structural evidence corroborates the metadata-named owner; an unproven or
+  conflicting claim leaves the protected row untouched. A row with no
+  recoverable owner moves to `_quarantine` with `metadata.quarantine` recorded;
+  it is still there, just out of ordinary reads, list, search and export.
+- **Legacy ids.** Rows an older binary wrote as bare ids are recorded in
+  `LegacyIdAlias (id, namespace, canonical_id)`. A later re-ingest of the
+  qualified id resolves through that alias and updates the existing row in
+  place, so edges stay attached and no duplicate row appears. Protected bare
+  rows are aliased for reads too, but the writer turn refuses to overwrite or
+  delete them **through that alias**; foreign-surface rows (for example vault
+  imports) keep their own identity and are not aliased.
+- **Recovery opens.** An unverified recovery open (checksum-config mismatch,
+  unverified WAL replay, or a discarded unreadable WAL) skips the migration
+  entirely and reports `skipped_reason = "unverified_open"`; a later verified
+  open performs it.
+
+The report is available from the store's last open (`MigrationReport`:
+`run`, `pk_rebuilt`, `null_namespace_recovered`, `quarantined`,
+`aliases_recorded`, `skipped_reason`). Re-running an open over an already
+migrated store reports zero changes, so the migration is idempotent.
+
 ## How Zero-Touch Upgrades Work
 
 1. **Replace or rebuild the binary:**
