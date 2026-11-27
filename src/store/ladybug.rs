@@ -118,54 +118,44 @@ async fn search_inner(
                 "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata LIMIT 512",
                 escape_ladybug_string(&namespace)
             );
+            // Fail closed: an incomplete hydration map would make reasoning
+            // rows look fully populated when their payloads are missing. Both
+            // a busy turn and an engine query failure must reach the caller.
             let hydrated = store
                 .with_conn(move |conn| {
                     let mut out: std::collections::HashMap<String, MemoryPayload> =
                         std::collections::HashMap::new();
-                    match conn.query(&hydrate_q) {
-                        Ok(rows) => {
-                            for row in rows {
-                                let id = format!("{}", row[0]);
-                                if id.is_empty() || out.contains_key(&id) {
-                                    continue;
+                    for row in conn.query(&hydrate_q)? {
+                        let id = format!("{}", row[0]);
+                        if id.is_empty() || out.contains_key(&id) {
+                            continue;
+                        }
+                        let metadata_str = format!("{}", row[7]);
+                        let metadata: Value = match serde_json::from_str(&metadata_str) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                if !metadata_str.trim().is_empty() {
+                                    tracing::warn!("corrupt metadata JSON in store row: {e}");
                                 }
-                                let metadata_str = format!("{}", row[7]);
-                                let metadata: Value = match serde_json::from_str(&metadata_str) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        if !metadata_str.trim().is_empty() {
-                                            tracing::warn!(
-                                                "corrupt metadata JSON in store row: {e}"
-                                            );
-                                        }
-                                        Value::Null
-                                    }
-                                };
-                                out.insert(
-                                    id,
-                                    MemoryPayload {
-                                        content: format!("{}", row[1]),
-                                        user_id: format!("{}", row[2]),
-                                        memory_type: format!("{}", row[3]),
-                                        agent_name: Some(format!("{}", row[4])),
-                                        location: format!("{}", row[5]),
-                                        location_lines: format!("{}", row[6]),
-                                        metadata,
-                                    },
-                                );
+                                Value::Null
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!("reasoning payload hydration query failed: {e}");
-                        }
+                        };
+                        out.insert(
+                            id,
+                            MemoryPayload {
+                                content: format!("{}", row[1]),
+                                user_id: format!("{}", row[2]),
+                                memory_type: format!("{}", row[3]),
+                                agent_name: Some(format!("{}", row[4])),
+                                location: format!("{}", row[5]),
+                                location_lines: format!("{}", row[6]),
+                                metadata,
+                            },
+                        );
                     }
                     Ok(out)
                 })
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!("failed to hydrate reasoning payloads: {e}");
-                    std::collections::HashMap::new()
-                });
+                .await?;
             let exec_adapter =
                 crate::rdf::reasoning::ReasoningAdapter::new().with_payloads(hydrated);
             inferred_results = exec_adapter.execute(&ont_idx, &namespace, q, &[]);
@@ -5605,7 +5595,7 @@ impl LadybugStore {
         // store is busy; a caller that gives up after the statement was
         // dispatched still leaves the dirty mark behind, because the mark is
         // owned by the blocking task rather than by this future.
-        let outcome = bounded(what, write_turn_budget(), async move {
+        let outcome = bounded(what, write_turn_budget(), true, async move {
             // One writer at a time, because the engine refuses the second
             // rather than making it wait. The deadline covers this queue too:
             // a caller stuck behind a stalled write hears that the database is
@@ -5721,11 +5711,9 @@ impl LadybugStore {
         budget: std::time::Duration,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
         let write_lock = Arc::clone(&self.write_lock);
-        bounded(
-            what,
-            budget,
-            async move { Ok(write_lock.lock_owned().await) },
-        )
+        bounded(what, budget, false, async move {
+            Ok(write_lock.lock_owned().await)
+        })
         .await
     }
 
@@ -5754,7 +5742,15 @@ impl LadybugStore {
         // writer holds the turn. As in `write_owning_turn`, the guard lives
         // inside the blocking task, so a dropped await cannot release it
         // while a statement is still running.
-        let turn = self.acquire_write_turn_within(what, budget).await?;
+        let turn = match self.acquire_write_turn_within(what, budget).await {
+            Ok(turn) => turn,
+            Err(err) => {
+                if is_store_busy(&err) {
+                    READ_TURNS_BUSY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Err(err);
+            }
+        };
         ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
             let _turn = turn;
@@ -7917,11 +7913,7 @@ impl LadybugStore {
         self.read_with_turn_within(
             "reading active generations",
             READ_TURN_BUDGET,
-            move |conn| {
-                Ok(crate::store::ladybug::active_generations_of(
-                    conn, &namespace,
-                ))
-            },
+            move |conn| active_generations_checked(conn, &namespace),
         )
         .await
     }
@@ -9534,8 +9526,7 @@ impl LadybugStore {
                 }
                 Ok(out)
             })
-            .await
-            .unwrap_or_else(|e| { tracing::warn!("query_db_metrics failed: {e}"); Vec::new() });
+            .await?;
 
         let key = (namespace.to_string(), kind, name.to_string());
         let mut samples = self.metrics.range(
@@ -16501,6 +16492,46 @@ pub static ENGINE_CALLS_FINISHED: std::sync::atomic::AtomicU64 =
 pub static WRITES_ABANDONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Times the engine refused a second write transaction.
 pub static WRITE_COLLISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Reads that gave up waiting for the store turn before an engine call began.
+pub static READ_TURNS_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Serializes the process-wide write-timeout override used by tests. Without
+/// this lock one test's `NEUROSTRATA_WRITE_TIMEOUT_SECS` changes another
+/// test's write budget, and restoring a previously observed value can leave a
+/// stale budget behind when two tests overlap.
+#[cfg(test)]
+pub(crate) static WRITE_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct WriteTimeoutEnvGuard {
+    previous: Option<String>,
+    _held: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl WriteTimeoutEnvGuard {
+    pub(crate) fn set(secs: &str) -> Self {
+        let held = WRITE_TIMEOUT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var("NEUROSTRATA_WRITE_TIMEOUT_SECS").ok();
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", secs);
+        Self {
+            previous,
+            _held: held,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for WriteTimeoutEnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", value),
+            None => std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS"),
+        }
+    }
+}
 
 /// How many engine calls are inside lbug right now.
 pub fn engine_in_flight() -> u64 {
@@ -16513,12 +16544,13 @@ pub fn engine_in_flight() -> u64 {
 pub fn engine_stats() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     format!(
-        "{} in flight ({} started, {} finished), {} abandoned, {} collisions",
+        "{} in flight ({} started, {} finished), {} abandoned, {} collisions, {} read-turns busy",
         engine_in_flight(),
         ENGINE_CALLS_STARTED.load(Relaxed),
         ENGINE_CALLS_FINISHED.load(Relaxed),
         WRITES_ABANDONED.load(Relaxed),
-        WRITE_COLLISIONS.load(Relaxed)
+        WRITE_COLLISIONS.load(Relaxed),
+        READ_TURNS_BUSY.load(Relaxed)
     )
 }
 
@@ -16679,15 +16711,28 @@ fn resolve_target_on_write(
 pub struct StoreBusy {
     operation: String,
     budget: std::time::Duration,
+    /// Whether the deadline fired after a statement was dispatched. A caller
+    /// that only failed to acquire the turn must not be told a statement may
+    /// still be running: nothing was sent to the engine.
+    dispatched: bool,
 }
 
 impl std::fmt::Display for StoreBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let budget = if self.budget.subsec_millis() == 0 {
+            format!("{}s", self.budget.as_secs())
+        } else {
+            format!("{}ms", self.budget.as_millis())
+        };
+        let recovery = if self.dispatched {
+            "The statement may still be running, so read the record back before retrying."
+        } else {
+            "No statement was dispatched, so retrying is safe."
+        };
         write!(
             f,
-            "the database is busy: {} did not finish within {}s. The statement may still be running, so read the record back before retrying.",
-            self.operation,
-            self.budget.as_secs()
+            "the database is busy: {} did not finish within {}. {}",
+            self.operation, budget, recovery
         )
     }
 }
@@ -16714,6 +16759,7 @@ pub fn store_busy_message(err: &anyhow::Error) -> Option<String> {
 async fn bounded<T>(
     what: &str,
     limit: std::time::Duration,
+    dispatched: bool,
     fut: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     match tokio::time::timeout(limit, fut).await {
@@ -16721,6 +16767,7 @@ async fn bounded<T>(
         Err(_) => Err(StoreBusy {
             operation: what.to_string(),
             budget: limit,
+            dispatched,
         }
         .into()),
     }
@@ -17035,6 +17082,7 @@ eurostrata\src\daemon.rs",
         let err = bounded(
             "deleting a memory",
             std::time::Duration::from_millis(50),
+            true,
             slow,
         )
         .await
@@ -17058,6 +17106,7 @@ eurostrata\src\daemon.rs",
         let err = bounded(
             "writing a memory",
             std::time::Duration::from_millis(50),
+            false,
             async {
                 let _turn = lock.lock().await;
                 Ok::<(), anyhow::Error>(())
@@ -17091,6 +17140,7 @@ eurostrata\src\daemon.rs",
         let err = bounded(
             "writing a memory",
             std::time::Duration::from_millis(20),
+            false,
             async {
                 let _held = Arc::clone(&lock).lock_owned().await;
                 Ok::<(), anyhow::Error>(())
@@ -17116,21 +17166,28 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn a_write_inside_its_deadline_is_left_alone() {
         let quick = async { Ok::<u8, anyhow::Error>(7) };
-        let out = bounded("writing a memory", std::time::Duration::from_secs(5), quick)
-            .await
-            .unwrap();
+        let out = bounded(
+            "writing a memory",
+            std::time::Duration::from_secs(5),
+            false,
+            quick,
+        )
+        .await
+        .unwrap();
         assert_eq!(out, 7);
     }
 
     #[test]
     fn the_write_deadline_can_be_overridden() {
-        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "90");
-        assert_eq!(write_timeout(), std::time::Duration::from_secs(90));
-
-        // A nonsense or zero value falls back rather than disabling the bound.
-        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "0");
-        assert_eq!(write_timeout(), std::time::Duration::from_secs(30));
-        std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS");
+        {
+            let _guard = WriteTimeoutEnvGuard::set("90");
+            assert_eq!(write_timeout(), std::time::Duration::from_secs(90));
+        }
+        {
+            // A nonsense or zero value falls back rather than disabling the bound.
+            let _guard = WriteTimeoutEnvGuard::set("0");
+            assert_eq!(write_timeout(), std::time::Duration::from_secs(30));
+        }
     }
 
     #[test]
@@ -25190,8 +25247,7 @@ eurostrata\src\daemon.rs",
 
     #[tokio::test]
     async fn refresh_ontology_keeps_the_cached_index_when_the_store_is_busy() {
-        let dir =
-            std::env::temp_dir().join(format!("ns-ontology-busy-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("ns-ontology-busy-{}", uuid::Uuid::new_v4()));
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
         store.init("probe").await.expect("create the schema");
 
@@ -26813,15 +26869,10 @@ eurostrata\src\daemon.rs",
                 .map(|i| format!("missing-target-{i}"))
                 .collect::<Vec<_>>(),
         });
-        let previous_timeout = std::env::var("NEUROSTRATA_WRITE_TIMEOUT_SECS").ok();
-        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "1");
+        // write_timeout() is read at invocation; the guard restores the
+        // process-wide override only after this test's write has ended.
+        let _timeout_guard = WriteTimeoutEnvGuard::set("1");
         let timed_out = store.upsert("probe", "m1", vec![0.0; 4], payload).await;
-        // write_timeout() is read at invocation, so restoring the var
-        // now cannot affect the already-running task.
-        match previous_timeout {
-            Some(value) => std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", value),
-            None => std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS"),
-        }
         let err = timed_out.expect_err("the slow first write must time out to the caller");
         assert!(
             err.to_string().contains("the database is busy"),
@@ -33556,7 +33607,7 @@ eurostrata\src\daemon.rs",
 
         fn expected_busy_message(operation: &str) -> String {
             format!(
-                "the database is busy: {operation} did not finish within 0s. The statement may still be running, so read the record back before retrying."
+                "the database is busy: {operation} did not finish within 20ms. No statement was dispatched, so retrying is safe."
             )
         }
 
@@ -33610,23 +33661,20 @@ eurostrata\src\daemon.rs",
             // The same caller succeeds once the turn is free: busy is a wait,
             // not a failure of the store.
             drop(held);
-            let started = std::time::Instant::now();
+            // Recovery is the assertion. Scheduler and blocking-pool delays
+            // are not the store's busy condition, so no wall-clock bound here.
             let value = store
                 .read_with_turn_within("reading a memory", Duration::from_secs(5), |_| Ok(7u8))
                 .await
                 .expect("the read recovers");
             assert_eq!(value, 7);
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "recovery took {:?}",
-                started.elapsed()
-            );
         }
 
         #[tokio::test]
         async fn a_read_behind_a_held_turn_reports_busy_not_empty() {
             let (_dir, store) = fresh_store().await;
             let held = Arc::clone(&store.write_lock).lock_owned().await;
+            let busy_before = READ_TURNS_BUSY.load(Ordering::Relaxed);
 
             let err = match store
                 .read_with_turn_within("reading a memory", Duration::from_millis(20), |_| {
@@ -33639,6 +33687,11 @@ eurostrata\src\daemon.rs",
             };
 
             assert!(is_store_busy(&err), "{err:?}");
+            assert_eq!(
+                READ_TURNS_BUSY.load(Ordering::Relaxed),
+                busy_before + 1,
+                "read contention must be visible in engine statistics"
+            );
             assert!(
                 store_busy_message(&err)
                     .as_deref()
@@ -33705,6 +33758,7 @@ eurostrata\src\daemon.rs",
             let wrapped = anyhow::Error::new(StoreBusy {
                 operation: "reading a memory".to_string(),
                 budget: Duration::from_secs(3),
+                dispatched: true,
             })
             .context("outer context");
             assert!(is_store_busy(&wrapped), "{wrapped:?}");
@@ -33799,17 +33853,11 @@ eurostrata\src\daemon.rs",
         async fn write_with_deadline_behind_a_held_turn_reports_busy() {
             let (_dir, store) = fresh_store().await;
             let held = Arc::clone(&store.write_lock).lock_owned().await;
-            let previous_timeout = std::env::var("NEUROSTRATA_WRITE_TIMEOUT_SECS").ok();
-            std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "1");
+            let _timeout_guard = WriteTimeoutEnvGuard::set("1");
 
             let outcome = store
                 .write_with_deadline("writing a memory", |_conn| Ok(()))
                 .await;
-
-            match previous_timeout {
-                Some(value) => std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", value),
-                None => std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS"),
-            }
             let err =
                 outcome.expect_err("a held turn must report busy, not dispatch the statement");
             assert!(is_store_busy(&err), "{err:?}");
