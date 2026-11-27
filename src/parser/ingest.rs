@@ -2074,6 +2074,18 @@ pub async fn ingest_directory(
             tracing::warn!("enrichment registry update failed: {e}");
         }
     }
+    // A process killed after publication but before relinking leaves the
+    // pointer live with its declared edges missing. Complete that relink
+    // before this ingest stages new rows; stores without a pending marker
+    // return 0. Warn-first: a recovery failure must not strand later ingests.
+    if let Err(e) = vector_store
+        .recover_pending_relink(namespace, &source_key)
+        .await
+    {
+        tracing::warn!(
+            "could not finish a relink left pending by a crash in namespace '{namespace}': {e}"
+        );
+    }
     let source_identity = crate::context::model::SourceIdentity {
         worktree_id,
         ..Default::default()
@@ -2729,6 +2741,21 @@ pub async fn ingest_directory(
                         generation, namespace, abort
                     );
                 }
+                // `enrichment_start` already marked this run as running. Fail
+                // it before returning, or the registry reports a stale active
+                // ingest until the lock expires (review finding on the read
+                // error branch).
+                if let Err(fail) = crate::registry::enrichment_fail(
+                    &vector_store,
+                    Some(&embedder),
+                    namespace,
+                    "ingest",
+                    &e.to_string(),
+                )
+                .await
+                {
+                    tracing::warn!("enrichment registry update failed: {fail}");
+                }
                 return Err(anyhow::anyhow!(
                     "stored the nodes of namespace {} but could not read its previous active generation before publishing generation {}: {}",
                     namespace,
@@ -2800,29 +2827,63 @@ pub async fn ingest_directory(
             }
             match previous_generation {
                 Some(previous_generation) => {
-                    let restore = vector_store
-                        .publish_generation(namespace, &source_key, previous_generation)
-                        .await;
-                    let abort = vector_store
-                        .abort_generation(namespace, &source_key, generation)
-                        .await;
-                    let restore_note = match restore {
-                        Ok(()) => format!("restored generation {previous_generation}"),
-                        Err(e) => {
-                            format!("could not restore generation {previous_generation}: {e}")
+                    // Restore only while this ingest's published generation is
+                    // still active. A later ingest may have published over it;
+                    // its tree is the truth and a stale rollback target must
+                    // never replace it.
+                    match vector_store
+                        .publish_generation_if_active(
+                            namespace,
+                            &source_key,
+                            generation,
+                            previous_generation,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            // The pointer is back on the previous generation,
+                            // so this abort only deletes the failed rows.
+                            let abort = vector_store
+                                .abort_generation(namespace, &source_key, generation)
+                                .await;
+                            let abort_note = match abort {
+                                Ok(()) => format!("aborted generation {generation}"),
+                                Err(e) => format!("could not abort generation {generation}: {e}"),
+                            };
+                            return Err(anyhow::anyhow!(
+                                "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; rollback restored generation {}; {}; relink error: {}",
+                                namespace,
+                                previous_generation,
+                                abort_note,
+                                relink_error
+                            ));
                         }
-                    };
-                    let abort_note = match abort {
-                        Ok(()) => format!("aborted generation {generation}"),
-                        Err(e) => format!("could not abort generation {generation}: {e}"),
-                    };
-                    return Err(anyhow::anyhow!(
-                        "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; rollback: {}; {}; relink error: {}",
-                        namespace,
-                        restore_note,
-                        abort_note,
-                        relink_error
-                    ));
+                        Ok(false) => {
+                            // Another ingest owns the pointer now. Aborting
+                            // would clear a generation that is not ours, so
+                            // leave both the pointer and its tree intact.
+                            return Err(anyhow::anyhow!(
+                                "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; a newer generation is active so stale rollback target {} was left untouched and generation {} was not aborted; relink error: {}",
+                                namespace,
+                                previous_generation,
+                                generation,
+                                relink_error
+                            ));
+                        }
+                        Err(restore_error) => {
+                            // Restore failed, so the pointer may still name
+                            // generation N. Aborting N clears the active
+                            // pointer and leaves every reader with no tree.
+                            return Err(anyhow::anyhow!(
+                                "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; could not restore generation {}: {}; generation {} was not aborted so its active pointer stays intact; relink error: {}",
+                                namespace,
+                                previous_generation,
+                                restore_error,
+                                generation,
+                                relink_error
+                            ));
+                        }
+                    }
                 }
                 None => {
                     // No prior generation (a first ingest, or a namespace an
@@ -6483,9 +6544,10 @@ use super::x;"#;
         std::fs::remove_dir_all(&db).ok();
     }
 
-    /// When the rollback itself fails, the error must name both the relink
-    /// failure and every rollback failure, so the operator knows the store was
-    /// left on the unrelinked generation instead of a restored one (#417).
+    /// When restoring the previous generation fails, the error must name both
+    /// the relink failure and the restore failure, and the failed generation
+    /// must NOT be aborted: aborting clears the active pointer and leaves every
+    /// reader with no tree at all (#417).
     #[tokio::test]
     async fn a_failed_relink_reports_the_rollback_failures_too() {
         let db =
@@ -6550,8 +6612,7 @@ use super::x;"#;
             "injected relink failure",
             "could not restore generation 1",
             "injected rollback restore failure",
-            "could not abort generation 2",
-            "injected rollback abort failure",
+            "generation 2 was not aborted",
         ] {
             assert!(
                 text.contains(expected),

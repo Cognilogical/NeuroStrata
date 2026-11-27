@@ -1530,6 +1530,15 @@ async fn handle_ingest_scip(
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     let scip_file = caller_path_refusal(&state, &req.scip_path)?;
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
+    if crate::traits::is_reserved_ingest_destination(&namespace) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "ingest destination uses the reserved internal staging namespace '{}'; choose a different namespace",
+                namespace
+            ),
+        ));
+    }
     let report =
         crate::parser::scip::ingest_scip_index(state.vector_store.clone(), &namespace, &scip_file)
             .await

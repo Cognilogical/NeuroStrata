@@ -81,6 +81,12 @@ pub async fn ingest_scip_index(
     namespace: &str,
     scip_path: &Path,
 ) -> Result<ScipIngestReport> {
+    if crate::traits::is_reserved_ingest_destination(namespace) {
+        anyhow::bail!(
+            "ingest destination uses the reserved internal staging namespace '{}'; choose a different namespace",
+            namespace
+        );
+    }
     let bytes = std::fs::read(scip_path)
         .with_context(|| format!("failed to read SCIP index at {}", scip_path.display()))?;
     ingest_scip_bytes(vector_store, namespace, &bytes).await
@@ -93,6 +99,12 @@ pub async fn ingest_scip_bytes(
     namespace: &str,
     bytes: &[u8],
 ) -> Result<ScipIngestReport> {
+    if crate::traits::is_reserved_ingest_destination(namespace) {
+        anyhow::bail!(
+            "ingest destination uses the reserved internal staging namespace '{}'; choose a different namespace",
+            namespace
+        );
+    }
     let index = parse_scip_bytes(bytes)?;
     let all_rows = vector_store.list(namespace, None, None).await?;
 

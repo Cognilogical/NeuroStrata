@@ -12492,7 +12492,13 @@ impl VectorStore for LadybugStore {
         }
 
         let namespace_owned = namespace.to_string();
+        let source_key_owned = source_key.to_string();
         self.write_with_deadline("relinking the graph", move |conn| {
+            // One transaction: a later statement failing must not leave an
+            // earlier mentions rewrite, stub retirement or edge replay
+            // committed against a pointer the caller is about to roll back.
+            conn.query("BEGIN TRANSACTION")?;
+            let inner: Result<usize> = (|| {
             // Update only mentions metadata rows that actually changed, batched
             // via UNWIND to avoid a separate write transaction per memory.
             for chunk in mention_updates.chunks(100) {
@@ -12605,6 +12611,31 @@ impl VectorStore for LadybugStore {
                 )?;
             }
             Ok(created)
+            })();
+            match inner {
+                Ok(created) => {
+                    // Recovery marker: the pointer is now live with its edges.
+                    // A failed marker clear only causes a redundant relink on
+                    // the next ingest, never a wrong acceptance (the graph is
+                    // already correct), so it is warn-first.
+                    let clear = format!(
+                        "MATCH (g:IngestGeneration) WHERE g.id = '{}' SET g.relink_pending = false",
+                        escape_ladybug_string(&crate::parser::ingest::generation_key(
+                            &namespace_owned,
+                            &source_key_owned
+                        ))
+                    );
+                    if let Err(e) = conn.query(&clear) {
+                        tracing::warn!("relink: could not clear the pending marker: {e}");
+                    }
+                    conn.query("COMMIT")?;
+                    Ok(created)
+                }
+                Err(e) => {
+                    let _ = conn.query("ROLLBACK");
+                    Err(e)
+                }
+            }
         })
         .await
     }
@@ -12748,7 +12779,7 @@ impl VectorStore for LadybugStore {
             #[cfg(test)]
             publication_phase_barrier("precommit", generation);
             let write = format!(
-                "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {generation}, g.previous_generation = {previous} ON MATCH SET g.active_generation = {generation}, g.previous_generation = {previous}"
+                "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {generation}, g.previous_generation = {previous}, g.relink_pending = true ON MATCH SET g.active_generation = {generation}, g.previous_generation = {previous}, g.relink_pending = true"
             );
             conn.query(&write)?;
             // Only this generation's staging row: an overlapping ingest's
@@ -12770,6 +12801,78 @@ impl VectorStore for LadybugStore {
         #[cfg(test)]
         publication_phase_barrier("postcommit", generation);
         Ok(())
+    }
+
+    async fn publish_generation_if_active(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        expected: u64,
+        target: u64,
+    ) -> Result<bool> {
+        let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
+        let refresh_ns = namespace.clone();
+        let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+            &namespace,
+            &source_key,
+        ));
+        let flipped = self
+            .write_with_deadline("conditionally restoring a generation", move |conn| {
+                let read = format!(
+                    "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.active_generation"
+                );
+                let active = conn
+                    .query(&read)?
+                    .next()
+                    .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64)
+                    .unwrap_or(0);
+                if active != expected {
+                    // A newer ingest published over ours. Its tree stays live:
+                    // a stale rollback target must never replace it.
+                    return Ok(false);
+                }
+                // Compare and flip in one statement inside the writer turn, so
+                // no other publication can land between the check and the write.
+                let write = format!(
+                    "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' AND g.active_generation = {expected} SET g.active_generation = {target}, g.previous_generation = {expected}, g.relink_pending = false"
+                );
+                conn.query(&write)?;
+                Ok(true)
+            })
+            .await?;
+        if flipped {
+            self.refresh_lexical_after_pointer_change(&refresh_ns).await;
+        }
+        Ok(flipped)
+    }
+
+    async fn recover_pending_relink(&self, namespace: &str, source_key: &str) -> Result<usize> {
+        let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
+        let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+            &namespace,
+            &source_key,
+        ));
+        let pending = self
+            .with_conn(move |conn| {
+                let read = format!(
+                    "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.relink_pending"
+                );
+                Ok(conn
+                    .query(&read)?
+                    .next()
+                    .map(|row| format!("{}", row[0]).eq_ignore_ascii_case("true"))
+                    .unwrap_or(false))
+            })
+            .await?;
+        if !pending {
+            return Ok(0);
+        }
+        // A crash after publication but before relinking leaves the marker set.
+        // Replay the declarations against the now-active generation before any
+        // new ingest stages rows over them.
+        self.relink_edges(&namespace, &source_key).await
     }
 
     async fn abort_generation(
@@ -12799,7 +12902,7 @@ impl VectorStore for LadybugStore {
             // aborted generation (abort is normally pre-publish), clear it so
             // the superseded generation is never reachable.
             let clear = format!(
-                "MATCH (g:IngestGeneration) WHERE g.id = '{}' AND g.active_generation = {} SET g.active_generation = 0",
+                "MATCH (g:IngestGeneration) WHERE g.id = '{}' AND g.active_generation = {} SET g.active_generation = 0, g.relink_pending = false",
                 escape_ladybug_string(&crate::parser::ingest::generation_key(
                     &namespace,
                     &source_key
@@ -32673,10 +32776,13 @@ eurostrata\src\daemon.rs",
             .begin_generation("crashprobe", PROBE_SOURCE)
             .await
             .expect("begin the staging generation");
-        for (path, content) in [
+        for (index, (path, content)) in [
             ("src/a.rs", "second generation"),
             ("src/b.rs", "second file"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let id = crate::parser::ingest::generation_scoped_id("crashprobe", second, path);
             store
                 .upsert(
@@ -32687,7 +32793,28 @@ eurostrata\src\daemon.rs",
                 )
                 .await
                 .expect("stage the row");
+            if index == 0 {
+                publication_phase_barrier("after-first-page", second);
+            }
         }
+        // A staged row can be deleted while shaping a generation. A crash at
+        // that point must reopen on the previous, whole generation.
+        let first_id =
+            crate::parser::ingest::generation_scoped_id("crashprobe", second, "src/a.rs");
+        store
+            .delete("crashprobe", &first_id)
+            .await
+            .expect("delete the staged row");
+        publication_phase_barrier("after-delete", second);
+        store
+            .upsert(
+                "crashprobe",
+                &first_id,
+                vec![0.0; 4],
+                generation_payload("second generation", PROBE_SOURCE, json!({})),
+            )
+            .await
+            .expect("restore the staged row");
         store
             .publish_generation("crashprobe", PROBE_SOURCE, second)
             .await
@@ -32707,7 +32834,14 @@ eurostrata\src\daemon.rs",
         }
 
         let exe = std::env::current_exe().expect("the test binary has a path");
-        for phase in ["staged", "precommit", "after-flip", "postcommit"] {
+        for phase in [
+            "staged",
+            "after-delete",
+            "after-first-page",
+            "precommit",
+            "after-flip",
+            "postcommit",
+        ] {
             let root = tempfile::tempdir().expect("create the crash fixture directory");
             let db = root.path().join("crash.lbug");
             let marker = root.path().join(format!("reached-{phase}"));
@@ -32754,7 +32888,7 @@ eurostrata\src\daemon.rs",
                 .await
                 .expect("read the recovered active generation");
             let expected = match phase {
-                "staged" | "precommit" => 1,
+                "staged" | "after-delete" | "after-first-page" | "precommit" => 1,
                 "after-flip" | "postcommit" => 2,
                 other => panic!("unknown crash phase {other}"),
             };

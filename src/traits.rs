@@ -619,6 +619,33 @@ pub trait VectorStore: Send + Sync + AsAny {
         Ok(())
     }
 
+    /// Flip the active pointer to `target` only while it still names `expected`.
+    /// A store without compare-and-swap reads then publishes; stores with a
+    /// single-writer turn override this so check and flip are one atomic write.
+    /// `false` means another publish landed first and the caller must not touch
+    /// the newer pointer.
+    async fn publish_generation_if_active(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        expected: u64,
+        target: u64,
+    ) -> Result<bool> {
+        if self.active_generation(namespace, source_key).await? == expected {
+            self.publish_generation(namespace, source_key, target)
+                .await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Finish a relink left pending by a process crash between publication and
+    /// relinking. Stores without a pending marker return `0`.
+    async fn recover_pending_relink(&self, _namespace: &str, _source_key: &str) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Discard a staged generation's nodes, leaving the previous active
     /// generation untouched. Used when a build fails midway so a half-built
     /// tree never becomes visible.

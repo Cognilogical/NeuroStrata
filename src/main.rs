@@ -10599,6 +10599,7 @@ async fn run() -> anyhow::Result<()> {
                         scip_path,
                         namespace,
                     } => {
+                        reject_reserved_ingest_destination(&namespace)?;
                         let report = crate::parser::scip::ingest_scip_index(
                             vector_store.clone(),
                             &namespace,
