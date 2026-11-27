@@ -188,7 +188,7 @@ Installs `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (g
 neurostrata-mcp hooks install [--force] [--namespace <ns>]
 ```
 
-It also writes the project marker `.NeuroStrata/config.json` at the main checkout's top, for `--namespace` or, without it, for the one namespace the harness configs, `NEUROSTRATA_NAMESPACE` and `.NeuroStrata/session_queries.json` agree on (never the folder name). When they name none or disagree, it writes no marker, still installs the hooks, and lists the candidates. When the namespace's cached root is a subfolder, or the change would stop memories matching, it writes no marker and says which `root set` to run. When another namespace's marker covers the folder, or it runs inside a split subfolder of another namespace, it installs nothing (exit 1). When the marker is in place but the cached root could not be set, it installs the hooks, prints why on stderr and exits 1. `--namespace` is also written into every harness config; without it, a namespace that a marker now covers the checkout for goes into configs that name none. See [Project root](ops/project-root.md).
+It also writes the project marker `.NeuroStrata/config.json` at the main checkout's top, for `--namespace` or, without it, for the one namespace the harness configs, `NEUROSTRATA_NAMESPACE` and `.NeuroStrata/session_queries.json` agree on (never the folder name). When they name none or disagree, it writes no marker, still installs the hooks, and lists the candidates. When the namespace's cached root is a subfolder, or the change would stop memories matching, it writes no marker and says which `root set` to run. When another namespace's marker covers the folder, or it runs inside a split subfolder of another namespace, it installs nothing (exit 1). When the marker is in place but the cached root could not be set, it installs the hooks, prints why on stderr and exits 1. `--namespace` is also written into every harness config; without it, a namespace that a marker now covers the checkout for goes into configs that name none. Detected harness hook files (`.claude/settings.local.json`, `.codex/hooks.json`, `.github/hooks/neurostrata.json`, and `.opencode/opencode.json`) are wired idempotently for tool-guard, session lifecycle, and Working-Set GC prompt/context hooks. See [Project root](ops/project-root.md).
 The pre-push hook gates the project's configured namespace (see `namespace resolve`) and the checkout's folder name when that is a valid namespace; the pre-commit hook records against the configured namespace. The pre-push hook blocks the push when `neurostrata-mcp` is missing, when `namespace resolve` fails, or when the gate exits with anything other than 0 or 1.
 
 ### `namespace resolve`
@@ -203,22 +203,6 @@ neurostrata-mcp namespace resolve --pushed [dir]
 ```
 
 With `--pushed` it reads the pre-push hook's stdin (`<local ref> <local sha> <remote ref> <remote sha>` lines) and prints, one per line, every namespace the push must pass the task gate for: the checkout's folder name, the resolved namespace, the namespace of the marker over each path the pushed commits change, read from the pushed commit, and the namespace a marker the push deletes or changes named at the remote tip. It exits 1 on an unreadable marker on a pushed path, on a stdin line it cannot read, or when a committed and an untracked marker disagree.
-
-### `root show`, `root set` & `root audit`
-
-Read and write the project marker `.NeuroStrata/config.json` (see [Project root](ops/project-root.md)).
-
-```bash
-neurostrata-mcp root show [dir]
-neurostrata-mcp root audit [dir] [--namespace <ns>] [--for-root <path>] [--json]
-neurostrata-mcp root set <dir> --namespace <ns> [--source-id <id>] [--replace] [--force]
-```
-
-- `root show` (read-only): the marker that applies to `dir` (default: the current folder) and how it was found, its namespace and `source_id`, whether git tracks it (`unknown` when git fails), the cached root, other markers below the marker root (in a linked worktree also those only in the main checkout, labeled), and project-context bindings to missing folders (`unknown` when the user config cannot be read). It notes a `.NeuroStrata` folder spelled in another letter case, which is not a marker. It starts no daemon; with no daemon it takes the store lock and holds it while it reads the store.
-- `root audit` (read-only): memories whose stored paths are absolute inside the root, each with the `neurostrata_supersede_memory` call that fixes it, and paths that need a decision. `--for-root <path>` spells the corrections relative to a planned new root (relative keys of the current root included), so `root set <path>` passes after they are applied. Exits 0 when nothing is fixable, else 1. A user config that cannot be read or parsed is an error; a missing one means no project-context bindings.
-- `root set`: writes the marker (in the main checkout for a linked worktree) and sets the cached root; the command writes every file itself, and a running daemon only updates the cached root (with none, the store is opened directly). Refuses a root change that would stop memories matching unless `--force` (for an unrelated new root: keys whose file exists under the old root but not the new one); refuses another namespace's marker in `<dir>` or a second marker for the namespace in the checkout unless `--replace`; binds `--source-id` only when it is unbound or bound to a missing folder.
-
-The marker is strict JSON: `version` 1, `namespace`, and optionally `source_id` (a string, not `null`); `src/schemas/root-config.schema.json` documents it. A new marker is published with a hard link, so the filesystem must support hard links (exFAT and FAT do not). The home folder, a filesystem or drive root, and a folder outside git with a checkout below it may not hold a marker; that last check looks four levels down and skips `node_modules` and `target`.
 
 ### `root show`, `root set` & `root audit`
 
@@ -301,6 +285,14 @@ Queries the Thalamic Bus event dispatcher counters (`published`, `delivered`, `d
 neurostrata-mcp bus-metrics
 ```
 
+### Logging
+
+All `tracing` output goes to **stderr**, never stdout. Stdout is the MCP stdio channel, so a log line there would corrupt the protocol; the process installs one subscriber at startup with ANSI escapes off, and a second install is a no-op. `RUST_LOG` sets the filter. When it is unset or cannot be parsed (for example `RUST_LOG=neurostrata_mcp=lolwut`), the filter falls back to `info` rather than failing startup or going silent.
+
+```bash
+RUST_LOG=debug neurostrata-mcp status
+```
+
 ### `backup` & `restore`
 
 Creates a checkpointed snapshot (`CHECKPOINT` + store copy + `manifest.json`) or restores a snapshot into a new database path.
@@ -311,6 +303,8 @@ neurostrata-mcp restore <backup_dir> --into <new_db_path>
 ```
 
 `backup --no-open` copies the database, its write-ahead log, the checkpoint shadow, and the store-state sidecar directly to disk without opening or checkpointing the store. It **takes the store lock and holds it for the whole copy** (`#209`, `#241`): it refuses while another process holds the lock, and it fails closed when the lock cannot be taken at all, because an untakeable lock is not evidence that the store is free. Holding the lock across the window means a daemon that starts mid-copy cannot change the files being captured. Use a plain `backup <dir>` (daemon-coordinated) or `shutdown` first when the daemon is running.
+
+`restore` likewise **takes the target's store lock before it re-checks the destination and holds it until the database, every companion (`.wal`, `.wal.checkpoint`, `.shadow`, `.pinned.tmp`, `.store-state.json`), the post-install verification open, and the namespace listing have all completed**. A concurrent daemon or CLI command therefore cannot observe a half-restored store; the lock is released only after the restored set is complete or the failed copy has been rolled back.
 
 ### `semantic-eval`
 
