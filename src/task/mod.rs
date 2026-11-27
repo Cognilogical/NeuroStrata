@@ -2264,6 +2264,9 @@ pub(crate) async fn receipt_ledger_root(
             return Some(root);
         }
     }
+    if check_namespace(namespace).is_err() {
+        return None;
+    }
     let ns = crate::server::resolve_namespace(store, namespace).await;
     if let Ok(Some((_, registry))) = store.get(&ns, &crate::registry::registry_row_id(&ns)).await {
         if crate::registry::is_registry_row(&registry.metadata) {
@@ -2343,6 +2346,9 @@ async fn record_graph_query_inner(
     caller_root: Option<&str>,
     count_task: bool,
 ) {
+    if check_namespace(namespace).is_err() {
+        return;
+    }
     let ns = crate::server::resolve_namespace(store, namespace).await;
     #[cfg(test)]
     {
@@ -2538,6 +2544,9 @@ pub async fn record_tool_receipt(
     mut fields: tool_receipts::ReceiptFields,
     caller_root: Option<&str>,
 ) {
+    if check_namespace(&fields.namespace).is_err() {
+        return;
+    }
     let ns = crate::server::resolve_namespace(store, &fields.namespace).await;
 
     // Review fix round 2: ATTRIBUTION ONLY. Never touch `graph_queries_count`,
@@ -3598,10 +3607,10 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
         Ok(v) => v,
         Err(e) => return e,
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = check_namespace(namespace) {
         return e;
     }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
 
     let status_filter = match arg_str(&args, "status") {
         None => None,
@@ -4384,10 +4393,10 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
         Ok(v) => v,
         Err(e) => return e,
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = check_namespace(namespace) {
         return e;
     }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
     // One list scan serves both the gate and the R7 advisories: the gate
     // stays metadata-only and the advisory inputs come from the same rows,
     // so the two surfaces cannot disagree about which tasks are active.
@@ -4726,10 +4735,10 @@ pub async fn handle_bootstrap(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = check_namespace(namespace) {
         return e;
     }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let checked = match checked_marker_root(project_root) {
         Ok(root) => root,
@@ -6231,10 +6240,10 @@ pub async fn handle_task_setup(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = check_namespace(namespace) {
         return e;
     }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
     let checked = match checked_marker_root(project_root) {
         Ok(root) => root,
         Err(e) => return e,
@@ -14001,6 +14010,62 @@ exit 0
             mock.list_namespaces_calls(),
             0,
             "format validation must run before resolve_namespace consults the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_entry_points_refuse_illegal_namespace_before_catalog_access() {
+        // Issue #412: a name refused at one task surface is refused at all of
+        // them, and no handler consults the namespace catalog first.
+        let bad = "team:proj";
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_list(json!({ "namespace": bad }), store).await;
+        assert!(reply.starts_with("ERROR [NAMESPACE]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "task_list consulted catalog"
+        );
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_validate(json!({ "namespace": bad }), store).await;
+        assert!(reply.starts_with("ERROR [NAMESPACE]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "task_validate consulted catalog"
+        );
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_bootstrap(
+            json!({ "namespace": bad, "project_root": "/tmp" }),
+            emb(),
+            store,
+        )
+        .await;
+        assert!(reply.starts_with("ERROR [NAMESPACE]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "bootstrap consulted catalog"
+        );
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_setup(
+            json!({ "namespace": bad, "project_root": "/tmp" }),
+            emb(),
+            store,
+        )
+        .await;
+        assert!(reply.starts_with("ERROR [NAMESPACE]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "task_setup consulted catalog"
         );
     }
 

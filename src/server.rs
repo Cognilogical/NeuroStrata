@@ -3884,6 +3884,9 @@ async fn record_graph_query_for_caller_root(
     query_hint: &str,
     caller_root: Option<&str>,
 ) {
+    if check_namespace_arg(namespace).is_err() {
+        return;
+    }
     // Legacy queries[] row (+ test ledger entry) without a counter bump.
     crate::task::record_legacy_query_path(store, namespace, tool_name, query_hint, caller_root)
         .await;
@@ -4012,6 +4015,9 @@ async fn handle_memories_for_file(arguments: Value, store: Arc<dyn VectorStore>)
         Some(p) => p,
         None => return "Missing 'path' parameter.".to_string(),
     };
+    if let Err(e) = check_namespace_arg(namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, namespace).await;
 
     // Spec §6 R6.2: no pre-dispatch ledger write here. Receipts for this tool
@@ -4362,6 +4368,9 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
         return e.to_string();
     }
     let original_seed = seed;
+    if let Err(e) = check_namespace_arg(namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, namespace).await;
     let store_for_meta = store.clone();
     let project_root = arguments.get("project_root").and_then(|v| v.as_str());
@@ -5326,6 +5335,9 @@ async fn handle_add_memory(
             return e.to_string();
         }
     }
+    if let Err(e) = check_namespace_arg(namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
@@ -6254,6 +6266,9 @@ async fn handle_get_snapshot(
         .get("namespace")
         .and_then(|n| n.as_str())
         .ok_or_else(|| "Missing 'namespace' parameter.".to_string())?;
+    if let Err(e) = check_namespace_arg(namespace) {
+        return Err(e);
+    }
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
@@ -7176,6 +7191,9 @@ async fn handle_ingest_directory(
         Some(n) => n,
         None => return "ERROR: namespace missing.".to_string(),
     };
+    if let Err(e) = check_namespace_arg(namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
@@ -7299,6 +7317,9 @@ async fn handle_feedback_memory(arguments: Value, store: Arc<dyn VectorStore>) -
     if let Err(e) = crate::domain::validate_id_for_read(&id) {
         return e.to_string();
     }
+    if let Err(e) = check_namespace_arg(namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
     let rating = match arguments.get("rating").and_then(|v| v.as_f64()) {
@@ -7353,6 +7374,9 @@ async fn handle_validate_shapes(arguments: Value, store: Arc<dyn VectorStore>) -
         Some(n) => n.to_string(),
         None => return serde_json::json!({"ok":false,"error":"namespace missing"}).to_string(),
     };
+    if let Err(e) = check_namespace_arg(&namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, &namespace).await;
     match store.get(&namespace, &id).await {
         Ok(Some((_vec, payload))) => {
@@ -7403,6 +7427,9 @@ async fn handle_ingest_bounded(
         _ => return json!({"ok": false, "error": "candidates must be an array"}).to_string(),
     };
 
+    if let Err(e) = check_namespace_arg(namespace_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, namespace_raw).await;
     let Some(lb) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::LadybugStore>()
@@ -7529,6 +7556,9 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
                 .to_string();
         }
     };
+    if let Err(e) = check_namespace_arg(&namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, &namespace).await;
     let namespace_str = namespace.as_str();
     let profile = arguments
@@ -7873,6 +7903,9 @@ async fn handle_validate_canonical_rdf(arguments: &Value, store: Arc<dyn VectorS
         Ok(u) => u,
         Err(e) => return serde_json::json!({"ok":false,"valid":false,"violations":[format!("invalid memory_id: {e}")]}).to_string(),
     };
+    if let Err(e) = check_namespace_arg(&namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, &namespace).await;
     let namespace = namespace.as_str();
     let id_str = id.to_string();
@@ -8257,6 +8290,9 @@ pub(crate) async fn handle_twin_get(arguments: &Value, store: Arc<dyn VectorStor
         return serde_json::json!({"ok":false,"error":"twin_id required"}).to_string();
     };
     let req_version = arguments.get("version").and_then(|v| v.as_u64());
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     if let Some(v) = req_version {
         // Async history channel first; the rows fallback keeps a namespace
@@ -8392,6 +8428,9 @@ pub(crate) async fn handle_twin_set(
         vars.insert(k.clone(), f);
     }
 
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     let rows_raw = match store.list(&namespace, None, None).await {
         Ok(r) => r,
@@ -8585,6 +8624,9 @@ pub(crate) async fn handle_twin_diff(arguments: &Value, store: Arc<dyn VectorSto
     let Some(to_version) = arguments.get("to_version").and_then(|v| v.as_u64()) else {
         return serde_json::json!({"ok":false,"error":"to_version required"}).to_string();
     };
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     match crate::digital_twin::twin_diff(
         store.as_ref(),
@@ -8612,6 +8654,9 @@ pub(crate) async fn handle_twin_list(arguments: &Value, store: Arc<dyn VectorSto
     let Some(ns_raw) = arguments.get("namespace").and_then(|v| v.as_str()) else {
         return serde_json::json!({"ok":false,"error":"namespace required"}).to_string();
     };
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     let twins = crate::digital_twin::list_twins(store.as_ref(), &namespace).await;
     serde_json::json!({
@@ -8634,6 +8679,9 @@ pub(crate) async fn handle_export_rdf_star(
         .get("format")
         .and_then(|v| v.as_str())
         .unwrap_or("n-triples-star");
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     let rows_raw = match store.list(&namespace, None, None).await {
         Ok(r) => r,
@@ -8773,6 +8821,9 @@ pub(crate) async fn handle_provenance_for(
     let Some(memory_id) = arguments.get("memory_id").and_then(|v| v.as_str()) else {
         return serde_json::json!({"ok":false,"error":"memory_id required"}).to_string();
     };
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     match store.get(&namespace, memory_id).await {
         Ok(Some((_, payload))) => {
@@ -8904,6 +8955,9 @@ pub(crate) async fn handle_graphql_query(arguments: &Value, store: Arc<dyn Vecto
                 .and_then(|v| v.as_str())
         })
         .unwrap_or("NeuroStrata");
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     // Introspection/SDL queries run on the sync executor; data queries ride the
     // async executor so both GraphQL entry points stay exercised in production.
@@ -8986,6 +9040,9 @@ pub(crate) async fn handle_action_with_auth(
     else {
         return serde_json::json!({"ok": false, "error": "action required"}).to_string();
     };
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     let Some(lb_store) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::ladybug::LadybugStore>()
@@ -9228,6 +9285,9 @@ pub(crate) async fn handle_scenario_with_auth(
     else {
         return serde_json::json!({"ok": false, "error": "action required"}).to_string();
     };
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     let Some(lb_store) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::ladybug::LadybugStore>()
@@ -9754,6 +9814,9 @@ pub(crate) async fn handle_object_view_with_auth(
     else {
         return serde_json::json!({"ok": false, "error": "id required"}).to_string();
     };
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     let Some(lb_store) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::ladybug::LadybugStore>()
@@ -10122,6 +10185,9 @@ pub(crate) async fn handle_metrics_query(arguments: &Value, store: Arc<dyn Vecto
         .get("limit")
         .and_then(|v| v.as_u64())
         .unwrap_or(100) as usize;
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     // One series pointer: the persisted samples merged with the live series,
     // plus that series' rolling aggregate. Sweeps call this per series and
@@ -10293,6 +10359,9 @@ pub(crate) async fn handle_metrics_list(arguments: &Value, store: Arc<dyn Vector
         .get("namespace")
         .and_then(|v| v.as_str())
         .unwrap_or("NeuroStrata");
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::LadybugStore>()
@@ -10353,6 +10422,9 @@ pub(crate) async fn handle_chat_ask(
         .get("principal")
         .and_then(|v| v.as_str())
         .unwrap_or(&cfg.default_principal);
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
 
     let provider: Arc<dyn crate::rag_chat::LlmProvider> = if cfg.provider == "openai"
@@ -10409,6 +10481,9 @@ pub(crate) async fn handle_export_wasm_snapshot(
         .get("include_retired")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, ns_raw).await;
     if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::LadybugStore>()
@@ -10448,6 +10523,9 @@ async fn handle_domain_registry(
         Some(n) => n.to_string(),
         None => return serde_json::json!({"ok":false,"error":{"code":"INVALID_SLUG","message":"namespace missing"}}).to_string(),
     };
+    if let Err(e) = check_namespace_arg(&namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, &namespace).await;
     let namespace = namespace.as_str();
     let action = arguments
@@ -10727,6 +10805,9 @@ async fn handle_supersede_memory(
         }
     }
 
+    if let Err(e) = check_namespace_arg(namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
@@ -11170,6 +11251,9 @@ async fn handle_rebuild_communities(
         Some(n) => n,
         None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the specific project namespace.".to_string(),
     };
+    if let Err(e) = check_namespace_arg(namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
@@ -11422,6 +11506,9 @@ async fn handle_find_duplicate_candidates(arguments: Value, store: Arc<dyn Vecto
         Some(n) => n,
         None => return "ERROR [NAMESPACE]: 'namespace' is missing.".to_string(),
     };
+    if let Err(e) = check_namespace_arg(namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
@@ -11636,6 +11723,9 @@ async fn handle_search_memory(
             )
         }
     };
+    if let Err(e) = check_namespace_arg(namespace) {
+        return e;
+    }
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
 
@@ -12375,6 +12465,14 @@ async fn handle_search_memory(
 /// spelling it was stored with; a genuinely new name is left exactly as the
 /// caller wrote it. Listing namespaces costs about two milliseconds, so this
 /// runs on every call rather than being cached and going stale.
+/// Validate a caller-supplied namespace with the canonical DR-1 rule before
+/// `resolve_namespace` consults the catalog (issue #412). Every server entry
+/// point calls this first; the resolver's case-insensitive result is still
+/// used for addressing, but malformed input never reaches a store read.
+pub(crate) fn check_namespace_arg(namespace: &str) -> Result<(), String> {
+    crate::domain::validate_namespace(namespace).map_err(|e| e.to_string())
+}
+
 pub(crate) async fn resolve_namespace(store: &Arc<dyn VectorStore>, requested: &str) -> String {
     match store.list_namespaces().await {
         Ok(existing) => {
@@ -17055,6 +17153,34 @@ mod tests {
             mock.list_namespaces_calls(),
             0,
             "format validation must run before resolve_namespace consults the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_handlers_refuse_illegal_namespace_before_catalog_access() {
+        // Issue #412: memories_for_file and get_snapshot are read surfaces too;
+        // a malformed namespace must be refused before list_namespaces().
+        let bad = "team:proj";
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let text =
+            handle_memories_for_file(json!({ "namespace": bad, "path": "src/a.rs" }), store).await;
+        assert!(text.starts_with("ERROR [NAMESPACE]"), "{text}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "memories_for_file consulted catalog"
+        );
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let result = handle_get_snapshot(json!({ "namespace": bad }), store).await;
+        let err = result.expect_err("get_snapshot must refuse a malformed namespace");
+        assert!(err.starts_with("ERROR [NAMESPACE]"), "{err}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "get_snapshot consulted catalog"
         );
     }
 
@@ -26069,6 +26195,9 @@ async fn handle_distill(arguments: Value, store: Arc<dyn VectorStore>) -> String
         Some(n) if !n.trim().is_empty() => n.to_string(),
         _ => return "ERROR: 'namespace' is required and cannot be empty.".to_string(),
     };
+    if let Err(e) = check_namespace_arg(&namespace_raw) {
+        return e;
+    }
     let namespace = crate::server::resolve_namespace(&store, &namespace_raw).await;
 
     // J22 path containment.
