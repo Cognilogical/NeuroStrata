@@ -4980,11 +4980,13 @@ impl FirstWriteMarker {
             }
             return Ok(());
         }
-        // No marker yet and no identity to record: an unbound process that
-        // embeds nothing cannot name the producer. Production write paths
-        // always bind a serving descriptor.
+        // No marker yet and no identity to record means the write cannot name
+        // the embedding space its vectors live in. Fail closed rather than
+        // land vectors nobody can later attribute (#409).
         let Some(descriptor) = self.descriptor() else {
-            return Ok(());
+            anyhow::bail!(
+                "refusing to write vectors: the store has no persisted embedding marker and this process can resolve no embedding identity (no serving or configured descriptor)"
+            );
         };
         // Rows without a marker belong to a legacy store, not to this first
         // vector. Pinning the configured descriptor to them without physical
@@ -37857,6 +37859,28 @@ mod store_identity {
                 .is_none(),
             "the refused write records no marker"
         );
+    }
+
+    #[tokio::test]
+    async fn a_vector_write_with_no_resolvable_identity_is_refused() {
+        let fx = fixture("no-embedder-identity");
+        // A config path beneath the DB file cannot be created, so this
+        // process resolves neither a serving nor a configured descriptor.
+        let unreachable_config = fx.db.join("config");
+        let store = LadybugStore::for_testing(&fx.db, 4)
+            .expect("open temp database")
+            .with_embed_config_dir(&unreachable_config);
+        store.init("probe").await.expect("init");
+
+        let error = store
+            .upsert("probe", "m1", vector(), payload("owner"))
+            .await
+            .expect_err("vectors whose space cannot be named are refused");
+        assert!(
+            format!("{error:#}").contains("no embedding identity"),
+            "the refusal names the missing identity: {error:#}"
+        );
+        assert_eq!(row_count(&store).await, 0, "no unidentified vector lands");
     }
 
     #[tokio::test]
