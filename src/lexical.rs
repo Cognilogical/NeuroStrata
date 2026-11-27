@@ -194,6 +194,9 @@ fn archived_flag(metadata: &serde_json::Value) -> i64 {
     match metadata.get("archived") {
         Some(v) if v.as_bool() == Some(true) => 1,
         Some(v) if v.as_i64().map(|n| n != 0).unwrap_or(false) => 1,
+        // serde_json keeps values above i64::MAX as u64; as_i64() alone reads
+        // them as zero and lets an archive tombstone index as a live row.
+        Some(v) if v.as_u64().map(|n| n != 0).unwrap_or(false) => 1,
         Some(_) => 0,
         None => 0,
     }
@@ -1010,6 +1013,22 @@ mod tests {
     use super::*;
     use crate::traits::MemoryPayload;
     use serde_json::json;
+
+    #[test]
+    fn archived_flag_recognizes_unsigned_tombstone_beyond_i64() {
+        let unsigned = json!({"archived": u64::MAX});
+        assert_eq!(
+            archived_flag(&unsigned),
+            1,
+            "a nonzero unsigned archive flag above i64::MAX must stay a tombstone"
+        );
+    }
+
+    #[test]
+    fn archived_flag_keeps_zero_unsigned_flag_live() {
+        let unsigned = json!({"archived": 0_u64});
+        assert_eq!(archived_flag(&unsigned), 0);
+    }
 
     fn dummy_payload(content: &str, symbol: Option<&str>) -> MemoryPayload {
         MemoryPayload {

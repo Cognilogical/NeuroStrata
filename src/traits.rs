@@ -247,6 +247,9 @@ pub struct LexicalSearchOutcome {
     /// True when a requested domain filter actually selected the rows.
     /// False covers both "no filter asked for" and the documented fallback.
     pub domain_filter_applied: bool,
+    /// True when the bounded candidate scan ended with a short page and more
+    /// matches may sit below the vetoed prefix. Callers must paginate.
+    pub incomplete: bool,
 }
 
 /// What an attempt to move a memory between namespaces found.
