@@ -3556,10 +3556,15 @@ pub async fn handle_task_get(args: Value, store: Arc<dyn VectorStore>) -> String
         Ok(v) => v,
         Err(e) => return e,
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    // Same typed refusal as claim/update/complete, before resolve_namespace
+    // lists the catalog or load_task reads the caller's id.
+    if let Err(e) = check_namespace(namespace) {
         return e;
     }
+    if let Err(e) = crate::domain::validate_id(&id) {
+        return e.to_string();
+    }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
     let include_history = args
         .get("include_history")
         .and_then(|v| v.as_bool())
@@ -11516,6 +11521,26 @@ exit 0
                 "existing attribution must not be overwritten"
             );
         });
+    }
+
+    #[tokio::test]
+    async fn task_get_refuses_malformed_addresses_before_store_access() {
+        let store = store_with_namespace("MyProj").await;
+        let bad_id = handle_task_get(
+            json!({ "id": "bad/id", "namespace": "MyProj" }),
+            store.clone(),
+        )
+        .await;
+        assert!(bad_id.starts_with("ERROR [ID]:"), "{bad_id}");
+        assert!(bad_id.contains("bad/id"), "{bad_id}");
+
+        let bad_ns = handle_task_get(
+            json!({ "id": "myproj-abc", "namespace": "team:proj" }),
+            store,
+        )
+        .await;
+        assert!(bad_ns.starts_with("ERROR [NAMESPACE]:"), "{bad_ns}");
+        assert!(bad_ns.contains("team:proj"), "{bad_ns}");
     }
 
     #[tokio::test]

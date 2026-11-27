@@ -196,55 +196,22 @@ pub fn validate_id(id: &str) -> Result<(), ValidationError> {
     }
 }
 
-/// Read/address compatibility for rows persisted before DR-1. New writes
-/// always use the strict validator; this one only accepts shapes the old
-/// code could actually store (colon-bearing namespace names), so an existing
-/// marker or memory stays addressable while new writes remain strict.
+/// The read-side gate uses the same DR-1 rule as the write side. Issue #412
+/// requires one canonical rule at every surface: a namespace such as
+/// `team:proj` refused on write must also be refused when addressed for read.
+/// Keeping a named read entry point makes the surface explicit without
+/// widening the accepted set.
 pub fn validate_namespace_for_read(ns: &str) -> Result<(), ValidationError> {
-    if validate_namespace(ns).is_ok() {
-        return Ok(());
-    }
-    let detail = if ns.is_empty() {
-        "must not be empty".to_string()
-    } else if ns.chars().count() > MAX_NAMESPACE_CHARS * 4 {
-        format!("must be at most {} characters", MAX_NAMESPACE_CHARS * 4)
-    } else if let Some(ch) = ns
-        .chars()
-        .find(|c| matches!(c, '/' | '\\' | '\'' | '"') || c.is_control())
-    {
-        format!("contains disallowed character {ch:?}")
-    } else {
-        return Ok(());
-    };
-    Err(ValidationError::Namespace(format!(
-        "'{}' is not an addressable namespace: {detail}",
-        ns.escape_debug()
-    )))
+    validate_namespace(ns)
 }
 
-/// Read/address compatibility for rows persisted before DR-2. A legacy bare
-/// path id such as `file:src/lib.rs` can still be read and rated, but a new
-/// write with that shape is refused by [`validate_id`].
+/// The read-side gate uses the same DR-2 rule as the write side. Bare ids
+/// with spaces or `/` are refused here too; legacy qualified ids
+/// (`<namespace>::<path>`) stay addressable because DR-2 permits a path with
+/// slashes and spaces. Keeping a named read entry point makes the surface
+/// explicit without widening the accepted set.
 pub fn validate_id_for_read(id: &str) -> Result<(), ValidationError> {
-    if validate_id(id).is_ok() {
-        return Ok(());
-    }
-    let detail = if id.is_empty() {
-        "must not be empty".to_string()
-    } else if id.chars().count() > MAX_ID_CHARS * 4 {
-        format!("must be at most {} characters", MAX_ID_CHARS * 4)
-    } else if let Some(ch) = id
-        .chars()
-        .find(|c| matches!(c, '\'' | '"' | '\\') || c.is_control())
-    {
-        format!("contains disallowed character {ch:?}")
-    } else {
-        return Ok(());
-    };
-    Err(ValidationError::Id(format!(
-        "'{}' is not an addressable id: {detail}",
-        id.escape_debug()
-    )))
+    validate_id(id)
 }
 
 #[cfg(test)]
@@ -382,6 +349,51 @@ mod tests {
         }
         let err = validate_id(&too_long).expect_err("129 chars must be refused");
         assert!(err.to_string().contains("128"), "{err}");
+    }
+
+    #[test]
+    fn read_validators_enforce_the_same_dr1_dr2_rules_as_writes() {
+        // Issue #412: a name refused at one surface is refused at all of them.
+        for bad in ["", "team:proj", "a b", "a/b", "a\\b", "é", "a\nb"] {
+            assert!(validate_namespace(bad).is_err(), "write accepted {bad:?}");
+            assert!(
+                validate_namespace_for_read(bad).is_err(),
+                "read accepted {bad:?}"
+            );
+        }
+        for bad in [
+            "",
+            "a b",
+            "a/b",
+            "file:src/lib.rs",
+            "a~b",
+            "a$b",
+            "é",
+            "a\nb",
+        ] {
+            assert!(validate_id(bad).is_err(), "write accepted {bad:?}");
+            assert!(validate_id_for_read(bad).is_err(), "read accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_qualified_ids_and_valid_namespaces_stay_addressable_on_read() {
+        for ok in ["a", "A1_b.c-d", "global", "NeuroStrata", "-abc", "_abc"] {
+            assert!(validate_namespace_for_read(ok).is_ok(), "{ok:?}");
+        }
+        // A qualified id's path keeps its slash and spaces; that shape is
+        // valid under DR-2 and must survive the read-side gate unchanged.
+        for ok in [
+            "a",
+            "memory-1",
+            "a:b",
+            "probe::src/a.rs",
+            "probe::src/with space.rs",
+            "probe::generation::src/a.rs",
+        ] {
+            assert!(validate_id(ok).is_ok(), "{ok:?}");
+            assert!(validate_id_for_read(ok).is_ok(), "{ok:?}");
+        }
     }
 
     #[test]
