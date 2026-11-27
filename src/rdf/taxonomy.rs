@@ -1267,30 +1267,30 @@ pub async fn execute_taxonomy(
 /// distinct namespaces never collide in LadybugStore's global row ID space
 /// (including when one namespace is `a-b` with slug `c` and another is `a`
 /// with slug `b-c`).
+///
+/// The escape delimiter is `.XX.` rather than the earlier `-XX-`. A pre-PR
+/// token only ever contained `[A-Za-z0-9_-]` (dots were escaped, hyphens were
+/// kept or escaped), so a dot marks a token this encoding minted and cannot
+/// alias a row an older binary wrote. Literal dots escape as `.2e.`, and the
+/// second hyphen of `--` escapes as `.2d.` so the row-id `--` delimiter can
+/// never be forged by a namespace. Ordinary single hyphens and alphanumerics
+/// keep the spelling earlier releases wrote.
 pub fn taxonomy_namespace_token(namespace: &str) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(namespace.len());
     let bytes = namespace.as_bytes();
-    let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
     for (i, &b) in bytes.iter().enumerate() {
         match b {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' => out.push(b as char),
-            b'-' => {
-                // A literal `-xx-` (lowercase hex) is indistinguishable from
-                // our escape for a non-charset byte. Escape only that shape;
-                // ordinary single hyphens keep the ids earlier releases wrote.
-                let looks_like_escape = i + 3 < bytes.len()
-                    && lower_hex(bytes[i + 1])
-                    && lower_hex(bytes[i + 2])
-                    && bytes[i + 3] == b'-';
-                if looks_like_escape {
-                    out.push_str("-2d-");
-                } else {
-                    out.push('-');
-                }
+            b'-' if i > 0 && bytes[i - 1] == b'-' => {
+                // Escape the second hyphen of `--`: a literal `--` in a token
+                // would otherwise be indistinguishable from the version
+                // delimiter and could split a row id in the wrong place.
+                out.push_str(".2d.");
             }
+            b'-' => out.push('-'),
             _ => {
-                let _ = write!(&mut out, "-{:02x}-", b);
+                let _ = write!(&mut out, ".{:02x}.", b);
             }
         }
     }
@@ -1323,6 +1323,11 @@ fn bounded_taxonomy_id(kind: &str, base: &str, version: u64) -> String {
 /// addressing the row an earlier binary wrote, whatever escape spelling that
 /// binary used for the namespace token. Mixed-version upserts then converge
 /// on one id for a slug instead of publishing two active versions.
+///
+/// Callers only reach this for ids that already validate under DR-2. A
+/// pre-DR-2 `~xx` row cannot keep its spelling in a valid successor, so its
+/// caller starts the successor at the canonical id and retires the old row by
+/// its original address instead.
 fn versioned_row_id_from_existing(existing: &str, version: u64, kind: &str) -> String {
     let base = existing
         .rfind("-v")
@@ -1332,30 +1337,7 @@ fn versioned_row_id_from_existing(existing: &str, version: u64, kind: &str) -> S
         })
         .map(|at| &existing[..at])
         .unwrap_or(existing);
-    // Earlier releases escaped non-alphanumerics as `~2e~`; `~` is outside
-    // DR-2. Re-spell those escapes as the current `-2e-` form so the new
-    // version has a valid id. The old row is still located by its original
-    // id; only the successor's address is rewritten.
-    let mut migrated = String::with_capacity(base.len());
-    let mut rest = base;
-    while let Some(at) = rest.find('~') {
-        migrated.push_str(&rest[..at]);
-        let after = &rest[at + 1..];
-        if let Some(end) = after.find('~') {
-            let inner = &after[..end];
-            if inner.len() == 2 && inner.bytes().all(|b| b.is_ascii_hexdigit()) {
-                migrated.push('-');
-                migrated.push_str(inner);
-                migrated.push('-');
-                rest = &after[end + 1..];
-                continue;
-            }
-        }
-        migrated.push('~');
-        rest = after;
-    }
-    migrated.push_str(rest);
-    bounded_taxonomy_id(kind, &migrated, version)
+    bounded_taxonomy_id(kind, base, version)
 }
 
 /// Deterministic, namespace-qualified row ID for a thesis version.
@@ -1504,8 +1486,13 @@ async fn execute_set_thesis(
             (1u64, None)
         };
     let new_id = match superseded_id.as_deref() {
-        Some(existing) => versioned_row_id_from_existing(existing, next_ver, "thesis"),
-        None => thesis_row_id(namespace, next_ver),
+        // Only a DR-2-valid spelling can be versioned in place: an earlier
+        // release's `~xx` escape cannot be re-spelled reliably while keeping
+        // the same address, so its successor starts at the canonical id.
+        Some(existing) if crate::domain::validate_id(existing).is_ok() => {
+            versioned_row_id_from_existing(existing, next_ver, "thesis")
+        }
+        Some(_) | None => thesis_row_id(namespace, next_ver),
     };
     expected_heads.push(ExpectedHead::AbsentOrInactive {
         row_id: new_id.clone(),
@@ -1956,8 +1943,14 @@ async fn execute_upsert_concept(
     // Continue the existing row's id spelling so an upgrade cannot fork a
     // slug into two active concepts under old and new namespace encodings.
     let new_id = match superseded_id.as_deref() {
-        Some(existing) => versioned_row_id_from_existing(existing, next_ver, "concept"),
-        None => concept_row_id(namespace, &slug, next_ver),
+        // Continue the existing row's id spelling only when it is DR-2 valid.
+        // A pre-DR-2 `~xx`/`~xx~` row cannot be evolved in place; its
+        // successor is the canonical id, while the old row itself is still
+        // retired by its original address.
+        Some(existing) if crate::domain::validate_id(existing).is_ok() => {
+            versioned_row_id_from_existing(existing, next_ver, "concept")
+        }
+        Some(_) | None => concept_row_id(namespace, &slug, next_ver),
     };
 
     let mut expected_heads: Vec<ExpectedHead> = vec![ExpectedHead::AbsentOrInactive {
@@ -3869,17 +3862,6 @@ mod tests {
     use super::*;
     use crate::rdf::action::ActionSecurityContext;
 
-    #[test]
-    fn legacy_tilde_escaped_row_ids_version_into_dr2_valid_ids() {
-        let next = versioned_row_id_from_existing("thesis-team~2e~proj--v3", 4, "thesis");
-        assert!(!next.contains('~'), "{next}");
-        assert!(crate::domain::validate_id(&next).is_ok(), "{next}");
-        assert!(next.ends_with("-v4"), "{next}");
-        let concept = versioned_row_id_from_existing("concept-a~2d~b--slug-v7", 8, "concept");
-        assert!(crate::domain::validate_id(&concept).is_ok(), "{concept}");
-        assert!(concept.contains("-2d-"), "{concept}");
-    }
-
     use crate::store::ladybug::LadybugStore;
     use crate::traits::{Embedder, VectorStore};
     use std::sync::Arc;
@@ -3900,6 +3882,440 @@ mod tests {
             authenticated_principal: principal.to_string(),
             requested_principal: Some(principal.to_string()),
         }
+    }
+
+    /// Seed a row straight into the engine with a spelling the strict write
+    /// gate would refuse today. Older databases hold exactly these rows.
+    async fn seed_raw_taxonomy_row(
+        store: &LadybugStore,
+        namespace: &str,
+        id: &str,
+        memory_type: &str,
+        slug: Option<&str>,
+    ) {
+        let metadata = match memory_type {
+            "thesis" => json!({"thesis_version": 1, "valid_from": 0}),
+            "concept" => json!({
+                "concept": {
+                    "slug": slug.unwrap_or("core-concept"),
+                    "pref_label": "Seeded Label",
+                    "definition": "Seeded definition"
+                },
+                "concept_version": 1,
+                "valid_from": 0
+            }),
+            _ => json!({}),
+        };
+        let query = format!(
+            "CREATE (:Memory {{id: '{}', namespace: '{}', content: 'seeded {}', user_id: 'alice', memory_type: '{}', agent_name: '', location: '', location_lines: '', metadata: '{}'}})",
+            crate::store::ladybug::escape_ladybug_string(id),
+            crate::store::ladybug::escape_ladybug_string(namespace),
+            memory_type,
+            memory_type,
+            crate::store::ladybug::escape_ladybug_string(&metadata.to_string()),
+        );
+        store
+            .with_conn(move |conn| {
+                conn.query(&query)?;
+                Ok(())
+            })
+            .await
+            .expect("seed the raw taxonomy row");
+    }
+
+    fn concept_batch(_namespace: &str, id: &str, slug: &str) -> ActionWriteSet {
+        let payload = MemoryPayload {
+            content: format!("concept {slug}"),
+            user_id: "alice".to_string(),
+            memory_type: "concept".to_string(),
+            agent_name: Some("test".to_string()),
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({
+                "concept": {
+                    "slug": slug,
+                    "pref_label": "Race Label",
+                    "definition": "Race definition"
+                },
+                "concept_version": 1,
+                "valid_from": 0
+            }),
+        };
+        ActionWriteSet {
+            expected_heads: vec![ExpectedHead::AbsentOrInactive {
+                row_id: id.to_string(),
+            }],
+            writes: vec![StagedMemoryWrite {
+                id: id.to_string(),
+                vector: vec![0.1; 4],
+                payload,
+            }],
+            edge_deltas: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_tilde_taxonomy_rows_upgrade_to_canonical_successors() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "team.proj";
+        store.init(ns).await.expect("init");
+
+        seed_raw_taxonomy_row(&store, ns, "thesis-team~2eproj--v1", "thesis", None).await;
+        seed_raw_taxonomy_row(
+            &store,
+            ns,
+            "concept-team~2eproj--core-concept-v1",
+            "concept",
+            Some("core-concept"),
+        )
+        .await;
+
+        let thesis = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: ns.to_string(),
+                primary_domain: Some("cognitive-memory".to_string()),
+                mission: Some("Upgrade the tilde thesis".to_string()),
+                direction: Some("Canonical successor".to_string()),
+                core_pillars: Some(vec!["graph-memory".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("set_thesis must retire the pre-PR tilde row");
+        assert_eq!(thesis["thesis_id"], thesis_row_id(ns, 2));
+        assert_eq!(thesis["thesis_id"], "thesis-team.2e.proj--v2");
+        assert_eq!(thesis["superseded_id"], "thesis-team~2eproj--v1");
+        assert_eq!(
+            store
+                .get(ns, "thesis-team~2eproj--v1")
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .metadata["superseded_by"],
+            "thesis-team.2e.proj--v2"
+        );
+
+        let concept = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("core-concept".to_string()),
+                pref_label: Some("Core Concept".to_string()),
+                definition: Some("Canonical successor definition".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("upsert_concept must retire the pre-PR tilde row");
+        assert_eq!(concept["concept_id"], concept_row_id(ns, "core-concept", 2));
+        assert_eq!(
+            concept["concept_id"],
+            "concept-team.2e.proj--core-concept-v2"
+        );
+        assert_eq!(
+            concept["superseded_id"],
+            "concept-team~2eproj--core-concept-v1"
+        );
+        assert_eq!(
+            store
+                .get(ns, "concept-team~2eproj--core-concept-v1")
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .metadata["superseded_by"],
+            "concept-team.2e.proj--core-concept-v2"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_concept_beside_a_tilde_sibling_stays_canonical() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let ns = "team.proj";
+        store.init(ns).await.expect("init");
+        seed_raw_taxonomy_row(
+            &store,
+            ns,
+            "concept-team~2eproj--legacy-slug-v1",
+            "concept",
+            Some("legacy-slug"),
+        )
+        .await;
+
+        let fresh = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "upsert_concept".to_string(),
+                namespace: ns.to_string(),
+                slug: Some("fresh-slug".to_string()),
+                pref_label: Some("Fresh".to_string()),
+                definition: Some("A new concept beside a legacy row".to_string()),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("a new concept must not be blocked by a tilde sibling");
+        assert_eq!(fresh["concept_id"], concept_row_id(ns, "fresh-slug", 1));
+        assert_eq!(fresh["concept_id"], "concept-team.2e.proj--fresh-slug-v1");
+        assert!(fresh["superseded_id"].is_null());
+        assert!(
+            store
+                .get(ns, "concept-team~2eproj--legacy-slug-v1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the unrelated legacy row stays untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_legacy_token_and_tilde_namespace_upgrade_without_collision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let embedder = DummyEmbedder(4);
+        let literal_ns = "team-2e-proj";
+        let dotted_ns = "team.proj";
+        store.init(literal_ns).await.expect("init literal");
+        store.init(dotted_ns).await.expect("init dotted");
+        seed_raw_taxonomy_row(
+            &store,
+            literal_ns,
+            "thesis-team-2e-proj--v1",
+            "thesis",
+            None,
+        )
+        .await;
+        seed_raw_taxonomy_row(&store, dotted_ns, "thesis-team~2eproj--v1", "thesis", None).await;
+
+        let literal = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: literal_ns.to_string(),
+                primary_domain: Some("graph-memory".to_string()),
+                mission: Some("Literal namespace mission".to_string()),
+                direction: Some("Literal namespace direction".to_string()),
+                core_pillars: Some(vec!["graph-memory".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("literal namespace upgrade");
+        assert_eq!(literal["thesis_id"], "thesis-team-2e-proj--v2");
+
+        let dotted = execute_taxonomy(
+            &store,
+            &embedder,
+            TaxonomyRequest {
+                operation: "set_thesis".to_string(),
+                namespace: dotted_ns.to_string(),
+                primary_domain: Some("graph-memory".to_string()),
+                mission: Some("Dotted namespace mission".to_string()),
+                direction: Some("Dotted namespace direction".to_string()),
+                core_pillars: Some(vec!["graph-memory".to_string()]),
+                ..Default::default()
+            },
+            &sec("alice"),
+        )
+        .await
+        .expect("dotted namespace upgrade");
+        assert_eq!(dotted["thesis_id"], "thesis-team.2e.proj--v2");
+        assert_ne!(literal["thesis_id"], dotted["thesis_id"]);
+        assert!(store
+            .get(literal_ns, "thesis-team-2e-proj--v2")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get(dotted_ns, "thesis-team.2e.proj--v2")
+            .await
+            .unwrap()
+            .is_some());
+        // Neither upgrade touched the other namespace's row.
+        assert!(store
+            .get(dotted_ns, "thesis-team-2e-proj--v2")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get(literal_ns, "thesis-team.2e.proj--v2")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_tilde_taxonomy_write_cannot_overwrite_another_namespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let owner = "tax-legacy-owner";
+        let intruder = "tax-legacy-intruder";
+        store.init(owner).await.expect("init owner");
+        store.init(intruder).await.expect("init intruder");
+        seed_raw_taxonomy_row(&store, owner, "thesis-team~2eproj--v1", "thesis", None).await;
+
+        let err = store
+            .commit_action_batch(
+                intruder,
+                ActionWriteSet {
+                    expected_heads: Vec::new(),
+                    writes: vec![StagedMemoryWrite {
+                        id: "thesis-team~2eproj--v1".to_string(),
+                        vector: vec![0.1; 4],
+                        payload: MemoryPayload {
+                            content: "intruder".to_string(),
+                            user_id: "alice".to_string(),
+                            memory_type: "thesis".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata: json!({"thesis_version": 1}),
+                        },
+                    }],
+                    edge_deltas: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("a legacy tilde id owned elsewhere must not be overwritten");
+        assert!(
+            err.to_string().contains("cross-namespace id collision"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            store
+                .get(owner, "thesis-team~2eproj--v1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the owner's row stays intact"
+        );
+        assert!(store
+            .get(intruder, "thesis-team~2eproj--v1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn new_legacy_tilde_taxonomy_row_is_never_created() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let ns = "tax-no-tilde-create";
+        store.init(ns).await.expect("init");
+        let err = store
+            .commit_action_batch(
+                ns,
+                ActionWriteSet {
+                    expected_heads: Vec::new(),
+                    writes: vec![StagedMemoryWrite {
+                        id: "thesis-team~2eproj--v1".to_string(),
+                        vector: vec![0.1; 4],
+                        payload: MemoryPayload {
+                            content: "must not exist".to_string(),
+                            user_id: "alice".to_string(),
+                            memory_type: "thesis".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata: json!({"thesis_version": 1}),
+                        },
+                    }],
+                    edge_deltas: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("a legacy tilde id must never be newly created");
+        assert!(
+            err.to_string().contains("refusing to create"),
+            "unexpected error: {err}"
+        );
+        assert!(store
+            .get(ns, "thesis-team~2eproj--v1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_distinct_ids_for_one_slug_commit_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let ns = "tax-concurrent-slug";
+        store.init(ns).await.expect("init");
+        let first_id = concept_row_id(ns, "race-concept", 1);
+        let second_id = concept_row_id(ns, "race-concept", 2);
+        assert_ne!(first_id, second_id);
+
+        let (first, second) = tokio::join!(
+            store.commit_action_batch(ns, concept_batch(ns, &first_id, "race-concept")),
+            store.commit_action_batch(ns, concept_batch(ns, &second_id, "race-concept")),
+        );
+        let successes = [first.is_ok(), second.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(successes, 1, "exactly one batch must commit");
+        let rejected = if first.is_err() {
+            first.expect_err("checked")
+        } else {
+            second.expect_err("checked")
+        };
+        match rejected {
+            ActionError::ConflictWithNewerVersion { superseded_by, .. } => assert!(
+                superseded_by.contains("duplicate_active_concept_slug"),
+                "unexpected conflict: {superseded_by}"
+            ),
+            other => panic!("expected a duplicate-slug conflict, got {other:?}"),
+        }
+        let active = store.list(ns, None, Some("concept")).await.expect("list");
+        assert_eq!(active.len(), 1, "the loser must roll back completely");
+    }
+
+    #[tokio::test]
+    async fn sequential_distinct_ids_for_one_slug_roll_back_duplicate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = LadybugStore::new(&tmp.path().join("db"), 4).expect("store");
+        let ns = "tax-sequential-slug";
+        store.init(ns).await.expect("init");
+        let first_id = concept_row_id(ns, "race-concept", 1);
+        let second_id = concept_row_id(ns, "race-concept", 2);
+
+        store
+            .commit_action_batch(ns, concept_batch(ns, &first_id, "race-concept"))
+            .await
+            .expect("first batch commits");
+        let err = store
+            .commit_action_batch(ns, concept_batch(ns, &second_id, "race-concept"))
+            .await
+            .expect_err("a second active concept with the same slug must be refused");
+        match err {
+            ActionError::ConflictWithNewerVersion { superseded_by, .. } => assert!(
+                superseded_by.contains("duplicate_active_concept_slug"),
+                "unexpected conflict: {superseded_by}"
+            ),
+            other => panic!("expected a duplicate-slug conflict, got {other:?}"),
+        }
+        assert!(
+            store.get(ns, &second_id).await.unwrap().is_none(),
+            "the rejected row must not have been committed"
+        );
+        assert!(store.get(ns, &first_id).await.unwrap().is_some());
     }
 
     #[test]
@@ -3923,6 +4339,23 @@ mod tests {
             taxonomy_namespace_token("a-2e-b"),
             "a dotted namespace and a literal escape-looking namespace must not collide"
         );
+        // The `.XX.` delimiter is disjoint from every pre-PR token spelling:
+        // older tokens used only `[A-Za-z0-9_-]` plus `~` escapes.
+        assert_eq!(taxonomy_namespace_token("team.proj"), "team.2e.proj");
+        assert_eq!(taxonomy_namespace_token("team-2e-proj"), "team-2e-proj");
+        assert_eq!(taxonomy_namespace_token("team--proj"), "team-.2d.proj");
+        assert!(taxonomy_namespace_token("team.proj").contains('.'));
+        assert_ne!(
+            taxonomy_namespace_token("a.2e.b"),
+            taxonomy_namespace_token("a.b"),
+            "a literal `.2e.` spelling must not alias an escaped dot"
+        );
+        for pre_pr in ["team.proj", "team--proj", "team~proj", "a.b-c..d"] {
+            assert!(
+                !taxonomy_namespace_token(pre_pr).contains('~'),
+                "new tokens never use the pre-PR tilde escape: {pre_pr:?}"
+            );
+        }
         let long_namespace = format!("{}{}", "a".repeat(63), ".");
         let long_slug = "s".repeat(64);
         for id in [

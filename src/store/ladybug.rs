@@ -10350,13 +10350,16 @@ impl LadybugStore {
     }
 }
 
-/// Recheck a legacy-shaped address inside the write turn. The preflight read
-/// can go stale when another caller deletes the row first; without this the
-/// MERGE recreates a row whose shape new writes refuse.
-fn legacy_row_still_present(conn: &Connection, id: &str) -> Result<bool> {
+/// Recheck a legacy-shaped address inside the write turn. The owner check can
+/// go stale when another caller deletes the row first; without this a write
+/// could recreate a row whose shape new writes refuse. The check is scoped to
+/// the namespace that asked: a same-id row owned elsewhere is a collision, not
+/// permission to update it.
+fn legacy_row_still_present(conn: &Connection, namespace: &str, id: &str) -> Result<bool> {
     let query = format!(
-        "MATCH (m:Memory {{id: '{}'}}) RETURN m LIMIT 1",
-        escape_ladybug_string(id)
+        "MATCH (m:Memory {{id: '{}', namespace: '{}'}}) RETURN m LIMIT 1",
+        escape_ladybug_string(id),
+        escape_ladybug_string(namespace)
     );
     let mut result = conn.query(&query)?;
     Ok(result.next().is_some())
@@ -10737,23 +10740,32 @@ impl VectorStore for LadybugStore {
         // shape and must not be laundered by an existing row: without this,
         // upsert could mutate another namespace's row through this one.
         crate::domain::validate_id_for_namespace(id, namespace)?;
+        // Re-spell an owned prefix with the exact stored namespace before the
+        // id is used for the lexical doc, mentions, edges or the report. A
+        // differently-cased prefix is the same owner; the stored spelling is
+        // the one the row (and every future lookup) must carry.
+        let canonical_id = crate::domain::canonicalize_id_for_namespace(id, namespace)?;
         let strict: Result<(), crate::domain::ValidationError> = (|| {
             crate::domain::validate_namespace(namespace)?;
-            crate::domain::validate_id(id)?;
+            crate::domain::validate_id(&canonical_id)?;
             Ok(())
         })();
-        let legacy_address = strict.is_err();
-        if let Err(reason) = strict {
-            // Legacy rows written before DR-1/DR-2 remain updatable (feedback,
-            // edits) only when the address has a legacy-valid shape AND the
-            // row already exists. A new write with a legacy shape stays refused.
-            if crate::domain::validate_namespace_legacy(namespace).is_err()
-                || crate::domain::validate_id_for_read(id).is_err()
-                || !matches!(self.get(namespace, id).await, Ok(Some(_)))
-            {
-                return Err(reason.into());
+        let legacy_refusal: Option<crate::domain::ValidationError> = match strict {
+            Ok(()) => None,
+            Err(reason) => {
+                // Legacy rows written before DR-1/DR-2 remain updatable
+                // (feedback, edits) only when the address has a legacy-valid
+                // shape. Whether the row actually exists is re-checked inside
+                // the write turn, not from a preflight read that can go stale.
+                if crate::domain::validate_namespace_legacy(namespace).is_err()
+                    || crate::domain::validate_id_for_read(&canonical_id).is_err()
+                {
+                    return Err(reason.into());
+                }
+                Some(reason)
             }
-        }
+        };
+        let legacy_address = legacy_refusal.is_some();
         let namespace = namespace.to_string();
         // First-write race guard: on a pristine store, refuse the first
         // write if the configured model changed since this process
@@ -10773,17 +10785,13 @@ impl VectorStore for LadybugStore {
         // the first write records the transition itself.
         let first_write_flip = self.first_write_flip();
 
-        // Every upsert is one sample of the MemoryCount series for the
-        // namespace; anomalies surface through the rolling detector.
-        self.metrics.record(
-            &namespace,
-            crate::telemetry::anomaly::MetricKind::MemoryCount,
-            "upsert",
-            chrono::Utc::now().timestamp(),
-            1.0,
-            std::collections::BTreeMap::new(),
-        );
-        let id = id.to_string();
+        // Every successful upsert is one sample of the MemoryCount series for
+        // the namespace; anomalies surface through the rolling detector. The
+        // sample is taken only after the write lands, so a refused legacy
+        // address is never counted as data.
+        let raw_id = id.to_string();
+        let id = canonical_id;
+        let id_was_canonicalized = raw_id != id;
         // Parse shape warnings from the ORIGINAL payload before the write.
         let mut payload = payload;
         // AC3: canonicalize resolvable (unqualified) edge targets at write time.
@@ -11025,7 +11033,10 @@ impl VectorStore for LadybugStore {
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
             let mut mentions =
                 crate::mention::detect_mentions(&payload.content, &payload.location, &known);
-            mentions.retain(|m| m != &id);
+            // Exclude both spellings: a noncanonical row updated in place keeps
+            // its raw id, and a self-mention under either address must not
+            // create an edge to itself.
+            mentions.retain(|m| m != &id && m != &raw_id);
             // Skip symbols already declared via related_to (declared intent wins).
             if let Some(arr) = payload
                 .metadata
@@ -11081,45 +11092,67 @@ impl VectorStore for LadybugStore {
         let refresh_ont_after_upsert = payload.memory_type == "action_type"
             || id == crate::registry::registry_row_id(&namespace);
         let ns_for_post_refresh = namespace.clone();
-        // Composite Rec #14: memory ids are globally unique (PRIMARY KEY), so an
-        // upsert of an existing id into a DIFFERENT namespace would silently
-        // relocate the row. Read which namespace owns the id first and fail
-        // closed on a collision.
-        {
-            let check_id = id.clone();
-            let check_ns = namespace.clone();
-            let existing_ns: Option<String> = self
-                .with_conn(move |conn| {
-                    let query = format!(
-                        "MATCH (m:Memory {{id: '{}'}}) WHERE m.namespace <> '{}' RETURN m.namespace LIMIT 1",
-                        escape_ladybug_string(&check_id),
-                        escape_ladybug_string(&check_ns)
-                    );
-                    let mut result = conn.query(&query)?;
-                    let found = result.next().map(|row| format!("{}", row[0]));
-                    Ok(found)
-                })
-                .await?;
-            if let Some(existing_ns) = existing_ns {
-                anyhow::bail!(
-                    "cross-namespace id collision: memory '{}' belongs to namespace '{}', cannot upsert into '{}'",
-                    id,
-                    existing_ns,
-                    namespace
-                );
-            }
-        }
         let outcome = self.write_with_deadline("writing a memory", move |conn| {
-
-            let safe_id = escape_ladybug_string(&id);
-            // Atomic recheck: the preflight read can go stale. A legacy row
-            // deleted before this turn must not be recreated by the MERGE.
-            if legacy_address && !legacy_row_still_present(conn, &id)? {
-                anyhow::bail!(
-                    "legacy-shaped memory '{}' was deleted before the write turn; refusing to recreate it",
-                    id
+            // Composite Rec #14: memory ids are globally unique (PRIMARY KEY), so
+            // an upsert of an existing id into a DIFFERENT namespace would silently
+            // relocate the row. The owner check runs inside the write turn, once,
+            // so the preflight read cannot go stale before the write lands.
+            let owner_of = |conn: &Connection, candidate: &str| -> Result<Option<String>> {
+                let query = format!(
+                    "MATCH (m:Memory {{id: '{}'}}) RETURN m.namespace LIMIT 1",
+                    escape_ladybug_string(candidate)
                 );
+                let mut result = conn.query(&query)?;
+                Ok(result.next().map(|row| format!("{}", row[0])))
+            };
+            let raw_owner = if id_was_canonicalized {
+                owner_of(conn, &raw_id)?
+            } else {
+                None
+            };
+            let canon_owner = owner_of(conn, &id)?;
+            for (candidate, owner) in [(&raw_id, &raw_owner), (&id, &canon_owner)] {
+                if let Some(existing_ns) = owner {
+                    if existing_ns != &namespace {
+                        anyhow::bail!(
+                            "cross-namespace id collision: memory '{}' belongs to namespace '{}', cannot upsert into '{}'",
+                            candidate,
+                            existing_ns,
+                            namespace
+                        );
+                    }
+                }
             }
+            // If a differently-spelled row already lives in this namespace and
+            // the canonical spelling does not, keep updating that row instead
+            // of forking a second one under the new spelling.
+            let update_in_place =
+                id_was_canonicalized && raw_owner.is_some() && canon_owner.is_none();
+            let effective_id = if update_in_place {
+                raw_id.clone()
+            } else {
+                id.clone()
+            };
+            let row_exists = if update_in_place {
+                true
+            } else {
+                canon_owner.is_some()
+            };
+            let id = effective_id;
+            // Legacy-shaped rows remain updatable only when they already
+            // exist: the recheck lives in this turn so a row deleted after the
+            // preflight read is not recreated by the write.
+            if legacy_address && !legacy_row_still_present(conn, &namespace, &id)? {
+                return Err(match &legacy_refusal {
+                    Some(reason) => reason.clone().into(),
+                    None => anyhow::anyhow!(
+                        "legacy-shaped memory '{}' is not present in namespace '{}'; refusing to create it",
+                        id,
+                        namespace
+                    ),
+                });
+            }
+            let safe_id = escape_ladybug_string(&id);
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_content = escape_ladybug_string(&payload.content);
             let safe_user_id = escape_ladybug_string(&payload.user_id);
@@ -11146,17 +11179,25 @@ impl VectorStore for LadybugStore {
                 }).collect::<Vec<_>>().join(",")
             );
 
-            let insert_query = format!(
-                "MERGE (m:Memory {{id: '{}'}})
-                 ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
-                 ON MATCH SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
-                safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
-                safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
-            );
+            if row_exists {
+                // Update only the row this namespace owns. A foreign row with
+                // the same id was refused above and is never touched.
+                let update_query = format!(
+                    "MATCH (m:Memory {{id: '{}', namespace: '{}'}}) SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
+                    safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
+                );
+                conn.query(&update_query)?;
+            } else {
+                // Strict new write: no row exists for this id anywhere, so a
+                // plain CREATE lands exactly one row in the requested namespace.
+                let insert_query = format!(
+                    "CREATE (m:Memory {{id: '{}', namespace: '{}', content: '{}', user_id: '{}', memory_type: '{}', agent_name: '{}', location: '{}', location_lines: '{}', metadata: '{}', embedding: {}}})",
+                    safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
+                );
+                conn.query(&insert_query)?;
+            }
 
-            conn.query(&insert_query)?;
-
-            // The core MERGE has landed, so this write's data is in the
+            // The core row write has landed, so this write's data is in the
             // store: record the first-data transition here, in the
             // committing task, before the best-effort edge bookkeeping.
             // The caller may already have been released by the write
@@ -11499,8 +11540,23 @@ impl VectorStore for LadybugStore {
             })
         })
         .await;
-        if outcome.is_ok() {
-            self.lexical_apply_doc(lexical_doc);
+        if let Ok(report) = &outcome {
+            self.metrics.record(
+                &ns_for_post_refresh,
+                crate::telemetry::anomaly::MetricKind::MemoryCount,
+                "upsert",
+                chrono::Utc::now().timestamp(),
+                1.0,
+                std::collections::BTreeMap::new(),
+            );
+            // A pre-existing noncanonical row updated in place keeps its
+            // original id: the lexical doc must address the row that exists,
+            // not the spelling the caller asked for.
+            let mut doc = lexical_doc;
+            if doc.id != report.id {
+                doc.id = report.id.clone();
+            }
+            self.lexical_apply_doc(doc);
             if refresh_ont_after_upsert {
                 self.refresh_ontology(&ns_for_post_refresh).await;
             }
@@ -11993,39 +12049,66 @@ impl VectorStore for LadybugStore {
     }
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
+        // A namespace that no release would have written is refused before
+        // the write turn, so a malformed scope cannot reach a Cypher match.
+        crate::domain::validate_namespace_legacy(namespace)?;
+        // Reads must be able to address rows an earlier release wrote, but a
+        // malformed address is refused before the turn begins.
+        crate::domain::validate_id_for_read(id)?;
+        let ownership = crate::domain::validate_id_for_namespace(id, namespace);
+        // Keep the raw spelling and the exact spelling this namespace gives
+        // the id. The requested row is deleted first: when both spellings
+        // coexist, the caller asked for the raw one, not the canonical twin.
+        // A foreign-prefixed id that still lives here is a pre-DR-1 anomaly
+        // (e.g. a freshness flag); the delete stays scoped to this namespace
+        // and must be able to clean it up. It keeps the raw spelling for that
+        // fallback, and refuses with the ownership rule only when no such row
+        // exists here.
+        let canonical_id = match &ownership {
+            Ok(()) => crate::domain::canonicalize_id_for_namespace(id, namespace)?,
+            Err(_) => id.to_string(),
+        };
         let namespace = namespace.to_string();
-        let id = id.to_string();
+        let raw_id = id.to_string();
         let index_namespace = namespace.clone();
-        let index_id = id.clone();
         let outcome = self.write_with_deadline("deleting a memory", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
-            let safe_id = escape_ladybug_string(&id);
 
+            let exists = |candidate: &str| -> Result<bool> {
+                Ok(conn
+                    .query(&format!(
+                        "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' RETURN m.id LIMIT 1",
+                        escape_ladybug_string(candidate),
+                        safe_ns
+                    ))?
+                    .next()
+                    .is_some())
+            };
             // A silent no-op on a missing id reads as success to the caller
             // (the CLI then reports a deletion that never happened), so
             // resolve the row first and fail loudly when it is absent.
-            let exists = conn
-                .query(&format!(
-                    "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' RETURN m.id LIMIT 1",
-                    safe_id, safe_ns
-                ))?
-                .next()
-                .is_some();
-            if !exists {
-                anyhow::bail!("No memory with id '{}' in namespace '{}'. Note: stored ids are namespace-qualified for ingested nodes.", id, namespace);
-            }
+            let effective_id = if exists(&raw_id)? {
+                raw_id.clone()
+            } else if canonical_id != raw_id && exists(&canonical_id)? {
+                canonical_id.clone()
+            } else if let Err(reason) = &ownership {
+                return Err(reason.clone().into());
+            } else {
+                anyhow::bail!("No memory with id '{}' in namespace '{}'. Note: stored ids are namespace-qualified for ingested nodes.", raw_id, namespace);
+            };
             conn.query(&format!(
                 "MATCH (m:Memory) WHERE m.id = '{}' AND m.namespace = '{}' DETACH DELETE m",
-                safe_id, safe_ns
+                escape_ladybug_string(&effective_id),
+                safe_ns
             ))?;
-            Ok(())
+            Ok(effective_id)
         })
         .await;
-        if outcome.is_ok() {
-            self.lexical_remove_doc(&index_namespace, &index_id);
+        if let Ok(effective_id) = &outcome {
+            self.lexical_remove_doc(&index_namespace, effective_id);
             self.refresh_ontology(&index_namespace).await;
         }
-        outcome
+        outcome.map(|_| ())
     }
 
     async fn relocate(&self, id: &str, from: &str, to: &str) -> Result<RelocateOutcome> {
@@ -12036,26 +12119,28 @@ impl VectorStore for LadybugStore {
         // compatibility gate, never a licence to create a new one.
         crate::domain::validate_namespace(from)?;
         crate::domain::validate_namespace(to)?;
+        crate::domain::validate_id_for_read(id)?;
         crate::domain::validate_id_for_namespace(id, from)?;
-        let strict_id = crate::domain::validate_id(id);
-        let legacy_source = match &strict_id {
-            Ok(()) => false,
-            Err(_) => {
-                // A value DR-2 refuses and the read bridge also refuses is
-                // simply malformed: answer with the typed strict rule, not a
-                // generic relocation failure.
-                if crate::domain::validate_id_for_read(id).is_err() {
-                    return Err(strict_id.expect_err("checked above").into());
-                }
-                true
-            }
-        };
+        // An owned prefix is re-spelled with the exact source namespace before
+        // the lookup; an older row may still sit under the raw spelling, so
+        // that spelling remains the fallback below.
+        let canonical_id = crate::domain::canonicalize_id_for_namespace(id, from)?;
+        let strict_id = crate::domain::validate_id(&canonical_id);
+        let legacy_source = strict_id.is_err();
         if !legacy_source && from == to {
             // A strict id in its own namespace is a no-op: no store read.
             return Ok(RelocateOutcome::SameNamespace);
         }
-        let payload = match self.get(from, id).await? {
-            Some((_, payload)) => payload,
+        let effective = match self.get(from, &canonical_id).await? {
+            Some((_, payload)) => Some((canonical_id.clone(), payload)),
+            None if canonical_id != id => self
+                .get(from, id)
+                .await?
+                .map(|(_, payload)| (id.to_string(), payload)),
+            None => None,
+        };
+        let (effective_id, payload) = match effective {
+            Some(found) => found,
             None => {
                 // A legacy-shaped id may only move if that row exists. The
                 // refusal keeps the DR-2 rule as its reason for both a
@@ -12076,15 +12161,15 @@ impl VectorStore for LadybugStore {
         // ingest of that namespace would MERGE onto the moved row and update it
         // where it now sits -- the cross-project theft qualified ids exist to stop.
         if payload.user_id == "auto-ingestor"
-            || id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
+            || effective_id.contains(crate::parser::ingest::NAMESPACE_SEPARATOR)
         {
             return Ok(RelocateOutcome::Ingested);
         }
 
-        let index_id = id.to_string();
+        let index_id = effective_id.clone();
         let index_from = from.to_string();
         let index_to = to.to_string();
-        let (id, from, to) = (id.to_string(), from.to_string(), to.to_string());
+        let (id, from, to) = (effective_id, from.to_string(), to.to_string());
         let outcome = self.write_with_deadline("moving a memory", move |conn| {
             // One statement, so there is no moment at which the memory exists in
             // neither namespace, and the row keeps its id, vector and edges.
@@ -16956,19 +17041,38 @@ mod tests {
             .await
             .expect("seed row");
         let present = store
-            .with_conn(|conn| legacy_row_still_present(conn, "mem-1"))
+            .with_conn(|conn| legacy_row_still_present(conn, "probe", "mem-1"))
             .await
             .expect("presence check");
         assert!(present, "seeded row must pass the atomic recheck");
         store.delete("probe", "mem-1").await.expect("delete row");
         let present = store
-            .with_conn(|conn| legacy_row_still_present(conn, "mem-1"))
+            .with_conn(|conn| legacy_row_still_present(conn, "probe", "mem-1"))
             .await
             .expect("presence check");
         assert!(
             !present,
             "a deleted row must not be recreated by the legacy path"
         );
+        // A same-id row in another namespace is not this namespace's row.
+        store
+            .upsert(
+                "other",
+                "mem-2",
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .expect("seed foreign row");
+        let present = store
+            .with_conn(|conn| legacy_row_still_present(conn, "probe", "mem-2"))
+            .await
+            .expect("presence check");
+        assert!(!present, "the recheck must be namespace-scoped");
+        assert!(store
+            .with_conn(|conn| legacy_row_still_present(conn, "other", "mem-2"))
+            .await
+            .expect("presence check"));
     }
 
     /// The canonical source key used by the relink/publish seed helpers. A real
@@ -19554,6 +19658,231 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    async fn upsert_canonicalizes_an_owned_prefix_and_updates_the_old_spelling_in_place() {
+        let store = retired_test_store().await;
+        let seeded = retired_test_payload("fact", "agent", json!({"marker": "old"}));
+        // An earlier binary stored the row under a differently-cased prefix.
+        seed_foreign_prefixed_row(&store, "probe", "Probe::row-1", &seeded).await;
+
+        let report = store
+            .upsert(
+                "probe",
+                "Probe::row-1",
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({"marker": "new"})),
+            )
+            .await
+            .expect("the owned raw spelling must stay updatable");
+        assert_eq!(report.id, "Probe::row-1", "the existing row keeps its id");
+        assert!(
+            store.get("probe", "probe::row-1").await.unwrap().is_none(),
+            "the canonical spelling must not fork a second row"
+        );
+        let (_, payload) = store.get("probe", "Probe::row-1").await.unwrap().unwrap();
+        assert_eq!(payload.metadata["marker"], "new");
+
+        // A new write canonicalizes the prefix before it lands.
+        let created = store
+            .upsert(
+                "probe",
+                "Probe::row-2",
+                vec![0.0; 4],
+                retired_test_payload("fact", "agent", json!({})),
+            )
+            .await
+            .expect("a new write with an owned prefix canonicalizes");
+        assert_eq!(created.id, "probe::row-2");
+        assert!(store.get("probe", "probe::row-2").await.unwrap().is_some());
+        assert!(store.get("probe", "Probe::row-2").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn upsert_updates_an_existing_legacy_path_row_but_never_creates_one() {
+        let store = retired_test_store().await;
+        let row = retired_test_payload("file", "agent", json!({"marker": "old"}));
+        seed_foreign_prefixed_row(&store, "probe", "src/a.rs", &row).await;
+        store
+            .upsert(
+                "probe",
+                "src/a.rs",
+                vec![0.0; 4],
+                retired_test_payload("file", "agent", json!({"marker": "new"})),
+            )
+            .await
+            .expect("an existing legacy path row stays updatable");
+        let (_, payload) = store.get("probe", "src/a.rs").await.unwrap().unwrap();
+        assert_eq!(payload.metadata["marker"], "new");
+
+        // The historical `file:<path>` spelling is readable and updatable only
+        // when the row exists.
+        let prefixed = retired_test_payload("file", "agent", json!({"marker": "old"}));
+        seed_foreign_prefixed_row(&store, "probe", "file:src/lib.rs", &prefixed).await;
+        store
+            .upsert(
+                "probe",
+                "file:src/lib.rs",
+                vec![0.0; 4],
+                retired_test_payload("file", "agent", json!({"marker": "new"})),
+            )
+            .await
+            .expect("an existing `file:` row stays updatable");
+
+        let err = store
+            .upsert(
+                "probe",
+                "src/new.rs",
+                vec![0.0; 4],
+                retired_test_payload("file", "agent", json!({})),
+            )
+            .await
+            .expect_err("a new legacy-shaped id must stay refused");
+        assert!(err.to_string().starts_with("ERROR [ID]"), "{err}");
+        assert!(store.get("probe", "src/new.rs").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn upsert_updates_an_existing_legacy_tilde_taxonomy_row_in_place() {
+        let store = retired_test_store().await;
+        let row = retired_test_payload(
+            "thesis",
+            "alice",
+            json!({"thesis_version": 1, "valid_from": 0}),
+        );
+        seed_foreign_prefixed_row(&store, "probe", "thesis-team~2eproj--v1", &row).await;
+        store
+            .upsert(
+                "probe",
+                "thesis-team~2eproj--v1",
+                vec![0.0; 4],
+                retired_test_payload(
+                    "thesis",
+                    "alice",
+                    json!({"thesis_version": 1, "valid_from": 0, "archived": true}),
+                ),
+            )
+            .await
+            .expect("an existing tilde taxonomy row stays updatable");
+        let (_, payload) = store
+            .get("probe", "thesis-team~2eproj--v1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload.metadata["archived"], true);
+
+        let err = store
+            .upsert(
+                "probe",
+                "thesis-team~2eproj--v2",
+                vec![0.0; 4],
+                retired_test_payload("thesis", "alice", json!({"thesis_version": 2})),
+            )
+            .await
+            .expect_err("a new tilde taxonomy id must stay refused");
+        assert!(err.to_string().starts_with("ERROR [ID]"), "{err}");
+        assert!(store
+            .get("probe", "thesis-team~2eproj--v2")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_deletes_the_requested_raw_spelling_when_both_coexist() {
+        let store = retired_test_store().await;
+        seed_foreign_prefixed_row(
+            &store,
+            "probe",
+            "Probe::row-1",
+            &retired_test_payload("fact", "agent", json!({"spelling": "raw"})),
+        )
+        .await;
+        seed_foreign_prefixed_row(
+            &store,
+            "probe",
+            "probe::row-1",
+            &retired_test_payload("fact", "agent", json!({"spelling": "canonical"})),
+        )
+        .await;
+
+        store
+            .delete("probe", "Probe::row-1")
+            .await
+            .expect("the exact requested spelling is deleted first");
+        assert!(
+            store.get("probe", "Probe::row-1").await.unwrap().is_none(),
+            "the raw row the caller named must be gone"
+        );
+        assert!(
+            store.get("probe", "probe::row-1").await.unwrap().is_some(),
+            "the canonical twin is a different row and must survive"
+        );
+
+        // Only the canonical spelling exists: the raw lookup misses and the
+        // canonical fallback is exercised.
+        seed_foreign_prefixed_row(
+            &store,
+            "probe",
+            "probe::row-2",
+            &retired_test_payload("fact", "agent", json!({})),
+        )
+        .await;
+        store
+            .delete("probe", "Probe::row-2")
+            .await
+            .expect("the canonical fallback deletes the stored row");
+        assert!(store.get("probe", "Probe::row-2").await.unwrap().is_none());
+        assert!(store.get("probe", "probe::row-2").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_cleans_up_an_in_namespace_foreign_prefixed_row() {
+        let store = retired_test_store().await;
+        seed_foreign_prefixed_row(
+            &store,
+            "probe",
+            "Other::row-1",
+            &retired_test_payload("fact", "agent", json!({})),
+        )
+        .await;
+        store
+            .delete("probe", "Other::row-1")
+            .await
+            .expect("a pre-DR-1 row stored in this namespace stays deletable");
+        assert!(store.get("probe", "Other::row-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_an_absent_foreign_prefixed_id_with_the_typed_rule() {
+        let store = retired_test_store().await;
+        let err = store
+            .delete("probe", "Other::row-9")
+            .await
+            .expect_err("an absent foreign-prefixed id must state the ownership rule");
+        assert!(err.to_string().starts_with("ERROR [ID]"), "{err}");
+        assert!(err.to_string().contains("names namespace"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_a_malformed_namespace_with_the_typed_rule() {
+        let store = retired_test_store().await;
+        let err = store
+            .delete("bad/ns", "row-1")
+            .await
+            .expect_err("a malformed namespace must be refused before the write turn");
+        assert!(err.to_string().starts_with("ERROR [NAMESPACE]"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_a_malformed_id_with_the_typed_rule() {
+        let store = retired_test_store().await;
+        let err = store
+            .delete("probe", "bad id")
+            .await
+            .expect_err("a malformed id must be refused");
+        assert!(err.to_string().starts_with("ERROR [ID]"), "{err}");
+    }
+
+    #[tokio::test]
     async fn upsert_refuses_an_illegal_namespace_before_any_write() {
         let store = retired_test_store().await;
         let err = store
@@ -19752,6 +20081,399 @@ eurostrata\src\daemon.rs",
             "{err}"
         );
         assert!(store.list("probe", None, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn action_batch_canonicalizes_owned_prefixes() {
+        let store = retired_test_store().await;
+        store
+            .commit_action_batch(
+                "probe",
+                crate::rdf::action::ActionWriteSet {
+                    expected_heads: vec![crate::rdf::action::ExpectedHead::AbsentOrInactive {
+                        row_id: "Probe::row-1".to_string(),
+                    }],
+                    writes: vec![crate::rdf::action::StagedMemoryWrite {
+                        id: "Probe::row-1".to_string(),
+                        vector: vec![0.0; 4],
+                        payload: retired_test_payload("rule", "agent", json!({})),
+                    }],
+                    edge_deltas: Vec::new(),
+                },
+            )
+            .await
+            .expect("an owned prefix canonicalizes before the transaction");
+        assert!(store.get("probe", "probe::row-1").await.unwrap().is_some());
+        assert!(store.get("probe", "Probe::row-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn action_batch_updates_a_seeded_noncanonical_row_in_place() {
+        use crate::rdf::action::{
+            ActionWriteSet, EdgeDelta, EdgeMutationOp, ExpectedHead, StagedMemoryWrite,
+        };
+
+        let store = retired_test_store().await;
+        seed_foreign_prefixed_row(
+            &store,
+            "probe",
+            "Probe::row-1",
+            &retired_test_payload("fact", "agent", json!({"marker": "seeded"})),
+        )
+        .await;
+        seed_foreign_prefixed_row(
+            &store,
+            "probe",
+            "probe::row-2",
+            &retired_test_payload("fact", "agent", json!({})),
+        )
+        .await;
+
+        let (_, live) = store.get("probe", "Probe::row-1").await.unwrap().unwrap();
+        let now_ts = crate::rdf::action::current_action_timestamp();
+        let fingerprint = crate::rdf::scenario::fingerprint_live_row(Some(&live), now_ts);
+        let mut updated = retired_test_payload("fact", "agent", json!({"marker": "updated"}));
+        updated.content = "canonicalised in place".to_string();
+
+        store
+            .commit_action_batch(
+                "probe",
+                ActionWriteSet {
+                    expected_heads: vec![
+                        ExpectedHead::RowFingerprint {
+                            row_id: "Probe::row-1".to_string(),
+                            expected_fingerprint: fingerprint,
+                        },
+                        // The canonical twin does not exist, so it must not be
+                        // created by the same transaction.
+                        ExpectedHead::AbsentOrInactive {
+                            row_id: "probe::row-1".to_string(),
+                        },
+                    ],
+                    writes: vec![StagedMemoryWrite {
+                        id: "Probe::row-1".to_string(),
+                        vector: vec![0.1; 4],
+                        payload: updated,
+                    }],
+                    edge_deltas: vec![EdgeDelta {
+                        source: "Probe::row-1".to_string(),
+                        relation: "RELATES_TO".to_string(),
+                        target: "probe::row-2".to_string(),
+                        existed_before: false,
+                        op: EdgeMutationOp::EnsurePresent,
+                    }],
+                },
+            )
+            .await
+            .expect("the seeded raw row is resolved and updated in place");
+
+        assert!(
+            store.get("probe", "probe::row-1").await.unwrap().is_none(),
+            "the canonical spelling must not fork a second row"
+        );
+        let (_, payload) = store.get("probe", "Probe::row-1").await.unwrap().unwrap();
+        assert_eq!(payload.metadata["marker"], "updated");
+
+        let edge_present = store
+            .with_conn(|conn| {
+                Ok(conn
+                    .query("MATCH (a:Memory {id: 'Probe::row-1', namespace: 'probe'})-[r:RELATES_TO]->(b:Memory {id: 'probe::row-2', namespace: 'probe'}) RETURN a.id LIMIT 1")?
+                    .next()
+                    .is_some())
+            })
+            .await
+            .expect("edge lookup");
+        assert!(edge_present, "the edge resolves to the updated raw row");
+
+        let outcome = store
+            .search_lexical("probe", "canonicalised", 10, false, false, &[], "admin", 2)
+            .await
+            .expect("lexical search");
+        assert!(
+            outcome.results.iter().any(|r| r.id == "Probe::row-1"),
+            "the lexical doc is keyed by the resolved raw id: {:?}",
+            outcome.results.iter().map(|r| &r.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn action_batch_refuses_a_raw_spelling_owned_by_another_namespace() {
+        use crate::rdf::action::{ActionWriteSet, StagedMemoryWrite};
+
+        let store = retired_test_store().await;
+        seed_foreign_prefixed_row(
+            &store,
+            "other",
+            "Probe::row-1",
+            &retired_test_payload("fact", "agent", json!({})),
+        )
+        .await;
+
+        let err = store
+            .commit_action_batch(
+                "probe",
+                ActionWriteSet {
+                    expected_heads: Vec::new(),
+                    writes: vec![StagedMemoryWrite {
+                        id: "Probe::row-1".to_string(),
+                        vector: vec![0.1; 4],
+                        payload: retired_test_payload("fact", "agent", json!({})),
+                    }],
+                    edge_deltas: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("a raw address owned elsewhere must be refused");
+        assert!(
+            err.to_string().contains("cross-namespace id collision"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            store.get("other", "Probe::row-1").await.unwrap().is_some(),
+            "the foreign owner's row stays intact"
+        );
+        assert!(store.get("probe", "probe::row-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn action_batch_allows_bare_foreign_owned_edge_references() {
+        use crate::rdf::action::{
+            ActionWriteSet, EdgeDelta, EdgeMutationOp, ExpectedHead, StagedMemoryWrite,
+        };
+
+        let store = retired_test_store().await;
+        // A bare id carries no namespace prefix, so a row under that spelling
+        // is legitimately owned by another namespace. Referencing it as an edge
+        // endpoint (or expected edge state) must not be mistaken for a write
+        // collision.
+        seed_foreign_prefixed_row(
+            &store,
+            "other",
+            "foreign-row",
+            &retired_test_payload("fact", "agent", json!({})),
+        )
+        .await;
+
+        store
+            .commit_action_batch(
+                "probe",
+                ActionWriteSet {
+                    expected_heads: vec![
+                        ExpectedHead::AbsentOrInactive {
+                            row_id: "probe::row-1".to_string(),
+                        },
+                        ExpectedHead::EdgeState {
+                            source: "probe::row-1".to_string(),
+                            relation: "RELATES_TO".to_string(),
+                            target: "foreign-row".to_string(),
+                            expected_exists: false,
+                        },
+                    ],
+                    writes: vec![StagedMemoryWrite {
+                        id: "probe::row-1".to_string(),
+                        vector: vec![0.1; 4],
+                        payload: retired_test_payload("fact", "agent", json!({})),
+                    }],
+                    edge_deltas: vec![EdgeDelta {
+                        source: "probe::row-1".to_string(),
+                        relation: "RELATES_TO".to_string(),
+                        target: "foreign-row".to_string(),
+                        existed_before: false,
+                        op: EdgeMutationOp::EnsurePresent,
+                    }],
+                },
+            )
+            .await
+            .expect("a bare reference owned elsewhere is a query key, not a collision");
+
+        assert!(
+            store.get("probe", "probe::row-1").await.unwrap().is_some(),
+            "the namespace's own write still lands"
+        );
+        assert!(
+            store.get("other", "foreign-row").await.unwrap().is_some(),
+            "the foreign row is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_batch_accepts_a_qualified_foreign_edge_endpoint() {
+        use crate::rdf::action::{ActionWriteSet, EdgeDelta, EdgeMutationOp, StagedMemoryWrite};
+
+        let store = retired_test_store().await;
+        seed_foreign_prefixed_row(
+            &store,
+            "other",
+            "other::row-1",
+            &retired_test_payload("fact", "agent", json!({})),
+        )
+        .await;
+
+        store
+            .commit_action_batch(
+                "probe",
+                ActionWriteSet {
+                    expected_heads: Vec::new(),
+                    writes: vec![StagedMemoryWrite {
+                        id: "probe::row-1".to_string(),
+                        vector: vec![0.1; 4],
+                        payload: retired_test_payload("fact", "agent", json!({})),
+                    }],
+                    edge_deltas: vec![EdgeDelta {
+                        source: "probe::row-1".to_string(),
+                        relation: "RELATES_TO".to_string(),
+                        target: "other::row-1".to_string(),
+                        existed_before: false,
+                        op: EdgeMutationOp::EnsurePresent,
+                    }],
+                },
+            )
+            .await
+            .expect(
+                "a qualified foreign endpoint is declared, not resolved against this namespace",
+            );
+        assert!(
+            store.get("other", "other::row-1").await.unwrap().is_some(),
+            "the foreign row is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_batch_does_not_abort_on_a_foreign_owned_raw_reference() {
+        use crate::rdf::action::{ActionWriteSet, EdgeDelta, EdgeMutationOp, StagedMemoryWrite};
+
+        let store = retired_test_store().await;
+        // An older release stored this raw spelling in another namespace even
+        // though its prefix names `probe`. A reference to it must neither abort
+        // the batch nor disclose which namespace owns it.
+        seed_foreign_prefixed_row(
+            &store,
+            "other",
+            "Probe::row-9",
+            &retired_test_payload("fact", "agent", json!({})),
+        )
+        .await;
+
+        store
+            .commit_action_batch(
+                "probe",
+                ActionWriteSet {
+                    expected_heads: Vec::new(),
+                    writes: vec![StagedMemoryWrite {
+                        id: "probe::row-1".to_string(),
+                        vector: vec![0.1; 4],
+                        payload: retired_test_payload("fact", "agent", json!({})),
+                    }],
+                    edge_deltas: vec![EdgeDelta {
+                        source: "probe::row-1".to_string(),
+                        relation: "RELATES_TO".to_string(),
+                        target: "Probe::row-9".to_string(),
+                        existed_before: false,
+                        op: EdgeMutationOp::EnsurePresent,
+                    }],
+                },
+            )
+            .await
+            .expect("a non-write reference to a foreign-owned raw spelling must not abort");
+        assert!(
+            store.get("other", "Probe::row-9").await.unwrap().is_some(),
+            "the foreign row is untouched"
+        );
+        assert!(store.get("probe", "probe::row-9").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn action_batch_write_collision_error_hides_the_owner_namespace() {
+        use crate::rdf::action::{ActionWriteSet, StagedMemoryWrite};
+
+        let store = retired_test_store().await;
+        seed_foreign_prefixed_row(
+            &store,
+            "hidden-owner-ns",
+            "Probe::row-1",
+            &retired_test_payload("fact", "agent", json!({})),
+        )
+        .await;
+
+        let err = store
+            .commit_action_batch(
+                "probe",
+                ActionWriteSet {
+                    expected_heads: Vec::new(),
+                    writes: vec![StagedMemoryWrite {
+                        id: "Probe::row-1".to_string(),
+                        vector: vec![0.1; 4],
+                        payload: retired_test_payload("fact", "agent", json!({})),
+                    }],
+                    edge_deltas: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("a write into another namespace's row is still refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("cross-namespace id collision"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            !message.contains("hidden-owner-ns"),
+            "the refusal must not reveal the owner namespace: {message}"
+        );
+        assert!(
+            store
+                .get("hidden-owner-ns", "Probe::row-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the foreign owner's row stays intact"
+        );
+        assert!(store.get("probe", "probe::row-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn action_batch_prefers_the_canonical_twin_when_both_exist() {
+        use crate::rdf::action::{ActionWriteSet, StagedMemoryWrite};
+
+        let store = retired_test_store().await;
+        seed_foreign_prefixed_row(
+            &store,
+            "probe",
+            "Probe::row-1",
+            &retired_test_payload("fact", "agent", json!({"marker": "raw"})),
+        )
+        .await;
+        seed_foreign_prefixed_row(
+            &store,
+            "probe",
+            "probe::row-1",
+            &retired_test_payload("fact", "agent", json!({"marker": "canonical"})),
+        )
+        .await;
+
+        store
+            .commit_action_batch(
+                "probe",
+                ActionWriteSet {
+                    expected_heads: Vec::new(),
+                    writes: vec![StagedMemoryWrite {
+                        id: "Probe::row-1".to_string(),
+                        vector: vec![0.1; 4],
+                        payload: retired_test_payload(
+                            "fact",
+                            "agent",
+                            json!({"marker": "updated"}),
+                        ),
+                    }],
+                    edge_deltas: Vec::new(),
+                },
+            )
+            .await
+            .expect("both spellings exist; the canonical one is the live row");
+
+        let (_, raw) = store.get("probe", "Probe::row-1").await.unwrap().unwrap();
+        assert_eq!(raw.metadata["marker"], "raw", "the raw twin is untouched");
+        let (_, canonical) = store.get("probe", "probe::row-1").await.unwrap().unwrap();
+        assert_eq!(canonical.metadata["marker"], "updated");
     }
 
     #[tokio::test]
@@ -37451,42 +38173,98 @@ impl LadybugStore {
         // batch, so a transaction never begins with a malformed address.
         crate::domain::validate_namespace(namespace)
             .map_err(|e| ActionError::Storage(e.to_string()))?;
+        // Validate ownership/syntax here and retain BOTH spellings: the one the
+        // caller used and the exact one this namespace canonicalizes to. The
+        // transaction resolves which spelling names a live row; rewriting the
+        // batch here would lose the raw address an older release persisted and
+        // could fork a second row under the canonical spelling. A foreign
+        // prefix is still refused for row addresses; edge endpoints that
+        // legitimately name another namespace are left as declared.
+        let mut id_pairs: Vec<ActionIdPair> = Vec::new();
         for w in &batch.writes {
-            crate::domain::validate_id(&w.id).map_err(|e| ActionError::Storage(e.to_string()))?;
-            // A qualified row id must name the namespace this batch writes.
-            // There is no existence fallback here: one foreign prefix refuses
-            // the whole transaction before it begins.
-            crate::domain::validate_id_for_namespace(&w.id, namespace)
+            let canonical = crate::domain::canonicalize_id_for_namespace(&w.id, namespace)
                 .map_err(|e| ActionError::Storage(e.to_string()))?;
+            // Legacy tilde taxonomy rows were written before the token became
+            // DR-2 clean. They may only be retired/updated in place (checked
+            // inside the transaction); a new create under that shape is never
+            // allowed, so only this narrow spelling gets a validation pass.
+            if let Err(err) = crate::domain::validate_id(&canonical) {
+                if !crate::domain::is_legacy_taxonomy_row_id(&w.id) {
+                    return Err(ActionError::Storage(err.to_string()));
+                }
+            }
+            id_pairs.push(ActionIdPair {
+                raw: w.id.clone(),
+                canonical,
+                is_write: true,
+            });
         }
         // Expected heads and edge endpoints are query keys too. Validating
         // only the staged row ids lets a malformed reference reach a Cypher
         // query, and an unmatched EnsurePresent can commit row writes while
         // silently skipping the requested edge.
         for head in &batch.expected_heads {
-            let ids: Vec<&str> = match head {
+            match head {
                 ExpectedHead::ActiveRow { row_id, .. }
-                | ExpectedHead::AbsentOrInactive { row_id }
-                | ExpectedHead::RowFingerprint { row_id, .. } => vec![row_id.as_str()],
-                ExpectedHead::EdgeState { source, target, .. } => {
-                    vec![source.as_str(), target.as_str()]
-                }
-                ExpectedHead::UniqueActionSlug { .. } => Vec::new(),
-            };
-            let is_edge = matches!(head, ExpectedHead::EdgeState { .. });
-            for id in ids {
-                crate::domain::validate_id(id).map_err(|e| ActionError::Storage(e.to_string()))?;
-                // Edge endpoints may legitimately name another namespace;
-                // row-address expectations may not.
-                if !is_edge {
-                    crate::domain::validate_id_for_namespace(id, namespace)
+                | ExpectedHead::AbsentOrInactive { row_id } => {
+                    crate::domain::validate_id(row_id)
                         .map_err(|e| ActionError::Storage(e.to_string()))?;
+                    id_pairs.push(ActionIdPair {
+                        raw: row_id.clone(),
+                        canonical: crate::domain::canonicalize_id_for_namespace(row_id, namespace)
+                            .map_err(|e| ActionError::Storage(e.to_string()))?,
+                        is_write: false,
+                    });
                 }
+                ExpectedHead::RowFingerprint { row_id, .. } => {
+                    // A legacy tilde row can be fingerprinted for retirement,
+                    // but the write that follows must prove it exists.
+                    if let Err(err) = crate::domain::validate_id(row_id) {
+                        if !crate::domain::is_legacy_taxonomy_row_id(row_id) {
+                            return Err(ActionError::Storage(err.to_string()));
+                        }
+                    }
+                    id_pairs.push(ActionIdPair {
+                        raw: row_id.clone(),
+                        canonical: crate::domain::canonicalize_id_for_namespace(row_id, namespace)
+                            .map_err(|e| ActionError::Storage(e.to_string()))?,
+                        is_write: false,
+                    });
+                }
+                ExpectedHead::EdgeState { source, target, .. } => {
+                    for endpoint in [source, target] {
+                        crate::domain::validate_id(endpoint)
+                            .map_err(|e| ActionError::Storage(e.to_string()))?;
+                        // Edge endpoints may legitimately name another
+                        // namespace; only an owned (or bare) address is
+                        // resolved against this transaction's owner map.
+                        if let Ok(canonical) =
+                            crate::domain::canonicalize_id_for_namespace(endpoint, namespace)
+                        {
+                            id_pairs.push(ActionIdPair {
+                                raw: endpoint.clone(),
+                                canonical,
+                                is_write: false,
+                            });
+                        }
+                    }
+                }
+                ExpectedHead::UniqueActionSlug { .. } => {}
             }
         }
         for ed in &batch.edge_deltas {
-            for id in [&ed.source, &ed.target] {
-                crate::domain::validate_id(id).map_err(|e| ActionError::Storage(e.to_string()))?;
+            for endpoint in [&ed.source, &ed.target] {
+                crate::domain::validate_id(endpoint)
+                    .map_err(|e| ActionError::Storage(e.to_string()))?;
+                if let Ok(canonical) =
+                    crate::domain::canonicalize_id_for_namespace(endpoint, namespace)
+                {
+                    id_pairs.push(ActionIdPair {
+                        raw: endpoint.clone(),
+                        canonical,
+                        is_write: false,
+                    });
+                }
             }
         }
         let ns = namespace.to_string();
@@ -37503,7 +38281,7 @@ impl LadybugStore {
         let mut refresh_ont = false;
         let rid = crate::registry::registry_row_id(&ns);
 
-        for w in &mut batch.writes {
+        for (index, w) in batch.writes.iter_mut().enumerate() {
             if let Some(topology) = w.payload.metadata.get_mut("topology") {
                 crate::rdf::canonicalize_topology(topology, &ontology);
             }
@@ -37518,6 +38296,7 @@ impl LadybugStore {
                 || w.payload.memory_type == "thesis"
                 || w.payload.memory_type == "concept"
                 || w.id == rid
+                || id_pairs[index].canonical == rid
             {
                 refresh_ont = true;
             }
@@ -37534,24 +38313,155 @@ impl LadybugStore {
             .write_with_deadline("committing a kinetic action batch", move |conn| {
                 conn.query("BEGIN TRANSACTION")?;
 
-                let inner: std::result::Result<(), ActionError> = (|| {
+                let inner: std::result::Result<Vec<String>, ActionError> = (|| {
                     let safe_ns = escape_ladybug_string(&ns_for_tx);
 
-                    // 1. Cross-namespace ID collision check for every row in the write set.
-                    for w in &writes {
-                        let safe_id = escape_ladybug_string(&w.id);
+                    let owner_of = |conn: &Connection,
+                                    candidate: &str|
+                     -> std::result::Result<Option<String>, ActionError> {
                         let q = format!(
-                            "MATCH (m:Memory {{id: '{safe_id}'}}) WHERE m.namespace <> '{safe_ns}' RETURN m.namespace LIMIT 1"
+                            "MATCH (m:Memory {{id: '{}'}}) RETURN m.namespace LIMIT 1",
+                            escape_ladybug_string(candidate)
                         );
                         let mut res = conn
                             .query(&q)
                             .map_err(|e| ActionError::Storage(e.to_string()))?;
-                        if let Some(row) = res.next() {
-                            let existing_ns = format!("{}", row[0]);
-                            return Err(ActionError::Storage(format!(
-                                "cross-namespace id collision: memory '{}' belongs to namespace '{}', cannot write into '{}'",
-                                w.id, existing_ns, ns_for_tx
-                            )));
+                        Ok(res.next().map(|row| format!("{}", row[0])))
+                    };
+
+                    // 1. Resolve every distinct address against the transaction's
+                    // current state. Only a row *write* is authoritative: an owned
+                    // prefix has two spellings, and if either one names a live row
+                    // owned by another namespace, the write would steal that row,
+                    // so the batch is refused. Expected heads and edge endpoints
+                    // are query keys, not writes: they may legitimately reference a
+                    // row another namespace owns, so they must never abort the
+                    // batch, and a bare address has a single spelling that needs no
+                    // lookup at all.
+                    let mut resolved: std::collections::BTreeMap<String, String> =
+                        std::collections::BTreeMap::new();
+                    for pair in id_pairs.iter().filter(|pair| pair.is_write) {
+                        if resolved.contains_key(&pair.raw) {
+                            continue;
+                        }
+                        let raw_owner = if pair.raw != pair.canonical {
+                            owner_of(conn, &pair.raw)?
+                        } else {
+                            None
+                        };
+                        let canon_owner = owner_of(conn, &pair.canonical)?;
+                        for (candidate, owner) in
+                            [(&pair.raw, &raw_owner), (&pair.canonical, &canon_owner)]
+                        {
+                            if let Some(existing_ns) = owner {
+                                if *existing_ns != ns_for_tx {
+                                    // The owner's name is deliberately withheld:
+                                    // a caller must not learn which other
+                                    // namespace holds the row from this refusal.
+                                    return Err(ActionError::Storage(format!(
+                                        "cross-namespace id collision: memory '{}' is owned by another namespace, cannot write into '{}'",
+                                        candidate, ns_for_tx
+                                    )));
+                                }
+                            }
+                        }
+                        let effective = if pair.raw != pair.canonical
+                            && raw_owner.as_deref() == Some(ns_for_tx.as_str())
+                            && canon_owner.is_none()
+                        {
+                            pair.raw.clone()
+                        } else {
+                            pair.canonical.clone()
+                        };
+                        resolved.insert(pair.raw.clone(), effective);
+                    }
+                    for pair in id_pairs.iter().filter(|pair| !pair.is_write) {
+                        // A bare address equals its canonical spelling, so a row
+                        // under it may belong to any namespace without becoming a
+                        // collision. A write already resolved this key differently.
+                        if pair.raw == pair.canonical || resolved.contains_key(&pair.raw) {
+                            continue;
+                        }
+                        let raw_owner = owner_of(conn, &pair.raw)?;
+                        let canon_owner = owner_of(conn, &pair.canonical)?;
+                        // Resolve strictly inside this namespace: the raw spelling
+                        // wins only when this namespace owns it and the canonical
+                        // spelling is not ours. Ownership elsewhere is not an error
+                        // for a reference and is never named.
+                        let effective = if raw_owner.as_deref() == Some(ns_for_tx.as_str())
+                            && canon_owner.as_deref() != Some(ns_for_tx.as_str())
+                        {
+                            pair.raw.clone()
+                        } else {
+                            pair.canonical.clone()
+                        };
+                        resolved.insert(pair.raw.clone(), effective);
+                    }
+
+                    // Apply the resolution to every key the transaction uses,
+                    // so heads, writes and edges all address the same rows.
+                    // The closure is `Fn` (a write turn may be retried), so
+                    // work on clones rather than moving the captured sets.
+                    let mut writes = writes.clone();
+                    for w in &mut writes {
+                        if let Some(effective) = resolved.get(&w.id) {
+                            w.id = effective.clone();
+                        }
+                    }
+                    let mut expected_heads = expected_heads.clone();
+                    for head in &mut expected_heads {
+                        match head {
+                            ExpectedHead::ActiveRow { row_id, .. }
+                            | ExpectedHead::AbsentOrInactive { row_id }
+                            | ExpectedHead::RowFingerprint { row_id, .. } => {
+                                if let Some(effective) = resolved.get(row_id) {
+                                    *row_id = effective.clone();
+                                }
+                            }
+                            ExpectedHead::EdgeState { source, target, .. } => {
+                                if let Some(effective) = resolved.get(source) {
+                                    *source = effective.clone();
+                                }
+                                if let Some(effective) = resolved.get(target) {
+                                    *target = effective.clone();
+                                }
+                            }
+                            ExpectedHead::UniqueActionSlug { .. } => {}
+                        }
+                    }
+                    let mut edge_deltas = edge_deltas.clone();
+                    for ed in &mut edge_deltas {
+                        if let Some(effective) = resolved.get(&ed.source) {
+                            ed.source = effective.clone();
+                        }
+                        if let Some(effective) = resolved.get(&ed.target) {
+                            ed.target = effective.clone();
+                        }
+                    }
+                    let effective_write_ids: Vec<String> =
+                        writes.iter().map(|w| w.id.clone()).collect();
+
+                    // 1b. A legacy tilde taxonomy row may only be retired or
+                    // updated where it already lives. The batch validator
+                    // admitted the shape for that purpose; prove existence in
+                    // this namespace so a transaction can never create one.
+                    for w in &writes {
+                        if crate::domain::is_legacy_taxonomy_row_id(&w.id) {
+                            let q = format!(
+                                "MATCH (m:Memory {{id: '{}', namespace: '{safe_ns}'}}) RETURN m.id LIMIT 1",
+                                escape_ladybug_string(&w.id)
+                            );
+                            let present = conn
+                                .query(&q)
+                                .map_err(|e| ActionError::Storage(e.to_string()))?
+                                .next()
+                                .is_some();
+                            if !present {
+                                return Err(ActionError::Storage(format!(
+                                    "legacy taxonomy row '{}' is not present in namespace '{}'; refusing to create it",
+                                    w.id, ns_for_tx
+                                )));
+                            }
                         }
                     }
 
@@ -37852,6 +38762,18 @@ impl LadybugStore {
                         if w.payload.memory_type == "thesis" || w.payload.memory_type == "concept" {
                             touches_taxonomy = true;
                         }
+                        // Decide update-vs-create from the transaction's own
+                        // view: a same-id row owned by another namespace was
+                        // refused above, so this only asks whether this
+                        // namespace already owns the resolved address.
+                        let row_exists = conn
+                            .query(&format!(
+                                "MATCH (m:Memory {{id: '{}', namespace: '{safe_ns}'}}) RETURN m.id LIMIT 1",
+                                escape_ladybug_string(&w.id)
+                            ))
+                            .map_err(|e| ActionError::Storage(e.to_string()))?
+                            .next()
+                            .is_some();
                         conn_upsert_action_row(
                             conn,
                             &ns_for_tx,
@@ -37859,6 +38781,7 @@ impl LadybugStore {
                             &w.vector,
                             &w.payload,
                             now_ts,
+                            row_exists,
                         )
                         .map_err(|e| ActionError::Storage(e.to_string()))?;
                         writes_done += 1;
@@ -37986,11 +38909,11 @@ impl LadybugStore {
                         }
                     }
 
-                    Ok(())
+                    Ok(effective_write_ids)
                 })();
 
                 match inner {
-                    Ok(()) => {
+                    Ok(effective_write_ids) => {
                         if let Err(e) = conn.query("COMMIT") {
                             let _ = conn.query("ROLLBACK");
                             return Ok(Err(ActionError::Storage(format!(
@@ -37998,7 +38921,7 @@ impl LadybugStore {
                             ))));
                         }
                         first_write_flip.flip_store_state_to_data();
-                        Ok(Ok(()))
+                        Ok(Ok(effective_write_ids))
                     }
                     Err(action_err) => {
                         let _ = conn.query("ROLLBACK");
@@ -38009,15 +38932,23 @@ impl LadybugStore {
             .await
             .map_err(|e| ActionError::Storage(e.to_string()))?;
 
-        if tx_outcome.is_ok() {
-            for doc in lexical_docs {
+        if let Ok(effective_write_ids) = &tx_outcome {
+            // A pre-existing noncanonical row updated in place keeps its raw
+            // id: the lexical document must address the row that exists, not
+            // the spelling the caller asked for (or the canonical one that
+            // never landed).
+            for (doc, effective_id) in lexical_docs.into_iter().zip(effective_write_ids.iter()) {
+                let mut doc = doc;
+                if doc.id != *effective_id {
+                    doc.id = effective_id.clone();
+                }
                 self.lexical_apply_doc(doc);
             }
             if refresh_ont {
                 self.refresh_ontology(&ns).await;
             }
         }
-        tx_outcome
+        tx_outcome.map(|_| ())
     }
 }
 
@@ -38028,6 +38959,20 @@ fn action_batch_fail_map() -> &'static std::sync::Mutex<std::collections::HashMa
     MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// One row address as the caller spelled it and the exact spelling its owning
+/// namespace gives it. The action transaction resolves which spelling names a
+/// live row (see `LadybugStore::commit_action_batch`).
+///
+/// `is_write` separates an authoritative row write from a mere query key: only
+/// a write may be refused because another namespace owns the address, so a
+/// reference to a foreign row never aborts the batch.
+#[derive(Clone)]
+struct ActionIdPair {
+    raw: String,
+    canonical: String,
+    is_write: bool,
+}
+
 fn conn_upsert_action_row(
     conn: &Connection,
     namespace: &str,
@@ -38035,6 +38980,7 @@ fn conn_upsert_action_row(
     vector: &[f32],
     payload: &MemoryPayload,
     edge_now: i64,
+    row_exists: bool,
 ) -> Result<()> {
     let safe_id = escape_ladybug_string(id);
     let safe_ns = escape_ladybug_string(namespace);
@@ -38062,14 +39008,24 @@ fn conn_upsert_action_row(
             .join(",")
     );
 
-    let insert_query = format!(
-        "MERGE (m:Memory {{id: '{}'}})
-         ON CREATE SET m.namespace = '{}', m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}
-         ON MATCH SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
-        safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str,
-        safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
-    );
-    conn.query(&insert_query)?;
+    if row_exists {
+        // Update only the row this namespace owns. A foreign row with the same
+        // id was refused before this write, and the transaction's own view is
+        // authoritative, so no unscoped MERGE can relocate it.
+        let update_query = format!(
+            "MATCH (m:Memory {{id: '{}', namespace: '{}'}}) SET m.content = '{}', m.user_id = '{}', m.memory_type = '{}', m.agent_name = '{}', m.location = '{}', m.location_lines = '{}', m.metadata = '{}', m.embedding = {}",
+            safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
+        );
+        conn.query(&update_query)?;
+    } else {
+        // No row exists for this address anywhere (step 1 refused a foreign
+        // owner), so a plain CREATE lands exactly one row here.
+        let insert_query = format!(
+            "CREATE (m:Memory {{id: '{}', namespace: '{}', content: '{}', user_id: '{}', memory_type: '{}', agent_name: '{}', location: '{}', location_lines: '{}', metadata: '{}', embedding: {}}})",
+            safe_id, safe_ns, safe_content, safe_user_id, safe_memory_type, safe_agent_name, safe_location, safe_location_lines, safe_metadata, vec_str
+        );
+        conn.query(&insert_query)?;
+    }
 
     for edge in edge_specs(&payload.metadata) {
         if !is_valid_relation_name(edge.rel_type) {

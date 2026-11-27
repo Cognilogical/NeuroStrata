@@ -133,6 +133,43 @@ pub fn validate_namespace(ns: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// A JSON value's shape, for a typed refusal that names what arrived.
+fn json_shape(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// The caller's optional `namespace` argument, validated before any store or
+/// connector access.
+///
+/// An absent argument keeps the surface's documented `default`. A present
+/// string is checked unchanged by [`validate_namespace`]: argument syntax is
+/// not laundered through `trim`, so an explicit empty or padded value is a
+/// refused address rather than a silent default. Any other JSON shape is a
+/// typed `ERROR [NAMESPACE]` refusal, not an absent argument.
+pub fn optional_namespace_arg<'a>(
+    args: &'a Value,
+    default: &'a str,
+) -> Result<&'a str, ValidationError> {
+    match args.get("namespace") {
+        None => Ok(default),
+        Some(Value::String(raw)) => {
+            validate_namespace(raw)?;
+            Ok(raw)
+        }
+        Some(other) => Err(ValidationError::Namespace(format!(
+            "'namespace' must be a string, got {}",
+            json_shape(other)
+        ))),
+    }
+}
+
 fn bare_id_rule_reason(id: &str) -> Option<String> {
     let len = id.chars().count();
     if !(1..=MAX_ID_CHARS).contains(&len) {
@@ -242,44 +279,54 @@ pub fn validate_namespace_legacy(ns: &str) -> Result<(), ValidationError> {
 }
 
 /// A bare id that earlier releases wrote as a relative or absolute file
-/// path. It must contain a path separator, stay inside DR-2's cap, carry a
-/// file extension, and avoid the characters a qualified path forbids.
+/// path. It must contain a path separator, stay inside DR-2's cap, and avoid
+/// the characters a qualified path forbids. The leaf may be any non-empty
+/// path step except `.` and `..`: older stores hold extensionless files
+/// (`src/Makefile`) and extensions longer than the guard once assumed, and a
+/// false refusal strands a row its owner can no longer address. Whitespace is
+/// refused in every form, including non-ASCII, because no stored path shape
+/// legitimately carries it and it hides an address from equality checks.
 fn is_legacy_file_path_id(id: &str) -> bool {
-    if id.is_empty()
-        || id.chars().count() > MAX_ID_CHARS
-        || !id.contains('/')
-        || id.contains(':')
-        || id.chars().any(|c| {
-            matches!(c, '\'' | '"' | '\\')
-                || c.is_control()
-                || !(c.is_ascii_graphic() || (!c.is_ascii() && !c.is_control()))
-        })
+    if id.is_empty() || id.chars().count() > MAX_ID_CHARS || !id.contains('/') {
+        return false;
+    }
+    if id.contains(':')
+        || id
+            .chars()
+            .any(|c| matches!(c, '\'' | '"' | '\\') || c.is_control() || c.is_whitespace())
     {
         return false;
     }
     let leaf = id.rsplit('/').next().unwrap_or("");
-    match leaf.rsplit_once('.') {
-        Some((stem, ext)) => {
-            !stem.is_empty()
-                && !ext.is_empty()
-                && ext.len() <= 16
-                && ext
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        }
-        None => false,
+    !leaf.is_empty() && leaf != "." && leaf != ".."
+}
+
+/// A bare id an earlier release wrote with the historical `file:` prefix in
+/// front of a path. Only the prefix is peeled; the rest must be a valid
+/// legacy path under the same cap. Reads accept the spelling, writes never
+/// mint a new one.
+fn is_historical_file_prefixed_id(id: &str) -> bool {
+    if id.chars().count() > MAX_ID_CHARS {
+        return false;
     }
+    id.strip_prefix("file:")
+        .map(is_legacy_file_path_id)
+        .unwrap_or(false)
 }
 
 /// The caller-facing read gate. Strict DR-2 ids pass, and so do bare file
 /// path ids that earlier releases persisted (reads and updates of those rows
-/// must keep working). Qualified ids are unchanged: their paths already
-/// allow `/` and spaces, and their prefixes still obey DR-1.
+/// must keep working), the historical `file:<path>` spelling, and the narrow
+/// pre-DR-2 tilde taxonomy spelling. Qualified ids are unchanged: their paths
+/// already allow `/` and spaces, and their prefixes still obey DR-1.
 pub fn validate_id_for_read(id: &str) -> Result<(), ValidationError> {
     match validate_id(id) {
         Ok(()) => Ok(()),
         Err(err) => {
-            if is_legacy_file_path_id(id) {
+            if is_legacy_file_path_id(id)
+                || is_historical_file_prefixed_id(id)
+                || is_legacy_taxonomy_row_id(id)
+            {
                 Ok(())
             } else {
                 let reason = err.to_string();
@@ -313,6 +360,119 @@ pub fn validate_id_for_namespace(id: &str, namespace: &str) -> Result<(), Valida
         }
     }
     Ok(())
+}
+
+/// Re-spell a qualified id's namespace prefix with the exact stored namespace.
+///
+/// Ownership is still checked case-insensitively: a prefix that names another
+/// namespace is refused rather than rewritten. Bare ids have no prefix and are
+/// returned unchanged, so legacy file-path spellings keep their identity.
+pub fn canonicalize_id_for_namespace(id: &str, namespace: &str) -> Result<String, ValidationError> {
+    validate_id_for_namespace(id, namespace)?;
+    match id.find(NAMESPACE_SEPARATOR) {
+        Some(pos) => {
+            let path = &id[pos + NAMESPACE_SEPARATOR.len()..];
+            Ok(format!("{namespace}{NAMESPACE_SEPARATOR}{path}"))
+        }
+        None => Ok(id.to_string()),
+    }
+}
+
+/// Walk the namespace token a pre-DR-2 taxonomy row id carries.
+///
+/// That token used `[A-Za-z0-9_~-]`, where `~hh` escaped one non-charset byte
+/// and a single closing `~` could follow the escape (`~hh~`). The walk is
+/// strict: every `~` must open an escape or close one that was just consumed,
+/// and the token must contain at least one escape. This accepts `~2e`, `~2e~`,
+/// adjacent escapes (`~2e~2e`), and a closing tilde between them
+/// (`~2e~~2e~`), while rejecting a stray `~`, `~zz`, and any character outside
+/// the token set.
+fn legacy_namespace_token_is_valid(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    let mut escapes = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'~' => {
+                if i + 2 >= bytes.len()
+                    || !bytes[i + 1].is_ascii_hexdigit()
+                    || !bytes[i + 2].is_ascii_hexdigit()
+                {
+                    return false;
+                }
+                escapes += 1;
+                i += 3;
+                // A closing `~` may follow the escape, unless the bytes there
+                // open another escape (then the tilde belongs to that one).
+                let opens_escape = i + 2 < bytes.len()
+                    && bytes[i] == b'~'
+                    && bytes[i + 1].is_ascii_hexdigit()
+                    && bytes[i + 2].is_ascii_hexdigit();
+                if i < bytes.len() && bytes[i] == b'~' && !opens_escape {
+                    i += 1;
+                }
+            }
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' => i += 1,
+            _ => return false,
+        }
+    }
+    escapes > 0
+}
+
+/// A taxonomy row id written before the namespace token became DR-2 clean.
+///
+/// Those releases escaped namespace characters as `~xx` (single tilde, e.g.
+/// `team~2eproj`) or `~xx~`; `~` is outside DR-2, so such a row cannot be
+/// re-minted today, but it still exists and must be retirable. Only the exact
+/// historical structure is accepted, so no other `~`-bearing address can slip
+/// through the read bridge:
+///
+/// - `thesis-<token>--v<digits>`
+/// - `concept-<token>--<slug>-v<digits>`
+///
+/// A token is walked byte by byte (see `legacy_namespace_token_is_valid`);
+/// a concept slug is lowercase kebab. The whole id is ASCII, within the DR-2
+/// cap, and uses only `[A-Za-z0-9_~-]`. No `::` is allowed: this is a bare
+/// address only.
+pub fn is_legacy_taxonomy_row_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > MAX_ID_CHARS || !id.is_ascii() {
+        return false;
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'~' | b'-'))
+    {
+        return false;
+    }
+    if let Some(rest) = id.strip_prefix("thesis-") {
+        let Some((token, version)) = rest.rsplit_once("--v") else {
+            return false;
+        };
+        return !token.is_empty()
+            && !version.is_empty()
+            && version.bytes().all(|b| b.is_ascii_digit())
+            && legacy_namespace_token_is_valid(token);
+    }
+    if let Some(rest) = id.strip_prefix("concept-") {
+        let Some((token, tail)) = rest.rsplit_once("--") else {
+            return false;
+        };
+        let Some((slug, version)) = tail.rsplit_once("-v") else {
+            return false;
+        };
+        return !token.is_empty()
+            && !slug.is_empty()
+            && !version.is_empty()
+            && version.bytes().all(|b| b.is_ascii_digit())
+            && slug
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && legacy_namespace_token_is_valid(token);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -486,7 +646,17 @@ mod tests {
             "a\nb",
         ] {
             assert!(validate_id(bad).is_err(), "write accepted {bad:?}");
-            assert!(validate_id_for_read(bad).is_err(), "read accepted {bad:?}");
+            // The read bridge now accepts `a/b` and `file:src/lib.rs`, but a
+            // value with no path separator, whitespace, or a hostile character
+            // stays refused on both surfaces.
+            if matches!(bad, "a/b" | "file:src/lib.rs") {
+                assert!(
+                    validate_id_for_read(bad).is_ok(),
+                    "read must accept the legacy path spelling {bad:?}"
+                );
+            } else {
+                assert!(validate_id_for_read(bad).is_err(), "read accepted {bad:?}");
+            }
         }
         // The qualified-id cap is a write rule and a read rule alike: a
         // legacy row can hold a long id, but the gate never addresses it.
@@ -580,12 +750,149 @@ mod tests {
                 "read must accept {path:?}"
             );
         }
-        for bad in ["a/b", "a b", "file:src/lib.rs", "a\\b", "src/a'.rs"] {
+        // Older stores hold extensionless files, long extensions, and
+        // non-ASCII names. A read bridge that refused them would strand the
+        // rows; a write bridge still refuses every one of them.
+        for path in [
+            "src/Makefile",
+            "src/a.superlongextension",
+            "src/naïve.rs",
+            "docs/日本語.md",
+        ] {
+            assert!(
+                validate_id(path).is_err(),
+                "write must stay strict: {path:?}"
+            );
+            assert!(
+                validate_id_for_read(path).is_ok(),
+                "read must accept {path:?}"
+            );
+        }
+        for bad in [
+            "a b",
+            "a\\b",
+            "src/a'.rs",
+            "src/",
+            "src/.",
+            "src/..",
+            "src/a b.rs",
+            "src/a\u{a0}b.rs",
+        ] {
             assert!(
                 validate_id_for_read(bad).is_err(),
                 "read must refuse {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn historical_file_prefixed_ids_are_read_only() {
+        for ok in ["file:src/lib.rs", "file:/abs/a.rs", "file:docs/a/b.md"] {
+            assert!(validate_id(ok).is_err(), "write must stay strict: {ok:?}");
+            assert!(validate_id_for_read(ok).is_ok(), "read must accept {ok:?}");
+        }
+        for bad in [
+            "file:src/",
+            "file:a b",
+            "file:src/a b.rs",
+            "file:src/a\\b.rs",
+            "file:src/a:b.rs",
+            "file:src/a'.rs",
+        ] {
+            assert!(
+                validate_id_for_read(bad).is_err(),
+                "read must refuse {bad:?}"
+            );
+        }
+        // `file:` alone is an ordinary DR-2 bare id (colon is allowed there);
+        // it is not a historical path and stays writable on its own terms.
+        assert!(validate_id("file:").is_ok());
+        let too_long = format!("file:src/{}", "a".repeat(130));
+        assert!(
+            validate_id_for_read(&too_long).is_err(),
+            "the whole prefixed id stays inside the cap"
+        );
+    }
+
+    #[test]
+    fn only_narrow_legacy_taxonomy_ids_are_recognized() {
+        for ok in [
+            "thesis-team~2eproj--v1",
+            "concept-team~2eproj--slug-v1",
+            "thesis-team~2e~proj--v1",
+            "concept-a~2d~b--core-v7",
+        ] {
+            assert!(is_legacy_taxonomy_row_id(ok), "{ok:?}");
+            assert!(validate_id(ok).is_err(), "write must stay strict: {ok:?}");
+            assert!(
+                validate_id_for_read(ok).is_ok(),
+                "read must accept the legacy taxonomy row: {ok:?}"
+            );
+        }
+        // Boundary forms the token walk must keep: a closing tilde between
+        // adjacent escapes, and a trailing hyphen in the namespace token.
+        for ok in [
+            "thesis-a~2e~2eb--v1",
+            "thesis-a~2e---v1",
+            "thesis-a~2e~~2e~--v1",
+            "concept-a~2e-b--a1-v2",
+        ] {
+            assert!(is_legacy_taxonomy_row_id(ok), "{ok:?}");
+            assert!(validate_id(ok).is_err(), "write must stay strict: {ok:?}");
+            assert!(
+                validate_id_for_read(ok).is_ok(),
+                "read must accept the legacy taxonomy row: {ok:?}"
+            );
+        }
+        for bad in [
+            "thesis-team.proj--v1",
+            "concept-team.proj--slug-v1",
+            "rule-team~2eproj",
+            "fact-team~2eproj",
+            "thesis-team~zzproj--v1",
+            "thesis-team~2eproj::x",
+            "thesis-team~2e proj--v1",
+            "thesis-team~2e'proj--v1",
+            // Gemini Stage 1 findings: no other `~`-bearing spelling may be
+            // laundered by the read bridge.
+            "thesis-team~2e$bad--v1",
+            "thesis-team~2e/bad--v1",
+            "thesis-team~2e-b~zz--v1",
+            "thesis-team~2eproj",
+            "thesis-team~2eé--v1",
+            "concept-team~2eproj--Slug-v1",
+        ] {
+            assert!(!is_legacy_taxonomy_row_id(bad), "{bad:?}");
+        }
+        let too_long = format!("thesis-{}~2e-v1", "a".repeat(130));
+        assert!(!is_legacy_taxonomy_row_id(&too_long));
+        for bad in [
+            "thesis-team~zzproj--v1",
+            "thesis-team~2e proj--v1",
+            "thesis-team~2e$bad--v1",
+        ] {
+            assert!(!is_legacy_taxonomy_row_id(bad), "{bad:?}");
+            assert!(validate_id_for_read(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn canonicalization_replaces_only_the_owned_prefix() {
+        assert_eq!(
+            canonicalize_id_for_namespace("Team.Proj::src/a.rs", "team.proj").unwrap(),
+            "team.proj::src/a.rs"
+        );
+        assert_eq!(
+            canonicalize_id_for_namespace("probe::src/a.rs", "probe").unwrap(),
+            "probe::src/a.rs"
+        );
+        assert_eq!(
+            canonicalize_id_for_namespace("bare-id", "probe").unwrap(),
+            "bare-id"
+        );
+        let err = canonicalize_id_for_namespace("other::src/a.rs", "probe")
+            .expect_err("a foreign prefix must not be rewritten");
+        assert!(err.to_string().contains("names namespace"), "{err}");
     }
 
     #[test]

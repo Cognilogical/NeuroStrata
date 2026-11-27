@@ -51,6 +51,12 @@ pub struct MockStore {
     /// How many times `list` was called. Read routes that must reject caller
     /// input before scanning a namespace assert this stays zero.
     list_calls: AtomicUsize,
+    /// How many times `delete` was called. Address-validation tests assert a
+    /// refused id never reached the destructive write.
+    delete_calls: AtomicUsize,
+    /// The namespaced graph body `export_graph` returns. Handler tests seed a
+    /// global/other fixture and assert the route's own namespace filter.
+    export_graph: Mutex<serde_json::Value>,
 }
 
 impl MockStore {
@@ -64,6 +70,8 @@ impl MockStore {
             upsert_calls: AtomicUsize::new(0),
             get_calls: AtomicUsize::new(0),
             list_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            export_graph: Mutex::new(serde_json::json!({"nodes": [], "links": []})),
         }
     }
 
@@ -85,6 +93,16 @@ impl MockStore {
     /// The number of `upsert` calls this store has served.
     pub fn upsert_calls(&self) -> usize {
         self.upsert_calls.load(Ordering::SeqCst)
+    }
+
+    /// The number of `delete` calls this store has served.
+    pub fn delete_calls(&self) -> usize {
+        self.delete_calls.load(Ordering::SeqCst)
+    }
+
+    /// Seed the namespaced graph body `export_graph` returns.
+    pub fn set_export_graph(&self, value: serde_json::Value) {
+        *self.export_graph.lock().expect("mock store lock") = value;
     }
 
     /// The `hit_count` the store holds for a row, exactly as it is persisted.
@@ -328,6 +346,7 @@ impl VectorStore for MockStore {
     }
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
+        self.delete_calls.fetch_add(1, Ordering::SeqCst);
         let mut rows = self.rows.lock().expect("mock store lock");
         rows.retain(|r| !(r.namespace == namespace && r.id == id));
         Ok(())
@@ -402,7 +421,7 @@ impl VectorStore for MockStore {
         _project_contexts: &HashMap<String, PathBuf>,
         _anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
     ) -> Result<serde_json::Value> {
-        Ok(serde_json::json!({"nodes": [], "links": []}))
+        Ok(self.export_graph.lock().expect("mock store lock").clone())
     }
 
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()> {

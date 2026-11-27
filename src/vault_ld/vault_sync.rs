@@ -1020,19 +1020,23 @@ fn strip_history_edge_declarations(metadata: &mut serde_json::Value) {
 }
 
 /// A failed history rollback must be surfaced, never treated as success.
-/// A history id stays readable when the head id is short enough, otherwise
-/// the bare prefix is content-addressed. Without this, a note id accepted on
-/// initial import (up to 128 chars) grows past DR-2's cap once the history
-/// marker and UUID are appended, so the note can never be updated.
+/// A bare history id stays readable when the head id is short enough, otherwise
+/// the prefix is content-addressed. A qualified head id (`ns::path`) always
+/// takes the hashed form: its history copy belongs to the same namespace, so a
+/// readable candidate would carry a second `::` and a redundant owner prefix.
+/// Ask the shared validator rather than re-deriving the cap: any future bound
+/// is then honoured automatically.
 fn vault_history_id(note_id: &str) -> String {
-    const TAIL_LEN: usize = ".vault-history.".len() + 36; // UUID v4 text form
-    let mut prefix = note_id.to_string();
-    if prefix.len() + TAIL_LEN > crate::domain::MAX_ID_CHARS {
-        use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(note_id.as_bytes());
-        prefix = format!("h{}", &hex::encode(digest)[..32]);
+    let uuid = uuid::Uuid::new_v4();
+    let candidate = format!("{note_id}.vault-history.{uuid}");
+    if !note_id.contains(crate::domain::NAMESPACE_SEPARATOR)
+        && crate::domain::validate_id(&candidate).is_ok()
+    {
+        return candidate;
     }
-    format!("{prefix}.vault-history.{}", uuid::Uuid::new_v4())
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(note_id.as_bytes());
+    format!("h{}.vault-history.{uuid}", &hex::encode(digest)[..32])
 }
 
 fn cleanup_orphan_error(history_id: &str, cleanup_err: &str) -> String {
@@ -1324,7 +1328,6 @@ pub async fn import_vault_with_limits(
         related: Vec<String>,
         history: Option<(String, Vec<f32>, crate::traits::MemoryPayload)>,
     }
-
     let mut planned: Vec<Planned> = Vec::new();
     // An unchanged declarer skips planning, so its edge can never observe a
     // preferred target that only arrives in this turn. Record the declaration
@@ -1342,14 +1345,21 @@ pub async fn import_vault_with_limits(
             continue;
         }
 
-        let (prior_vector, prior_payload) = match store.get(&config.namespace, &note.id).await {
-            Ok(Some(pair)) => (Some(pair.0), Some(pair.1)),
-            Ok(None) => (None, None),
-            Err(e) => {
-                errors.push(format!("Failed to read prior head {}: {}", note.id, e));
-                continue;
-            }
-        };
+        // A prior head may carry a noncanonical spelling from an older
+        // release. Read canonical-first with a raw fallback and keep the
+        // effective id, so every following write and edge names the row that
+        // exists instead of forking a canonical twin.
+        let (prior_vector, prior_payload, effective_id) =
+            match crate::server::lookup_effective_row(store.as_ref(), &config.namespace, &note.id)
+                .await
+            {
+                Ok(Some((effective, vector, payload))) => (Some(vector), Some(payload), effective),
+                Ok(None) => (None, None, note.id.clone()),
+                Err(e) => {
+                    errors.push(format!("Failed to read prior head {}: {}", note.id, e));
+                    continue;
+                }
+            };
 
         // #336 backstop: a stub is additive only. If a prior head exists for
         // a stub id (a write landed between resolution and planning), refuse
@@ -1406,7 +1416,7 @@ pub async fn import_vault_with_limits(
                 // stays a silent no-op, exactly as the unchanged path was before.
                 if writable_prior(principal, prior).is_ok() {
                     if let Some(declared) = vault_declared_targets(prior) {
-                        unchanged_declarers.push((note.id.clone(), declared));
+                        unchanged_declarers.push((effective_id.clone(), declared));
                     }
                 }
                 continue;
@@ -1466,15 +1476,18 @@ pub async fn import_vault_with_limits(
             }
             // `visible_to` / `eligibility` (and any future structured field)
             // already came across in the wholesale copy above.
-            let history_id = vault_history_id(&note.id);
-            retire_metadata(&mut prior.metadata, &note.id, now);
+            // The history row and its stamps name the row that actually exists:
+            // a case-variant address resolves to `effective_id`, so retiring
+            // the prior head under the caller's spelling would point the
+            // lineage at a twin that was never written.
+            let history_id = vault_history_id(&effective_id);
+            retire_metadata(&mut prior.metadata, &effective_id, now);
             strip_history_edge_declarations(&mut prior.metadata);
-            metadata["supersedes"] = serde_json::json!(history_id);
             history = Some((history_id, hv, prior));
         }
 
         planned.push(Planned {
-            id: note.id,
+            id: effective_id,
             vector,
             metadata,
             content: note.content,
@@ -1488,10 +1501,13 @@ pub async fn import_vault_with_limits(
     let mut imported = 0;
     let mut imported_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut deferred_retry: Vec<(String, Vec<f32>, crate::traits::MemoryPayload)> = Vec::new();
-    for item in planned {
-        let cleanup_id = item.history.as_ref().map(|(id, _, _)| id.clone());
-        if let Some((history_id, history_vector, history_payload)) = item.history {
-            if let Err(e) = store
+    for mut item in planned {
+        // The staged history row's real id, known only after its write: the
+        // store may keep a raw spelling or report the canonical one. Rollback
+        // and the head's `supersedes` pointer must name what landed.
+        let mut cleanup_id = None;
+        if let Some((history_id, history_vector, history_payload)) = item.history.take() {
+            match store
                 .upsert(
                     &config.namespace,
                     &history_id,
@@ -1500,8 +1516,14 @@ pub async fn import_vault_with_limits(
                 )
                 .await
             {
-                errors.push(format!("Failed to preserve history for {}: {}", item.id, e));
-                continue;
+                Ok(hist_report) => {
+                    cleanup_id = Some(hist_report.id.clone());
+                    item.metadata["supersedes"] = serde_json::json!(hist_report.id);
+                }
+                Err(e) => {
+                    errors.push(format!("Failed to preserve history for {}: {}", item.id, e));
+                    continue;
+                }
             }
         }
 
@@ -1534,14 +1556,23 @@ pub async fn import_vault_with_limits(
         {
             Ok(report) => {
                 imported += 1;
-                imported_ids.insert(item.id.clone());
+                // The store reports the row it actually wrote: a raw spelling
+                // it kept in place, or the canonical spelling it minted. Edge
+                // reconciliation and the imported set must use that id.
+                let effective_id = report.id.clone();
+                imported_ids.insert(effective_id.clone());
                 if let Err(e) = store
-                    .reconcile_declared_edges(&config.namespace, &item.id, "RELATES_TO", &keep.ids)
+                    .reconcile_declared_edges(
+                        &config.namespace,
+                        &effective_id,
+                        "RELATES_TO",
+                        &keep.ids,
+                    )
                     .await
                 {
                     errors.push(format!(
                         "Failed to retire stale edges for {}: {}",
-                        item.id, e
+                        effective_id, e
                     ));
                 }
                 // A declarer may precede its target in id order, and an alias
@@ -1550,7 +1581,7 @@ pub async fn import_vault_with_limits(
                 // stored.
                 if !report.deferred_edges.is_empty() || keep.pending_preferred {
                     if let Some((payload, vector)) = retry {
-                        deferred_retry.push((item.id.clone(), vector, payload));
+                        deferred_retry.push((effective_id, vector, payload));
                     }
                 }
             }
@@ -1633,10 +1664,23 @@ pub async fn handle_vault_sync(
         .and_then(|v| v.as_str())
         .unwrap_or("export");
 
-    let namespace = args
-        .get("namespace")
-        .and_then(|v| v.as_str())
-        .unwrap_or("NeuroStrata");
+    // Argument syntax first: a present namespace is validated unchanged
+    // before the sync opens the store or walks the vault. An absent one keeps
+    // the documented `NeuroStrata` default.
+    let namespace = match crate::domain::optional_namespace_arg(args, "NeuroStrata") {
+        Ok(ns) => ns,
+        Err(e) => {
+            return serde_json::json!({
+                "success": false,
+                "message": e.to_string(),
+                "notes_exported": 0,
+                "topology_exported": false,
+                "canvas_path": null,
+                "errors": [],
+            })
+            .to_string();
+        }
+    };
 
     let vault_path = args
         .get("vault_path")
@@ -6632,5 +6676,161 @@ mod tests {
         assert_eq!(head.metadata["fingerprint_version"], serde_json::json!(2));
         assert!(head.metadata.get("supersedes").is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The history id is derived from the shared validator, not a hand-rolled
+    /// length budget, and a qualified head id always takes the hashed form:
+    /// whatever DR-2 refuses today (a path-bearing spelling, a qualified
+    /// prefix, or an id already near the cap) becomes content-addressed, while
+    /// a plain bare id keeps its readable prefix.
+    #[test]
+    fn vault_history_ids_stay_valid_for_every_note_shape() {
+        let long = format!("note-{}", "x".repeat(120));
+        for note_id in [
+            "src/lib.rs",
+            "file:src/lib.rs",
+            "src/Makefile",
+            long.as_str(),
+            "probe::src/lib.rs",
+            "probe::note-1",
+        ] {
+            let history = vault_history_id(note_id);
+            assert!(
+                history.starts_with('h'),
+                "{note_id:?} must hash its history id, got {history:?}"
+            );
+            assert!(
+                crate::domain::validate_id(&history).is_ok(),
+                "{note_id:?} produced an invalid history id {history:?}"
+            );
+            assert!(
+                history.len() <= crate::domain::MAX_ID_CHARS,
+                "{note_id:?} produced an overlong history id: {} chars",
+                history.len()
+            );
+            assert!(
+                history.contains(".vault-history."),
+                "{note_id:?} lost the history marker: {history}"
+            );
+            assert!(
+                !history.contains(crate::domain::NAMESPACE_SEPARATOR),
+                "{note_id:?} kept a namespace separator in a hashed history id: {history}"
+            );
+            assert_ne!(vault_history_id(note_id), history, "each call is unique");
+        }
+        assert!(
+            vault_history_id("normal-note").starts_with("normal-note.vault-history."),
+            "a plain bare id keeps its readable prefix"
+        );
+    }
+
+    /// A pre-existing row written under a differently-cased prefix must not be
+    /// forked by a reimport that addresses it through that same spelling. The
+    /// history row is keyed to the row that exists, and its `superseded_by`
+    /// names that effective id, not the caller's spelling.
+    #[tokio::test]
+    async fn reimport_of_a_case_variant_head_keeps_one_row_and_a_bound_lineage() {
+        for (seed_id, effective_id) in [
+            // A legacy row stored with a noncanonical prefix, addressed in
+            // that same spelling: the write updates the row in place.
+            ("Probe::note-1", "Probe::note-1"),
+            // A canonical row addressed through the noncanonical prefix: the
+            // write lands on the canonical row it resolved to.
+            ("probe::note-1", "probe::note-1"),
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("ns-vault-lineage-{}", uuid::Uuid::new_v4()));
+            let vault = root.join("vault");
+            std::fs::create_dir_all(&vault).expect("create vault");
+            let lb = std::sync::Arc::new(
+                crate::store::ladybug::LadybugStore::for_testing(root.join("db"), 4)
+                    .expect("temp store"),
+            );
+            let store: std::sync::Arc<dyn VectorStore> = lb.clone();
+            let ns = "probe";
+            store.init(ns).await.expect("init namespace");
+            let embedder: std::sync::Arc<dyn Embedder> = std::sync::Arc::new(TestEmbedder);
+
+            // Seed the prior head exactly as an older release left it. A
+            // noncanonical id cannot be seeded through `upsert` (which
+            // canonicalizes), so that row is created verbatim.
+            if seed_id == "Probe::note-1" {
+                let query = format!(
+                    "CREATE (:Memory {{id: '{}', namespace: '{}', content: 'old body', user_id: 'default', memory_type: 'fact', location: '', metadata: '{{\"vault_source\": true}}', embedding: [0.0, 0.0, 0.0, 0.0]}})",
+                    crate::store::ladybug::escape_ladybug_string(seed_id),
+                    crate::store::ladybug::escape_ladybug_string(ns),
+                );
+                lb.with_conn(move |conn| {
+                    conn.query(&query)?;
+                    Ok(())
+                })
+                .await
+                .expect("seed legacy prior head");
+            } else {
+                store
+                    .upsert(
+                        ns,
+                        seed_id,
+                        vec![0.0; 4],
+                        crate::traits::MemoryPayload {
+                            content: "old body".to_string(),
+                            user_id: "default".to_string(),
+                            memory_type: "fact".to_string(),
+                            agent_name: None,
+                            location: String::new(),
+                            location_lines: String::new(),
+                            metadata: serde_json::json!({"vault_source": true}),
+                        },
+                    )
+                    .await
+                    .expect("seed prior head");
+            }
+
+            let mut changed = note("Probe::note-1", &[]);
+            changed.content = "new body".to_string();
+            changed.canonical_sha256 = changed.fingerprint();
+            std::fs::write(vault.join("note-1.md"), changed.to_markdown()).expect("write note");
+
+            let result =
+                import_vault(vault_config(&root, &vault, ns), store.clone(), embedder)
+                    .await
+                    .expect("import");
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+            let (_, head) = store
+                .get(ns, effective_id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("seed {seed_id}: the effective head must exist"));
+            let twin_id = if effective_id == "probe::note-1" {
+                "Probe::note-1"
+            } else {
+                "probe::note-1"
+            };
+            assert!(
+                store.get(ns, twin_id).await.unwrap().is_none(),
+                "seed {seed_id}: reimport forked {twin_id}"
+            );
+            assert_eq!(head.content, "new body", "seed {seed_id}");
+
+            let history_id = head.metadata["supersedes"]
+                .as_str()
+                .unwrap_or_else(|| panic!("seed {seed_id}: head must cite history"));
+            assert!(
+                history_id.starts_with('h'),
+                "a qualified head hashes its history id: {history_id}"
+            );
+            let (_, history) = store
+                .get(ns, history_id)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("seed {seed_id}: history row must resolve"));
+            assert_eq!(
+                history.metadata["superseded_by"],
+                serde_json::json!(effective_id),
+                "seed {seed_id}: superseded_by must name the row that exists"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }

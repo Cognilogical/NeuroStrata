@@ -247,27 +247,53 @@ pub async fn handle_mesh_pull(
     }
 }
 
-/// Validate the caller's `namespace` argument (a string or an array of them)
-/// against DR-1 without consulting the catalog or the mesh. The supplied
-/// string is checked unchanged: it is argument syntax, so surrounding
-/// whitespace is not a spelling of a valid namespace, and an empty or blank
-/// value is refused rather than treated as "absent" (which would silently
-/// fall back to the mesh manifest). A value of any other shape is not a
-/// namespace declaration and is left to the resolver's default branch.
-fn validate_caller_namespaces(arguments: &Value) -> Result<(), String> {
-    let check = |s: &str| crate::domain::validate_namespace(s).map_err(|e| e.to_string());
-    match arguments.get("namespace") {
-        Some(Value::String(s)) => check(s),
-        Some(Value::Array(items)) => {
-            for item in items {
-                if let Some(s) = item.as_str() {
-                    check(s)?;
-                }
-            }
-            Ok(())
+/// Parse and validate a caller's `namespace` argument, shared by the mesh
+/// pull and init surfaces. Absent means "no declaration" (the caller falls
+/// back to its documented default); a present string or a non-empty array of
+/// strings is returned exactly as supplied, after every raw string passes
+/// DR-1. Any other shape -- a scalar number/object/null, an array holding a
+/// non-string, or an empty array -- is a typed `ERROR [NAMESPACE]` refusal.
+/// Validation happens before any resolution, catalog read or `git pull`.
+pub(crate) fn parse_caller_namespaces(value: Option<&Value>) -> Result<Vec<String>, String> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(Value::String(s)) => {
+            crate::domain::validate_namespace(s).map_err(|e| e.to_string())?;
+            Ok(vec![s.clone()])
         }
-        _ => Ok(()),
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return Err("ERROR [NAMESPACE]: 'namespace' must not be an empty array".to_string());
+            }
+            let mut declared = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(raw) = item.as_str() else {
+                    return Err(
+                        "ERROR [NAMESPACE]: every 'namespace' array element must be a string"
+                            .to_string(),
+                    );
+                };
+                crate::domain::validate_namespace(raw).map_err(|e| e.to_string())?;
+                declared.push(raw.to_string());
+            }
+            Ok(declared)
+        }
+        Some(other) => Err(format!(
+            "ERROR [NAMESPACE]: 'namespace' must be a string or an array of strings, got {}",
+            match other {
+                Value::Null => "null",
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                Value::Object(_) => "an object",
+                Value::String(_) | Value::Array(_) => "an invalid shape",
+            }
+        )),
     }
+}
+
+/// Validate a caller declaration without consulting the catalog.
+fn validate_caller_namespaces(arguments: &Value) -> Result<(), String> {
+    parse_caller_namespaces(arguments.get("namespace")).map(|_| ())
 }
 
 /// Which namespaces this pull serves records into: the explicit
@@ -280,27 +306,15 @@ async fn served_namespaces(
 ) -> Result<Vec<String>, String> {
     let mut served: Vec<String> = vec![];
     // `handle_mesh_pull` already refused malformed declarations before any
-    // I/O; this repeats the check so a direct caller cannot skip it. The
-    // caller's spelling is validated unchanged, so a blank or padded value
-    // never becomes a silent "serve the manifest namespaces" fallback.
-    match arguments.get("namespace") {
-        Some(Value::String(s)) => {
-            crate::domain::validate_namespace(s).map_err(|e| e.to_string())?;
-            served.push(crate::server::resolve_namespace(store, s).await);
+    // I/O; this repeats the check so a direct caller cannot skip it. One
+    // parser owns the shape rules, so a non-string element or an empty array
+    // cannot become a silent manifest fallback here.
+    if arguments.get("namespace").is_some() {
+        for declared in parse_caller_namespaces(arguments.get("namespace"))? {
+            served.push(crate::server::resolve_namespace(store, &declared).await);
         }
-        Some(Value::Array(items)) => {
-            // Check every supplied name before the first resolution: one bad
-            // element must refuse the whole declaration without consulting
-            // the catalog for its valid neighbours.
-            let declared: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
-            for s in &declared {
-                crate::domain::validate_namespace(s).map_err(|e| e.to_string())?;
-            }
-            for s in declared {
-                served.push(crate::server::resolve_namespace(store, s).await);
-            }
-        }
-        _ => served.extend(mesh.manifest().namespaces.iter().cloned()),
+    } else {
+        served.extend(mesh.manifest().namespaces.iter().cloned());
     }
     served.retain(|s| !s.is_empty());
     served.sort();
@@ -2911,15 +2925,31 @@ mod tests {
             json!([""]),
             json!(["   "]),
             json!(["probe", "bad/ns"]),
+            // A non-string element is a shape refusal, never skipped.
+            json!(["probe", 42]),
+            json!([42]),
+            json!([null]),
+            json!([{"ns": "probe"}]),
+            // An explicit empty declaration is not "no declaration".
+            json!([]),
+            // Scalars and objects are not namespace declarations.
+            json!(42),
+            json!({}),
+            Value::Null,
         ] {
             let err = validate_caller_namespaces(&json!({ "namespace": refused }))
-                .expect_err("a malformed element in a caller array must be refused");
+                .expect_err("a malformed caller declaration must be refused");
             assert!(err.starts_with("ERROR [NAMESPACE]"), "{refused}: {err}");
         }
         assert!(validate_caller_namespaces(&json!({ "namespace": "probe" })).is_ok());
         assert!(validate_caller_namespaces(&json!({ "namespace": ["probe", "other.ns"] })).is_ok());
         // No declaration at all still falls back to the mesh manifest.
         assert!(validate_caller_namespaces(&json!({})).is_ok());
+        assert_eq!(
+            parse_caller_namespaces(Some(&json!(["probe", "other.ns"]))).unwrap(),
+            vec!["probe".to_string(), "other.ns".to_string()],
+            "valid declarations are returned exactly as supplied"
+        );
     }
 
     fn mesh_id_str(mesh: &MeshStorage) -> String {

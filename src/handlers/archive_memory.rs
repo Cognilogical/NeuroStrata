@@ -141,17 +141,20 @@ pub async fn archive_memory(
         );
     }
 
-    let (vector, mut payload) = match store.get(&namespace, &id).await {
-        Ok(Some(found)) => found,
-        Ok(None) => return ArchiveOutcome::NotFound { namespace, id },
-        Err(e) => return ArchiveOutcome::Failed(format!("Failed to read memory {}: {}", id, e)),
-    };
+    let (effective_id, vector, mut payload) =
+        match crate::server::lookup_effective_row(store.as_ref(), &namespace, &id).await {
+            Ok(Some((effective, vector, payload))) => (effective, vector, payload),
+            Ok(None) => return ArchiveOutcome::NotFound { namespace, id },
+            Err(e) => {
+                return ArchiveOutcome::Failed(format!("Failed to read memory {}: {}", id, e))
+            }
+        };
     // A legacy scalar/string metadata cannot carry the tombstone without
     // discarding whatever it did hold, so it is refused rather than clobbered.
     if !payload.metadata.is_object() {
         return ArchiveOutcome::Invalid(format!(
             "Memory {} has legacy-shaped metadata (not a JSON object) and cannot be archived automatically. Re-add it with object metadata first.",
-            id
+            effective_id
         ));
     }
 
@@ -169,8 +172,11 @@ pub async fn archive_memory(
     if payload.metadata.get("facets_bitemporal").is_some() {
         crate::domain::retract_inferred_facets(&mut payload.metadata, now_ts);
     }
-    if let Err(e) = store.upsert(&namespace, &id, vector, payload).await {
-        return ArchiveOutcome::Failed(format!("Failed to archive memory {}: {}", id, e));
+    if let Err(e) = store
+        .upsert(&namespace, &effective_id, vector, payload)
+        .await
+    {
+        return ArchiveOutcome::Failed(format!("Failed to archive memory {}: {}", effective_id, e));
     }
     if std::env::var_os("NEUROSTRATA_LEARNING_DIR").is_some() {
         match crate::learning::recorder::LearningRecorder::open(
@@ -181,12 +187,12 @@ pub async fn archive_memory(
         {
             Ok(recorder) => {
                 let outcome = crate::learning::observation::LearningOutcome {
-                    outcome_id: format!("archive-{}-{}", now_ts, id),
+                    outcome_id: format!("archive-{}-{}", now_ts, effective_id),
                     occurred_at: now_ts,
                     namespace: namespace.clone(),
                     connection_id: None,
                     task_id: None,
-                    target_ids: vec![id.clone()],
+                    target_ids: vec![effective_id.clone()],
                     kind: crate::learning::observation::LearningOutcomeKind::MemoryArchived,
                 };
                 if let Err(e) = recorder.record_outcome(&outcome).await {
@@ -199,13 +205,16 @@ pub async fn archive_memory(
 
     bus.emit(
         ThalamicPulse::Archived {
-            id: id.clone(),
+            id: effective_id.clone(),
             namespace: namespace.clone(),
         },
         &RecursionToken::root(),
     );
 
-    ArchiveOutcome::Archived { namespace, id }
+    ArchiveOutcome::Archived {
+        namespace,
+        id: effective_id,
+    }
 }
 
 /// The archive handler as the MCP tool surface wants it: one sentence, either
@@ -450,6 +459,75 @@ mod tests {
             is_archived(&p),
             "the field archive_memory writes reads as archived"
         );
+    }
+
+    /// A row an older release stored under a noncanonical spelling is
+    /// archived where it lives: the write must not fork a canonical twin.
+    #[tokio::test]
+    async fn archiving_a_pre_existing_noncanonical_row_does_not_fork() {
+        use crate::traits::VectorStore;
+        let store: Arc<dyn VectorStore> = Arc::new(crate::guard::testkit::MockStore::new());
+        store
+            .upsert(
+                "probe",
+                "Probe::row-1",
+                vec![0.1, 0.2, 0.3, 0.4],
+                payload_fixture(),
+            )
+            .await
+            .unwrap();
+        let bus = Arc::new(ThalamicBus::new(8));
+
+        let outcome = archive_memory(
+            serde_json::json!({ "namespace": "probe", "id": "Probe::row-1" }),
+            store.clone(),
+            bus,
+        )
+        .await;
+        assert!(outcome.is_archived(), "{outcome:?}");
+        let (_, raw) = store
+            .get("probe", "Probe::row-1")
+            .await
+            .unwrap()
+            .expect("the raw row is the one archived");
+        assert!(is_archived(&raw));
+        assert!(
+            store.get("probe", "probe::row-1").await.unwrap().is_none(),
+            "the canonical spelling must not be created as a fork"
+        );
+    }
+
+    /// A canonical row stays archivable when the caller spells the namespace
+    /// prefix in another case; the canonical fallback finds the live row.
+    #[tokio::test]
+    async fn archiving_a_canonical_row_through_another_case_resolves_it() {
+        use crate::traits::VectorStore;
+        let store: Arc<dyn VectorStore> = Arc::new(crate::guard::testkit::MockStore::new());
+        store
+            .upsert(
+                "probe",
+                "probe::row-2",
+                vec![0.1, 0.2, 0.3, 0.4],
+                payload_fixture(),
+            )
+            .await
+            .unwrap();
+        let bus = Arc::new(ThalamicBus::new(8));
+
+        let outcome = archive_memory(
+            serde_json::json!({ "namespace": "probe", "id": "Probe::row-2" }),
+            store.clone(),
+            bus,
+        )
+        .await;
+        assert!(outcome.is_archived(), "{outcome:?}");
+        let (_, canonical) = store
+            .get("probe", "probe::row-2")
+            .await
+            .unwrap()
+            .expect("the canonical row is still readable");
+        assert!(is_archived(&canonical));
+        assert!(store.get("probe", "Probe::row-2").await.unwrap().is_none());
     }
 
     fn payload_fixture() -> MemoryPayload {
