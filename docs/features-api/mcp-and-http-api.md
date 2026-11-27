@@ -117,3 +117,7 @@ At startup the daemon refreshes the harness plugin files in its startup root and
 ## Storage Status Surfaces
 
 `storage status` has two provenance layers since #212. The path-only (no-open) surface — used by the CLI's dispatch and by callers that must not open the store — reports filesystem and store-state sidecar facts: `wal_bytes`, `wal_age_secs` (age of the active WAL, regular files only), `checkpoint_failures`, and the persisted `last_recovery { at, kind, wal_bytes }` history. The live-handle surface additionally owns `opened_via_recovery` and its kind _exclusively_: a verified live store never reports recovery because the sidecar holds a `last_recovery` entry. Identity writes (`has_data`, descriptor) and health writes (checkpoint health) are split (`write_store_state_identity` vs. the health writers), and a fresh process still reports the last real checkpoint because `record_checkpoint_outcome` persists to the sidecar (best effort, never propagated).
+
+## Verification Note — Task Session File Fields
+
+The `src/server.rs` changes carried in from the working-set GC work are test-only. They pin that claiming a task records `task_id`, `status`, and `session_id` in the session file, that ending a task clears those fields together with `subagent_prompt_injection`, and that a stale session file still restores golden rules. No MCP method name, JSON-RPC error code, or HTTP route signature changed in that range; the endpoint table above remains authoritative.

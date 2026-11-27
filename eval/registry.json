@@ -644,6 +644,46 @@
         "ignored": 0
       }
     },
+    "tauri-config-shape": {
+      "commands": [
+        "cargo test --locked --test tauri_config_shape -- --test-threads=1"
+      ],
+      "tests": [
+        "csp_is_set_and_strict",
+        "capability_has_no_file_or_root_open_patterns",
+        "daemon_connect_src_is_loopback_only",
+        "dev_csp_permits_vite_hmr_without_loosening_production_csp",
+        "vite_enables_react_refresh",
+        "open_external_delegates_to_shared_policy",
+        "ui_emits_native_editor_links",
+        "navigation_policy_guards_webview_without_widening_csp",
+        "native_editor_launch_works_without_registered_handler",
+        "port_override_doc_distinguishes_backend_requests"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
+    "tauri-url-policy": {
+      "commands": [
+        "cargo test --locked --test tauri_url_policy -- --test-threads=1"
+      ],
+      "tests": [
+        "allows_web_and_native_editor_targets",
+        "rejects_non_web_and_non_native_schemes",
+        "rejects_web_url_evasions",
+        "rejects_native_editor_path_evasions",
+        "native_editor_path_is_validated_before_use",
+        "opener_hands_allowed_web_urls_to_the_os",
+        "opener_never_hands_rejected_urls_to_the_os",
+        "native_editor_paths_are_confined_to_the_active_project",
+        "reserved_characters_in_file_paths_survive_url_encoding",
+        "navigation_policy_blocks_offsite_form_targets"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "store-write-turn": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::store_busy -- --test-threads=1"

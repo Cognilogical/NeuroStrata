@@ -1,0 +1,6 @@
+{
+  "cliHookRunner": "/tmp/opencode/wt-443/.NeuroStrata/plugins/codex/cli-hook.mjs",
+  "entry": "/tmp/opencode/wt-443/.NeuroStrata/plugins/codex/dist/index.js",
+  "id": "neurostrata-codex",
+  "namespace": "NeuroStrata"
+}

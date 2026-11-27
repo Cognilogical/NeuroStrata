@@ -8,6 +8,11 @@ use tauri::{
     Emitter,
 };
 
+// Same policy source as tests/tauri_url_policy.rs: the GUI crate cannot link
+// the root crate, so both compile this file directly.
+#[path = "../../src/tauri_url_policy.rs"]
+mod url_policy;
+
 #[derive(Serialize, Deserialize, Default)]
 struct Config {
     last_project_path: Option<String>,
@@ -18,7 +23,10 @@ fn get_config_path() -> PathBuf {
     path.push(".config");
     path.push("NeuroStrata");
     if let Err(e) = fs::create_dir_all(&path) {
-        eprintln!("Failed to create NeuroStrata config directory {}: {e}", path.display());
+        eprintln!(
+            "Failed to create NeuroStrata config directory {}: {e}",
+            path.display()
+        );
     }
     path.push("selected-project");
     path
@@ -26,7 +34,9 @@ fn get_config_path() -> PathBuf {
 
 fn load_config() -> Config {
     if let Ok(content) = fs::read_to_string(get_config_path()) {
-        Config { last_project_path: Some(content.trim().to_string()) }
+        Config {
+            last_project_path: Some(content.trim().to_string()),
+        }
     } else {
         Config::default()
     }
@@ -147,7 +157,11 @@ fn ensure_daemon() -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    if client.get(&format!("{}/health", daemon_base_url())).send().is_err() {
+    if client
+        .get(&format!("{}/health", daemon_base_url()))
+        .send()
+        .is_err()
+    {
         // Not running, spawn it
         println!("MCP Daemon not running. Starting it...");
 
@@ -225,36 +239,64 @@ fn namespace_for(project_path: &str) -> String {
 /// The result is a Result on purpose: a button that silently does nothing is
 /// indistinguishable from a missing editor, a bad path, or a broken build, and
 /// this one was mistaken for all three.
+/// Launch a validated native editor target on an ordinary installation.
+///
+/// The custom scheme is only an internal envelope; no OS handler is assumed.
+/// An operator can name a launcher command in one of two profile variables,
+/// otherwise the OS opens the file in its registered application. No editor
+/// product is hard-coded here.
+fn launch_editor(path: &str, profile: &str) -> Result<(), String> {
+    let variable = if profile == "alternate" {
+        "NEUROSTRATA_EDITOR_ALTERNATE"
+    } else {
+        "NEUROSTRATA_EDITOR_PRIMARY"
+    };
+    if let Some(command) = std::env::var(variable)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        let status = std::process::Command::new(command)
+            .arg(path)
+            .status()
+            .map_err(|e| format!("Could not launch the configured editor: {e}"))?;
+        if !status.success() {
+            return Err(format!("The configured editor exited with {status}"));
+        }
+        return Ok(());
+    }
+    open::that(path).map_err(|e| format!("Could not open '{}': {}", path, e))
+}
+
 #[tauri::command]
 fn open_external(url: String) -> Result<(), String> {
-    // Only schemes the visualizer actually emits. An unrestricted opener
-    // reachable from the webview would run whatever a memory's content asked
-    // for, and node content is not ours.
-    const ALLOWED: [&str; 4] = ["vscode://", "cursor://", "https://", "http://"];
-    if !ALLOWED.iter().any(|s| url.starts_with(s)) {
-        return Err(format!(
-            "Refusing to open '{}': only {} are allowed.",
-            url,
-            ALLOWED.join(", ")
-        ));
-    }
-
-    // The `open` crate rather than a hand-rolled Command per platform: it is
-    // what tauri-plugin-shell uses underneath, so it is already in the tree, and
-    // it knows the cases that are easy to get subtly wrong -- `start` being a
-    // cmd builtin whose first quoted argument is the window title, xdg-open
-    // versus the desktop-specific openers, quoting on each.
-    open::that(&url).map_err(|e| format!("Could not open '{}': {}", url, e))
+    // The root comes from the operator's saved project selection, never from
+    // graph content: a crafted node location cannot widen the confinement.
+    let root = load_config().last_project_path;
+    let profile = url_policy::native_editor_profile(&url).to_string();
+    let native = url.starts_with(url_policy::NATIVE_EDITOR_SCHEME);
+    url_policy::open_external_with(&url, root.as_deref(), |target| {
+        if native {
+            launch_editor(target, &profile)
+        } else {
+            // The `open` crate rather than a hand-rolled Command per platform:
+            // it is what tauri-plugin-shell uses underneath, so it is already in
+            // the tree, and it handles the cases easy to get wrong -- `start`
+            // being a cmd builtin whose first quoted argument is the window
+            // title, xdg-open versus desktop-specific openers, quoting on each.
+            open::that(target).map_err(|e| format!("Could not open '{}': {}", target, e))
+        }
+    })
 }
 
 #[tauri::command]
 fn ingest_ast(project_path: String) -> Result<String, String> {
     ensure_daemon()?;
-    
+
     let namespace = namespace_for(&project_path);
 
     let client = daemon_client(INGEST_TIMEOUT)?;
-    let resp = client.post(format!("{}/ingest", daemon_base_url()))
+    let resp = client
+        .post(format!("{}/ingest", daemon_base_url()))
         .json(&serde_json::json!({
             "dir": project_path,
             "namespace": namespace
@@ -265,37 +307,39 @@ fn ingest_ast(project_path: String) -> Result<String, String> {
     if resp.status().is_success() {
         Ok("AST ingested successfully".to_string())
     } else {
-        Err(resp.text().unwrap_or_else(|_| "Failed to ingest".to_string()))
+        Err(resp
+            .text()
+            .unwrap_or_else(|_| "Failed to ingest".to_string()))
     }
 }
 
 #[tauri::command]
 fn delete_memory(namespace: String, id: String) -> Result<String, String> {
     ensure_daemon()?;
-    
+
     let client = daemon_client(QUERY_TIMEOUT)?;
     // /delete is destructive-class on the daemon: it additionally
     // requires the operator token (Task 1, DR-5). The backend holds it
     // as a first-party same-UID client; the web-ui never sees it.
     // A missing token file is an explicit authorization failure, not a
     // silent unauthenticated request the daemon would have to refuse.
-    let operator = daemon_token_file("operator.token").ok_or_else(|| {
-        "operator.token is missing; cannot authorize delete_memory".to_string()
-    })?;
-    let request = client.post(format!("{}/delete", daemon_base_url()))
+    let operator = daemon_token_file("operator.token")
+        .ok_or_else(|| "operator.token is missing; cannot authorize delete_memory".to_string())?;
+    let request = client
+        .post(format!("{}/delete", daemon_base_url()))
         .json(&serde_json::json!({
             "namespace": namespace,
             "id": id
         }))
         .header("x-neurostrata-operator", operator);
-    let resp = request
-        .send()
-        .map_err(|e| e.to_string())?;
+    let resp = request.send().map_err(|e| e.to_string())?;
 
     if resp.status().is_success() {
         Ok("Deleted".to_string())
     } else {
-        Err(resp.text().unwrap_or_else(|_| "Failed to delete".to_string()))
+        Err(resp
+            .text()
+            .unwrap_or_else(|_| "Failed to delete".to_string()))
     }
 }
 
@@ -310,7 +354,8 @@ fn edit_memory(
     ensure_daemon()?;
 
     let client = daemon_client(QUERY_TIMEOUT)?;
-    let resp = client.post(format!("{}/edit", daemon_base_url()))
+    let resp = client
+        .post(format!("{}/edit", daemon_base_url()))
         .json(&serde_json::json!({
             "old_namespace": old_namespace,
             "id": id,
@@ -336,9 +381,10 @@ fn get_graph(project_path: Option<String>) -> Result<GraphData, String> {
     if let Some(path_str) = &project_path {
         namespace_filter = namespace_for(path_str);
     }
-    
+
     let client = daemon_client(QUERY_TIMEOUT)?;
-    let resp = client.get(format!("{}/graph", daemon_base_url()))
+    let resp = client
+        .get(format!("{}/graph", daemon_base_url()))
         .query(&[("namespace", namespace_filter)])
         .send()
         .map_err(|e| e.to_string())?;
@@ -347,12 +393,25 @@ fn get_graph(project_path: Option<String>) -> Result<GraphData, String> {
         let data: GraphData = resp.json().map_err(|e| e.to_string())?;
         Ok(data)
     } else {
-        Err(resp.text().unwrap_or_else(|_| "Failed to fetch graph".to_string()))
+        Err(resp
+            .text()
+            .unwrap_or_else(|_| "Failed to fetch graph".to_string()))
     }
 }
 
 fn main() {
     tauri::Builder::default()
+        // Form submissions and other navigations are webview-level operations:
+        // `form-action` has no `default-src` fallback, but a navigation guard
+        // blocks offsite targets without adding a sixth CSP directive. Tauri's
+        // IPC postMessage fallback keeps `invoke` working with the exact CSP.
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry, ()>::new("ns-navigation-policy")
+                .on_navigation(|_window, url| {
+                    url_policy::is_allowed_navigation(url.as_str(), cfg!(debug_assertions))
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_store::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())

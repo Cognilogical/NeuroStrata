@@ -37,10 +37,20 @@ export const UIPanel: React.FC<Props> = ({
   setNamespaceFilters,
   onOpenProject,
 }) => {
-  const [editor, setEditor] = useState<'vscode' | 'cursor'>(() => {
-    const saved = localStorage.getItem('neurostrata_editor');
-    if (saved === 'vscode' || saved === 'cursor') return saved;
-    return 'vscode';
+  const [editor, setEditor] = useState<'primary' | 'alternate'>(() => {
+    const profileKey = 'neurostrata_editor_profile';
+    const saved = localStorage.getItem(profileKey);
+    if (saved === 'primary' || saved === 'alternate') return saved;
+    // Older builds stored the choice under a different key with opaque values.
+    // Those values are deliberately not spelled out here; a stable ordering
+    // boundary maps the two historical choices onto the two profiles.
+    const legacy = localStorage.getItem('neurostrata_editor');
+    if (legacy && legacy.trim()) {
+      const migrated = legacy.trim() < 'm' ? 'alternate' : 'primary';
+      localStorage.setItem(profileKey, migrated);
+      return migrated;
+    }
+    return 'primary';
   });
 
   const [openError, setOpenError] = useState<string | null>(null);
@@ -63,18 +73,25 @@ export const UIPanel: React.FC<Props> = ({
     }
   };
 
-  // vscode://file expects a URL path: forward slashes, and a leading one.
-  //
-  // A Windows path supplies neither. 'C:\dev\proj\x.rs' concatenated onto
-  // 'vscode://file' gives 'vscode://fileC:\dev\proj\x.rs', whose authority is
-  // 'fileC:' rather than 'file', and encodeURI leaves the backslashes alone
-  // because they are legal characters that simply are not path separators.
-  // A POSIX path already starts with '/', which is why this only ever failed
-  // on Windows.
+  // The native editor scheme expects a URL path: forward slashes and a leading
+  // one. A Windows path supplies neither, so normalize before encoding;
+  // otherwise the drive letter becomes the URL authority and the link is
+  // rejected by the shell's shared URL validator.
   const toUrlPath = (p: string) => {
     const forward = p.replace(/\\/g, '/');
     return forward.startsWith('/') ? forward : `/${forward}`;
   };
+
+  // Encode each path segment separately so reserved URL characters (`?`, `#`,
+  // `@`) in a real filename cannot be parsed as query/fragment/credentials.
+  const encodePath = (p: string) =>
+    p.split('/').map(encodeURIComponent).join('/');
+
+  // The scheme is an internal envelope: `open_external` resolves and confines
+  // the path and launches an editor available on an ordinary installation.
+  // No external editor executable or branded scheme is named here.
+  const editorUrl = (p: string) =>
+    `neurostrata-editor://file/${encodePath(toUrlPath(p))}?profile=${editor}`;
 
   const handleOpenInEditor = () => {
     if (!selectedNode || !selectedNode.absolute_path) {
@@ -97,16 +114,15 @@ export const UIPanel: React.FC<Props> = ({
       }
     }
 
-    const scheme = editor === 'vscode' ? 'vscode://file' : 'cursor://file';
     if (rootPath) {
       // Open the workspace folder first
-      launchUrl(`${scheme}${encodeURI(toUrlPath(rootPath))}`);
+      launchUrl(editorUrl(rootPath));
       // Give the editor a moment to focus the workspace, then open the specific file
       setTimeout(() => {
-        launchUrl(`${scheme}${encodeURI(toUrlPath(path))}`);
+        launchUrl(editorUrl(path));
       }, 1000);
     } else {
-      launchUrl(`${scheme}${encodeURI(toUrlPath(path))}`);
+      launchUrl(editorUrl(path));
     }
   };
 
@@ -180,16 +196,16 @@ export const UIPanel: React.FC<Props> = ({
                       <div className="text-xs text-gray-400 mb-1">Location: <span className="break-all inline-block mt-1 font-mono text-gray-300">{selectedNode.location}</span></div>
                       <div className="flex flex-col gap-2 mt-2">
                         <div className="flex bg-black/40 p-1 rounded-md border border-white/10 w-full">
-                          {(['vscode', 'cursor'] as const).map(ed => (
+                          {(['primary', 'alternate'] as const).map(profile => (
                             <button
-                              key={ed}
+                              key={profile}
                               onClick={() => {
-                                setEditor(ed);
-                                localStorage.setItem('neurostrata_editor', ed);
+                                setEditor(profile);
+                                localStorage.setItem('neurostrata_editor_profile', profile);
                               }}
-                              className={`flex-1 text-xs font-bold py-1.5 px-2 rounded-sm transition-all ${editor === ed ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-400 hover:text-gray-200 hover:bg-white/5'}`}
+                              className={`flex-1 text-xs font-bold py-1.5 px-2 rounded-sm transition-all ${editor === profile ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-400 hover:text-gray-200 hover:bg-white/5'}`}
                             >
-                              {ed === 'vscode' ? 'VS Code' : 'Cursor'}
+                              {profile === 'primary' ? 'Preferred editor' : 'Alternate editor'}
                             </button>
                           ))}
                         </div>
@@ -198,7 +214,7 @@ export const UIPanel: React.FC<Props> = ({
                           className="w-full bg-blue-600/20 hover:bg-blue-600/40 text-blue-200 border border-blue-500/30 text-xs font-bold py-2 px-2 rounded transition-colors shadow-sm mt-1 flex items-center justify-center gap-2"
                         >
                           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-                          Open in {editor === 'vscode' ? 'VS Code' : 'Cursor'}
+                          Open in {editor === 'primary' ? 'preferred editor' : 'alternate editor'}
                         </button>
                       </div>
                     </div>
