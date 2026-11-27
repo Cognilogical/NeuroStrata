@@ -10035,6 +10035,47 @@ fn row_is_protected(metadata: Option<&str>) -> bool {
             .map_or(false, |value| value.eq_ignore_ascii_case("private"))
 }
 
+/// Whether a row declares that a surface other than ingestion owns it. The
+/// vault import owns its exact bare note ids (`metadata.vault_source`,
+/// PR #363), so a published generation whose logical path happens to match a
+/// note id must never archive or rebind that note. Recognition stays broad —
+/// the store-open migration still records a bare vault row's identity alias —
+/// but taking the row away from its namespace is not recognition, it is
+/// loss of the note's tenant visibility.
+fn row_is_foreign_surface(metadata: Option<&str>) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    let Ok(metadata) = serde_json::from_str::<Value>(metadata) else {
+        return false;
+    };
+    metadata
+        .get("vault_source")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether a legacy identity alias is already recorded for `canonical_id`.
+/// Publication reconciliation uses this to keep an existing bridge pointed
+/// at the generation that currently owns the path. A missing alias table
+/// means no bridge exists anywhere.
+fn legacy_alias_exists(conn: &Connection, canonical_id: &str) -> Result<bool> {
+    match conn.query(&format!(
+        "MATCH (a:LegacyIdAlias {{canonical_id: '{}'}}) RETURN a.id LIMIT 1",
+        escape_ladybug_string(canonical_id)
+    )) {
+        Ok(mut rows) => Ok(rows.next().is_some()),
+        Err(error) => {
+            let message = error.to_string().to_lowercase();
+            if message.contains("does not exist") || message.contains("not found") {
+                Ok(false)
+            } else {
+                Err(error.into())
+            }
+        }
+    }
+}
+
 /// The one namespace that unambiguously owns `bare_id`, when exactly one other
 /// row's qualified id carries the same logical path (`#408`). The candidate
 /// must actually be qualified by its own namespace; a bare row with the same
@@ -10317,6 +10358,14 @@ fn migrate_legacy_id_aliases(conn: &Connection) -> Result<usize> {
         // provenance or private eligibility remain protected — a qualified
         // re-ingest must not overwrite content this process does not own.
         if row_is_protected(metadata.as_deref()) {
+            continue;
+        }
+        // A row a foreign surface owns (a vault import note carries
+        // `metadata.vault_source`) owns its exact id outright: no alias is
+        // recorded for it, so a qualified ingest of the same path writes its
+        // own row instead of being redirected onto — and overwriting —
+        // content another surface owns.
+        if row_is_foreign_surface(metadata.as_deref()) {
             continue;
         }
         // Only a generation-scoped id (`ns::7::path`) is already a current
@@ -10888,8 +10937,8 @@ fn rebuild_memory_table_with_id_key(conn: &Connection) -> Result<()> {
     };
     let mut stored: Vec<(Option<String>, Vec<Option<String>>)> = Vec::new();
     for row in conn.query(&format!("MATCH (m:Memory) RETURN {return_list}"))? {
-        let legacy_id = source_id_position
-            .and_then(|position| migration_value_string(row.get(position)));
+        let legacy_id =
+            source_id_position.and_then(|position| migration_value_string(row.get(position)));
         let mut literals = vec![None; columns.len()];
         for (position, (_, target)) in projection.iter().enumerate() {
             literals[*target] = migration_literal(row.get(position));
@@ -11322,8 +11371,11 @@ fn clear_publication_marker(
 }
 
 /// The reconciliation half of a publication. Idempotent: re-running it after
-/// an interrupted attempt re-points the alias and clears the staging marker,
-/// and an already-archived bare row is no longer a candidate.
+/// an interrupted attempt re-points the alias, archives any bare row the
+/// interrupted pass left behind, and clears the staging marker; an
+/// already-archived bare row is no longer a candidate. An alias is recorded
+/// only for a path that superseded a genuine legacy bare row — a staged row
+/// with no bare predecessor owns its canonical identity directly.
 fn reconcile_publication(
     conn: &Connection,
     namespace: &str,
@@ -11369,8 +11421,10 @@ fn reconcile_publication(
                 }
                 let metadata = migration_value_string(row.get(1));
                 // Only a genuine legacy bare row is archived. Protected rows,
-                // scoped rows of any generation and quarantined rows stay put.
+                // scoped rows of any generation, qualified rows and rows a
+                // foreign surface (e.g. the vault import) owns stay put.
                 if row_is_protected(metadata.as_deref())
+                    || row_is_foreign_surface(metadata.as_deref())
                     || crate::parser::generation::split_scoped_id(id).is_some()
                     || crate::parser::ingest::is_qualified(namespace, id)
                 {
@@ -11379,23 +11433,40 @@ fn reconcile_publication(
                 bare_rows.push((id.clone(), metadata));
             }
         }
-        for (bare_id, raw) in bare_rows {
-            let metadata = superseded_metadata(raw.as_deref(), generation, &scoped_id);
+        // Point the legacy identity at the row that superseded it — when this
+        // publication archived the bare row that owned the path, or when an
+        // earlier publication already recorded the bridge and this generation
+        // is its new owner. The repoint happens BEFORE archiving the bare row,
+        // so an interrupted publication resumes cleanly: a crash between the
+        // statements leaves the alias already repointed and the bare row a
+        // live candidate the re-run can archive.
+        if !bare_rows.is_empty() || legacy_alias_exists(conn, &canonical_id)? {
             conn.query(&format!(
-                "MATCH (m:Memory {{id: '{}'}}) SET m.namespace = '{}', m.metadata = '{}'",
-                escape_ladybug_string(&bare_id),
-                escape_ladybug_string(QUARANTINE_NAMESPACE),
-                escape_ladybug_string(&metadata)
+                "MERGE (a:LegacyIdAlias {{canonical_id: '{}'}}) ON CREATE SET a.id = '{}', a.namespace = '{}' ON MATCH SET a.id = '{}', a.namespace = '{}'",
+                escape_ladybug_string(&canonical_id),
+                escape_ladybug_string(&scoped_id),
+                safe_ns,
+                escape_ladybug_string(&scoped_id),
+                safe_ns
             ))?;
+            for (bare_id, raw) in bare_rows {
+                let metadata = superseded_metadata(raw.as_deref(), generation, &scoped_id);
+                conn.query(&format!(
+                    "MATCH (m:Memory {{id: '{}'}}) SET m.namespace = '{}', m.metadata = '{}'",
+                    escape_ladybug_string(&bare_id),
+                    escape_ladybug_string(QUARANTINE_NAMESPACE),
+                    escape_ladybug_string(&metadata)
+                ))?;
+            }
         }
-        conn.query(&format!(
-            "MERGE (a:LegacyIdAlias {{canonical_id: '{}'}}) ON CREATE SET a.id = '{}', a.namespace = '{}' ON MATCH SET a.id = '{}', a.namespace = '{}'",
-            escape_ladybug_string(&canonical_id),
-            escape_ladybug_string(&scoped_id),
-            safe_ns,
-            escape_ladybug_string(&scoped_id),
-            safe_ns
-        ))?;
+        // A staged row whose path no legacy identity owns gets NO alias of
+        // its own. The alias is the bridge from a legacy bare row to
+        // wherever that row now lives; fabricating one for every staged path
+        // would redirect qualified reads, live-generation scoped reads, and
+        // bare-id writes onto this generation's row — deleted paths would
+        // resurrect through the previous generation, a retired stub's
+        // qualified id would find the real node, and a vault import of the
+        // same path would collide with an ingested node it does not own.
     }
     let clear_staging = format!(
         "MATCH (s:StagingGeneration) WHERE s.namespace = '{safe_ns}' AND s.source_key = '{safe_sk}' AND s.generation = {generation} DELETE s"
@@ -39352,7 +39423,10 @@ mod store_migration {
         let b = derived_legacy_id("alpha", "content", "metadata", 0);
         let other = derived_legacy_id("beta", "content", "metadata", 0);
         let next = derived_legacy_id("alpha", "content", "metadata", 1);
-        assert_eq!(a, b, "the derived id is deterministic, not scan-order based");
+        assert_eq!(
+            a, b,
+            "the derived id is deterministic, not scan-order based"
+        );
         assert_ne!(a, other, "namespace is part of the identity");
         assert_ne!(a, next, "duplicate occurrences get distinct ids");
         assert!(a.starts_with("derived-"));
@@ -39669,6 +39743,117 @@ mod store_migration {
         assert_eq!(
             bare.content, "content-src/main.rs",
             "the live bare row is untouched by the whole staged cycle"
+        );
+    }
+
+    /// A legacy identity bridge follows the generation that owns the path
+    /// now: gen 1 archives the bare row and repoints the qualified id at
+    /// itself, and a gen 2 re-ingest of the same path must repoint the
+    /// bridge again — never leave it frozen on a superseded generation.
+    #[tokio::test]
+    async fn a_superseded_legacy_id_repoints_to_each_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy.lbug");
+        seed(
+            &db,
+            &memory_ddl("id"),
+            &[&insert_row("src/main.rs", Some("alpha"), "{}")],
+        );
+
+        let store = open(&db);
+        store.init("alpha").await.expect("legacy store opens");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some("src/main.rs"),
+            "the migration records the legacy row's canonical identity"
+        );
+
+        let first = store.begin_generation("alpha", "docs").await.unwrap();
+        let first_id = crate::parser::ingest::generation_scoped_id("alpha", first, "src/main.rs");
+        store
+            .upsert("alpha", &first_id, vec![0.0; DIMS], row_payload("gen one"))
+            .await
+            .expect("stage gen 1");
+        store
+            .publish_generation("alpha", "docs", first)
+            .await
+            .expect("publish gen 1");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some(first_id.as_str()),
+            "the bridge follows the generation that archived the bare row"
+        );
+        let (_, via_alias) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("qualified read")
+            .expect("gen 1 row found through the bridge");
+        assert_eq!(via_alias.content, "gen one");
+
+        let second = store.begin_generation("alpha", "docs").await.unwrap();
+        let second_id = crate::parser::ingest::generation_scoped_id("alpha", second, "src/main.rs");
+        store
+            .upsert("alpha", &second_id, vec![0.0; DIMS], row_payload("gen two"))
+            .await
+            .expect("stage gen 2");
+        store
+            .publish_generation("alpha", "docs", second)
+            .await
+            .expect("publish gen 2");
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await.as_deref(),
+            Some(second_id.as_str()),
+            "each new generation repoints the legacy bridge at its own row"
+        );
+        let (_, via_alias) = store
+            .get("alpha", "alpha::src/main.rs")
+            .await
+            .expect("qualified read")
+            .expect("gen 2 row found through the bridge");
+        assert_eq!(via_alias.content, "gen two");
+    }
+
+    /// A publication in a store no legacy bare row ever touched must not
+    /// fabricate an identity bridge: the staged row's own scoped id is the
+    /// identity, and a path-level alias would redirect live-generation reads
+    /// and foreign-surface writes onto it.
+    #[tokio::test]
+    async fn a_modern_publication_records_no_alias_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fresh.lbug");
+        seed(&db, &memory_ddl("id"), &[]);
+
+        let store = open(&db);
+        store.init("alpha").await.expect("store opens");
+        let generation = store.begin_generation("alpha", "docs").await.unwrap();
+        let staged_id =
+            crate::parser::ingest::generation_scoped_id("alpha", generation, "src/main.rs");
+        store
+            .upsert(
+                "alpha",
+                &staged_id,
+                vec![0.0; DIMS],
+                row_payload("fresh write"),
+            )
+            .await
+            .expect("stage the row");
+        store
+            .publish_generation("alpha", "docs", generation)
+            .await
+            .expect("publish");
+
+        assert_eq!(
+            alias_target(&store, "alpha::src/main.rs").await,
+            None,
+            "no legacy bare row existed, so no bridge is fabricated for the path"
+        );
+        assert!(
+            store
+                .get("alpha", &staged_id)
+                .await
+                .expect("staged lookup")
+                .is_some(),
+            "the row keeps its own generation-scoped identity"
         );
     }
 

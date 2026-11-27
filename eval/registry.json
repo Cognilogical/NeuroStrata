@@ -220,6 +220,8 @@
         "store::ladybug::store_migration::a_transient_alias_load_failure_is_retried_on_the_next_upsert",
         "store::ladybug::store_migration::a_scoped_counterpart_suppresses_the_legacy_alias",
         "store::ladybug::store_migration::a_bare_id_matching_two_namespaces_is_quarantined",
+        "store::ladybug::store_migration::a_superseded_legacy_id_repoints_to_each_new_generation",
+        "store::ladybug::store_migration::a_modern_publication_records_no_alias_of_its_own",
         "store::ladybug::store_migration::a_legacy_primary_key_rebuild_preserves_non_memory_relationships",
         "store::ladybug::store_migration::a_legacy_primary_key_rebuild_preserves_mixed_memory_relationships"
       ],
