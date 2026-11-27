@@ -2078,10 +2078,20 @@ pub async fn ingest_directory(
     // pointer live with its declared edges missing. Complete that relink
     // before this ingest stages new rows; stores without a pending marker
     // return 0. Warn-first: a recovery failure must not strand later ingests.
+    let mut recovery_failed = false;
     if let Err(e) = vector_store
         .recover_pending_relink(namespace, &source_key)
         .await
     {
+        if e.to_string().contains("lease provenance") {
+            // A lookalike owner shares the derived pointer key but not the
+            // lease. Staging here would later overwrite the real owner's
+            // pointer and generation state: refuse before any staging.
+            return Err(anyhow::anyhow!(
+                "refusing to ingest namespace '{namespace}' source '{source_key}': {e}"
+            ));
+        }
+        recovery_failed = true;
         tracing::warn!(
             "could not finish a relink left pending by a crash in namespace '{namespace}': {e}"
         );
@@ -2714,24 +2724,22 @@ pub async fn ingest_directory(
         .await;
     }
 
-    // Capture the rollback target before publication flips the pointer. If
-    // `relink_edges` then fails, the freshly published generation has no rule
-    // edges and must not stay live: the previous generation is restored.
+    // Publish with one compare-and-flip. The generation this pointer actually
+    // held is returned by the same write turn that flips it, so a stale
+    // publisher cannot overwrite a newer tree and the rollback target is the
+    // generation this publication displaced, not one read earlier.
     //
-    // `None` covers both a first ingest and an unchanged ingest, which differ
-    // after a relink failure: an unchanged ingest never moves the pointer (its
-    // staging generation was already discarded), while a first ingest
-    // published generation 1 and has no earlier generation to restore.
-    let previous_generation = if unchanged {
+    // `None` covers an unchanged ingest (no pointer move) and a first publish
+    // (the displaced generation is 0): neither has a prior tree to restore.
+    let displaced_generation = if unchanged {
         None
     } else {
-        match vector_store.active_generation(namespace, &source_key).await {
-            Ok(previous) if previous > 0 => Some(previous),
-            Ok(_) => None,
+        let expected = match vector_store.active_generation(namespace, &source_key).await {
+            Ok(active) => active,
             Err(e) => {
-                // Without the target there is nothing safe to roll back to,
-                // so publishing would be an unrecoverable risk. Clean up the
-                // staging generation exactly like a publish failure.
+                // Without an expected value there is no safe compare: refuse
+                // before touching the pointer, and clean up staging exactly
+                // like a publish failure.
                 if let Err(abort) = vector_store
                     .abort_generation(namespace, &source_key, generation)
                     .await
@@ -2763,36 +2771,49 @@ pub async fn ingest_directory(
                     e
                 ));
             }
-        }
-    };
-
-    // Atomically flip the active pointer onto this generation. Only now are its
-    // nodes reachable; the previous generation remains as history.
-    if let Err(e) = if unchanged {
-        Ok(())
-    } else {
-        vector_store
-            .publish_generation(namespace, &source_key, generation)
-            .await
-    } {
-        // Publication failed: abort the staged generation so its rows do not
-        // leak as orphaned staging (same cleanup as the failure branch above).
-        if let Err(abort) = vector_store
-            .abort_generation(namespace, &source_key, generation)
+        };
+        match vector_store
+            .publish_generation_cas(namespace, &source_key, expected, generation, true)
             .await
         {
-            eprintln!(
-                "Failed to abort staging generation {} of namespace {}: {}",
-                generation, namespace, abort
-            );
+            Ok(Some(displaced)) => Some(displaced),
+            Ok(None) => {
+                // A newer ingest published first. Our staged snapshot is
+                // stale: abort it and leave the newer tree live.
+                if let Err(abort) = vector_store
+                    .abort_generation(namespace, &source_key, generation)
+                    .await
+                {
+                    eprintln!(
+                        "Failed to abort staging generation {} of namespace {}: {}",
+                        generation, namespace, abort
+                    );
+                }
+                return Err(anyhow::anyhow!(
+                    "stored the nodes of namespace {} but generation {} is stale: a newer generation published first, so the staged nodes were discarded and the newer tree left active",
+                    namespace,
+                    generation
+                ));
+            }
+            Err(e) => {
+                if let Err(abort) = vector_store
+                    .abort_generation(namespace, &source_key, generation)
+                    .await
+                {
+                    eprintln!(
+                        "Failed to abort staging generation {} of namespace {}: {}",
+                        generation, namespace, abort
+                    );
+                }
+                return Err(anyhow::anyhow!(
+                    "stored the nodes of namespace {} but could not make generation {} active: {}",
+                    namespace,
+                    generation,
+                    e
+                ));
+            }
         }
-        return Err(anyhow::anyhow!(
-            "stored the nodes of namespace {} but could not make generation {} active: {}",
-            namespace,
-            generation,
-            e
-        ));
-    }
+    };
 
     // A rule is not rewritten just because its file came back, so replay what
     // the memories still declare now that the nodes they point at are the
@@ -2825,23 +2846,58 @@ pub async fn ingest_directory(
                     relink_error
                 ));
             }
-            match previous_generation {
-                Some(previous_generation) => {
+            // A relink whose write timed out may still commit in its blocking
+            // worker. When it did, the edges it wrote belong to the generation
+            // we are about to abandon, so the restored generation must be
+            // relinked before rollback can be reported complete.
+            let relink_committed = vector_store
+                .relink_committed_for(namespace, &source_key, generation)
+                .await
+                .unwrap_or(false);
+            match displaced_generation {
+                Some(displaced) if displaced > 0 => {
                     // Restore only while this ingest's published generation is
-                    // still active. A later ingest may have published over it;
-                    // its tree is the truth and a stale rollback target must
-                    // never replace it.
+                    // still active and only to the generation this publication
+                    // actually displaced. Keep its pending marker when an
+                    // earlier recovery failed, so a later ingest retries the
+                    // relink the crashed process could not finish.
                     match vector_store
-                        .publish_generation_if_active(
+                        .publish_generation_cas(
                             namespace,
                             &source_key,
                             generation,
-                            previous_generation,
+                            displaced,
+                            recovery_failed,
                         )
                         .await
                     {
-                        Ok(true) => {
-                            // The pointer is back on the previous generation,
+                        Ok(Some(_)) => {
+                            let mut relink_note = String::new();
+                            if relink_committed {
+                                match vector_store.relink_edges(namespace, &source_key).await {
+                                    Ok(_) => {
+                                        relink_note =
+                                            format!("; relinked restored generation {displaced}")
+                                    }
+                                    Err(e) => {
+                                        // The restored generation still needs
+                                        // recovery: leave a matching marker on it.
+                                        let _ = vector_store
+                                            .publish_generation_cas(
+                                                namespace,
+                                                &source_key,
+                                                displaced,
+                                                displaced,
+                                                true,
+                                            )
+                                            .await;
+                                        relink_note = format!(
+                                            "; could not relink restored generation {displaced}: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            // The pointer is back on the displaced generation,
                             // so this abort only deletes the failed rows.
                             let abort = vector_store
                                 .abort_generation(namespace, &source_key, generation)
@@ -2851,21 +2907,22 @@ pub async fn ingest_directory(
                                 Err(e) => format!("could not abort generation {generation}: {e}"),
                             };
                             return Err(anyhow::anyhow!(
-                                "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; rollback restored generation {}; {}; relink error: {}",
+                                "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; rollback restored generation {}; {}{}; relink error: {}",
                                 namespace,
-                                previous_generation,
+                                displaced,
                                 abort_note,
+                                relink_note,
                                 relink_error
                             ));
                         }
-                        Ok(false) => {
+                        Ok(None) => {
                             // Another ingest owns the pointer now. Aborting
                             // would clear a generation that is not ours, so
                             // leave both the pointer and its tree intact.
                             return Err(anyhow::anyhow!(
                                 "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; a newer generation is active so stale rollback target {} was left untouched and generation {} was not aborted; relink error: {}",
                                 namespace,
-                                previous_generation,
+                                displaced,
                                 generation,
                                 relink_error
                             ));
@@ -2877,7 +2934,7 @@ pub async fn ingest_directory(
                             return Err(anyhow::anyhow!(
                                 "stored the nodes of namespace {} but could not relink the edges its memories declare, so rules do not reach their code; could not restore generation {}: {}; generation {} was not aborted so its active pointer stays intact; relink error: {}",
                                 namespace,
-                                previous_generation,
+                                displaced,
                                 restore_error,
                                 generation,
                                 relink_error
@@ -2885,7 +2942,7 @@ pub async fn ingest_directory(
                         }
                     }
                 }
-                None => {
+                _ => {
                     // No prior generation (a first ingest, or a namespace an
                     // earlier failed first ingest emptied): there is nothing
                     // to restore. Abort the generation just published, which
@@ -3284,8 +3341,9 @@ mod tests {
         std::fs::write(tmp.join("planted.rs"), "fn planted() {}").expect("write planted file");
 
         let db = std::env::temp_dir().join(format!("ns-reserved-db-{}", uuid::Uuid::new_v4()));
-        let store: Arc<dyn VectorStore> =
+        let concrete =
             Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        let store: Arc<dyn VectorStore> = concrete.clone();
         let reserved = "__neurostrata_ingest_stage__probe";
         store.init(reserved).await.expect("create the schema");
 
@@ -3342,7 +3400,15 @@ mod tests {
                 .await
                 .expect("read"),
             0,
-            "refusal happens before a staging generation begins"
+            "refusal leaves the active pointer untouched"
+        );
+        assert!(
+            concrete
+                .staging_generations_for_test(reserved)
+                .await
+                .expect("read staging rows")
+                .is_empty(),
+            "refusal happens before any generation is allocated: begin_generation could stage without moving the active pointer"
         );
         assert!(
             store
@@ -5785,6 +5851,19 @@ use super::x;"#;
                 .await
         }
 
+        async fn publish_generation_cas(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            expected: u64,
+            target: u64,
+            pending: bool,
+        ) -> anyhow::Result<Option<u64>> {
+            self.inner
+                .publish_generation_cas(namespace, source_key, expected, target, pending)
+                .await
+        }
+
         async fn abort_generation(
             &self,
             namespace: &str,
@@ -5984,6 +6063,19 @@ use super::x;"#;
                 .await
         }
 
+        async fn publish_generation_cas(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            expected: u64,
+            target: u64,
+            pending: bool,
+        ) -> anyhow::Result<Option<u64>> {
+            self.inner
+                .publish_generation_cas(namespace, source_key, expected, target, pending)
+                .await
+        }
+
         async fn abort_generation(
             &self,
             namespace: &str,
@@ -6164,6 +6256,22 @@ use super::x;"#;
             }
             self.inner
                 .publish_generation(namespace, source_key, generation)
+                .await
+        }
+
+        async fn publish_generation_cas(
+            &self,
+            namespace: &str,
+            source_key: &str,
+            expected: u64,
+            target: u64,
+            pending: bool,
+        ) -> anyhow::Result<Option<u64>> {
+            if target == 1 && self.fail_restore.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("injected rollback restore failure (test double)");
+            }
+            self.inner
+                .publish_generation_cas(namespace, source_key, expected, target, pending)
                 .await
         }
 

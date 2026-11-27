@@ -606,7 +606,10 @@ pub trait VectorStore: Send + Sync + AsAny {
 
     /// Atomically make `generation` the active generation for `namespace` and
     /// `source_key`. The previous active generation's nodes remain as history,
-    /// unreachable through edge resolution.
+    /// unreachable through edge resolution. Ingest publication goes through
+    /// `publish_generation_cas` now; this unconditional form remains part of
+    /// the store API for fixtures and direct callers.
+    #[allow(dead_code)]
     async fn publish_generation(
         &self,
         _namespace: &str,
@@ -619,25 +622,40 @@ pub trait VectorStore: Send + Sync + AsAny {
         Ok(())
     }
 
-    /// Flip the active pointer to `target` only while it still names `expected`.
-    /// A store without compare-and-swap reads then publishes; stores with a
-    /// single-writer turn override this so check and flip are one atomic write.
-    /// `false` means another publish landed first and the caller must not touch
-    /// the newer pointer.
-    async fn publish_generation_if_active(
+    /// Atomically flip the active pointer to `target` only while it still
+    /// names `expected`. Return the generation actually displaced on success
+    /// (`None` when a newer publication landed first, so the caller must not
+    /// touch the newer pointer). The check and the flip must occupy one write
+    /// turn: a check-then-publish default can overwrite a concurrent publish
+    /// and is deliberately absent. `pending` selects the relink marker on the
+    /// resulting pointer — set for `target` on a fresh publication or a
+    /// rollback that must be retried, cleared on a normal rollback.
+    async fn publish_generation_cas(
         &self,
         namespace: &str,
         source_key: &str,
-        expected: u64,
-        target: u64,
+        _expected: u64,
+        _target: u64,
+        _pending: bool,
+    ) -> Result<Option<u64>> {
+        anyhow::bail!(
+            "VectorStore must implement atomic conditional publication for '{namespace}:{source_key}'"
+        )
+    }
+
+    /// Whether a relink for `generation` committed: the pointer's pending
+    /// marker is clear and its recorded lease belongs to that generation.
+    /// A relink that timed out may still commit in its blocking worker, so
+    /// callers use this after a timeout rather than assuming the rollback
+    /// left the restored generation relinked. Stores without a lease marker
+    /// answer `false`.
+    async fn relink_committed_for(
+        &self,
+        _namespace: &str,
+        _source_key: &str,
+        _generation: u64,
     ) -> Result<bool> {
-        if self.active_generation(namespace, source_key).await? == expected {
-            self.publish_generation(namespace, source_key, target)
-                .await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(false)
     }
 
     /// Finish a relink left pending by a process crash between publication and

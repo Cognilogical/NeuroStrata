@@ -10060,6 +10060,16 @@ async fn run() -> anyhow::Result<()> {
                     }
                     return Ok(());
                 }
+                // Refuse a reserved ingest destination before the store is
+                // opened. On a fresh configured path the open itself creates
+                // the database, so a command that must be rejected would
+                // otherwise leave a store behind for the operator to clean up.
+                match &other {
+                    Commands::IngestScip { namespace, .. } | Commands::Ingest { namespace, .. } => {
+                        reject_reserved_ingest_destination(namespace)?;
+                    }
+                    _ => {}
+                }
                 let concrete_store: Arc<LadybugStore> = match LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
                     embed::configured_dimensions()?,

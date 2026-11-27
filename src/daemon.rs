@@ -1528,7 +1528,6 @@ async fn handle_ingest_scip(
     State(state): State<AppState>,
     Json(req): Json<IngestScipReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    let scip_file = caller_path_refusal(&state, &req.scip_path)?;
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
     if crate::traits::is_reserved_ingest_destination(&namespace) {
         return Err((
@@ -1539,6 +1538,9 @@ async fn handle_ingest_scip(
             ),
         ));
     }
+    // Path validation canonicalizes the supplied file and can fail on its own;
+    // a reserved destination must be refused before probing the caller's path.
+    let scip_file = caller_path_refusal(&state, &req.scip_path)?;
     let report =
         crate::parser::scip::ingest_scip_index(state.vector_store.clone(), &namespace, &scip_file)
             .await

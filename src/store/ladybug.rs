@@ -1720,6 +1720,18 @@ enum CachedStoreState {
 /// sidecar cache. A file that does not exist yet is anchored through its
 /// nearest existing ancestor.
 fn db_alias_key(path: &std::path::Path) -> PathBuf {
+    // A bare relative path, `./db` and the absolute form name one file. Anchor
+    // relative spellings at the current directory before canonicalizing their
+    // existing ancestors, so they cannot get separate writer locks or sidecars.
+    let anchored;
+    let path = if path.is_relative() {
+        anchored = std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf());
+        anchored.as_path()
+    } else {
+        path
+    };
     if let Ok(canonical) = dunce::canonicalize(path) {
         return canonical;
     }
@@ -4620,9 +4632,10 @@ impl FirstWriteFlip {
         match self.cached_store_state() {
             CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
                 recorded.has_data = true;
-                if let Err(e) =
-                    crate::model_choice::write_store_state_identity(&self.local_path, &recorded)
-                {
+                if let Err(e) = crate::model_choice::write_store_state_identity(
+                    &db_alias_key(&self.local_path),
+                    &recorded,
+                ) {
                     tracing::error!(
                         "store-state sidecar flip failed after a successful write; the store has data but its sidecar still reads pristine: {e}"
                     );
@@ -4648,9 +4661,10 @@ impl FirstWriteFlip {
                 };
                 if let Some(descriptor) = descriptor {
                     let state = crate::model_choice::StoreState::new(true, descriptor);
-                    if let Err(e) =
-                        crate::model_choice::write_store_state_identity(&self.local_path, &state)
-                    {
+                    if let Err(e) = crate::model_choice::write_store_state_identity(
+                        &db_alias_key(&self.local_path),
+                        &state,
+                    ) {
                         tracing::error!(
                             "store-state sidecar flip failed after a successful write; the store has data but no sidecar records it: {e}"
                         );
@@ -4794,7 +4808,10 @@ impl LockedUnknownStamp {
             return;
         }
         let state = crate::model_choice::StoreState::new(false, serving.clone());
-        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
+        match crate::model_choice::write_store_state_identity(
+            &db_alias_key(&self.local_path),
+            &state,
+        ) {
             Ok(()) => self.set_cached_store_state(CachedStoreState::Recorded(state)),
             Err(e) => {
                 tracing::warn!("store-state sidecar write failed: {e}")
@@ -4854,7 +4871,10 @@ impl LockedUnknownMigration {
             return Ok(false);
         }
         let state = crate::model_choice::StoreState::new(true, self.serving.clone());
-        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
+        match crate::model_choice::write_store_state_identity(
+            &db_alias_key(&self.local_path),
+            &state,
+        ) {
             Ok(()) => {
                 let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
                 *cache = Some(CachedStoreState::Recorded(state));
@@ -5244,7 +5264,7 @@ impl LadybugStore {
                     if serving != recorded.descriptor && self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
                         match crate::model_choice::write_store_state_identity(
-                            &self.local_path,
+                            &db_alias_key(&self.local_path),
                             &state,
                         ) {
                             Ok(()) => {
@@ -5262,7 +5282,7 @@ impl LadybugStore {
                     if self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
                         match crate::model_choice::write_store_state_identity(
-                            &self.local_path,
+                            &db_alias_key(&self.local_path),
                             &state,
                         ) {
                             Ok(()) => {
@@ -10246,7 +10266,7 @@ impl LadybugStore {
             }
         }
 
-        let sidecar = crate::model_choice::store_state_path(source);
+        let sidecar = crate::model_choice::store_state_path(&db_alias_key(source));
         let dest_sidecar = dir.join("ladybug.store.store-state.json");
         if sidecar.exists() {
             std::fs::copy(&sidecar, &dest_sidecar).map_err(|e| {
@@ -10301,6 +10321,34 @@ impl LadybugStore {
             }
         }
         Ok(())
+    }
+    /// Clear a relink pending marker only while the pointer still names
+    /// `generation` and carries that generation's provenance. An empty tree
+    /// has nothing to replay but is still a completed relink.
+    async fn clear_pending_relink_if_active(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        generation: u64,
+    ) -> Result<()> {
+        let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+            namespace, source_key,
+        ));
+        let lease = escape_ladybug_string(&crate::parser::generation::stage_lease_id(
+            namespace, source_key, generation,
+        ));
+        let safe_ns = escape_ladybug_string(namespace);
+        let safe_sk = escape_ladybug_string(source_key);
+        self.write_with_deadline("clearing a no-work relink marker", move |conn| {
+            // Legacy rows predate leases: their owner columns are the only
+            // provenance available, so they still get a guarded clear.
+            let clear = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' AND g.active_generation = {generation} AND (g.stage_lease_id = '{lease}' OR (g.stage_lease_id = '' AND g.namespace = '{safe_ns}' AND g.source_key = '{safe_sk}')) SET g.relink_pending = false"
+            );
+            conn.query(&clear)?;
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -12547,6 +12595,12 @@ impl VectorStore for LadybugStore {
             && mention_pairs.is_empty()
             && mention_updates.is_empty()
         {
+            // No work is still a successful relink: the pending marker must be
+            // cleared so a later ingest does not replay recovery for this
+            // generation forever. Use the same active-generation and lease
+            // guard as the normal completion path.
+            self.clear_pending_relink_if_active(namespace, source_key, active_gen)
+                .await?;
             return Ok(0);
         }
 
@@ -12559,11 +12613,34 @@ impl VectorStore for LadybugStore {
 
         let namespace_owned = namespace.to_string();
         let source_key_owned = source_key.to_string();
+        let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+            namespace, source_key,
+        ));
+        let lease = escape_ladybug_string(&crate::parser::generation::stage_lease_id(
+            namespace, source_key, active_gen,
+        ));
         self.write_with_deadline("relinking the graph", move |conn| {
             // One transaction: a later statement failing must not leave an
             // earlier mentions rewrite, stub retirement or edge replay
             // committed against a pointer the caller is about to roll back.
             conn.query("BEGIN TRANSACTION")?;
+            // Re-check inside the write turn. The plan was built from an
+            // active-generation snapshot taken before this turn; a newer
+            // publication may have landed in between, and applying the stale
+            // plan (or clearing its pending marker) would strand the newer
+            // tree with missing edges.
+            let active_read = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.active_generation"
+            );
+            let current = conn
+                .query(&active_read)?
+                .next()
+                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64)
+                .unwrap_or(0);
+            if current != active_gen {
+                let _ = conn.query("ROLLBACK");
+                return Ok(0);
+            }
             let inner: Result<usize> = (|| {
             // Update only mentions metadata rows that actually changed, batched
             // via UNWIND to avoid a separate write transaction per memory.
@@ -12593,9 +12670,9 @@ impl VectorStore for LadybugStore {
                             escape_ladybug_string(id),
                             escape_ladybug_string(meta)
                         );
-                        if let Err(row_err) = conn.query(&q) {
-                            tracing::warn!("relink: mentions metadata write failed for {id}: {row_err}");
-                        }
+                        conn.query(&q).map_err(|e| {
+                            anyhow::anyhow!("relink: mentions metadata write failed for {id}: {e}")
+                        })?;
                     }
                 }
             }
@@ -12646,21 +12723,21 @@ impl VectorStore for LadybugStore {
                 "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) WHERE a.namespace = '{}' AND r.extractor = 'mention-detector' RETURN a.id, b.id",
                 escape_ladybug_string(&namespace_owned)
             );
-            let has_stale_mention_edges = match conn.query(&existing_mention_q) {
-                Ok(rows) => rows.into_iter().any(|row| {
+            let has_stale_mention_edges = conn
+                .query(&existing_mention_q)?
+                .into_iter()
+                .any(|row| {
                     let pair = (format!("{}", row[0]), format!("{}", row[1]));
                     !wanted_mention_set.contains(&pair)
-                }),
-                Err(_) => true,
-            };
+                });
             if has_stale_mention_edges {
                 let del_q = format!(
                     "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) WHERE a.namespace = '{}' AND r.extractor = 'mention-detector' DELETE r",
                     escape_ladybug_string(&namespace_owned)
                 );
-                if let Err(e) = conn.query(&del_q) {
-                    tracing::warn!("relink: mention-detector edge cleanup failed: {e}");
-                }
+                conn.query(&del_q).map_err(|e| {
+                    anyhow::anyhow!("relink: mention-detector edge cleanup failed: {e}")
+                })?;
             }
             if !mention_pairs.is_empty() {
                 created += create_missing_edges(
@@ -12680,20 +12757,19 @@ impl VectorStore for LadybugStore {
             })();
             match inner {
                 Ok(created) => {
-                    // Recovery marker: the pointer is now live with its edges.
-                    // A failed marker clear only causes a redundant relink on
-                    // the next ingest, never a wrong acceptance (the graph is
-                    // already correct), so it is warn-first.
+                    // Clear only the marker this relink completed, and only
+                    // while the pointer still names its generation. Another
+                    // publication must keep its own pending recovery. A failed
+                    // clear rolls the transaction back so the caller can retry
+                    // rather than reporting a complete graph with a stale marker.
                     let clear = format!(
-                        "MATCH (g:IngestGeneration) WHERE g.id = '{}' SET g.relink_pending = false",
-                        escape_ladybug_string(&crate::parser::ingest::generation_key(
-                            &namespace_owned,
-                            &source_key_owned
-                        ))
+                        "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' AND g.active_generation = {active_gen} AND (g.stage_lease_id = '{lease}' OR (g.stage_lease_id = '' AND g.namespace = '{}' AND g.source_key = '{}')) SET g.relink_pending = false",
+                        escape_ladybug_string(&namespace_owned),
+                        escape_ladybug_string(&source_key_owned)
                     );
-                    if let Err(e) = conn.query(&clear) {
-                        tracing::warn!("relink: could not clear the pending marker: {e}");
-                    }
+                    conn.query(&clear).map_err(|e| {
+                        anyhow::anyhow!("relink: could not clear the pending marker: {e}")
+                    })?;
                     conn.query("COMMIT")?;
                     Ok(created)
                 }
@@ -12874,13 +12950,14 @@ impl VectorStore for LadybugStore {
         Ok(())
     }
 
-    async fn publish_generation_if_active(
+    async fn publish_generation_cas(
         &self,
         namespace: &str,
         source_key: &str,
         expected: u64,
         target: u64,
-    ) -> Result<bool> {
+        pending: bool,
+    ) -> Result<Option<u64>> {
         let namespace = namespace.to_string();
         let source_key = source_key.to_string();
         let refresh_ns = namespace.clone();
@@ -12888,8 +12965,17 @@ impl VectorStore for LadybugStore {
             &namespace,
             &source_key,
         ));
-        let flipped = self
-            .write_with_deadline("conditionally restoring a generation", move |conn| {
+        let lease = if pending {
+            escape_ladybug_string(&crate::parser::generation::stage_lease_id(
+                &namespace,
+                &source_key,
+                target,
+            ))
+        } else {
+            String::new()
+        };
+        let displaced = self
+            .write_with_deadline("conditionally publishing a generation", move |conn| {
                 let read = format!(
                     "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.active_generation"
                 );
@@ -12900,22 +12986,67 @@ impl VectorStore for LadybugStore {
                     .unwrap_or(0);
                 if active != expected {
                     // A newer ingest published over ours. Its tree stays live:
-                    // a stale rollback target must never replace it.
-                    return Ok(false);
+                    // neither a stale publication nor a stale rollback target
+                    // may replace it. The displaced generation is taken from
+                    // this same read, so rollback never targets a value captured
+                    // before an intervening publication.
+                    return Ok(None);
                 }
-                // Compare and flip in one statement inside the writer turn, so
-                // no other publication can land between the check and the write.
+                let safe_ns = escape_ladybug_string(&namespace);
+                let safe_sk = escape_ladybug_string(&source_key);
+                let state = format!(
+                    "g.active_generation = {target}, g.previous_generation = {active}, g.relink_pending = {pending}, g.stage_lease_id = '{lease}'"
+                );
+                // MERGE covers a first publish where the pointer row does not
+                // exist yet; the read above proved no newer publication landed
+                // and the single-writer turn holds until both statements finish.
                 let write = format!(
-                    "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' AND g.active_generation = {expected} SET g.active_generation = {target}, g.previous_generation = {expected}, g.relink_pending = false"
+                    "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, {state} ON MATCH SET {state}"
                 );
                 conn.query(&write)?;
-                Ok(true)
+                // Publishing consumes this source's staging marker for the
+                // target generation. Leaving it behind makes retention treat
+                // a live generation as abandoned and refuse to prune it.
+                let clear_staging = format!(
+                    "MATCH (s:StagingGeneration) WHERE s.namespace = '{safe_ns}' AND s.source_key = '{safe_sk}' AND s.generation = {target} DELETE s"
+                );
+                conn.query(&clear_staging)?;
+                Ok(Some(active))
             })
             .await?;
-        if flipped {
+        if displaced.is_some() {
             self.refresh_lexical_after_pointer_change(&refresh_ns).await;
         }
-        Ok(flipped)
+        Ok(displaced)
+    }
+
+    async fn relink_committed_for(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        generation: u64,
+    ) -> Result<bool> {
+        let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+            namespace, source_key,
+        ));
+        let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
+        self.with_conn(move |conn| {
+            let read = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.relink_pending, g.stage_lease_id"
+            );
+            let Some(row) = conn.query(&read)?.next() else {
+                return Ok(false);
+            };
+            if format!("{}", row[0]).eq_ignore_ascii_case("true") {
+                return Ok(false);
+            }
+            let expected = crate::parser::generation::stage_lease_id(
+                &namespace, &source_key, generation,
+            );
+            Ok(format!("{}", row[1]) == expected)
+        })
+        .await
     }
 
     async fn recover_pending_relink(&self, namespace: &str, source_key: &str) -> Result<usize> {
@@ -32785,23 +32916,48 @@ eurostrata\src\daemon.rs",
         let root = std::env::temp_dir().join(format!("ns-db-alias-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let database = root.join("database.store");
-        let alias = root.join("database-alias.store");
-        std::fs::write(&database, b"fixture").unwrap();
-        std::os::unix::fs::symlink(&database, &alias).unwrap();
-
-        assert_eq!(db_alias_key(&database), db_alias_key(&alias));
-        let canonical = db_alias_state(&database);
-        let through_alias = db_alias_state(&alias);
+        // Open a real store through the canonical spelling first. The engine
+        // refuses two live handles on one file in this process, so the alias
+        // handle is opened only after this one is dropped.
+        let first = LadybugStore::for_testing(&database, 4).unwrap();
+        let shared = db_alias_state(&database);
         assert!(
-            Arc::ptr_eq(&canonical, &through_alias),
-            "two spellings of one database must share one writer and one sidecar cache"
+            Arc::ptr_eq(&first.write_lock, &shared.write_lock),
+            "the constructor must assign the shared writer to each handle"
         );
+        assert!(
+            Arc::ptr_eq(&first.store_state, &shared.store_state),
+            "the constructor must assign the shared sidecar cache to each handle"
+        );
+        drop(first);
+
+        let alias = root.join("database-alias.store");
+        std::os::unix::fs::symlink(&database, &alias).unwrap();
+        assert_eq!(db_alias_key(&database), db_alias_key(&alias));
+        // A bare relative spelling anchors at the current directory, so it
+        // matches the absolute form of the same file.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            db_alias_key(std::path::Path::new("Cargo.toml")),
+            db_alias_key(&cwd.join("Cargo.toml")),
+            "relative paths must anchor at cwd before canonicalizing"
+        );
+        let second = LadybugStore::for_testing(&alias, 4).unwrap();
+        assert!(
+            Arc::ptr_eq(&second.write_lock, &shared.write_lock),
+            "a store opened through the alias must inherit the same writer"
+        );
+        assert!(
+            Arc::ptr_eq(&second.store_state, &shared.store_state),
+            "a store opened through the alias must inherit the same sidecar cache"
+        );
+        drop(second);
 
         // A lookalike path that names a different file is not an alias: it
         // must not inherit the lease or the writer turn.
         let other = root.join("other.store");
         std::fs::write(&other, b"fixture").unwrap();
-        assert!(!Arc::ptr_eq(&canonical, &db_alias_state(&other)));
+        assert!(!Arc::ptr_eq(&shared, &db_alias_state(&other)));
 
         // The sidecar follows the canonical file, not the alias spelling:
         // `<alias>.store-state.json` would be a second, divergent sidecar.
@@ -32832,6 +32988,36 @@ eurostrata\src\daemon.rs",
             .publish_generation(owner_ns, owner_src, generation)
             .await
             .unwrap();
+        // Declare the edge while its target is still absent: the upsert write
+        // path resolves targets eagerly, so no edge is materialized. Adding
+        // the target afterwards leaves a declaration that only relink can
+        // satisfy, giving recovery real work to prove it did.
+        let target_id = "recovery-target";
+        store
+            .upsert(
+                "probe",
+                "recovery-rule",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": [target_id] })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                target_id,
+                vec![0.0; 4],
+                retired_test_payload("file", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .has_edge("probe", "recovery-rule", "GOVERNS", target_id)
+                .await
+                .unwrap(),
+            "the declared edge must be absent before recovery"
+        );
 
         let refused = store
             .recover_pending_relink(lookalike_ns, lookalike_src)
@@ -32842,18 +33028,113 @@ eurostrata\src\daemon.rs",
             "lookalike namespace must not claim the pending relink: {refused}"
         );
 
-        // The provenance-bearing owner can still recover; once the marker is
-        // clear a second recovery is a no-op.
-        store
+        // The provenance-bearing owner recovers: the declared edge appears,
+        // and a second recovery is a no-op because the marker was cleared.
+        let linked = store
             .recover_pending_relink(owner_ns, owner_src)
             .await
             .unwrap();
+        assert!(linked > 0, "recovery must materialize the declared edge");
+        assert!(
+            store
+                .has_edge("probe", "recovery-rule", "GOVERNS", target_id)
+                .await
+                .unwrap(),
+            "recovery must materialize the declared edge"
+        );
         assert_eq!(
             store
                 .recover_pending_relink(owner_ns, owner_src)
                 .await
                 .unwrap(),
+            0,
+            "the marker must be cleared after a successful recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_relink_clears_the_pending_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("empty-relink.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+        let owner_ns = "probe";
+        let owner_src = "sub::src";
+        let lookalike_ns = "probe::sub";
+        let lookalike_src = "src";
+        let generation = store.begin_generation(owner_ns, owner_src).await.unwrap();
+        store
+            .publish_generation(owner_ns, owner_src, generation)
+            .await
+            .unwrap();
+
+        // No row declares an edge, so relink has no work to create. An empty
+        // tree is still a completed relink and must clear the recovery marker.
+        assert_eq!(store.relink_edges(owner_ns, owner_src).await.unwrap(), 0);
+
+        // With the marker cleared, a lookalike owner can no longer trigger the
+        // lease-provenance refusal: recovery returns immediately. This proves
+        // the no-work path cleared the marker rather than leaving it pending.
+        assert_eq!(
+            store
+                .recover_pending_relink(lookalike_ns, lookalike_src)
+                .await
+                .unwrap(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn relink_committed_for_tracks_the_active_generations_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("relink-commit.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+        let generation = store.begin_generation("probe", "src").await.unwrap();
+        store
+            .publish_generation("probe", "src", generation)
+            .await
+            .unwrap();
+
+        // A pending relink has not committed, even though the lease names this
+        // generation: recovery may still be owed.
+        assert!(
+            !store
+                .relink_committed_for("probe", "src", generation)
+                .await
+                .unwrap(),
+            "a pending marker means the relink has not committed"
+        );
+
+        // Completing the relink clears the marker while keeping the lease, so
+        // a caller that only saw a timeout can now tell it did commit.
+        store.relink_edges("probe", "src").await.unwrap();
+        assert!(
+            store
+                .relink_committed_for("probe", "src", generation)
+                .await
+                .unwrap(),
+            "a cleared marker with this generation's lease proves the relink committed"
+        );
+
+        // The lease is generation-specific: the same marker after a newer
+        // publication cannot vouch for the older generation.
+        let next = store.begin_generation("probe", "src").await.unwrap();
+        store
+            .publish_generation_cas("probe", "src", generation, next, true)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .relink_committed_for("probe", "src", generation)
+                .await
+                .unwrap(),
+            "a newer generation's lease must not vouch for an older relink"
+        );
+        assert!(
+            !store
+                .relink_committed_for("probe", "src", next)
+                .await
+                .unwrap(),
+            "the newly published generation is still pending relink"
         );
     }
 
