@@ -106,25 +106,46 @@ pub struct StoreConfig {
     pub max_db_bytes: Option<u64>,
 }
 
-/// Load-path guidance for the deprecated megabyte knob. The migration itself
-/// happens in `load_from`; this helper keeps the warning text testable and
-/// makes sure neither case is silently dropped.
-fn legacy_pool_guidance(config: &Config) -> Vec<String> {
-    let Some(mb) = config.storage_hygiene.buffer_pool_mb else {
-        return Vec::new();
-    };
-    if config.store.buffer_pool_bytes.is_some() {
-        vec![format!(
-            "storage_hygiene.buffer_pool_mb={mb} is deprecated and ignored because \
-             store.buffer_pool_bytes is set; remove the old key"
-        )]
-    } else {
-        vec![format!(
-            "storage_hygiene.buffer_pool_mb={mb} is deprecated; migrating it to \
-             store.buffer_pool_bytes={} bytes; replace the old key in the config",
-            mb.saturating_mul(1024 * 1024)
-        )]
+/// #414 owner ruling (2026-11-27): no megabyte knob is configuration. A legacy
+/// value is recognized only to fail with the exact byte replacement.
+fn legacy_pool_error(legacy_key: &str, replacement_key: &str, value: &str, mb: u64) -> String {
+    format!(
+        "{legacy_key}={value} is no longer accepted; replace it with \
+         {replacement_key}={} bytes",
+        mb.saturating_mul(1024 * 1024)
+    )
+}
+
+/// Error text for the legacy environment variable, including the exact byte
+/// replacement when the value is numeric.
+pub(crate) fn legacy_pool_env_error(value: &str) -> String {
+    let value = value.trim();
+    match value.parse::<u64>() {
+        Ok(mb) => legacy_pool_error(
+            "NEUROSTRATA_BUFFER_POOL_MB",
+            "NEUROSTRATA_BUFFER_POOL_BYTES",
+            value,
+            mb,
+        ),
+        Err(_) => format!(
+            "NEUROSTRATA_BUFFER_POOL_MB={value:?} is no longer accepted; replace it with \
+             NEUROSTRATA_BUFFER_POOL_BYTES=<bytes>; the megabyte variable must not be set"
+        ),
     }
+}
+
+/// The real environment check. `None` (unset or empty) is the only accepted
+/// state; any legacy value fails closed.
+pub(crate) fn reject_legacy_pool_env_at(value: Option<&str>) -> Result<()> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(value) => anyhow::bail!("{}", legacy_pool_env_error(value)),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn reject_legacy_pool_env() -> Result<()> {
+    let raw = std::env::var("NEUROSTRATA_BUFFER_POOL_MB").ok();
+    reject_legacy_pool_env_at(raw.as_deref())
 }
 
 #[derive(Debug, Deserialize, serde::Serialize)]
@@ -269,16 +290,19 @@ impl Config {
     pub fn load_from(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Could not read config at {}", path.display()))?;
+        reject_legacy_pool_env()?;
         let mut config: Config = serde_json::from_str(&content)?;
 
-        for note in legacy_pool_guidance(&config) {
-            tracing::warn!("{note}");
-        }
-        if config.store.buffer_pool_bytes.is_none() {
-            if let Some(mb) = config.storage_hygiene.buffer_pool_mb {
-                config.store.buffer_pool_bytes = Some(mb.saturating_mul(1024 * 1024));
-                config.storage_hygiene.buffer_pool_mb = None;
-            }
+        if let Some(mb) = config.storage_hygiene.legacy_buffer_pool_mb {
+            anyhow::bail!(
+                "{}",
+                legacy_pool_error(
+                    "storage_hygiene.buffer_pool_mb",
+                    "store.buffer_pool_bytes",
+                    &mb.to_string(),
+                    mb,
+                )
+            );
         }
 
         if config.db_path.is_dir() {
@@ -757,38 +781,40 @@ mod tests {
         assert!(bare.store.max_db_bytes.is_none());
     }
 
-    /// PR #453 re-review: an existing deployment's megabyte key is not
-    /// silently ignored. It migrates to the byte setting with a load-path
-    /// warning, and an explicit byte value wins with its own warning.
+    /// Owner ruling 2026-11-27 (#414): the megabyte key is not configuration.
+    /// It is recognized only to fail with the exact byte replacement, whether
+    /// or not a byte setting is also present.
     #[test]
-    fn a_legacy_megabyte_pool_key_is_migrated_with_guidance() {
+    fn a_legacy_megabyte_pool_key_is_rejected_with_a_byte_migration_error() {
         let dir = temp_dir("legacy-pool");
         let path = dir.join("config.json");
         let legacy = r#"{"db_path":"test.db","store":{"buffer_pool_bytes":null},"storage_hygiene":{"buffer_pool_mb":768}}"#;
         fs::write(&path, legacy).unwrap();
-        let config = Config::load_from(&path).unwrap();
-        assert_eq!(config.store.buffer_pool_bytes, Some(768 * 1024 * 1024));
-        assert_eq!(
-            config.storage_hygiene.buffer_pool_mb, None,
-            "the migrated key must not be applied twice"
-        );
+        let err = Config::load_from(&path).unwrap_err().to_string();
+        assert!(err.contains("storage_hygiene.buffer_pool_mb"), "{err}");
+        assert!(err.contains("store.buffer_pool_bytes=805306368"), "{err}");
+        assert!(err.contains("no longer accepted"), "{err}");
 
-        let raw: Config = serde_json::from_str(legacy).unwrap();
-        let notes = legacy_pool_guidance(&raw);
-        assert!(
-            notes.iter().any(|note| note.contains("migrating")),
-            "the migration must be announced: {notes:?}"
-        );
+        let both = r#"{"db_path":"test.db","store":{"buffer_pool_bytes":536870912},"storage_hygiene":{"buffer_pool_mb":768}}"#;
+        fs::write(&path, both).unwrap();
+        let err = Config::load_from(&path).unwrap_err().to_string();
+        assert!(err.contains("store.buffer_pool_bytes=805306368"), "{err}");
+    }
 
-        let both: Config = serde_json::from_str(
-            r#"{"db_path":"test.db","store":{"buffer_pool_bytes":536870912},"storage_hygiene":{"buffer_pool_mb":768}}"#,
+    /// The byte-only setting loads and is the only pool key that round-trips.
+    #[test]
+    fn byte_pool_settings_load_without_any_legacy_field() {
+        let dir = temp_dir("byte-pool");
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"db_path":"test.db","store":{"buffer_pool_bytes":536870912}}"#,
         )
         .unwrap();
-        let notes = legacy_pool_guidance(&both);
-        assert!(
-            notes.iter().any(|note| note.contains("ignored")),
-            "an overridden legacy key must not be silently dropped: {notes:?}"
-        );
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.store.buffer_pool_bytes, Some(536870912));
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(!serialized.contains("buffer_pool_mb"), "{serialized}");
     }
 
     #[test]

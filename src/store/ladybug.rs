@@ -1880,54 +1880,28 @@ static BUFFER_POOL_BYTES_IN_USE: std::sync::atomic::AtomicU64 =
 /// environment overrides applied (#414). `NEUROSTRATA_BUFFER_POOL_BYTES` and
 /// `NEUROSTRATA_MAX_DB_BYTES` win when they parse; an unparseable value warns
 /// and falls back to the config. Pool 0 and cap 0 both mean "no bound".
+/// The megabyte variable has no seat at this table: [`crate::config::reject_legacy_pool_env`]
+/// fails closed on it before any store is opened.
 fn resolve_store_limits(
     configured_pool_bytes: Option<u64>,
     configured_max_db_bytes: Option<u64>,
     env_pool: Option<&str>,
     env_cap: Option<&str>,
-    legacy_env_pool_mb: Option<&str>,
 ) -> (StoreLimits, Vec<String>) {
     let mut notes = Vec::new();
 
     let configured_pool = configured_pool_bytes.unwrap_or(DEFAULT_BUFFER_POOL_BYTES);
     let mut pool = match env_pool.map(str::trim).filter(|v| !v.is_empty()) {
-        Some(value) => {
-            if let Some(mb) = legacy_env_pool_mb.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(value) => match value.parse::<u64>() {
+            Ok(bytes) => bytes,
+            Err(_) => {
                 notes.push(format!(
-                    "NEUROSTRATA_BUFFER_POOL_MB={mb:?} is deprecated and ignored because \
-                     NEUROSTRATA_BUFFER_POOL_BYTES is set; remove the old variable"
+                    "NEUROSTRATA_BUFFER_POOL_BYTES={value:?} is not a number of bytes; using {configured_pool} from the config"
                 ));
+                configured_pool
             }
-            match value.parse::<u64>() {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    notes.push(format!(
-                        "NEUROSTRATA_BUFFER_POOL_BYTES={value:?} is not a number of bytes; using {configured_pool} from the config"
-                    ));
-                    configured_pool
-                }
-            }
-        }
-        None => match legacy_env_pool_mb.map(str::trim).filter(|v| !v.is_empty()) {
-            Some(value) => match value.parse::<u64>() {
-                Ok(mb) => {
-                    notes.push(format!(
-                        "NEUROSTRATA_BUFFER_POOL_MB={value:?} is deprecated; using {} bytes; \
-                         replace it with NEUROSTRATA_BUFFER_POOL_BYTES",
-                        mb.saturating_mul(1024 * 1024)
-                    ));
-                    mb.saturating_mul(1024 * 1024)
-                }
-                Err(_) => {
-                    notes.push(format!(
-                        "NEUROSTRATA_BUFFER_POOL_MB={value:?} is not a number of megabytes; \
-                         using {configured_pool} from the config"
-                    ));
-                    configured_pool
-                }
-            },
-            None => configured_pool,
         },
+        None => configured_pool,
     };
     if pool != 0 && pool < MIN_BUFFER_POOL_BYTES {
         notes.push(format!(
@@ -1979,16 +1953,18 @@ fn configured_store_limits() -> (Option<u64>, Option<u64>) {
 /// for error messages and saying the effective settings once per process.
 fn resolved_store_limits() -> StoreLimits {
     static SAID: std::sync::Once = std::sync::Once::new();
+    // Fail closed even when a caller bypasses config loading: the legacy
+    // variable must never reach an engine config.
+    crate::config::reject_legacy_pool_env()
+        .expect("the buffer pool is byte-denominated only (#414)");
     let (configured_pool, configured_cap) = configured_store_limits();
     let env_pool = std::env::var("NEUROSTRATA_BUFFER_POOL_BYTES").ok();
     let env_cap = std::env::var("NEUROSTRATA_MAX_DB_BYTES").ok();
-    let legacy_env_pool_mb = std::env::var("NEUROSTRATA_BUFFER_POOL_MB").ok();
     let (limits, notes) = resolve_store_limits(
         configured_pool,
         configured_cap,
         env_pool.as_deref(),
         env_cap.as_deref(),
-        legacy_env_pool_mb.as_deref(),
     );
     BUFFER_POOL_BYTES_IN_USE.store(
         limits.buffer_pool_bytes,
@@ -2612,7 +2588,7 @@ mod store_limits_tests {
     const MIB: u64 = 1024 * 1024;
 
     fn limits(pool: Option<u64>, cap: Option<u64>) -> (StoreLimits, Vec<String>) {
-        resolve_store_limits(pool, cap, None, None, None)
+        resolve_store_limits(pool, cap, None, None)
     }
 
     #[test]
@@ -2622,14 +2598,13 @@ mod store_limits_tests {
             Some(1024 * MIB),
             Some("805306368"),
             Some("2147483648"),
-            None,
         );
         assert_eq!(resolved.buffer_pool_bytes, 768 * MIB);
         assert_eq!(resolved.max_db_bytes, 2048 * MIB);
         assert!(notes.is_empty(), "{notes:?}");
 
         let (resolved, notes) =
-            resolve_store_limits(Some(512 * MIB), None, Some(" 671088640 "), Some(""), None);
+            resolve_store_limits(Some(512 * MIB), None, Some(" 671088640 "), Some(""));
         assert_eq!(resolved.buffer_pool_bytes, 640 * MIB);
         assert_eq!(resolved.max_db_bytes, 0);
         assert!(notes.is_empty(), "{notes:?}");
@@ -2642,7 +2617,6 @@ mod store_limits_tests {
             Some(1024 * MIB),
             Some("lots"),
             Some("2GiB"),
-            None,
         );
         assert_eq!(resolved.buffer_pool_bytes, 512 * MIB);
         assert_eq!(resolved.max_db_bytes, 1024 * MIB);
@@ -2666,13 +2640,8 @@ mod store_limits_tests {
         assert_eq!(resolved.max_db_bytes, 0);
         assert!(notes.is_empty(), "{notes:?}");
 
-        let (resolved, notes) = resolve_store_limits(
-            Some(1024 * MIB),
-            Some(1024 * MIB),
-            Some("0"),
-            Some("0"),
-            None,
-        );
+        let (resolved, notes) =
+            resolve_store_limits(Some(1024 * MIB), Some(1024 * MIB), Some("0"), Some("0"));
         assert_eq!(
             resolved.buffer_pool_bytes, 0,
             "0 hands the pool to the engine"
@@ -2717,27 +2686,25 @@ mod store_limits_tests {
         assert_eq!(other, "Parser exception: nope");
     }
 
-    /// PR #453 re-review: an existing deployment's legacy megabyte environment
-    /// variable stays effective with a warning, but never overrides the byte
-    /// variable. No legacy value is silently dropped.
+    /// Owner ruling 2026-11-27 (#414): the megabyte variable is not a setting.
+    /// It is rejected with the exact byte replacement and cannot size the pool;
+    /// the byte-denominated path keeps working.
     #[test]
-    fn a_legacy_megabyte_env_value_is_honored_with_guidance() {
-        let (limits, notes) = resolve_store_limits(None, None, None, None, Some("768"));
-        assert_eq!(limits.buffer_pool_bytes, 768 * MIB);
+    fn a_legacy_megabyte_env_value_is_rejected_and_never_sets_the_pool() {
+        let err = crate::config::legacy_pool_env_error("768");
+        assert!(err.contains("NEUROSTRATA_BUFFER_POOL_MB"), "{err}");
         assert!(
-            notes
-                .iter()
-                .any(|n| n.contains("NEUROSTRATA_BUFFER_POOL_MB")),
-            "{notes:?}"
+            err.contains("NEUROSTRATA_BUFFER_POOL_BYTES=805306368"),
+            "{err}"
         );
+        assert!(crate::config::reject_legacy_pool_env_at(Some(" 768 ")).is_err());
+        assert!(crate::config::reject_legacy_pool_env_at(Some("lots")).is_err());
+        assert!(crate::config::reject_legacy_pool_env_at(None).is_ok());
+        assert!(crate::config::reject_legacy_pool_env_at(Some("")).is_ok());
 
-        let (limits, notes) =
-            resolve_store_limits(Some(512 * MIB), None, Some("805306368"), None, Some("768"));
+        let (limits, notes) = resolve_store_limits(Some(512 * MIB), None, Some("805306368"), None);
         assert_eq!(limits.buffer_pool_bytes, 768 * MIB);
-        assert!(
-            notes.iter().any(|n| n.contains("ignored")),
-            "the shadowed legacy variable must be named: {notes:?}"
-        );
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     /// PR #453 review: assert the value that reaches the engine, not just the
