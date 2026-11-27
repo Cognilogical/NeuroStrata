@@ -3,15 +3,15 @@
 //! The GUI crate (`src-tauri`) is not part of the root crate's build, so the
 //! shipped Tauri configuration is pinned here at config level. The webview must
 //! run under a strict, closed CSP and the `shell:allow-open` capability must
-//! carry only the URL schemes the visualizer actually emits.
+//! carry only web links and the reserved native editor scheme. Behavioral URL
+//! checks live in `tests/tauri_url_policy.rs`.
 
 use serde_json::Value;
 use std::path::PathBuf;
 
-/// The shipped CSP: issue #413's five directives plus `form-action 'self'`
-/// (which has no `default-src` fallback) and the two local Tauri IPC transport
-/// origins in `connect-src` (required for desktop `invoke` calls).
-const EXPECTED_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343 ipc: http://ipc.localhost; form-action 'self'";
+/// The exact five-directive CSP required by issue #413. `connect-src` allows
+/// only same-origin and the loopback daemon: no extra directive or token.
+const EXPECTED_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343";
 
 /// URL patterns the scoped `shell:allow-open` capability may allow: web links
 /// plus the reserved NeuroStrata-native editor deep-link scheme. No branded
@@ -19,8 +19,8 @@ const EXPECTED_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'se
 const EXPECTED_OPEN_PATTERNS: [&str; 2] = ["^neurostrata-editor://.*", "^https?://.*"];
 
 /// Patterns that must never reappear: they turn the opener into an arbitrary
-/// local-file/executable launcher. Branded editor deep-link schemes are also
-/// excluded: the visualizer emits only web links.
+/// local-file/executable launcher. Branded editor schemes are equally excluded;
+/// file-backed nodes use the reserved native editor scheme instead.
 const FORBIDDEN_OPEN_PATTERNS: [&str; 2] = ["^file://.*", "^/.*"];
 
 fn config_path(rel: &str) -> PathBuf {
@@ -135,13 +135,8 @@ fn csp_is_set_and_strict() {
         .collect();
     assert_eq!(
         directives.len(),
-        6,
-        "the CSP must contain exactly six directives: {actual}"
-    );
-    assert_eq!(
-        directive_tokens(&actual, "form-action"),
-        vec!["'self'".to_string()],
-        "form-action must be 'self' (it has no default-src fallback)"
+        5,
+        "the CSP must contain exactly issue #413's five directives: {actual}"
     );
 }
 
@@ -256,14 +251,22 @@ fn dev_csp_permits_vite_hmr_without_loosening_production_csp() {
         tokens, expected,
         "devCsp connect-src must be the production set plus only the Vite HMR origins"
     );
-    // Every non-connect directive stays identical to production.
-    for name in [
-        "default-src",
-        "script-src",
-        "style-src",
-        "img-src",
-        "form-action",
-    ] {
+    // Vite's React plugin injects an inline Refresh preamble in dev only.
+    let mut dev_script = directive_tokens(&dev, "script-src");
+    dev_script.sort();
+    let mut expected_script = vec!["'self'".to_string(), "'unsafe-inline'".to_string()];
+    expected_script.sort();
+    assert_eq!(
+        dev_script, expected_script,
+        "devCsp script-src must permit the inline React Refresh preamble"
+    );
+    assert_eq!(
+        directive_tokens(&prod, "script-src"),
+        vec!["'self'".to_string()],
+        "production script-src must stay same-origin-only"
+    );
+    // Other non-connect directives stay identical to production.
+    for name in ["default-src", "style-src", "img-src"] {
         assert_eq!(
             directive_tokens(&dev, name),
             directive_tokens(&prod, name),
@@ -273,68 +276,53 @@ fn dev_csp_permits_vite_hmr_without_loosening_production_csp() {
 }
 
 #[test]
+fn vite_enables_react_refresh() {
+    let vite = read_text("web-ui/vite.config.ts");
+    assert!(
+        vite.contains("@vitejs/plugin-react") && vite.contains("react()"),
+        "the dev server must enable the React plugin that injects the Refresh preamble"
+    );
+}
+
+#[test]
 fn daemon_connect_src_is_loopback_only() {
     let policy = csp();
     let mut tokens = directive_tokens(&policy, "connect-src");
     tokens.sort();
-    // Same-origin, the loopback daemon, and Tauri's two local IPC transport
-    // origins (desktop `invoke` calls); no remote host belongs in the policy.
-    let mut expected = vec![
-        "'self'".to_string(),
-        "http://127.0.0.1:34343".to_string(),
-        "ipc:".to_string(),
-        "http://ipc.localhost".to_string(),
-    ];
+    // Issue #413 requires exactly same-origin and the loopback daemon.
+    let mut expected = vec!["'self'".to_string(), "http://127.0.0.1:34343".to_string()];
     expected.sort();
     assert_eq!(
         tokens, expected,
-        "connect-src must allow only same-origin, the loopback daemon, and the local Tauri IPC transport"
+        "connect-src must allow only same-origin and the loopback daemon"
     );
 }
 
 #[test]
-fn form_action_blocks_offsite_submission() {
-    assert_eq!(
-        directive_tokens(&csp(), "form-action"),
-        vec!["'self'".to_string()],
-        "form-action has no default-src fallback; omitting it allows offsite form posts"
-    );
-}
-
-#[test]
-fn desktop_ipc_transport_is_allowed() {
-    let tokens = directive_tokens(&csp(), "connect-src");
-    for required in ["ipc:", "http://ipc.localhost"] {
-        assert!(
-            tokens.iter().any(|token| token == required),
-            "connect-src must allow {required} or desktop invoke calls fail"
-        );
-    }
-}
-
-#[test]
-fn open_external_allowlist_is_web_only() {
+fn open_external_delegates_to_shared_policy() {
     let src = read_text("src-tauri/src/main.rs");
-    let start = src
-        .find("const ALLOWED:")
-        .unwrap_or_else(|| panic!("open_external must pin an explicit ALLOWED scheme list"));
-    let rest = &src[start..];
-    let assign = rest
-        .find("= [")
-        .expect("ALLOWED list must be an array literal");
-    let open = assign + 2;
-    let close = rest[open..].find(']').expect("ALLOWED array must close") + open;
-    let mut schemes: Vec<String> = rest[open + 1..close]
-        .split(',')
-        .map(|entry| entry.trim().trim_matches('"').to_string())
-        .filter(|entry| !entry.is_empty())
-        .collect();
-    schemes.sort();
-    let mut expected = vec!["http://".to_string(), "https://".to_string()];
-    expected.sort();
-    assert_eq!(
-        schemes, expected,
-        "open_external must accept only web schemes: editor deep links must not launch from untrusted renderer content"
+    let validation = src
+        .find("url_policy::is_allowed_external_url")
+        .expect("open_external must call the shared URL validator");
+    let opener = src
+        .find("open::that(")
+        .expect("open_external must still hand allowed targets to the OS");
+    assert!(
+        validation < opener,
+        "URL validation must happen before any target is opened"
+    );
+    assert!(
+        src.contains("url_policy::native_editor_path"),
+        "native editor links must be resolved through the validated path helper"
+    );
+}
+
+#[test]
+fn ui_emits_native_editor_links() {
+    let ui = read_text("web-ui/src/components/UIPanel.tsx");
+    assert!(
+        ui.contains("neurostrata-editor://file/"),
+        "the editor action must emit the native, non-branded editor deep link"
     );
 }
 

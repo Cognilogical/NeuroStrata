@@ -61,17 +61,16 @@ The Tauri desktop shell renders graph content that originates from ingested repo
 
 ### 6.1 Shipped CSP
 
-`src-tauri/tauri.conf.json` pins exactly six directives: issue #413's five, plus `form-action`, and two local IPC transport origins in `connect-src`:
+`src-tauri/tauri.conf.json` pins exactly the five directives required by issue #413 — no extra directive and no extra connection origin:
 
 ```text
-default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343 ipc: http://ipc.localhost; form-action 'self'
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:34343
 ```
 
-- `default-src 'self'` and `script-src 'self'` deny remote and inline scripts, so injected memory text cannot execute as code.
+- `default-src 'self'` and `script-src 'self'` deny remote and inline scripts in the shipped build, so injected memory text cannot execute as code.
 - `style-src 'self' 'unsafe-inline'` is the single retained relaxation: the bundled UI applies computed inline styles (graph highlighting and layout), which do not execute script.
 - `img-src 'self' data:` permits bundled art and inline `data:` images while rejecting remote image beacons.
-- `connect-src 'self' http://127.0.0.1:34343 ipc: http://ipc.localhost` is deliberately local-only: the webview may reach only the loopback daemon and Tauri's two IPC transport origins. Without the IPC origins the desktop webview rejects every `invoke` request and the UI cannot load graph data; neither origin is a remote host, so a compromised renderer still cannot exfiltrate data offsite.
-- `form-action 'self'` restricts form submissions to the app's own origin. It must be explicit: `form-action` has no `default-src` fallback, so omitting it would let attacker-controlled form markup submit graph or memory data to a remote endpoint despite the local-only `connect-src`.
+- `connect-src 'self' http://127.0.0.1:34343` allows exactly same-origin requests and the loopback daemon; no remote host is reachable from the webview.
 
 `tests/tauri_config_shape.rs` pins the policy byte-for-byte (including the exact directive count and `connect-src` token set), so a future edit that widens the CSP fails CI instead of silently shipping.
 
@@ -86,11 +85,11 @@ default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src
 ]
 ```
 
-The allowlist covers web links plus the reserved NeuroStrata-native editor deep-link scheme. The native scheme is declarative only: `plugins.shell.open` is disabled and `open_external` accepts only web schemes, so untrusted renderer content cannot launch an external editor even if it emits an editor link. The previously duplicated bare `"shell:allow-open"` entry and the `^file://.*` and `^/.*` local-launch patterns are removed: they turned the opener into an arbitrary local-file or executable launcher. No branded scheme is present. `src-tauri/gen/schemas/capabilities.json` mirrors this capability and is kept in sync.
+The allowlist covers web links plus the reserved NeuroStrata-native editor deep-link scheme. `UIPanel` emits `neurostrata-editor://file/<absolute path>?profile=<primary|alternate>` for file-backed nodes; the OS routes that scheme to the editor handler the user registered, so no editor executable or branded scheme is named in the app. The previously duplicated bare `"shell:allow-open"` entry and the `^file://.*` and `^/.*` local-launch patterns are removed: they turned the opener into an arbitrary local-file or executable launcher. `src-tauri/gen/schemas/capabilities.json` mirrors this capability and is kept in sync.
 
-`plugins.shell.open` is `false` in `src-tauri/tauri.conf.json`: external URLs go through `open_external`, whose Rust allowlist is the enforced gate, so plugin-shell's own `open` command stays disabled and `tests/tauri_config_shape.rs` pins the key to `false` (absence would be read as `true` by tauri-plugin-shell).
+`plugins.shell.open` is `false` in `src-tauri/tauri.conf.json`: external URLs go through `open_external`, which validates every target through `src/tauri_url_policy.rs` before handing it to the OS. The policy admits only HTTP(S) URLs with an explicit host and validated native editor paths; uppercase schemes, embedded credentials, backslashes, control characters, dot segments and encoded traversal are rejected. `tests/tauri_url_policy.rs` exercises those cases behaviorally — a stale constant in `open_external` cannot make the test pass. `tests/tauri_config_shape.rs` pins the `plugins.shell.open` key to `false` (absence would be read as `true` by tauri-plugin-shell).
 
 ### 6.3 Port override and dev-mode caveats
 
 - **`NEUROSTRATA_DAEMON_PORT`:** the webview `connect-src` pins the default daemon origin for frontend-originated requests only. Desktop commands (`invoke`) execute in Rust and reach the daemon through `reqwest`; the webview CSP does not govern those backend requests. A supported non-default port therefore works without changing the CSP or loosening it — no need to abandon the override. If a future frontend feature calls a daemon origin directly, update the CSP and `tests/tauri_config_shape.rs` together.
-- **Dev CSP:** `devUrl` serves the UI from `http://localhost:5173`, whose Vite HMR websocket (`ws://localhost:5173`) is not permitted by the production policy. `app.security.devCsp` is therefore configured separately: it is the production policy plus only `http://localhost:5173` and `ws://localhost:5173` in `connect-src`, so HMR works under `tauri dev` while the release build keeps the strict policy above (never loosen the shipped `csp` for development). `tests/tauri_config_shape.rs` pins this relationship.
+- **Dev CSP:** `devUrl` serves the UI from `http://localhost:5173`, whose Vite HMR websocket (`ws://localhost:5173`) is not permitted by the production policy, and the configured React plugin injects an inline Refresh preamble that `script-src 'self'` would block. `app.security.devCsp` is therefore configured separately: the production policy plus only `http://localhost:5173` and `ws://localhost:5173` in `connect-src`, and `'unsafe-inline'` added to `script-src` for the preamble. The relaxation is dev-only — the shipped `csp` keeps `script-src 'self'` — and `tests/tauri_config_shape.rs` pins both sides of that relationship.

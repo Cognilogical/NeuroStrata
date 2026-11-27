@@ -8,6 +8,11 @@ use tauri::{
     Emitter,
 };
 
+// Same policy source as tests/tauri_url_policy.rs: the GUI crate cannot link
+// the root crate, so both compile this file directly.
+#[path = "../../src/tauri_url_policy.rs"]
+mod url_policy;
+
 #[derive(Serialize, Deserialize, Default)]
 struct Config {
     last_project_path: Option<String>,
@@ -227,17 +232,20 @@ fn namespace_for(project_path: &str) -> String {
 /// this one was mistaken for all three.
 #[tauri::command]
 fn open_external(url: String) -> Result<(), String> {
-    // Only web schemes. Editor deep links are intentionally not launchable:
-    // the capability may declare the native editor scheme, but an unrestricted
-    // opener reachable from the webview would run whatever a memory's content
-    // asked for, and node content is not ours.
-    const ALLOWED: [&str; 2] = ["https://", "http://"];
-    if !ALLOWED.iter().any(|s| url.starts_with(s)) {
+    // Shared with the behavioral tests, so a loosened check cannot pass by
+    // merely editing a constant. Validation runs before any OS handoff: node
+    // content is untrusted and must not choose its own opener.
+    if !url_policy::is_allowed_external_url(&url) {
         return Err(format!(
-            "Refusing to open '{}': only {} are allowed.",
-            url,
-            ALLOWED.join(", ")
+            "Refusing to open '{url}': only web URLs and validated native editor links are allowed."
         ));
+    }
+    // Native editor links are resolved by the user-registered handler for the
+    // reserved scheme. Resolve the path here too, so an evasive link is
+    // rejected even if the OS would normalize it differently.
+    if url.starts_with(url_policy::NATIVE_EDITOR_SCHEME) {
+        url_policy::native_editor_path(&url)
+            .map_err(|reason| format!("Refusing to open editor link '{url}': {reason}"))?;
     }
 
     // The `open` crate rather than a hand-rolled Command per platform: it is

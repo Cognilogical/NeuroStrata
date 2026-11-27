@@ -613,10 +613,25 @@
         "capability_has_no_file_or_root_open_patterns",
         "daemon_connect_src_is_loopback_only",
         "dev_csp_permits_vite_hmr_without_loosening_production_csp",
-        "form_action_blocks_offsite_submission",
-        "desktop_ipc_transport_is_allowed",
-        "open_external_allowlist_is_web_only",
+        "vite_enables_react_refresh",
+        "open_external_delegates_to_shared_policy",
+        "ui_emits_native_editor_links",
         "port_override_doc_distinguishes_backend_requests"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
+    "tauri-url-policy": {
+      "commands": [
+        "cargo test --locked --test tauri_url_policy -- --test-threads=1"
+      ],
+      "tests": [
+        "allows_web_and_native_editor_targets",
+        "rejects_non_web_and_non_native_schemes",
+        "rejects_web_url_evasions",
+        "rejects_native_editor_path_evasions",
+        "native_editor_path_is_validated_before_use"
       ],
       "thresholds": {
         "ignored": 0
