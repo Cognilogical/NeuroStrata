@@ -5104,10 +5104,17 @@ impl LadybugStore {
         if let Some((scoped_namespace, generation, _)) =
             crate::parser::generation::split_scoped_id(requested_id)
         {
-            if scoped_namespace == namespace
-                && self.is_staging_generation(namespace, generation).await
-            {
-                return Ok(None);
+            if scoped_namespace == namespace {
+                if self.is_staging_generation(namespace, generation).await {
+                    return Ok(None);
+                }
+                let namespace = namespace.to_string();
+                if self
+                    .with_conn(move |conn| generation_is_closed(conn, &namespace, generation))
+                    .await?
+                {
+                    return Ok(None);
+                }
             }
         }
         let canonical_id = crate::parser::ingest::qualified_id(
@@ -10434,6 +10441,34 @@ fn staging_marker_state(
     }
 }
 
+/// A generation whose counter was allocated but whose pointer no longer names
+/// it is closed: it was aborted or superseded. Its scoped ids must never fall
+/// through a legacy alias onto the live bare row, or a write the generation
+/// discarded would be resurrected. A store that never began a generation has
+/// no counter row, so an ordinary qualified re-ingest keeps alias resolution.
+fn generation_is_closed(conn: &Connection, namespace: &str, generation: u64) -> Result<bool> {
+    let counter = conn
+        .query(&format!(
+            "MATCH (g:IngestGeneration) WHERE g.id = '{}' RETURN g.counter",
+            escape_ladybug_string(namespace)
+        ))?
+        .next()
+        .and_then(|row| format!("{}", row[0]).parse::<u64>().ok())
+        .unwrap_or(0);
+    if generation == 0 || generation > counter {
+        return Ok(false);
+    }
+    let active = conn
+        .query(&format!(
+            "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation = {} RETURN g.id LIMIT 1",
+            escape_ladybug_string(namespace),
+            generation
+        ))?
+        .next()
+        .is_some();
+    Ok(!active)
+}
+
 /// Re-read the alias inside the writer turn. A publication may have repointed
 /// it since the earlier async lookup; using a stale mapping writes to an
 /// archived row and leaves a duplicate identity visible.
@@ -10442,6 +10477,13 @@ fn legacy_alias_in_conn(
     namespace: &str,
     requested_id: &str,
 ) -> Result<Option<String>> {
+    if let Some((scoped_namespace, generation, _)) =
+        crate::parser::generation::split_scoped_id(requested_id)
+    {
+        if scoped_namespace == namespace && generation_is_closed(conn, namespace, generation)? {
+            return Ok(None);
+        }
+    }
     let canonical_id = crate::parser::ingest::qualified_id(
         namespace,
         logical_path_in_namespace(requested_id, namespace),
@@ -12776,22 +12818,13 @@ impl VectorStore for LadybugStore {
                             // An in-flight staging row keeps its scoped id: an
                             // alias must not redirect it onto the live row.
                             StagingMarkerState::Fresh => {}
+                            // No marker: an older binary may have written a
+                            // generation-scoped id directly. Re-read the alias
+                            // inside this turn; `legacy_alias_in_conn` refuses
+                            // closed generations, so an aborted or superseded
+                            // id keeps its own identity instead of mutating the
+                            // live bare row.
                             StagingMarkerState::Absent => {
-                                let active = conn
-                                    .query(&format!(
-                                        "MATCH (g:IngestGeneration) WHERE g.namespace = '{}' AND g.active_generation = {} RETURN g.id LIMIT 1",
-                                        escape_ladybug_string(&namespace),
-                                        generation
-                                    ))
-                                    .map(|mut rows| rows.next().is_some())
-                                    .unwrap_or(false);
-                                if !active {
-                                    anyhow::bail!(
-                                        "generation {} of namespace '{}' is no longer staged or active",
-                                        generation,
-                                        namespace
-                                    );
-                                }
                                 if let Some(stored) =
                                     legacy_alias_in_conn(conn, &namespace, &requested_id)?
                                 {
