@@ -615,7 +615,12 @@
         "guard::sandbox::tests::exact_home_directory_is_refused_but_descendants_are_allowed",
         "guard::sandbox::tests::a_project_working_directory_is_allowed",
         "guard::sandbox::tests::a_timed_out_run_kills_and_reaps_its_child",
-        "guard::sandbox::tests::a_large_payload_to_a_child_that_never_reads_stdin_times_out_and_reaps"
+        "guard::sandbox::tests::a_large_payload_to_a_child_that_never_reads_stdin_times_out_and_reaps",
+        "guard::sandbox::tests::unknown_home_fails_closed",
+        "guard::sandbox::tests::a_descendant_holding_a_pipe_does_not_hang_the_verdict",
+        "guard::sandbox::tests::stalled_cleanup_child_is_killed_and_reaped",
+        "guard::sandbox::tests::mount_cwd_revalidation_detects_a_swapped_symlink",
+        "guard::sandbox::tests::sandbox_concurrency_is_bounded"
       ],
       "thresholds": {
         "ignored": 0
