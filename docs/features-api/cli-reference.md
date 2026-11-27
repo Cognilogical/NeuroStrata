@@ -130,7 +130,7 @@ _Example:_
 neurostrata-mcp ingest ./src my-rust-project
 ```
 
-Namespaces that begin with `__neurostrata_ingest_stage__` are reserved for internal staging. The command refuses them before the directory is read, before the fallback store is prepared, and before `NEUROSTRATA_CLEAR_BEFORE_INGEST` can clear any stored rows.
+Namespaces that begin with `__neurostrata_ingest_stage__` are reserved for internal staging. Both `ingest` and `ingest-scip` refuse them before the directory or index is read, before the fallback store is prepared, and before `NEUROSTRATA_CLEAR_BEFORE_INGEST` can clear any stored rows.
 
 ### `project-context` & `export-graph`
 
@@ -187,20 +187,25 @@ Installs `.git/hooks/pre-push` (strict task gate) and `.git/hooks/pre-commit` (g
 ```bash
 neurostrata-mcp hooks install [--force] [--namespace <ns>]
 ```
+
 It also writes the project marker `.NeuroStrata/config.json` at the main checkout's top, for `--namespace` or, without it, for the one namespace the harness configs, `NEUROSTRATA_NAMESPACE` and `.NeuroStrata/session_queries.json` agree on (never the folder name). When they name none or disagree, it writes no marker, still installs the hooks, and lists the candidates. When the namespace's cached root is a subfolder, or the change would stop memories matching, it writes no marker and says which `root set` to run. When another namespace's marker covers the folder, or it runs inside a split subfolder of another namespace, it installs nothing (exit 1). When the marker is in place but the cached root could not be set, it installs the hooks, prints why on stderr and exits 1. `--namespace` is also written into every harness config; without it, a namespace that a marker now covers the checkout for goes into configs that name none. See [Project root](ops/project-root.md).
 The pre-push hook gates the project's configured namespace (see `namespace resolve`) and the checkout's folder name when that is a valid namespace; the pre-commit hook records against the configured namespace. The pre-push hook blocks the push when `neurostrata-mcp` is missing, when `namespace resolve` fails, or when the gate exits with anything other than 0 or 1.
 
 ### `namespace resolve`
+
 Prints the namespace configured for a project. Order: the `namespace` of the project marker `.NeuroStrata/config.json` found from `dir` upward, then Claude's plugin config `.NeuroStrata/plugins/claude/neurostrata.json`, else `NEUROSTRATA_NAMESPACE` in `.claude/settings.local.json` (its `env` block, else a hook command in the installer's exact form `NEUROSTRATA_NAMESPACE=<ns> node "<runner>"` that runs the installer's `.NeuroStrata/plugins/claude/cli-hook.mjs`), then `namespace` in the opencode, codex, hermes, openclaw or GitHub CLI plugin config, read from `dir` itself, then its checkout, else from the main checkout of a linked worktree; then `NEUROSTRATA_NAMESPACE` in the environment (surrounding quotes dropped); then the `namespace` field of `.NeuroStrata/session_queries.json`; the main checkout's folder name last (outside git, the same files in `dir` itself, then its folder name). A namespace is letters, digits, `-`, `_`, `.` and `:`, starting with a letter or digit; any other value is skipped, and a config value in quotes is not one. When harness configs name different namespaces and no marker decides, it prints a warning on stderr and uses the first in the order above (Claude, opencode, codex, hermes, openclaw, GitHub CLI). Namespaces that differ only in letter case are the same namespace. It exits non-zero with an error on stderr, so the `pre-push` hook blocks the push, when `dir` does not exist, when the project marker or a harness config exists but cannot be read or parsed (a UTF-8 byte order mark included; the error names the file), or when nothing names a namespace and the folder name is not one (a space in it, say). A relative `dir` is taken against the current directory. It opens no database and starts no daemon. The `pre-push` and `pre-commit` hooks use it; the `pre-commit` hook also sets the ledger's `namespace` field to its answer, and when the lookup fails it falls back to the ledger's field, then the folder name, with the lookup's error left on stderr.
 
 `hooks install`, `get_snapshot`'s hook refresh and the daemon's startup install refresh the harness plugin files. Apart from `hooks install`'s `--namespace` or marker namespace (above), they write a namespace into a harness config only when it came from a harness config or, for `hooks install` and the CLI, `NEUROSTRATA_NAMESPACE` (the daemon does not read its own environment: one daemon serves every project); a ledger or folder-name answer is never written there. Each config keeps a usable namespace it already names, a config that cannot be read is left as it is, and a config with no namespace to write is written without one (the runner finds the namespace when it runs). Config files are written through a temporary file and a rename. When the project marker cannot be read, `hooks install` and `get_snapshot`'s refresh write no new namespace into any config and say so; the daemon's startup install logs one warning naming the file and keeps each config's own namespace.
+
 ```bash
 neurostrata-mcp namespace resolve [dir]
 neurostrata-mcp namespace resolve --pushed [dir]
 ```
+
 With `--pushed` it reads the pre-push hook's stdin (`<local ref> <local sha> <remote ref> <remote sha>` lines) and prints, one per line, every namespace the push must pass the task gate for: the checkout's folder name, the resolved namespace, the namespace of the marker over each path the pushed commits change, read from the pushed commit, and the namespace a marker the push deletes or changes named at the remote tip. It exits 1 on an unreadable marker on a pushed path, on a stdin line it cannot read, or when a committed and an untracked marker disagree.
 
 ### `root show`, `root set` & `root audit`
+
 Read and write the project marker `.NeuroStrata/config.json` (see [Project root](ops/project-root.md)).
 
 ```bash
@@ -216,6 +221,7 @@ neurostrata-mcp root set <dir> --namespace <ns> [--source-id <id>] [--replace] [
 The marker is strict JSON: `version` 1, `namespace`, and optionally `source_id` (a string, not `null`); `src/schemas/root-config.schema.json` documents it. A new marker is published with a hard link, so the filesystem must support hard links (exFAT and FAT do not). The home folder, a filesystem or drive root, and a folder outside git with a checkout below it may not hold a marker; that last check looks four levels down and skips `node_modules` and `target`.
 
 ### `root show`, `root set` & `root audit`
+
 Read and write the project marker `.NeuroStrata/config.json` (see [Project root](ops/project-root.md)).
 
 ```bash

@@ -9,7 +9,7 @@ The `Embedder` trait is the pluggable interface for embedding generation. Implem
 
 ### Degradable batch embedding
 
-`embed_batch` is all-or-nothing: one refused input fails the batch. A provider that can refuse a *single* input (an oversized or malformed item answered with `400`/`413`) instead implements the optional seam
+`embed_batch` is all-or-nothing: one refused input fails the batch. A provider that can refuse a _single_ input (an oversized or malformed item answered with `400`/`413`) instead implements the optional seam
 
 - `async fn embed_batch_degradable(&self, texts: &[String]) -> Result<BatchEmbedOutcome>` — a batch embed that may degrade item by item
 
@@ -39,7 +39,9 @@ The default is again a no-op. `LadybugStore` creates edges under the same `extra
 
 ### Reserved ingest namespaces
 
-A namespace whose name begins with `crate::traits::INTERNAL_INGEST_STAGE_PREFIX` (`__neurostrata_ingest_stage__`) belongs to the internal staging machinery. `is_reserved_ingest_destination(namespace)` reports whether a destination is reserved, and directory ingest refuses one before it normalizes a node set, probes the directory, embeds anything or opens a staging generation. The ingest-jobs layer applies the same predicate before it canonicalizes a path or registers a job, and the CLI applies it before it can clear stored rows. A staging namespace is therefore never a valid project destination, and refusing it early costs no work.
+A namespace whose name begins with `crate::traits::INTERNAL_INGEST_STAGE_PREFIX` (`__neurostrata_ingest_stage__`) belongs to the internal staging machinery. `is_reserved_ingest_destination(namespace)` reports whether a destination is reserved, and directory ingest refuses one before it normalizes a node set, probes the directory (including a `dry_run` preview), embeds anything or opens a staging generation. The ingest-jobs layer, SCIP ingest and bounded classification apply the same predicate before they canonicalize a path, read the index or validate a batch, and the CLI applies it before it can clear stored rows. A staging namespace is therefore never a valid project destination, and refusing it early costs no work.
+
+Two further optional seams govern staged publications. `async fn publish_generation_if_active(&self, namespace, source_key, expected, target) -> Result<bool>` flips the active pointer only while it still names `expected`, so a failed roll-back cannot replace a newer generation published in the meantime; it returns `false` when the pointer moved and the caller must leave it alone. Stores with a single-writer turn should override the default read-then-publish so the comparison and flip share one write turn. `async fn recover_pending_relink(&self, namespace, source_key) -> Result<usize>` finishes a relink left pending by a crash after publication but before edge materialisation; the default is a no-op, and `LadybugStore` replays the declarations against the active generation. Both defaults are no-ops or best-effort, so a vector-only backend keeps working unchanged.
 
 Both traits are generic over storage backend. The default implementation uses a local in-memory store; custom implementations can target GPU-accelerated indexes or distributed stores.
 
