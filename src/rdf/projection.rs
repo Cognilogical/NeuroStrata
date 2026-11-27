@@ -2159,6 +2159,8 @@ mod tests {
                 superseded_by: None,
                 ts: 1794675600,
                 epoch: 1,
+                bus_seq: None,
+                bus_key: None,
             })
             .unwrap();
 
@@ -2184,6 +2186,8 @@ mod tests {
                 superseded_by: None,
                 ts: 1794675600,
                 epoch: 1,
+                bus_seq: None,
+                bus_key: None,
             })
             .unwrap();
 

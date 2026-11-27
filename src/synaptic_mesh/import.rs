@@ -1276,6 +1276,7 @@ pub fn classify_merge_parity_tag(
         rdf: None,
         relationships: vec![],
         update_id: Uuid::new_v4(),
+        bus_seq: None,
         origin_mesh_epoch: 1,
         trust: Trust::Untrusted,
         signature: None,
@@ -2338,6 +2339,7 @@ fn preserved_edit_record(
             quads: nquads_text,
         }),
         relationships: rels,
+        bus_seq: None,
         update_id,
         origin_mesh_epoch,
         trust: import_trust,
@@ -5911,6 +5913,7 @@ mod tests {
 
             relationships: vec![],
             update_id: Uuid::new_v4(),
+            bus_seq: None,
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
             signature: None,
@@ -6494,6 +6497,7 @@ mod tests {
 
             relationships: vec![],
             update_id: Uuid::new_v4(),
+            bus_seq: None,
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
             signature: None,
@@ -6631,6 +6635,7 @@ mod tests {
 
             relationships: vec![],
             update_id: Uuid::new_v4(),
+            bus_seq: None,
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
             signature: None,
@@ -6734,6 +6739,7 @@ mod tests {
 
             relationships: vec![],
             update_id: Uuid::new_v4(),
+            bus_seq: None,
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
             signature: None,

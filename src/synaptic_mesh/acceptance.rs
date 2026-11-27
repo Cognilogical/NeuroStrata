@@ -171,6 +171,8 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
+            bus_key: None,
         }
     }
 

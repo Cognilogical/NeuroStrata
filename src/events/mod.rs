@@ -16,14 +16,16 @@
 
 mod bus;
 mod event;
+mod outbox;
 mod subscriber;
 pub(crate) mod subscribers;
 
-pub use self::bus::ThalamicBus;
+pub use self::bus::{OutboxConfig, ThalamicBus};
 pub use self::event::ThalamicPulse;
+pub use self::outbox::{DurableDelivery, EventClass, EventOutbox, EventOutboxError, MeshCapture};
 pub use self::subscriber::{
-    BackpressureEvent, BusMetrics, MemorySubscriber, RecursionToken, SubscriberContext,
-    SubscriberError,
+    current_delivery, with_delivery, BackpressureEvent, BusMetrics, MemorySubscriber,
+    RecursionToken, SubscriberContext, SubscriberError,
 };
 pub use self::subscribers::{
     check_export_freshness, clear_export_freshness, EpisodicPointerEcho, ExportFreshnessDirty,

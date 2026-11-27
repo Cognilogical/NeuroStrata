@@ -3930,7 +3930,6 @@ pub async fn handle_task_complete(
     // `extracted_from: [id]`).
     let mut memories = list_now().await?;
     let mut edge = gate::extraction_exists(&memories, &id, now);
-
     // Path 2: bind an already-written memory. Its existing vector is reused
     // verbatim -- linking must never change what the memory ranks for.
     if !edge {
@@ -4181,15 +4180,38 @@ pub async fn handle_task_complete(
     // so a Lock 2 refusal above must leave the bus silent rather than send
     // every subscriber down a chain that does not exist. The ordering is the
     // invariant -- nothing re-derives it from the adjacent check.
-    if let Some(lesson_id) = inline_lesson {
-        bus.emit(
+    // A retry after a failed durable append can find the extraction edge
+    // already stored and would otherwise skip the pulse, leaving a stored
+    // mutation without its mesh sync record. The authoritative target is the
+    // row the EXTRACTED_FROM edge actually points at: derive it from the
+    // (post-write, gated) memory list so a retry announces the validated
+    // lesson rather than an id guessed from the write path. A first link
+    // stores its edge inside this call and is announced from that same edge;
+    // the worker's idempotency absorbs the duplicate a genuine retry can
+    // produce.
+    let announced_lesson = gate::extraction_target(&memories, &id, now)
+        .or(inline_lesson)
+        .or_else(|| link_memory_id.clone());
+    if let Some(lesson_id) = announced_lesson {
+        // Class M (Wave 3): the completion's sync record goes through
+        // `emit_checked` -- a failed durable append fails the completion
+        // before it is recorded below, so the caller can retry rather than
+        // strand a completion the mesh never hears about.
+        bus.emit_checked(
             crate::events::ThalamicPulse::Superseded {
                 old_id: id.clone(),
-                new_id: lesson_id,
+                new_id: lesson_id.clone(),
                 namespace: namespace.clone(),
             },
             &crate::events::RecursionToken::root(),
-        );
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "ERROR: the lesson {} was extracted, but the completion's durable event record failed: {}. The completion was not recorded; retry neurostrata_task_complete with `link_memory_id: \"{}\"` so the retry still publishes the sync record.",
+                lesson_id, e, lesson_id
+            )
+        })?;
     }
 
     // The completing session travels into the "done" history entry: without
@@ -12930,12 +12952,12 @@ exit 0
         );
     }
 
-    /// Linking an already-written memory adds the edge but creates no row, so
-    /// there is no "gave way to" to publish. The negative half of the
-    /// contract: an emit here would announce a move for a memory that was
-    /// already there.
+    /// Linking an already-written memory adds the edge but creates no row;
+    /// the completion still announces the VALIDATED lesson so the mesh sees
+    /// the task-to-lesson transition (#6). The pulse must name the row the
+    /// extraction edge actually points at, never an unvalidated caller id.
     #[tokio::test]
-    async fn linking_an_existing_memory_emits_nothing() {
+    async fn linking_an_existing_memory_announces_the_validated_lesson() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
         claim(&store, &id).await;
@@ -12970,13 +12992,73 @@ exit 0
         .await
         .expect("linking must not embed anything");
 
-        // The dispatcher is asynchronous, so a pulse in flight would show up
-        // late. Give it the window this path must stay silent through.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let pulses = pulses_seen(&seen, 1).await;
         assert!(
-            seen.lock().expect("recorder lock").is_empty(),
-            "binding an existing memory publishes no pulse"
+            pulses.iter().any(|pulse| matches!(
+                pulse,
+                ThalamicPulse::Superseded { old_id, new_id, .. }
+                    if old_id == &id && new_id == &mem_id
+            )),
+            "the completion must name the validated extraction target: {pulses:?}"
         );
+    }
+
+    /// The retry half of the same contract. A failed durable append leaves the
+    /// extraction edge stored and the completion unrecorded; the retry names
+    /// the lesson via `link_memory_id`, and that pairing -- edge durable
+    /// before the call, lesson named anyway -- must still publish the sync
+    /// record the failed attempt never delivered.
+    #[tokio::test]
+    async fn linking_a_lesson_against_an_already_stored_edge_emits_the_retry_pulse() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+        // The failed attempt's durable residue: the lesson and its edge,
+        // both stored before this completion call.
+        let mem_id = uuid::Uuid::new_v4().to_string();
+        let vector = StubEmbedder.embed("the lesson").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                &mem_id,
+                vector,
+                MemoryPayload {
+                    content: "the lesson".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "extracted_from": [id.as_str()] }),
+                },
+            )
+            .await
+            .unwrap();
+        let (bus, seen) = recording_bus();
+
+        handle_task_complete(
+            json!({ "namespace": "MyProj", "id": id, "link_memory_id": mem_id }),
+            emb(),
+            store.clone(),
+            None,
+            bus,
+        )
+        .await
+        .expect("the edge is already stored; the retry completes");
+
+        let pulses = pulses_seen(&seen, 1).await;
+        match &pulses[0] {
+            ThalamicPulse::Superseded {
+                old_id,
+                new_id,
+                namespace,
+            } => {
+                assert_eq!(old_id, &id, "the task is the row that gave way");
+                assert_eq!(new_id, &mem_id, "the named lesson is the replacement");
+                assert_eq!(namespace, "MyProj");
+            }
+            other => panic!("expected Superseded, got {:?}", other),
+        }
     }
 
     #[tokio::test]

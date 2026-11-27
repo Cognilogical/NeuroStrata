@@ -186,13 +186,24 @@ pub async fn archive_memory(
         }
     }
 
-    bus.emit(
-        ThalamicPulse::Archived {
-            id: id.clone(),
-            namespace: namespace.clone(),
-        },
-        &RecursionToken::root(),
-    );
+    // Class M (Wave 3): the tombstone's sync record goes through
+    // `emit_checked` -- a failed durable append is a Failed outcome, not a
+    // silent success the mesh never hears about.
+    if let Err(err) = bus
+        .emit_checked(
+            ThalamicPulse::Archived {
+                id: id.clone(),
+                namespace: namespace.clone(),
+            },
+            &RecursionToken::root(),
+        )
+        .await
+    {
+        return ArchiveOutcome::Failed(format!(
+            "Archived memory {}, but its durable event record failed: {}",
+            id, err
+        ));
+    }
 
     ArchiveOutcome::Archived { namespace, id }
 }

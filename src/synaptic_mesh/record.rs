@@ -59,6 +59,12 @@ pub struct MeshRecord {
     /// diff uses `(id, update_id)` as the identity tuple; a record at the
     /// same `update_id` is a no-op.
     pub update_id: Uuid,
+    /// Durable event sequence of the operation that wrote this revision.
+    /// Revision ids derived from a bus key are UUIDv5 and carry NO time
+    /// ordering, so a durable replay must be ordered by its sequence instead
+    /// of by `update_id`. Legacy/local records leave this `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bus_seq: Option<u64>,
     /// The mesh epoch when this record was first published. Two gates compare
     /// it against the mesh manifest's current epoch: `import::epoch_gate`
     /// refuses to *replay* a record born in an older epoch, and the
@@ -200,6 +206,7 @@ mod tests {
 
             relationships: vec![],
             update_id: Uuid::nil(),
+            bus_seq: None,
             origin_mesh_epoch: 1,
             trust: super::super::manifest::Trust::Trusted,
             signature: None,

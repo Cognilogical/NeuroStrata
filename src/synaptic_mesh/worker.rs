@@ -343,6 +343,21 @@ fn apply_one(
             // mark-committed). Idempotent: nothing to write, nothing to commit.
             return Ok((ApplyOutcome::AlreadyApplied, None));
         }
+        // Durable revision ids are UUIDv5 derived from a bus key: they carry
+        // NO chronological ordering. Order by the durable event's sequence;
+        // fall back to UUIDv7 ordering only for local/legacy revisions that
+        // have no bus sequence. An older replay must be consumed as a no-op
+        // instead of rolling a newer lifecycle back.
+        let stale = match (existing.bus_seq, record.bus_seq) {
+            (Some(committed), Some(incoming)) => incoming <= committed,
+            (None, None) => existing.update_id > record.update_id,
+            // One side has no durable identity: the durable/live operation is
+            // the later mutation, never a stale replay of a durable one.
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        if stale {
+            return Ok((ApplyOutcome::AlreadyApplied, None));
+        }
         // Guard against silent overwrite of independently authored records
         // that map to the same deterministic UUID (#249):
         // - If the on-disk record was created by a different node (`created_by != node_id`)
@@ -614,6 +629,7 @@ fn build_record(
         // The record's revision id IS the outbox entry's idempotency key, so
         // re-applying an entry produces byte-identical output.
         update_id: entry.stable_op_id,
+        bus_seq: entry.bus_seq,
         origin_mesh_epoch: epoch,
         trust: trust_from(&entry.metadata),
         signature: None,
@@ -1141,6 +1157,8 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
+            bus_key: None,
         }
     }
 
@@ -1196,6 +1214,45 @@ mod tests {
         assert_eq!(record.update_id, entry.stable_op_id);
         assert_eq!(record.origin_mesh_epoch, 1);
         assert_eq!(record.trust, Trust::Trusted);
+    }
+
+    #[test]
+    fn a_stale_durable_sequence_cannot_overwrite_a_newer_record() {
+        let (mesh, outbox) = fixture("stale-durable-seq", None);
+        let id = Uuid::now_v7();
+        // The newer operation first: `OP_ARCHIVED` at bus sequence 20, with a
+        // deterministic UUIDv5 revision id (as a durable emit produces).
+        let mut newer = created(&id.to_string(), shareable_metadata());
+        newer.op = OP_ARCHIVED.to_string();
+        newer.bus_seq = Some(20);
+        newer.stable_op_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"20:retire");
+        outbox.append(&newer).unwrap();
+        drain_once(&outbox, &mesh, "node-author").unwrap();
+
+        // A replay of an older sequence arrives with a UUIDv7 id that sorts
+        // ABOVE the v5 id. Revision-id ordering would roll the record back.
+        let mut stale = created(&id.to_string(), shareable_metadata());
+        stale.bus_seq = Some(3);
+        stale.stable_op_id = Uuid::from_bytes([
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF,
+        ]);
+        outbox.append(&stale).unwrap();
+        let report = drain_once(&outbox, &mesh, "node-author").unwrap();
+
+        let path = mesh
+            .root()
+            .join("ns")
+            .join("memories")
+            .join(format!("{id}.json"));
+        let record: MeshRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            record.lifecycle.state,
+            LifecycleState::Archived,
+            "the older replay must not overwrite the newer archive"
+        );
+        assert_eq!(report.applied, 0, "the stale entry is consumed as a no-op");
     }
 
     #[test]
@@ -1335,6 +1392,8 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
+            bus_key: None,
         };
         outbox.append(&entry).unwrap();
 
@@ -1516,6 +1575,8 @@ mod tests {
             superseded_by: Some(new_id.to_string()),
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
+            bus_key: None,
         };
         outbox.append(&entry).unwrap();
 
@@ -1546,6 +1607,8 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
+            bus_key: None,
         };
         outbox.append(&entry).unwrap();
 
@@ -1646,6 +1709,8 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_100,
             epoch: 1,
+            bus_seq: None,
+            bus_key: None,
         };
         outbox.append(&archive).unwrap();
         drain_once(&outbox, &mesh, "node-author").unwrap();
@@ -1977,6 +2042,8 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_100,
             epoch: 1,
+            bus_seq: None,
+            bus_key: None,
         };
         outbox.append(&archive).unwrap();
         drain_once(&outbox, &mesh, "node-other").unwrap();
@@ -2036,6 +2103,8 @@ mod tests {
             superseded_by: Some(successor.to_string()),
             ts: 1_700_000_100,
             epoch: 2,
+            bus_seq: None,
+            bus_key: None,
         };
         outbox.append(&supersede).unwrap();
         drain_once(&outbox, &mesh, "node-author").unwrap();
@@ -2154,6 +2223,8 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_100,
             epoch: 2,
+            bus_seq: None,
+            bus_key: None,
         };
         outbox.append(&archive).unwrap();
         drain_once(&outbox, &mesh, "node-other").unwrap();
@@ -2404,6 +2475,7 @@ mod tests {
             }),
             relationships: vec![],
             update_id: Uuid::now_v7(),
+            bus_seq: None,
             origin_mesh_epoch: 1,
             trust: Trust::Untrusted,
             signature: None,
@@ -2664,6 +2736,8 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_000,
             epoch: 1,
+            bus_seq: None,
+            bus_key: None,
         };
         outbox.append(&entry_a).unwrap();
         let rep_a = drain_once(&outbox, &mesh, "node-a").unwrap();
@@ -2684,6 +2758,8 @@ mod tests {
             superseded_by: None,
             ts: 1_700_000_100,
             epoch: 1,
+            bus_seq: None,
+            bus_key: None,
         };
         outbox.append(&entry_b).unwrap();
         let rep_b = drain_once(&outbox, &mesh, "node-b").unwrap();
