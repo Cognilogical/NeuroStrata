@@ -24,17 +24,29 @@ Every open of an existing store runs one migration inside the schema turn. It
 never blocks the open on its own account, and it never deletes a row or an
 edge.
 
-- **Primary key.** `CALL table_info('Memory')` must report `id` as the primary
-  key. If an older table's key is a different column, the open fails loudly with
-  `LegacyPrimaryKeyMigrationError` and leaves the original table untouched: the
-  pinned `lbug` engine has no `ALTER` that adds or changes a primary key, so a
-  half-migrated rebuild is refused rather than attempted.
-- **NULL namespaces.** A row with a `NULL` namespace is recovered from, in
-  order, `metadata.namespace`, a generation-scoped id
-  (`namespace::generation::path`), or the single qualified row that shares its
-  logical path in exactly one namespace. A row with no recoverable owner moves
-  to the `_quarantine` namespace with `metadata.quarantine` recorded; it is
-  still there, just out of ordinary reads.
+This port is **independent of #68**: it does not depend on, sequence with, or
+block that work. It only normalizes already-present on-disk stores so the
+current binary can open them; no #68 schema or lifecycle change is assumed.
+
+- **Primary key.** When `CALL table_info('Memory')` does not report `id` as the
+  sole primary key, the open rebuilds the table keyed by `id` into scratch
+  tables, copies every row and relationship, validates the counts, and only
+  then swaps the names. The migration reports `pk_rebuilt = true`; the original
+  tables are renamed aside until the replacement passes validation, and an
+  interrupted swap is resumed or rolled back on the next open before a fresh
+  `Memory` table can be created. A rebuild that cannot copy every row or edge
+  fails loudly with `LegacyPrimaryKeyMigrationError` and leaves the source
+  tables untouched.
+- **NULL namespaces.** `metadata.namespace` is checked first, then the trusted
+  structural owner: a generation-scoped id (`namespace::generation::path`) or
+  the single qualified row that shares its logical path in exactly one
+  namespace. When both exist and disagree, or when only an unverified metadata
+  claim exists against contradicting structural evidence, the row moves to
+  `_quarantine` instead of being exposed under a tenant that never owned it.
+  Imported rows with foreign mesh provenance or private eligibility are never
+  rewritten or quarantined. A row with no recoverable owner moves to
+  `_quarantine` with `metadata.quarantine` recorded; it is still there, just
+  out of ordinary reads, list, search and export.
 - **Legacy ids.** Rows an older binary wrote as bare ids are recorded in
   `LegacyIdAlias (id, namespace, canonical_id)`. A later re-ingest of the
   qualified id resolves through that alias and updates the existing row in
