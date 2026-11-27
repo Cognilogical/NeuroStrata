@@ -499,6 +499,27 @@ pub fn build_merged_registry_payload(
 /// function that holds it must not call another function that takes it.
 pub(crate) static REGISTRY_ROW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Restores the registry row to the state captured before a failed write.
+/// `None` means the row did not exist and must be removed. The same row lock
+/// `write_registry` takes is held, so the restore is serialized with
+/// registration writes rather than interleaving with one.
+pub async fn rollback_registry(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    before: Option<(Vec<f32>, MemoryPayload)>,
+) -> Option<String> {
+    let _guard = REGISTRY_ROW_LOCK.lock().await;
+    let registry_id = registry_row_id(namespace);
+    let result = match before {
+        Some((vector, payload)) => store
+            .upsert(namespace, &registry_id, vector, payload)
+            .await
+            .map(|_| ()),
+        None => store.delete(namespace, &registry_id).await,
+    };
+    result.err().map(|e| format!("{}", e))
+}
+
 /// Read-merge-write the registry under a process-wide mutex (the guard is held
 /// across awaits, so this is a `tokio` mutex). `None` on success; `Some(warning)`
 /// when the cache did not stick -- the write it belongs to has already been

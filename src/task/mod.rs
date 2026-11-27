@@ -345,29 +345,214 @@ async fn follow_up_committed(
     }
 }
 
-/// Staged follow-ups left behind by a completion that stopped before its
-/// parent save, keyed by title. A retry after that crash reuses these rows
-/// instead of creating a second set. Ids already on the parent's commit list
-/// are prior committed work and are never reused.
-async fn staged_follow_ups_by_title(
+/// A child row written by a completion that has not committed yet. The flag
+/// is durable and the row is parked in `done` state, so an older daemon in a
+/// rolling deployment -- which knows nothing about this protocol -- treats
+/// it as history and never offers it for claim. Children written before the
+/// protocol have no flag and stay ordinary work.
+fn follow_up_is_staged(payload: &MemoryPayload) -> bool {
+    payload
+        .metadata
+        .get("task")
+        .and_then(|t| t.get("follow_up_staged"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// True when a follow-up may be read as work. A legacy child (no staged flag)
+/// is already committed work from before the protocol: hiding it after an
+/// upgrade would strand it. A flagged child needs its parent's commit list.
+async fn follow_up_may_proceed(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    id: &str,
+    payload: &MemoryPayload,
+) -> bool {
+    let Some(parent) = spawned_from_of(payload) else {
+        return true;
+    };
+    if !follow_up_is_staged(payload) {
+        return true;
+    }
+    follow_up_committed(store, namespace, id, &parent).await
+}
+
+/// Matches staged children to retry specs one-to-one (title order, so two
+/// specs with the same title consume two distinct rows) and returns the ids
+/// that no spec claims. Those orphans were staged by a stopped attempt whose
+/// retry changed or dropped them: leaving them parked would hide them from
+/// every listing forever, so the caller removes them during reconciliation.
+async fn reconcile_staged_follow_ups(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     parent_id: &str,
     committed: &HashSet<String>,
-) -> HashMap<String, String> {
-    let mut out = HashMap::new();
+    titles: &[String],
+) -> (Vec<Option<String>>, Vec<String>) {
+    let mut by_title: HashMap<String, Vec<String>> = HashMap::new();
     if let Ok(rows) = store.list(namespace, None, Some("task")).await {
         for r in rows {
             if r.id == parent_id || committed.contains(&r.id) {
                 continue;
             }
-            if spawned_from_of(&r.payload).as_deref() != Some(parent_id) {
+            if spawned_from_of(&r.payload).as_deref() != Some(parent_id)
+                || !follow_up_is_staged(&r.payload)
+            {
                 continue;
             }
-            out.entry(r.payload.content.clone()).or_insert(r.id.clone());
+            by_title
+                .entry(r.payload.content.clone())
+                .or_default()
+                .push(r.id.clone());
         }
     }
-    out
+    let mut matched = Vec::with_capacity(titles.len());
+    for title in titles {
+        let id = by_title.get_mut(title).and_then(|ids| ids.pop());
+        matched.push(id);
+    }
+    let orphans: Vec<String> = by_title.into_values().flatten().collect();
+    (matched, orphans)
+}
+
+/// Rewrites a reused staged child with the fields the retry actually asked
+/// for. Reuse by title alone would silently keep the crashed attempt's
+/// description, priority and labels when the caller changed them.
+async fn restage_follow_up(
+    store: &Arc<dyn VectorStore>,
+    emb: &Arc<dyn Embedder>,
+    namespace: &str,
+    id: &str,
+    spec: &(String, Option<String>, String, i64, Vec<String>),
+) -> Result<(), String> {
+    let (title, description, task_type, priority, labels) = spec;
+    let lock = claim_lock(id);
+    let _guard = lock.lock().await;
+    let (_, mut payload) = store
+        .get(namespace, id)
+        .await
+        .map_err(|e| format!("ERROR: could not restage follow-up {}: {}", id, e))?
+        .ok_or_else(|| format!("ERROR: staged follow-up {} no longer exists", id))?;
+    payload.content = title.clone();
+    let vector = emb
+        .embed(&payload.content)
+        .await
+        .map_err(|e| format!("ERROR: could not embed restaged follow-up {}: {}", id, e))?;
+    if let Some(obj) = payload.metadata.as_object_mut() {
+        if let Some(t) = obj.get_mut("task").and_then(Value::as_object_mut) {
+            t.insert("priority".to_string(), json!(*priority));
+            t.insert("task_type".to_string(), json!(task_type));
+            match description {
+                Some(d) => {
+                    t.insert("description".to_string(), json!(d));
+                }
+                None => {
+                    t.remove("description");
+                }
+            }
+            if labels.is_empty() {
+                t.remove("labels");
+            } else {
+                t.insert("labels".to_string(), json!(labels));
+            }
+        }
+    }
+    store
+        .upsert(namespace, id, vector, payload)
+        .await
+        .map_err(|e| format!("ERROR: could not restage follow-up {}: {}", id, e))?;
+    Ok(())
+}
+
+/// Opens a staged child after its parent's completion has committed. The
+/// parked `done` status and staged flag are protocol state, not a decision the
+/// child made: the parent's completion owns the transition back to open work.
+/// The vector is reused -- activation changes metadata, not the title -- so
+/// the same function can be called by startup recovery without an embedder.
+async fn commit_staged_follow_up(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    id: &str,
+) -> Result<(), String> {
+    let lock = claim_lock(id);
+    let _guard = lock.lock().await;
+    let (vector, mut payload) = store
+        .get(namespace, id)
+        .await
+        .map_err(|e| format!("ERROR: could not commit follow-up {}: {}", id, e))?
+        .ok_or_else(|| format!("ERROR: committed follow-up {} no longer exists", id))?;
+    if !follow_up_is_staged(&payload) {
+        return Ok(());
+    }
+    let Some(parent) = spawned_from_of(&payload) else {
+        return Ok(());
+    };
+    if !follow_up_committed(store, namespace, id, &parent).await {
+        return Err(format!(
+            "ERROR: follow-up {} is not committed by {} and cannot be opened",
+            id, parent
+        ));
+    }
+    if let Some(obj) = payload.metadata.as_object_mut() {
+        if let Some(t) = obj.get_mut("task").and_then(Value::as_object_mut) {
+            t.remove("follow_up_staged");
+        }
+    }
+    let task = machine::Task {
+        id: id.to_string(),
+        payload: payload.clone(),
+    };
+    if task.status() != Status::Open {
+        let ctx = machine::Ctx {
+            reason: "follow-up committed with parent completion".to_string(),
+            extraction_edge_exists: false,
+            actor: "system".to_string(),
+            session: String::new(),
+        };
+        let opened = machine::apply(&task, Status::Open, &ctx)
+            .map_err(|e| format!("ERROR: could not open committed follow-up {}: {}", id, e))?;
+        payload = opened.payload;
+    }
+    store
+        .upsert(namespace, id, vector, payload)
+        .await
+        .map_err(|e| format!("ERROR: could not commit follow-up {}: {}", id, e))?;
+    Ok(())
+}
+
+/// Opens children a committed completion left parked. A stop between the
+/// parent save and the child activation, or a transient write failure, leaves
+/// the staged flag in place; the commit list on the done parent is the durable
+/// authority for reopening them on the next start.
+pub async fn activate_committed_follow_ups(store: &Arc<dyn VectorStore>) -> Vec<String> {
+    let mut failed = Vec::new();
+    let namespaces = match store.list_namespaces().await {
+        Ok(namespaces) => namespaces,
+        Err(e) => {
+            tracing::warn!("follow-up activation could not list namespaces: {}", e);
+            return failed;
+        }
+    };
+    for namespace in namespaces {
+        let rows = match store.list(&namespace, None, Some("task")).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("follow-up activation could not list '{}': {}", namespace, e);
+                continue;
+            }
+        };
+        let committed = committed_follow_ups(&rows);
+        for row in rows {
+            if !follow_up_is_staged(&row.payload) || !committed.contains(&row.id) {
+                continue;
+            }
+            if let Err(e) = commit_staged_follow_up(store, &namespace, &row.id).await {
+                tracing::warn!("follow-up activation failed for {}: {}", row.id, e);
+                failed.push(row.id);
+            }
+        }
+    }
+    failed
 }
 
 /// `ready` (section 3.2): open AND every blocker done. A blocker that is
@@ -383,7 +568,7 @@ fn is_ready(
     // A follow-up is ready only after its parent's completion committed.
     // The commit list (not the parent's current status) is the evidence: a
     // reopened parent must not make its already-committed children unready.
-    if spawned_from_of(payload).is_some() && !committed.contains(id) {
+    if follow_up_is_staged(payload) && !committed.contains(id) {
         return false;
     }
     blocked_by_of(payload)
@@ -790,12 +975,17 @@ async fn rollback_extraction_edges(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     parent_id: &str,
-    linked_before: &Option<(String, Vec<f32>, MemoryPayload)>,
+    linked_before: &Option<(String, Vec<f32>, MemoryPayload, bool)>,
     inline_created: &Option<String>,
     dedup_linked_id: &Option<String>,
 ) -> Vec<String> {
     let mut failed = Vec::new();
     if let Some(created_id) = inline_created {
+        // A concurrent completion can touch the same lesson row. Serialize
+        // this read-modify-write with the edge-add path on the row's own lock
+        // so neither side overwrites the other's edge.
+        let lock = claim_lock(created_id);
+        let _guard = lock.lock().await;
         match store.get(namespace, created_id).await {
             Ok(Some((vector, mut payload))) => {
                 if remove_extraction_edge(&mut payload, parent_id) {
@@ -823,12 +1013,19 @@ async fn rollback_extraction_edges(
             }
         }
     }
-    for link_id in linked_before
+    for (link_id, edge_added) in linked_before
         .as_ref()
-        .map(|(id, _, _)| id.clone())
+        .map(|(id, _, _, added)| (id.clone(), *added))
         .into_iter()
-        .chain(dedup_linked_id.clone())
+        .chain(dedup_linked_id.clone().map(|id| (id, true)))
     {
+        // A row that already carried this task's edge before the completion
+        // is history: rolling it back must not erase an older association.
+        if !edge_added {
+            continue;
+        }
+        let lock = claim_lock(&link_id);
+        let _guard = lock.lock().await;
         match store.get(namespace, &link_id).await {
             Ok(Some((vector, mut payload))) => {
                 remove_extraction_edge(&mut payload, parent_id);
@@ -851,17 +1048,27 @@ async fn rollback_extraction_edges(
     failed
 }
 
-/// Undoes every write a failed completion made: follow-up rows and all three
-/// extraction paths. Returns every id whose cleanup failed; callers must
-/// surface them rather than report a clean refusal over partial state.
+/// Registry state captured before a completion registered new domains. The
+/// row is a namespace-wide cache, so a rolled-back completion must restore
+/// the exact prior list (or remove the row when it did not exist).
+#[derive(Clone)]
+struct RegistryUndo {
+    before: Option<(Vec<f32>, MemoryPayload)>,
+}
+
+/// Undoes every write a failed completion made: follow-up rows, all three
+/// extraction paths, and any domain-registry cache entry it added. Returns
+/// every id whose cleanup failed; callers must surface them rather than
+/// report a clean refusal over partial state.
 async fn rollback_completion(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     parent_id: &str,
     follow_up_ids: &[String],
-    linked_before: &Option<(String, Vec<f32>, MemoryPayload)>,
+    linked_before: &Option<(String, Vec<f32>, MemoryPayload, bool)>,
     inline_created: &Option<String>,
     dedup_linked_id: &Option<String>,
+    registry_undo: Option<&RegistryUndo>,
 ) -> Vec<String> {
     let mut failed = rollback_follow_up_tasks(store, namespace, follow_up_ids).await;
     failed.extend(
@@ -875,6 +1082,14 @@ async fn rollback_completion(
         )
         .await,
     );
+    if let Some(undo) = registry_undo {
+        if let Some(err) =
+            crate::registry::rollback_registry(store, namespace, undo.before.clone()).await
+        {
+            tracing::warn!("failed to roll back the domain registry: {}", err);
+            failed.push(format!("domain registry in '{}'", namespace));
+        }
+    }
     failed
 }
 
@@ -3132,7 +3347,7 @@ static CLAIM_LOCKS: OnceLock<StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()
 /// all claim traffic in the shipped topology. The store's upsert API has no
 /// conditional write to build a CAS on, so the process lock is the smallest
 /// honest atomicity mechanism.
-fn claim_lock(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn claim_lock(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     let registry = CLAIM_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
     let mut map = registry.lock().unwrap_or_else(|e| e.into_inner());
     map.retain(|_, lock| lock.strong_count() > 0);
@@ -3142,6 +3357,135 @@ fn claim_lock(task_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     let lock = Arc::new(tokio::sync::Mutex::new(()));
     map.insert(task_id.to_string(), Arc::downgrade(&lock));
     lock
+}
+
+/// Stable id for the durable record of a completion's Superseded pulse.
+fn completion_event_outbox_id(task_id: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("neurostrata:completion-event:{task_id}").as_bytes(),
+    )
+    .to_string()
+}
+
+/// Writes the completion pulse to a durable outbox row immediately before the
+/// parent save that commits it. The bus is in-memory and cannot replay; the
+/// store can. A stop between commit and emit is recovered by
+/// `replay_pending_completion_events`.
+async fn stage_completion_event(
+    store: &Arc<dyn VectorStore>,
+    emb: &Arc<dyn Embedder>,
+    namespace: &str,
+    task_id: &str,
+    lesson_id: &str,
+) -> Result<(), String> {
+    let vector = emb
+        .embed(&format!("completion event {task_id}"))
+        .await
+        .map_err(|e| format!("ERROR: could not stage the completion event: {}", e))?;
+    let payload = MemoryPayload {
+        content: lesson_id.to_string(),
+        user_id: "system".to_string(),
+        memory_type: "event_outbox".to_string(),
+        agent_name: None,
+        location: String::new(),
+        location_lines: String::new(),
+        metadata: json!({
+            "event_outbox": {
+                "task_id": task_id,
+                "lesson_id": lesson_id,
+                "namespace": namespace,
+            },
+            "eligibility": "private",
+        }),
+    };
+    store
+        .upsert(
+            namespace,
+            &completion_event_outbox_id(task_id),
+            vector,
+            payload,
+        )
+        .await
+        .map_err(|e| format!("ERROR: could not stage the completion event: {}", e))?;
+    Ok(())
+}
+
+async fn clear_completion_event(store: &Arc<dyn VectorStore>, namespace: &str, task_id: &str) {
+    let _ = store
+        .delete(namespace, &completion_event_outbox_id(task_id))
+        .await;
+}
+
+/// Dispatches pulses whose parent committed but whose emit was lost to a
+/// process stop, and discards pulses whose parent never committed. At-least-
+/// once delivery is intentional: the mesh outbox already deduplicates by id.
+pub async fn replay_pending_completion_events(
+    store: &Arc<dyn VectorStore>,
+    bus: &Arc<crate::events::ThalamicBus>,
+) {
+    let namespaces = match store.list_namespaces().await {
+        Ok(namespaces) => namespaces,
+        Err(e) => {
+            tracing::warn!("completion outbox replay could not list namespaces: {}", e);
+            return;
+        }
+    };
+    for namespace in namespaces {
+        let rows = match store.list(&namespace, None, Some("event_outbox")).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    "completion outbox replay could not list '{}': {}",
+                    namespace,
+                    e
+                );
+                continue;
+            }
+        };
+        for row in rows {
+            let Some(outbox) = row.payload.metadata.get("event_outbox") else {
+                continue;
+            };
+            let task_id = outbox
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let lesson_id = outbox
+                .get("lesson_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if task_id.is_empty() || lesson_id.is_empty() {
+                let _ = store.delete(&namespace, &row.id).await;
+                continue;
+            }
+            let committed = matches!(
+                store.get(&namespace, task_id).await,
+                Ok(Some((_, parent)))
+                    if parent
+                        .metadata
+                        .get("task")
+                        .and_then(|t| t.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("done")
+            );
+            if !committed {
+                // The completion rolled back or crashed before commit: the
+                // pulse must never be published for work that did not finish.
+                let _ = store.delete(&namespace, &row.id).await;
+                continue;
+            }
+            bus.emit(
+                crate::events::ThalamicPulse::Superseded {
+                    old_id: task_id.to_string(),
+                    new_id: lesson_id.to_string(),
+                    namespace: namespace.clone(),
+                },
+                &crate::events::RecursionToken::root(),
+            );
+            let _ = store.delete(&namespace, &row.id).await;
+        }
+    }
 }
 
 async fn resolve_task_scope(
@@ -3300,13 +3644,12 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
     // worker pick up a row a failed completion may delete. The commit list,
     // not the parent's current status, is the evidence: reopening a parent
     // must not strand its already-committed children.
-    if let Some(parent_id) = spawned_from_of(&task.payload) {
-        if !follow_up_committed(&store, &namespace, &id, &parent_id).await {
-            return format!(
-                "ERROR: task {} is a follow-up of {} and is not claimable until that completion commits.",
-                id, parent_id
-            );
-        }
+    if !follow_up_may_proceed(&store, &namespace, &id, &task.payload).await {
+        return format!(
+            "ERROR: task {} is a staged follow-up of {} and is not claimable until that completion commits.",
+            id,
+            spawned_from_of(&task.payload).unwrap_or_default()
+        );
     }
     let from = task.status();
     let holder = task
@@ -3730,13 +4073,12 @@ pub async fn handle_task_update(
     // A staged follow-up can still be deleted by its parent's rollback. Refuse
     // every mutation until that completion commits, so an update cannot turn
     // a child into active work (or a claimed row) underneath a rollback.
-    if let Some(parent_id) = spawned_from_of(&task.payload) {
-        if !follow_up_committed(&store, &namespace, &id, &parent_id).await {
-            return format!(
-                "ERROR: task {} is a staged follow-up of {} and cannot be mutated until that completion commits.",
-                id, parent_id
-            );
-        }
+    if !follow_up_may_proceed(&store, &namespace, &id, &task.payload).await {
+        return format!(
+            "ERROR: task {} is a staged follow-up of {} and cannot be mutated until that completion commits.",
+            id,
+            spawned_from_of(&task.payload).unwrap_or_default()
+        );
     }
     let from = task.status();
     let history_before = task
@@ -4123,7 +4465,7 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
     }
     // An uncommitted follow-up is staged work that a failed completion may
     // still roll back: hide it from ordinary listings, not just `ready`.
-    tasks.retain(|m| spawned_from_of(&m.payload).is_none() || committed.contains(&m.id));
+    tasks.retain(|m| !follow_up_is_staged(&m.payload) || committed.contains(&m.id));
     if ready_only {
         tasks.retain(|m| {
             gate::task_status(m) == Status::Open
@@ -4230,16 +4572,19 @@ pub async fn handle_task_complete(
 ) -> Result<String, String> {
     let id = required_str(&args, "id")?.to_string();
     let namespace_arg = required_str(&args, "namespace")?;
-    let namespace = crate::server::resolve_namespace(&store, namespace_arg).await;
-    check_namespace(&namespace)?;
 
-    // Judge the caller's raw completion payload before redaction, the
-    // per-task lock, or namespace normalization. A secret in the reason,
-    // a follow-up spec, or the inline memory refuses the whole completion
-    // while the store is still untouched.
+    // Judge the caller's raw completion payload before redaction, namespace
+    // resolution, the per-task lock, or any write. resolve_namespace logs the
+    // raw request when several case-insensitive spellings exist, so scanning
+    // after it would expose a secret-bearing namespace to stderr before the
+    // completion is refused. A secret anywhere in the payload refuses the
+    // whole completion while the store is still untouched.
     if let Some(rejection) = scan_raw_task_args(&args, "task_complete") {
         return Err(rejection);
     }
+
+    let namespace = crate::server::resolve_namespace(&store, namespace_arg).await;
+    check_namespace(&namespace)?;
 
     let reason = arg_str(&args, "reason")
         .or_else(|| arg_str(&args, "close_reason"))
@@ -4285,6 +4630,16 @@ pub async fn handle_task_complete(
     precheck::normalize_and_precheck_namespace(&*store, &namespace).await?;
 
     let (task, vector) = load_task(&store, &namespace, &id).await?;
+    // A staged follow-up can still be deleted by its parent's rollback.
+    // Completing it first would leave an extraction whose owner disappears,
+    // so refuse until the parent's completion names it as committed.
+    if !follow_up_may_proceed(&store, &namespace, &id, &task.payload).await {
+        return Err(format!(
+            "ERROR: task {} is a staged follow-up of {} and cannot be completed until that completion commits.",
+            id,
+            spawned_from_of(&task.payload).unwrap_or_default()
+        ));
+    }
     // The clock the gate reads with: a lesson row that has been retired is
     // history and discharges nothing, so the completion path asks the same
     // question the gate asks.
@@ -4479,9 +4834,13 @@ pub async fn handle_task_complete(
     // save) rolls it back instead of leaving it behind an unfinished task.
     // Path 2 restores the linked row's before-image; Path 3 deletes the
     // row it created (a dedup-linked pre-existing row is never deleted).
-    let mut linked_before: Option<(String, Vec<f32>, MemoryPayload)> = None;
+    let mut linked_before: Option<(String, Vec<f32>, MemoryPayload, bool)> = None;
     let mut inline_created: Option<String> = None;
     let mut dedup_linked_id: Option<String> = None;
+    // Captured only when this completion actually writes the registry, so a
+    // failed completion restores the exact prior cache instead of leaving a
+    // domain it never committed as registered.
+    let mut registry_undo: Option<RegistryUndo> = None;
 
     // Path 2: bind an already-written memory. Its existing vector is reused
     // verbatim -- linking must never change what the memory ranks for.
@@ -4493,6 +4852,10 @@ pub async fn handle_task_complete(
                     id
                 ));
             }
+            // The same per-row lock rollback uses: a get -> add-edge -> upsert
+            // must not interleave with another completion's edge on this row.
+            let link_lock = claim_lock(link_id);
+            let _link_guard = link_lock.lock().await;
             let (existing_vector, mut payload) = match store.get(&namespace, link_id).await {
                 Ok(Some(found)) => found,
                 Ok(None) => {
@@ -4509,7 +4872,20 @@ pub async fn handle_task_complete(
                     link_id
                 ));
             }
-            linked_before = Some((link_id.clone(), existing_vector.clone(), payload.clone()));
+            // Record whether *this* completion added the edge. A row that
+            // already named the task (a retired memory, or a prior attempt)
+            // carries history that rollback must not delete.
+            let edge_added = !payload
+                .metadata
+                .get("extracted_from")
+                .and_then(Value::as_array)
+                .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(id.as_str())));
+            linked_before = Some((
+                link_id.clone(),
+                existing_vector.clone(),
+                payload.clone(),
+                edge_added,
+            ));
             let declared = payload.metadata.get("extracted_from").cloned();
             let mut arr: Vec<Value> = match declared {
                 None => Vec::new(),
@@ -4550,6 +4926,7 @@ pub async fn handle_task_complete(
                         &linked_before,
                         &inline_created,
                         &dedup_linked_id,
+                        registry_undo.as_ref(),
                     )
                     .await;
                     return Err(with_rollback_failures(e, &failed));
@@ -4732,10 +5109,39 @@ pub async fn handle_task_complete(
             // Only now, with the extraction durable: a cache failure is
             // reported and never undoes the acceptance.
             if let Some(domains) = pending_registry.take() {
+                // Capture the row as it stands before the write so a later
+                // failure can restore it: the registry is namespace-wide, and
+                // leaving a domain from a rolled-back completion would make
+                // later checks treat it as registered.
+                let before = match store
+                    .get(&namespace, &crate::registry::registry_row_id(&namespace))
+                    .await
+                {
+                    Ok(row) => row,
+                    Err(e) => {
+                        let failed = rollback_completion(
+                            &store,
+                            &namespace,
+                            &id,
+                            &[],
+                            &linked_before,
+                            &inline_created,
+                            &dedup_linked_id,
+                            registry_undo.as_ref(),
+                        )
+                        .await;
+                        return Err(with_rollback_failures(
+                            format!("ERROR: could not read the domain registry: {}", e),
+                            &failed,
+                        ));
+                    }
+                };
                 if let Some(warning) =
                     crate::registry::write_registry(&store, &emb, &namespace, &domains).await
                 {
                     registry_warnings.push(warning);
+                } else {
+                    registry_undo = Some(RegistryUndo { before });
                 }
             }
             memories = match list_now().await {
@@ -4749,6 +5155,7 @@ pub async fn handle_task_complete(
                         &linked_before,
                         &inline_created,
                         &dedup_linked_id,
+                        registry_undo.as_ref(),
                     )
                     .await;
                     return Err(with_rollback_failures(e, &failed));
@@ -4821,6 +5228,7 @@ pub async fn handle_task_complete(
                 &linked_before,
                 &inline_created,
                 &dedup_linked_id,
+                registry_undo.as_ref(),
             )
             .await;
             return Err(with_rollback_failures(format!("ERROR: {}", e), &failed));
@@ -4840,9 +5248,9 @@ pub async fn handle_task_complete(
     let follow_user_id = arg_str(&args, "user_id").unwrap_or("unknown").to_string();
     let follow_agent = arg_str(&args, "agent_name").map(|s| s.to_string());
     let mut follow_up_created_ids: Vec<String> = Vec::new();
-    // Recovery from a partial completion: a run that stopped after staging
-    // children but before this parent save left them on the parent's
-    // spawned_from list. Reuse them by title instead of duplicating work.
+    // Recovery from a partial completion: the rows a stopped attempt staged
+    // are matched to this attempt's specs one-to-one, so changed fields are
+    // applied and two specs with the same title keep two distinct children.
     let parent_committed: HashSet<String> = task
         .payload
         .metadata
@@ -4856,10 +5264,39 @@ pub async fn handle_task_complete(
                 .collect()
         })
         .unwrap_or_default();
-    let staged_by_title =
-        staged_follow_ups_by_title(&store, &namespace, &id, &parent_committed).await;
-    for (title, description, task_type, priority, labels) in &follow_up_specs {
-        if let Some(existing) = staged_by_title.get(title) {
+    let titles: Vec<String> = follow_up_specs.iter().map(|s| s.0.clone()).collect();
+    let (reused, orphans) =
+        reconcile_staged_follow_ups(&store, &namespace, &id, &parent_committed, &titles).await;
+    // A retry that dropped or renamed a spec must not strand its old staged
+    // child: parked in done state, no listing would ever offer it again.
+    let orphan_failures = rollback_follow_up_tasks(&store, &namespace, &orphans).await;
+    if !orphan_failures.is_empty() {
+        return Err(with_rollback_failures(
+            format!(
+                "ERROR: staged follow-up(s) {} could not be reconciled and remain parked",
+                orphan_failures.join(", ")
+            ),
+            &[],
+        ));
+    }
+    for (index, spec) in follow_up_specs.iter().enumerate() {
+        let (title, description, task_type, priority, labels) = spec;
+        if let Some(existing) = &reused[index] {
+            if let Err(e) = restage_follow_up(&store, &emb, &namespace, existing, spec).await {
+                let mut failed = rollback_completion(
+                    &store,
+                    &namespace,
+                    &id,
+                    &follow_up_created_ids,
+                    &linked_before,
+                    &inline_created,
+                    &dedup_linked_id,
+                    registry_undo.as_ref(),
+                )
+                .await;
+                failed.extend(orphan_failures.clone());
+                return Err(with_rollback_failures(e, &failed));
+            }
             follow_up_created_ids.push(existing.clone());
             continue;
         }
@@ -4867,6 +5304,11 @@ pub async fn handle_task_complete(
         task_meta.insert("priority".to_string(), json!(*priority));
         task_meta.insert("task_type".to_string(), json!(task_type));
         task_meta.insert("spawned_from".to_string(), json!(id.as_str()));
+        // Park the child as history until the parent saves Done. An older
+        // daemon sharing the store during a rolling deployment treats a done
+        // row as history and cannot claim it out from under this completion.
+        task_meta.insert("follow_up_staged".to_string(), json!(true));
+        task_meta.insert("status".to_string(), json!("done"));
         if !labels.is_empty() {
             task_meta.insert("labels".to_string(), json!(labels));
         }
@@ -4890,7 +5332,7 @@ pub async fn handle_task_complete(
         {
             Ok((new_id, _payload)) => follow_up_created_ids.push(new_id),
             Err(e) => {
-                let failed = rollback_completion(
+                let mut failed = rollback_completion(
                     &store,
                     &namespace,
                     &id,
@@ -4898,8 +5340,10 @@ pub async fn handle_task_complete(
                     &linked_before,
                     &inline_created,
                     &dedup_linked_id,
+                    registry_undo.as_ref(),
                 )
                 .await;
+                failed.extend(orphan_failures.clone());
                 return Err(with_rollback_failures(e, &failed));
             }
         }
@@ -4927,6 +5371,25 @@ pub async fn handle_task_complete(
         }
     }
 
+    // Persist the pulse before the commit point so a stop after the parent
+    // save but before `bus.emit` can still dispatch it on the next start.
+    if let Some(lesson_id) = &inline_lesson {
+        if let Err(e) = stage_completion_event(&store, &emb, &namespace, &id, lesson_id).await {
+            let failed = rollback_completion(
+                &store,
+                &namespace,
+                &id,
+                &follow_up_created_ids,
+                &linked_before,
+                &inline_created,
+                &dedup_linked_id,
+                registry_undo.as_ref(),
+            )
+            .await;
+            return Err(with_rollback_failures(e, &failed));
+        }
+    }
+
     if let Err(e) = save_task(&store, &namespace, &id, vector, completed.payload.clone()).await {
         let failed = rollback_completion(
             &store,
@@ -4936,12 +5399,32 @@ pub async fn handle_task_complete(
             &linked_before,
             &inline_created,
             &dedup_linked_id,
+            registry_undo.as_ref(),
         )
         .await;
         return Err(with_rollback_failures(e, &failed));
     }
-    // The parent's save is the commit point: only after it succeeds are the
-    // children visible to list/claim (their spawned_from parent is now Done).
+    // Activation happens only after the parent save. Until then the children
+    // stay parked as done with a durable staged flag, so even an older daemon
+    // that does not know the protocol cannot claim them before the commit.
+    let mut activation_failed = Vec::new();
+    for fid in &follow_up_created_ids {
+        if let Err(e) = commit_staged_follow_up(&store, &namespace, fid).await {
+            tracing::warn!("follow-up {} could not be opened after commit: {}", fid, e);
+            activation_failed.push(fid.clone());
+        }
+    }
+    if !activation_failed.is_empty() {
+        // The commit list on the done parent is durable authority: a restart
+        // (or this best-effort pass) opens whatever a transient write missed.
+        activation_failed = activate_committed_follow_ups(&store).await;
+        if !activation_failed.is_empty() {
+            tracing::warn!(
+                "follow-up activation pending after restart: {}",
+                activation_failed.join(", ")
+            );
+        }
+    }
     let session_roots = session_file_roots_for(&args, &task);
     clear_finished_task_from_session_file(&store, &namespace, &id, &session_roots).await;
     // Emit site 3 (see the note above the gate): only now, with the parent
@@ -4956,6 +5439,7 @@ pub async fn handle_task_complete(
             &crate::events::RecursionToken::root(),
         );
     }
+    clear_completion_event(&store, &namespace, &id).await;
     let event_id = arg_str(&args, "event_id")
         .unwrap_or(&format!("complete-{}", id))
         .to_string();
@@ -7237,6 +7721,14 @@ pub async fn import_beads(
     namespace: &str,
     from_beads: &str,
 ) -> Result<ImportSummary, String> {
+    // The namespace becomes a durable store key, so judge it before the
+    // schema init and every write below: a secret in it must be refused,
+    // not persisted as the namespace of the imported rows.
+    if let Some(rejection) =
+        crate::secrets::scan_entry_point(namespace, &Value::Null, "task_import")
+    {
+        return Err(rejection.to_string());
+    }
     let raw = std::fs::read_to_string(from_beads)
         .map_err(|e| format!("ERROR: could not read {}: {}", from_beads, e))?;
 
@@ -14012,6 +14504,13 @@ exit 0
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
         claim(&store, &id).await;
+        let before: Vec<(String, String)> = store
+            .list("MyProj", None, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.id.clone(), serde_json::to_string(&r.payload).unwrap()))
+            .collect();
         let token = scanner_fixture();
         let err = handle_task_complete(
             json!({
@@ -14028,6 +14527,14 @@ exit 0
         .await
         .expect_err("a secret session_id must refuse before any write");
         assert_security_refusal(&err);
+        let after: Vec<(String, String)> = store
+            .list("MyProj", None, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.id.clone(), serde_json::to_string(&r.payload).unwrap()))
+            .collect();
+        assert_eq!(after, before, "refusal leaves every store row unchanged");
         assert_eq!(status_of(&store, "MyProj", &id).await, Status::InProgress);
     }
 
@@ -14635,6 +15142,7 @@ exit 0
         claim(&store, &parent).await;
         let mut task_meta = Map::new();
         task_meta.insert("spawned_from".to_string(), json!(parent));
+        task_meta.insert("follow_up_staged".to_string(), json!(true));
         let mut top_level = Map::new();
         top_level.insert("related_to".to_string(), json!([parent]));
         let (child, _) = store_new_task(
@@ -14704,6 +15212,7 @@ exit 0
         claim(&store, &parent).await;
         let mut task_meta = Map::new();
         task_meta.insert("spawned_from".to_string(), json!(parent));
+        task_meta.insert("follow_up_staged".to_string(), json!(true));
         let (child, _) = store_new_task(
             &store,
             &emb(),
@@ -14717,6 +15226,13 @@ exit 0
         )
         .await
         .expect("staged child");
+        let before = store
+            .get("MyProj", &child)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .clone();
         let reply = handle_task_update(
             json!({ "namespace": "MyProj", "id": child, "note": "handoff" }),
             emb(),
@@ -14727,6 +15243,12 @@ exit 0
             reply.contains("staged follow-up"),
             "a staged child refuses mutation until its parent commits: {}",
             reply
+        );
+        let after = store.get("MyProj", &child).await.unwrap().unwrap().1;
+        assert_eq!(
+            serde_json::to_string(&after).unwrap(),
+            serde_json::to_string(&before).unwrap(),
+            "a refused staged update leaves the child payload and history untouched"
         );
     }
 
@@ -14799,6 +15321,7 @@ exit 0
         claim(&store, &parent).await;
         let mut task_meta = Map::new();
         task_meta.insert("spawned_from".to_string(), json!(parent));
+        task_meta.insert("follow_up_staged".to_string(), json!(true));
         store_new_task(
             &store,
             &emb(),
@@ -16933,5 +17456,468 @@ exit 0
             let (prev_wires, _) = record_setup_doctor_state(&store, "example-project").await;
             assert_eq!(prev_wires, wires, "round {i}");
         }
+    }
+
+    // ── PR #449 second-round regressions ───────────────────────────────
+
+    async fn payload_rows(store: &Arc<dyn VectorStore>, namespace: &str) -> Vec<String> {
+        store
+            .list(namespace, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| serde_json::to_string(&r.payload).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn secret_namespace_in_completion_is_refused_without_writes() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+        let before = payload_rows(&store, "MyProj").await;
+        let token = scanner_fixture();
+        let err = handle_task_complete(
+            json!({
+                "namespace": token,
+                "id": id,
+                "memory": { "content": "a clean lesson worth keeping" },
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("a secret namespace must refuse the completion");
+        assert_security_refusal(&err);
+        assert_eq!(payload_rows(&store, "MyProj").await, before);
+    }
+
+    #[tokio::test]
+    async fn secret_metadata_key_in_completion_is_refused_without_writes() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+        let before = payload_rows(&store, "MyProj").await;
+        let token = scanner_fixture();
+        let err = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "memory": {
+                    "content": "a clean lesson worth keeping",
+                    "metadata": { token: "clean value" },
+                },
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("a secret metadata key must refuse the completion");
+        assert_security_refusal(&err);
+        assert_eq!(payload_rows(&store, "MyProj").await, before);
+    }
+
+    #[tokio::test]
+    async fn secret_namespace_in_import_is_refused_before_the_file_is_read() {
+        let store = store_with_namespace("MyProj").await;
+        let token = scanner_fixture();
+        // A path that does not exist: the only way this call can return a
+        // security refusal is if the namespace was scanned before the read.
+        let err = import_beads(
+            store,
+            emb(),
+            &token,
+            "/tmp/opencode/no-such-beads-file.jsonl",
+        )
+        .await
+        .expect_err("a secret namespace must be refused");
+        assert_security_refusal(&err);
+    }
+
+    #[tokio::test]
+    async fn rollback_preserves_a_preexisting_extraction_edge() {
+        let store = store_with_namespace("MyProj").await;
+        let vector = emb().embed("a lesson written earlier").await.unwrap();
+        let payload = MemoryPayload {
+            content: "a lesson written earlier".to_string(),
+            user_id: "kenton".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({ "extracted_from": ["parent"] }),
+        };
+        store
+            .upsert("MyProj", "lesson", vector.clone(), payload.clone())
+            .await
+            .unwrap();
+        // The edge predates this completion: `false` says this attempt did not
+        // add it, so rollback must leave the historical association intact.
+        let linked = Some(("lesson".to_string(), vector, payload, false));
+        let failed =
+            rollback_extraction_edges(&store, "MyProj", "parent", &linked, &None, &None).await;
+        assert!(failed.is_empty(), "{failed:?}");
+        let (_, after) = store.get("MyProj", "lesson").await.unwrap().unwrap();
+        assert_eq!(
+            after.metadata["extracted_from"],
+            json!(["parent"]),
+            "a prior association is history, not this attempt's write"
+        );
+        // When this attempt did add the edge, rollback still removes it.
+        let added = Some((
+            "lesson".to_string(),
+            emb().embed("a lesson").await.unwrap(),
+            MemoryPayload {
+                metadata: json!({ "extracted_from": ["parent"] }),
+                ..after.clone()
+            },
+            true,
+        ));
+        let failed =
+            rollback_extraction_edges(&store, "MyProj", "parent", &added, &None, &None).await;
+        assert!(failed.is_empty(), "{failed:?}");
+        let (_, after) = store.get("MyProj", "lesson").await.unwrap().unwrap();
+        assert_eq!(after.metadata["extracted_from"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn registry_rollback_restores_or_removes_the_captured_row() {
+        let store = store_with_namespace("MyProj").await;
+        let rid = crate::registry::registry_row_id("MyProj");
+        let vector = emb().embed("registry").await.unwrap();
+        let original = MemoryPayload {
+            content: "registry".to_string(),
+            user_id: "system".to_string(),
+            memory_type: "registry".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: json!({ "domain_registry": ["alpha"] }),
+        };
+        store
+            .upsert("MyProj", &rid, vector.clone(), original.clone())
+            .await
+            .unwrap();
+        let before = store.get("MyProj", &rid).await.unwrap();
+        let changed = MemoryPayload {
+            metadata: json!({ "domain_registry": ["beta"] }),
+            ..original.clone()
+        };
+        store
+            .upsert("MyProj", &rid, vector.clone(), changed)
+            .await
+            .unwrap();
+        let before_json = serde_json::to_string(&before).unwrap();
+        let err = crate::registry::rollback_registry(&store, "MyProj", before).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            serde_json::to_string(&store.get("MyProj", &rid).await.unwrap()).unwrap(),
+            before_json
+        );
+        // A completion that created the row restores a namespace with no row.
+        let err = crate::registry::rollback_registry(&store, "MyProj", None).await;
+        assert!(err.is_none(), "{err:?}");
+        assert!(store.get("MyProj", &rid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn staged_child_cannot_complete_before_its_parent_commits() {
+        let store = store_with_namespace("MyProj").await;
+        let parent = create_task(&store, "MyProj", "parent", 2).await;
+        let mut meta = Map::new();
+        meta.insert("spawned_from".to_string(), json!(parent));
+        meta.insert("follow_up_staged".to_string(), json!(true));
+        meta.insert("status".to_string(), json!("done"));
+        let (child, _) = store_new_task(
+            &store,
+            &emb(),
+            "MyProj",
+            "staged child",
+            "unknown",
+            None,
+            meta,
+            Map::new(),
+            "task_follow_up",
+        )
+        .await
+        .expect("staged child");
+        let before = payload_rows(&store, "MyProj").await;
+        let err = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": child,
+                "memory": { "content": "an orphaned lesson" },
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect_err("a staged child must refuse completion");
+        assert!(
+            err.contains("staged follow-up"),
+            "a staged child refuses completion: {err}"
+        );
+        assert_eq!(payload_rows(&store, "MyProj").await, before);
+    }
+
+    #[tokio::test]
+    async fn retry_matches_staged_children_one_to_one_and_applies_new_fields() {
+        let store = store_with_namespace("MyProj").await;
+        let parent = create_task(&store, "MyProj", "parent", 2).await;
+        for priority in [1, 2] {
+            let mut meta = Map::new();
+            meta.insert("spawned_from".to_string(), json!(parent));
+            meta.insert("follow_up_staged".to_string(), json!(true));
+            meta.insert("status".to_string(), json!("done"));
+            meta.insert("priority".to_string(), json!(priority));
+            meta.insert("description".to_string(), json!("old description"));
+            store_new_task(
+                &store,
+                &emb(),
+                "MyProj",
+                "same title",
+                "unknown",
+                None,
+                meta,
+                Map::new(),
+                "task_follow_up",
+            )
+            .await
+            .expect("staged child");
+        }
+        let titles = vec!["same title".to_string(), "same title".to_string()];
+        let (matched, orphans) =
+            reconcile_staged_follow_ups(&store, "MyProj", &parent, &HashSet::new(), &titles).await;
+        assert_eq!(matched.len(), 2);
+        assert!(matched[0].is_some() && matched[1].is_some());
+        assert_ne!(
+            matched[0], matched[1],
+            "same-title specs keep distinct rows"
+        );
+        assert!(orphans.is_empty());
+        let spec = (
+            "same title".to_string(),
+            Some("new description".to_string()),
+            "bug".to_string(),
+            5,
+            vec!["ops".to_string()],
+        );
+        restage_follow_up(
+            &store,
+            &emb(),
+            "MyProj",
+            matched[0].as_ref().unwrap(),
+            &spec,
+        )
+        .await
+        .unwrap();
+        let (_, payload) = store
+            .get("MyProj", matched[0].as_ref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let task = &payload.metadata["task"];
+        assert_eq!(task["description"], json!("new description"));
+        assert_eq!(task["priority"], json!(5));
+        assert_eq!(task["task_type"], json!("bug"));
+        assert_eq!(task["labels"], json!(["ops"]));
+    }
+
+    #[tokio::test]
+    async fn retry_removes_staged_children_the_new_specs_drop() {
+        let store = store_with_namespace("MyProj").await;
+        let parent = create_task(&store, "MyProj", "parent", 2).await;
+        for title in ["keep", "drop"] {
+            let mut meta = Map::new();
+            meta.insert("spawned_from".to_string(), json!(parent));
+            meta.insert("follow_up_staged".to_string(), json!(true));
+            meta.insert("status".to_string(), json!("done"));
+            store_new_task(
+                &store,
+                &emb(),
+                "MyProj",
+                title,
+                "unknown",
+                None,
+                meta,
+                Map::new(),
+                "task_follow_up",
+            )
+            .await
+            .expect("staged child");
+        }
+        let (matched, orphans) = reconcile_staged_follow_ups(
+            &store,
+            "MyProj",
+            &parent,
+            &HashSet::new(),
+            &["keep".to_string()],
+        )
+        .await;
+        assert_eq!(matched.iter().filter(|id| id.is_some()).count(), 1);
+        assert_eq!(orphans.len(), 1);
+        assert!(rollback_follow_up_tasks(&store, "MyProj", &orphans)
+            .await
+            .is_empty());
+        assert!(store.get("MyProj", &orphans[0]).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_follow_up_stays_claimable_after_the_protocol_upgrade() {
+        let store = store_with_namespace("MyProj").await;
+        let parent = create_task(&store, "MyProj", "parent", 2).await;
+        let mut meta = Map::new();
+        meta.insert("spawned_from".to_string(), json!(parent));
+        let (child, _) = store_new_task(
+            &store,
+            &emb(),
+            "MyProj",
+            "legacy child",
+            "unknown",
+            None,
+            meta,
+            Map::new(),
+            "task_follow_up",
+        )
+        .await
+        .expect("legacy child");
+        let (_, payload) = store.get("MyProj", &child).await.unwrap().unwrap();
+        assert!(
+            follow_up_may_proceed(&store, "MyProj", &child, &payload).await,
+            "a child without the staged marker was already committed work"
+        );
+        claim(&store, &child).await;
+    }
+
+    #[tokio::test]
+    async fn completion_event_outbox_replays_only_committed_completions() {
+        let (bus, seen) = recording_bus();
+        let store = store_with_namespace("MyProj").await;
+        let parent = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &parent).await;
+        handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": parent,
+                "memory": { "content": "a lesson worth keeping" },
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await;
+        let lesson_id = store
+            .list("MyProj", None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.payload.metadata.get("extracted_from").is_some())
+            .expect("the inline lesson was committed")
+            .id;
+        // Simulate a stop after the commit but before `bus.emit`: the durable
+        // record is still there even though the live bus never saw the pulse.
+        stage_completion_event(&store, &emb(), "MyProj", &parent, &lesson_id)
+            .await
+            .unwrap();
+        replay_pending_completion_events(&store, &bus).await;
+        let pulses = pulses_seen(&seen, 1).await;
+        assert!(
+            pulses.iter().any(|p| matches!(
+                p,
+                ThalamicPulse::Superseded { old_id, new_id, .. }
+                    if old_id == &parent && new_id == &lesson_id
+            )),
+            "the lost Superseded pulse is replayed: {pulses:?}"
+        );
+        assert!(store
+            .get("MyProj", &completion_event_outbox_id(&parent))
+            .await
+            .unwrap()
+            .is_none());
+
+        // The mirror case: a stopped attempt that never committed must not
+        // publish a replacement lesson.
+        let (bus2, seen2) = recording_bus();
+        let uncommitted = create_task(&store, "MyProj", "uncommitted", 2).await;
+        stage_completion_event(
+            &store,
+            &emb(),
+            "MyProj",
+            &uncommitted,
+            "lesson-that-never-landed",
+        )
+        .await
+        .unwrap();
+        replay_pending_completion_events(&store, &bus2).await;
+        assert!(seen2.lock().unwrap().is_empty());
+        assert!(store
+            .get("MyProj", &completion_event_outbox_id(&uncommitted))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn parked_follow_up_is_activated_from_the_committed_parent() {
+        let store = store_with_namespace("MyProj").await;
+        let parent = create_task(&store, "MyProj", "parent", 2).await;
+        claim(&store, &parent).await;
+        handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": parent,
+                "memory": { "content": "a lesson worth keeping" },
+                "follow_up_tasks": [{ "title": "child work" }],
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect("the parent completion commits");
+
+        let child = store
+            .list("MyProj", None, Some("task"))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| {
+                r.payload
+                    .metadata
+                    .get("task")
+                    .and_then(|t| t.get("spawned_from"))
+                    .and_then(Value::as_str)
+                    == Some(parent.as_str())
+            })
+            .expect("the child was committed")
+            .id;
+        // Simulate a stop between the parent save and child activation: the
+        // child is still parked, but the done parent names it as committed.
+        let (vector, mut payload) = store.get("MyProj", &child).await.unwrap().unwrap();
+        {
+            let t = payload.metadata["task"].as_object_mut().unwrap();
+            t.insert("status".to_string(), json!("done"));
+            t.insert("follow_up_staged".to_string(), json!(true));
+        }
+        store
+            .upsert("MyProj", &child, vector, payload)
+            .await
+            .unwrap();
+        assert_eq!(status_of(&store, "MyProj", &child).await, Status::Done);
+
+        let failed = activate_committed_follow_ups(&store).await;
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(status_of(&store, "MyProj", &child).await, Status::Open);
+        let (_, after) = store.get("MyProj", &child).await.unwrap().unwrap();
+        assert!(!follow_up_is_staged(&after));
+        claim(&store, &child).await;
     }
 }
