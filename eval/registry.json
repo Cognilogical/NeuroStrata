@@ -65,6 +65,25 @@
         "ignored": 0
       }
     },
+    "lexical-visibility": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp lexical::tests::archived_bool_and_int_both_excluded_from_upsert_index -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp lexical::tests::archived_bool_and_int_both_excluded_from_rebuild -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::inhouse_lexical_excludes_int_archived_rows -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::tantivy_hydration_backfills_past_dropped_hits -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::tantivy_hydration_rechecks_acl_object_form -- --exact --test-threads=1"
+      ],
+      "tests": [
+        "lexical::tests::archived_bool_and_int_both_excluded_from_upsert_index",
+        "lexical::tests::archived_bool_and_int_both_excluded_from_rebuild",
+        "store::ladybug::tests::inhouse_lexical_excludes_int_archived_rows",
+        "store::ladybug::tests::tantivy_hydration_backfills_past_dropped_hits",
+        "store::ladybug::tests::tantivy_hydration_rechecks_acl_object_form"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "guard-3000": {
       "commands": [
         "cargo test --locked --bin neurostrata-mcp guard::semantic::tests -- --test-threads=1"
@@ -589,6 +608,27 @@
         "ignored": 0
       }
     },
+    "daemon-logging": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp tests::tracing_output_reaches_stderr -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::stdout_carries_no_log_output -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::rust_log_filter_is_honored -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::unparsable_rust_log_falls_back_to_info -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::final_checkpoint_report_is_the_exit_report_whole_content -- --exact --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp tests::restore_holds_target_open_lock_until_database_and_provenance_are_installed -- --exact --test-threads=1"
+      ],
+      "tests": [
+        "tests::tracing_output_reaches_stderr",
+        "tests::stdout_carries_no_log_output",
+        "tests::rust_log_filter_is_honored",
+        "tests::unparsable_rust_log_falls_back_to_info",
+        "tests::final_checkpoint_report_is_the_exit_report_whole_content",
+        "tests::restore_holds_target_open_lock_until_database_and_provenance_are_installed"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
     "dependency-advisory": {
       "commands": [
         "cargo test --locked --test dependency_integrity -- --test-threads=1"
@@ -599,6 +639,32 @@
         "srctauri_glib_decision_recorded",
         "webui_has_no_vulnerable_minimatch",
         "webui_has_no_vulnerable_zod"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
+    },
+    "store-write-turn": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp store::ladybug::tests::store_busy -- --test-threads=1"
+      ],
+      "tests": [
+        "store::ladybug::tests::store_busy::a_turn_wait_past_its_budget_returns_typed_store_busy",
+        "store::ladybug::tests::store_busy::store_busy_is_recoverable_in_under_five_seconds",
+        "store::ladybug::tests::store_busy::a_read_behind_a_held_turn_reports_busy_not_empty",
+        "store::ladybug::tests::store_busy::active_generations_behind_a_held_turn_report_busy",
+        "store::ladybug::tests::store_busy::mention_symbol_ids_behind_a_held_turn_report_busy",
+        "store::ladybug::tests::store_busy::shape_warnings_behind_a_held_turn_report_busy",
+        "store::ladybug::tests::store_busy::busy_detection_rejects_an_ordinary_error",
+        "store::ladybug::tests::store_busy::busy_detection_finds_a_wrapped_busy",
+        "store::ladybug::tests::store_busy::mention_symbol_ids_keep_their_cache_when_a_refresh_is_busy",
+        "store::ladybug::tests::store_busy::get_behind_a_held_turn_reports_busy_not_a_missing_row",
+        "store::ladybug::tests::store_busy::write_with_deadline_behind_a_held_turn_reports_busy",
+        "store::ladybug::tests::store_busy::reads_recover_once_the_turn_is_released",
+        "store::ladybug::tests::store_busy::a_dispatched_write_marks_dirty_when_its_caller_is_cancelled",
+        "store::ladybug::tests::store_busy::a_write_error_after_mutation_keeps_the_dirty_flag",
+        "store::ladybug::tests::store_busy::a_write_cancelled_before_dispatch_neither_dispatches_nor_marks_dirty",
+        "store::ladybug::tests::store_busy::a_cancelled_write_leaves_the_turn_free_once_the_statement_ends"
       ],
       "thresholds": {
         "ignored": 0

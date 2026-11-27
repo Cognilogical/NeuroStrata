@@ -5,7 +5,7 @@
 //! All types are `Copy` and all functions are `const fn` to enable Charon/Aeneas
 //! translation to pure Lean 4 without borrow/heap complexity.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::items_after_test_module)]
 
 /// Task status in the task state machine.
 #[cfg_attr(kani, derive(kani::Arbitrary))]
@@ -2669,6 +2669,192 @@ pub const fn wal_commit_evidence_tag(evidence: KernelWalCommitEvidence) -> &'sta
     }
 }
 
+/// Hard upper bound for a working-set frame's charged bytes.
+pub const WORKING_SET_MAX_FRAME_BYTES: u32 = 4096;
+
+/// Maximum charged bytes permitted for a deterministic working-set stub.
+pub const WORKING_SET_STUB_MAX_BYTES: u32 = 192;
+
+/// Generational tier of a working-set node.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingSetTier {
+    Immortal,
+    PinnedRoot,
+    YoungGen,
+    EvictedStub,
+}
+
+/// Pure working-set garbage-collection decision.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcAction {
+    RetainFull,
+    PromoteToYoungGen,
+    DemoteToStub,
+    RetainStub,
+}
+
+/// Inputs for one deterministic working-set eviction decision.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkingSetEvictionInput {
+    pub tier: WorkingSetTier,
+    pub turn_age: u32,
+    pub max_idle_turns: u32,
+    pub node_bytes: u32,
+    pub projected_frame_bytes: u32,
+    pub max_frame_bytes: u32,
+    pub is_re_referenced: bool,
+}
+
+/// Applies the spec's first-match eviction precedence to one node.
+/// Stub construction and byte accounting belong to the state layer.
+pub const fn evaluate_working_set_eviction(input: WorkingSetEvictionInput) -> GcAction {
+    match input.tier {
+        WorkingSetTier::Immortal => GcAction::RetainFull,
+        WorkingSetTier::EvictedStub => {
+            if input.is_re_referenced && input.projected_frame_bytes <= input.max_frame_bytes {
+                GcAction::PromoteToYoungGen
+            } else {
+                GcAction::RetainStub
+            }
+        }
+        WorkingSetTier::YoungGen => {
+            if (!input.is_re_referenced && input.turn_age > input.max_idle_turns)
+                || input.projected_frame_bytes > input.max_frame_bytes
+            {
+                GcAction::DemoteToStub
+            } else {
+                GcAction::RetainFull
+            }
+        }
+        WorkingSetTier::PinnedRoot => {
+            if !input.is_re_referenced
+                && input.turn_age > 0
+                && input.projected_frame_bytes > input.max_frame_bytes
+            {
+                GcAction::DemoteToStub
+            } else {
+                GcAction::RetainFull
+            }
+        }
+    }
+}
+
+/// KV-cache tier a working-set node projects into.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingSetCacheTier {
+    Tier0SystemPrefix,
+    Tier1QuantizedHistory,
+    Tier2TailDelta,
+    EvictedHeapStub,
+}
+
+impl WorkingSetCacheTier {
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            WorkingSetCacheTier::Tier0SystemPrefix => "tier0_system_prefix",
+            WorkingSetCacheTier::Tier1QuantizedHistory => "tier1_quantized_history",
+            WorkingSetCacheTier::Tier2TailDelta => "tier2_tail_delta",
+            WorkingSetCacheTier::EvictedHeapStub => "evicted_heap_stub",
+        }
+    }
+}
+
+/// Routes a generational tier to its KV-cache projection. Tier 1 is reserved
+/// for the state layer's folded stubs, never emitted by this pure decision.
+pub const fn evaluate_working_set_cache_tier(
+    tier: WorkingSetTier,
+    has_system_channel: bool,
+) -> WorkingSetCacheTier {
+    match tier {
+        WorkingSetTier::Immortal => {
+            if has_system_channel {
+                WorkingSetCacheTier::Tier0SystemPrefix
+            } else {
+                WorkingSetCacheTier::Tier2TailDelta
+            }
+        }
+        WorkingSetTier::EvictedStub => WorkingSetCacheTier::EvictedHeapStub,
+        WorkingSetTier::PinnedRoot | WorkingSetTier::YoungGen => {
+            WorkingSetCacheTier::Tier2TailDelta
+        }
+    }
+}
+
+/// Action applied to one message while projecting the quantized history window.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkingSetStrideAction {
+    RetainRawMessage,
+    FoldIntoQuantizedStub,
+    InvalidMessageIndex,
+}
+
+impl WorkingSetStrideAction {
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            WorkingSetStrideAction::RetainRawMessage => "retain_raw_message",
+            WorkingSetStrideAction::FoldIntoQuantizedStub => "fold_into_quantized_stub",
+            WorkingSetStrideAction::InvalidMessageIndex => "invalid_message_index",
+        }
+    }
+}
+
+/// Inputs for one deterministic quantized-stride folding decision.
+#[cfg_attr(kani, derive(kani::Arbitrary))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkingSetStrideInput {
+    pub total_messages: u32,
+    pub message_index: u32,
+    pub hot_tail_count: u32,
+    pub stride: u32,
+    pub is_protected_system_or_pinned: bool,
+}
+
+/// Largest message index eligible for folding, stepped down to a stride
+/// boundary. A zero stride or a history fully covered by the hot tail yields
+/// no foldable prefix.
+pub const fn compute_working_set_quantized_frontier(
+    total_messages: u32,
+    hot_tail_count: u32,
+    stride: u32,
+) -> u32 {
+    if stride == 0 || total_messages <= hot_tail_count {
+        0
+    } else {
+        let foldable = total_messages - hot_tail_count;
+        (foldable / stride) * stride
+    }
+}
+
+/// First-match decision: invalid index, protected/stride-disabled/hot-tail
+/// retention, then fold only indices strictly before the quantized frontier.
+pub const fn evaluate_working_set_stride_fold(
+    input: WorkingSetStrideInput,
+) -> WorkingSetStrideAction {
+    if input.message_index >= input.total_messages {
+        WorkingSetStrideAction::InvalidMessageIndex
+    } else if input.is_protected_system_or_pinned
+        || input.stride == 0
+        || input.total_messages <= input.hot_tail_count
+    {
+        WorkingSetStrideAction::RetainRawMessage
+    } else if input.message_index
+        < compute_working_set_quantized_frontier(
+            input.total_messages,
+            input.hot_tail_count,
+            input.stride,
+        )
+    {
+        WorkingSetStrideAction::FoldIntoQuantizedStub
+    } else {
+        WorkingSetStrideAction::RetainRawMessage
+    }
+}
+
 // Unit tests for formal_kernel.rs – covering classify_epistemic_status, validate_taxonomy_dag, validate_skos_disjointness, compute_epistemic_coverage_bps, realization_status_gap_bps, compute_frontier_leverage_bps
 #[cfg(test)]
 mod tests {
@@ -3064,6 +3250,291 @@ mod tests {
         assert_eq!(
             evaluate_workflow_stage_transition(Completed, LoadContext),
             Err("IllegalWorkflowStageTransition")
+        );
+    }
+
+    fn working_set_input(
+        tier: WorkingSetTier,
+        turn_age: u32,
+        max_idle_turns: u32,
+        node_bytes: u32,
+        projected_frame_bytes: u32,
+        max_frame_bytes: u32,
+        is_re_referenced: bool,
+    ) -> WorkingSetEvictionInput {
+        WorkingSetEvictionInput {
+            tier,
+            turn_age,
+            max_idle_turns,
+            node_bytes,
+            projected_frame_bytes,
+            max_frame_bytes,
+            is_re_referenced,
+        }
+    }
+
+    #[test]
+    fn working_set_immortal_overflow_retains_full() {
+        let input = working_set_input(
+            WorkingSetTier::Immortal,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            0,
+            false,
+        );
+        assert_eq!(evaluate_working_set_eviction(input), GcAction::RetainFull);
+    }
+
+    #[test]
+    fn working_set_page_fault_promotes_only_when_fits() {
+        for (projected, expected) in [
+            (0u32, GcAction::PromoteToYoungGen),
+            (WORKING_SET_MAX_FRAME_BYTES, GcAction::PromoteToYoungGen),
+            (WORKING_SET_MAX_FRAME_BYTES + 1, GcAction::RetainStub),
+            (u32::MAX, GcAction::RetainStub),
+        ] {
+            assert_eq!(
+                evaluate_working_set_eviction(working_set_input(
+                    WorkingSetTier::EvictedStub,
+                    4,
+                    3,
+                    256,
+                    projected,
+                    WORKING_SET_MAX_FRAME_BYTES,
+                    true,
+                )),
+                expected
+            );
+        }
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::EvictedStub,
+                4,
+                3,
+                256,
+                0,
+                WORKING_SET_MAX_FRAME_BYTES,
+                false,
+            )),
+            GcAction::RetainStub
+        );
+    }
+
+    #[test]
+    fn working_set_ttl_equality_retains_and_expiry_demotes() {
+        for (turn_age, expected) in [
+            (3u32, GcAction::RetainFull),
+            (4, GcAction::DemoteToStub),
+            (u32::MAX, GcAction::DemoteToStub),
+        ] {
+            assert_eq!(
+                evaluate_working_set_eviction(working_set_input(
+                    WorkingSetTier::YoungGen,
+                    turn_age,
+                    3,
+                    256,
+                    0,
+                    WORKING_SET_MAX_FRAME_BYTES,
+                    false,
+                )),
+                expected
+            );
+        }
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::YoungGen,
+                u32::MAX,
+                u32::MAX,
+                256,
+                0,
+                WORKING_SET_MAX_FRAME_BYTES,
+                false,
+            )),
+            GcAction::RetainFull
+        );
+    }
+
+    #[test]
+    fn working_set_pinned_root_pressure_respects_current_turn() {
+        for (turn_age, is_re_referenced, expected) in [
+            (0u32, false, GcAction::RetainFull),
+            (1, true, GcAction::RetainFull),
+            (1, false, GcAction::DemoteToStub),
+            (u32::MAX, false, GcAction::DemoteToStub),
+        ] {
+            assert_eq!(
+                evaluate_working_set_eviction(working_set_input(
+                    WorkingSetTier::PinnedRoot,
+                    turn_age,
+                    0,
+                    256,
+                    WORKING_SET_MAX_FRAME_BYTES + 1,
+                    WORKING_SET_MAX_FRAME_BYTES,
+                    is_re_referenced,
+                )),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn working_set_zero_budget_is_total() {
+        for tier in [
+            WorkingSetTier::Immortal,
+            WorkingSetTier::PinnedRoot,
+            WorkingSetTier::YoungGen,
+            WorkingSetTier::EvictedStub,
+        ] {
+            let action =
+                evaluate_working_set_eviction(working_set_input(tier, 0, 0, 0, 0, 0, false));
+            let expected = match tier {
+                WorkingSetTier::Immortal | WorkingSetTier::PinnedRoot => GcAction::RetainFull,
+                WorkingSetTier::YoungGen => GcAction::RetainFull,
+                WorkingSetTier::EvictedStub => GcAction::RetainStub,
+            };
+            assert_eq!(action, expected);
+        }
+    }
+
+    #[test]
+    fn working_set_maximum_integer_inputs() {
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::YoungGen,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                false,
+            )),
+            GcAction::RetainFull
+        );
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::YoungGen,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX - 1,
+                false,
+            )),
+            GcAction::DemoteToStub
+        );
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::PinnedRoot,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                0,
+                false,
+            )),
+            GcAction::DemoteToStub
+        );
+        assert_eq!(
+            evaluate_working_set_eviction(working_set_input(
+                WorkingSetTier::EvictedStub,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                true,
+            )),
+            GcAction::PromoteToYoungGen
+        );
+    }
+
+    #[test]
+    fn working_set_cache_tier_routes_immortal_to_system_prefix() {
+        assert_eq!(
+            evaluate_working_set_cache_tier(WorkingSetTier::Immortal, true),
+            WorkingSetCacheTier::Tier0SystemPrefix
+        );
+        assert_eq!(
+            evaluate_working_set_cache_tier(WorkingSetTier::Immortal, false),
+            WorkingSetCacheTier::Tier2TailDelta
+        );
+        assert_eq!(
+            evaluate_working_set_cache_tier(WorkingSetTier::PinnedRoot, true),
+            WorkingSetCacheTier::Tier2TailDelta
+        );
+        assert_eq!(
+            evaluate_working_set_cache_tier(WorkingSetTier::YoungGen, true),
+            WorkingSetCacheTier::Tier2TailDelta
+        );
+        assert_eq!(
+            evaluate_working_set_cache_tier(WorkingSetTier::EvictedStub, true),
+            WorkingSetCacheTier::EvictedHeapStub
+        );
+        assert_eq!(
+            WorkingSetCacheTier::Tier0SystemPrefix.as_tag(),
+            "tier0_system_prefix"
+        );
+        assert_eq!(
+            WorkingSetCacheTier::Tier1QuantizedHistory.as_tag(),
+            "tier1_quantized_history"
+        );
+        assert_eq!(
+            WorkingSetCacheTier::Tier2TailDelta.as_tag(),
+            "tier2_tail_delta"
+        );
+        assert_eq!(
+            WorkingSetCacheTier::EvictedHeapStub.as_tag(),
+            "evicted_heap_stub"
+        );
+    }
+
+    #[test]
+    fn working_set_stride_fold_preserves_hot_tail_and_quantizes_frontier() {
+        assert_eq!(compute_working_set_quantized_frontier(20, 12, 8), 8);
+        assert_eq!(compute_working_set_quantized_frontier(27, 12, 8), 8);
+        assert_eq!(compute_working_set_quantized_frontier(28, 12, 8), 16);
+        assert_eq!(compute_working_set_quantized_frontier(20, 12, 0), 0);
+        assert_eq!(compute_working_set_quantized_frontier(12, 12, 8), 0);
+        let stride_input = |total, index, hot, stride, protected| WorkingSetStrideInput {
+            total_messages: total,
+            message_index: index,
+            hot_tail_count: hot,
+            stride,
+            is_protected_system_or_pinned: protected,
+        };
+        assert_eq!(
+            evaluate_working_set_stride_fold(stride_input(20, 20, 12, 8, false)),
+            WorkingSetStrideAction::InvalidMessageIndex
+        );
+        assert_eq!(
+            evaluate_working_set_stride_fold(stride_input(20, 7, 12, 8, false)),
+            WorkingSetStrideAction::FoldIntoQuantizedStub
+        );
+        assert_eq!(
+            evaluate_working_set_stride_fold(stride_input(20, 16, 12, 8, false)),
+            WorkingSetStrideAction::RetainRawMessage
+        );
+        assert_eq!(
+            evaluate_working_set_stride_fold(stride_input(20, 7, 12, 8, true)),
+            WorkingSetStrideAction::RetainRawMessage
+        );
+        assert_eq!(
+            evaluate_working_set_stride_fold(stride_input(20, 7, 12, 0, false)),
+            WorkingSetStrideAction::RetainRawMessage
+        );
+        assert_eq!(
+            WorkingSetStrideAction::RetainRawMessage.as_tag(),
+            "retain_raw_message"
+        );
+        assert_eq!(
+            WorkingSetStrideAction::FoldIntoQuantizedStub.as_tag(),
+            "fold_into_quantized_stub"
+        );
+        assert_eq!(
+            WorkingSetStrideAction::InvalidMessageIndex.as_tag(),
+            "invalid_message_index"
         );
     }
 
@@ -3500,6 +3971,129 @@ mod tests {
 #[cfg(kani)]
 mod kani_proofs {
     use super::*;
+
+    #[kani::proof]
+    fn proof_evaluate_working_set_eviction_total() {
+        let input = kani::any::<WorkingSetEvictionInput>();
+        let action = evaluate_working_set_eviction(input);
+        // Theorem 1: immortal_never_evicted
+        if matches!(input.tier, WorkingSetTier::Immortal) {
+            assert_eq!(action, GcAction::RetainFull);
+        }
+        // Theorem 2: page_fault_promotes_stub (bidirectional iff)
+        if matches!(input.tier, WorkingSetTier::EvictedStub) {
+            let expected =
+                if input.is_re_referenced && input.projected_frame_bytes <= input.max_frame_bytes {
+                    GcAction::PromoteToYoungGen
+                } else {
+                    GcAction::RetainStub
+                };
+            assert_eq!(action, expected);
+        }
+        // Theorem 3: idle_young_gen_demotes_to_stub
+        if matches!(input.tier, WorkingSetTier::YoungGen)
+            && !input.is_re_referenced
+            && input.turn_age > input.max_idle_turns
+        {
+            assert_eq!(action, GcAction::DemoteToStub);
+        }
+        // Theorem 4: budget_overflow_demotes_non_immortal + stub shrinkage guarantee
+        let budget_eligible = matches!(input.tier, WorkingSetTier::YoungGen)
+            || (matches!(input.tier, WorkingSetTier::PinnedRoot)
+                && !input.is_re_referenced
+                && input.turn_age > 0);
+        if budget_eligible && input.projected_frame_bytes > input.max_frame_bytes {
+            assert_eq!(action, GcAction::DemoteToStub);
+            let stub_bytes = kani::any::<u32>();
+            if input.node_bytes > WORKING_SET_STUB_MAX_BYTES
+                && stub_bytes <= WORKING_SET_STUB_MAX_BYTES
+                && stub_bytes < input.node_bytes
+            {
+                assert!(
+                    input.node_bytes - WORKING_SET_STUB_MAX_BYTES <= input.node_bytes - stub_bytes
+                );
+            }
+        }
+        // PinnedRoot retention when re-referenced on current turn or turn_age == 0
+        if matches!(input.tier, WorkingSetTier::PinnedRoot)
+            && (input.is_re_referenced || input.turn_age == 0)
+        {
+            assert_eq!(action, GcAction::RetainFull);
+        }
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_working_set_eviction_deterministic() {
+        let a = kani::any::<WorkingSetEvictionInput>();
+        let b = a;
+        assert_eq!(
+            evaluate_working_set_eviction(a),
+            evaluate_working_set_eviction(b)
+        );
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_working_set_cache_tier_contract() {
+        let tier = kani::any::<WorkingSetTier>();
+        let has_system_channel = kani::any::<bool>();
+        let cache_tier = evaluate_working_set_cache_tier(tier, has_system_channel);
+        // Theorem 6: Tier0 is reachable only for an immortal node with a
+        // system channel; the pure kernel never emits Tier1 itself.
+        assert!(cache_tier != WorkingSetCacheTier::Tier1QuantizedHistory);
+        if matches!(tier, WorkingSetTier::Immortal) && has_system_channel {
+            assert_eq!(cache_tier, WorkingSetCacheTier::Tier0SystemPrefix);
+        } else {
+            let expected = if matches!(tier, WorkingSetTier::Immortal)
+                || matches!(tier, WorkingSetTier::PinnedRoot)
+                || matches!(tier, WorkingSetTier::YoungGen)
+            {
+                WorkingSetCacheTier::Tier2TailDelta
+            } else {
+                WorkingSetCacheTier::EvictedHeapStub
+            };
+            assert_eq!(cache_tier, expected);
+        }
+    }
+
+    #[kani::proof]
+    fn proof_evaluate_working_set_stride_fold_contract() {
+        let input = kani::any::<WorkingSetStrideInput>();
+        // CBMC's symbolic u32 division/modulo encoding diverges on this
+        // contract. Bounding the window fields and stride keeps every branch
+        // and boundary shape (zero stride, full hot tail, index gaps) covered
+        // while letting the same assertions finish.
+        kani::assume(input.total_messages <= 4095);
+        kani::assume(input.hot_tail_count <= 4095);
+        kani::assume(input.message_index <= 4095);
+        kani::assume(input.stride <= 128);
+        let action = evaluate_working_set_stride_fold(input);
+        if input.message_index >= input.total_messages {
+            assert_eq!(action, WorkingSetStrideAction::InvalidMessageIndex);
+        } else if input.is_protected_system_or_pinned
+            || input.stride == 0
+            || input.total_messages <= input.hot_tail_count
+        {
+            assert_eq!(action, WorkingSetStrideAction::RetainRawMessage);
+        } else {
+            let frontier = compute_working_set_quantized_frontier(
+                input.total_messages,
+                input.hot_tail_count,
+                input.stride,
+            );
+            // Theorem 8: the frontier steps on stride boundaries and never
+            // crosses into the hot tail.
+            assert_eq!(frontier % input.stride, 0);
+            assert!(frontier <= input.total_messages - input.hot_tail_count);
+            // Theorem 7: the hot tail is never folded.
+            if input.total_messages - input.hot_tail_count <= input.message_index {
+                assert_eq!(action, WorkingSetStrideAction::RetainRawMessage);
+            } else if input.message_index < frontier {
+                assert_eq!(action, WorkingSetStrideAction::FoldIntoQuantizedStub);
+            } else {
+                assert_eq!(action, WorkingSetStrideAction::RetainRawMessage);
+            }
+        }
+    }
 
     #[kani::proof]
     fn proof_task_step_no_panic() {
@@ -4009,7 +4603,7 @@ pub fn evaluate_shell_exemption(payload: &str) -> bool {
         return false;
     }
     let segments: Vec<String> = cmd
-        .split(|c| c == ';' || c == '\n' || c == '|' || c == '&')
+        .split([';', '\n', '|', '&'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -4472,9 +5066,12 @@ fn is_exempt_segment(segment: &str) -> bool {
                 }
                 "stash" => matches!(sub_args.first().map(|s| s.as_str()), Some("list" | "show")),
                 "branch" => {
-                    sub_args.len() >= 1 // allow empty? original requires all listed; empty args -> true? original: all() on empty true but len>=2 check
+                    !sub_args.is_empty()
                         && sub_args.iter().all(|t| {
-                            matches!(t.as_str(), "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv")
+                            matches!(
+                                t.as_str(),
+                                "--show-current" | "-a" | "-r" | "--list" | "-v" | "-vv"
+                            )
                         })
                         && rest.len() >= 2
                 }

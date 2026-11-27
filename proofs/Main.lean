@@ -1,5 +1,6 @@
 import NeuroStrata
 import NeuroStrata.DerivationCertificate
+import NeuroStrata.WorkingSetGc
 
 open NeuroStrata.TaskMachine
 open NeuroStrata.SynapticMesh
@@ -16,6 +17,7 @@ open NeuroStrata
 open NeuroStrata.Taxonomy
 open NeuroStrata.WorkflowStage
 open NeuroStrata.DerivationCertificate
+open NeuroStrata.WorkingSetGc
 
 def boolToStr (b : Bool) : String := if b then "true" else "false"
 
@@ -380,3 +382,45 @@ def main : IO Unit := do
   IO.println s!"CERT_FULL|2|true|[8:2:true]|true|{fProfile}"
   IO.println s!"CERT_FULL|1|true|[8:2:true]|false|{fProof}"
   IO.println s!"CERT_FULL|1|true|70x[8:2:true]|true|{fBig}"
+  -- Generational working-set GC: 2,560 rows appended in canonical order.
+  let workingSetTiers : List WorkingSetTier :=
+    [.immortal, .pinnedRoot, .youngGen, .evictedStub]
+  let workingSetAges : List Nat := [0, 1, 3, 4, 4294967295]
+  let workingSetIdleLimits : List Nat := [0, 3]
+  let workingSetNodeBytes : List Nat := [0, 1, 256, 4294967295]
+  let workingSetProjections : List Nat := [0, 4096, 4097, 4294967295]
+  let workingSetFrameLimits : List Nat := [0, 4096]
+  for tier in workingSetTiers do
+    for turnAge in workingSetAges do
+      for maxIdleTurns in workingSetIdleLimits do
+        for nodeBytes in workingSetNodeBytes do
+          for projectedFrameBytes in workingSetProjections do
+            for maxFrameBytes in workingSetFrameLimits do
+              for isReReferenced in [false, true] do
+                let input : WorkingSetEvictionInput :=
+                  { tier, turnAge, maxIdleTurns, nodeBytes, projectedFrameBytes
+                    maxFrameBytes, isReReferenced }
+                let action := evaluateWorkingSetEviction input
+                IO.println s!"WORKING_SET_GC|{tier.asStr}|{turnAge}|{maxIdleTurns}|{nodeBytes}|{projectedFrameBytes}|{maxFrameBytes}|{boolToStr isReReferenced}|{action.asTag}"
+  -- KV-cache tier routing: 4 tiers × 2 system-channel states = 8 rows.
+  let cacheTiers : List WorkingSetTier :=
+    [.immortal, .pinnedRoot, .youngGen, .evictedStub]
+  for tier in cacheTiers do
+    for hasSystemChannel in [false, true] do
+      let cacheTier := evaluateWorkingSetCacheTier tier hasSystemChannel
+      IO.println s!"WORKING_SET_CACHE_TIER|{tier.asStr}|{boolToStr hasSystemChannel}|{cacheTier.asTag}"
+  -- Quantized stride folding: 4 × 4 × 2 × 2 × 2 = 128 rows.
+  let foldTotalMessages : List Nat := [0, 12, 20, 28]
+  let foldMessageIndices : List Nat := [0, 7, 8, 19]
+  let foldHotTails : List Nat := [0, 12]
+  let foldStrides : List Nat := [0, 8]
+  for totalMessages in foldTotalMessages do
+    for messageIndex in foldMessageIndices do
+      for hotTailCount in foldHotTails do
+        for stride in foldStrides do
+          for isProtected in [false, true] do
+            let input : WorkingSetStrideInput :=
+              { totalMessages, messageIndex, hotTailCount, stride
+                isProtectedSystemOrPinned := isProtected }
+            let action := evaluateWorkingSetStrideFold input
+            IO.println s!"WORKING_SET_STRIDE_FOLD|{totalMessages}|{messageIndex}|{hotTailCount}|{stride}|{boolToStr isProtected}|{action.asTag}"

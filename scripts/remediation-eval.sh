@@ -1,15 +1,42 @@
 #!/usr/bin/env bash
 # Run one registered remediation eval suite and emit JSON evidence.
 # Usage: scripts/remediation-eval.sh <suite> [--json <path>]
-# Refuses tracked dirty trees unless EVAL_ALLOW_DIRTY=1.
+#        scripts/remediation-eval.sh --suite <suite> [--receipt <path>]
+#
+# `--suite` and `--receipt` are aliases for the positional suite and `--json`
+# output path; `--receipt` names the same JSON evidence file.
+#
+# Refuses tracked dirty trees unless EVAL_ALLOW_DIRTY=1. The runner requires
+# every expected test to print `test <name> ... ok` and requires zero ignored
+# tests, so a renamed test or a zero-match filter cannot pass silently.
 set -euo pipefail
 
-suite=${1:?usage: remediation-eval.sh <suite> [--json <path>]}
-shift || true
+suite=""
 out=""
-if [ "${1:-}" = "--json" ]; then
-  out=${2:?--json needs a path}
-fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --suite)
+      suite=${2:?--suite needs a suite name}
+      shift 2
+      ;;
+    --json | --receipt)
+      out=${2:?$1 needs a path}
+      shift 2
+      ;;
+    -*)
+      echo "unknown option: $1" >&2
+      exit 2
+      ;;
+    *)
+      suite=$1
+      shift
+      ;;
+  esac
+done
+[ -n "$suite" ] || {
+  echo "usage: remediation-eval.sh <suite> [--json <path>] | --suite <suite> [--receipt <path>]" >&2
+  exit 2
+}
 
 # GNU `realpath -m` resolves nonexistent paths; stock macOS does not ship it.
 # Resolve existing ancestors with pwd -P and follow final symlinks by hand so

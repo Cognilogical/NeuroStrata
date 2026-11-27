@@ -46,7 +46,7 @@ cat > "$tmp/registry.json" <<'JSON'
 JSON
 
 EVAL_REGISTRY="$tmp/registry.json" EVAL_ALLOW_DIRTY=1 \
-  bash "$root/scripts/remediation-eval.sh" self-pass --json "$tmp/pass.json" >/dev/null
+  bash "$root/scripts/remediation-eval.sh" --suite self-pass --receipt "$tmp/pass.json" >/dev/null
 jq -e '.verdict == "PASS" and .failed == 0 and .ignored == 0' "$tmp/pass.json" >/dev/null
 
 if EVAL_REGISTRY="$tmp/registry.json" EVAL_ALLOW_DIRTY=1 \

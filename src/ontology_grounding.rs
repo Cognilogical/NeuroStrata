@@ -176,7 +176,13 @@ pub async fn ontology_warnings(store: &LadybugStore, namespace: &str) -> Vec<Val
         Ok(None) => Value::Null,
         Err(e) => {
             tracing::warn!("ontology_warnings store.get failed for '{namespace}:{rid}': {e}");
-            Value::Null
+            out.push(Value::json_obj(
+                namespace,
+                "ontology_registry_read_failed",
+                None,
+                format!("ontology registry read failed: {e}"),
+            ));
+            return out;
         }
     };
 
