@@ -688,6 +688,23 @@
       "thresholds": {
         "ignored": 0
       }
+    },
+    "model-bundle-honesty": {
+      "commands": [
+        "cargo test --locked --bin neurostrata-mcp learning::model_bundle::tests -- --test-threads=1",
+        "cargo test --locked --bin neurostrata-mcp learning::trainer::tests::default_evaluation_report_names_its_placeholder -- --test-threads=1"
+      ],
+      "tests": [
+        "learning::model_bundle::tests::bundle_load_fails_without_a_manifest",
+        "learning::model_bundle::tests::bundle_load_fails_when_manifest_declares_no_version",
+        "learning::model_bundle::tests::bundle_load_rejects_empty_or_whitespace_version",
+        "learning::model_bundle::tests::bundle_version_falls_back_to_model_version",
+        "learning::model_bundle::tests::bundle_version_is_not_fabricated",
+        "learning::trainer::tests::default_evaluation_report_names_its_placeholder"
+      ],
+      "thresholds": {
+        "ignored": 0
+      }
     }
   }
 }
