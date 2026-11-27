@@ -15,6 +15,13 @@ if [ "${1:-}" = "--json" ]; then
   out=${2:?--json needs a path}
 fi
 
+# Invalidate the requested evidence before doing any work. A run that fails
+# early (dirty tree, unknown suite, failed command) must never leave a prior
+# PASS at the documented path for a caller to mistake for this run's verdict.
+if [ -n "$out" ] && [ -e "$out" ]; then
+  rm -f -- "$out"
+fi
+
 root=$(git rev-parse --show-toplevel)
 registry=${EVAL_REGISTRY:-$root/eval/registry.json}
 [ -f "$registry" ] || { echo "registry not found: $registry" >&2; exit 2; }
@@ -95,7 +102,10 @@ result=$(jq -n \
 
 if [ -n "$out" ]; then
   mkdir -p "$(dirname "$out")"
-  printf '%s\n' "$result" > "$out"
+  tmp_out=$(mktemp "$(dirname "$out")/.$(basename "$out").XXXXXX")
+  trap 'rm -f "$log" "$tmp_out"' EXIT
+  printf '%s\n' "$result" > "$tmp_out"
+  mv -f -- "$tmp_out" "$out"
   echo "wrote $out"
 else
   printf '%s\n' "$result"

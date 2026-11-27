@@ -45,4 +45,19 @@ if EVAL_REGISTRY="$tmp/registry.json" EVAL_ALLOW_DIRTY=1 \
   exit 1
 fi
 
+# A failed rerun must invalidate an earlier PASS at the same output path
+# instead of leaving stale evidence for a caller to read.
+EVAL_REGISTRY="$tmp/registry.json" EVAL_ALLOW_DIRTY=1 \
+  bash "$root/scripts/remediation-eval.sh" self-pass --json "$tmp/stale.json" >/dev/null
+jq -e '.verdict == "PASS"' "$tmp/stale.json" >/dev/null
+if EVAL_REGISTRY="$tmp/registry.json" EVAL_ALLOW_DIRTY=1 \
+  bash "$root/scripts/remediation-eval.sh" self-wrong-name --json "$tmp/stale.json" >/dev/null 2>&1; then
+  echo "FAIL: a renamed expectation passed with an output path" >&2
+  exit 1
+fi
+if [ -e "$tmp/stale.json" ]; then
+  echo "FAIL: a failed rerun left stale PASS evidence" >&2
+  exit 1
+fi
+
 echo "remediation-eval self-test: PASS"
