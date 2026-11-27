@@ -792,6 +792,12 @@ pub async fn ingest_bounded_classification<S: VectorStore + ?Sized>(
     request: &BoundedClassificationRequest,
     embedder: &dyn Embedder,
 ) -> Result<IngestOutcome, IngestError> {
+    if crate::traits::is_reserved_ingest_destination(namespace) {
+        return Err(IngestError::Store(anyhow::anyhow!(
+            "ingest destination uses the reserved internal staging namespace '{}'; choose a different namespace",
+            namespace
+        )));
+    }
     let batch = bounded_classify(index, budget, request)?;
     let namespace = namespace.trim();
     if namespace.is_empty() {

@@ -173,6 +173,16 @@ impl IngestJobs {
         embedder: Arc<dyn Embedder>,
         vector_store: Arc<dyn VectorStore>,
     ) -> anyhow::Result<IngestProgress> {
+        // Mirror the ingest-level refusal before this layer canonicalizes the
+        // directory or registers a job. A reserved destination must not reach
+        // the filesystem or the registry at all, and the ordering is the point.
+        if crate::traits::is_reserved_ingest_destination(namespace) {
+            anyhow::bail!(
+                "ingest destination uses the reserved internal staging namespace '{}'; choose a different namespace",
+                namespace
+            );
+        }
+
         // Canonicalize the incoming root before acquiring the jobs registry
         // mutex. NFS mounts or slow filesystems would stall every other job
         // if this happened inside the critical section.
@@ -377,6 +387,63 @@ mod tests {
             "and is waited for until it finishes"
         );
         finish.await.expect("the walk reports its end");
+    }
+
+    struct NoopEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for NoopEmbedder {
+        async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![0.0; 4])
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+    }
+
+    /// The jobs layer refuses a reserved destination before it canonicalizes
+    /// the directory or registers a job, mirroring the ingest guard so no
+    /// caller can reach the walk through this path (issue #417).
+    #[tokio::test]
+    async fn reserved_destination_is_rejected_before_directory_or_job_registry_work() {
+        let db = std::env::temp_dir().join(format!("ns-reserved-jobs-db-{}", uuid::Uuid::new_v4()));
+        let store: Arc<dyn VectorStore> =
+            Arc::new(crate::store::LadybugStore::for_testing(&db, 4).expect("open temp database"));
+        let jobs = Arc::new(IngestJobs::new());
+        // The path deliberately does not exist: a reserved namespace must be
+        // refused for being reserved, not for being an unreadable directory.
+        let missing =
+            std::env::temp_dir().join(format!("ns-reserved-jobs-missing-{}", uuid::Uuid::new_v4()));
+        let schema =
+            ParserSchema::load(include_str!("schema.json")).expect("shipped schema parses");
+
+        let error = jobs
+            .run(
+                "__neurostrata_ingest_stage__probe",
+                missing.to_str().expect("utf-8 path"),
+                schema,
+                Arc::new(NoopEmbedder),
+                store,
+            )
+            .await
+            .expect_err("a reserved destination is refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("ingest destination uses the reserved internal staging namespace"),
+            "the refusal names the reserved staging namespace: {error}"
+        );
+        assert!(
+            jobs.jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "no job is registered for a reserved destination"
+        );
+
+        std::fs::remove_dir_all(&db).ok();
     }
 
     #[test]

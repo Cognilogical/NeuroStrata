@@ -1708,7 +1708,12 @@ async fn _with_watch(
                                 .get("scip_path")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
-                            if scip_path.is_empty() {
+                            if crate::traits::is_reserved_ingest_destination(&ns) {
+                                result_text = format!(
+                                    "Error: ingest destination uses the reserved internal staging namespace '{}'; choose a different namespace",
+                                    ns
+                                );
+                            } else if scip_path.is_empty() {
                                 result_text = "Error: scip_path is required".to_string();
                             } else {
                                 match crate::parser::scip::ingest_scip_index(
@@ -7165,6 +7170,14 @@ async fn handle_ingest_directory(
     };
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
+    // Refuse before schema loading or a dry-run walk: an MCP preview must not
+    // read a directory on behalf of a namespace reserved for staging.
+    if crate::traits::is_reserved_ingest_destination(namespace) {
+        return format!(
+            "ERROR: ingest destination uses the reserved internal staging namespace '{}'; choose a different namespace",
+            namespace
+        );
+    }
 
     let dry_run = arguments
         .get("dry_run")
@@ -7383,6 +7396,16 @@ async fn handle_ingest_bounded(
     };
 
     let namespace = resolve_namespace(&store, namespace_raw).await;
+    if crate::traits::is_reserved_ingest_destination(&namespace) {
+        return json!({
+            "ok": false,
+            "error": format!(
+                "ingest destination uses the reserved internal staging namespace '{}'; choose a different namespace",
+                namespace
+            )
+        })
+        .to_string();
+    }
     let Some(lb) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::LadybugStore>()
     else {

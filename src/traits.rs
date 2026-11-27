@@ -29,6 +29,22 @@ pub fn memory_vocabulary() -> &'static serde_json::Value {
     })
 }
 
+/// Namespaces beginning with this prefix belong to the internal staging
+/// machinery, not to an operator's project. They are reserved so an ingest can
+/// never treat scratch space as a destination.
+pub const INTERNAL_INGEST_STAGE_PREFIX: &str = "__neurostrata_ingest_stage__";
+
+/// Whether `namespace` is reserved for internal ingest staging.
+///
+/// Prefix matching covers both the bare staging namespace and every
+/// generation-suffixed variant the store creates from it.
+pub fn is_reserved_ingest_destination(namespace: &str) -> bool {
+    namespace
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with(INTERNAL_INGEST_STAGE_PREFIX)
+}
+
 /// Represents a stored memory payload
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MemoryPayload {
@@ -590,7 +606,10 @@ pub trait VectorStore: Send + Sync + AsAny {
 
     /// Atomically make `generation` the active generation for `namespace` and
     /// `source_key`. The previous active generation's nodes remain as history,
-    /// unreachable through edge resolution.
+    /// unreachable through edge resolution. Ingest publication goes through
+    /// `publish_generation_cas` now; this unconditional form remains part of
+    /// the store API for fixtures and direct callers.
+    #[allow(dead_code)]
     async fn publish_generation(
         &self,
         _namespace: &str,
@@ -601,6 +620,60 @@ pub trait VectorStore: Send + Sync + AsAny {
             "VectorStore::publish_generation default no-op called for '{_namespace}:{_source_key}' gen {_generation}"
         );
         Ok(())
+    }
+
+    /// Whether this store implements [`VectorStore::publish_generation_cas`]
+    /// as one database-atomic conditional write. Stores that answer `false`
+    /// ingest through the unconditional generation methods instead; that
+    /// fallback is safe for a single writer but offers no protection against a
+    /// concurrent publisher. A custom backend serving concurrent writers must
+    /// override both this predicate and the CAS method.
+    async fn supports_atomic_publication(&self) -> bool {
+        false
+    }
+
+    /// Atomically flip the active pointer to `target` only while it still
+    /// names `expected`. Return the generation actually displaced on success
+    /// (`None` when a newer publication landed first, so the caller must not
+    /// touch the newer pointer). The check and the flip must occupy one write
+    /// turn: a check-then-publish default can overwrite a concurrent publish
+    /// and is deliberately absent. `pending` selects the relink marker on the
+    /// resulting pointer — set for `target` on a fresh publication or a
+    /// rollback that must be retried, cleared on a normal rollback. Backends
+    /// that cannot provide this operation leave [`Self::supports_atomic_publication`]
+    /// at its default and are routed around this method by ingest.
+    async fn publish_generation_cas(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        _expected: u64,
+        _target: u64,
+        _pending: bool,
+    ) -> Result<Option<u64>> {
+        anyhow::bail!(
+            "VectorStore must implement atomic conditional publication for '{namespace}:{source_key}'"
+        )
+    }
+
+    /// Whether a relink for `generation` committed: the pointer's pending
+    /// marker is clear and its recorded lease belongs to that generation.
+    /// A relink that timed out may still commit in its blocking worker, so
+    /// callers use this after a timeout rather than assuming the rollback
+    /// left the restored generation relinked. Stores without a lease marker
+    /// answer `false`.
+    async fn relink_committed_for(
+        &self,
+        _namespace: &str,
+        _source_key: &str,
+        _generation: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Finish a relink left pending by a process crash between publication and
+    /// relinking. Stores without a pending marker return `0`.
+    async fn recover_pending_relink(&self, _namespace: &str, _source_key: &str) -> Result<usize> {
+        Ok(0)
     }
 
     /// Discard a staged generation's nodes, leaving the previous active
@@ -1164,5 +1237,27 @@ mod tests {
         ] {
             assert!(has_source(&real), "real source is provenance: {}", real);
         }
+    }
+
+    /// The reserved prefix is matched after trimming surrounding whitespace and
+    /// folding ASCII case, so padding or an upper-cased spelling cannot smuggle
+    /// an operator ingest into the staging machinery (issue #417).
+    #[test]
+    fn reserved_ingest_destination_normalizes_whitespace_and_case() {
+        assert!(is_reserved_ingest_destination(INTERNAL_INGEST_STAGE_PREFIX));
+        assert!(is_reserved_ingest_destination(
+            "__neurostrata_ingest_stage__probe"
+        ));
+        assert!(is_reserved_ingest_destination(
+            " __neurostrata_ingest_stage__x"
+        ));
+        assert!(is_reserved_ingest_destination(
+            "__NEUROSTRATA_INGEST_STAGE__x"
+        ));
+        assert!(is_reserved_ingest_destination(
+            "\t__NeuroStrata_Ingest_Stage__x\n"
+        ));
+        assert!(!is_reserved_ingest_destination("__neurostrata_ingest_stag"));
+        assert!(!is_reserved_ingest_destination("project__neurostrata"));
     }
 }

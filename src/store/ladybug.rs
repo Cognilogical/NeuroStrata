@@ -1704,6 +1704,105 @@ enum CachedStoreState {
     Unparseable(String),
 }
 
+/// Process-local identity for a database file, independent of the spelling
+/// used to open it. A symlinked directory, a `..` segment or a relative
+/// spelling all name one database, so they must key one writer turn and one
+/// sidecar cache. A file that does not exist yet is anchored through its
+/// nearest existing ancestor.
+fn db_alias_key(path: &std::path::Path) -> PathBuf {
+    // A bare relative path, `./db` and the absolute form name one file. Anchor
+    // relative spellings at the current directory before canonicalizing their
+    // existing ancestors, so they cannot get separate writer locks or sidecars.
+    let anchored;
+    let path = if path.is_relative() {
+        anchored = std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf());
+        anchored.as_path()
+    } else {
+        path
+    };
+    if let Ok(canonical) = dunce::canonicalize(path) {
+        return canonical;
+    }
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        let Some(parent) = cursor.parent() else {
+            return path.to_path_buf();
+        };
+        if let Ok(canonical) = dunce::canonicalize(parent) {
+            let mut anchored = canonical;
+            for part in missing.iter().rev() {
+                anchored.push(part);
+            }
+            return anchored;
+        }
+        if let Some(name) = cursor.file_name() {
+            missing.push(name.to_os_string());
+        }
+        cursor = parent;
+    }
+}
+
+/// The database path as the caller spelled it, anchored at the current
+/// directory for relative spellings but not canonicalized. A sidecar written
+/// beside a symlink alias lives here; canonical identity lives at
+/// `db_alias_key`.
+fn db_supplied_path(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_relative() {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Read the recorded store identity from the canonical sidecar, falling back to
+/// a sidecar beside the supplied alias path only when the canonical one is
+/// absent. A present-but-unparseable canonical sidecar stays authoritative: an
+/// alias must not launder an untrustworthy identity into absence.
+fn read_store_state_for_path(path: &std::path::Path) -> crate::model_choice::StoreStateRead {
+    let canonical = db_alias_key(path);
+    let state = crate::model_choice::read_store_state(&canonical);
+    if !matches!(state, crate::model_choice::StoreStateRead::Absent) {
+        return state;
+    }
+    let supplied = db_supplied_path(path);
+    if supplied == canonical {
+        return state;
+    }
+    crate::model_choice::read_store_state(&supplied)
+}
+
+/// State shared by every handle to one database file. LadybugDB permits one
+/// write transaction at a time and the store-state sidecar has one recorded
+/// identity; handles opened through different aliases must not own separate
+/// writer locks or cache contradictory sidecar views.
+struct DbAliasState {
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+    store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+}
+
+fn db_alias_state(path: &std::path::Path) -> Arc<DbAliasState> {
+    static STATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<DbAliasState>>>,
+    > = std::sync::OnceLock::new();
+    let key = db_alias_key(path);
+    let states = STATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut states = states.lock().unwrap_or_else(|e| e.into_inner());
+    states
+        .entry(key)
+        .or_insert_with(|| {
+            Arc::new(DbAliasState {
+                write_lock: Arc::new(tokio::sync::Mutex::new(())),
+                store_state: Arc::new(std::sync::Mutex::new(None)),
+            })
+        })
+        .clone()
+}
+
 /// The first-write guard's restart-to-apply refusal.
 ///
 /// `guard_first_write` returns this typed error — never a bare string —
@@ -4543,7 +4642,7 @@ impl FirstWriteFlip {
         if let Some(state) = &*cache {
             return state.clone();
         }
-        let state = match crate::model_choice::read_store_state(&self.local_path) {
+        let state = match read_store_state_for_path(&self.local_path) {
             crate::model_choice::StoreStateRead::Recorded(recorded) => {
                 CachedStoreState::Recorded(recorded)
             }
@@ -4570,9 +4669,10 @@ impl FirstWriteFlip {
         match self.cached_store_state() {
             CachedStoreState::Recorded(mut recorded) if !recorded.has_data => {
                 recorded.has_data = true;
-                if let Err(e) =
-                    crate::model_choice::write_store_state_identity(&self.local_path, &recorded)
-                {
+                if let Err(e) = crate::model_choice::write_store_state_identity(
+                    &db_alias_key(&self.local_path),
+                    &recorded,
+                ) {
                     tracing::error!(
                         "store-state sidecar flip failed after a successful write; the store has data but its sidecar still reads pristine: {e}"
                     );
@@ -4598,9 +4698,10 @@ impl FirstWriteFlip {
                 };
                 if let Some(descriptor) = descriptor {
                     let state = crate::model_choice::StoreState::new(true, descriptor);
-                    if let Err(e) =
-                        crate::model_choice::write_store_state_identity(&self.local_path, &state)
-                    {
+                    if let Err(e) = crate::model_choice::write_store_state_identity(
+                        &db_alias_key(&self.local_path),
+                        &state,
+                    ) {
                         tracing::error!(
                             "store-state sidecar flip failed after a successful write; the store has data but no sidecar records it: {e}"
                         );
@@ -4647,7 +4748,7 @@ impl LockedUnknownStamp {
         if let Some(state) = &*cache {
             return state.clone();
         }
-        let state = match crate::model_choice::read_store_state(&self.local_path) {
+        let state = match read_store_state_for_path(&self.local_path) {
             crate::model_choice::StoreStateRead::Recorded(recorded) => {
                 CachedStoreState::Recorded(recorded)
             }
@@ -4744,7 +4845,10 @@ impl LockedUnknownStamp {
             return;
         }
         let state = crate::model_choice::StoreState::new(false, serving.clone());
-        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
+        match crate::model_choice::write_store_state_identity(
+            &db_alias_key(&self.local_path),
+            &state,
+        ) {
             Ok(()) => self.set_cached_store_state(CachedStoreState::Recorded(state)),
             Err(e) => {
                 tracing::warn!("store-state sidecar write failed: {e}")
@@ -4804,7 +4908,10 @@ impl LockedUnknownMigration {
             return Ok(false);
         }
         let state = crate::model_choice::StoreState::new(true, self.serving.clone());
-        match crate::model_choice::write_store_state_identity(&self.local_path, &state) {
+        match crate::model_choice::write_store_state_identity(
+            &db_alias_key(&self.local_path),
+            &state,
+        ) {
             Ok(()) => {
                 let mut cache = self.store_state.lock().unwrap_or_else(|e| e.into_inner());
                 *cache = Some(CachedStoreState::Recorded(state));
@@ -4962,13 +5069,17 @@ impl LadybugStore {
         );
 
         let checkpoints = CheckpointLatch::new(local_path.clone());
+        // Aliases of one database share the writer turn and the sidecar
+        // cache; otherwise two open handles would queue on independent
+        // locks and race each other's stage lease inside the engine.
+        let alias_state = db_alias_state(&local_path);
         Ok(Self {
             local_path,
             dimensions,
             db: Arc::new(db),
             dirty: Arc::new(Dirty::default()),
             checkpoints,
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            write_lock: Arc::clone(&alias_state.write_lock),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
             ontology: Arc::new(arc_swap::ArcSwap::from_pointee(
                 std::collections::BTreeMap::new(),
@@ -4991,7 +5102,7 @@ impl LadybugStore {
             serving_descriptor: std::sync::Mutex::new(None),
             db_preexisting,
             open_provenance,
-            store_state: Arc::new(std::sync::Mutex::new(None)),
+            store_state: Arc::clone(&alias_state.store_state),
             census_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             form_scans: Arc::default(),
@@ -5116,7 +5227,7 @@ impl LadybugStore {
         if let Some(state) = &*cache {
             return state.clone();
         }
-        let state = match crate::model_choice::read_store_state(&self.local_path) {
+        let state = match read_store_state_for_path(&self.local_path) {
             crate::model_choice::StoreStateRead::Recorded(recorded) => {
                 CachedStoreState::Recorded(recorded)
             }
@@ -5125,7 +5236,12 @@ impl LadybugStore {
             }
             crate::model_choice::StoreStateRead::Absent
                 if !self.db_preexisting
-                    && !crate::model_choice::store_state_path(&self.local_path).exists() =>
+                    && !crate::model_choice::store_state_path(&db_alias_key(&self.local_path))
+                        .exists()
+                    && !crate::model_choice::store_state_path(&db_supplied_path(
+                        &self.local_path,
+                    ))
+                    .exists() =>
             {
                 CachedStoreState::FreshUnrecorded
             }
@@ -5189,7 +5305,7 @@ impl LadybugStore {
                     if serving != recorded.descriptor && self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
                         match crate::model_choice::write_store_state_identity(
-                            &self.local_path,
+                            &db_alias_key(&self.local_path),
                             &state,
                         ) {
                             Ok(()) => {
@@ -5207,7 +5323,7 @@ impl LadybugStore {
                     if self.serving_matches_configured(&serving) {
                         let state = crate::model_choice::StoreState::new(false, serving.clone());
                         match crate::model_choice::write_store_state_identity(
-                            &self.local_path,
+                            &db_alias_key(&self.local_path),
                             &state,
                         ) {
                             Ok(()) => {
@@ -7932,6 +8048,22 @@ impl LadybugStore {
         .await
     }
 
+    /// Test-only read of the live staging markers of a namespace, so an
+    /// ingest rollback test can assert that a failed generation left no
+    /// orphaned `StagingGeneration` row behind (issue #417).
+    #[cfg(test)]
+    pub(crate) async fn staging_generations_for_test(&self, namespace: &str) -> Result<Vec<u64>> {
+        let namespace = namespace.to_string();
+        self.with_conn(move |conn| {
+            let mut generations: Vec<u64> = staging_generations_of(conn, &namespace)?
+                .into_iter()
+                .collect();
+            generations.sort_unstable();
+            Ok(generations)
+        })
+        .await
+    }
+
     /// Delete every row of one superseded generation in `namespace`.
     ///
     /// # Rollback constraint
@@ -10292,7 +10424,7 @@ impl LadybugStore {
             }
         }
 
-        let sidecar = crate::model_choice::store_state_path(source);
+        let sidecar = crate::model_choice::store_state_path(&db_alias_key(source));
         let dest_sidecar = dir.join("ladybug.store.store-state.json");
         if sidecar.exists() {
             std::fs::copy(&sidecar, &dest_sidecar).map_err(|e| {
@@ -10347,6 +10479,63 @@ impl LadybugStore {
             }
         }
         Ok(())
+    }
+    /// Clear a relink pending marker only while the pointer still names
+    /// `generation` and carries that generation's provenance. An empty tree
+    /// has nothing to replay but is still a completed relink.
+    async fn clear_pending_relink_if_active(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        generation: u64,
+    ) -> Result<()> {
+        let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+            namespace, source_key,
+        ));
+        let lease = escape_ladybug_string(&crate::parser::generation::stage_lease_id(
+            namespace, source_key, generation,
+        ));
+        let safe_ns = escape_ladybug_string(namespace);
+        let safe_sk = escape_ladybug_string(source_key);
+        self.write_with_deadline("clearing a no-work relink marker", move |conn| {
+            // Legacy rows predate leases: their owner columns are the only
+            // provenance available, so they still get a guarded clear.
+            let clear = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' AND g.active_generation = {generation} AND (g.stage_lease_id = '{lease}' OR (g.stage_lease_id = '' AND g.namespace = '{safe_ns}' AND g.source_key = '{safe_sk}')) SET g.relink_pending = false"
+            );
+            conn.query(&clear)?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+/// Test-only publication barrier used by the process-crash fixture.
+///
+/// When the parent arms a phase and a generation, the matching call writes a
+/// marker file and then blocks forever. The parent waits for the marker and
+/// `SIGKILL`s the child, so the store is reopened from a real crash at that
+/// exact point rather than from a simulated in-process failure. Compiled out
+/// of production builds.
+#[cfg(test)]
+fn publication_phase_barrier(phase: &str, generation: u64) {
+    let Ok(wanted_phase) = std::env::var("NEUROSTRATA_TEST_PUBLICATION_PHASE") else {
+        return;
+    };
+    if wanted_phase != phase {
+        return;
+    }
+    let wanted_generation = std::env::var("NEUROSTRATA_TEST_PUBLICATION_GENERATION")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    if wanted_generation != Some(generation) {
+        return;
+    }
+    if let Ok(marker) = std::env::var("NEUROSTRATA_TEST_PUBLICATION_MARKER") {
+        let _ = std::fs::write(marker, phase);
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
@@ -10621,6 +10810,11 @@ impl VectorStore for LadybugStore {
                 "ALTER TABLE IngestGeneration ADD active_generation INT64",
                 "ALTER TABLE IngestGeneration ADD counter INT64",
                 "ALTER TABLE IngestGeneration ADD previous_generation INT64",
+                // Crash-recovery markers must be declared columns: LadybugDB
+                // binds `g.<property>` against the table schema and refuses a
+                // marker that was only ever introduced through a SET clause.
+                "ALTER TABLE IngestGeneration ADD relink_pending BOOLEAN",
+                "ALTER TABLE IngestGeneration ADD stage_lease_id STRING",
             ] {
                 if let Err(e) = conn.query(stmt) {
                     tracing::debug!("schema DDL query note: {e}");
@@ -12350,8 +12544,13 @@ impl VectorStore for LadybugStore {
         // Declarations live in each memory's metadata, which survives ingestion;
         // only the edges themselves are lost with the nodes. Replaying them is
         // therefore a read of what is already stored, not a guess.
-        let memories = self.list(namespace, None, None).await?;
+        // Read the generation FIRST, then build the plan. Reversing these two
+        // reads let a publication land in between: the plan would describe the
+        // old tree while `active_gen` named the new one, and the in-turn guard
+        // below would accept its own stale plan. A publication landing after
+        // the plan is built is caught by that same guard.
         let active_gen = self.active_generation(namespace, source_key).await?;
+        let memories = self.list(namespace, None, None).await?;
 
         // The published generation's logical paths. A stub materialised before
         // the file was ingested is a placeholder; once the real node arrives it
@@ -12561,6 +12760,12 @@ impl VectorStore for LadybugStore {
             && mention_pairs.is_empty()
             && mention_updates.is_empty()
         {
+            // No work is still a successful relink: the pending marker must be
+            // cleared so a later ingest does not replay recovery for this
+            // generation forever. Use the same active-generation and lease
+            // guard as the normal completion path.
+            self.clear_pending_relink_if_active(namespace, source_key, active_gen)
+                .await?;
             return Ok(0);
         }
 
@@ -12572,7 +12777,39 @@ impl VectorStore for LadybugStore {
         }
 
         let namespace_owned = namespace.to_string();
+        let source_key_owned = source_key.to_string();
+        let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+            namespace, source_key,
+        ));
+        let lease = escape_ladybug_string(&crate::parser::generation::stage_lease_id(
+            namespace, source_key, active_gen,
+        ));
         self.write_with_deadline("relinking the graph", move |conn| {
+            // One transaction: a later statement failing must not leave an
+            // earlier mentions rewrite, stub retirement or edge replay
+            // committed against a pointer the caller is about to roll back.
+            conn.query("BEGIN TRANSACTION")?;
+            // Re-check inside the write turn. The plan was built from an
+            // active-generation snapshot taken before this turn; a newer
+            // publication may have landed in between, and applying the stale
+            // plan (or clearing its pending marker) would strand the newer
+            // tree with missing edges.
+            let active_read = format!(
+                "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.active_generation, g.namespace, g.source_key"
+            );
+            let owner = conn.query(&active_read)?.next();
+            let current = owner
+                .as_ref()
+                .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64)
+                .unwrap_or(0);
+            let owner_matches = owner.as_ref().map_or(true, |row| {
+                format!("{}", row[1]) == namespace_owned && format!("{}", row[2]) == source_key_owned
+            });
+            if current != active_gen || !owner_matches {
+                let _ = conn.query("ROLLBACK");
+                return Ok(0);
+            }
+            let inner: Result<usize> = (|| {
             // Update only mentions metadata rows that actually changed, batched
             // via UNWIND to avoid a separate write transaction per memory.
             for chunk in mention_updates.chunks(100) {
@@ -12601,9 +12838,9 @@ impl VectorStore for LadybugStore {
                             escape_ladybug_string(id),
                             escape_ladybug_string(meta)
                         );
-                        if let Err(row_err) = conn.query(&q) {
-                            tracing::warn!("relink: mentions metadata write failed for {id}: {row_err}");
-                        }
+                        conn.query(&q).map_err(|e| {
+                            anyhow::anyhow!("relink: mentions metadata write failed for {id}: {e}")
+                        })?;
                     }
                 }
             }
@@ -12654,21 +12891,21 @@ impl VectorStore for LadybugStore {
                 "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) WHERE a.namespace = '{}' AND r.extractor = 'mention-detector' RETURN a.id, b.id",
                 escape_ladybug_string(&namespace_owned)
             );
-            let has_stale_mention_edges = match conn.query(&existing_mention_q) {
-                Ok(rows) => rows.into_iter().any(|row| {
+            let has_stale_mention_edges = conn
+                .query(&existing_mention_q)?
+                .into_iter()
+                .any(|row| {
                     let pair = (format!("{}", row[0]), format!("{}", row[1]));
                     !wanted_mention_set.contains(&pair)
-                }),
-                Err(_) => true,
-            };
+                });
             if has_stale_mention_edges {
                 let del_q = format!(
                     "MATCH (a:Memory)-[r:RELATES_TO]->(b:Memory) WHERE a.namespace = '{}' AND r.extractor = 'mention-detector' DELETE r",
                     escape_ladybug_string(&namespace_owned)
                 );
-                if let Err(e) = conn.query(&del_q) {
-                    tracing::warn!("relink: mention-detector edge cleanup failed: {e}");
-                }
+                conn.query(&del_q).map_err(|e| {
+                    anyhow::anyhow!("relink: mention-detector edge cleanup failed: {e}")
+                })?;
             }
             if !mention_pairs.is_empty() {
                 created += create_missing_edges(
@@ -12685,6 +12922,30 @@ impl VectorStore for LadybugStore {
                 )?;
             }
             Ok(created)
+            })();
+            match inner {
+                Ok(created) => {
+                    // Clear only the marker this relink completed, and only
+                    // while the pointer still names its generation. Another
+                    // publication must keep its own pending recovery. A failed
+                    // clear rolls the transaction back so the caller can retry
+                    // rather than reporting a complete graph with a stale marker.
+                    let clear = format!(
+                        "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' AND g.active_generation = {active_gen} AND (g.stage_lease_id = '{lease}' OR (g.stage_lease_id = '' AND g.namespace = '{}' AND g.source_key = '{}')) SET g.relink_pending = false",
+                        escape_ladybug_string(&namespace_owned),
+                        escape_ladybug_string(&source_key_owned)
+                    );
+                    conn.query(&clear).map_err(|e| {
+                        anyhow::anyhow!("relink: could not clear the pending marker: {e}")
+                    })?;
+                    conn.query("COMMIT")?;
+                    Ok(created)
+                }
+                Err(e) => {
+                    let _ = conn.query("ROLLBACK");
+                    Err(e)
+                }
+            }
         })
         .await
     }
@@ -12796,9 +13057,16 @@ impl VectorStore for LadybugStore {
         source_key: &str,
         generation: u64,
     ) -> Result<()> {
+        #[cfg(test)]
+        publication_phase_barrier("staged", generation);
         let namespace = namespace.to_string();
         let refresh_ns = namespace.clone();
         let source_key = source_key.to_string();
+        // Record who owns this pending relink. The pointer key alone is not
+        // enough: `::` is legal inside a namespace, so lookalike owners share
+        // one row and only an unambiguous lease id can attribute the marker.
+        let lease = crate::parser::generation::stage_lease_id(&namespace, &source_key, generation);
+        let safe_lease = escape_ladybug_string(&lease);
         self.write_with_deadline("publishing a staging generation", move |conn| {
             let safe_ns = escape_ladybug_string(&namespace);
             let safe_sk = escape_ladybug_string(&source_key);
@@ -12820,8 +13088,13 @@ impl VectorStore for LadybugStore {
                 .next()
                 .map(|row| format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64)
                 .unwrap_or(0);
+            // Crash-fixture barrier: after the rollback target is read and
+            // before the pointer is written, either outcome of a crash is a
+            // whole generation (the write below is atomic).
+            #[cfg(test)]
+            publication_phase_barrier("precommit", generation);
             let write = format!(
-                "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {generation}, g.previous_generation = {previous} ON MATCH SET g.active_generation = {generation}, g.previous_generation = {previous}"
+                "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {generation}, g.previous_generation = {previous}, g.relink_pending = true, g.stage_lease_id = '{safe_lease}' ON MATCH SET g.active_generation = {generation}, g.previous_generation = {previous}, g.relink_pending = true, g.stage_lease_id = '{safe_lease}'"
             );
             conn.query(&write)?;
             // Only this generation's staging row: an overlapping ingest's
@@ -12833,8 +13106,209 @@ impl VectorStore for LadybugStore {
             Ok(())
         })
         .await?;
+        // Crash-fixture barrier: the pointer flip has committed, so recovery
+        // here must land on the committed generation.
+        #[cfg(test)]
+        publication_phase_barrier("after-flip", generation);
         self.refresh_lexical_after_pointer_change(&refresh_ns).await;
+        // Crash-fixture barrier: publication is complete, including the
+        // lexical refresh.
+        #[cfg(test)]
+        publication_phase_barrier("postcommit", generation);
         Ok(())
+    }
+
+    async fn supports_atomic_publication(&self) -> bool {
+        true
+    }
+
+    async fn publish_generation_cas(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        expected: u64,
+        target: u64,
+        pending: bool,
+    ) -> Result<Option<u64>> {
+        let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
+        let refresh_ns = namespace.clone();
+        let safe_ns = escape_ladybug_string(&namespace);
+        let safe_sk = escape_ladybug_string(&source_key);
+        let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+            &namespace,
+            &source_key,
+        ));
+        let lease = if pending {
+            escape_ladybug_string(&crate::parser::generation::stage_lease_id(
+                &namespace,
+                &source_key,
+                target,
+            ))
+        } else {
+            String::new()
+        };
+        // For an existing pointer the comparison and the flip are ONE
+        // conditional write: a second process cannot slip a publication
+        // between the read and the write, and the WHERE binds the row to its
+        // stored owner so colliding key pairs cannot overwrite each other.
+        let conditional = format!(
+            "MATCH (g:IngestGeneration {{id: '{pointer_id}'}}) WHERE g.namespace = '{safe_ns}' AND g.source_key = '{safe_sk}' AND g.active_generation = {expected} SET g.active_generation = {target}, g.previous_generation = {expected}, g.relink_pending = {pending}, g.stage_lease_id = '{lease}' RETURN g.active_generation AS active"
+        );
+        // A first publish has no row to compare against. MERGE creates one
+        // only while it is still absent; ON MATCH deliberately does nothing,
+        // so a concurrent creator's tree is never overwritten.
+        let create = format!(
+            "MERGE (g:IngestGeneration {{id: '{pointer_id}'}}) ON CREATE SET g.namespace = '{safe_ns}', g.source_key = '{safe_sk}', g.counter = 0, g.active_generation = {target}, g.previous_generation = 0, g.relink_pending = {pending}, g.stage_lease_id = '{lease}' RETURN g.active_generation AS active, g.namespace AS owner_ns, g.source_key AS owner_sk, g.relink_pending AS pending"
+        );
+        let clear_staging = format!(
+            "MATCH (s:StagingGeneration) WHERE s.namespace = '{safe_ns}' AND s.source_key = '{safe_sk}' AND s.generation = {target} DELETE s"
+        );
+        let displaced = self
+            .write_with_deadline("conditionally publishing a generation", move |conn| {
+                if conn.query(&conditional)?.next().is_some() {
+                    conn.query(&clear_staging)?;
+                    return Ok(Some(expected));
+                }
+                if expected != 0 {
+                    // Either a newer publication landed first or a lookalike
+                    // owner holds the row. Neither may be replaced by a stale
+                    // publish, so no further write is attempted here.
+                    return Ok(None);
+                }
+                let Some(row) = conn.query(&create)?.next() else {
+                    return Ok(None);
+                };
+                let stored_ns = format!("{}", row[1]);
+                let stored_sk = format!("{}", row[2]);
+                if stored_ns != namespace || stored_sk != source_key {
+                    anyhow::bail!(
+                        "lease provenance mismatch: '{namespace}'/'{source_key}' cannot publish over pointer owned by '{stored_ns}'/'{stored_sk}'"
+                    );
+                }
+                let active = format!("{}", row[0]).parse::<i64>().unwrap_or(0).max(0) as u64;
+                let marked = format!("{}", row[3]).eq_ignore_ascii_case("true");
+                if active != target || marked != pending {
+                    return Ok(None);
+                }
+                conn.query(&clear_staging)?;
+                Ok(Some(0))
+            })
+            .await?;
+        if displaced.is_some() {
+            self.refresh_lexical_after_pointer_change(&refresh_ns).await;
+        }
+        Ok(displaced)
+    }
+
+    async fn relink_committed_for(
+        &self,
+        namespace: &str,
+        source_key: &str,
+        generation: u64,
+    ) -> Result<bool> {
+        let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+            namespace, source_key,
+        ));
+        let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
+        // A relink that timed out may still own the writer turn in its blocking
+        // worker. An unbounded read here would hang the ingest behind it, so
+        // the status probe shares the write deadline and reports an error when
+        // the answer cannot be obtained.
+        bounded(
+            "checking whether a relink committed",
+            write_timeout(),
+            true,
+            self.with_conn(move |conn| {
+                let read = format!(
+                    "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.relink_pending, g.stage_lease_id, g.namespace, g.source_key"
+                );
+                let Some(row) = conn.query(&read)?.next() else {
+                    return Ok(false);
+                };
+                if format!("{}", row[2]) != namespace || format!("{}", row[3]) != source_key {
+                    anyhow::bail!(
+                        "lease provenance mismatch: '{namespace}'/'{source_key}' cannot read the relink status of a pointer owned by '{}'/'{}'",
+                        row[2],
+                        row[3]
+                    );
+                }
+                if format!("{}", row[0]).eq_ignore_ascii_case("true") {
+                    return Ok(false);
+                }
+                let expected = crate::parser::generation::stage_lease_id(
+                    &namespace, &source_key, generation,
+                );
+                Ok(format!("{}", row[1]) == expected)
+            }),
+        )
+        .await
+    }
+
+    async fn recover_pending_relink(&self, namespace: &str, source_key: &str) -> Result<usize> {
+        let namespace = namespace.to_string();
+        let source_key = source_key.to_string();
+        let pointer_id = escape_ladybug_string(&crate::parser::ingest::generation_key(
+            &namespace,
+            &source_key,
+        ));
+        let read_ns = namespace.clone();
+        let read_sk = source_key.clone();
+        let pending = self
+            .with_conn(move |conn| {
+                let read = format!(
+                    "MATCH (g:IngestGeneration) WHERE g.id = '{pointer_id}' RETURN g.relink_pending, g.stage_lease_id, g.active_generation, g.namespace, g.source_key"
+                );
+                let Some(row) = conn.query(&read)?.next() else {
+                    return Ok(false);
+                };
+                let stored_lease = format!("{}", row[1]);
+                let active = format!("{}", row[2]).parse::<i64>().unwrap_or(0).max(0) as u64;
+                let stored_ns = format!("{}", row[3]);
+                let stored_sk = format!("{}", row[4]);
+                // Validate the owner on EVERY use, not just when the marker is
+                // pending. A lookalike pair shares the pointer key and would
+                // otherwise publish over the real owner's tree as soon as a
+                // relink happened to leave the marker clear.
+                if stored_ns.is_empty() && stored_sk.is_empty() && stored_lease.is_empty() {
+                    // A pre-lease, unattributed pointer has no work to recover.
+                    return Ok(false);
+                }
+                if stored_lease.is_empty() {
+                    // A pointer written before stage leases existed carries only
+                    // its owner columns. Keep those recoverable, but still
+                    // refuse a lookalike namespace claiming the same row.
+                    if stored_ns != read_ns || stored_sk != read_sk {
+                        anyhow::bail!(
+                            "lease provenance mismatch: '{read_ns}'/'{read_sk}' cannot recover a pending relink owned by '{stored_ns}'/'{stored_sk}'"
+                        );
+                    }
+                } else {
+                    // The lease id is length-prefixed, so a colliding lookalike
+                    // cannot forge the active generation's provenance.
+                    let expected = crate::parser::generation::stage_lease_id(
+                        &read_ns, &read_sk, active,
+                    );
+                    if stored_lease != expected {
+                        anyhow::bail!(
+                            "lease provenance mismatch: stage lease does not belong to the active generation for '{read_ns}'/'{read_sk}'"
+                        );
+                    }
+                }
+                if !format!("{}", row[0]).eq_ignore_ascii_case("true") {
+                    return Ok(false);
+                }
+                Ok(true)
+            })
+            .await?;
+        if !pending {
+            return Ok(0);
+        }
+        // A crash after publication but before relinking leaves the marker set.
+        // Replay the declarations against the now-active generation before any
+        // new ingest stages rows over them.
+        self.relink_edges(&namespace, &source_key).await
     }
 
     async fn abort_generation(
@@ -12864,11 +13338,13 @@ impl VectorStore for LadybugStore {
             // aborted generation (abort is normally pre-publish), clear it so
             // the superseded generation is never reachable.
             let clear = format!(
-                "MATCH (g:IngestGeneration) WHERE g.id = '{}' AND g.active_generation = {} SET g.active_generation = 0",
+                "MATCH (g:IngestGeneration) WHERE g.id = '{}' AND g.namespace = '{}' AND g.source_key = '{}' AND g.active_generation = {} SET g.active_generation = 0, g.relink_pending = false",
                 escape_ladybug_string(&crate::parser::ingest::generation_key(
                     &namespace,
                     &source_key
                 )),
+                escape_ladybug_string(&namespace),
+                escape_ladybug_string(&source_key),
                 generation
             );
             conn.query(&clear)?;
@@ -33095,6 +33571,324 @@ eurostrata\src\daemon.rs",
         assert_eq!(result_ids(&tantivy), vec![id]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn database_path_aliases_share_writer_and_stage_sidecars() {
+        let root = std::env::temp_dir().join(format!("ns-db-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("database.store");
+        // Open a real store through the canonical spelling first. The engine
+        // refuses two live handles on one file in this process, so the alias
+        // handle is opened only after this one is dropped.
+        let first = LadybugStore::for_testing(&database, 4).unwrap();
+        let shared = db_alias_state(&database);
+        assert!(
+            Arc::ptr_eq(&first.write_lock, &shared.write_lock),
+            "the constructor must assign the shared writer to each handle"
+        );
+        assert!(
+            Arc::ptr_eq(&first.store_state, &shared.store_state),
+            "the constructor must assign the shared sidecar cache to each handle"
+        );
+        drop(first);
+
+        let alias = root.join("database-alias.store");
+        std::os::unix::fs::symlink(&database, &alias).unwrap();
+        assert_eq!(db_alias_key(&database), db_alias_key(&alias));
+        // A bare relative spelling anchors at the current directory, so it
+        // matches the absolute form of the same file.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            db_alias_key(std::path::Path::new("Cargo.toml")),
+            db_alias_key(&cwd.join("Cargo.toml")),
+            "relative paths must anchor at cwd before canonicalizing"
+        );
+        let second = LadybugStore::for_testing(&alias, 4).unwrap();
+        assert!(
+            Arc::ptr_eq(&second.write_lock, &shared.write_lock),
+            "a store opened through the alias must inherit the same writer"
+        );
+        assert!(
+            Arc::ptr_eq(&second.store_state, &shared.store_state),
+            "a store opened through the alias must inherit the same sidecar cache"
+        );
+        drop(second);
+
+        // A lookalike path that names a different file is not an alias: it
+        // must not inherit the lease or the writer turn.
+        let other = root.join("other.store");
+        std::fs::write(&other, b"fixture").unwrap();
+        assert!(!Arc::ptr_eq(&shared, &db_alias_state(&other)));
+
+        // The sidecar follows the canonical file, not the alias spelling:
+        // `<alias>.store-state.json` would be a second, divergent sidecar.
+        assert_eq!(
+            crate::model_choice::store_state_path(&db_alias_key(&database)),
+            crate::model_choice::store_state_path(&db_alias_key(&alias))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stage_lease_recovery_refuses_a_lookalike_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("stage-lease.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+        let owner_ns = "probe";
+        let owner_src = "sub::src";
+        let lookalike_ns = "probe::sub";
+        let lookalike_src = "src";
+        assert_eq!(
+            crate::parser::ingest::generation_key(owner_ns, owner_src),
+            crate::parser::ingest::generation_key(lookalike_ns, lookalike_src),
+            "these owner pairs must actually collide on the derived pointer key"
+        );
+        let generation = store.begin_generation(owner_ns, owner_src).await.unwrap();
+        store
+            .publish_generation(owner_ns, owner_src, generation)
+            .await
+            .unwrap();
+        // Declare the edge while its target is still absent: the upsert write
+        // path resolves targets eagerly, so no edge is materialized. Adding
+        // the target afterwards leaves a declaration that only relink can
+        // satisfy, giving recovery real work to prove it did.
+        let target_id = "recovery-target";
+        store
+            .upsert(
+                "probe",
+                "recovery-rule",
+                vec![0.0; 4],
+                retired_test_payload("rule", "agent", json!({ "governs": [target_id] })),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert(
+                "probe",
+                target_id,
+                vec![0.0; 4],
+                retired_test_payload("file", "agent", json!({})),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .has_edge("probe", "recovery-rule", "GOVERNS", target_id)
+                .await
+                .unwrap(),
+            "the declared edge must be absent before recovery"
+        );
+
+        let refused = store
+            .recover_pending_relink(lookalike_ns, lookalike_src)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("lease provenance"),
+            "lookalike namespace must not claim the pending relink: {refused}"
+        );
+
+        // The provenance-bearing owner recovers: the declared edge appears,
+        // and a second recovery is a no-op because the marker was cleared.
+        let linked = store
+            .recover_pending_relink(owner_ns, owner_src)
+            .await
+            .unwrap();
+        assert!(linked > 0, "recovery must materialize the declared edge");
+        assert!(
+            store
+                .has_edge("probe", "recovery-rule", "GOVERNS", target_id)
+                .await
+                .unwrap(),
+            "recovery must materialize the declared edge"
+        );
+        assert_eq!(
+            store
+                .recover_pending_relink(owner_ns, owner_src)
+                .await
+                .unwrap(),
+            0,
+            "the marker must be cleared after a successful recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_relink_clears_the_pending_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("empty-relink.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+        let owner_ns = "probe";
+        let owner_src = "sub::src";
+        let lookalike_ns = "probe::sub";
+        let lookalike_src = "src";
+        let generation = store.begin_generation(owner_ns, owner_src).await.unwrap();
+        store
+            .publish_generation(owner_ns, owner_src, generation)
+            .await
+            .unwrap();
+
+        // No row declares an edge, so relink has no work to create. An empty
+        // tree is still a completed relink and must clear the recovery marker.
+        assert_eq!(store.relink_edges(owner_ns, owner_src).await.unwrap(), 0);
+
+        // A clear marker is not a licence for a lookalike owner to claim this
+        // pointer: recovery validates the stored owner on every use. The
+        // no-work path is still proved by the owner's own second recovery.
+        assert_eq!(
+            store
+                .recover_pending_relink(owner_ns, owner_src)
+                .await
+                .unwrap(),
+            0
+        );
+        let refused = store
+            .recover_pending_relink(lookalike_ns, lookalike_src)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("lease provenance"),
+            "a lookalike must be refused even with no pending marker: {refused}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cas_publication_refuses_a_colliding_owner_pointer() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("cas-owner.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+        let (owner_ns, owner_src) = ("probe", "sub::src");
+        let (lookalike_ns, lookalike_src) = ("probe::sub", "src");
+        assert_eq!(
+            crate::parser::ingest::generation_key(owner_ns, owner_src),
+            crate::parser::ingest::generation_key(lookalike_ns, lookalike_src),
+            "these owner pairs must collide on one pointer row"
+        );
+        let generation = store.begin_generation(owner_ns, owner_src).await.unwrap();
+        store
+            .publish_generation(owner_ns, owner_src, generation)
+            .await
+            .unwrap();
+
+        let refused = store
+            .publish_generation_cas(
+                lookalike_ns,
+                lookalike_src,
+                generation,
+                generation + 1,
+                true,
+            )
+            .await;
+        match refused {
+            Ok(None) | Err(_) => {}
+            Ok(Some(displaced)) => {
+                panic!("a lookalike owner displaced the real owner's tree: {displaced:?}")
+            }
+        }
+        assert_eq!(
+            store.active_generation(owner_ns, owner_src).await.unwrap(),
+            generation,
+            "the real owner's pointer must not move"
+        );
+
+        // The real owner can still publish over its own generation.
+        assert_eq!(
+            store
+                .publish_generation_cas(owner_ns, owner_src, generation, generation + 2, true,)
+                .await
+                .unwrap(),
+            Some(generation)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alias_side_store_state_sidecar_is_still_consulted() {
+        let root = std::env::temp_dir().join(format!("ns-alias-sidecar-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("database.lbug");
+        std::fs::write(&database, b"fixture").unwrap();
+        let alias = root.join("database-alias.lbug");
+        std::os::unix::fs::symlink(&database, &alias).unwrap();
+
+        let descriptor = crate::traits::EmbeddingDescriptor {
+            provider: "alias-provider".into(),
+            model: "alias-model".into(),
+            dims: 4,
+            ..Default::default()
+        };
+        let state = crate::model_choice::StoreState::new(true, descriptor.clone());
+        crate::model_choice::write_store_state_identity(&alias, &state).unwrap();
+
+        // The canonical spelling has no sidecar; only the alias does.
+        assert!(matches!(
+            crate::model_choice::read_store_state(&db_alias_key(&alias)),
+            crate::model_choice::StoreStateRead::Absent
+        ));
+        match read_store_state_for_path(&alias) {
+            crate::model_choice::StoreStateRead::Recorded(recorded) => {
+                assert_eq!(recorded.descriptor, descriptor)
+            }
+            other => panic!("alias-side sidecar was not consulted: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn relink_committed_for_tracks_the_active_generations_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let store = LadybugStore::for_testing(root.path().join("relink-commit.lbug"), 4).unwrap();
+        store.init("probe").await.unwrap();
+        let generation = store.begin_generation("probe", "src").await.unwrap();
+        store
+            .publish_generation("probe", "src", generation)
+            .await
+            .unwrap();
+
+        // A pending relink has not committed, even though the lease names this
+        // generation: recovery may still be owed.
+        assert!(
+            !store
+                .relink_committed_for("probe", "src", generation)
+                .await
+                .unwrap(),
+            "a pending marker means the relink has not committed"
+        );
+
+        // Completing the relink clears the marker while keeping the lease, so
+        // a caller that only saw a timeout can now tell it did commit.
+        store.relink_edges("probe", "src").await.unwrap();
+        assert!(
+            store
+                .relink_committed_for("probe", "src", generation)
+                .await
+                .unwrap(),
+            "a cleared marker with this generation's lease proves the relink committed"
+        );
+
+        // The lease is generation-specific: the same marker after a newer
+        // publication cannot vouch for the older generation.
+        let next = store.begin_generation("probe", "src").await.unwrap();
+        store
+            .publish_generation_cas("probe", "src", generation, next, true)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .relink_committed_for("probe", "src", generation)
+                .await
+                .unwrap(),
+            "a newer generation's lease must not vouch for an older relink"
+        );
+        assert!(
+            !store
+                .relink_committed_for("probe", "src", next)
+                .await
+                .unwrap(),
+            "the newly published generation is still pending relink"
+        );
+    }
+
     #[tokio::test]
     async fn lexical_owner_parity() {
         let root = tempfile::tempdir().unwrap();
@@ -33158,6 +33952,200 @@ eurostrata\src\daemon.rs",
                 result_ids(&inhouse),
                 result_ids(&tantivy),
                 "both lexical routes must agree for {principal}"
+            );
+        }
+    }
+
+    const CRASH_TEST_NAME: &str =
+        "store::ladybug::tests::process_crash_during_publication_recovers_old_or_committed_generation";
+    const CRASH_CHILD_VAR: &str = "NEUROSTRATA_TEST_PUBLICATION_CHILD";
+    const CRASH_PHASE_VAR: &str = "NEUROSTRATA_TEST_PUBLICATION_PHASE";
+    const CRASH_GENERATION_VAR: &str = "NEUROSTRATA_TEST_PUBLICATION_GENERATION";
+    const CRASH_MARKER_VAR: &str = "NEUROSTRATA_TEST_PUBLICATION_MARKER";
+    const CRASH_DB_VAR: &str = "NEUROSTRATA_TEST_PUBLICATION_DB";
+
+    /// Child half of the publication crash fixture: publish generation 1,
+    /// stage generation 2, then enter `publish_generation` with a phase barrier
+    /// armed. The parent kills this process at the barrier and reopens the
+    /// store, so the barrier is never released in-process.
+    async fn publication_crash_child() {
+        let db = std::env::var(CRASH_DB_VAR).expect("the child is given a database path");
+        let store = LadybugStore::for_testing(&db, 4).expect("open the child store");
+        store.init("crashprobe").await.expect("create the schema");
+
+        let first = publish_fixture_generation(
+            &store,
+            "crashprobe",
+            PROBE_SOURCE,
+            &[("src/a.rs", "first generation")],
+        )
+        .await;
+        assert_eq!(first, 1, "the fixture starts at generation 1");
+
+        let second = store
+            .begin_generation("crashprobe", PROBE_SOURCE)
+            .await
+            .expect("begin the staging generation");
+        for (index, (path, content)) in [
+            ("src/a.rs", "second generation"),
+            ("src/b.rs", "second file"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = crate::parser::ingest::generation_scoped_id("crashprobe", second, path);
+            store
+                .upsert(
+                    "crashprobe",
+                    &id,
+                    vec![0.0; 4],
+                    generation_payload(content, PROBE_SOURCE, json!({})),
+                )
+                .await
+                .expect("stage the row");
+            if index == 0 {
+                publication_phase_barrier("after-first-page", second);
+            }
+        }
+        // A staged row can be deleted while shaping a generation. A crash at
+        // that point must reopen on the previous, whole generation.
+        let first_id =
+            crate::parser::ingest::generation_scoped_id("crashprobe", second, "src/a.rs");
+        store
+            .delete("crashprobe", &first_id)
+            .await
+            .expect("delete the staged row");
+        publication_phase_barrier("after-delete", second);
+        store
+            .upsert(
+                "crashprobe",
+                &first_id,
+                vec![0.0; 4],
+                generation_payload("second generation", PROBE_SOURCE, json!({})),
+            )
+            .await
+            .expect("restore the staged row");
+        store
+            .publish_generation("crashprobe", PROBE_SOURCE, second)
+            .await
+            .expect("publish unless a barrier kills the process");
+    }
+
+    /// A process killed during publication must reopen on either the previous
+    /// generation or the fully committed one -- never zero active generations
+    /// and never a mix of the two (issue #417).
+    #[tokio::test]
+    async fn process_crash_during_publication_recovers_old_or_committed_generation() {
+        if std::env::var(CRASH_CHILD_VAR).as_deref() == Ok("1") {
+            publication_crash_child().await;
+            // Reaching here means the barrier did not fire; the parent sees
+            // the child exit without a marker and fails the test.
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("the test binary has a path");
+        for phase in [
+            "staged",
+            "after-delete",
+            "after-first-page",
+            "precommit",
+            "after-flip",
+            "postcommit",
+        ] {
+            let root = tempfile::tempdir().expect("create the crash fixture directory");
+            let db = root.path().join("crash.lbug");
+            let marker = root.path().join(format!("reached-{phase}"));
+            let mut child = std::process::Command::new(&exe)
+                .arg("--exact")
+                .arg(CRASH_TEST_NAME)
+                .arg("--nocapture")
+                .env(CRASH_CHILD_VAR, "1")
+                .env(CRASH_PHASE_VAR, phase)
+                .env(CRASH_GENERATION_VAR, "2")
+                .env(CRASH_MARKER_VAR, &marker)
+                .env(CRASH_DB_VAR, &db)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start the crash child");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if marker.exists() {
+                    break;
+                }
+                if let Some(status) = child.try_wait().expect("wait on the crash child") {
+                    panic!("the child exited before the {phase} barrier: {status:?}");
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    panic!("the child did not reach the {phase} barrier within the deadline");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            child.kill().expect("kill the child at the phase barrier");
+            let status = child.wait().expect("reap the killed child");
+            assert!(
+                !status.success(),
+                "the fixture must kill the child, not let it finish: {status:?}"
+            );
+
+            let reopened =
+                LadybugStore::for_testing(&db, 4).expect("reopen the store after the crash");
+            let active = reopened
+                .active_generation("crashprobe", PROBE_SOURCE)
+                .await
+                .expect("read the recovered active generation");
+            let expected = match phase {
+                "staged" | "after-delete" | "after-first-page" | "precommit" => 1,
+                "after-flip" | "postcommit" => 2,
+                other => panic!("unknown crash phase {other}"),
+            };
+            assert_eq!(
+                active, expected,
+                "{phase}: the store must recover the previous or the committed generation, never a torn one"
+            );
+            assert_ne!(
+                active, 0,
+                "{phase}: recovery must never leave zero active generations"
+            );
+
+            let expected_row =
+                crate::parser::ingest::generation_scoped_id("crashprobe", active, "src/a.rs");
+            assert!(
+                reopened
+                    .get("crashprobe", &expected_row)
+                    .await
+                    .expect("read the recovered row")
+                    .is_some(),
+                "{phase}: the whole active generation is present, not a partial one"
+            );
+            let expected_nodes = if expected == 1 { 1 } else { 2 };
+            assert_eq!(
+                reopened
+                    .generation_nodes("crashprobe", active)
+                    .await
+                    .expect("list the active generation")
+                    .len(),
+                expected_nodes,
+                "{phase}: every row of the recovered generation is present"
+            );
+            let visible = reopened
+                .list("crashprobe", None, None)
+                .await
+                .expect("list the visible rows");
+            assert_eq!(
+                visible.len(),
+                expected_nodes,
+                "{phase}: the visible rows are exactly the recovered generation, not a mix"
+            );
+            assert!(
+                visible.iter().all(|row| {
+                    crate::parser::ingest::split_scoped_id(&row.id)
+                        .is_some_and(|(_, generation, _)| generation == active)
+                }),
+                "{phase}: every visible row belongs to the active generation"
             );
         }
     }

@@ -3369,6 +3369,81 @@ fn cli_ingest_root(dir: &str) -> String {
 
 const DAEMON_BUSY_MESSAGE: &str = "A NeuroStrata daemon holds the database but did not answer within 500ms, so it is busy rather than gone, and opening the database from here would contend with it. Retry in a moment, or run `neurostrata-mcp shutdown` and let it finish.";
 
+/// Refuse a destination that belongs to the internal ingest staging machinery.
+///
+/// Shared by every CLI ingest arm so the refusal carries the same message
+/// wherever the destination is named (issue #417).
+fn reject_reserved_ingest_destination(namespace: &str) -> anyhow::Result<()> {
+    if crate::traits::is_reserved_ingest_destination(namespace) {
+        anyhow::bail!(
+            "ingest destination uses the reserved internal staging namespace '{}'; choose a different namespace",
+            namespace
+        );
+    }
+    Ok(())
+}
+
+/// The `ingest --dry-run` arm: a read-only preview that never opens a store.
+///
+/// The reserved-destination guard runs before the schema or the operator's
+/// tree is read, so a reserved namespace is refused identically whether or not
+/// that tree exists (issue #417).
+async fn run_ingest_dry_run(
+    namespace: &str,
+    dir: &str,
+    schema_path: Option<&str>,
+    dry_run_mode: &str,
+) -> anyhow::Result<()> {
+    run_ingest_dry_run_with(
+        namespace,
+        dir,
+        schema_path,
+        dry_run_mode,
+        |path, schema, mode| async move {
+            crate::parser::ingest::dry_run_directory(&path, &schema, &mode).await
+        },
+    )
+    .await
+}
+
+/// Same dry-run path with an injectable tree walk. The injection exists so a
+/// test can observe whether the walk was invoked; the reserved-destination
+/// refusal still runs before any schema read or filesystem access.
+async fn run_ingest_dry_run_with<F, Fut>(
+    namespace: &str,
+    dir: &str,
+    schema_path: Option<&str>,
+    dry_run_mode: &str,
+    walk: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(std::path::PathBuf, crate::parser::schema::ParserSchema, String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<String>>,
+{
+    reject_reserved_ingest_destination(namespace)?;
+    let dir_str = cli_ingest_root(dir);
+    let dir_path_owned = std::path::PathBuf::from(&dir_str);
+    let schema_str = if let Some(path) = schema_path {
+        std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("Failed to read schema from {}: {}", path, e);
+            std::process::exit(1);
+        })
+    } else {
+        include_str!("schema.json").to_string()
+    };
+    let schema = match crate::parser::schema::ParserSchema::load(&schema_str) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to load schema: {}", e);
+            return Err(e.into());
+        }
+    };
+    let report = walk(dir_path_owned, schema, dry_run_mode.to_string()).await?;
+    println!("Namespace: {}", namespace);
+    println!("{}", report);
+    Ok(())
+}
+
 /// Refusal for `backup --no-open` while the daemon lock is held (#209). The
 /// copy is uncoordinated: the mmapped database, its WAL, and the checkpoint
 /// shadow would be read at different instants while the daemon may be
@@ -3907,6 +3982,52 @@ mod tests {
         // A command that writes must still be allowed to open (and create)
         // the store; only read/report arms take the #390 guard.
         assert!(!fallback_read_only_command(&Commands::Status));
+    }
+
+    /// The dry-run arm must refuse a reserved destination before it reads any
+    /// directory. The path below deliberately does not exist: with the guard
+    /// after the walk, `dry_run_directory` would treat the missing root as an
+    /// empty tree and return a report instead of the reserved-destination
+    /// error (issue #417).
+    #[tokio::test]
+    async fn cli_ingest_dry_run_refuses_reserved_destination_before_reading_the_tree() {
+        let missing = std::env::temp_dir().join(format!(
+            "ns-dry-run-reserved-missing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let missing_str = missing.to_str().expect("utf-8 path");
+
+        // Inject the tree walk so an actual probe is observable: the missing
+        // directory alone would stay missing even if the walk ran first.
+        let probed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_flag = probed.clone();
+        let error = run_ingest_dry_run_with(
+            "  __NEUROSTRATA_INGEST_STAGE__probe ",
+            missing_str,
+            None,
+            "estimate",
+            move |_, _, _| {
+                probe_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(String::new()) }
+            },
+        )
+        .await
+        .expect_err("a reserved destination is refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("ingest destination uses the reserved internal staging namespace"),
+            "the refusal names the reserved staging namespace: {error}"
+        );
+        assert!(
+            !probed.load(std::sync::atomic::Ordering::SeqCst),
+            "the refusal must happen before the dry-run tree walk is invoked"
+        );
+        assert!(
+            !missing.exists(),
+            "the refusal happens before the dry-run walk touches the tree"
+        );
     }
 
     #[test]
@@ -10060,32 +10181,13 @@ async fn run() -> anyhow::Result<()> {
                     dry_run_mode,
                 } = &other
                 {
-                    let dir_str = cli_ingest_root(dir);
-                    let dir_path_owned = std::path::PathBuf::from(&dir_str);
-                    let schema_str = if let Some(path) = schema_path {
-                        std::fs::read_to_string(path).unwrap_or_else(|e| {
-                            eprintln!("Failed to read schema from {}: {}", path, e);
-                            std::process::exit(1);
-                        })
-                    } else {
-                        include_str!("schema.json").to_string()
-                    };
-                    let schema = match crate::parser::schema::ParserSchema::load(&schema_str) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            eprintln!("Failed to load schema: {}", e);
-                            return Err(e.into());
-                        }
-                    };
-                    let report = crate::parser::ingest::dry_run_directory(
-                        &dir_path_owned,
-                        &schema,
-                        &dry_run_mode,
+                    return run_ingest_dry_run(
+                        namespace,
+                        dir,
+                        schema_path.as_deref(),
+                        dry_run_mode,
                     )
-                    .await?;
-                    println!("Namespace: {}", namespace);
-                    println!("{}", report);
-                    return Ok(());
+                    .await;
                 }
 
                 // `storage status` and `storage verify-snapshot` are path-only
@@ -10595,6 +10697,16 @@ async fn run() -> anyhow::Result<()> {
                         );
                     }
                     return Ok(());
+                }
+                // Refuse a reserved ingest destination before the store is
+                // opened. On a fresh configured path the open itself creates
+                // the database, so a command that must be rejected would
+                // otherwise leave a store behind for the operator to clean up.
+                match &other {
+                    Commands::IngestScip { namespace, .. } | Commands::Ingest { namespace, .. } => {
+                        reject_reserved_ingest_destination(namespace)?;
+                    }
+                    _ => {}
                 }
                 let concrete_store: Arc<LadybugStore> = match LadybugStore::new(
                     config.db_path.to_string_lossy().to_string(),
@@ -11135,6 +11247,7 @@ async fn run() -> anyhow::Result<()> {
                         scip_path,
                         namespace,
                     } => {
+                        reject_reserved_ingest_destination(&namespace)?;
                         let report = crate::parser::scip::ingest_scip_index(
                             vector_store.clone(),
                             &namespace,
@@ -11150,6 +11263,11 @@ async fn run() -> anyhow::Result<()> {
                         dry_run: _,
                         dry_run_mode: _,
                     } => {
+                        // Refuse a reserved staging destination before the
+                        // fallback store is prepared or `clear_ingested` can
+                        // run: clearing is destructive and must never touch a
+                        // namespace the operator was never allowed to name.
+                        reject_reserved_ingest_destination(&namespace)?;
                         let embedder = build_embedder()?;
                         prepare_fallback_write_store(&vector_store, &embedder, &namespace)
                             .await?;
