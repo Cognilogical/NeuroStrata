@@ -22,7 +22,7 @@ pub(crate) mod subscribers;
 
 pub use self::bus::{OutboxConfig, ThalamicBus};
 pub use self::event::ThalamicPulse;
-pub use self::outbox::{DurableDelivery, EventClass, EventOutbox, EventOutboxError};
+pub use self::outbox::{DurableDelivery, EventClass, EventOutbox, EventOutboxError, MeshCapture};
 pub use self::subscriber::{
     BackpressureEvent, BusMetrics, MemorySubscriber, RecursionToken, SubscriberContext,
     SubscriberError,

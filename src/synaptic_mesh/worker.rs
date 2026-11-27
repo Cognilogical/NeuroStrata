@@ -343,6 +343,15 @@ fn apply_one(
             // mark-committed). Idempotent: nothing to write, nothing to commit.
             return Ok((ApplyOutcome::AlreadyApplied, None));
         }
+        if existing.update_id > record.update_id {
+            // Revision ids are UUIDv7, so ordering is creation-time ordering.
+            // A committed bus key can fall out of the sidecar's dedup window
+            // while its event-bus offset is still pending; the replay then
+            // arrives with an older revision. A newer record already won --
+            // applying this stale operation would roll it back (for example
+            // restoring an archived record to Active). Consume it as a no-op.
+            return Ok((ApplyOutcome::AlreadyApplied, None));
+        }
         // Guard against silent overwrite of independently authored records
         // that map to the same deterministic UUID (#249):
         // - If the on-disk record was created by a different node (`created_by != node_id`)

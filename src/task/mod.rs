@@ -1031,7 +1031,13 @@ fn persist_active_session_file_with_home(
         // No task is in progress: drop the fields a finished (completed or
         // released) task left behind, or the session-start hook keeps
         // announcing it as the active task.
-        for key in ["task_id", "active_task_id", "status", "session_id", "subagent_prompt_injection"] {
+        for key in [
+            "task_id",
+            "active_task_id",
+            "status",
+            "session_id",
+            "subagent_prompt_injection",
+        ] {
             active.remove(key);
         }
         active.insert("updated_at".to_string(), json!(machine::timestamp()));
@@ -1174,10 +1180,21 @@ static SESSION_FILE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
 /// The task id the session file at `project_root` currently names, if any,
 /// and the session id written with it.
 fn session_file_task_id(project_root: &std::path::Path) -> Option<(String, Option<String>)> {
-    let text = std::fs::read_to_string(project_root.join(".NeuroStrata").join("active_session.json")).ok()?;
+    let text = std::fs::read_to_string(
+        project_root
+            .join(".NeuroStrata")
+            .join("active_session.json"),
+    )
+    .ok()?;
     let value = serde_json::from_str::<Value>(&text).ok()?;
     let task_id = value.get("task_id").and_then(|v| v.as_str())?.to_string();
-    Some((task_id, value.get("session_id").and_then(|v| v.as_str()).map(String::from)))
+    Some((
+        task_id,
+        value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    ))
 }
 
 /// Whether a session file's claim is still the task row's claim: the same
@@ -1208,7 +1225,10 @@ async fn in_progress_task(
         .metadata
         .get("valid_to")
         .is_some_and(|v| !v.is_null() && v.as_i64().unwrap_or(0) <= now);
-    let task = Task { id: id.to_string(), payload };
+    let task = Task {
+        id: id.to_string(),
+        payload,
+    };
     let shown = task.payload.memory_type == "task"
         && task.status() == Status::InProgress
         && !expired
@@ -1342,7 +1362,13 @@ pub(crate) async fn clear_finished_task_from_session_file(
             Some(Ok(Some(task))) if file_names_current_claim(file_session, task) => continue,
             _ => {}
         }
-        for key in ["task_id", "active_task_id", "status", "session_id", "subagent_prompt_injection"] {
+        for key in [
+            "task_id",
+            "active_task_id",
+            "status",
+            "session_id",
+            "subagent_prompt_injection",
+        ] {
             active.remove(key);
         }
         active.insert("updated_at".to_string(), json!(machine::timestamp()));
@@ -1360,7 +1386,10 @@ fn session_file_roots_for(args: &Value, task: &Task) -> Vec<std::path::PathBuf> 
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(std::path::PathBuf::from);
-    recorded.into_iter().chain(caller_session_root(args)).collect()
+    recorded
+        .into_iter()
+        .chain(caller_session_root(args))
+        .collect()
 }
 
 /// The root `task_claim` writes the session file into for a caller that names
@@ -3201,13 +3230,13 @@ pub async fn handle_task_update(
     // rewriting content AND re-embedding: a title is what search_memory reads.
     let new_title = match args.get("title") {
         None => None,
-        Some(_) => match check_title_redacted(
-            arg_str(&args, "title").unwrap_or_default(),
-            &mut redactions,
-        ) {
-            Ok(t) => Some(t),
-            Err(e) => return e,
-        },
+        Some(_) => {
+            match check_title_redacted(arg_str(&args, "title").unwrap_or_default(), &mut redactions)
+            {
+                Ok(t) => Some(t),
+                Err(e) => return e,
+            }
+        }
     };
     let priority = match args.get("priority") {
         None => None,
@@ -4152,7 +4181,12 @@ pub async fn handle_task_complete(
     // so a Lock 2 refusal above must leave the bus silent rather than send
     // every subscriber down a chain that does not exist. The ordering is the
     // invariant -- nothing re-derives it from the adjacent check.
-    if let Some(lesson_id) = inline_lesson {
+    // A retry after a failed durable append can find the extraction edge
+    // already stored (path 1/2) and would otherwise skip the pulse, leaving a
+    // stored mutation without its mesh sync record. Re-emit from the linked id
+    // too; the worker's idempotency absorbs a genuine duplicate.
+    let announced_lesson = inline_lesson.or_else(|| link_memory_id.clone());
+    if let Some(lesson_id) = announced_lesson {
         // Class M (Wave 3): the completion's sync record goes through
         // `emit_checked` -- a failed durable append fails the completion
         // before it is recorded below, so the caller can retry rather than
@@ -6849,8 +6883,10 @@ mod tests {
             "  - fact-live -> src/a.rs -> rule-live",
             "- Mandatory Graph-First Lookup Rule: ...",
         ]
-        .join("
-");
+        .join(
+            "
+",
+        );
         task.metadata["task"]["subagent_prompt_injection"] = json!(only_retired_entries);
         let current = task_payload_without_retired_entries(&store, "probe", &task).await;
         assert_eq!(
@@ -6861,8 +6897,10 @@ mod tests {
                 "  - fact-live -> src/a.rs -> rule-live",
                 "- Mandatory Graph-First Lookup Rule: ...",
             ]
-            .join("
-"))
+            .join(
+                "
+"
+            ))
         );
 
         task.metadata["task"]["subagent_prompt_injection"] = json!(block);
@@ -10378,7 +10416,10 @@ exit 0
             metadata: json!({ "task": { "status": "open" } }),
         };
         assert_eq!(task_summary("t", &payload, true)["history"], json!([]));
-        assert_eq!(task_summary("t", &payload, false)["history_count"], json!(0));
+        assert_eq!(
+            task_summary("t", &payload, false)["history_count"],
+            json!(0)
+        );
     }
 
     #[tokio::test]
@@ -10906,7 +10947,10 @@ exit 0
             store.clone(),
         )
         .await;
-        assert!(!reply.contains(key) && !reply.contains("hunter22"), "{reply}");
+        assert!(
+            !reply.contains(key) && !reply.contains("hunter22"),
+            "{reply}"
+        );
         let parsed: Value = serde_json::from_str(&reply).expect("json reply");
         assert_eq!(
             parsed["redactions"],
@@ -10916,7 +10960,10 @@ exit 0
         let row = stored(id.clone()).await;
         assert!(!row.contains(key) && !row.contains("hunter22"), "{row}");
         assert!(row.contains("rotate [REDACTED:github_pat]"), "{row}");
-        assert!(row.contains("then set password=[REDACTED:password] everywhere"), "{row}");
+        assert!(
+            row.contains("then set password=[REDACTED:password] everywhere"),
+            "{row}"
+        );
 
         // A title within the limit as written is not refused because its
         // marker is longer than the secret it replaced.
@@ -10954,7 +11001,10 @@ exit 0
         let parsed: Value = serde_json::from_str(&reply).expect("json reply");
         assert_eq!(parsed["redactions"], json!([{ "category": "github_pat" }]));
         let row = stored(id.clone()).await;
-        assert!(row.contains("rotate [REDACTED:github_pat] now") && !row.contains(key), "{row}");
+        assert!(
+            row.contains("rotate [REDACTED:github_pat] now") && !row.contains(key),
+            "{row}"
+        );
 
         claim(&store, &id).await;
         let mem_id = uuid::Uuid::new_v4().to_string();
@@ -10990,18 +11040,30 @@ exit 0
         )
         .await
         .expect("completes");
-        assert!(!reply.contains(key) && !reply.contains("hunter22"), "{reply}");
+        assert!(
+            !reply.contains(key) && !reply.contains("hunter22"),
+            "{reply}"
+        );
         let parsed: Value = serde_json::from_str(&reply).expect("json reply");
         assert_eq!(
             parsed["redactions"],
             json!([{ "category": "password" }, { "category": "github_pat" }])
         );
         let row = stored(id.clone()).await;
-        assert!(row.contains("rotated, old password=[REDACTED:password]"), "{row}");
+        assert!(
+            row.contains("rotated, old password=[REDACTED:password]"),
+            "{row}"
+        );
         assert!(!row.contains("hunter22"), "{row}");
-        let follow_up = parsed["follow_up_tasks_created"][0].as_str().unwrap().to_string();
+        let follow_up = parsed["follow_up_tasks_created"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
         let row = stored(follow_up).await;
-        assert!(row.contains("check [REDACTED:github_pat]") && !row.contains(key), "{row}");
+        assert!(
+            row.contains("check [REDACTED:github_pat]") && !row.contains(key),
+            "{row}"
+        );
     }
 
     /// Task text that reaches the store without passing the three tools is
@@ -11025,17 +11087,33 @@ exit 0
         let first_id = parsed["first_task"]["id"].as_str().unwrap().to_string();
         let (_, first) = store.get("MyProj", &first_id).await.unwrap().unwrap();
         let row = first.metadata.to_string();
-        assert!(row.contains("deploys with [REDACTED:github_pat]") && !row.contains(key), "{row}");
+        assert!(
+            row.contains("deploys with [REDACTED:github_pat]") && !row.contains(key),
+            "{row}"
+        );
 
-        let (_, _, staged) =
-            stage_task_transition_at(&first_id, &first, "open", &format!("use {key}"), "a", "s", 1)
-                .expect("staged");
+        let (_, _, staged) = stage_task_transition_at(
+            &first_id,
+            &first,
+            "open",
+            &format!("use {key}"),
+            "a",
+            "s",
+            1,
+        )
+        .expect("staged");
         let row = staged.metadata.to_string();
-        assert!(row.contains("use [REDACTED:github_pat]") && !row.contains(key), "{row}");
+        assert!(
+            row.contains("use [REDACTED:github_pat]") && !row.contains(key),
+            "{row}"
+        );
 
         let (vector, mut legacy) = store.get("MyProj", &first_id).await.unwrap().unwrap();
         legacy.content = format!("old title {key}");
-        store.upsert("MyProj", &first_id, vector, legacy).await.unwrap();
+        store
+            .upsert("MyProj", &first_id, vector, legacy)
+            .await
+            .unwrap();
         let reply = handle_task_update(
             json!({ "namespace": "MyProj", "id": first_id, "title": "new title" }),
             emb(),
@@ -11522,9 +11600,15 @@ exit 0
             )
             .await
             .unwrap();
-        let not_a_task =
-            handle_task_get(json!({ "id": rule_id, "namespace": "MyProj" }), store.clone()).await;
-        assert!(not_a_task.contains("is a rule memory, not a task"), "{not_a_task}");
+        let not_a_task = handle_task_get(
+            json!({ "id": rule_id, "namespace": "MyProj" }),
+            store.clone(),
+        )
+        .await;
+        assert!(
+            not_a_task.contains("is a rule memory, not a task"),
+            "{not_a_task}"
+        );
 
         let missing =
             handle_task_get(json!({ "id": "myproj-zzzz", "namespace": "MyProj" }), store).await;
@@ -11539,7 +11623,10 @@ exit 0
         let expired = create_task(&store, "MyProj", "the old work", 2).await;
         let (vector, mut payload) = store.get("MyProj", &expired).await.unwrap().unwrap();
         payload.metadata["valid_to"] = json!(chrono::Utc::now().timestamp() - 60);
-        store.upsert("MyProj", &expired, vector, payload).await.unwrap();
+        store
+            .upsert("MyProj", &expired, vector, payload)
+            .await
+            .unwrap();
         let shelved = create_task(&store, "MyProj", "the shelved work", 2).await;
         let archived = crate::handlers::archive_memory::archive_memory(
             json!({ "namespace": "MyProj", "id": shelved }),
@@ -11566,7 +11653,11 @@ exit 0
 
         // task_list labels its rows with the same helper.
         let list: Value = serde_json::from_str(
-            &handle_task_list(json!({ "namespace": "MyProj", "include_retired": true }), store).await,
+            &handle_task_list(
+                json!({ "namespace": "MyProj", "include_retired": true }),
+                store,
+            )
+            .await,
         )
         .unwrap();
         let row = |title: &str| {
@@ -11862,7 +11953,12 @@ exit 0
 
         let takeover = claim("ses_b", &new).await;
         assert!(takeover.contains("in_progress"), "{}", takeover);
-        assert_eq!(session(&new)["session_id"], json!("ses_b"), "{}", session(&new));
+        assert_eq!(
+            session(&new)["session_id"],
+            json!("ses_b"),
+            "{}",
+            session(&new)
+        );
         let old_file = session(&old);
         assert!(old_file.get("task_id").is_none(), "{}", old_file);
         assert_eq!(old_file["namespace"], json!("MyProj"), "{}", old_file);
@@ -11896,7 +11992,10 @@ exit 0
         clear_finished_task_from_session_file(&store, "MyProj", &id, &[dir.path().to_path_buf()])
             .await;
         let file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(file.get("task_id").is_none() && file.get("active_task_id").is_none(), "{file}");
+        assert!(
+            file.get("task_id").is_none() && file.get("active_task_id").is_none(),
+            "{file}"
+        );
     }
 
     #[tokio::test]
@@ -13599,12 +13698,7 @@ exit 0
 
         // The verbatim spelling a claim stores matches the caller's plain root,
         // and beats an unstamped claim listed earlier.
-        let rows = [
-            open_mine.clone(),
-            other.clone(),
-            unstamped.clone(),
-            mine,
-        ];
+        let rows = [open_mine.clone(), other.clone(), unstamped.clone(), mine];
         assert_eq!(pick(&rows, r"C:\repo\mine").as_deref(), Some("t-mine"));
         // A task claimed in another worktree, or with no worktree stamped
         // (it may come from any folder of the namespace), is never named.

@@ -24,6 +24,7 @@
 //! than silently degrading when the mesh subscriber is not wired.
 
 use super::outbox::EventOutbox;
+use super::outbox::{MeshCapture, OutboxEntry};
 use super::{
     BackpressureEvent, BusMetrics, DurableDelivery, EventClass, EventOutboxError, MemorySubscriber,
     RecursionToken, SubscriberContext, ThalamicPulse,
@@ -56,6 +57,9 @@ const MAX_DURABLE_QUEUED: usize = 10_000;
 const REPLAY_BATCH: usize = 256;
 /// Pause after a failed durable delivery before the top-up retries it.
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
+/// A class with no subscriber still yields to every other class: the dispatcher
+/// parks for this short backstop, not the old five-second registration wait.
+const MISSING_CLASS_BACKOFF: Duration = Duration::from_millis(20);
 
 /// The six counters `BusMetrics` snapshots. Plain atomics: `emit` and the
 /// dispatcher both bump them from different tasks, and none of them ever needs
@@ -278,18 +282,30 @@ impl Queue {
     /// in sequence order.
     fn hold_for_missing_class(&self, pulse: QueuedPulse) {
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
-        let class = pulse.delivery.as_ref().map(|delivery| delivery.class);
-        let insert_at = class
-            .and_then(|class| {
-                items
-                    .iter()
-                    .rposition(|queued| {
-                        queued
-                            .delivery
-                            .as_ref()
-                            .is_some_and(|delivery| delivery.class == class)
+        let identity = pulse.delivery.as_ref();
+        let insert_at = identity
+            .and_then(|delivery| {
+                // Before the FIRST queued entry of this class with a higher
+                // sequence: a subscriber registering mid-hold must never see
+                // seq N+1 before seq N.
+                items.iter().position(|queued| {
+                    queued.delivery.as_ref().is_some_and(|queued| {
+                        queued.class == delivery.class && queued.seq > delivery.seq
                     })
-                    .map(|position| position + 1)
+                })
+            })
+            .or_else(|| {
+                identity.and_then(|delivery| {
+                    items
+                        .iter()
+                        .rposition(|queued| {
+                            queued
+                                .delivery
+                                .as_ref()
+                                .is_some_and(|queued| queued.class == delivery.class)
+                        })
+                        .map(|position| position + 1)
+                })
             })
             .unwrap_or(items.len());
         items.insert(insert_at, pulse);
@@ -352,7 +368,7 @@ pub struct ThalamicBus {
     /// Serializes the durable append with the queue enqueue, so two
     /// concurrent publishers of the same class cannot enqueue seq N+1 ahead
     /// of seq N (which would bury N behind a later success).
-    publish_lock: Mutex<()>,
+    publish_lock: Arc<Mutex<()>>,
     /// Durable deliveries currently in the queue or being handled. Top-up
     /// skips them, so a slow subscriber cannot cause a duplicate enqueue; a
     /// failed delivery is removed and becomes eligible again without waiting
@@ -362,6 +378,10 @@ pub struct ThalamicBus {
     /// From then on a checked mesh emit must be durably recorded or fail: an
     /// absent mesh subscriber is a wiring error, not a quiet fallback.
     mesh_required: AtomicBool,
+    /// The mesh identity and epoch in force at append time. Stamped on each
+    /// durable mesh entry, so a later replay keeps its original destination
+    /// instead of following the daemon's current pointer.
+    mesh_binding: Mutex<Option<MeshCapture>>,
 }
 
 impl ThalamicBus {
@@ -392,17 +412,20 @@ impl ThalamicBus {
         let mut replayed = 0u64;
         for class in EventClass::all() {
             for entry in outbox.pending_limited(class, config.replay_limit) {
+                let capture = capture_of(&entry);
+                let replay_generation = generation_of(&entry, generation);
                 bus.inflight
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert((generation, entry.seq));
+                    .insert((replay_generation, entry.seq));
                 bus.queue.push(
                     QueuedPulse {
                         event: entry.pulse,
                         delivery: Some(DurableDelivery {
                             class,
                             seq: entry.seq,
-                            generation,
+                            generation: replay_generation,
+                            capture,
                         }),
                     },
                     capacity,
@@ -437,9 +460,10 @@ impl ThalamicBus {
             store,
             outbox,
             subs_notify: Arc::new(Notify::new()),
-            publish_lock: Mutex::new(()),
+            publish_lock: Arc::new(Mutex::new(())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             mesh_required: AtomicBool::new(false),
+            mesh_binding: Mutex::new(None),
         }
     }
 
@@ -455,6 +479,7 @@ impl ThalamicBus {
                     self.outbox.clone(),
                     self.subs_notify.clone(),
                     self.inflight.clone(),
+                    self.publish_lock.clone(),
                     self.capacity,
                 ));
             }
@@ -519,14 +544,21 @@ impl ThalamicBus {
             // lossy queue would swallow the sync record silently.
             return Err(EventOutboxError::MeshUnavailable);
         }
+        let binding = *self.mesh_binding.lock().unwrap_or_else(|e| e.into_inner());
         let mut mesh_error = None;
         for class in classes {
-            match outbox.append(class, event) {
+            let capture = if class == EventClass::Mesh {
+                binding
+            } else {
+                None
+            };
+            match outbox.append_captured(class, event, capture) {
                 Ok(seq) => {
                     return Ok(Some(DurableDelivery {
                         class,
                         seq,
                         generation: outbox.generation(),
+                        capture,
                     }))
                 }
                 Err(err) => match class {
@@ -649,6 +681,13 @@ impl ThalamicBus {
         self.mesh_required.store(true, Ordering::Release);
     }
 
+    /// Bind checked mesh emits to the mesh that is actually configured. Called
+    /// once the pointer is resolved; every append from then on carries this
+    /// identity, and replays keep it even after the daemon joins another mesh.
+    pub fn set_mesh_binding(&self, capture: MeshCapture) {
+        *self.mesh_binding.lock().unwrap_or_else(|e| e.into_inner()) = Some(capture);
+    }
+
     fn refuse_recursion(&self) {
         self.metrics
             .recursion_blocks
@@ -758,6 +797,25 @@ fn redact_panic(text: &str) -> String {
     }
 }
 
+/// Recover the mesh binding stamped when the entry was written. Replay must
+/// reuse it: the daemon's current pointer can be a different mesh entirely.
+/// The generation a replay must report: the one stamped on the entry, or the
+/// current outbox generation for a legacy line written before the stamp.
+fn generation_of(entry: &OutboxEntry, current: u64) -> u64 {
+    if entry.generation == 0 {
+        current
+    } else {
+        entry.generation
+    }
+}
+
+fn capture_of(entry: &OutboxEntry) -> Option<MeshCapture> {
+    match (entry.mesh_id, entry.mesh_epoch) {
+        (Some(mesh_id), Some(epoch)) => Some(MeshCapture { mesh_id, epoch }),
+        _ => None,
+    }
+}
+
 /// Extract the namespace a pulse belongs to, so the context can name it without
 /// carrying a second copy on the pulse.
 fn namespace_of(event: &ThalamicPulse) -> &str {
@@ -786,16 +844,20 @@ fn top_up_durable(
     outbox: &EventOutbox,
     queue: &Queue,
     inflight: &Mutex<HashSet<(u64, u64)>>,
+    publish_lock: &Mutex<()>,
     capacity: usize,
 ) {
     if queue.durable_len() >= MAX_DURABLE_QUEUED {
         return;
     }
-    let generation = outbox.generation();
-    let skip = inflight
+    // Same lock as a live append: a top-up scan and its enqueues must not be
+    // interleaved with a newer pulse entering the queue, or seq N+1 could be
+    // dispatched ahead of the older entry being topped up.
+    let _publish = publish_lock
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .len();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let generation = outbox.generation();
+    let skip = inflight.lock().unwrap_or_else(|e| e.into_inner()).len();
     for class in EventClass::all() {
         if queue.durable_len() >= MAX_DURABLE_QUEUED {
             break;
@@ -805,7 +867,8 @@ fn top_up_durable(
             if queue.durable_len() >= MAX_DURABLE_QUEUED {
                 break;
             }
-            let key = (generation, entry.seq);
+            let replay_generation = generation_of(&entry, generation);
+            let key = (replay_generation, entry.seq);
             if !inflight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -813,18 +876,71 @@ fn top_up_durable(
             {
                 continue;
             }
+            let capture = capture_of(&entry);
             queue.push(
                 QueuedPulse {
                     event: entry.pulse,
                     delivery: Some(DurableDelivery {
                         class,
                         seq: entry.seq,
-                        generation,
+                        generation: replay_generation,
+                        capture,
                     }),
                 },
                 capacity,
             );
         }
+    }
+}
+
+/// Completion state for one durable delivery across ALL subscribers, including
+/// detached timeout retries. The offset advances only when every subscriber has
+/// finished successfully -- a detached retry succeeding for one subscriber must
+/// not acknowledge a pulse another subscriber failed.
+struct DeliveryCompletion {
+    remaining: usize,
+    all_ok: bool,
+}
+
+fn note_delivery(
+    completion: &Mutex<DeliveryCompletion>,
+    ok: bool,
+    identity: Option<DurableDelivery>,
+    outbox: &Option<Arc<EventOutbox>>,
+    inflight: &Mutex<HashSet<(u64, u64)>>,
+) {
+    let (done, all_ok) = {
+        let mut state = completion.lock().unwrap_or_else(|e| e.into_inner());
+        state.remaining = state.remaining.saturating_sub(1);
+        state.all_ok &= ok;
+        (state.remaining == 0, state.all_ok)
+    };
+    let Some(identity) = identity else { return };
+    if !done {
+        // Keep the slot reserved while a detached retry is still running, so a
+        // top-up cannot re-enqueue the same sequence concurrently.
+        return;
+    }
+    inflight
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(identity.generation, identity.seq));
+    if all_ok {
+        if let Some(outbox) = outbox {
+            if let Err(err) = outbox.advance(identity.class, identity.seq) {
+                tracing::error!(
+                    class = identity.class.as_str(),
+                    seq = identity.seq,
+                    "outbox offset advance failed: {err}; the entry will be redelivered"
+                );
+            }
+        }
+    } else {
+        tracing::warn!(
+            class = identity.class.as_str(),
+            seq = identity.seq,
+            "durable delivery did not succeed; the entry stays unacknowledged for retry"
+        );
     }
 }
 
@@ -837,13 +953,17 @@ async fn dispatch(
     outbox: Option<Arc<EventOutbox>>,
     subs_notify: Arc<Notify>,
     inflight: Arc<Mutex<HashSet<(u64, u64)>>>,
+    publish_lock: Arc<Mutex<()>>,
     capacity: usize,
 ) {
     let mut last_top_up = std::time::Instant::now();
     loop {
         if let Some(outbox) = outbox.as_ref() {
-            if queue.len() < capacity / 2 && last_top_up.elapsed() >= Duration::from_millis(50) {
-                top_up_durable(outbox, &queue, &inflight, capacity);
+            // A small bus must still top up: `capacity / 2` is 0 below two,
+            // which would make the check unreachable forever.
+            let threshold = (capacity / 2).max(1);
+            if queue.len() < threshold && last_top_up.elapsed() >= Duration::from_millis(50) {
+                top_up_durable(outbox, &queue, &inflight, &publish_lock, capacity);
                 last_top_up = std::time::Instant::now();
             }
         }
@@ -881,7 +1001,7 @@ async fn dispatch(
                 // Park until a registration (or a bounded backstop) rather
                 // than polling: a class that is never wired costs one wakeup
                 // per backstop, not a spin.
-                let _ = tokio::time::timeout(Duration::from_secs(5), subs_notify.notified()).await;
+                let _ = tokio::time::timeout(MISSING_CLASS_BACKOFF, subs_notify.notified()).await;
                 continue;
             }
         }
@@ -901,7 +1021,11 @@ async fn dispatch(
 
         let registered: Vec<Arc<dyn MemorySubscriber>> =
             subs.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let mut all_ok = true;
+        let completion = Arc::new(Mutex::new(DeliveryCompletion {
+            remaining: registered.len(),
+            all_ok: true,
+        }));
+        let mut main_failed = false;
         for sub in registered.iter() {
             // A fresh depth-1 token per subscriber: the token exists to refuse
             // a subscriber emitting from inside its own invocation.
@@ -915,14 +1039,15 @@ async fn dispatch(
             )
             .await;
             match outcome {
-                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Ok(()))) => note_delivery(&completion, true, delivery, &outbox, &inflight),
                 Ok(Ok(Err(err))) => {
-                    all_ok = false;
+                    main_failed = true;
                     metrics.subscriber_failures.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(subscriber = sub.name(), "subscriber failed: {err:#}");
+                    note_delivery(&completion, false, delivery, &outbox, &inflight);
                 }
                 Ok(Err(payload)) => {
-                    all_ok = false;
+                    main_failed = true;
                     metrics.subscriber_panics.fetch_add(1, Ordering::Relaxed);
                     let text = panic_text(payload.as_ref());
                     // Redacted snippet onto the audit path; full text stays in
@@ -933,9 +1058,10 @@ async fn dispatch(
                         payload: snippet,
                     });
                     tracing::warn!(subscriber = sub.name(), "subscriber panicked: {text}");
+                    note_delivery(&completion, false, delivery, &outbox, &inflight);
                 }
                 Err(_elapsed) => {
-                    all_ok = false;
+                    main_failed = true;
                     metrics.subscriber_timeouts.fetch_add(1, Ordering::Relaxed);
                     let name = sub.name().to_string();
                     let _ = bp_tx.send(BackpressureEvent::SubscriberTimeout { name: sub.name() });
@@ -947,13 +1073,17 @@ async fn dispatch(
                     if sub.retry_on_timeout() {
                         // Detached recovery task so the dispatcher isn't blocked
                         // on the 4x budget; the subscriber's flip outlives the
-                        // transient stall.
+                        // transient stall. The in-flight slot and the offset
+                        // advance are both deferred to this task's completion:
+                        // a top-up cannot re-enqueue while the retry runs, and
+                        // no offset moves before EVERY subscriber has finished.
                         let sub = Arc::clone(sub);
                         let event = event.clone();
                         let metrics = metrics.clone();
                         let store = store.clone();
                         let retry_outbox = outbox.clone();
                         let retry_inflight = inflight.clone();
+                        let retry_completion = completion.clone();
                         let ns = namespace.to_string();
                         let name = name.clone();
                         tokio::spawn(async move {
@@ -971,32 +1101,30 @@ async fn dispatch(
                             .await;
                             match retry {
                                 Ok(Ok(Ok(()))) => {
-                                    // The detached attempt is the one that
-                                    // succeeded: acknowledge here instead of
-                                    // leaving the entry for a restart replay.
-                                    if let (Some(identity), Some(durable)) =
-                                        (delivery, retry_outbox.as_ref())
-                                    {
-                                        if let Err(err) =
-                                            durable.advance(identity.class, identity.seq)
-                                        {
-                                            tracing::error!(
-                                                class = identity.class.as_str(),
-                                                seq = identity.seq,
-                                                "detached retry offset advance failed: {err}"
-                                            );
-                                        }
-                                        retry_inflight
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .remove(&(identity.generation, identity.seq));
-                                    }
+                                    tracing::info!(
+                                        subscriber = %name,
+                                        "subscriber retry after timeout succeeded"
+                                    );
+                                    note_delivery(
+                                        &retry_completion,
+                                        true,
+                                        delivery,
+                                        &retry_outbox,
+                                        &retry_inflight,
+                                    );
                                 }
                                 Ok(Ok(Err(err))) => {
                                     metrics.subscriber_failures.fetch_add(1, Ordering::Relaxed);
                                     tracing::warn!(
                                         subscriber = name,
                                         "subscriber retry after timeout failed: {err:#}"
+                                    );
+                                    note_delivery(
+                                        &retry_completion,
+                                        false,
+                                        delivery,
+                                        &retry_outbox,
+                                        &retry_inflight,
                                     );
                                 }
                                 Ok(Err(payload)) => {
@@ -1006,6 +1134,13 @@ async fn dispatch(
                                         subscriber = name,
                                         "subscriber panicked on retry after timeout: {text}"
                                     );
+                                    note_delivery(
+                                        &retry_completion,
+                                        false,
+                                        delivery,
+                                        &retry_outbox,
+                                        &retry_inflight,
+                                    );
                                 }
                                 Err(_) => {
                                     tracing::warn!(
@@ -1013,42 +1148,27 @@ async fn dispatch(
                                         "subscriber retry after timeout also ran past {}ms",
                                         (SUBSCRIBER_TIMEOUT * 4).as_millis()
                                     );
+                                    note_delivery(
+                                        &retry_completion,
+                                        false,
+                                        delivery,
+                                        &retry_outbox,
+                                        &retry_inflight,
+                                    );
                                 }
                             }
                         });
+                    } else {
+                        note_delivery(&completion, false, delivery, &outbox, &inflight);
                     }
                 }
             }
         }
-        if let Some(identity) = delivery {
-            // Release the in-flight slot whether or not the delivery succeeded.
-            // A failure leaves the offset unadvanced, so top-up picks the entry
-            // up again without a daemon restart; the pause below keeps that
-            // retry bounded rather than a hot loop.
-            inflight
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&(identity.generation, identity.seq));
-            if !all_ok {
-                tokio::time::sleep(RETRY_PAUSE).await;
-                tracing::warn!(
-                    class = identity.class.as_str(),
-                    seq = identity.seq,
-                    "durable delivery did not succeed; the entry stays unacknowledged for retry"
-                );
-            }
-            if let (true, Some(outbox)) = (all_ok, outbox.as_ref()) {
-                if let Err(err) = outbox.advance(identity.class, identity.seq) {
-                    // The side effect landed but the acknowledgment did not:
-                    // the entry *will* be redelivered, and the consumer's
-                    // idempotency basis absorbs the duplicate.
-                    tracing::error!(
-                        class = identity.class.as_str(),
-                        seq = identity.seq,
-                        "outbox offset advance failed: {err}; the entry will be redelivered"
-                    );
-                }
-            }
+        // A main-loop failure paid for a bounded pause so a permanently failing
+        // subscriber cannot hot-loop the dispatcher. Detached retries settle on
+        // their own task; `note_delivery` owns the in-flight slot and the offset.
+        if main_failed && delivery.is_some() {
+            tokio::time::sleep(RETRY_PAUSE).await;
         }
         // The pulse is done: every registered subscriber got an invocation or
         // was counted by the panic/timeout arms above. This is the
@@ -1908,11 +2028,14 @@ mod tests {
     }
 
     fn seen_ids(seen: &Arc<Mutex<Vec<DurableSeen>>>) -> Vec<String> {
-        seen.lock()
-            .expect("durable spy log poisoned")
-            .iter()
-            .map(|entry| entry.id.clone())
-            .collect()
+        let mut unique = Vec::new();
+        let mut known = HashSet::new();
+        for entry in seen.lock().expect("durable spy log poisoned").iter() {
+            if known.insert(entry.id.clone()) {
+                unique.push(entry.id.clone());
+            }
+        }
+        unique
     }
 
     async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
@@ -2297,7 +2420,9 @@ mod tests {
         wait_until("the durable delivery", || seen_ids(&seen).len() == 1).await;
         let observed = seen.lock().expect("durable spy log poisoned");
         assert_eq!(
-            observed[0].delivery.map(|delivery| (delivery.class, delivery.seq)),
+            observed[0]
+                .delivery
+                .map(|delivery| (delivery.class, delivery.seq)),
             Some((EventClass::Mesh, 1)),
             "the subscriber can key on and deduplicate a replayed delivery"
         );
@@ -2399,6 +2524,7 @@ mod tests {
                 ThalamicPulse::Archived { id, .. } => id.clone(),
                 _ => return Ok(()),
             };
+            let is_first = id == "m1";
             self.seen
                 .lock()
                 .expect("durable spy log poisoned")
@@ -2406,7 +2532,12 @@ mod tests {
                     id,
                     delivery: ctx.delivery,
                 });
-            if !self.failed.swap(true, Ordering::AcqRel) {
+            // Keep failing m1 for the whole test: an automatic retry must not
+            // flip the first entry to success before the offset/pending
+            // assertions run. `failed` is retained so the log still shows the
+            // first failure distinctly.
+            if is_first {
+                self.failed.store(true, Ordering::Release);
                 return Err(anyhow!("simulated failure of the first durable entry"));
             }
             Ok(())
@@ -2437,7 +2568,7 @@ mod tests {
             .expect("seq 2 appends");
         wait_until("both deliveries", || seen_ids(&seen).len() == 2).await;
         wait_until("both pulses dispatched", || {
-            bus.metrics().dispatcher_handled == 2
+            bus.metrics().dispatcher_handled >= 2
         })
         .await;
         // Let the (un)acknowledgment write settle.

@@ -189,9 +189,40 @@ static OUTBOX_LOCK: Mutex<()> = Mutex::new(());
 
 /// Owner-only directory creation and file modes on Unix. Audit and mesh WALs
 /// carry memory content and must not be readable by other local users.
+/// Refuse symlinks, wrong file types, and foreign-owned outbox paths. The
+/// outbox lives in a daemon-owned scratch dir sibling to the mesh checkout;
+/// a planted symlink there must not redirect a WAL append or a committed
+/// sidecar rename onto an unrelated file.
+#[cfg(unix)]
+fn reject_unsafe_path(path: &Path, expect_dir: bool) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("outbox path {} unreadable: {e}", path.display())),
+    };
+    let kind = meta.file_type();
+    let wrong = kind.is_symlink()
+        || if expect_dir {
+            !kind.is_dir()
+        } else {
+            !kind.is_file()
+        };
+    if wrong || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(format!("refusing unsafe outbox path {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_unsafe_path(_path: &Path, _expect_dir: bool) -> Result<(), String> {
+    Ok(())
+}
+
 fn create_private_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("outbox dir {} could not be created: {e}", dir.display()))?;
+    reject_unsafe_path(dir, true)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -202,12 +233,13 @@ fn create_private_dir(dir: &Path) -> Result<(), String> {
 }
 
 fn open_private_append(path: &Path) -> Result<std::fs::File, String> {
+    reject_unsafe_path(path, false)?;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let file = options
         .open(path)
@@ -222,12 +254,13 @@ fn open_private_append(path: &Path) -> Result<std::fs::File, String> {
 }
 
 fn create_private_file(path: &Path) -> Result<std::fs::File, String> {
+    reject_unsafe_path(path, false)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let file = options
         .open(path)
@@ -521,10 +554,8 @@ impl Outbox {
             .filter(|e| ids.contains(&e.stable_op_id))
             .collect();
         let committed_seqs: Vec<u64> = committed.iter().filter_map(|e| e.bus_seq).collect();
-        let committed_keys: Vec<String> = committed
-            .iter()
-            .filter_map(|e| e.bus_key.clone())
-            .collect();
+        let committed_keys: Vec<String> =
+            committed.iter().filter_map(|e| e.bus_key.clone()).collect();
         self.record_committed_locked(&committed_seqs, &committed_keys)?;
         let remaining: Vec<OutboxEntry> = pending
             .into_iter()

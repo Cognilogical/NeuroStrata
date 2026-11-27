@@ -119,6 +119,22 @@ pub struct SubscriberContext<'a> {
     pub delivery: Option<DurableDelivery>,
 }
 
+impl<'a> SubscriberContext<'a> {
+    /// Backward-compatible construction path for external subscribers written
+    /// against the pre-durability three-field context. A live (non-durable)
+    /// invocation has no delivery identity, which is exactly what those
+    /// consumers observed before the field existed. The bus itself builds
+    /// durable contexts directly so it can stamp the delivery.
+    pub fn new(store: &'a dyn VectorStore, namespace: &'a str, ts: i64) -> Self {
+        Self {
+            store,
+            namespace,
+            ts,
+            delivery: None,
+        }
+    }
+}
+
 /// A consumer of thalamic pulses.
 ///
 /// A subscriber opts in by matching on the pulse and returning `Ok(())` for the

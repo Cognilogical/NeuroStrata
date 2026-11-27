@@ -58,6 +58,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use uuid::Uuid;
 
 /// How many successful offset advancements trigger a runtime compaction
 /// check. Compaction itself only runs when the size or dead-ratio bound is
@@ -139,6 +140,15 @@ impl EventClass {
     }
 }
 
+/// The mesh identity in force when a durable pulse was emitted. Stamped on the
+/// event-outbox entry, so a replay after an epoch migration or a mesh switch is
+/// delivered with its ORIGINAL binding instead of the daemon's current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshCapture {
+    pub mesh_id: Uuid,
+    pub epoch: u32,
+}
+
 /// The identity a durable delivery carries into the subscriber's context:
 /// which class's acknowledgment the delivery earns, and at which sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +161,43 @@ pub struct DurableDelivery {
     /// restarts at 1; without this a fresh delivery can collide with a stale
     /// committed marker or audit row from the old instance.
     pub generation: u64,
+    /// The mesh this pulse was captured for. `None` for a pre-binding or
+    /// non-mesh delivery; never inferred from the current wiring on replay.
+    pub capture: Option<MeshCapture>,
+}
+
+/// Sequence and (when legible) class of a line this version left opaque. Such
+/// a line still occupies a place in the class sequence: an acknowledgment must
+/// never jump across it, or a newer reader would find its sequence already at
+/// or below the class offset and never replay it.
+#[derive(Debug, Clone, Copy)]
+struct OpaqueMarker {
+    seq: u64,
+    class: Option<EventClass>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn opaque_marker(text: Option<&str>, known: Option<(u64, EventClass)>) -> Option<OpaqueMarker> {
+    if let Some((seq, class)) = known {
+        return Some(OpaqueMarker {
+            seq,
+            class: Some(class),
+        });
+    }
+    let value = serde_json::from_str::<serde_json::Value>(text?).ok()?;
+    let seq = value.get("seq")?.as_u64()?;
+    let class = value
+        .get("class")
+        .and_then(|c| c.as_str())
+        .and_then(|s| match s {
+            "audit" => Some(EventClass::Audit),
+            "mesh" => Some(EventClass::Mesh),
+            _ => None,
+        });
+    Some(OpaqueMarker { seq, class })
 }
 
 /// One durable entry: the outbox line format.
@@ -167,6 +214,18 @@ pub struct OutboxEntry {
     pub at: String,
     /// The pulse itself, in its tagged serde wire form (`event.rs`).
     pub pulse: ThalamicPulse,
+    /// Mesh identity at emit time. Kept with the entry so a replay cannot pick
+    /// up the mesh the daemon happens to be joined to after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_id: Option<Uuid>,
+    /// Manifest epoch at emit time; the twin of `mesh_id` for the purge gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_epoch: Option<u32>,
+    /// The outbox generation that assigned `seq`, persisted WITH the entry so
+    /// a corrupt offsets file cannot change the dedup identity on replay.
+    /// Legacy lines read `0`, which means "use the current generation".
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: u64,
 }
 
 fn default_format_version() -> u32 {
@@ -346,6 +405,8 @@ struct Inner {
     /// Lines this version cannot interpret. Kept verbatim and rewritten by
     /// compaction so an older reader cannot delete newer-version records.
     opaque_lines: Vec<Vec<u8>>,
+    /// The sequence/class of those opaque lines, used to bound acknowledgments.
+    opaque_markers: Vec<OpaqueMarker>,
 }
 
 impl Inner {
@@ -468,10 +529,14 @@ fn repair_torn_tail(path: &Path, bytes: &[u8]) -> Result<usize, EventOutboxError
 /// Parse the clean prefix into entries, skipping and counting complete lines
 /// that are not valid UTF-8, not JSON, not an `OutboxEntry`, or not the current
 /// format version. One bad line never fails the open.
-fn parse_entries(bytes: &[u8], path: &Path) -> (Vec<OutboxEntry>, u64, u64, Vec<Vec<u8>>) {
+fn parse_entries(
+    bytes: &[u8],
+    path: &Path,
+) -> (Vec<OutboxEntry>, u64, u64, Vec<Vec<u8>>, Vec<OpaqueMarker>) {
     let mut entries = Vec::new();
     let mut corrupt = 0u64;
     let mut corrupt_high_seq = 0u64;
+    let mut opaque_markers: Vec<OpaqueMarker> = Vec::new();
     // Raw lines this reader cannot interpret are kept verbatim. Compaction may
     // rewrite the file, but it must never silently delete a record written by a
     // newer reader: the sequence belongs to the whole deployment, not to one
@@ -494,6 +559,9 @@ fn parse_entries(bytes: &[u8], path: &Path) -> (Vec<OutboxEntry>, u64, u64, Vec<
                 corrupt += 1;
                 corrupt_high_seq = corrupt_high_seq.max(entry.seq);
                 opaque_lines.push(line.to_vec());
+                if let Some(marker) = opaque_marker(None, Some((entry.seq, entry.class))) {
+                    opaque_markers.push(marker);
+                }
             }
             None => {
                 // A corrupt line can still carry the sequence that was handed
@@ -512,11 +580,20 @@ fn parse_entries(bytes: &[u8], path: &Path) -> (Vec<OutboxEntry>, u64, u64, Vec<
                 );
                 corrupt += 1;
                 opaque_lines.push(line.to_vec());
+                if let Some(marker) = opaque_marker(text, None) {
+                    opaque_markers.push(marker);
+                }
             }
         }
     }
     entries.sort_by_key(|entry| entry.seq);
-    (entries, corrupt, corrupt_high_seq, opaque_lines)
+    (
+        entries,
+        corrupt,
+        corrupt_high_seq,
+        opaque_lines,
+        opaque_markers,
+    )
 }
 
 impl EventOutbox {
@@ -549,13 +626,10 @@ impl EventOutbox {
         }
         let raw = std::fs::read(&path)?;
         let clean_len = repair_torn_tail(&path, &raw)?;
-        let (entries, corrupt_skipped, corrupt_high_seq, opaque_lines) =
+        let (entries, corrupt_skipped, corrupt_high_seq, opaque_lines, opaque_markers) =
             parse_entries(&raw[..clean_len], &path);
         let max_entry = entries.iter().map(|entry| entry.seq).max().unwrap_or(0);
-        let base_seq = offsets
-            .high_water()
-            .max(max_entry)
-            .max(corrupt_high_seq);
+        let base_seq = offsets.high_water().max(max_entry).max(corrupt_high_seq);
         generation_changed |= offsets.base_seq != base_seq;
         offsets.base_seq = base_seq;
         let audit_acked: BTreeSet<u64> = offsets
@@ -591,6 +665,7 @@ impl EventOutbox {
                 poisoned: false,
                 corrupt_skipped,
                 opaque_lines,
+                opaque_markers,
             }),
         };
         let skipped = outbox.corrupt_entries_skipped();
@@ -626,12 +701,24 @@ impl EventOutbox {
         class: EventClass,
         pulse: &ThalamicPulse,
     ) -> Result<u64, EventOutboxError> {
+        self.append_captured(class, pulse, None)
+    }
+
+    /// Append with the mesh identity that was in force at emit time. The
+    /// binding travels with the entry so a later replay cannot borrow the
+    /// daemon's current mesh/epoch.
+    pub fn append_captured(
+        &self,
+        class: EventClass,
+        pulse: &ThalamicPulse,
+        capture: Option<MeshCapture>,
+    ) -> Result<u64, EventOutboxError> {
         let mut inner = self.lock()?;
         if inner.poisoned {
             return Err(EventOutboxError::Poisoned);
         }
         let mut file = open_private_append(&self.entries_path())?;
-        self.append_locked(&mut inner, class, pulse, &mut file)
+        self.append_locked(&mut inner, class, pulse, &mut file, capture)
     }
 
     /// The append body, shared by the production path and the failed-rollback
@@ -643,6 +730,7 @@ impl EventOutbox {
         class: EventClass,
         pulse: &ThalamicPulse,
         target: &mut T,
+        capture: Option<MeshCapture>,
     ) -> Result<u64, EventOutboxError> {
         let seq = inner.next_seq;
         let entry = OutboxEntry {
@@ -651,9 +739,13 @@ impl EventOutbox {
             class,
             at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             pulse: pulse.clone(),
+            mesh_id: capture.map(|capture| capture.mesh_id),
+            mesh_epoch: capture.map(|capture| capture.epoch),
+            generation: inner.offsets.generation,
         };
         let mut line = serde_json::to_vec(&entry)?;
         line.push(b'\n');
+        let prior_len = target.file_len()?;
         if let Err(failure) = write_line_durably(target, &line) {
             if !failure.rolled_back {
                 inner.poisoned = true;
@@ -665,15 +757,29 @@ impl EventOutbox {
             }
             return Err(failure.error);
         }
+        // The line is durable, but the offsets write can still fail. Until it
+        // succeeds the append is NOT receipted: roll the line back and keep it
+        // out of the mirror, so a top-up or restart cannot deliver an entry the
+        // caller was told failed (and the mesh may already have committed).
+        let mut offsets = inner.offsets.clone();
+        offsets.base_seq = offsets.base_seq.max(inner.base_seq).max(seq);
+        if let Err(err) = write_offsets(&self.dir, offsets.clone()) {
+            let rolled_back = target.truncate_to(prior_len).is_ok();
+            if rolled_back {
+                let _ = target.sync();
+            } else {
+                inner.poisoned = true;
+            }
+            tracing::error!(
+                class = class.as_str(),
+                seq,
+                "event outbox: offsets persist failed after the entry write; append rolled back: {err}"
+            );
+            return Err(err);
+        }
         inner.entries.push(entry);
         inner.next_seq = seq + 1;
         inner.base_seq = inner.base_seq.max(seq);
-        // Persist the high-water mark with the append, not only at the next
-        // offset advance: a corrupt tail then cannot make a later instance
-        // reuse a sequence the mesh already committed.
-        let mut offsets = inner.offsets.clone();
-        offsets.base_seq = offsets.base_seq.max(inner.base_seq);
-        write_offsets(&self.dir, offsets.clone())?;
         inner.offsets = offsets;
         Ok(seq)
     }
@@ -692,7 +798,7 @@ impl EventOutbox {
         if inner.poisoned {
             return Err(EventOutboxError::Poisoned);
         }
-        self.append_locked(&mut inner, class, pulse, target)
+        self.append_locked(&mut inner, class, pulse, target, None)
     }
 
     /// This class's unacknowledged entries, in sequence order.
@@ -796,7 +902,7 @@ impl EventOutbox {
             })
             .map(|entry| entry.seq)
             .min();
-        let new_offset = match unacked_min {
+        let mut new_offset = match unacked_min {
             // Nothing unacknowledged above the failed entry: the prefix can
             // move to the highest acknowledged sequence.
             None => acked.iter().next_back().copied().unwrap_or(current),
@@ -809,6 +915,20 @@ impl EventOutbox {
                 .unwrap_or(current),
         }
         .max(current);
+        // An opaque line (future format, corrupt payload) still owns its
+        // sequence. Never move the prefix across it: a newer reader must be
+        // able to replay it instead of finding its sequence already acked.
+        let opaque_first = inner
+            .opaque_markers
+            .iter()
+            .filter(|marker| {
+                marker.seq > current && (marker.class.is_none() || marker.class == Some(class))
+            })
+            .map(|marker| marker.seq)
+            .min();
+        if let Some(first) = opaque_first {
+            new_offset = new_offset.min(first.saturating_sub(1)).max(current);
+        }
         acked.retain(|acked_seq| *acked_seq > new_offset);
         while acked.len() > MAX_OUT_OF_ORDER_ACKS {
             acked.pop_first();
@@ -968,8 +1088,42 @@ fn sync_dir(dir: &Path) {
 
 /// Create the outbox directory owner-only on Unix. A typical umask would
 /// otherwise leave audit JSONL world-readable.
+/// Refuse a path that is a symlink, the wrong file type, or owned by somebody
+/// other than the daemon. `create_dir_all`/`OpenOptions` follow symlinks by
+/// default, which would let a local attacker redirect an append or truncate
+/// an unrelated file through a planted outbox path.
+#[cfg(unix)]
+fn reject_unsafe_path(path: &Path, expect_dir: bool) -> Result<(), EventOutboxError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let kind = meta.file_type();
+    let wrong = kind.is_symlink()
+        || if expect_dir {
+            !kind.is_dir()
+        } else {
+            !kind.is_file()
+        };
+    if wrong || meta.uid() != unsafe { libc::geteuid() } {
+        return Err(EventOutboxError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing unsafe outbox path {}", path.display()),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_unsafe_path(_path: &Path, _expect_dir: bool) -> Result<(), EventOutboxError> {
+    Ok(())
+}
+
 fn create_private_dir(dir: &Path) -> Result<(), EventOutboxError> {
     std::fs::create_dir_all(dir)?;
+    reject_unsafe_path(dir, true)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -981,12 +1135,13 @@ fn create_private_dir(dir: &Path) -> Result<(), EventOutboxError> {
 /// Open an append-only JSONL file with owner-only permissions, tightening an
 /// existing file too (it may predate this hardening or have a loose umask).
 fn open_private_append(path: &Path) -> Result<File, EventOutboxError> {
+    reject_unsafe_path(path, false)?;
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let file = options.open(path)?;
     #[cfg(unix)]
@@ -999,12 +1154,13 @@ fn open_private_append(path: &Path) -> Result<File, EventOutboxError> {
 
 /// Create a replacement/temporary file with owner-only permissions.
 fn create_private_file(path: &Path) -> Result<File, EventOutboxError> {
+    reject_unsafe_path(path, false)?;
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let file = options.open(path)?;
     #[cfg(unix)]
@@ -1096,12 +1252,13 @@ mod tests {
             pending[0].at
         );
 
-        // The unreceipted torn entry never consumed a sequence: the next
-        // append reuses it and lands as its own parseable line.
+        // The high-water mark is persisted with the append, so a sequence is
+        // never reused -- not even when its line was torn. Reusing it could
+        // collide with a generation the mesh already committed.
         let seq = outbox
             .append(EventClass::Mesh, &created("after-repair"))
             .expect("append after repair");
-        assert_eq!(seq, 2);
+        assert_eq!(seq, 3);
         let bytes = std::fs::read(&path).expect("read repaired file");
         assert!(bytes.ends_with(b"\n"), "the repaired file ends cleanly");
         let text = String::from_utf8(bytes).expect("the repaired file is UTF-8");
@@ -1209,6 +1366,9 @@ mod tests {
             class: EventClass::Mesh,
             at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             pulse: created("victim"),
+            mesh_id: None,
+            mesh_epoch: None,
+            generation: 0,
         };
         let mut line = serde_json::to_vec(&entry).expect("serialize entry");
         line.push(b'\n');

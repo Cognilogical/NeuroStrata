@@ -662,10 +662,8 @@ fn event_outbox_dir() -> Result<PathBuf, String> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-            let dir = std::env::temp_dir().join(format!(
-                "neurostrata-{}-event-outbox",
-                current_uid()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("neurostrata-{}-event-outbox", current_uid()));
             match std::fs::metadata(&dir) {
                 Ok(meta) => {
                     if !meta.is_dir() || meta.uid() != current_uid() || meta.mode() & 0o077 != 0 {
@@ -679,7 +677,10 @@ fn event_outbox_dir() -> Result<PathBuf, String> {
                     let mut builder = std::fs::DirBuilder::new();
                     builder.mode(0o700);
                     builder.create(&dir).map_err(|e| {
-                        format!("could not create owner-only outbox directory {}: {e}", dir.display())
+                        format!(
+                            "could not create owner-only outbox directory {}: {e}",
+                            dir.display()
+                        )
                     })?;
                     let meta = std::fs::metadata(&dir).map_err(|e| e.to_string())?;
                     if meta.uid() != current_uid() || meta.mode() & 0o077 != 0 {
@@ -689,7 +690,12 @@ fn event_outbox_dir() -> Result<PathBuf, String> {
                         ));
                     }
                 }
-                Err(err) => return Err(format!("cannot inspect outbox directory {}: {err}", dir.display())),
+                Err(err) => {
+                    return Err(format!(
+                        "cannot inspect outbox directory {}: {err}",
+                        dir.display()
+                    ))
+                }
             }
             return Ok(dir);
         }
@@ -904,14 +910,22 @@ fn wire_mesh_publish(
     embedder: Arc<dyn Embedder>,
 ) {
     let project_root = resolve_project_root();
-    let mesh_dir = match crate::synaptic_mesh::storage::MeshStorage::read_pointer(&project_root) {
-        Ok(Some((_mesh_id, dir, _remote))) => dir,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!("mesh pointer unreadable; mesh outbox disabled: {e}");
-            return;
-        }
-    };
+    // Fail closed as soon as configuration indicates a mesh publish path: a
+    // pointer that exists but cannot be read still means the project is joined,
+    // and checked emits must keep failing rather than accept a sync record on
+    // the lossy queue.
+    if crate::synaptic_mesh::storage::MeshStorage::pointer_path(&project_root).exists() {
+        bus.expect_mesh_durability();
+    }
+    let (mesh_id, mesh_dir) =
+        match crate::synaptic_mesh::storage::MeshStorage::read_pointer(&project_root) {
+            Ok(Some((mesh_id, dir, _remote))) => (mesh_id, dir),
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!("mesh pointer unreadable; mesh outbox disabled: {e}");
+                return;
+            }
+        };
     // The project IS joined to a mesh. From here on a checked mesh emit must
     // either be durably appended and acknowledged by `MeshOutbox`, or fail:
     // if the wiring below cannot register the subscriber, the memory-write
@@ -930,7 +944,15 @@ fn wire_mesh_publish(
             return;
         }
     };
-    match crate::events::subscribers::MeshOutbox::new(outbox_dir.clone(), wake.clone(), epoch) {
+    // Stamp every checked mesh emit with the mesh + epoch that owns it, so a
+    // replay after a mesh switch or purge keeps its original destination.
+    bus.set_mesh_binding(crate::events::MeshCapture { mesh_id, epoch });
+    match crate::events::subscribers::MeshOutbox::new_bound(
+        outbox_dir.clone(),
+        wake.clone(),
+        epoch,
+        mesh_id,
+    ) {
         Ok(sub) => {
             bus.register(Box::new(sub));
         }

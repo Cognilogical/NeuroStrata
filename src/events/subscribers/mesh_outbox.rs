@@ -26,6 +26,7 @@ use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 /// Whether a memory is a derived artifact (KGE vectors, community labels,
 /// inferred edges) that must stay local/versioned derived data and never
@@ -51,6 +52,10 @@ struct CaptureStamp {
     ts: i64,
     bus_seq: Option<u64>,
     generation: u64,
+    /// Mesh epoch stamped on the durable event, not the epoch current at
+    /// replay time. A pre-purge event must stay pre-purge so the worker's
+    /// epoch gate can quarantine it.
+    epoch: u32,
 }
 
 impl CaptureStamp {
@@ -73,6 +78,10 @@ pub struct MeshOutbox {
     /// that rewires the daemon, so wiring-time resolution is the same
     /// freshness contract the drain loop's per-tick reopen implies.
     epoch: u32,
+    /// The mesh this subscriber may export to. A durable event captured for a
+    /// different mesh is refused rather than replayed into the current one;
+    /// `Uuid::nil()` is the legacy/unbound case with no identity to compare.
+    mesh_id: Uuid,
 }
 
 impl MeshOutbox {
@@ -84,10 +93,22 @@ impl MeshOutbox {
         wake: Arc<Notify>,
         epoch: u32,
     ) -> Result<Self, String> {
+        Self::new_bound(outbox_dir, wake, epoch, Uuid::nil())
+    }
+
+    /// Bind the subscriber to the mesh currently configured, so a replay of
+    /// an event captured for a different mesh is retained, never exported.
+    pub fn new_bound(
+        outbox_dir: impl Into<PathBuf>,
+        wake: Arc<Notify>,
+        epoch: u32,
+        mesh_id: Uuid,
+    ) -> Result<Self, String> {
         Ok(Self {
             outbox: Outbox::open(&outbox_dir.into())?,
             wake,
             epoch,
+            mesh_id,
         })
     }
 }
@@ -111,10 +132,26 @@ impl MemorySubscriber for MeshOutbox {
         let delivery = ctx
             .delivery
             .filter(|delivery| delivery.class == crate::events::EventClass::Mesh);
+        let capture = delivery.and_then(|delivery| delivery.capture);
+        // A durable event remembers the mesh it was captured for. Replaying it
+        // after the project left that mesh must never publish the pending
+        // mutation into the NEW mesh; refuse so the entry stays unacknowledged
+        // for an operator instead of silently crossing the boundary.
+        if let Some(capture) = capture {
+            if self.mesh_id != Uuid::nil() && capture.mesh_id != self.mesh_id {
+                return Err(anyhow::anyhow!(
+                    "durable event {} was captured for mesh {} but this daemon publishes to {}",
+                    delivery.map(|d| d.seq).unwrap_or(0),
+                    capture.mesh_id,
+                    self.mesh_id
+                ));
+            }
+        }
         let stamp = CaptureStamp {
             ts: ctx.ts,
             bus_seq: delivery.map(|delivery| delivery.seq),
             generation: delivery.map(|delivery| delivery.generation).unwrap_or(0),
+            epoch: capture.map(|capture| capture.epoch).unwrap_or(self.epoch),
         };
         let mut entries: Vec<OutboxEntry> = Vec::new();
         match event {
@@ -124,7 +161,7 @@ impl MemorySubscriber for MeshOutbox {
                     // archived or retired. Exporting it as a creation would
                     // make the mesh worker overwrite the newer lifecycle, so
                     // replay the state the payload actually records.
-                    let op = if payload_is_retired(&payload.metadata) {
+                    let op = if payload_is_retired(&payload.metadata, &payload.memory_type) {
                         OP_ARCHIVED
                     } else {
                         OP_CREATED
@@ -145,8 +182,17 @@ impl MemorySubscriber for MeshOutbox {
                 // replacement row that was never announced by its own `Created`
                 // pulse (the supersede handler writes it directly). Capture both.
                 if let Some(payload) = self.read(ctx, namespace, old_id).await? {
+                    // A replay can reach this pulse after the old row was
+                    // archived. Exporting a `superseded` lifecycle there would
+                    // roll the mesh back from Archived to Superseded, so
+                    // capture the state the row actually records now.
+                    let retire_op = if payload_is_retired(&payload.metadata, &payload.memory_type) {
+                        OP_ARCHIVED
+                    } else {
+                        OP_SUPERSEDED
+                    };
                     if let Some(entry) = self.entry(
-                        OP_SUPERSEDED,
+                        retire_op,
                         old_id,
                         namespace,
                         payload,
@@ -158,7 +204,7 @@ impl MemorySubscriber for MeshOutbox {
                     }
                 }
                 if let Some(payload) = self.read(ctx, namespace, new_id).await? {
-                    let op = if payload_is_retired(&payload.metadata) {
+                    let op = if payload_is_retired(&payload.metadata, &payload.memory_type) {
                         OP_ARCHIVED
                     } else {
                         OP_CREATED
@@ -304,7 +350,7 @@ impl MeshOutbox {
             metadata: payload.metadata,
             superseded_by,
             ts: stamp.ts,
-            epoch: self.epoch,
+            epoch: stamp.epoch,
             bus_seq: stamp.bus_seq,
             bus_key,
         })
@@ -313,7 +359,7 @@ impl MeshOutbox {
 
 /// Whether a captured payload already records a retired/archived lifecycle.
 /// A replayed creation must not export an `Active` lifecycle over it.
-fn payload_is_retired(metadata: &serde_json::Value) -> bool {
+fn payload_is_retired(metadata: &serde_json::Value, memory_type: &str) -> bool {
     let archived = match metadata.get("archived") {
         Some(serde_json::Value::Bool(value)) => *value,
         Some(serde_json::Value::Number(value)) => value.as_i64().unwrap_or(0) != 0,
@@ -324,6 +370,12 @@ fn payload_is_retired(metadata: &serde_json::Value) -> bool {
     };
     if archived {
         return true;
+    }
+    // A procedure's `valid_to` is its rehearsal-budget expiry: a lapsed
+    // procedure still answers and its row is NOT archived. Only an explicit
+    // retirement marker changes the exported lifecycle.
+    if memory_type == "procedure" {
+        return false;
     }
     match metadata.get("valid_to") {
         Some(serde_json::Value::Number(value)) => value
@@ -824,6 +876,7 @@ mod tests {
                 class: EventClass::Mesh,
                 seq: 7,
                 generation: 1,
+                capture: None,
             }),
         };
 
@@ -883,6 +936,7 @@ mod tests {
                 class: EventClass::Mesh,
                 seq: 7,
                 generation: 1,
+                capture: None,
             }),
         };
 

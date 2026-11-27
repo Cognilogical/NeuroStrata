@@ -124,6 +124,7 @@ fn audit_id(delivery: Option<DurableDelivery>) -> String {
             class: EventClass::Audit,
             generation,
             seq,
+            ..
         }) => format!("{GUARD_EVENT_ID_PREFIX}::{generation}::{seq}"),
         _ => format!("{GUARD_EVENT_ID_PREFIX}::{}", uuid::Uuid::new_v4()),
     }
