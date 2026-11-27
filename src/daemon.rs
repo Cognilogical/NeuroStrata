@@ -1378,9 +1378,10 @@ pub(crate) async fn start_daemon_on(
 async fn handle_get_graph(
     State(state): State<AppState>,
     Query(query): Query<GraphQuery>,
-) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    let requested = query.namespace.unwrap_or_else(|| "global".to_string());
-    let ns = crate::server::resolve_namespace(&state.vector_store, &requested).await;
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let requested = query.namespace.as_deref().unwrap_or("global");
+    namespace_refusal(requested)?;
+    let ns = crate::server::resolve_namespace(&state.vector_store, requested).await;
     let project_contexts = crate::config::Config::load()
         .map(|c| c.project_contexts)
         .unwrap_or_default();
@@ -1408,7 +1409,7 @@ async fn handle_get_graph(
         .await
         .map_err(|e| {
             tracing::warn!("handle_get_graph export_graph failed: {e}");
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
     if query.all.unwrap_or(false) {
@@ -1467,10 +1468,34 @@ fn caller_path_refusal(
     .map_err(|e| (axum::http::StatusCode::FORBIDDEN, e))
 }
 
+/// The shared DR-1 namespace check as a handler refusal (issue #412): the
+/// value is validated BEFORE `resolve_namespace` or any store access, so a
+/// malformed caller namespace answers HTTP 400 carrying the typed
+/// `ERROR [NAMESPACE]: …` detail instead of reaching the catalog. Callers
+/// keep their documented absent-argument default by validating the value
+/// that will actually be used; an explicit empty or whitespace-padded value
+/// is therefore refused rather than laundered into that default.
+fn namespace_refusal(raw: &str) -> Result<(), (axum::http::StatusCode, String)> {
+    crate::domain::validate_namespace(raw)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+/// The shared read-side id check as a handler refusal: a malformed address is
+/// answered with HTTP 400 and the typed `ERROR [ID]: …` detail before any
+/// namespace resolution or store call. Legacy file-path spellings that older
+/// releases persisted remain readable through [`validate_id_for_read`].
+fn id_refusal(raw: &str) -> Result<(), (axum::http::StatusCode, String)> {
+    crate::domain::validate_id_for_read(raw)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))
+}
+
 async fn handle_ingest(
     State(state): State<AppState>,
     Json(req): Json<IngestReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    // Argument syntax first: a malformed namespace costs no path check, walk
+    // or store read at all.
+    namespace_refusal(&req.namespace)?;
     // The walk reads whatever directory the caller named; the path policy
     // decides whether this daemon may read it at all (Task 2 re-file / J6).
     let dir = caller_path_refusal(&state, &req.dir)?;
@@ -1528,6 +1553,7 @@ async fn handle_ingest_scip(
     State(state): State<AppState>,
     Json(req): Json<IngestScipReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    namespace_refusal(&req.namespace)?;
     let scip_file = caller_path_refusal(&state, &req.scip_path)?;
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
     let report =
@@ -1631,6 +1657,7 @@ async fn handle_tasks_import(
     State(state): State<AppState>,
     Json(req): Json<ImportReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
+    namespace_refusal(&req.namespace)?;
     // The import reads whatever file the caller named; the path policy
     // decides whether this daemon may read it at all (Task 2 re-file / J6).
     let from_beads = caller_path_refusal(&state, &req.from_beads)?;
@@ -1664,44 +1691,48 @@ async fn handle_cli_read(
     State(state): State<AppState>,
     Json(req): Json<ReadReq>,
 ) -> Result<String, (axum::http::StatusCode, String)> {
-    let value = match req.op.as_str() {
-        "namespaces" => {
-            let namespaces = state
-                .vector_store
-                .list_namespaces()
-                .await
-                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            serde_json::json!({ "namespaces": namespaces })
-        }
-        "list" => {
-            let ns = req.namespace.unwrap_or_default();
-            let rows = state
-                .vector_store
-                .list(&ns, None, None)
-                .await
-                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            serde_json::json!({ "rows": rows })
-        }
-        // `root show`: the registry's cached project root for a namespace,
-        // matched case-insensitively the way tool calls are.
-        "project_root" => {
-            let requested = req.namespace.unwrap_or_default();
-            let ns = crate::server::resolve_namespace(&state.vector_store, &requested).await;
-            let root = crate::registry::cached_project_root(&state.vector_store, &ns)
-                .await
-                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            serde_json::json!({ "namespace": ns, "project_root": root })
-        }
-        other => {
-            return Err((
-                axum::http::StatusCode::BAD_REQUEST,
-                format!(
-                    "unknown read op '{}': expected 'namespaces', 'list' or 'project_root'",
-                    other
-                ),
-            ))
-        }
-    };
+    let value =
+        match req.op.as_str() {
+            "namespaces" => {
+                let namespaces =
+                    state.vector_store.list_namespaces().await.map_err(|e| {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                    })?;
+                serde_json::json!({ "namespaces": namespaces })
+            }
+            "list" => {
+                // No documented absent default exists for this op: validating the
+                // value that will be used refuses an omitted namespace along with
+                // an explicit empty, whitespace-padded or malformed one.
+                let ns = req.namespace.as_deref().unwrap_or_default();
+                namespace_refusal(ns)?;
+                let rows =
+                    state.vector_store.list(ns, None, None).await.map_err(|e| {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                    })?;
+                serde_json::json!({ "rows": rows })
+            }
+            // `root show`: the registry's cached project root for a namespace,
+            // matched case-insensitively the way tool calls are.
+            "project_root" => {
+                let requested = req.namespace.as_deref().unwrap_or_default();
+                namespace_refusal(requested)?;
+                let ns = crate::server::resolve_namespace(&state.vector_store, requested).await;
+                let root = crate::registry::cached_project_root(&state.vector_store, &ns)
+                    .await
+                    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                serde_json::json!({ "namespace": ns, "project_root": root })
+            }
+            other => {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    format!(
+                        "unknown read op '{}': expected 'namespaces', 'list' or 'project_root'",
+                        other
+                    ),
+                ))
+            }
+        };
     Ok(value.to_string())
 }
 
@@ -1738,6 +1769,7 @@ async fn cli_root_value(
 ) -> Result<serde_json::Value, (axum::http::StatusCode, String)> {
     match req.op.as_str() {
         "cache_root" => {
+            namespace_refusal(&req.namespace)?;
             let root = std::path::Path::new(&req.root);
             if !root.is_absolute() {
                 return Err((
@@ -1821,7 +1853,14 @@ async fn handle_delete(
     // Answer with what the engine said. A bare 500 cost an afternoon here: a
     // caller could not tell a write conflict from a missing id, and neither
     // could the log (bead neurostrata-3fi.6.5).
+    namespace_refusal(&req.namespace)?;
+    // Syntax first, then ownership: neither a malformed id nor a foreign
+    // prefix may reach resolve_namespace or the store's delete.
+    id_refusal(&req.id)?;
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
+    if let Err(e) = crate::domain::validate_id_for_namespace(&req.id, &namespace) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, e.to_string()));
+    }
     state
         .vector_store
         .delete(&namespace, &req.id)
@@ -1882,8 +1921,18 @@ async fn handle_edit(
     // The operator's repair path: an in-place rewrite that keeps the id and
     // keeps no history. Agents get neurostrata_supersede_memory instead, which
     // is additive. Editing stays here, behind a human, because it destroys.
+    // Both addresses are checked before either resolution reaches the catalog,
+    // so a malformed new namespace cannot leave the old one resolved.
+    namespace_refusal(&req.old_namespace)?;
+    namespace_refusal(&req.new_namespace)?;
+    // The id belongs to the old namespace and is checked before either
+    // resolution reaches the catalog.
+    id_refusal(&req.id)?;
     let old_namespace =
         crate::server::resolve_namespace(&state.vector_store, &req.old_namespace).await;
+    if let Err(e) = crate::domain::validate_id_for_namespace(&req.id, &old_namespace) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, e.to_string()));
+    }
     let new_namespace =
         crate::server::resolve_namespace(&state.vector_store, &req.new_namespace).await;
     match crate::server::edit_memory(
@@ -1928,7 +1977,12 @@ async fn handle_set_metadata(
     State(state): State<AppState>,
     Json(req): Json<SetMetadataReq>,
 ) -> Result<&'static str, (axum::http::StatusCode, String)> {
+    namespace_refusal(&req.namespace)?;
+    id_refusal(&req.id)?;
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
+    if let Err(e) = crate::domain::validate_id_for_namespace(&req.id, &namespace) {
+        return Err((axum::http::StatusCode::BAD_REQUEST, e.to_string()));
+    }
     // The daemon is bearer-authenticated per user, so its caller is the local
     // operator: the same admin default the CLI uses.
     match crate::server::set_metadata(
@@ -2276,6 +2330,7 @@ async fn handle_tasks_gate(
     State(state): State<AppState>,
     Json(req): Json<TaskGateReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    namespace_refusal(&req.namespace)?;
     let namespace = crate::server::resolve_namespace(&state.vector_store, &req.namespace).await;
     let report = crate::task::gate::run_scoped(&state.vector_store, &namespace, req.scope.as_ref())
         .await
@@ -2298,6 +2353,9 @@ async fn handle_ingest_watch_status(
     State(state): State<AppState>,
     Query(query): Query<crate::ingest_watch::WatchStatusQuery>,
 ) -> Result<Json<crate::ingest_watch::WatchStatusReport>, (axum::http::StatusCode, String)> {
+    if let Some(namespace) = query.namespace.as_deref() {
+        namespace_refusal(namespace)?;
+    }
     let report = state.watch.status(query.namespace.as_deref());
     Ok(Json(report))
 }
@@ -2306,8 +2364,10 @@ async fn handle_ingest_watch_unwatch(
     State(state): State<AppState>,
     Json(req): Json<crate::ingest_watch::WatchUnwatchReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    // J6 path policy first, so an outside path is 403 (not an opaque 500),
-    // and the resolved canonical path is what the core unregisters.
+    namespace_refusal(&req.namespace)?;
+    // The J6 path policy follows argument syntax, so an outside path is 403
+    // (not an opaque 500), and the resolved canonical path is what the core
+    // unregisters.
     let canonical = caller_path_refusal(&state, &req.dir_path)?;
     let removed = state
         .watch
@@ -2324,7 +2384,17 @@ async fn handle_http_sparql(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<serde_json::Value>,
-) -> impl axum::response::IntoResponse {
+) -> axum::response::Response {
+    // Validate the whole namespace argument before either SPARQL branch: a
+    // present non-string is a typed refusal, not the documented default. An
+    // absent argument stays the shared handler's default.
+    if let Err(e) = crate::domain::optional_namespace_arg(&req, "NeuroStrata") {
+        return axum::response::IntoResponse::into_response((
+            axum::http::StatusCode::BAD_REQUEST,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "ok": false, "error": e.to_string() }).to_string(),
+        ));
+    }
     // `{"federated": true}` names this daemon as a remote SPARQL peer: route
     // to the federation handler on the underlying LadybugStore. Security per
     // deployment: served-host/namespace allowlists and peers come from env,
@@ -2379,16 +2449,16 @@ async fn handle_http_sparql(
             }),
             Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}),
         };
-        return (
+        return axum::response::IntoResponse::into_response((
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             body.to_string(),
-        );
+        ));
     }
     let body = crate::server::handle_sparql_query(&req, state.vector_store.clone()).await;
-    (
+    axum::response::IntoResponse::into_response((
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
-    )
+    ))
 }
 
 fn env_csv(name: &str) -> Vec<String> {
@@ -2473,11 +2543,36 @@ async fn handle_http_action(
 async fn handle_http_data_connector(
     State(state): State<AppState>,
     Json(req): Json<serde_json::Value>,
-) -> impl axum::response::IntoResponse {
+) -> (
+    axum::http::StatusCode,
+    [(axum::http::header::HeaderName, &'static str); 1],
+    String,
+) {
+    // The namespace defaults to the documented `global`; validate the value
+    // that will be used before any connector or store access. A present
+    // non-string is refused here, never laundered into the default.
+    if let Err(e) = crate::domain::optional_namespace_arg(&req, "global") {
+        let detail = match req.get("namespace").and_then(|v| v.as_str()) {
+            Some(s) if s.trim().is_empty() => {
+                "ERROR [NAMESPACE]: namespace must not be blank".to_string()
+            }
+            Some(s) if s.trim() != s => {
+                "ERROR [NAMESPACE]: namespace must not have leading or trailing whitespace"
+                    .to_string()
+            }
+            _ => e.to_string(),
+        };
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "ok": false, "error": detail }).to_string(),
+        );
+    }
     let body =
         crate::server::handle_data_connector(&req, state.vector_store.clone(), state.bus.clone())
             .await;
     (
+        axum::http::StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         body,
     )
@@ -2494,6 +2589,12 @@ async fn handle_http_vault_sync(
     ([(axum::http::header::HeaderName, &'static str); 1], String),
     (axum::http::StatusCode, String),
 > {
+    // The namespace defaults to the documented `NeuroStrata`; validate the
+    // value that will be used before the sync opens the store. A present
+    // non-string is refused, not defaulted.
+    if let Err(e) = crate::domain::optional_namespace_arg(&req, "NeuroStrata") {
+        return Err((axum::http::StatusCode::BAD_REQUEST, e.to_string()));
+    }
     let vault_path = req
         .get("vault_path")
         .and_then(|v| v.as_str())
@@ -4640,7 +4741,17 @@ mod tests {
     /// the list from the operator's real config file, which a test must
     /// never rewrite.
     async fn caller_path_state(root: &Path, allowlist: Vec<PathBuf>) -> AppState {
-        let store = Arc::new(RecordingStore::default());
+        state_with_store(root, allowlist, Arc::new(RecordingStore::default())).await
+    }
+
+    /// The same state, over any store: namespace-refusal tests use a counting
+    /// `MockStore` to prove a rejected request never touched the catalog or
+    /// any row.
+    async fn state_with_store(
+        root: &Path,
+        allowlist: Vec<PathBuf>,
+        store: Arc<dyn crate::traits::VectorStore>,
+    ) -> AppState {
         let embedder = Arc::new(StubEmbedder { dimensions: 8 });
         let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
         let watch_service = Arc::new(crate::ingest_watch::IngestWatchService::new(
@@ -5210,5 +5321,468 @@ mod tests {
             assert_eq!(roots.len(), 1);
             assert_eq!(roots[0]["namespace"], namespace);
         }
+    }
+
+    // ---- HTTP namespace refusals (issue #412 / PR #451) --------------------
+    //
+    // The daemon's own REST handlers used to resolve the caller namespace (and
+    // so list the catalog) before checking it. These tests drive the real
+    // handlers over a Router with a counting MockStore: an invalid namespace
+    // must answer 400 with the typed detail and leave every counter at zero.
+
+    fn namespace_test_app(state: AppState) -> Router {
+        Router::new()
+            .route("/graph", get(handle_get_graph))
+            .route("/ingest", post(handle_ingest))
+            .route("/ingest-scip", post(handle_ingest_scip))
+            .route("/delete", post(handle_delete))
+            .route("/edit", post(handle_edit))
+            .route("/set-metadata", post(handle_set_metadata))
+            .route("/tasks/import", post(handle_tasks_import))
+            .route("/tasks/gate", post(handle_tasks_gate))
+            .route("/cli/read", post(handle_cli_read))
+            .route("/cli/root", post(handle_cli_root))
+            .route("/vault-sync", post(handle_http_vault_sync))
+            .route("/data-connector", post(handle_http_data_connector))
+            .route("/sparql", post(handle_http_sparql))
+            .with_state(state)
+    }
+
+    fn json_post(uri: &str, body: &serde_json::Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri(uri)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn response_body(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn namespace_refusal_is_a_typed_400() {
+        let (status, detail) = super::namespace_refusal("bad/ns").unwrap_err();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(detail.starts_with("ERROR [NAMESPACE]"), "{detail}");
+        for blank in ["", "   ", " probe "] {
+            let (status, detail) = super::namespace_refusal(blank).unwrap_err();
+            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{blank:?}");
+            assert!(
+                detail.starts_with("ERROR [NAMESPACE]"),
+                "{blank:?}: {detail}"
+            );
+        }
+        assert!(super::namespace_refusal("probe").is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_routes_refuse_invalid_namespaces_before_store_access() {
+        use tower::ServiceExt;
+
+        let root = scratch_root("http-ns-refusal");
+        std::fs::create_dir_all(&root).unwrap();
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let state = state_with_store(&root, vec![], mock.clone()).await;
+        let app = namespace_test_app(state);
+
+        // (raw value, its URL query spelling) for GET /graph.
+        let invalid = [
+            ("bad/ns", "bad%2Fns"),
+            ("", ""),
+            ("   ", "%20%20%20"),
+            (" probe ", "%20probe%20"),
+        ];
+
+        for (raw, query) in invalid {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(axum::http::Method::GET)
+                        .uri(format!("/graph?namespace={query}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "graph {raw:?}"
+            );
+            let body = response_body(response).await;
+            assert!(
+                body.starts_with("ERROR [NAMESPACE]"),
+                "graph {raw:?}: {body}"
+            );
+
+            let cases = [
+                (
+                    "/ingest",
+                    serde_json::json!({ "dir": root, "namespace": raw }),
+                ),
+                (
+                    "/ingest-scip",
+                    serde_json::json!({ "scip_path": root, "namespace": raw }),
+                ),
+                (
+                    "/cli/read",
+                    serde_json::json!({ "op": "list", "namespace": raw }),
+                ),
+                (
+                    "/cli/read",
+                    serde_json::json!({ "op": "project_root", "namespace": raw }),
+                ),
+                (
+                    "/delete",
+                    serde_json::json!({ "namespace": raw, "id": "m1" }),
+                ),
+                (
+                    "/edit",
+                    serde_json::json!({
+                        "old_namespace": raw,
+                        "id": "m1",
+                        "new_namespace": "probe",
+                        "content": "x",
+                        "location": ""
+                    }),
+                ),
+                (
+                    "/edit",
+                    serde_json::json!({
+                        "old_namespace": "probe",
+                        "id": "m1",
+                        "new_namespace": raw,
+                        "content": "x",
+                        "location": ""
+                    }),
+                ),
+                (
+                    "/set-metadata",
+                    serde_json::json!({ "namespace": raw, "id": "m1", "metadata": {} }),
+                ),
+                (
+                    "/tasks/import",
+                    serde_json::json!({ "namespace": raw, "from_beads": root }),
+                ),
+                ("/tasks/gate", serde_json::json!({ "namespace": raw })),
+                (
+                    "/cli/root",
+                    serde_json::json!({ "op": "cache_root", "namespace": raw, "root": root }),
+                ),
+                (
+                    "/vault-sync",
+                    serde_json::json!({ "namespace": raw, "vault_path": root }),
+                ),
+            ];
+            for (uri, payload) in cases {
+                let response = app.clone().oneshot(json_post(uri, &payload)).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "{uri} {raw:?}"
+                );
+                let body = response_body(response).await;
+                assert!(
+                    body.starts_with("ERROR [NAMESPACE]"),
+                    "{uri} {raw:?}: {body}"
+                );
+            }
+
+            // The connector route wraps its typed refusal in the JSON shape
+            // the rest of that surface uses; the status is still 400.
+            let response = app
+                .clone()
+                .oneshot(json_post(
+                    "/data-connector",
+                    &serde_json::json!({
+                        "namespace": raw,
+                        "args": { "operation": "list_connectors" }
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "data-connector {raw:?}"
+            );
+            let body = response_body(response).await;
+            assert!(
+                body.contains("ERROR [NAMESPACE]"),
+                "data-connector {raw:?}: {body}"
+            );
+
+            // SPARQL shares the typed status; its body is the surface's JSON.
+            let response = app
+                .clone()
+                .oneshot(json_post(
+                    "/sparql",
+                    &serde_json::json!({
+                        "namespace": raw,
+                        "query": "SELECT ?s WHERE { ?s ?p ?o }"
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "sparql {raw:?}"
+            );
+            let body = response_body(response).await;
+            assert!(body.contains("ERROR [NAMESPACE]"), "sparql {raw:?}: {body}");
+        }
+
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "no refused request may resolve a namespace (catalog read)"
+        );
+        assert_eq!(
+            mock.list_calls(),
+            0,
+            "no refused request may scan a namespace"
+        );
+        assert_eq!(mock.get_calls(), 0, "no refused request may read a row");
+        assert_eq!(mock.upsert_calls(), 0, "no refused request may write a row");
+        assert_eq!(
+            mock.delete_calls(),
+            0,
+            "no refused request may delete a row"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_routes_refuse_malformed_and_foreign_ids_before_store_access() {
+        use tower::ServiceExt;
+
+        let root = scratch_root("http-id-refusal");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A malformed address is a syntax refusal: no catalog read and no
+        // store call of any kind.
+        for (uri, payload) in [
+            (
+                "/delete",
+                serde_json::json!({ "namespace": "probe", "id": "bad id" }),
+            ),
+            (
+                "/edit",
+                serde_json::json!({
+                    "old_namespace": "probe",
+                    "id": "bad id",
+                    "new_namespace": "probe",
+                    "content": "x",
+                    "location": ""
+                }),
+            ),
+            (
+                "/set-metadata",
+                serde_json::json!({ "namespace": "probe", "id": "bad id", "metadata": {} }),
+            ),
+        ] {
+            let mock = Arc::new(crate::guard::testkit::MockStore::new());
+            let state = state_with_store(&root, vec![], mock.clone()).await;
+            let app = namespace_test_app(state);
+            let response = app.oneshot(json_post(uri, &payload)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+            let body = response_body(response).await;
+            assert!(body.starts_with("ERROR [ID]"), "{uri}: {body}");
+            assert_eq!(mock.list_namespaces_calls(), 0, "{uri} catalog read");
+            assert_eq!(mock.get_calls(), 0, "{uri} get");
+            assert_eq!(mock.upsert_calls(), 0, "{uri} upsert");
+            assert_eq!(mock.delete_calls(), 0, "{uri} delete");
+        }
+
+        // A well-formed but foreign-prefixed address is refused after the
+        // namespace resolves and before any row is read, written or deleted.
+        for (uri, payload) in [
+            (
+                "/delete",
+                serde_json::json!({ "namespace": "probe", "id": "other::m1" }),
+            ),
+            (
+                "/edit",
+                serde_json::json!({
+                    "old_namespace": "probe",
+                    "id": "other::m1",
+                    "new_namespace": "probe",
+                    "content": "x",
+                    "location": ""
+                }),
+            ),
+            (
+                "/set-metadata",
+                serde_json::json!({ "namespace": "probe", "id": "other::m1", "metadata": {} }),
+            ),
+        ] {
+            let mock = Arc::new(crate::guard::testkit::MockStore::new());
+            let state = state_with_store(&root, vec![], mock.clone()).await;
+            let app = namespace_test_app(state);
+            let response = app.oneshot(json_post(uri, &payload)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+            let body = response_body(response).await;
+            assert!(body.starts_with("ERROR [ID]"), "{uri}: {body}");
+            assert!(body.contains("names namespace"), "{uri}: {body}");
+            assert_eq!(mock.get_calls(), 0, "{uri} get");
+            assert_eq!(mock.upsert_calls(), 0, "{uri} upsert");
+            assert_eq!(mock.delete_calls(), 0, "{uri} delete");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_routes_refuse_a_non_string_namespace_before_store_access() {
+        use tower::ServiceExt;
+
+        let root = scratch_root("http-ns-shape-refusal");
+        std::fs::create_dir_all(&root).unwrap();
+        let shapes = [
+            serde_json::json!(123),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::Value::Null,
+        ];
+        for shape in shapes {
+            for uri in ["/sparql", "/vault-sync", "/data-connector"] {
+                let mock = Arc::new(crate::guard::testkit::MockStore::new());
+                let state = state_with_store(&root, vec![], mock.clone()).await;
+                let app = namespace_test_app(state);
+                let payload = match uri {
+                    "/sparql" => serde_json::json!({
+                        "namespace": shape,
+                        "query": "SELECT ?s WHERE { ?s ?p ?o }"
+                    }),
+                    "/vault-sync" => serde_json::json!({
+                        "namespace": shape,
+                        "vault_path": root
+                    }),
+                    _ => serde_json::json!({
+                        "namespace": shape,
+                        "args": { "operation": "list_connectors" }
+                    }),
+                };
+                let response = app.oneshot(json_post(uri, &payload)).await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "{uri} {shape}"
+                );
+                let body = response_body(response).await;
+                assert!(body.contains("ERROR [NAMESPACE]"), "{uri} {shape}: {body}");
+                assert_eq!(mock.list_namespaces_calls(), 0, "{uri} {shape}");
+                assert_eq!(mock.get_calls(), 0, "{uri} {shape}");
+                assert_eq!(mock.upsert_calls(), 0, "{uri} {shape}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_get_graph_keeps_its_documented_global_default() {
+        use tower::ServiceExt;
+
+        let root = scratch_root("http-ns-global-default");
+        std::fs::create_dir_all(&root).unwrap();
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let state = state_with_store(&root, vec![], mock.clone()).await;
+        let app = namespace_test_app(state);
+
+        // No namespace argument still means "global", and that value passes
+        // the shared check before the catalog is read.
+        for uri in ["/graph", "/graph?namespace=global"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(axum::http::Method::GET)
+                        .uri(uri)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK, "{uri}");
+        }
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            2,
+            "each accepted graph read resolves the valid default"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_get_graph_filters_to_global_plus_the_selected_namespace() {
+        use tower::ServiceExt;
+
+        let root = scratch_root("http-graph-filter");
+        std::fs::create_dir_all(&root).unwrap();
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        mock.set_export_graph(serde_json::json!({
+            "nodes": [
+                {"id": "g1", "namespace": "global"},
+                {"id": "n1", "namespace": "NeuroStrata"},
+                {"id": "o1", "namespace": "other"}
+            ],
+            "links": [
+                {"source": "g1", "target": "n1"},
+                {"source": "g1", "target": "o1"},
+                {"source": "n1", "target": "o1"}
+            ]
+        }));
+        let state = state_with_store(&root, vec![], mock.clone()).await;
+        let app = namespace_test_app(state);
+
+        let graph = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(axum::http::Method::GET)
+                            .uri(uri)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK, "{uri}");
+                let body: serde_json::Value =
+                    serde_json::from_str(&response_body(response).await).unwrap();
+                let mut ids: Vec<String> = body["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|n| n["id"].as_str().unwrap().to_string())
+                    .collect();
+                ids.sort();
+                (ids, body["links"].as_array().unwrap().len())
+            }
+        };
+
+        // Absent and explicit `global` both select only the global rows.
+        assert_eq!(graph("/graph").await, (vec!["g1".to_string()], 0));
+        assert_eq!(
+            graph("/graph?namespace=global").await,
+            (vec!["g1".to_string()], 0)
+        );
+        // Selecting another namespace keeps global and adds that namespace,
+        // never a third one.
+        assert_eq!(
+            graph("/graph?namespace=other").await,
+            (vec!["g1".to_string(), "o1".to_string()], 1)
+        );
     }
 }

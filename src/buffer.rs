@@ -346,6 +346,35 @@ pub async fn handle_append_log(
         })
         .unwrap_or_default();
 
+    // Validate only the caller-supplied namespace, before append_entry writes
+    // anything. Absent and empty/whitespace keep the F7 fallback to the
+    // project-root folder name; a non-empty string is checked unchanged; any
+    // other shape is a typed refusal. The folder-name fallback is derived,
+    // not caller syntax, so it is deliberately not validated here.
+    let namespace_arg: Option<String> = match arguments.get("namespace") {
+        None => None,
+        Some(Value::String(s)) if s.trim().is_empty() => None,
+        Some(Value::String(s)) => {
+            if let Err(e) = crate::domain::validate_namespace(s) {
+                return e.to_string();
+            }
+            Some(s.clone())
+        }
+        Some(other) => {
+            return format!(
+                "ERROR [NAMESPACE]: 'namespace' must be a string, got {}",
+                match other {
+                    Value::Null => "null",
+                    Value::Bool(_) => "a boolean",
+                    Value::Number(_) => "a number",
+                    Value::Array(_) => "an array",
+                    Value::Object(_) => "an object",
+                    Value::String(_) => "a string",
+                }
+            )
+        }
+    };
+
     if let Some(rejection) = scan_for_append(&content, &tags) {
         return rejection;
     }
@@ -391,18 +420,13 @@ pub async fn handle_append_log(
     };
 
     // The namespace the root cache and the root hint are for.
-    let cache_ns = arguments
-        .get("namespace")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| {
-            project_root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(String::from)
-                .unwrap_or_else(|| "default".to_string())
-        });
+    let cache_ns = namespace_arg.clone().unwrap_or_else(|| {
+        project_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| "default".to_string())
+    });
     let root_hint = crate::root_marker::root_hint(&cache_ns, &project_root);
 
     // Append succeeded - now run the recall if we have slugs
@@ -423,28 +447,13 @@ pub async fn handle_append_log(
         (vec![], None)
     } else {
         // Resolve namespace only when we actually need to search (F5)
-        let namespace_arg = arguments
-            .get("namespace")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let namespace_candidate = if let Some(ns) = namespace_arg {
-            if ns.trim().is_empty() {
-                // Treat empty/whitespace-only namespace as absent (F7)
-                project_root
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| "default".to_string())
-            } else {
-                ns
-            }
-        } else {
+        let namespace_candidate = namespace_arg.clone().unwrap_or_else(|| {
             project_root
                 .file_name()
                 .and_then(|n| n.to_str())
                 .map(String::from)
                 .unwrap_or_else(|| "default".to_string())
-        };
+        });
         let namespace = crate::server::resolve_namespace(&store, &namespace_candidate).await;
 
         // Embed the joined query once
@@ -1176,6 +1185,74 @@ mod tests {
             parsed.get("recalled_from").and_then(|v| v.as_str()),
             Some("domain")
         );
+    }
+
+    #[tokio::test]
+    async fn a_caller_namespace_is_validated_before_the_append() {
+        let base = scratch("namespace-validation");
+        let store = Arc::new(MockStore::new());
+        let emb = Arc::new(StubEmbedder);
+
+        // A project root whose folder name is not a valid namespace still
+        // works when the caller omits (or blanks) the namespace: only the
+        // caller-supplied argument is syntax, the fallback is derived.
+        // The folder labels avoid trailing spaces so the test also runs on
+        // Windows, where a folder name cannot end in a space.
+        for (label, namespace) in [
+            ("absent", None),
+            ("blank", Some(json!(""))),
+            ("spaces", Some(json!("   "))),
+        ] {
+            let root = base.join(format!("My Project {label}"));
+            std::fs::create_dir_all(&root).unwrap();
+            let mut args = json!({
+                "content": "entry",
+                "project_root": root.display().to_string(),
+            });
+            if let Some(ns) = &namespace {
+                args["namespace"] = ns.clone();
+            }
+            let result = handle_append_log(args, emb.clone(), store.clone()).await;
+            assert!(
+                result.contains("\"appended\":true"),
+                "namespace {namespace:?} must fall back, not fail: {result}"
+            );
+            assert!(root
+                .join(".NeuroStrata")
+                .join("sessions")
+                .join("current.md")
+                .exists());
+        }
+
+        // A malformed or non-string caller namespace fails before the write,
+        // so the sessions directory is never created.
+        for namespace in [json!("bad/ns"), json!(123)] {
+            let root = base.join(format!("refused-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let result = handle_append_log(
+                json!({
+                    "content": "entry",
+                    "project_root": root.display().to_string(),
+                    "namespace": namespace,
+                }),
+                emb.clone(),
+                store.clone(),
+            )
+            .await;
+            assert!(
+                result.starts_with("ERROR [NAMESPACE]"),
+                "{namespace}: {result}"
+            );
+            assert!(
+                !root
+                    .join(".NeuroStrata")
+                    .join("sessions")
+                    .join("current.md")
+                    .exists(),
+                "{namespace} wrote before validation"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

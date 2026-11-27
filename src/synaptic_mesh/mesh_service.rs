@@ -897,29 +897,25 @@ pub fn handle_mesh_tool_call_with_base(name: &str, arguments: &Value, base_root:
     let mut svc = MeshService::new(project_root);
     let command = match name {
         "neurostrata_synaptic_mesh_init" => match arguments.get("name").and_then(|v| v.as_str()) {
-            Some(mesh_name) => SynapticMeshCommands::Init {
-                name: mesh_name.to_string(),
-                // `namespace` accepts one string or an array of strings;
-                // omitted = the current project namespace (init_mesh's
-                // default), never "share nothing".
-                namespace: arguments
-                    .get("namespace")
-                    .and_then(|v| match v {
-                        Value::Array(items) => Some(
-                            items
-                                .iter()
-                                .filter_map(|s| s.as_str().map(String::from))
-                                .collect::<Vec<String>>(),
-                        ),
-                        Value::String(s) => Some(vec![s.to_string()]),
-                        _ => None,
-                    })
-                    .unwrap_or_default(),
-                remote: arguments
-                    .get("remote")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-            },
+            Some(mesh_name) => {
+                // `namespace` accepts one string or a non-empty array of
+                // strings; the shared parser refuses every other shape before
+                // the mesh manifest is opened. Omitted still means the current
+                // project namespace (init_mesh's default).
+                let namespace =
+                    match super::import::parse_caller_namespaces(arguments.get("namespace")) {
+                        Ok(namespace) => namespace,
+                        Err(e) => return format!("error: {e}"),
+                    };
+                SynapticMeshCommands::Init {
+                    name: mesh_name.to_string(),
+                    namespace,
+                    remote: arguments
+                        .get("remote")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                }
+            }
             None => return "error: neurostrata_synaptic_mesh_init requires `name`".to_string(),
         },
         "neurostrata_synaptic_mesh_join" => match arguments.get("dir").and_then(|v| v.as_str()) {
@@ -1004,6 +1000,40 @@ mod tests {
         assert_eq!(id, p_id, "first mesh id preserved");
         assert_eq!(dir, p_dir, "first mesh dir preserved");
         assert_eq!(id, first);
+    }
+
+    /// The sibling init parser now shares the pull parser: a non-string, a
+    /// non-string array element, and an empty array are refusals, never a
+    /// silent fallback to the project namespace.
+    #[test]
+    fn init_refuses_malformed_namespace_declarations() {
+        let base = std::env::temp_dir().join(format!("ns-mesh-ns-{}", uuid::Uuid::new_v4()));
+        let project = base.join("probe");
+        std::fs::create_dir_all(&project).unwrap();
+        for namespace in [
+            json!(42),
+            json!({}),
+            Value::Null,
+            json!(["probe", 42]),
+            json!([42]),
+            json!([]),
+            json!(""),
+            json!(" probe "),
+            json!("bad/ns"),
+        ] {
+            let reply = handle_mesh_tool_call_with_base(
+                "neurostrata_synaptic_mesh_init",
+                &json!({
+                    "name": "bad-mesh",
+                    "namespace": namespace,
+                    "project_root": project,
+                    "node_id": "n1"
+                }),
+                &base,
+            );
+            assert!(reply.contains("ERROR [NAMESPACE]"), "{namespace}: {reply}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The other half of the init contract: omitted `namespace` defaults to

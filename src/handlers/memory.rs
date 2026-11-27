@@ -21,33 +21,42 @@ pub async fn handle_get_memory(arguments: Value, store: Arc<dyn VectorStore>) ->
         Some(n) => n,
         None => return "ERROR [NAMESPACE]: 'namespace' is missing. You MUST explicitly provide the namespace the memory lives in.".to_string(),
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    let namespace = namespace.as_str();
-    if namespace.contains('/') || namespace.contains('\\') {
-        return "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes.".to_string();
+    // Format validation must precede any store access: resolve_namespace lists
+    // the catalog. Caller namespaces use the strict DR-1 rule; ids accept the
+    // bare file paths earlier releases persisted while new writes stay strict.
+    if let Err(e) = crate::domain::validate_namespace(namespace) {
+        return e.to_string();
     }
+    if let Err(e) = crate::domain::validate_id_for_read(id) {
+        return e.to_string();
+    }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
+    if let Err(e) = crate::domain::validate_id_for_namespace(id, &namespace) {
+        return e.to_string();
+    }
+    let namespace = namespace.as_str();
 
-    match store.get(namespace, id).await {
-        Ok(Some((_, payload))) => {
+    match crate::server::lookup_effective_row(store.as_ref(), namespace, id).await {
+        Ok(Some((effective_id, _, payload))) => {
             let store_clone = store.clone();
             let ns_clone = namespace.to_string();
-            let id_clone = id.to_string();
+            let id_clone = effective_id.clone();
             tokio::spawn(async move {
                 if let Err(e) = store_clone.increment_access_count(&ns_clone, &id_clone).await {
                     tracing::warn!("increment_access_count failed for {}:{}: {e}", ns_clone, id_clone);
                 }
             });
-            if !crate::recall_metrics::record_promotion(namespace, id) {
+            if !crate::recall_metrics::record_promotion(namespace, &effective_id) {
                 // The metric records "was this id recently recalled?" and a
                 // miss is a normal outcome, not an error -- so it is a
                 // debug note, not a warn.
                 tracing::debug!(
                     "record_promotion recorded no promotion for {}:{} (not in the recent-recall window)",
                     namespace,
-                    id
+                    effective_id
                 );
             }
-            format_memory(id, &payload)
+            format_memory(&effective_id, &payload)
         }
         Ok(None) => format!(
             "No memory with id '{}' in namespace '{}'. Ids come from neurostrata_search_memory; check the namespace with neurostrata_list_namespaces.",

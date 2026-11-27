@@ -69,13 +69,9 @@ pub const DONE_FUNNEL_MESSAGE: &str =
     "ERROR: done is reachable only via neurostrata_task_complete, which requires memory extraction (Lock 2).";
 
 fn check_namespace(namespace: &str) -> Result<(), String> {
-    if namespace.contains('/') || namespace.contains('\\') {
-        return Err(
-            "ERROR [NAMESPACE]: The namespace cannot be a file path. It must be the exact project name (e.g., 'NeuroStrata'). Do not use slashes."
-                .to_string(),
-        );
-    }
-    Ok(())
+    // One canonical rule at every task entry point: a namespace refused here
+    // is refused identically by the server, store and mesh-import surfaces.
+    crate::domain::validate_namespace(namespace).map_err(|e| e.to_string())
 }
 
 fn encode(body: &Value) -> String {
@@ -349,20 +345,44 @@ pub fn task_summary(id: &str, payload: &MemoryPayload, with_history: bool) -> Va
     summary
 }
 
+/// The id the store actually holds for a caller's task address.
+///
+/// The task claim lock is keyed by task id, so two spellings that differ only
+/// in the namespace prefix's case must resolve to the same key before either
+/// takes the lock. The lookup is canonical-first with the raw spelling as the
+/// fallback older releases need.
+async fn resolve_task_effective_id(
+    store: &Arc<dyn VectorStore>,
+    namespace: &str,
+    id: &str,
+) -> Result<String, String> {
+    match crate::server::lookup_effective_row(store.as_ref(), namespace, id).await {
+        Ok(Some((effective, _, _))) => Ok(effective),
+        Ok(None) => Ok(id.to_string()),
+        Err(e) => Err(format!("Failed to read task '{}': {}", id, e)),
+    }
+}
+
 async fn load_task(
     store: &Arc<dyn VectorStore>,
     namespace: &str,
     id: &str,
 ) -> Result<(Task, Vec<f32>), String> {
-    match store.get(namespace, id).await {
-        Ok(Some((vector, payload))) => {
+    match crate::server::lookup_effective_row(store.as_ref(), namespace, id).await {
+        Ok(Some((effective_id, vector, payload))) => {
             if payload.memory_type != "task" {
                 return Err(format!(
                     "ERROR: '{}' is a {} memory, not a task. Task tools only act on memory_type 'task' rows.",
-                    id, payload.memory_type
+                    effective_id, payload.memory_type
                 ));
             }
-            Ok((Task { id: id.to_string(), payload }, vector))
+            Ok((
+                Task {
+                    id: effective_id,
+                    payload,
+                },
+                vector,
+            ))
         }
         Ok(None) => Err(format!(
             "ERROR: no task with id '{}' in namespace '{}'. List the work with neurostrata_task_list; ids look like '{}-xxxx'.",
@@ -2268,6 +2288,9 @@ pub(crate) async fn receipt_ledger_root(
             return Some(root);
         }
     }
+    if check_namespace(namespace).is_err() {
+        return None;
+    }
     let ns = crate::server::resolve_namespace(store, namespace).await;
     if let Ok(Some((_, registry))) = store.get(&ns, &crate::registry::registry_row_id(&ns)).await {
         if crate::registry::is_registry_row(&registry.metadata) {
@@ -2347,6 +2370,9 @@ async fn record_graph_query_inner(
     caller_root: Option<&str>,
     count_task: bool,
 ) {
+    if check_namespace(namespace).is_err() {
+        return;
+    }
     let ns = crate::server::resolve_namespace(store, namespace).await;
     #[cfg(test)]
     {
@@ -2542,6 +2568,9 @@ pub async fn record_tool_receipt(
     mut fields: tool_receipts::ReceiptFields,
     caller_root: Option<&str>,
 ) {
+    if check_namespace(&fields.namespace).is_err() {
+        return;
+    }
     let ns = crate::server::resolve_namespace(store, &fields.namespace).await;
 
     // Review fix round 2: ATTRIBUTION ONLY. Never touch `graph_queries_count`,
@@ -2626,6 +2655,21 @@ pub async fn handle_task_create(
         Ok(n) => n,
         Err(e) => return e,
     };
+    // Format validation must precede any store access: resolve_namespace lists
+    // the catalog, so a rejected namespace would otherwise reach the store.
+    // Note there is deliberately no post-resolve check: resolve_namespace may
+    // return an existing legacy namespace whose shape new writes refuse.
+    if let Err(e) = check_namespace(namespace) {
+        return e;
+    }
+    // The parent id is an address checked before resolve_namespace lists the
+    // catalog; a malformed value must never reach a store read.
+    let mut parent_id = arg_str(&args, "parent_id").map(|s| s.to_string());
+    if let Some(parent) = &parent_id {
+        if let Err(e) = crate::domain::validate_id(parent) {
+            return e.to_string();
+        }
+    }
     let mut redactions = Vec::new();
     let title = match arg_str(&args, "title") {
         Some(t) => match check_title_redacted(t, &mut redactions) {
@@ -2637,8 +2681,10 @@ pub async fn handle_task_create(
         }
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
-        return e;
+    if let Some(parent) = &parent_id {
+        if let Err(e) = crate::domain::validate_id_for_namespace(parent, &namespace) {
+            return e.to_string();
+        }
     }
 
     // A typo'd namespace would silently fork the stratum. New projects seed
@@ -2692,22 +2738,32 @@ pub async fn handle_task_create(
     let description = arg_str(&args, "description")
         .map(|s| redact_into(s, &mut redactions))
         .filter(|s| !s.is_empty());
-    let parent_id = arg_str(&args, "parent_id").map(|s| s.to_string());
     let user_id = arg_str(&args, "user_id").unwrap_or("unknown").to_string();
     let agent_name = arg_str(&args, "agent_name").map(|s| s.to_string());
 
     // A parent must exist and be a task, or the CONTAINS edge points at nothing.
-    if let Some(parent) = &parent_id {
-        match store.get(&namespace, parent).await {
-            Ok(Some((_, p))) if p.memory_type == "task" => {}
-            Ok(Some(_)) => return format!("ERROR: parent_id '{}' is not a task.", parent),
+    // An older release may hold the parent under a differently-cased prefix,
+    // so the edge binds the row that exists, not the caller's spelling.
+    if let Some(parent) = parent_id.as_mut() {
+        match crate::server::lookup_effective_row(store.as_ref(), &namespace, parent).await {
+            Ok(Some((effective, _, p))) if p.memory_type == "task" => {
+                *parent = effective;
+            }
+            Ok(Some(_)) => return format!("ERROR: parent_id '{}' is not a task.", parent.as_str()),
             Ok(None) => {
                 return format!(
                     "ERROR: no task with id '{}' in namespace '{}'.",
-                    parent, namespace
+                    parent.as_str(),
+                    namespace
                 )
             }
-            Err(e) => return format!("ERROR: could not read parent_id '{}': {}", parent, e),
+            Err(e) => {
+                return format!(
+                    "ERROR: could not read parent_id '{}': {}",
+                    parent.as_str(),
+                    e
+                )
+            }
         }
     }
 
@@ -2887,6 +2943,14 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         Ok(v) => v,
         Err(e) => return e,
     };
+    // Addresses are checked before resolve_namespace lists the catalog, and
+    // the task id before any load_task read.
+    if let Err(e) = check_namespace(namespace) {
+        return e;
+    }
+    if let Err(e) = crate::domain::validate_id(&id) {
+        return e.to_string();
+    }
     // A claim without a session has no holder identity to exclude others
     // with: refuse before any state is read or written, and never persist
     // an empty session_id.
@@ -2895,21 +2959,31 @@ pub async fn handle_task_claim(args: Value, store: Arc<dyn VectorStore>) -> Stri
         Err(e) => return e,
     };
     let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
-        return e;
+    // A qualified task id names its owner; a foreign prefix must not load or
+    // claim a row through this namespace.
+    if let Err(e) = crate::domain::validate_id_for_namespace(&id, &namespace) {
+        return e.to_string();
     }
 
     let assignee = arg_str(&args, "assignee").unwrap_or("unknown").to_string();
 
+    // Resolve the effective row id before taking the claim lock: two spellings
+    // of one task must contend on the same lock, or both can observe it
+    // unclaimed and both win.
+    let effective_id = match resolve_task_effective_id(&store, &namespace, &id).await {
+        Ok(effective) => effective,
+        Err(e) => return e,
+    };
     // Serialize the whole load -> decide -> upsert sequence per task: two
     // concurrent claims on one task can no longer both observe it unclaimed.
-    let lock = claim_lock(&id);
+    let lock = claim_lock(&effective_id);
     let _claim_guard = lock.lock().await;
 
-    let (mut task, vector) = match load_task(&store, &namespace, &id).await {
+    let (mut task, vector) = match load_task(&store, &namespace, &effective_id).await {
         Ok(found) => found,
         Err(e) => return e,
     };
+    let id = task.id.clone();
     let from = task.status();
     let holder = task
         .task_field("session_id")
@@ -3204,9 +3278,15 @@ pub async fn handle_task_update(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = check_namespace(namespace) {
         return e;
+    }
+    if let Err(e) = crate::domain::validate_id(&id) {
+        return e.to_string();
+    }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
+    if let Err(e) = crate::domain::validate_id_for_namespace(&id, &namespace) {
+        return e.to_string();
     }
 
     let target = match arg_str(&args, "status") {
@@ -3269,10 +3349,20 @@ pub async fn handle_task_update(
         return "ERROR: nothing to update: pass at least one of title, status, note, priority, assignee, add_labels, blocked_by.".to_string();
     }
 
-    let (mut task, mut vector) = match load_task(&store, &namespace, &id).await {
+    // Resolve the effective row id before taking the claim lock, so every
+    // spelling of one task serializes against a concurrent claim/update.
+    let effective_id = match resolve_task_effective_id(&store, &namespace, &id).await {
+        Ok(effective) => effective,
+        Err(e) => return e,
+    };
+    let lock = claim_lock(&effective_id);
+    let _claim_guard = lock.lock().await;
+
+    let (mut task, mut vector) = match load_task(&store, &namespace, &effective_id).await {
         Ok(found) => found,
         Err(e) => return e,
     };
+    let id = task.id.clone();
     let from = task.status();
     let history_before = task
         .task_field("history")
@@ -3544,9 +3634,17 @@ pub async fn handle_task_get(args: Value, store: Arc<dyn VectorStore>) -> String
         Ok(v) => v,
         Err(e) => return e,
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    // Same typed refusal as claim/update/complete, before resolve_namespace
+    // lists the catalog or load_task reads the caller's id.
+    if let Err(e) = check_namespace(namespace) {
         return e;
+    }
+    if let Err(e) = crate::domain::validate_id(&id) {
+        return e.to_string();
+    }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
+    if let Err(e) = crate::domain::validate_id_for_namespace(&id, &namespace) {
+        return e.to_string();
     }
     let include_history = args
         .get("include_history")
@@ -3556,6 +3654,7 @@ pub async fn handle_task_get(args: Value, store: Arc<dyn VectorStore>) -> String
         Ok((task, _)) => task,
         Err(e) => return e,
     };
+    let id = task.id.clone();
     let mut summary = task_summary(&task.id, &task.payload, true);
     let notes = summary
         .get("history")
@@ -3581,10 +3680,10 @@ pub async fn handle_task_list(args: Value, store: Arc<dyn VectorStore>) -> Strin
         Ok(v) => v,
         Err(e) => return e,
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = check_namespace(namespace) {
         return e;
     }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
 
     let status_filter = match arg_str(&args, "status") {
         None => None,
@@ -3757,11 +3856,20 @@ pub async fn handle_task_complete(
 ) -> Result<String, String> {
     let id = required_str(&args, "id")?.to_string();
     let namespace_arg = required_str(&args, "namespace")?;
+    check_namespace(namespace_arg)?;
+    crate::domain::validate_id(&id).map_err(|e| e.to_string())?;
     let namespace = crate::server::resolve_namespace(&store, namespace_arg).await;
-    check_namespace(&namespace)?;
+    crate::domain::validate_id_for_namespace(&id, &namespace).map_err(|e| e.to_string())?;
     precheck::normalize_and_precheck_namespace(&*store, &namespace).await?;
 
-    let (task, vector) = load_task(&store, &namespace, &id).await?;
+    // Resolve the effective row id before taking the claim lock: completion and
+    // a concurrent claim on another spelling of the same task must serialize.
+    let effective_id = resolve_task_effective_id(&store, &namespace, &id).await?;
+    let lock = claim_lock(&effective_id);
+    let _claim_guard = lock.lock().await;
+
+    let (task, vector) = load_task(&store, &namespace, &effective_id).await?;
+    let id = task.id.clone();
     // The clock the gate reads with: a lesson row that has been retired is
     // history and discharges nothing, so the completion path asks the same
     // question the gate asks.
@@ -3935,26 +4043,41 @@ pub async fn handle_task_complete(
     // verbatim -- linking must never change what the memory ranks for.
     if !edge {
         if let Some(link_id) = &link_memory_id {
-            if link_id == &id {
+            // Defense in depth: a malformed or foreign-prefixed link is a
+            // refused address, never a store read. The task surface has its
+            // own gate; the shared read gate keeps legacy file-path rows
+            // linkable.
+            crate::domain::validate_id_for_read(link_id).map_err(|e| e.to_string())?;
+            crate::domain::validate_id_for_namespace(link_id, &namespace)
+                .map_err(|e| e.to_string())?;
+            let (effective_link_id, existing_vector, mut payload) =
+                match crate::server::lookup_effective_row(store.as_ref(), &namespace, link_id)
+                    .await
+                {
+                    Ok(Some((effective, vector, payload))) => (effective, vector, payload),
+                    Ok(None) => {
+                        return Err(format!(
+                            "ERROR: no memory with id '{}' in namespace '{}' to link.",
+                            link_id, namespace
+                        ))
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "ERROR: could not read memory '{}': {}",
+                            link_id, e
+                        ))
+                    }
+                };
+            if effective_link_id == id {
                 return Err(format!(
                     "ERROR: link_memory_id must be a memory, not the task itself ('{}').",
                     id
                 ));
             }
-            let (existing_vector, mut payload) = match store.get(&namespace, link_id).await {
-                Ok(Some(found)) => found,
-                Ok(None) => {
-                    return Err(format!(
-                        "ERROR: no memory with id '{}' in namespace '{}' to link.",
-                        link_id, namespace
-                    ))
-                }
-                Err(e) => return Err(format!("ERROR: could not read memory '{}': {}", link_id, e)),
-            };
             if !payload.metadata.is_object() {
                 return Err(format!(
                     "ERROR: memory '{}' has legacy-shaped metadata (not a JSON object) and cannot be linked. Re-add it with object metadata first.",
-                    link_id
+                    effective_link_id
                 ));
             }
             let declared = payload.metadata.get("extracted_from").cloned();
@@ -3964,7 +4087,7 @@ pub async fn handle_task_complete(
                 Some(_) => {
                     return Err(format!(
                         "ERROR: memory '{}' has a malformed 'extracted_from' (it must be an array of task ids).",
-                        link_id
+                        effective_link_id
                     ))
                 }
             };
@@ -3977,12 +4100,12 @@ pub async fn handle_task_complete(
                 .expect("object checked above")
                 .insert("extracted_from".to_string(), Value::Array(arr));
             store
-                .upsert(&namespace, link_id, existing_vector, payload)
+                .upsert(&namespace, &effective_link_id, existing_vector, payload)
                 .await
                 .map_err(|e| {
                     format!(
                         "Failed to link memory '{}' to task '{}': {}",
-                        link_id, id, e
+                        effective_link_id, id, e
                     )
                 })?;
             // Verified after the write: the rule is an edge *after the call*.
@@ -4366,10 +4489,10 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
         Ok(v) => v,
         Err(e) => return e,
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = check_namespace(namespace) {
         return e;
     }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
     // One list scan serves both the gate and the R7 advisories: the gate
     // stays metadata-only and the advisory inputs come from the same rows,
     // so the two surfaces cannot disagree about which tasks are active.
@@ -4714,10 +4837,10 @@ pub async fn handle_bootstrap(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = check_namespace(namespace) {
         return e;
     }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
     let project_description = arg_str(&args, "project_description").map(|s| s.to_string());
     let checked = match checked_marker_root(project_root) {
         Ok(root) => root,
@@ -6219,10 +6342,10 @@ pub async fn handle_task_setup(
         Ok(v) => v,
         Err(e) => return e,
     };
-    let namespace = crate::server::resolve_namespace(&store, namespace).await;
-    if let Err(e) = check_namespace(&namespace) {
+    if let Err(e) = check_namespace(namespace) {
         return e;
     }
+    let namespace = crate::server::resolve_namespace(&store, namespace).await;
     let checked = match checked_marker_root(project_root) {
         Ok(root) => root,
         Err(e) => return e,
@@ -9722,6 +9845,48 @@ exit 0
     }
 
     #[tokio::test]
+    async fn task_create_binds_contained_by_to_the_effective_parent() {
+        let store = store_with_namespace("MyProj").await;
+        // A parent row stored under the namespace's exact spelling, addressed
+        // by a caller through a differently-cased prefix.
+        store
+            .upsert(
+                "MyProj",
+                "MyProj::parent-1",
+                vec![0.0; 4],
+                MemoryPayload {
+                    content: "epic".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "task".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "task": { "status": "open" } }),
+                },
+            )
+            .await
+            .unwrap();
+        let reply = handle_task_create(
+            json!({
+                "namespace": "MyProj",
+                "title": "subtask",
+                "parent_id": "myproj::parent-1"
+            }),
+            emb(),
+            store.clone(),
+        )
+        .await;
+        let child: Value = serde_json::from_str(&reply).expect("json reply");
+        let child_id = child["id"].as_str().unwrap().to_string();
+        let (_, payload) = store.get("MyProj", &child_id).await.unwrap().unwrap();
+        assert_eq!(
+            payload.metadata["contained_by"],
+            json!(["MyProj::parent-1"]),
+            "the edge must name the row that exists, not the caller's spelling"
+        );
+    }
+
+    #[tokio::test]
     async fn task_update_refuses_done_and_points_at_task_complete() {
         let store = store_with_namespace("MyProj").await;
         let id = create_task(&store, "MyProj", "the work", 2).await;
@@ -11382,6 +11547,68 @@ exit 0
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claim_case_variants_of_one_task_share_the_lock() {
+        let real = store_with_namespace("MyProj").await;
+        let generated = create_task(&real, "MyProj", "the work", 2).await;
+        let (vector, payload) = real
+            .get("MyProj", &generated)
+            .await
+            .unwrap()
+            .expect("created task");
+        // Store the same task under an owned qualified id, then address it in
+        // two different prefix cases. Both must canonicalize to one key before
+        // the claim lock, so only one can win.
+        real.upsert("MyProj", "MyProj::task-1", vector, payload)
+            .await
+            .unwrap();
+
+        let store: Arc<dyn VectorStore> = Arc::new(SlowGetStore {
+            inner: real.clone(),
+        });
+        let a = tokio::spawn(handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": "MyProj::task-1",
+                "assignee": "agent-a",
+                "session_id": "ses_a"
+            }),
+            store.clone(),
+        ));
+        let b = tokio::spawn(handle_task_claim(
+            json!({
+                "namespace": "MyProj",
+                "id": "myproj::task-1",
+                "assignee": "agent-b",
+                "session_id": "ses_b"
+            }),
+            store.clone(),
+        ));
+        let replies = [a.await.unwrap(), b.await.unwrap()];
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|r| r.contains("\"claimed\": true"))
+                .count(),
+            1,
+            "case variants must serialize on one lock: {:?}",
+            replies
+        );
+        let (_, payload) = real
+            .get("MyProj", "MyProj::task-1")
+            .await
+            .unwrap()
+            .expect("canonical qualified task");
+        assert_eq!(
+            payload.metadata["task"]["history"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "only the winning claim is persisted"
+        );
+    }
+
     #[tokio::test]
     async fn empty_session_claim_is_refused() {
         let store = store_with_namespace("MyProj").await;
@@ -11509,6 +11736,37 @@ exit 0
                 "existing attribution must not be overwritten"
             );
         });
+    }
+
+    #[tokio::test]
+    async fn task_get_refuses_malformed_addresses_before_store_access() {
+        // A spy makes the ordering claim testable: a typed refusal alone
+        // would still pass if resolve_namespace had listed the catalog first.
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let bad_id = handle_task_get(json!({ "id": "bad/id", "namespace": "MyProj" }), store).await;
+        assert!(bad_id.starts_with("ERROR [ID]:"), "{bad_id}");
+        assert!(bad_id.contains("bad/id"), "{bad_id}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a malformed id must not consult the namespace catalog"
+        );
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let bad_ns = handle_task_get(
+            json!({ "id": "myproj-abc", "namespace": "team:proj" }),
+            store,
+        )
+        .await;
+        assert!(bad_ns.starts_with("ERROR [NAMESPACE]:"), "{bad_ns}");
+        assert!(bad_ns.contains("team:proj"), "{bad_ns}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a malformed namespace must not consult the namespace catalog"
+        );
     }
 
     #[tokio::test]
@@ -12221,6 +12479,67 @@ exit 0
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0].as_str(), Some(mem_id.as_str()));
         assert_eq!(status_of(&store, "MyProj", &id).await, Status::Done);
+    }
+
+    #[tokio::test]
+    async fn path_2_link_memory_id_reaches_a_canonical_row_through_a_case_variant() {
+        let store = store_with_namespace("MyProj").await;
+        let id = create_task(&store, "MyProj", "the work", 2).await;
+        claim(&store, &id).await;
+
+        // The row lives under the stored namespace's exact spelling.
+        let canonical = "MyProj::lesson-1";
+        let vector = StubEmbedder.embed("an existing memory").await.unwrap();
+        store
+            .upsert(
+                "MyProj",
+                canonical,
+                vector.clone(),
+                MemoryPayload {
+                    content: "an existing memory".to_string(),
+                    user_id: "kenton".to_string(),
+                    memory_type: "fact".to_string(),
+                    agent_name: None,
+                    location: String::new(),
+                    location_lines: String::new(),
+                    metadata: json!({ "access_count": 3 }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let reply = handle_task_complete(
+            json!({
+                "namespace": "MyProj",
+                "id": id,
+                "link_memory_id": "myproj::lesson-1",
+            }),
+            emb(),
+            store.clone(),
+            None,
+            quiet_bus(),
+        )
+        .await
+        .expect("the case-variant address resolves to the canonical row");
+
+        let parsed: Value = serde_json::from_str(&reply).expect("json reply");
+        assert_eq!(parsed["task"]["status"], json!("done"));
+        assert_eq!(
+            parsed["extracted_memory_ids"],
+            json!([canonical]),
+            "the reply names the row that was written"
+        );
+        let (kept_vector, kept) = store.get("MyProj", canonical).await.unwrap().unwrap();
+        assert_eq!(kept_vector, vector, "the linked memory keeps its vector");
+        assert_eq!(kept.metadata["extracted_from"], json!([id.as_str()]));
+        assert!(
+            store
+                .get("MyProj", "myproj::lesson-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "linking must not fork a differently-cased twin"
+        );
     }
 
     #[tokio::test]
@@ -13934,6 +14253,172 @@ exit 0
     }
 
     #[tokio::test]
+    async fn site_refuses_illegal_namespace() {
+        for illegal in ["team:proj", "a b", ".hidden"] {
+            let store = temp_store().await;
+            let reply = handle_task_create(
+                json!({ "namespace": illegal, "title": "probe task" }),
+                emb(),
+                store.clone(),
+            )
+            .await;
+            assert!(
+                reply.starts_with("ERROR [NAMESPACE]"),
+                "{illegal:?} was not refused: {reply}"
+            );
+            assert!(
+                store.list_namespaces().await.unwrap().is_empty(),
+                "{illegal:?} reached the store"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_task_create_refuses_illegal_namespace_before_any_store_access() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_create(
+            json!({ "namespace": "team:proj", "title": "probe task" }),
+            emb(),
+            store,
+        )
+        .await;
+        assert!(reply.starts_with("ERROR [NAMESPACE]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "format validation must run before resolve_namespace consults the store"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_create_refuses_a_malformed_parent_before_catalog_access() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_create(
+            json!({
+                "namespace": "MyProj",
+                "title": "child task",
+                "parent_id": "bad id",
+            }),
+            emb(),
+            store,
+        )
+        .await;
+        assert!(reply.starts_with("ERROR [ID]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a malformed parent id must not consult the namespace catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_handlers_refuse_a_foreign_prefix_before_any_store_read() {
+        let id = "other::task-1";
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_claim(
+            json!({ "namespace": "probe", "id": id, "session_id": "s-1" }),
+            store,
+        )
+        .await;
+        assert!(reply.contains("names namespace"), "claim: {reply}");
+        assert_eq!(mock.get_calls(), 0, "claim read the store");
+        assert_eq!(mock.upsert_calls(), 0, "claim wrote the store");
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_update(
+            json!({ "namespace": "probe", "id": id, "note": "touch" }),
+            emb(),
+            store,
+        )
+        .await;
+        assert!(reply.contains("names namespace"), "update: {reply}");
+        assert_eq!(mock.get_calls(), 0, "update read the store");
+        assert_eq!(mock.upsert_calls(), 0, "update wrote the store");
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_get(json!({ "namespace": "probe", "id": id }), store).await;
+        assert!(reply.contains("names namespace"), "get: {reply}");
+        assert_eq!(mock.get_calls(), 0, "get read the store");
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_complete(
+            json!({ "namespace": "probe", "id": id }),
+            emb(),
+            store,
+            None,
+            quiet_bus(),
+        )
+        .await
+        .unwrap_or_else(|e| e);
+        assert!(reply.contains("names namespace"), "complete: {reply}");
+        assert_eq!(mock.get_calls(), 0, "complete read the store");
+        assert_eq!(mock.upsert_calls(), 0, "complete wrote the store");
+    }
+
+    #[tokio::test]
+    async fn task_entry_points_refuse_illegal_namespace_before_catalog_access() {
+        // Issue #412: a name refused at one task surface is refused at all of
+        // them, and no handler consults the namespace catalog first.
+        let bad = "team:proj";
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_list(json!({ "namespace": bad }), store).await;
+        assert!(reply.starts_with("ERROR [NAMESPACE]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "task_list consulted catalog"
+        );
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_validate(json!({ "namespace": bad }), store).await;
+        assert!(reply.starts_with("ERROR [NAMESPACE]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "task_validate consulted catalog"
+        );
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_bootstrap(
+            json!({ "namespace": bad, "project_root": "/tmp" }),
+            emb(),
+            store,
+        )
+        .await;
+        assert!(reply.starts_with("ERROR [NAMESPACE]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "bootstrap consulted catalog"
+        );
+
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_task_setup(
+            json!({ "namespace": bad, "project_root": "/tmp" }),
+            emb(),
+            store,
+        )
+        .await;
+        assert!(reply.starts_with("ERROR [NAMESPACE]"), "{reply}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "task_setup consulted catalog"
+        );
+    }
+
+    #[tokio::test]
     async fn bootstrap_refuses_a_namespace_that_is_a_path() {
         let store = temp_store().await;
         let reply = handle_bootstrap(
@@ -14950,6 +15435,10 @@ exit 0
 
     #[tokio::test]
     async fn task_setup_returns_root_hint_fields() {
+        // The marker-writing call consults NEUROSTRATA_PROJECT_ROOT when it is
+        // set, and sibling tests set it under this lock. Take the same lock so
+        // a concurrent test cannot hand this caller another test's boundary.
+        let _env_guard = crate::daemon::project_root_env_test_lock();
         let tmp = tempfile::tempdir().unwrap();
         let base = dunce::canonicalize(tmp.path()).unwrap();
         let repo = base.join("example-project");

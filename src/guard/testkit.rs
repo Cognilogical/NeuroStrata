@@ -14,6 +14,7 @@ use crate::traits::{
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// One stored row: the namespace it belongs to, its id, its vector, its payload.
@@ -38,6 +39,24 @@ pub struct MockStore {
     get_fails: Mutex<bool>,
     /// Track which (namespace, id) pairs have had increment_access_count called.
     incremented_ids: Mutex<Vec<(String, String)>>,
+    /// How many times `list_namespaces` was called. Handlers that must reject
+    /// caller input before touching the store assert this stays zero.
+    list_namespaces_calls: AtomicUsize,
+    /// How many times `upsert` was called. Rejection tests assert a refused
+    /// call could not have mutated anything.
+    upsert_calls: AtomicUsize,
+    /// How many times `get` was called. Rejection tests assert a refused
+    /// address never reached a store read.
+    get_calls: AtomicUsize,
+    /// How many times `list` was called. Read routes that must reject caller
+    /// input before scanning a namespace assert this stays zero.
+    list_calls: AtomicUsize,
+    /// How many times `delete` was called. Address-validation tests assert a
+    /// refused id never reached the destructive write.
+    delete_calls: AtomicUsize,
+    /// The namespaced graph body `export_graph` returns. Handler tests seed a
+    /// global/other fixture and assert the route's own namespace filter.
+    export_graph: Mutex<serde_json::Value>,
 }
 
 impl MockStore {
@@ -47,7 +66,43 @@ impl MockStore {
             search_fails: Mutex::new(false),
             get_fails: Mutex::new(false),
             incremented_ids: Mutex::new(Vec::new()),
+            list_namespaces_calls: AtomicUsize::new(0),
+            upsert_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
+            list_calls: AtomicUsize::new(0),
+            delete_calls: AtomicUsize::new(0),
+            export_graph: Mutex::new(serde_json::json!({"nodes": [], "links": []})),
         }
+    }
+
+    /// The number of `list_namespaces` calls this store has served.
+    pub fn list_namespaces_calls(&self) -> usize {
+        self.list_namespaces_calls.load(Ordering::SeqCst)
+    }
+
+    /// The number of `get` calls this store has served.
+    pub fn get_calls(&self) -> usize {
+        self.get_calls.load(Ordering::SeqCst)
+    }
+
+    /// The number of `list` calls this store has served.
+    pub fn list_calls(&self) -> usize {
+        self.list_calls.load(Ordering::SeqCst)
+    }
+
+    /// The number of `upsert` calls this store has served.
+    pub fn upsert_calls(&self) -> usize {
+        self.upsert_calls.load(Ordering::SeqCst)
+    }
+
+    /// The number of `delete` calls this store has served.
+    pub fn delete_calls(&self) -> usize {
+        self.delete_calls.load(Ordering::SeqCst)
+    }
+
+    /// Seed the namespaced graph body `export_graph` returns.
+    pub fn set_export_graph(&self, value: serde_json::Value) {
+        *self.export_graph.lock().expect("mock store lock") = value;
     }
 
     /// The `hit_count` the store holds for a row, exactly as it is persisted.
@@ -106,6 +161,7 @@ impl VectorStore for MockStore {
         vector: Vec<f32>,
         payload: MemoryPayload,
     ) -> Result<UpsertReport> {
+        self.upsert_calls.fetch_add(1, Ordering::SeqCst);
         let mut rows = self.rows.lock().expect("mock store lock");
         let row = Row {
             namespace: namespace.to_string(),
@@ -290,6 +346,7 @@ impl VectorStore for MockStore {
     }
 
     async fn delete(&self, namespace: &str, id: &str) -> Result<()> {
+        self.delete_calls.fetch_add(1, Ordering::SeqCst);
         let mut rows = self.rows.lock().expect("mock store lock");
         rows.retain(|r| !(r.namespace == namespace && r.id == id));
         Ok(())
@@ -309,6 +366,7 @@ impl VectorStore for MockStore {
         user_id: Option<&str>,
         memory_type: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
         let rows = self.rows.lock().expect("mock store lock");
         Ok(rows
             .iter()
@@ -329,6 +387,7 @@ impl VectorStore for MockStore {
     }
 
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
         if *self.get_fails.lock().expect("mock store lock") {
             return Err(anyhow::anyhow!("MockStore get configured to fail"));
         }
@@ -344,6 +403,7 @@ impl VectorStore for MockStore {
     }
 
     async fn list_namespaces(&self) -> Result<Vec<String>> {
+        self.list_namespaces_calls.fetch_add(1, Ordering::SeqCst);
         let rows = self.rows.lock().expect("mock store lock");
         let mut names: Vec<String> = Vec::new();
         for r in rows.iter() {
@@ -361,7 +421,7 @@ impl VectorStore for MockStore {
         _project_contexts: &HashMap<String, PathBuf>,
         _anchor_override: Option<&crate::source_context::ScopedAnchorOverride>,
     ) -> Result<serde_json::Value> {
-        Ok(serde_json::json!({"nodes": [], "links": []}))
+        Ok(self.export_graph.lock().expect("mock store lock").clone())
     }
 
     async fn increment_access_count(&self, namespace: &str, id: &str) -> Result<()> {

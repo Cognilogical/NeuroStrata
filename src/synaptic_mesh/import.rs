@@ -170,6 +170,12 @@ pub async fn handle_mesh_pull(
     store: std::sync::Arc<dyn VectorStore>,
     emb: std::sync::Arc<dyn Embedder>,
 ) -> String {
+    // Caller-declared namespaces are argument syntax, not mesh state: they are
+    // checked before the pointer is read, the mesh is opened or `git pull`
+    // runs, so a refused name costs no I/O and no catalog read.
+    if let Err(e) = validate_caller_namespaces(arguments) {
+        return e;
+    }
     // The same per-request resolution the other mesh tools apply (Task 2 /
     // J6): canonicalize the caller's root; never consume the verbatim string.
     let project_root = match super::mesh_service::resolve_mesh_project_root(arguments) {
@@ -225,7 +231,10 @@ pub async fn handle_mesh_pull(
         return format!("error: pull failed — {:#}", e);
     }
 
-    let served = served_namespaces(arguments, &mesh, &store).await;
+    let served = match served_namespaces(arguments, &mesh, &store).await {
+        Ok(served) => served,
+        Err(e) => return format!("error: pull failed — {e}"),
+    };
     if served.is_empty() {
         return format!(
             "error: pull failed — mesh {mesh_id} has no joined namespace to serve records into"
@@ -238,6 +247,55 @@ pub async fn handle_mesh_pull(
     }
 }
 
+/// Parse and validate a caller's `namespace` argument, shared by the mesh
+/// pull and init surfaces. Absent means "no declaration" (the caller falls
+/// back to its documented default); a present string or a non-empty array of
+/// strings is returned exactly as supplied, after every raw string passes
+/// DR-1. Any other shape -- a scalar number/object/null, an array holding a
+/// non-string, or an empty array -- is a typed `ERROR [NAMESPACE]` refusal.
+/// Validation happens before any resolution, catalog read or `git pull`.
+pub(crate) fn parse_caller_namespaces(value: Option<&Value>) -> Result<Vec<String>, String> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(Value::String(s)) => {
+            crate::domain::validate_namespace(s).map_err(|e| e.to_string())?;
+            Ok(vec![s.clone()])
+        }
+        Some(Value::Array(items)) => {
+            if items.is_empty() {
+                return Err("ERROR [NAMESPACE]: 'namespace' must not be an empty array".to_string());
+            }
+            let mut declared = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(raw) = item.as_str() else {
+                    return Err(
+                        "ERROR [NAMESPACE]: every 'namespace' array element must be a string"
+                            .to_string(),
+                    );
+                };
+                crate::domain::validate_namespace(raw).map_err(|e| e.to_string())?;
+                declared.push(raw.to_string());
+            }
+            Ok(declared)
+        }
+        Some(other) => Err(format!(
+            "ERROR [NAMESPACE]: 'namespace' must be a string or an array of strings, got {}",
+            match other {
+                Value::Null => "null",
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                Value::Object(_) => "an object",
+                Value::String(_) | Value::Array(_) => "an invalid shape",
+            }
+        )),
+    }
+}
+
+/// Validate a caller declaration without consulting the catalog.
+fn validate_caller_namespaces(arguments: &Value) -> Result<(), String> {
+    parse_caller_namespaces(arguments.get("namespace")).map(|_| ())
+}
+
 /// Which namespaces this pull serves records into: the explicit
 /// `namespace` argument (resolved through the same case-folding the rest of
 /// the tool surface uses), or every namespace the mesh manifest joined.
@@ -245,27 +303,23 @@ async fn served_namespaces(
     arguments: &Value,
     mesh: &MeshStorage,
     store: &std::sync::Arc<dyn VectorStore>,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let mut served: Vec<String> = vec![];
-    match arguments.get("namespace") {
-        Some(Value::String(s)) if !s.trim().is_empty() => {
-            served.push(crate::server::resolve_namespace(store, s).await);
+    // `handle_mesh_pull` already refused malformed declarations before any
+    // I/O; this repeats the check so a direct caller cannot skip it. One
+    // parser owns the shape rules, so a non-string element or an empty array
+    // cannot become a silent manifest fallback here.
+    if arguments.get("namespace").is_some() {
+        for declared in parse_caller_namespaces(arguments.get("namespace"))? {
+            served.push(crate::server::resolve_namespace(store, &declared).await);
         }
-        Some(Value::Array(items)) => {
-            for item in items {
-                if let Some(s) = item.as_str() {
-                    if !s.trim().is_empty() {
-                        served.push(crate::server::resolve_namespace(store, s).await);
-                    }
-                }
-            }
-        }
-        _ => served.extend(mesh.manifest().namespaces.iter().cloned()),
+    } else {
+        served.extend(mesh.manifest().namespaces.iter().cloned());
     }
     served.retain(|s| !s.is_empty());
     served.sort();
     served.dedup();
-    served
+    Ok(served)
 }
 
 /// One pull/apply summary in the mesh surface's prose.
@@ -872,6 +926,17 @@ fn validate_parsed_record(
             record.schema_version, MESH_RECORD_SCHEMA_VERSION
         ));
     }
+    // DR-1 first: a malformed namespace is refused even when the caller lists
+    // it as served, so parity can never launder an illegal address.
+    crate::domain::validate_namespace(&record.namespace).map_err(|e| e.to_string())?;
+    // The apply path reads (namespace, id) before its eventual upsert, so a
+    // peer record's id is checked here, at the import boundary, not later.
+    crate::domain::validate_id(&record.id.to_string()).map_err(|e| e.to_string())?;
+    // A qualified id names its owning namespace. Mesh record ids are typed
+    // UUIDs today (so this is a no-op for valid wire records), but the check
+    // stays at the boundary so a future id shape cannot import across strata.
+    crate::domain::validate_id_for_namespace(&record.id.to_string(), &record.namespace)
+        .map_err(|e| e.to_string())?;
     if !served.iter().any(|s| s == &record.namespace) {
         return Err(format!(
             "record namespace {} is not served (served: {})",
@@ -2818,6 +2883,75 @@ mod tests {
         (base, mesh)
     }
 
+    #[tokio::test]
+    async fn published_namespace_arguments_are_refused_before_catalog_access() {
+        let (_base, mesh) = mesh_with_commit("served-ns");
+        let mock = std::sync::Arc::new(crate::guard::testkit::MockStore::new());
+        let store: std::sync::Arc<dyn VectorStore> = mock.clone();
+        // The supplied string is validated unchanged: malformed, padded and
+        // blank values are all refusals, never a fallback to the manifest.
+        let refused = [
+            json!("bad/ns"),
+            json!("team:proj"),
+            json!(" probe "),
+            json!(""),
+            json!("   "),
+            json!(["probe", " probe "]),
+            json!([""]),
+            json!(["probe", "bad/ns"]),
+        ];
+        for raw in refused {
+            let err = served_namespaces(&json!({ "namespace": raw }), &mesh, &store)
+                .await
+                .expect_err("an illegal caller namespace must be refused");
+            assert!(err.starts_with("ERROR [NAMESPACE]"), "{raw}: {err}");
+        }
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a refused namespace must not consult the catalog"
+        );
+    }
+
+    #[test]
+    fn caller_namespace_arguments_are_validated_unchanged() {
+        for refused in ["", "   ", " probe ", "bad/ns", "team:proj"] {
+            let err = validate_caller_namespaces(&json!({ "namespace": refused }))
+                .expect_err("a malformed caller namespace must be refused");
+            assert!(err.starts_with("ERROR [NAMESPACE]"), "{refused:?}: {err}");
+        }
+        for refused in [
+            json!(["probe", " probe "]),
+            json!([""]),
+            json!(["   "]),
+            json!(["probe", "bad/ns"]),
+            // A non-string element is a shape refusal, never skipped.
+            json!(["probe", 42]),
+            json!([42]),
+            json!([null]),
+            json!([{"ns": "probe"}]),
+            // An explicit empty declaration is not "no declaration".
+            json!([]),
+            // Scalars and objects are not namespace declarations.
+            json!(42),
+            json!({}),
+            Value::Null,
+        ] {
+            let err = validate_caller_namespaces(&json!({ "namespace": refused }))
+                .expect_err("a malformed caller declaration must be refused");
+            assert!(err.starts_with("ERROR [NAMESPACE]"), "{refused}: {err}");
+        }
+        assert!(validate_caller_namespaces(&json!({ "namespace": "probe" })).is_ok());
+        assert!(validate_caller_namespaces(&json!({ "namespace": ["probe", "other.ns"] })).is_ok());
+        // No declaration at all still falls back to the mesh manifest.
+        assert!(validate_caller_namespaces(&json!({})).is_ok());
+        assert_eq!(
+            parse_caller_namespaces(Some(&json!(["probe", "other.ns"]))).unwrap(),
+            vec!["probe".to_string(), "other.ns".to_string()],
+            "valid declarations are returned exactly as supplied"
+        );
+    }
+
     fn mesh_id_str(mesh: &MeshStorage) -> String {
         mesh.manifest().mesh_id.to_string()
     }
@@ -3892,6 +4026,25 @@ mod tests {
             0,
             "nothing reached the store"
         );
+    }
+
+    /// A record may not smuggle a malformed namespace past the served-list
+    /// parity check: the shared validator runs first and names the rule, so an
+    /// illegal namespace is refused even when the caller lists it as served.
+    #[test]
+    fn site_refuses_illegal_namespace() {
+        let record = bundle_record(record_value(
+            "synaptic-mesh-record/v1",
+            Uuid::new_v4(),
+            "bad/ns",
+            "rule",
+            "active",
+            None,
+            json!({"text": "probe"}),
+        ));
+        let err = validate_bundle_record(record, &["bad/ns".to_string()])
+            .expect_err("an illegal namespace must be refused");
+        assert!(err.starts_with("ERROR [NAMESPACE]"), "{err}");
     }
 
     /// The per-record byte cap is part of the portable validation
@@ -5875,6 +6028,46 @@ mod tests {
             out.starts_with("no mesh joined"),
             "canonical no-mesh answer required, got: {out}"
         );
+    }
+
+    /// A caller namespace is argument syntax, so a malformed one is refused
+    /// before the project pointer is read and before any `git pull` or
+    /// catalog access. The store here would answer the no-mesh path otherwise;
+    /// the typed refusal proves the pull never started.
+    #[tokio::test]
+    async fn wire_pull_refuses_a_malformed_namespace_before_any_mesh_work() {
+        let project = scratch("wire-bad-ns");
+        let mock = std::sync::Arc::new(crate::guard::testkit::MockStore::new());
+        let store: std::sync::Arc<dyn VectorStore> = mock.clone();
+        // Padded and blank strings are supplied values, not "absent": each is
+        // refused before the project pointer, `git pull` or the catalog.
+        let refused = [
+            json!("team:proj"),
+            json!(" probe "),
+            json!(""),
+            json!("   "),
+            json!(["probe", " probe "]),
+            json!([""]),
+        ];
+        for namespace in refused {
+            let out = handle_mesh_pull(
+                &json!({
+                    "project_root": project.display().to_string(),
+                    "namespace": namespace,
+                }),
+                store.clone(),
+                emb(),
+            )
+            .await;
+            assert!(out.starts_with("ERROR [NAMESPACE]"), "{namespace}: {out}");
+        }
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a refused namespace must not consult the catalog"
+        );
+        assert_eq!(mock.get_calls(), 0, "a refused pull must not read rows");
+        assert_eq!(mock.upsert_calls(), 0, "a refused pull must not write rows");
     }
 
     // ---- slice 6: lifecycle gate + concurrent merge table ----------------

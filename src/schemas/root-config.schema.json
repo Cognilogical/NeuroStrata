@@ -11,9 +11,11 @@
       "const": 1
     },
     "namespace": {
-      "description": "The NeuroStrata namespace this project uses. Starts with a letter or digit.",
+      "description": "The NeuroStrata namespace this project uses. 1-64 characters from A-Z a-z 0-9 . _ -, must not start with '.', and never contains ':'.",
       "type": "string",
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[^.][A-Za-z0-9_.-]*$"
     },
     "source_id": {
       "description": "Optional source identifier. Recorded only.",

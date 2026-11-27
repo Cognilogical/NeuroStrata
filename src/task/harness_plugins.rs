@@ -1813,18 +1813,20 @@ fn harness_namespaces_at(root: &Path) -> (Vec<(String, String)>, Vec<UnreadableC
 }
 
 /// A namespace value as written, or `None` when it is not one: empty, still
-/// an unexpanded shell or cmd variable (`$NS`, `%NS%`), quoted, or carrying
-/// anything but `[A-Za-z0-9_.:-]`.
+/// an unexpanded shell or cmd variable (`$NS`, `%NS%`), quoted, or failing the
+/// shared DR-1 rule.
 pub fn usable_namespace(ns: &str) -> Option<String> {
     // The value ends up in hook commands and in `task gate <ns>`: only plain
     // namespace characters are taken, so it can never carry shell syntax. It
-    // starts with a letter or digit, so it is never read as an option
-    // (`--help`) or as a path step (`.`, `..`).
-    let plain = ns
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
-    let leads = ns.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
-    (plain && leads).then(|| ns.to_string())
+    // must also start with an ASCII letter or digit here, so an option-shaped
+    // value (`--help`, `-x`) is never handed to a CLI even though DR-1 itself
+    // permits a leading '-' or '_'.
+    if !ns.chars().next()?.is_ascii_alphanumeric() {
+        return None;
+    }
+    crate::domain::validate_namespace(ns)
+        .ok()
+        .map(|()| ns.to_string())
 }
 
 /// [`usable_namespace`] for a value from the environment, where a shell user
@@ -3524,8 +3526,11 @@ mod tests {
 
     #[test]
     fn colon_namespace_is_usable() {
-        assert_eq!(usable_namespace("team:proj"), Some("team:proj".into()));
+        // `:` is banned now that `<namespace>::<path>` ids use it as the
+        // canonical qualifier; a colon-shaped value is never taken.
+        assert_eq!(usable_namespace("team:proj"), None);
         assert_eq!(usable_namespace(":x"), None);
+        assert_eq!(usable_namespace("team-proj").as_deref(), Some("team-proj"));
     }
 
     /// Configs that disagree resolve in the fixed order (Claude, opencode,
@@ -4236,6 +4241,12 @@ mod tests {
         for bad in ["", ".", "..", "--help", "-x", "_x", ".hidden", "a b", "$NS"] {
             assert_eq!(usable_namespace(bad), None, "{bad:?}");
         }
+        // The CLI hardening is deliberately narrower than DR-1: `-x` and `_x`
+        // are valid namespace names but never usable in a hook command.
+        assert!(crate::domain::validate_namespace("-x").is_ok());
+        assert!(crate::domain::validate_namespace("_x").is_ok());
+        assert_eq!(usable_namespace("-x"), None);
+        assert_eq!(usable_namespace("_x"), None);
     }
 
     #[test]

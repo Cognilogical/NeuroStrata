@@ -736,6 +736,7 @@ pub async fn execute_diff_tour(
     request: &DiffTourRequest,
     trusted_principal: Option<&str>,
 ) -> anyhow::Result<DiffTourResponse> {
+    crate::server::check_namespace_arg(&request.namespace).map_err(anyhow::Error::msg)?;
     let namespace = crate::server::resolve_namespace(store, &request.namespace).await;
     // One registry read per request; fail closed on a store error rather than
     // silently widening scope by pretending no root is registered.
