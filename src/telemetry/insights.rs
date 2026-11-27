@@ -1177,6 +1177,7 @@ pub async fn execute_insights(
     request: &InsightsRequest,
     trusted_principal: Option<&str>,
 ) -> Result<InsightsResponse, String> {
+    crate::server::check_namespace_arg(&request.namespace)?;
     let namespace = crate::server::resolve_namespace(store, &request.namespace).await;
     let action = request.action.trim().to_ascii_lowercase();
     let principal = resolve_principal(

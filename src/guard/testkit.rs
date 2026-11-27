@@ -42,6 +42,12 @@ pub struct MockStore {
     /// How many times `list_namespaces` was called. Handlers that must reject
     /// caller input before touching the store assert this stays zero.
     list_namespaces_calls: AtomicUsize,
+    /// How many times `upsert` was called. Rejection tests assert a refused
+    /// call could not have mutated anything.
+    upsert_calls: AtomicUsize,
+    /// How many times `get` was called. Rejection tests assert a refused
+    /// address never reached a store read.
+    get_calls: AtomicUsize,
 }
 
 impl MockStore {
@@ -52,12 +58,24 @@ impl MockStore {
             get_fails: Mutex::new(false),
             incremented_ids: Mutex::new(Vec::new()),
             list_namespaces_calls: AtomicUsize::new(0),
+            upsert_calls: AtomicUsize::new(0),
+            get_calls: AtomicUsize::new(0),
         }
     }
 
     /// The number of `list_namespaces` calls this store has served.
     pub fn list_namespaces_calls(&self) -> usize {
         self.list_namespaces_calls.load(Ordering::SeqCst)
+    }
+
+    /// The number of `get` calls this store has served.
+    pub fn get_calls(&self) -> usize {
+        self.get_calls.load(Ordering::SeqCst)
+    }
+
+    /// The number of `upsert` calls this store has served.
+    pub fn upsert_calls(&self) -> usize {
+        self.upsert_calls.load(Ordering::SeqCst)
     }
 
     /// The `hit_count` the store holds for a row, exactly as it is persisted.
@@ -116,6 +134,7 @@ impl VectorStore for MockStore {
         vector: Vec<f32>,
         payload: MemoryPayload,
     ) -> Result<UpsertReport> {
+        self.upsert_calls.fetch_add(1, Ordering::SeqCst);
         let mut rows = self.rows.lock().expect("mock store lock");
         let row = Row {
             namespace: namespace.to_string(),
@@ -339,6 +358,7 @@ impl VectorStore for MockStore {
     }
 
     async fn get(&self, namespace: &str, id: &str) -> Result<Option<(Vec<f32>, MemoryPayload)>> {
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
         if *self.get_fails.lock().expect("mock store lock") {
             return Err(anyhow::anyhow!("MockStore get configured to fail"));
         }

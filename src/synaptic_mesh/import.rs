@@ -170,6 +170,12 @@ pub async fn handle_mesh_pull(
     store: std::sync::Arc<dyn VectorStore>,
     emb: std::sync::Arc<dyn Embedder>,
 ) -> String {
+    // Caller-declared namespaces are argument syntax, not mesh state: they are
+    // checked before the pointer is read, the mesh is opened or `git pull`
+    // runs, so a refused name costs no I/O and no catalog read.
+    if let Err(e) = validate_caller_namespaces(arguments) {
+        return e;
+    }
     // The same per-request resolution the other mesh tools apply (Task 2 /
     // J6): canonicalize the caller's root; never consume the verbatim string.
     let project_root = match super::mesh_service::resolve_mesh_project_root(arguments) {
@@ -225,7 +231,10 @@ pub async fn handle_mesh_pull(
         return format!("error: pull failed — {:#}", e);
     }
 
-    let served = served_namespaces(arguments, &mesh, &store).await;
+    let served = match served_namespaces(arguments, &mesh, &store).await {
+        Ok(served) => served,
+        Err(e) => return format!("error: pull failed — {e}"),
+    };
     if served.is_empty() {
         return format!(
             "error: pull failed — mesh {mesh_id} has no joined namespace to serve records into"
@@ -238,6 +247,32 @@ pub async fn handle_mesh_pull(
     }
 }
 
+/// Validate the caller's `namespace` argument (a string or an array of them)
+/// against DR-1 without consulting the catalog or the mesh. A value of any
+/// other shape is not a namespace declaration and is left to the resolver's
+/// default branch.
+fn validate_caller_namespaces(arguments: &Value) -> Result<(), String> {
+    let check = |s: &str| {
+        if s.trim().is_empty() {
+            Ok(())
+        } else {
+            crate::domain::validate_namespace(s.trim()).map_err(|e| e.to_string())
+        }
+    };
+    match arguments.get("namespace") {
+        Some(Value::String(s)) => check(s),
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(s) = item.as_str() {
+                    check(s)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Which namespaces this pull serves records into: the explicit
 /// `namespace` argument (resolved through the same case-folding the rest of
 /// the tool surface uses), or every namespace the mesh manifest joined.
@@ -245,16 +280,20 @@ async fn served_namespaces(
     arguments: &Value,
     mesh: &MeshStorage,
     store: &std::sync::Arc<dyn VectorStore>,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let mut served: Vec<String> = vec![];
+    // `handle_mesh_pull` already refused malformed declarations before any
+    // I/O; this repeats the check so a direct caller cannot skip it.
     match arguments.get("namespace") {
         Some(Value::String(s)) if !s.trim().is_empty() => {
+            crate::domain::validate_namespace(s.trim()).map_err(|e| e.to_string())?;
             served.push(crate::server::resolve_namespace(store, s).await);
         }
         Some(Value::Array(items)) => {
             for item in items {
                 if let Some(s) = item.as_str() {
                     if !s.trim().is_empty() {
+                        crate::domain::validate_namespace(s.trim()).map_err(|e| e.to_string())?;
                         served.push(crate::server::resolve_namespace(store, s).await);
                     }
                 }
@@ -265,7 +304,7 @@ async fn served_namespaces(
     served.retain(|s| !s.is_empty());
     served.sort();
     served.dedup();
-    served
+    Ok(served)
 }
 
 /// One pull/apply summary in the mesh surface's prose.
@@ -878,6 +917,11 @@ fn validate_parsed_record(
     // The apply path reads (namespace, id) before its eventual upsert, so a
     // peer record's id is checked here, at the import boundary, not later.
     crate::domain::validate_id(&record.id.to_string()).map_err(|e| e.to_string())?;
+    // A qualified id names its owning namespace. Mesh record ids are typed
+    // UUIDs today (so this is a no-op for valid wire records), but the check
+    // stays at the boundary so a future id shape cannot import across strata.
+    crate::domain::validate_id_for_namespace(&record.id.to_string(), &record.namespace)
+        .map_err(|e| e.to_string())?;
     if !served.iter().any(|s| s == &record.namespace) {
         return Err(format!(
             "record namespace {} is not served (served: {})",
@@ -2822,6 +2866,22 @@ mod tests {
         )
         .unwrap();
         (base, mesh)
+    }
+
+    #[tokio::test]
+    async fn published_namespace_arguments_are_refused_before_catalog_access() {
+        let (_base, mesh) = mesh_with_commit("served-ns");
+        let mock = std::sync::Arc::new(crate::guard::testkit::MockStore::new());
+        let store: std::sync::Arc<dyn VectorStore> = mock.clone();
+        let err = served_namespaces(&json!({ "namespace": "bad/ns" }), &mesh, &store)
+            .await
+            .expect_err("an illegal caller namespace must be refused");
+        assert!(err.starts_with("ERROR [NAMESPACE]"), "{err}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a refused namespace must not consult the catalog"
+        );
     }
 
     fn mesh_id_str(mesh: &MeshStorage) -> String {
@@ -5900,6 +5960,34 @@ mod tests {
             out.starts_with("no mesh joined"),
             "canonical no-mesh answer required, got: {out}"
         );
+    }
+
+    /// A caller namespace is argument syntax, so a malformed one is refused
+    /// before the project pointer is read and before any `git pull` or
+    /// catalog access. The store here would answer the no-mesh path otherwise;
+    /// the typed refusal proves the pull never started.
+    #[tokio::test]
+    async fn wire_pull_refuses_a_malformed_namespace_before_any_mesh_work() {
+        let project = scratch("wire-bad-ns");
+        let mock = std::sync::Arc::new(crate::guard::testkit::MockStore::new());
+        let store: std::sync::Arc<dyn VectorStore> = mock.clone();
+        let out = handle_mesh_pull(
+            &json!({
+                "project_root": project.display().to_string(),
+                "namespace": "team:proj",
+            }),
+            store,
+            emb(),
+        )
+        .await;
+        assert!(out.starts_with("ERROR [NAMESPACE]"), "{out}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a refused namespace must not consult the catalog"
+        );
+        assert_eq!(mock.get_calls(), 0, "a refused pull must not read rows");
+        assert_eq!(mock.upsert_calls(), 0, "a refused pull must not write rows");
     }
 
     // ---- slice 6: lifecycle gate + concurrent merge table ----------------

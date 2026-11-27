@@ -601,6 +601,7 @@ pub async fn execute_locate(
     request: &LocateRequest,
     trusted_principal: Option<&str>,
 ) -> anyhow::Result<LocateResponse> {
+    crate::server::check_namespace_arg(&request.namespace).map_err(anyhow::Error::msg)?;
     let namespace = crate::server::resolve_namespace(store, &request.namespace).await;
     let query = request.query.trim().to_string();
     let max_locations = request

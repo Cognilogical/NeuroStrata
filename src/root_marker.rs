@@ -123,10 +123,10 @@ impl From<std::io::Error> for MarkerError {
     }
 }
 
-/// The DR-1 namespace rule, shared with every other entry point. The leading
-/// letter or digit keeps a namespace from reading as an option (`-x`) or a
-/// path step (`.`), and `:` is banned so `<namespace>::<path>` ids parse
-/// unambiguously.
+/// The DR-1 namespace rule, shared with every other entry point. `:` is
+/// banned so `<namespace>::<path>` ids parse unambiguously. A leading `-` or
+/// `_` is allowed by DR-1; the CLI-facing gate (`usable_namespace`) is what
+/// additionally refuses option-shaped values.
 pub fn is_valid_namespace(ns: &str) -> bool {
     crate::domain::validate_namespace(ns).is_ok()
 }
@@ -2070,15 +2070,13 @@ mod tests {
 
     #[test]
     fn namespace_charset() {
-        for ok in ["example-project", "a", "A1_b.c-d", "global"] {
+        for ok in ["example-project", "a", "A1_b.c-d", "global", "-x", "_x"] {
             assert!(is_valid_namespace(ok), "{ok}");
         }
         let too_long = "n".repeat(65);
         for bad in [
-            "-x",
             "",
             ".x",
-            "_x",
             "team:proj",
             "a:b",
             "a b",
@@ -2099,7 +2097,10 @@ mod tests {
         // An earlier release wrote colon-bearing namespaces; those roots stay
         // discoverable even though the same spelling is refused on write.
         assert!(matches!(read_marker(tmp.path()), MarkerRead::Valid(_)));
+        // DR-1 allows leading '-' and '_', including in an older marker.
         write_raw(tmp.path(), br#"{"version":1,"namespace":"-x"}"#);
+        assert!(matches!(read_marker(tmp.path()), MarkerRead::Valid(_)));
+        write_raw(tmp.path(), br#"{"version":1,"namespace":".x"}"#);
         assert!(matches!(
             read_marker(tmp.path()),
             MarkerRead::Unreadable { .. }

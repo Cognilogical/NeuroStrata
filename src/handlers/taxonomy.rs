@@ -132,6 +132,9 @@ pub async fn handle_taxonomy_with_auth_and_bus(
     else {
         return json!({"ok": false, "error": "namespace required"}).to_string();
     };
+    if let Err(e) = crate::server::check_namespace_arg(ns_raw) {
+        return json!({"ok": false, "error": e}).to_string();
+    }
 
     let namespace = crate::server::resolve_namespace(&store, ns_raw).await;
     let Some(lb_store) =

@@ -1703,17 +1703,19 @@ async fn _with_watch(
                                 .get("namespace")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("global");
-                            if let Err(e) = check_namespace_arg(ns_raw) {
-                                result_text = e;
-                            } else {
-                            let ns = resolve_namespace(&store, ns_raw).await;
+                            // The path is required input independent of the
+                            // catalog: check it before resolve_namespace spends
+                            // a namespace listing on a call that cannot run.
                             let scip_path = arguments
                                 .get("scip_path")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
                             if scip_path.is_empty() {
                                 result_text = "Error: scip_path is required".to_string();
+                            } else if let Err(e) = check_namespace_arg(ns_raw) {
+                                result_text = e;
                             } else {
+                                let ns = resolve_namespace(&store, ns_raw).await;
                                 match crate::parser::scip::ingest_scip_index(
                                     store.clone(),
                                     &ns,
@@ -1729,7 +1731,6 @@ async fn _with_watch(
                                         result_text = format!("Error ingesting SCIP index: {e}");
                                     }
                                 }
-                            }
                             }
                         }
                         "neurostrata_ingest_bounded" => {
@@ -2182,59 +2183,66 @@ async fn _with_watch(
                                 .and_then(Value::as_str)
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty());
-                            let ns = resolve_namespace(&store, ns_arg).await;
-                            // R7: the real handler response carries §5
-                            // next_actions/next_hop_calls with trigger ids and
-                            // action ids. Thread them into the receipt so task
-                            // validation can find applicable escalations with
-                            // no caller-supplied signals.
-                            let mut fields = crate::task::tool_receipts::attach_trigger_context(
-                                crate::task::tool_receipts::build_dispatch_receipt(
-                                    uuid::Uuid::new_v4().to_string(),
-                                    chrono::Utc::now().timestamp(),
-                                    crate::task::current_session_id(),
-                                    ns.clone(),
-                                    name.to_string(),
-                                    query_raw,
+                            // A malformed caller namespace was refused by the
+                            // handler before it touched the store; the receipt
+                            // layer must not resolve (and thereby list) that
+                            // namespace afterwards. There is nothing honest to
+                            // record for a call the handler never placed.
+                            if check_namespace_arg(ns_arg).is_ok() {
+                                let ns = resolve_namespace(&store, ns_arg).await;
+                                // R7: the real handler response carries §5
+                                // next_actions/next_hop_calls with trigger ids and
+                                // action ids. Thread them into the receipt so task
+                                // validation can find applicable escalations with
+                                // no caller-supplied signals.
+                                let mut fields = crate::task::tool_receipts::attach_trigger_context(
+                                    crate::task::tool_receipts::build_dispatch_receipt(
+                                        uuid::Uuid::new_v4().to_string(),
+                                        chrono::Utc::now().timestamp(),
+                                        crate::task::current_session_id(),
+                                        ns.clone(),
+                                        name.to_string(),
+                                        query_raw,
+                                        &result_text,
+                                        error_response.is_some(),
+                                        dispatch_started.elapsed().as_millis() as u64,
+                                    ),
                                     &result_text,
-                                    error_response.is_some(),
-                                    dispatch_started.elapsed().as_millis() as u64,
-                                ),
-                                &result_text,
-                            );
-                            // Task 11 Fix 2b: a failed taxonomy call carries no
-                            // handler `operation`, so recover the requested op
-                            // from args (bounded string only; no raw args stored).
-                            fields.operation =
-                                crate::task::tool_receipts::taxonomy_operation_fallback(
-                                    &fields.operation,
-                                    name == "neurostrata_taxonomy",
-                                    args_ref,
                                 );
-                            // R7 proof: mint a digest-only proof under the
-                            // trigger actually followed. `related` serves two
-                            // triggers with identical args, so only an
-                            // explicit `followed_trigger_id` (copied from the
-                            // prescribed `next_action.args`) can bind it; no
-                            // hint => abstain, never default. Reuse the
-                            // existing `followed_action_ids` field; no raw
-                            // args are written into the ledger.
-                            let followed_hint = args_ref
-                                .and_then(|a| a.get("followed_trigger_id"))
-                                .and_then(Value::as_str);
-                            if let Some((proof_id, followed_trigger)) = mint_followed_action_id(
-                                name,
-                                fields.operation.as_str(),
-                                args_ref,
-                                followed_hint,
-                                &ns,
-                            ) {
-                                fields.followed_action_ids = vec![proof_id];
-                                if fields.trigger_id.trim().is_empty() {
-                                    fields.trigger_id = followed_trigger;
+                                // Task 11 Fix 2b: a failed taxonomy call carries no
+                                // handler `operation`, so recover the requested op
+                                // from args (bounded string only; no raw args stored).
+                                fields.operation =
+                                    crate::task::tool_receipts::taxonomy_operation_fallback(
+                                        &fields.operation,
+                                        name == "neurostrata_taxonomy",
+                                        args_ref,
+                                    );
+                                // R7 proof: mint a digest-only proof under the
+                                // trigger actually followed. `related` serves two
+                                // triggers with identical args, so only an
+                                // explicit `followed_trigger_id` (copied from the
+                                // prescribed `next_action.args`) can bind it; no
+                                // hint => abstain, never default. Reuse the
+                                // existing `followed_action_ids` field; no raw
+                                // args are written into the ledger.
+                                let followed_hint = args_ref
+                                    .and_then(|a| a.get("followed_trigger_id"))
+                                    .and_then(Value::as_str);
+                                if let Some((proof_id, followed_trigger)) = mint_followed_action_id(
+                                    name,
+                                    fields.operation.as_str(),
+                                    args_ref,
+                                    followed_hint,
+                                    &ns,
+                                ) {
+                                    fields.followed_action_ids = vec![proof_id];
+                                    if fields.trigger_id.trim().is_empty() {
+                                        fields.trigger_id = followed_trigger;
+                                    }
                                 }
+                                crate::task::record_tool_receipt(&store, fields, caller_root).await;
                             }
-                            crate::task::record_tool_receipt(&store, fields, caller_root).await;
                         }
                     } else if matches!(
                         name,
@@ -4371,9 +4379,20 @@ async fn handle_related(arguments: Value, store: Arc<dyn VectorStore>) -> String
         return e;
     }
     let original_seed = seed;
-    let namespace = resolve_namespace(&store, namespace).await;
-    if !is_file_path_seed(seed) {
+    let seed_is_path = is_file_path_seed(seed);
+    // A memory/task seed is an address, not a path, so it is checked before
+    // resolve_namespace consults the catalog. File-path seeds are validated by
+    // the path resolver below, which is the only thing that can judge them.
+    if !seed_is_path {
         if let Err(e) = crate::domain::validate_id_for_read(seed) {
+            return e.to_string();
+        }
+    }
+    let namespace = resolve_namespace(&store, namespace).await;
+    // A qualified seed names its owner; a foreign prefix must not be looked up
+    // (or traversed) through this namespace.
+    if !seed_is_path {
+        if let Err(e) = crate::domain::validate_id_for_namespace(seed, &namespace) {
             return e.to_string();
         }
     }
@@ -7324,6 +7343,9 @@ async fn handle_feedback_memory(arguments: Value, store: Arc<dyn VectorStore>) -
         return e.to_string();
     }
     let namespace = resolve_namespace(&store, namespace).await;
+    if let Err(e) = crate::domain::validate_id_for_namespace(&id, &namespace) {
+        return e.to_string();
+    }
     let namespace = namespace.as_str();
     let rating = match arguments.get("rating").and_then(|v| v.as_f64()) {
         Some(r) => r,
@@ -7384,6 +7406,9 @@ async fn handle_validate_shapes(arguments: Value, store: Arc<dyn VectorStore>) -
         return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
     }
     let namespace = resolve_namespace(&store, &namespace).await;
+    if let Err(e) = crate::domain::validate_id_for_namespace(&id, &namespace) {
+        return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
+    }
     match store.get(&namespace, &id).await {
         Ok(Some((_vec, payload))) => {
             let violations = crate::rdf::shacl::validate_memory(&payload);
@@ -7565,6 +7590,33 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
     if let Err(e) = check_namespace_arg(&namespace) {
         return e;
     }
+    // The id target is an address, so it is parsed and validated before
+    // resolve_namespace consults the catalog. A malformed id must not cost a
+    // namespace listing (or reach any store read) first.
+    let memory_id_opt: Option<String> = arguments
+        .get("memory_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let memory_id_target: Option<String> = match &memory_id_opt {
+        Some(id) => {
+            // DR-2 is the address grammar; UUID is only the storage spelling.
+            // A malformed string is a typed ID refusal, and it is decided
+            // before resolve_namespace lists the catalog.
+            if let Err(e) = crate::domain::validate_id(id) {
+                // This handler's error contract is the JSON envelope, so the
+                // typed ID refusal travels inside it rather than as plain text.
+                return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
+            }
+            match Uuid::parse_str(id) {
+                Ok(u) => Some(u.to_string()),
+                Err(e) => {
+                    return serde_json::json!({"ok":false,"error":format!("invalid memory_id: {e}")})
+                        .to_string();
+                }
+            }
+        }
+        None => None,
+    };
     let namespace = resolve_namespace(&store, &namespace).await;
     let namespace_str = namespace.as_str();
     let profile = arguments
@@ -7588,22 +7640,11 @@ async fn handle_export_canonical_rdf(arguments: &Value, store: Arc<dyn VectorSto
         return serde_json::json!({"ok":false,"error":format!("unsupported format: {format}")})
             .to_string();
     }
-    let memory_id_opt: Option<String> = arguments
-        .get("memory_id")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
     // Canonical export targets: an explicit memory_id exports exactly that
     // memory; a namespace without memory_id exports every memory in the
     // namespace (the MCP tool schema declares memory_id optional).
-    let id_targets: Vec<String> = match &memory_id_opt {
-        Some(id) => vec![match Uuid::parse_str(id) {
-            Ok(u) => u.to_string(),
-            Err(e) => {
-                return serde_json::json!({"ok":false,"error":format!("invalid memory_id: {e}")})
-                    .to_string();
-            }
-        }],
+    let id_targets: Vec<String> = match memory_id_target {
+        Some(id) => vec![id],
         None => match store.list(namespace_str, None, None).await {
             Ok(rows) => rows.into_iter().map(|r| r.id).collect(),
             Err(e) => return serde_json::json!({"ok":false,"error":e.to_string()}).to_string(),
@@ -8142,7 +8183,14 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
     };
 
     let namespace = match arguments.get("namespace").and_then(|v| v.as_str()) {
-        Some(n) if !n.is_empty() => {
+        // An explicit namespace names where the query runs; an empty one is
+        // not "use the default", it is a malformed address. Only an absent
+        // namespace falls back to the project-root namespace.
+        Some(n) if n.trim().is_empty() => {
+            return serde_json::json!({"ok":false,"error":"ERROR [NAMESPACE]: namespace must not be empty"})
+                .to_string();
+        }
+        Some(n) => {
             if let Err(e) = check_namespace_arg(n) {
                 return serde_json::json!({"ok":false,"error":e}).to_string();
             }
@@ -8150,7 +8198,7 @@ pub(crate) async fn handle_sparql_query(arguments: &Value, store: Arc<dyn Vector
         }
         // No explicit namespace: resolve the project-root ("NeuroStrata")
         // default the same way every other handler does.
-        _ => resolve_namespace(&store, "NeuroStrata").await,
+        None => resolve_namespace(&store, "NeuroStrata").await,
     };
 
     let include_retired = arguments
@@ -8839,6 +8887,9 @@ pub(crate) async fn handle_provenance_for(
         return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
     }
     let namespace = resolve_namespace(&store, ns_raw).await;
+    if let Err(e) = crate::domain::validate_id_for_namespace(memory_id, &namespace) {
+        return serde_json::json!({"ok":false,"error":e.to_string()}).to_string();
+    }
     match store.get(&namespace, memory_id).await {
         Ok(Some((_, payload))) => {
             let prov = crate::rdf::provenance::extract_node_provenance(&payload.metadata, 0);
@@ -9835,6 +9886,9 @@ pub(crate) async fn handle_object_view_with_auth(
         return serde_json::json!({"ok": false, "error": e.to_string()}).to_string();
     }
     let namespace = resolve_namespace(&store, ns_raw).await;
+    if let Err(e) = crate::domain::validate_id_for_namespace(id_raw, &namespace) {
+        return serde_json::json!({"ok": false, "error": e.to_string()}).to_string();
+    }
     let Some(lb_store) = crate::traits::VectorStore::as_any(store.as_ref())
         .downcast_ref::<crate::store::ladybug::LadybugStore>()
     else {
@@ -9921,6 +9975,9 @@ pub(crate) async fn handle_locate_with_auth(
     else {
         return serde_json::json!({"ok": false, "error": "namespace required"}).to_string();
     };
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return serde_json::json!({"ok": false, "error": e}).to_string();
+    }
     let Some(query_raw) = arguments
         .get("query")
         .and_then(|v| v.as_str())
@@ -9994,6 +10051,9 @@ pub(crate) async fn handle_diff_tour_with_auth(
     else {
         return serde_json::json!({"ok": false, "error": "namespace required"}).to_string();
     };
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return serde_json::json!({"ok": false, "error": e}).to_string();
+    }
 
     let changed_spans: Option<Vec<crate::graph_read::diff_tour::ChangedFileSpan>> = arguments
         .get("changed_spans")
@@ -10060,6 +10120,9 @@ pub(crate) async fn handle_insights_with_auth(
     else {
         return serde_json::json!({"ok": false, "error": "namespace required"}).to_string();
     };
+    if let Err(e) = check_namespace_arg(ns_raw) {
+        return serde_json::json!({"ok": false, "error": e}).to_string();
+    }
     let Some(action_raw) = arguments
         .get("action")
         .and_then(|v| v.as_str())
@@ -10825,8 +10888,20 @@ async fn handle_supersede_memory(
     if let Err(e) = check_namespace_arg(namespace) {
         return e;
     }
+    // The id names the row this call will read, replace and retire, so it is
+    // checked before resolve_namespace consults the catalog. Reads tolerate the
+    // bare file paths earlier releases persisted; new writes stay strict.
+    if let Err(e) = crate::domain::validate_id_for_read(id) {
+        return e.to_string();
+    }
     let namespace = resolve_namespace(&store, namespace).await;
     let namespace = namespace.as_str();
+    // A qualified id names the namespace that owns it. Without this guard a
+    // foreign-prefixed id stored its replacement here and only then failed the
+    // retirement lookup, leaving an orphaned successor in the wrong stratum.
+    if let Err(e) = crate::domain::validate_id_for_namespace(id, namespace) {
+        return e.to_string();
+    }
 
     // Retiring a row hides it from every future search, so the machine-wide
     // stratum keeps the same guard the destructive tools carry.
@@ -17241,24 +17316,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn option_like_namespaces_are_refused_before_catalog_access() {
-        // A namespace beginning with '-' would be consumed as a CLI flag by
-        // the hook, so every handler refuses it before listing namespaces.
-        let mock = Arc::new(crate::guard::testkit::MockStore::new());
-        let store: Arc<dyn VectorStore> = mock.clone();
-        let text = crate::handlers::memory::handle_get_memory(
-            json!({ "namespace": "--help", "id": "mem-1" }),
-            store,
-        )
-        .await;
-        assert!(text.starts_with("ERROR [NAMESPACE]"), "{text}");
-        assert_eq!(mock.list_namespaces_calls(), 0);
+    async fn malformed_namespaces_are_refused_before_catalog_access() {
+        // Server handlers are not CLI option parsers, so DR-1-valid names such
+        // as `--help` are not refused here. A genuinely malformed namespace
+        // (`:`, a space, a leading `.`) is refused before listing namespaces.
+        for bad in ["team:proj", ".hidden"] {
+            let mock = Arc::new(crate::guard::testkit::MockStore::new());
+            let store: Arc<dyn VectorStore> = mock.clone();
+            let text = crate::handlers::memory::handle_get_memory(
+                json!({ "namespace": bad, "id": "mem-1" }),
+                store,
+            )
+            .await;
+            assert!(text.starts_with("ERROR [NAMESPACE]"), "{bad:?}: {text}");
+            assert_eq!(mock.list_namespaces_calls(), 0, "{bad:?}");
 
-        let mock = Arc::new(crate::guard::testkit::MockStore::new());
-        let store: Arc<dyn VectorStore> = mock.clone();
-        let text = handle_related(json!({ "namespace": "--help", "id": "src/a.rs" }), store).await;
-        assert!(text.starts_with("ERROR [NAMESPACE]"), "{text}");
-        assert_eq!(mock.list_namespaces_calls(), 0);
+            let mock = Arc::new(crate::guard::testkit::MockStore::new());
+            let store: Arc<dyn VectorStore> = mock.clone();
+            let text = handle_related(json!({ "namespace": bad, "id": "src/a.rs" }), store).await;
+            assert!(text.starts_with("ERROR [NAMESPACE]"), "{bad:?}: {text}");
+            assert_eq!(mock.list_namespaces_calls(), 0, "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_tools_refuse_a_malformed_namespace_before_catalog_access() {
+        for bad in ["team:proj", ".hidden"] {
+            let mock = Arc::new(crate::guard::testkit::MockStore::new());
+            let store: Arc<dyn VectorStore> = mock.clone();
+            let text = handle_locate(
+                &json!({ "namespace": bad, "query": "checkout" }),
+                Arc::new(StubEmbedder),
+                store,
+            )
+            .await;
+            assert!(text.contains("ERROR [NAMESPACE]"), "{bad:?}: {text}");
+            assert_eq!(mock.list_namespaces_calls(), 0, "locate {bad:?}");
+
+            let mock = Arc::new(crate::guard::testkit::MockStore::new());
+            let store: Arc<dyn VectorStore> = mock.clone();
+            let text = handle_diff_tour(&json!({ "namespace": bad }), store).await;
+            assert!(text.contains("ERROR [NAMESPACE]"), "{bad:?}: {text}");
+            assert_eq!(mock.list_namespaces_calls(), 0, "diff_tour {bad:?}");
+
+            let mock = Arc::new(crate::guard::testkit::MockStore::new());
+            let store: Arc<dyn VectorStore> = mock.clone();
+            let text =
+                handle_insights(&json!({ "namespace": bad, "action": "snapshot" }), store).await;
+            assert!(text.contains("ERROR [NAMESPACE]"), "{bad:?}: {text}");
+            assert_eq!(mock.list_namespaces_calls(), 0, "insights {bad:?}");
+
+            let mock = Arc::new(crate::guard::testkit::MockStore::new());
+            let store: Arc<dyn VectorStore> = mock.clone();
+            let text = crate::handlers::taxonomy::handle_taxonomy_with_bus(
+                &json!({ "namespace": bad, "operation": "tree" }),
+                Arc::new(StubEmbedder),
+                store,
+                None,
+            )
+            .await;
+            assert!(text.contains("ERROR [NAMESPACE]"), "{bad:?}: {text}");
+            assert_eq!(mock.list_namespaces_calls(), 0, "taxonomy {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sparql_refuses_an_explicit_bad_namespace_before_catalog_access() {
+        // Only an absent namespace means "project-root default"; an explicit
+        // empty or malformed one is a refused address, decided before the
+        // catalog is read (and before the backend downcast).
+        for bad in ["", "team:proj"] {
+            let mock = Arc::new(crate::guard::testkit::MockStore::new());
+            let store: Arc<dyn VectorStore> = mock.clone();
+            let text = handle_sparql_query(
+                &json!({ "query": "SELECT * WHERE {}", "namespace": bad }),
+                store,
+            )
+            .await;
+            assert!(text.contains("ERROR [NAMESPACE]"), "{bad:?}: {text}");
+            assert_eq!(mock.list_namespaces_calls(), 0, "{bad:?}");
+        }
     }
 
     #[tokio::test]
@@ -17272,6 +17409,99 @@ mod tests {
         .await;
         assert!(text.starts_with("ERROR [ID]"), "{text}");
         assert!(text.contains("names namespace"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn readers_refuse_a_foreign_prefix_before_lookup() {
+        // Seed a row under this namespace whose id claims another one, the
+        // legacy-shape/vault case the store can hold. A reader must refuse the
+        // address rather than find it here.
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        store
+            .upsert(
+                "probe",
+                "other::src/a.rs",
+                vec![0.0; 4],
+                payload("foreign-prefixed legacy row"),
+            )
+            .await
+            .unwrap();
+
+        let text = handle_validate_shapes(
+            json!({ "namespace": "probe", "id": "other::src/a.rs" }),
+            store.clone(),
+        )
+        .await;
+        assert!(text.contains("names namespace"), "{text}");
+
+        let text = handle_provenance_for(
+            &json!({ "namespace": "probe", "memory_id": "other::src/a.rs" }),
+            store.clone(),
+        )
+        .await;
+        assert!(text.contains("names namespace"), "{text}");
+
+        let text = handle_feedback_memory(
+            json!({
+                "namespace": "probe",
+                "id": "other::src/a.rs",
+                "rating": 1.0,
+            }),
+            store,
+        )
+        .await;
+        assert!(text.contains("names namespace"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn related_refuses_a_malformed_seed_before_catalog_access() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let text = handle_related(json!({ "namespace": "probe", "id": "bad id" }), store).await;
+        assert!(text.starts_with("ERROR [ID]"), "{text}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a malformed seed must not consult the namespace catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_export_refuses_a_malformed_memory_id_before_catalog_access() {
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let text = handle_export_canonical_rdf(
+            &json!({ "namespace": "probe", "memory_id": "not-a-uuid" }),
+            store,
+        )
+        .await;
+        assert!(text.contains("invalid memory_id"), "{text}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a malformed memory_id must not consult the namespace catalog"
+        );
+
+        // A string the DR-2 grammar itself refuses is a typed ID error, not a
+        // UUID parse failure: the address never reaches the parser, and the
+        // refusal keeps the handler's JSON error envelope.
+        let mock = Arc::new(crate::guard::testkit::MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let text = handle_export_canonical_rdf(
+            &json!({ "namespace": "probe", "memory_id": "bad id" }),
+            store,
+        )
+        .await;
+        let reply: Value = serde_json::from_str(&text).expect("canonical export error is JSON");
+        assert_eq!(reply["ok"], json!(false), "{text}");
+        let error = reply["error"].as_str().expect("error is a string");
+        assert!(error.starts_with("ERROR [ID]"), "{text}");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a DR-2-malformed memory_id must not consult the namespace catalog"
+        );
     }
 
     #[tokio::test]
@@ -19293,6 +19523,81 @@ mod tests {
             .and_then(|rest| rest.split(' ').next())
             .expect("the reply names the replacement")
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn supersede_refuses_a_malformed_id_before_catalog_access() {
+        let mock = Arc::new(MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": "bad id",
+                "namespace": "probe",
+                "content": "always use docker",
+            }),
+            Arc::new(StubEmbedder),
+            store,
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.starts_with("ERROR [ID]"), "got {}", reply);
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a malformed id must not consult the namespace catalog"
+        );
+        assert_eq!(
+            mock.get_calls(),
+            0,
+            "a malformed id must not read the store"
+        );
+        assert_eq!(mock.upsert_calls(), 0, "nothing may be stored");
+    }
+
+    #[tokio::test]
+    async fn supersede_refuses_a_foreign_prefix_before_any_store_write() {
+        let mock = Arc::new(MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        store
+            .upsert(
+                "probe",
+                "rule-1",
+                vec![0.0; 4],
+                payload("always use podman"),
+            )
+            .await
+            .unwrap();
+        let writes_before = mock.upsert_calls();
+        let reads_before = mock.get_calls();
+
+        let reply = handle_supersede_memory(
+            serde_json::json!({
+                "id": "other::rule-1",
+                "namespace": "probe",
+                "content": "always use docker",
+            }),
+            Arc::new(StubEmbedder),
+            store.clone(),
+            quiet_bus(),
+        )
+        .await;
+        assert!(reply.contains("names namespace"), "got {}", reply);
+        assert_eq!(
+            mock.upsert_calls(),
+            writes_before,
+            "a foreign-prefixed id must not store a replacement"
+        );
+        assert_eq!(
+            mock.get_calls(),
+            reads_before,
+            "a foreign-prefixed id must not read the store"
+        );
+        let (_, old) = store
+            .get("probe", "rule-1")
+            .await
+            .unwrap()
+            .expect("the original row is untouched");
+        assert_eq!(old.content, "always use podman");
     }
 
     /// The bi-temporal contract: the old wording survives, stamped with the
@@ -24121,6 +24426,76 @@ mod tests {
                 .iter()
                 .any(|e| e["tool"] == "neurostrata_search_memory" && e["namespace"] == "global"),
             "missing-namespace call must still record a receipt: {events:?}"
+        );
+    }
+
+    /// A SCIP ingest with no path cannot run: the required argument is
+    /// refused before `resolve_namespace` spends a catalog listing on it.
+    #[tokio::test]
+    async fn scip_ingest_refuses_a_missing_path_before_catalog_access() {
+        let mock = Arc::new(MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_ingest_scip",
+                "arguments": { "namespace": "probe" }
+            })),
+        };
+        let (bus, _seen) = recording_bus();
+        let reply =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let text = reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(text, "Error: scip_path is required");
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "a missing scip_path must not consult the namespace catalog"
+        );
+    }
+
+    /// A graph tool whose handler refused a malformed namespace never reached
+    /// the store; the post-dispatch receipt layer must not resolve (list) that
+    /// namespace afterwards either.
+    #[tokio::test]
+    async fn graph_receipt_skips_resolution_when_the_namespace_was_refused() {
+        let root = std::env::temp_dir().join(format!("ns-mcp-bad-ns-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".git")).expect("worktree marker");
+        let mock = Arc::new(MockStore::new());
+        let store: Arc<dyn VectorStore> = mock.clone();
+        let ingests = Arc::new(crate::ingest_jobs::IngestJobs::new());
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(1)),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "neurostrata_related",
+                "arguments": {
+                    "namespace": "team:proj",
+                    "id": "rule-1",
+                    "project_root": root.display().to_string()
+                }
+            })),
+        };
+        let (bus, _seen) = recording_bus();
+        let reply =
+            process_mcp_request(request, Arc::new(StubEmbedder), store, ingests, None, bus).await;
+        let text = reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.starts_with("ERROR [NAMESPACE]"),
+            "the handler must refuse the namespace: {reply}"
+        );
+        assert_eq!(
+            mock.list_namespaces_calls(),
+            0,
+            "the receipt layer must not resolve a namespace the handler refused"
         );
     }
 

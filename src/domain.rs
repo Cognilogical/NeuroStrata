@@ -210,7 +210,8 @@ pub fn validate_id(id: &str) -> Result<(), ValidationError> {
 
 /// Shape of a namespace persisted by an older release. Colon-bearing names
 /// remain discoverable when read from an already-written root marker or an
-/// existing row, but option-like names are still refused. New writes use
+/// existing row. Otherwise this follows DR-1 literally: leading `-` and `_`
+/// are allowed, only a leading `.` is prohibited. New writes use
 /// `validate_namespace`; this helper never launders a caller argument.
 pub fn validate_namespace_legacy(ns: &str) -> Result<(), ValidationError> {
     let invalid = (|| {
@@ -224,8 +225,8 @@ pub fn validate_namespace_legacy(ns: &str) -> Result<(), ValidationError> {
             return Some("must contain only ASCII characters".to_string());
         }
         let first = ns.chars().next().expect("length checked above");
-        if !first.is_ascii_alphanumeric() {
-            return Some("must start with an ASCII letter or digit".to_string());
+        if first == '.' {
+            return Some("must not start with '.'".to_string());
         }
         ns.chars()
             .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ':')))
@@ -283,7 +284,8 @@ pub fn validate_id_for_read(id: &str) -> Result<(), ValidationError> {
             } else {
                 let reason = err.to_string();
                 let reason = reason
-                    .split_once(" is not a valid id: ")
+                    .split_once(" is not a valid qualified id: ")
+                    .or_else(|| reason.split_once(" is not a valid id: "))
                     .map(|(_, r)| r)
                     .unwrap_or("it does not satisfy DR-2");
                 Err(ValidationError::Id(format!(
@@ -363,7 +365,20 @@ mod tests {
     #[test]
     fn valid_namespaces_accepted() {
         let longest = "n".repeat(64);
-        for ok in ["a", "A1_b.c-d", "global", "NeuroStrata", longest.as_str()] {
+        // DR-1 is literal: leading '-' and '_' are ordinary characters; only
+        // a leading '.' is prohibited.
+        for ok in [
+            "a",
+            "A1_b.c-d",
+            "global",
+            "NeuroStrata",
+            "-abc",
+            "_abc",
+            "-",
+            "_",
+            "--help",
+            longest.as_str(),
+        ] {
             assert!(validate_namespace(ok).is_ok(), "{ok:?}");
         }
     }
@@ -375,11 +390,6 @@ mod tests {
             " ",
             &"n".repeat(65),
             ".abc",
-            "-abc",
-            "_abc",
-            "-",
-            "_",
-            "--help",
             "a:b",
             "team:proj",
             "a b",
@@ -526,15 +536,36 @@ mod tests {
     #[test]
     fn legacy_namespace_shape_keeps_colon_bearing_markers_readable() {
         // A stored marker must survive an upgrade; a caller must not be able
-        // to address the same spelling on the write or resolve surface.
-        for ok in ["team:proj", "a:b", "example-project", "a"] {
+        // to address the same colon spelling on the write or resolve surface.
+        // Leading '-'/'_' are DR-1-valid and therefore legacy-valid too.
+        for ok in [
+            "team:proj",
+            "a:b",
+            "example-project",
+            "a",
+            "-x",
+            "--help",
+            "_x",
+        ] {
             assert!(validate_namespace_legacy(ok).is_ok(), "{ok:?}");
         }
-        for bad in ["", "-x", "--help", "_x", ".x", "a b", "a/b", "é"] {
+        for bad in ["", ".x", "a b", "a/b", "é"] {
             assert!(validate_namespace_legacy(bad).is_err(), "{bad:?}");
             assert!(validate_namespace(bad).is_err(), "{bad:?}");
         }
         assert!(validate_namespace("team:proj").is_err());
+    }
+
+    #[test]
+    fn read_gate_keeps_the_specific_qualified_id_reason() {
+        // The read bridge only widens bare file paths; a malformed qualified
+        // id is still refused with the rule it broke, not a generic DR-2 line.
+        let err = validate_id_for_read("bad/ns::src/a.rs")
+            .expect_err("an illegal namespace prefix must be refused");
+        assert!(err.to_string().contains("namespace prefix"), "{err}");
+        let err =
+            validate_id_for_read("probe::").expect_err("an empty qualified path must be refused");
+        assert!(err.to_string().contains("non-empty"), "{err}");
     }
 
     #[test]

@@ -12010,16 +12010,47 @@ impl VectorStore for LadybugStore {
     async fn relocate(&self, id: &str, from: &str, to: &str) -> Result<RelocateOutcome> {
         // Source, destination and id are validated before the row is read or
         // moved, so a malformed destination cannot half-apply a relocation.
-        crate::domain::validate_id(id)?;
+        // A bare file-path id written by an earlier release stays relocatable,
+        // but only when that row already exists: the legacy shape is a read
+        // compatibility gate, never a licence to create a new one.
         crate::domain::validate_namespace(from)?;
         crate::domain::validate_namespace(to)?;
-        if from == to {
+        crate::domain::validate_id_for_namespace(id, from)?;
+        let strict_id = crate::domain::validate_id(id);
+        let legacy_source = match &strict_id {
+            Ok(()) => false,
+            Err(_) => {
+                // A value DR-2 refuses and the read bridge also refuses is
+                // simply malformed: answer with the typed strict rule, not a
+                // generic relocation failure.
+                if crate::domain::validate_id_for_read(id).is_err() {
+                    return Err(strict_id.expect_err("checked above").into());
+                }
+                true
+            }
+        };
+        if !legacy_source && from == to {
+            // A strict id in its own namespace is a no-op: no store read.
             return Ok(RelocateOutcome::SameNamespace);
         }
         let payload = match self.get(from, id).await? {
             Some((_, payload)) => payload,
-            None => return Ok(RelocateOutcome::NotFound),
+            None => {
+                // A legacy-shaped id may only move if that row exists. The
+                // refusal keeps the DR-2 rule as its reason for both a
+                // same-namespace call and a cross-namespace move.
+                if legacy_source {
+                    return Err(strict_id
+                        .expect_err("legacy_source implies strict failure")
+                        .into());
+                }
+                return Ok(RelocateOutcome::NotFound);
+            }
         };
+        if from == to {
+            // Existence proved for a legacy id; there is nowhere to move it.
+            return Ok(RelocateOutcome::SameNamespace);
+        }
         // An ingested node's id names the namespace that owns it, and the next
         // ingest of that namespace would MERGE onto the moved row and update it
         // where it now sits -- the cross-project theft qualified ids exist to stop.
@@ -19534,6 +19565,118 @@ eurostrata\src\daemon.rs",
         assert!(
             store.get("probe", "rule").await.unwrap().is_some(),
             "the row stays where it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_moves_an_existing_legacy_path_row() {
+        let store = retired_test_store().await;
+        let row = retired_test_payload("file", "agent", json!({}));
+        // Seed the pre-DR-2 spelling straight into the engine: the strict
+        // upsert gate would refuse this id today, but older databases hold it.
+        seed_foreign_prefixed_row(&store, "probe", "src/a.rs", &row).await;
+
+        assert_eq!(
+            store.relocate("src/a.rs", "probe", "other").await.unwrap(),
+            RelocateOutcome::Moved
+        );
+        assert!(
+            store.get("other", "src/a.rs").await.unwrap().is_some(),
+            "the legacy row moved to the destination"
+        );
+        assert!(
+            store.get("probe", "src/a.rs").await.unwrap().is_none(),
+            "and left the source"
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_refuses_a_nonexistent_legacy_path_id() {
+        let store = retired_test_store().await;
+        let err = store
+            .relocate("src/missing.rs", "probe", "other")
+            .await
+            .expect_err("a legacy-shaped id that names no row must be refused");
+        assert!(
+            err.to_string().starts_with("ERROR [ID]"),
+            "the DR-2 rule is the refusal reason: {err}"
+        );
+        assert!(
+            store
+                .get("probe", "src/missing.rs")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing was written to the source"
+        );
+        assert!(
+            store
+                .get("other", "src/missing.rs")
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing was written to the destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_refuses_a_nonexistent_legacy_id_even_within_one_namespace() {
+        let store = retired_test_store().await;
+        let err = store
+            .relocate("src/missing.rs", "probe", "probe")
+            .await
+            .expect_err("same-namespace must still prove the legacy row exists");
+        assert!(err.to_string().starts_with("ERROR [ID]"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn relocate_is_a_no_op_for_an_existing_legacy_id_in_one_namespace() {
+        let store = retired_test_store().await;
+        let row = retired_test_payload("file", "agent", json!({}));
+        seed_foreign_prefixed_row(&store, "probe", "src/a.rs", &row).await;
+
+        assert_eq!(
+            store.relocate("src/a.rs", "probe", "probe").await.unwrap(),
+            RelocateOutcome::SameNamespace
+        );
+        assert!(
+            store.get("probe", "src/a.rs").await.unwrap().is_some(),
+            "the legacy row stayed put"
+        );
+    }
+
+    #[tokio::test]
+    async fn relocate_refuses_a_truly_malformed_id_with_the_typed_rule() {
+        let store = retired_test_store().await;
+        let err = store
+            .relocate("bad id", "probe", "other")
+            .await
+            .expect_err("a malformed id must be refused");
+        assert!(err.to_string().starts_with("ERROR [ID]"), "{err}");
+        assert!(err.to_string().contains("disallowed character"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn relocate_refuses_a_foreign_prefix() {
+        let store = retired_test_store().await;
+        let row = retired_test_payload("file", "agent", json!({}));
+        // The store can hold a row whose id claims another namespace; the
+        // relocation address must not treat it as owned here.
+        seed_foreign_prefixed_row(&store, "probe", "other::src/a.rs", &row).await;
+
+        let err = store
+            .relocate("other::src/a.rs", "probe", "other")
+            .await
+            .expect_err("a foreign-prefixed id must not move out of probe");
+        assert!(err.to_string().starts_with("ERROR [ID]"), "{err}");
+        assert!(err.to_string().contains("names namespace"), "{err}");
+        assert!(
+            store
+                .get("probe", "other::src/a.rs")
+                .await
+                .unwrap()
+                .is_some(),
+            "the row stayed where it was"
         );
     }
 

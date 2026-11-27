@@ -1750,8 +1750,12 @@ fn harness_namespaces_at(root: &Path) -> (Vec<(String, String)>, Vec<UnreadableC
 pub fn usable_namespace(ns: &str) -> Option<String> {
     // The value ends up in hook commands and in `task gate <ns>`: only plain
     // namespace characters are taken, so it can never carry shell syntax. It
-    // starts with a letter or digit, so it is never read as an option
-    // (`--help`) or as a path step (`.`, `..`).
+    // must also start with an ASCII letter or digit here, so an option-shaped
+    // value (`--help`, `-x`) is never handed to a CLI even though DR-1 itself
+    // permits a leading '-' or '_'.
+    if !ns.chars().next()?.is_ascii_alphanumeric() {
+        return None;
+    }
     crate::domain::validate_namespace(ns)
         .ok()
         .map(|()| ns.to_string())
@@ -4163,6 +4167,12 @@ mod tests {
         for bad in ["", ".", "..", "--help", "-x", "_x", ".hidden", "a b", "$NS"] {
             assert_eq!(usable_namespace(bad), None, "{bad:?}");
         }
+        // The CLI hardening is deliberately narrower than DR-1: `-x` and `_x`
+        // are valid namespace names but never usable in a hook command.
+        assert!(crate::domain::validate_namespace("-x").is_ok());
+        assert!(crate::domain::validate_namespace("_x").is_ok());
+        assert_eq!(usable_namespace("-x"), None);
+        assert_eq!(usable_namespace("_x"), None);
     }
 
     #[test]
