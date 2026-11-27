@@ -1714,6 +1714,62 @@ enum CachedStoreState {
     Unparseable(String),
 }
 
+/// Process-local identity for a database file, independent of the spelling
+/// used to open it. A symlinked directory, a `..` segment or a relative
+/// spelling all name one database, so they must key one writer turn and one
+/// sidecar cache. A file that does not exist yet is anchored through its
+/// nearest existing ancestor.
+fn db_alias_key(path: &std::path::Path) -> PathBuf {
+    if let Ok(canonical) = dunce::canonicalize(path) {
+        return canonical;
+    }
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        let Some(parent) = cursor.parent() else {
+            return path.to_path_buf();
+        };
+        if let Ok(canonical) = dunce::canonicalize(parent) {
+            let mut anchored = canonical;
+            for part in missing.iter().rev() {
+                anchored.push(part);
+            }
+            return anchored;
+        }
+        if let Some(name) = cursor.file_name() {
+            missing.push(name.to_os_string());
+        }
+        cursor = parent;
+    }
+}
+
+/// State shared by every handle to one database file. LadybugDB permits one
+/// write transaction at a time and the store-state sidecar has one recorded
+/// identity; handles opened through different aliases must not own separate
+/// writer locks or cache contradictory sidecar views.
+struct DbAliasState {
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+    store_state: Arc<std::sync::Mutex<Option<CachedStoreState>>>,
+}
+
+fn db_alias_state(path: &std::path::Path) -> Arc<DbAliasState> {
+    static STATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<DbAliasState>>>,
+    > = std::sync::OnceLock::new();
+    let key = db_alias_key(path);
+    let states = STATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut states = states.lock().unwrap_or_else(|e| e.into_inner());
+    states
+        .entry(key)
+        .or_insert_with(|| {
+            Arc::new(DbAliasState {
+                write_lock: Arc::new(tokio::sync::Mutex::new(())),
+                store_state: Arc::new(std::sync::Mutex::new(None)),
+            })
+        })
+        .clone()
+}
+
 /// The first-write guard's restart-to-apply refusal.
 ///
 /// `guard_first_write` returns this typed error — never a bare string —
@@ -4537,7 +4593,7 @@ impl FirstWriteFlip {
         if let Some(state) = &*cache {
             return state.clone();
         }
-        let state = match crate::model_choice::read_store_state(&self.local_path) {
+        let state = match crate::model_choice::read_store_state(&db_alias_key(&self.local_path)) {
             crate::model_choice::StoreStateRead::Recorded(recorded) => {
                 CachedStoreState::Recorded(recorded)
             }
@@ -4641,7 +4697,7 @@ impl LockedUnknownStamp {
         if let Some(state) = &*cache {
             return state.clone();
         }
-        let state = match crate::model_choice::read_store_state(&self.local_path) {
+        let state = match crate::model_choice::read_store_state(&db_alias_key(&self.local_path)) {
             crate::model_choice::StoreStateRead::Recorded(recorded) => {
                 CachedStoreState::Recorded(recorded)
             }
@@ -4956,13 +5012,17 @@ impl LadybugStore {
         );
 
         let checkpoints = CheckpointLatch::new(local_path.clone());
+        // Aliases of one database share the writer turn and the sidecar
+        // cache; otherwise two open handles would queue on independent
+        // locks and race each other's stage lease inside the engine.
+        let alias_state = db_alias_state(&local_path);
         Ok(Self {
             local_path,
             dimensions,
             db: Arc::new(db),
             dirty: Dirty::default(),
             checkpoints,
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            write_lock: Arc::clone(&alias_state.write_lock),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
             ontology: Arc::new(arc_swap::ArcSwap::from_pointee(
                 std::collections::BTreeMap::new(),
@@ -4985,7 +5045,7 @@ impl LadybugStore {
             serving_descriptor: std::sync::Mutex::new(None),
             db_preexisting,
             open_provenance,
-            store_state: Arc::new(std::sync::Mutex::new(None)),
+            store_state: Arc::clone(&alias_state.store_state),
             census_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             form_scans: Arc::default(),
@@ -5110,7 +5170,7 @@ impl LadybugStore {
         if let Some(state) = &*cache {
             return state.clone();
         }
-        let state = match crate::model_choice::read_store_state(&self.local_path) {
+        let state = match crate::model_choice::read_store_state(&db_alias_key(&self.local_path)) {
             crate::model_choice::StoreStateRead::Recorded(recorded) => {
                 CachedStoreState::Recorded(recorded)
             }
@@ -5119,7 +5179,8 @@ impl LadybugStore {
             }
             crate::model_choice::StoreStateRead::Absent
                 if !self.db_preexisting
-                    && !crate::model_choice::store_state_path(&self.local_path).exists() =>
+                    && !crate::model_choice::store_state_path(&db_alias_key(&self.local_path))
+                        .exists() =>
             {
                 CachedStoreState::FreshUnrecorded
             }
@@ -32716,6 +32777,40 @@ eurostrata\src\daemon.rs",
             .unwrap()
             .results;
         assert_eq!(result_ids(&tantivy), vec![id]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_path_aliases_share_writer_and_stage_sidecars() {
+        let root = std::env::temp_dir().join(format!("ns-db-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("database.store");
+        let alias = root.join("database-alias.store");
+        std::fs::write(&database, b"fixture").unwrap();
+        std::os::unix::fs::symlink(&database, &alias).unwrap();
+
+        assert_eq!(db_alias_key(&database), db_alias_key(&alias));
+        let canonical = db_alias_state(&database);
+        let through_alias = db_alias_state(&alias);
+        assert!(
+            Arc::ptr_eq(&canonical, &through_alias),
+            "two spellings of one database must share one writer and one sidecar cache"
+        );
+
+        // A lookalike path that names a different file is not an alias: it
+        // must not inherit the lease or the writer turn.
+        let other = root.join("other.store");
+        std::fs::write(&other, b"fixture").unwrap();
+        assert!(!Arc::ptr_eq(&canonical, &db_alias_state(&other)));
+
+        // The sidecar follows the canonical file, not the alias spelling:
+        // `<alias>.store-state.json` would be a second, divergent sidecar.
+        assert_eq!(
+            crate::model_choice::store_state_path(&db_alias_key(&database)),
+            crate::model_choice::store_state_path(&db_alias_key(&alias))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
