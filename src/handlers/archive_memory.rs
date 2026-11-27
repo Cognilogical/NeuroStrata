@@ -54,6 +54,11 @@ impl ArchiveOutcome {
 /// type, malformed metadata -- reads as not archived. A typo or a wrong-typed
 /// sentinel must not hide a row; the safe reading of an unknown shape is
 /// "this row has not been tombstoned".
+///
+/// This is the write/API contract, not the search-visibility rule. Index and
+/// hydration backstops use [`crate::lexical::archived_flag`], which also
+/// recognizes the legacy non-zero integer tombstone some stored rows carry
+/// (#404). The producer keeps writing the canonical boolean shape.
 pub fn is_archived(payload: &MemoryPayload) -> bool {
     payload
         .metadata

@@ -4428,9 +4428,15 @@ pub async fn handle_task_validate(args: Value, store: Arc<dyn VectorStore>) -> S
                 tracing::warn!("dangling_edges query failed for '{namespace}': {e}");
             }
         }
-        let sw = ls.shape_warnings(&namespace).await;
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert("shape_warnings".to_string(), serde_json::Value::Array(sw));
+        // Advisory surface: a busy store omits the block instead of failing the
+        // gate, but the error is surfaced rather than read as "no warnings".
+        match ls.shape_warnings(&namespace).await {
+            Ok(sw) => {
+                if let Some(obj) = json.as_object_mut() {
+                    obj.insert("shape_warnings".to_string(), serde_json::Value::Array(sw));
+                }
+            }
+            Err(e) => tracing::warn!("shape_warnings query failed for '{namespace}': {e}"),
         }
         let ow = ls.ontology_warnings(&namespace).await;
         if let Some(obj) = json.as_object_mut() {

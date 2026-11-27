@@ -118,54 +118,44 @@ async fn search_inner(
                 "MATCH (m:Memory) WHERE m.namespace = '{}' RETURN m.id, m.content, m.user_id, m.memory_type, m.agent_name, m.location, m.location_lines, m.metadata LIMIT 512",
                 escape_ladybug_string(&namespace)
             );
+            // Fail closed: an incomplete hydration map would make reasoning
+            // rows look fully populated when their payloads are missing. Both
+            // a busy turn and an engine query failure must reach the caller.
             let hydrated = store
                 .with_conn(move |conn| {
                     let mut out: std::collections::HashMap<String, MemoryPayload> =
                         std::collections::HashMap::new();
-                    match conn.query(&hydrate_q) {
-                        Ok(rows) => {
-                            for row in rows {
-                                let id = format!("{}", row[0]);
-                                if id.is_empty() || out.contains_key(&id) {
-                                    continue;
+                    for row in conn.query(&hydrate_q)? {
+                        let id = format!("{}", row[0]);
+                        if id.is_empty() || out.contains_key(&id) {
+                            continue;
+                        }
+                        let metadata_str = format!("{}", row[7]);
+                        let metadata: Value = match serde_json::from_str(&metadata_str) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                if !metadata_str.trim().is_empty() {
+                                    tracing::warn!("corrupt metadata JSON in store row: {e}");
                                 }
-                                let metadata_str = format!("{}", row[7]);
-                                let metadata: Value = match serde_json::from_str(&metadata_str) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        if !metadata_str.trim().is_empty() {
-                                            tracing::warn!(
-                                                "corrupt metadata JSON in store row: {e}"
-                                            );
-                                        }
-                                        Value::Null
-                                    }
-                                };
-                                out.insert(
-                                    id,
-                                    MemoryPayload {
-                                        content: format!("{}", row[1]),
-                                        user_id: format!("{}", row[2]),
-                                        memory_type: format!("{}", row[3]),
-                                        agent_name: Some(format!("{}", row[4])),
-                                        location: format!("{}", row[5]),
-                                        location_lines: format!("{}", row[6]),
-                                        metadata,
-                                    },
-                                );
+                                Value::Null
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!("reasoning payload hydration query failed: {e}");
-                        }
+                        };
+                        out.insert(
+                            id,
+                            MemoryPayload {
+                                content: format!("{}", row[1]),
+                                user_id: format!("{}", row[2]),
+                                memory_type: format!("{}", row[3]),
+                                agent_name: Some(format!("{}", row[4])),
+                                location: format!("{}", row[5]),
+                                location_lines: format!("{}", row[6]),
+                                metadata,
+                            },
+                        );
                     }
                     Ok(out)
                 })
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!("failed to hydrate reasoning payloads: {e}");
-                    std::collections::HashMap::new()
-                });
+                .await?;
             let exec_adapter =
                 crate::rdf::reasoning::ReasoningAdapter::new().with_payloads(hydrated);
             inferred_results = exec_adapter.execute(&ont_idx, &namespace, q, &[]);
@@ -1499,7 +1489,7 @@ pub struct LadybugStore {
     local_path: PathBuf,
     dimensions: usize,
     db: Arc<Database>,
-    dirty: Dirty,
+    dirty: Arc<Dirty>,
     /// Set by `stop_checkpoints_after_pool_failure`; no checkpoint runs after
     /// it except one standalone probe (#198, #211).
     checkpoints: CheckpointLatch,
@@ -1838,6 +1828,22 @@ impl Dirty {
 
     fn take(&self) -> bool {
         self.0.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
+/// Marks the store dirty when a blocking write ends, whatever the outcome.
+///
+/// Constructed inside the blocking task immediately before the statement runs,
+/// so a caller that gives up after dispatch still leaves the flag set, while a
+/// caller that gives up while still queued marks nothing: no statement was
+/// started, so there is nothing a checkpoint could flush.
+struct MarkDirtyOnDrop {
+    dirty: Arc<Dirty>,
+}
+
+impl Drop for MarkDirtyOnDrop {
+    fn drop(&mut self) {
+        self.dirty.mark();
     }
 }
 
@@ -4960,7 +4966,7 @@ impl LadybugStore {
             local_path,
             dimensions,
             db: Arc::new(db),
-            dirty: Dirty::default(),
+            dirty: Arc::new(Dirty::default()),
             checkpoints,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             schema_ready: std::sync::atomic::AtomicBool::new(false),
@@ -5582,8 +5588,14 @@ impl LadybugStore {
         let write_lock = Arc::clone(&self.write_lock);
         let db = self.db.clone();
         let latch = self.checkpoints.clone();
+        let dirty = Arc::clone(&self.dirty);
 
-        let outcome = bounded(what, write_timeout(), async move {
+        // One deadline covers both the wait for the writer's turn and the
+        // statement itself. A caller that cannot get the turn hears that the
+        // store is busy; a caller that gives up after the statement was
+        // dispatched still leaves the dirty mark behind, because the mark is
+        // owned by the blocking task rather than by this future.
+        let outcome = bounded(what, write_turn_budget(), true, async move {
             // One writer at a time, because the engine refuses the second
             // rather than making it wait. The deadline covers this queue too:
             // a caller stuck behind a stalled write hears that the database is
@@ -5598,8 +5610,14 @@ impl LadybugStore {
             // handing the caller a failure it can do nothing about.
             let mut attempt = 0;
             loop {
-                let (returned, result) =
-                    Self::write_owning_turn(db.clone(), latch.clone(), turn, f.clone()).await?;
+                let (returned, result) = Self::write_owning_turn(
+                    db.clone(),
+                    latch.clone(),
+                    Some(Arc::clone(&dirty)),
+                    turn,
+                    f.clone(),
+                )
+                .await?;
                 turn = returned;
 
                 match result {
@@ -5620,6 +5638,9 @@ impl LadybugStore {
 
         if outcome.is_err() {
             WRITES_ABANDONED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(message) = outcome.as_ref().err().and_then(store_busy_message) {
+                tracing::debug!("write turn ended busy: {message}");
+            }
             eprintln!(
                 "DIAGNOSTIC: gave up waiting on {} -- engine: {}",
                 what,
@@ -5627,10 +5648,6 @@ impl LadybugStore {
             );
         }
 
-        // Marked whatever the outcome: a write that timed out may still land,
-        // and an unnecessary checkpoint attempt costs nothing next to a write
-        // that never reaches disk.
-        self.dirty.mark();
         outcome
     }
 
@@ -5644,6 +5661,7 @@ impl LadybugStore {
     async fn write_owning_turn<T, F>(
         db: Arc<Database>,
         latch: CheckpointLatch,
+        dirty: Option<Arc<Dirty>>,
         turn: tokio::sync::OwnedMutexGuard<()>,
         f: F,
     ) -> Result<(tokio::sync::OwnedMutexGuard<()>, Result<T>)>
@@ -5664,6 +5682,10 @@ impl LadybugStore {
             }
             let outcome = (|| -> Result<T> {
                 let conn = Connection::new(&db)?;
+                // Owned by the statement from here on: normal return, error,
+                // panic, and a caller that gave up after dispatch all mark
+                // dirty; a caller that gave up while queued never got here.
+                let _dirty = dirty.map(|dirty| MarkDirtyOnDrop { dirty });
                 let result = f(&conn);
                 if let Err(e) = &result {
                     stop_checkpoints_after_pool_failure(&conn, &latch, e, false);
@@ -5678,19 +5700,35 @@ impl LadybugStore {
         .map_err(|e| anyhow::anyhow!("the database thread did not finish: {}", e))
     }
 
-    /// Runs one piece of database work on a blocking thread.
+    /// Waits for the one store turn with a bounded budget.
     ///
-    /// Every lbug call is synchronous FFI. Called straight from an async handler
-    /// it occupies a tokio worker for as long as the engine takes, and a handful
-    /// of concurrent queries can therefore starve the runtime outright: during a
-    /// write burst even /health -- an async closure returning a constant -- had
-    /// no thread to run on, which is what made the daemon look dead while it was
-    /// still listening (bead neurostrata-3fi.6).
+    /// A caller that cannot get the turn hears that the store is busy with a
+    /// typed [`StoreBusy`] instead of waiting behind a stalled statement
+    /// forever. Nothing is dispatched here, so giving up leaks nothing.
+    async fn acquire_write_turn_within(
+        &self,
+        what: &'static str,
+        budget: std::time::Duration,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let write_lock = Arc::clone(&self.write_lock);
+        bounded(what, budget, false, async move {
+            Ok(write_lock.lock_owned().await)
+        })
+        .await
+    }
+
+    /// Runs one read with a bounded wait for the turn.
     ///
-    /// The connection is opened inside the closure on purpose. It borrows the
-    /// Database and is not Send, so it must never be created here and moved, nor
-    /// held across an await.
-    pub(crate) async fn with_conn<T, F>(&self, f: F) -> Result<T>
+    /// Only the wait is bounded. Once the turn is acquired the engine call
+    /// runs with the same rules as [`Self::with_conn`], which is this method
+    /// with [`READ_TURN_BUDGET`]: a slow query is allowed to finish, but a
+    /// reader is never left waiting indefinitely behind a held turn.
+    async fn read_with_turn_within<T, F>(
+        &self,
+        what: &'static str,
+        budget: std::time::Duration,
+        f: F,
+    ) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
@@ -5704,7 +5742,15 @@ impl LadybugStore {
         // writer holds the turn. As in `write_owning_turn`, the guard lives
         // inside the blocking task, so a dropped await cannot release it
         // while a statement is still running.
-        let turn = Arc::clone(&self.write_lock).lock_owned().await;
+        let turn = match self.acquire_write_turn_within(what, budget).await {
+            Ok(turn) => turn,
+            Err(err) => {
+                if is_store_busy(&err) {
+                    READ_TURNS_BUSY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Err(err);
+            }
+        };
         ENGINE_CALLS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
             let _turn = turn;
@@ -5730,6 +5776,27 @@ impl LadybugStore {
         })
         .await
         .map_err(|e| anyhow::anyhow!("the database thread did not finish: {}", e))?
+    }
+
+    /// Runs one piece of database work on a blocking thread.
+    ///
+    /// Every lbug call is synchronous FFI. Called straight from an async handler
+    /// it occupies a tokio worker for as long as the engine takes, and a handful
+    /// of concurrent queries can therefore starve the runtime outright: during a
+    /// write burst even /health -- an async closure returning a constant -- had
+    /// no thread to run on, which is what made the daemon look dead while it was
+    /// still listening (bead neurostrata-3fi.6).
+    ///
+    /// The connection is opened inside the closure on purpose. It borrows the
+    /// Database and is not Send, so it must never be created here and moved, nor
+    /// held across an await.
+    pub(crate) async fn with_conn<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        self.read_with_turn_within("reading the database", READ_TURN_BUDGET, f)
+            .await
     }
 }
 
@@ -7468,14 +7535,28 @@ const STRUCTURAL_MEMORY_TYPES: [&str; 10] = [
     "action_receipt",
 ];
 
+/// Upper bound on how many Tantivy hits one lexical search may scan while
+/// backing up a page whose top hits were dropped during hydration (#404).
+/// The window doubles from `limit` until the page is full, the index is
+/// exhausted, or this cap is reached.
+const MAX_LEXICAL_SCAN_ROWS: usize = 1000;
+
+/// Read-gating options shared by the Tantivy hydration backstop.
+struct LexicalHydrationOptions<'a> {
+    include_tasks: bool,
+    include_archived: bool,
+    include_code_ast: bool,
+    principal: &'a str,
+}
+
 /// Row-class predicates for filtering at the store seam.
 /// These are applied BEFORE the candidate budget is spent.
 
 fn is_archived(metadata: &Value) -> bool {
-    metadata
-        .get("archived")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    // #404: one search-visibility predicate for every read path. The store
+    // must agree with Tantivy on both the boolean tombstone written by
+    // `archive_memory` and the legacy integer representation.
+    crate::lexical::archived_flag(metadata)
 }
 
 /// Row-class predicates for filtering at the store seam.
@@ -7841,19 +7922,14 @@ impl LadybugStore {
     pub async fn active_generations_public(
         &self,
         namespace: &str,
-    ) -> std::collections::HashSet<u64> {
-        let ns_label = namespace.to_string();
+    ) -> Result<std::collections::HashSet<u64>> {
         let namespace = namespace.to_string();
-        self.with_conn(move |conn| {
-            Ok(crate::store::ladybug::active_generations_of(
-                conn, &namespace,
-            ))
-        })
+        self.read_with_turn_within(
+            "reading active generations",
+            READ_TURN_BUDGET,
+            move |conn| active_generations_checked(conn, &namespace),
+        )
         .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("active generations query failed for '{ns_label}': {e}");
-            Default::default()
-        })
     }
 
     /// Delete every row of one superseded generation in `namespace`.
@@ -8094,15 +8170,9 @@ impl LadybugStore {
         Ok(deleted)
     }
 
-    pub async fn symbol_ids(&self, namespace: &str) -> Vec<String> {
-        let gens = self.active_generations_public(namespace).await;
-        let memories = self
-            .list(namespace, Some("auto-ingestor"), None)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("symbol_ids memory list failed for '{namespace}': {e}");
-                Default::default()
-            });
+    pub async fn symbol_ids(&self, namespace: &str) -> Result<Vec<String>> {
+        let gens = self.active_generations_public(namespace).await?;
+        let memories = self.list(namespace, Some("auto-ingestor"), None).await?;
         let mut out = Vec::new();
         for m in memories {
             let mt = m.payload.memory_type.as_str();
@@ -8126,23 +8196,25 @@ impl LadybugStore {
             }
             out.push(m.id);
         }
-        out
+        Ok(out)
     }
 
-    pub async fn mention_symbol_ids(&self, namespace: &str) -> std::sync::Arc<Vec<String>> {
-        let gens = self.active_generations_public(namespace).await;
+    pub async fn mention_symbol_ids(&self, namespace: &str) -> Result<std::sync::Arc<Vec<String>>> {
+        let gens = self.active_generations_public(namespace).await?;
         {
             let guard = self.mention_symbol_ids.read().await;
             if let Some((cached_gens, vec)) = guard.get(namespace) {
                 if *cached_gens == gens {
-                    return vec.clone();
+                    return Ok(vec.clone());
                 }
             }
         }
-        let vec = std::sync::Arc::new(self.symbol_ids(namespace).await);
+        // Only a complete list is cached: a busy read must not replace a good
+        // cache entry with an empty one.
+        let vec = std::sync::Arc::new(self.symbol_ids(namespace).await?);
         let mut guard = self.mention_symbol_ids.write().await;
         guard.insert(namespace.to_string(), (gens, vec.clone()));
-        vec
+        Ok(vec)
     }
 
     pub async fn dangling_edges(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
@@ -8662,14 +8734,8 @@ impl LadybugStore {
     }
 
     /// Advisory shape warnings for every row in the namespace (F18). Never blocks.
-    pub async fn shape_warnings(&self, namespace: &str) -> Vec<serde_json::Value> {
-        let rows = match self.list(namespace, None, None).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::warn!("shape_warnings list failed for '{namespace}': {e}");
-                Vec::new()
-            }
-        };
+    pub async fn shape_warnings(&self, namespace: &str) -> Result<Vec<serde_json::Value>> {
+        let rows = self.list(namespace, None, None).await?;
         let mut out = Vec::new();
         for r in rows {
             // shacl validate
@@ -8706,26 +8772,30 @@ impl LadybugStore {
                                 } else {
                                     (namespace.to_string(), target.to_string())
                                 };
-                            if let Ok(Some((_, tpayload))) = self.get(&ns, &tid).await {
-                                let target_type = tpayload.memory_type;
-                                if !crate::rdf::shacl::endpoint_role_allowed(
-                                    rel_type,
-                                    &source_type,
-                                    &target_type,
-                                ) {
-                                    out.push(serde_json::json!({
-                                        "id": r.id,
-                                        "field": format!("metadata.{}", key),
-                                        "why": format!("endpoint role mismatch: {} (source={} target={})", rel_type, source_type, target_type),
-                                    }));
-                                }
+                            // A target that does not exist contributes no
+                            // warning, but a read that failed -- a busy turn
+                            // above all -- must not be read as "no target".
+                            let Some((_, tpayload)) = self.get(&ns, &tid).await? else {
+                                continue;
+                            };
+                            let target_type = tpayload.memory_type;
+                            if !crate::rdf::shacl::endpoint_role_allowed(
+                                rel_type,
+                                &source_type,
+                                &target_type,
+                            ) {
+                                out.push(serde_json::json!({
+                                    "id": r.id,
+                                    "field": format!("metadata.{}", key),
+                                    "why": format!("endpoint role mismatch: {} (source={} target={})", rel_type, source_type, target_type),
+                                }));
                             }
                         }
                     }
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Advisory ontology warnings for a namespace (F21). Never blocks.
@@ -9202,6 +9272,95 @@ impl LadybugStore {
             .remove(namespace);
     }
 
+    /// Hydrate a slice of Tantivy hits into visible search results.
+    ///
+    /// The index entry is a derived, possibly stale view of the row. Every
+    /// backstop the index promised (namespace, generation/source, task and
+    /// code-AST gating, archive tombstone, registry/conflict exclusion,
+    /// retirement, and ReBAC ACL including object-form `visible_to`) is
+    /// re-asked of the store here, so a corrupted or stale index cannot leak
+    /// a restricted row. Hits are returned in the same `(score, id)` order the
+    /// index produced.
+    async fn hydrate_lexical_hits(
+        &self,
+        namespace: &str,
+        hits: &[crate::lexical::TantivyHit],
+        active: &ActiveGenerations,
+        options: &LexicalHydrationOptions<'_>,
+    ) -> Result<Vec<crate::traits::SearchResult>> {
+        let mut candidates = Vec::new();
+        for hit in hits {
+            // Defense in depth: the index query already scopes to `namespace`,
+            // but a hit whose stored namespace drifted (stale cross-namespace
+            // row) must not surface outside its own namespace.
+            if hit.namespace != namespace {
+                continue;
+            }
+            let Some((_, payload)) = self.get(namespace, &hit.id).await? else {
+                continue;
+            };
+            // #149 C2.4: a superseded or still-staged row must not surface
+            // even when the index entry is stale. The row's own source
+            // decides, so two worktrees sharing a namespace stay separate.
+            if !active.reaches_source(
+                &hit.id,
+                namespace,
+                &payload.memory_type,
+                row_source_key(&payload.metadata),
+            ) {
+                continue;
+            }
+            if !options.include_tasks && payload.memory_type == "task" {
+                continue;
+            }
+            if !options.include_code_ast
+                && (payload.memory_type == "code_ast" || payload.memory_type == "doc_section")
+            {
+                continue;
+            }
+            // Defense in depth: never surface an archived row when the caller
+            // excluded archived rows, even if its index entry predates the
+            // tombstone fix. One predicate covers both tombstone shapes.
+            if !options.include_archived && crate::lexical::archived_flag(&payload.metadata) {
+                continue;
+            }
+            // Defense in depth: registry and mesh-conflicting rows are
+            // excluded at index time, but a stale index entry must not
+            // surface them either (the in-house engine's doc_visible
+            // rejects both classes on every read).
+            if is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
+                continue;
+            }
+            // Defense in depth: never surface a retired row, even if its
+            // index entry predates the valid_to handling. Uses the
+            // is_retired_at predicate defined in this module: a non-null
+            // valid_to that does not parse as an integer reads as 0,
+            // i.e. retired.
+            if is_retired_at(&payload.metadata, chrono::Utc::now().timestamp()) {
+                continue;
+            }
+            if !crate::rebac::can_read_memory(
+                options.principal,
+                &payload.user_id,
+                &payload.metadata,
+            ) {
+                continue;
+            }
+            candidates.push(crate::traits::SearchResult {
+                id: hit.id.clone(),
+                score: hit.score,
+                payload,
+                evidence: Some(vec![crate::traits::SearchEvidence {
+                    kind: crate::traits::EvidenceKind::DirectMatch,
+                    path: Vec::new(),
+                    explanation: "Matched via Tantivy full-text lexical index.".to_string(),
+                    derivation: vec!["lexical".to_string()],
+                }]),
+            });
+        }
+        Ok(candidates)
+    }
+
     /// Search using the disk-backed Tantivy lexical index, hydrating payloads from LadybugDB.
     pub async fn search_tantivy_lexical(
         &self,
@@ -9262,119 +9421,84 @@ impl LadybugStore {
         } else {
             Some(active.active_generations_u64())
         };
-        let hits = {
-            let guard = self
-                .tantivy_lexical
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            let idx = guard.as_ref().expect("tantivy open");
-            idx.search_with_active_generations(
-                namespace,
-                query,
-                limit.max(1) * 4,
-                include_tasks,
-                include_archived,
-                None,
-                active_set.as_ref(),
-                include_code_ast,
-            )?
+        let hydration_options = LexicalHydrationOptions {
+            include_tasks,
+            include_archived,
+            include_code_ast,
+            principal,
         };
-        let mut candidates = Vec::new();
-        for hit in hits {
-            // Defense in depth: the index query already scopes to `namespace`,
-            // but a hit whose stored namespace drifted (stale cross-namespace
-            // row) must not surface outside its own namespace.
-            if hit.namespace != namespace {
-                continue;
+        let matches_domains = |result: &crate::traits::SearchResult| {
+            if domains.is_empty() {
+                return true;
             }
-            if let Some((_, payload)) = self.get(namespace, &hit.id).await? {
-                // #149 C2.4: a superseded or still-staged row must not surface
-                // even when the index entry is stale. The row's own source
-                // decides, so two worktrees sharing a namespace stay separate.
-                if !active.reaches_source(
-                    &hit.id,
+            let row_domains = crate::domain::domain_keys(&result.payload.metadata);
+            domains.iter().any(|d| row_domains.contains(d))
+        };
+        // Keep the historical `limit * 4` first fetch as the floor, then
+        // double only when hydration drops enough hits to shorten the page.
+        let mut window = limit.max(1).saturating_mul(4).min(MAX_LEXICAL_SCAN_ROWS);
+        let mut attempted: HashSet<String> = HashSet::new();
+        let mut hydrated_by_id: HashMap<String, crate::traits::SearchResult> = HashMap::new();
+        let mut candidates: Vec<crate::traits::SearchResult> = Vec::new();
+        loop {
+            let hits = {
+                let guard = self
+                    .tantivy_lexical
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                let idx = guard.as_ref().expect("tantivy open");
+                idx.search_with_active_generations(
                     namespace,
-                    &payload.memory_type,
-                    row_source_key(&payload.metadata),
-                ) {
-                    continue;
-                }
-                if !include_tasks && payload.memory_type == "task" {
-                    continue;
-                }
-                if !include_code_ast
-                    && (payload.memory_type == "code_ast" || payload.memory_type == "doc_section")
-                {
-                    continue;
-                }
-                // Defense in depth: never surface an archived row when the
-                // caller excluded archived rows, even if its index entry
-                // predates the tombstone fix. Bool/int-tolerant, matching
-                // lexical::archived_flag (duplicated inline per convention).
-                if !include_archived {
-                    let archived = match payload.metadata.get("archived") {
-                        Some(v) if v.as_bool() == Some(true) => true,
-                        Some(v) => v.as_i64().map(|n| n != 0).unwrap_or(false),
-                        None => false,
-                    };
-                    if archived {
-                        continue;
-                    }
-                }
-                // Defense in depth: registry and mesh-conflicting rows are
-                // excluded at index time, but a stale index entry must not
-                // surface them either (the in-house engine's doc_visible
-                // rejects both classes on every read).
-                if is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
-                    continue;
-                }
-                // Defense in depth: never surface a retired row, even if its
-                // index entry predates the valid_to handling. Uses the
-                // is_retired_at predicate defined in this module: a non-null
-                // valid_to that does not parse as an integer reads as 0,
-                // i.e. retired.
-                if is_retired_at(&payload.metadata, chrono::Utc::now().timestamp()) {
-                    continue;
-                }
-                if !crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
-                    continue;
-                }
-                candidates.push(crate::traits::SearchResult {
-                    id: hit.id,
-                    score: hit.score,
-                    payload,
-                    evidence: Some(vec![crate::traits::SearchEvidence {
-                        kind: crate::traits::EvidenceKind::DirectMatch,
-                        path: Vec::new(),
-                        explanation: "Matched via Tantivy full-text lexical index.".to_string(),
-                        derivation: vec!["lexical".to_string()],
-                    }]),
-                });
-            }
-        }
-        let mut domain_filter_applied = false;
-        let mut results = if !domains.is_empty() {
-            let filtered: Vec<_> = candidates
+                    query,
+                    window,
+                    include_tasks,
+                    include_archived,
+                    None,
+                    active_set.as_ref(),
+                    include_code_ast,
+                )?
+            };
+            // Hydrate by id, not by prefix position. Widening a window can
+            // shift tied hits across the old boundary; a positional slice
+            // then re-hydrates a displaced row and skips the row that moved
+            // into the prefix. `attempted` also keeps dropped hits from being
+            // re-queried on every widening.
+            let new_hits: Vec<_> = hits
                 .iter()
-                .filter(|r| {
-                    let row_domains = crate::domain::domain_keys(&r.payload.metadata);
-                    domains.iter().any(|d| row_domains.contains(d))
-                })
+                .filter(|hit| attempted.insert(hit.id.clone()))
                 .cloned()
                 .collect();
-            if !filtered.is_empty() {
-                domain_filter_applied = true;
-                filtered
-            } else {
-                candidates
+            if !new_hits.is_empty() {
+                for result in self
+                    .hydrate_lexical_hits(namespace, &new_hits, &active, &hydration_options)
+                    .await?
+                {
+                    hydrated_by_id.insert(result.id.clone(), result);
+                }
             }
-        } else {
-            candidates
-        };
+            candidates = hits
+                .iter()
+                .filter_map(|hit| hydrated_by_id.get(&hit.id).cloned())
+                .collect();
+            // A short window means the index had nothing more to offer; a full
+            // one may still hide visible rows behind dropped or filtered hits,
+            // so widen. The stop condition counts rows that survive the domain
+            // filter, never the raw candidates.
+            let matching = candidates.iter().filter(|r| matches_domains(r)).count();
+            let exhausted = hits.len() < window;
+            if matching >= limit || exhausted || window >= MAX_LEXICAL_SCAN_ROWS {
+                break;
+            }
+            window = (window * 2).min(MAX_LEXICAL_SCAN_ROWS);
+        }
+        let mut results: Vec<_> = candidates
+            .into_iter()
+            .filter(|r| matches_domains(r))
+            .collect();
         results.truncate(limit);
         Ok(crate::traits::LexicalSearchOutcome {
             results,
-            domain_filter_applied,
+            domain_filter_applied: !domains.is_empty(),
         })
     }
 
@@ -9470,8 +9594,7 @@ impl LadybugStore {
                 }
                 Ok(out)
             })
-            .await
-            .unwrap_or_else(|e| { tracing::warn!("query_db_metrics failed: {e}"); Vec::new() });
+            .await?;
 
         let key = (namespace.to_string(), kind, name.to_string());
         let mut samples = self.metrics.range(
@@ -10683,7 +10806,7 @@ impl VectorStore for LadybugStore {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if has_unqualified_edge_target && !exact_edge_targets {
-            let ids = self.mention_symbol_ids(&namespace).await;
+            let ids = self.mention_symbol_ids(&namespace).await?;
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
             for key in [
                 "related_to",
@@ -10884,7 +11007,7 @@ impl VectorStore for LadybugStore {
         if payload.user_id != "auto-ingestor" {
             let ids = match cached_symbol_ids {
                 Some(ids) => ids,
-                None => self.mention_symbol_ids(&namespace).await,
+                None => self.mention_symbol_ids(&namespace).await?,
             };
             let known = crate::store::ladybug::KnownIds::new(ids.iter().map(|s| s.as_str()));
             let mut mentions =
@@ -11966,12 +12089,14 @@ impl VectorStore for LadybugStore {
         // copies below. An external writer (another process, or the same
         // store without this instance's lock) can still mutate the source
         // mid-copy; the metadata bracket on the copy catches that.
-        let mut turn = Arc::clone(&self.write_lock).lock_owned().await;
+        let mut turn = self
+            .acquire_write_turn_within("exporting the database", write_turn_budget())
+            .await?;
         let started = std::time::Instant::now();
         let latch = self.checkpoints.clone();
         let checkpoint_run: CheckpointRun = {
             let (returned, outcome) =
-                Self::write_owning_turn(self.db.clone(), latch.clone(), turn, move |conn| {
+                Self::write_owning_turn(self.db.clone(), latch.clone(), None, turn, move |conn| {
                     Ok(guarded_checkpoint(conn, &latch))
                 })
                 .await?;
@@ -16458,6 +16583,46 @@ pub static ENGINE_CALLS_FINISHED: std::sync::atomic::AtomicU64 =
 pub static WRITES_ABANDONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Times the engine refused a second write transaction.
 pub static WRITE_COLLISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Reads that gave up waiting for the store turn before an engine call began.
+pub static READ_TURNS_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Serializes the process-wide write-timeout override used by tests. Without
+/// this lock one test's `NEUROSTRATA_WRITE_TIMEOUT_SECS` changes another
+/// test's write budget, and restoring a previously observed value can leave a
+/// stale budget behind when two tests overlap.
+#[cfg(test)]
+pub(crate) static WRITE_TIMEOUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct WriteTimeoutEnvGuard {
+    previous: Option<String>,
+    _held: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl WriteTimeoutEnvGuard {
+    pub(crate) fn set(secs: &str) -> Self {
+        let held = WRITE_TIMEOUT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var("NEUROSTRATA_WRITE_TIMEOUT_SECS").ok();
+        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", secs);
+        Self {
+            previous,
+            _held: held,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for WriteTimeoutEnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", value),
+            None => std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS"),
+        }
+    }
+}
 
 /// How many engine calls are inside lbug right now.
 pub fn engine_in_flight() -> u64 {
@@ -16470,13 +16635,27 @@ pub fn engine_in_flight() -> u64 {
 pub fn engine_stats() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     format!(
-        "{} in flight ({} started, {} finished), {} abandoned, {} collisions",
+        "{} in flight ({} started, {} finished), {} abandoned, {} collisions, {} read-turns busy",
         engine_in_flight(),
         ENGINE_CALLS_STARTED.load(Relaxed),
         ENGINE_CALLS_FINISHED.load(Relaxed),
         WRITES_ABANDONED.load(Relaxed),
-        WRITE_COLLISIONS.load(Relaxed)
+        WRITE_COLLISIONS.load(Relaxed),
+        READ_TURNS_BUSY.load(Relaxed)
     )
+}
+
+/// How long a read may wait for the store's one turn before it is told the
+/// database is busy. Reads are milliseconds once they hold the turn, so a
+/// quarter second of queueing means a statement is genuinely stuck; waiting
+/// longer turns a recoverable condition into a hang.
+const READ_TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long a write may wait for the turn and run its statement. One budget
+/// covers both, so a caller cannot spend the whole deadline queueing and then
+/// be told the statement is fine.
+fn write_turn_budget() -> std::time::Duration {
+    write_timeout()
 }
 
 /// How long a write may wait before the caller is told the database is busy.
@@ -16612,20 +16791,76 @@ fn resolve_target_on_write(
     pick_declared_target(namespace, active_gen, declared, &found)
 }
 
-/// Fails a future that outstays its deadline, with a message that says what was
-/// waiting and admits the work may still be running.
+/// The typed "could not get the store turn in time" condition.
+///
+/// A caller can tell this apart from a real query failure with
+/// [`is_store_busy`], so a busy store is retried while a broken one is not.
+/// The `Display` text deliberately keeps the pre-`#407` wording: existing
+/// operators and logs already recognise it, and it still admits that a
+/// statement dispatched before the deadline may land later.
+#[derive(Debug, Clone)]
+pub struct StoreBusy {
+    operation: String,
+    budget: std::time::Duration,
+    /// Whether the deadline fired after a statement was dispatched. A caller
+    /// that only failed to acquire the turn must not be told a statement may
+    /// still be running: nothing was sent to the engine.
+    dispatched: bool,
+}
+
+impl std::fmt::Display for StoreBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let budget = if self.budget.subsec_millis() == 0 {
+            format!("{}s", self.budget.as_secs())
+        } else {
+            format!("{}ms", self.budget.as_millis())
+        };
+        let recovery = if self.dispatched {
+            "The statement may still be running, so read the record back before retrying."
+        } else {
+            "No statement was dispatched, so retrying is safe."
+        };
+        write!(
+            f,
+            "the database is busy: {} did not finish within {}. {}",
+            self.operation, budget, recovery
+        )
+    }
+}
+
+impl std::error::Error for StoreBusy {}
+
+/// Whether this error is the recoverable "store turn was busy" condition.
+pub fn is_store_busy(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<StoreBusy>().is_some())
+}
+
+/// The busy message when this error carries [`StoreBusy`].
+pub fn store_busy_message(err: &anyhow::Error) -> Option<String> {
+    if !is_store_busy(err) {
+        return None;
+    }
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<StoreBusy>().map(ToString::to_string))
+}
+
+/// Fails a future that outstays its deadline, with a typed error that says
+/// what was waiting and admits the work may still be running.
 async fn bounded<T>(
     what: &str,
     limit: std::time::Duration,
+    dispatched: bool,
     fut: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     match tokio::time::timeout(limit, fut).await {
         Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "the database is busy: {} did not finish within {}s. The statement may still be running, so read the record back before retrying.",
-            what,
-            limit.as_secs()
-        )),
+        Err(_) => Err(StoreBusy {
+            operation: what.to_string(),
+            budget: limit,
+            dispatched,
+        }
+        .into()),
     }
 }
 
@@ -16938,6 +17173,7 @@ eurostrata\src\daemon.rs",
         let err = bounded(
             "deleting a memory",
             std::time::Duration::from_millis(50),
+            true,
             slow,
         )
         .await
@@ -16961,6 +17197,7 @@ eurostrata\src\daemon.rs",
         let err = bounded(
             "writing a memory",
             std::time::Duration::from_millis(50),
+            false,
             async {
                 let _turn = lock.lock().await;
                 Ok::<(), anyhow::Error>(())
@@ -16994,6 +17231,7 @@ eurostrata\src\daemon.rs",
         let err = bounded(
             "writing a memory",
             std::time::Duration::from_millis(20),
+            false,
             async {
                 let _held = Arc::clone(&lock).lock_owned().await;
                 Ok::<(), anyhow::Error>(())
@@ -17019,21 +17257,61 @@ eurostrata\src\daemon.rs",
     #[tokio::test]
     async fn a_write_inside_its_deadline_is_left_alone() {
         let quick = async { Ok::<u8, anyhow::Error>(7) };
-        let out = bounded("writing a memory", std::time::Duration::from_secs(5), quick)
-            .await
-            .unwrap();
+        let out = bounded(
+            "writing a memory",
+            std::time::Duration::from_secs(5),
+            false,
+            quick,
+        )
+        .await
+        .unwrap();
         assert_eq!(out, 7);
     }
 
     #[test]
     fn the_write_deadline_can_be_overridden() {
-        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "90");
-        assert_eq!(write_timeout(), std::time::Duration::from_secs(90));
+        {
+            let _guard = WriteTimeoutEnvGuard::set("90");
+            assert_eq!(write_timeout(), std::time::Duration::from_secs(90));
+        }
+        {
+            // A nonsense or zero value falls back rather than disabling the bound.
+            let _guard = WriteTimeoutEnvGuard::set("0");
+            assert_eq!(write_timeout(), std::time::Duration::from_secs(30));
+        }
+    }
 
-        // A nonsense or zero value falls back rather than disabling the bound.
-        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "0");
-        assert_eq!(write_timeout(), std::time::Duration::from_secs(30));
-        std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS");
+    #[tokio::test]
+    async fn ontobug_catalog_marks_dirty_only_after_the_turn_is_held() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store =
+            LadybugStore::for_testing(dir.path().join("db"), 4).expect("open temp database");
+        let _ = store.dirty.take();
+
+        // A caller that gave up while queued dispatched nothing, so it must
+        // not mark the store dirty for a checkpoint to flush.
+        let held = Arc::clone(&store.write_lock).lock_owned().await;
+        let queued = store.with_ontobug_catalog(|_| Ok::<(), ontobug::Error>(()));
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(20), queued).await;
+        assert!(timed_out.is_err(), "a held turn must not be acquired");
+        assert!(
+            !store.dirty.is_set(),
+            "a queued cancellation must not mark the store dirty"
+        );
+        drop(held);
+
+        // The turn is held now: a catalog operation that ends in an error has
+        // still had its chance to mutate the database, so it must mark dirty.
+        let err = store
+            .with_ontobug_catalog(|_| -> std::result::Result<(), ontobug::Error> {
+                Err(ontobug::Error::Other("boom".to_string()))
+            })
+            .await;
+        assert!(err.is_err(), "the catalog error must reach the caller");
+        assert!(
+            store.dirty.is_set(),
+            "a catalog mutation that ends in an error must leave the store dirty"
+        );
     }
 
     #[test]
@@ -21579,8 +21857,8 @@ eurostrata\src\daemon.rs",
                 .unwrap();
         }
 
-        let first = store.mention_symbol_ids("probe").await;
-        let second = store.mention_symbol_ids("other").await;
+        let first = store.mention_symbol_ids("probe").await.unwrap();
+        let second = store.mention_symbol_ids("other").await.unwrap();
 
         assert_eq!(
             first.as_slice(),
@@ -25181,6 +25459,53 @@ eurostrata\src\daemon.rs",
     }
 
     #[tokio::test]
+    async fn refresh_ontology_keeps_the_cached_index_when_the_store_is_busy() {
+        let dir = std::env::temp_dir().join(format!("ns-ontology-busy-{}", uuid::Uuid::new_v4()));
+        let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
+        store.init("probe").await.expect("create the schema");
+
+        let entries = vec![
+            serde_json::json!({"slug":"auth","parent":null,"aliases":["authentication"],"concept_iri":null}),
+            serde_json::json!({"slug":"tls","parent":"auth","aliases":["ssl"],"concept_iri":null}),
+        ];
+        let registry_id = crate::registry::registry_row_id("probe");
+        let payload = MemoryPayload {
+            content: crate::registry::registry_content("probe"),
+            user_id: "system".to_string(),
+            memory_type: "fact".to_string(),
+            agent_name: None,
+            location: String::new(),
+            location_lines: String::new(),
+            metadata: crate::registry::registry_metadata_v2(&entries),
+        };
+        store
+            .upsert("probe", &registry_id, vec![1.1, 0.0, 0.0, 0.0], payload)
+            .await
+            .unwrap();
+        store.refresh_ontology("probe").await;
+        assert_eq!(
+            store.get_ontology("probe").canonical_slug("authentication"),
+            Some("auth".to_string()),
+            "the successful refresh seeds the cache"
+        );
+
+        let held = Arc::clone(&store.write_lock).lock_owned().await;
+        store.refresh_ontology("probe").await;
+        drop(held);
+
+        let idx = store.get_ontology("probe");
+        assert_eq!(
+            idx.canonical_slug("authentication"),
+            Some("auth".to_string()),
+            "a busy refresh must keep the last good index, not replace it with a default"
+        );
+        assert!(
+            idx.expand_domain("auth").contains(&"tls".to_string()),
+            "a busy refresh must keep the seeded domain tree"
+        );
+    }
+
+    #[tokio::test]
     async fn test_f1_exact_name_recall_five_identifier_classes() {
         let dir = std::env::temp_dir().join(format!("ns-f1-exact-{}", uuid::Uuid::new_v4()));
         let store = LadybugStore::for_testing(&dir, 4).expect("open temp database");
@@ -25578,7 +25903,7 @@ eurostrata\src\daemon.rs",
             "resolved valid-target must not be in dangling_edges"
         );
 
-        let warnings = store.shape_warnings("probe").await;
+        let warnings = store.shape_warnings("probe").await.unwrap();
         assert!(
             warnings.iter().any(|w| w
                 .get("why")
@@ -26757,15 +27082,10 @@ eurostrata\src\daemon.rs",
                 .map(|i| format!("missing-target-{i}"))
                 .collect::<Vec<_>>(),
         });
-        let previous_timeout = std::env::var("NEUROSTRATA_WRITE_TIMEOUT_SECS").ok();
-        std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", "1");
+        // write_timeout() is read at invocation; the guard restores the
+        // process-wide override only after this test's write has ended.
+        let _timeout_guard = WriteTimeoutEnvGuard::set("1");
         let timed_out = store.upsert("probe", "m1", vec![0.0; 4], payload).await;
-        // write_timeout() is read at invocation, so restoring the var
-        // now cannot affect the already-running task.
-        match previous_timeout {
-            Some(value) => std::env::set_var("NEUROSTRATA_WRITE_TIMEOUT_SECS", value),
-            None => std::env::remove_var("NEUROSTRATA_WRITE_TIMEOUT_SECS"),
-        }
         let err = timed_out.expect_err("the slow first write must time out to the caller");
         assert!(
             err.to_string().contains("the database is busy"),
@@ -26792,7 +27112,24 @@ eurostrata\src\daemon.rs",
             flipped,
             "the committing task must flip has_data after its write lands, even though the caller timed out"
         );
-        let landed = store.get("probe", "m1").await.expect("get");
+        // The committing task still owns the write turn while it resolves the
+        // edge backlog, so a read can legitimately report StoreBusy. Poll the
+        // record view until the turn is released instead of asserting that a
+        // 250 ms read budget was enough.
+        let read_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut landed = None;
+        while std::time::Instant::now() < read_deadline {
+            match store.get("probe", "m1").await {
+                Ok(row) => {
+                    landed = row;
+                    break;
+                }
+                Err(error) if is_store_busy(&error) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("get failed after the write landed: {error}"),
+            }
+        }
         assert!(landed.is_some(), "the timed-out write actually landed");
         drop(store);
         let _ = std::fs::remove_dir_all(&fx.root);
@@ -32560,6 +32897,248 @@ eurostrata\src\daemon.rs",
         assert!(tantivy.is_empty(), "Tantivy must agree the row is archived");
     }
 
+    /// #404: the in-house lexical path and the Tantivy path must agree on what
+    /// an archived row is. `is_archived` used to read `as_bool()` only, so a
+    /// legacy `{"archived": 1}` row stayed visible here while Tantivy hid it.
+    #[tokio::test]
+    async fn inhouse_lexical_excludes_int_archived_rows() {
+        let store = retired_test_store().await;
+        let archived_payload =
+            tantivy_exclusion_payload("intarchivneedle tombstoned row", json!({"archived": 1}));
+        let visible_payload = tantivy_exclusion_payload("intarchivneedle visible row", json!({}));
+        store
+            .upsert("probe", "archived-int", vec![0.0; 4], archived_payload)
+            .await
+            .unwrap();
+        store
+            .upsert("probe", "visible", vec![0.0; 4], visible_payload)
+            .await
+            .unwrap();
+
+        let default_page = store
+            .search_lexical(
+                "probe",
+                "intarchivneedle",
+                10,
+                false,
+                false,
+                &[],
+                "admin",
+                0,
+            )
+            .await
+            .unwrap()
+            .results;
+        assert_eq!(
+            result_ids(&default_page),
+            vec!["visible".to_string()],
+            "an integer tombstone must stay off the default in-house page"
+        );
+
+        let escape_hatch = store
+            .search_lexical("probe", "intarchivneedle", 10, false, true, &[], "admin", 0)
+            .await
+            .unwrap()
+            .results;
+        let escape_ids: std::collections::BTreeSet<&str> =
+            escape_hatch.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            escape_ids.contains("archived-int"),
+            "include_archived must still find the integer tombstone, got {escape_ids:?}"
+        );
+    }
+
+    /// #404: an index can hold more stale archived entries than the first
+    /// hydration window carries. The search must keep widening the window
+    /// until the page is full or the index is exhausted, instead of returning
+    /// a short page because `limit * 4` slots were all dropped.
+    #[tokio::test]
+    async fn tantivy_hydration_backfills_past_dropped_hits() {
+        let store = retired_test_store().await;
+        const STALE: usize = 400;
+        const CLEAN: usize = 5;
+        let mut rows: Vec<(String, MemoryPayload)> = Vec::new();
+
+        for i in 0..STALE {
+            let id = format!("stale-{i:04}");
+            let payload = tantivy_exclusion_payload(
+                "backfillneedle backfillneedle backfillneedle archived tombstone",
+                json!({"archived": true}),
+            );
+            store
+                .upsert("probe", &id, vec![0.0; 4], payload.clone())
+                .await
+                .unwrap();
+            rows.push((id, payload));
+        }
+        for i in 0..CLEAN {
+            let id = format!("clean-{i:04}");
+            let payload = tantivy_exclusion_payload(
+                "backfillneedle diluted by a long tail of unrelated filler words that lower this row's score",
+                json!({}),
+            );
+            store
+                .upsert("probe", &id, vec![0.0; 4], payload.clone())
+                .await
+                .unwrap();
+            rows.push((id, payload));
+        }
+
+        // Seed a stale index: same ids/content but the tombstone metadata is
+        // stripped, so only hydration can drop the archived rows.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        let stale_rows: Vec<(String, String, MemoryPayload)> = rows
+            .iter()
+            .map(|(id, payload)| {
+                let mut stale = payload.clone();
+                stale.metadata = json!({});
+                ("probe".to_string(), id.clone(), stale)
+            })
+            .collect();
+        idx.rebuild(&stale_rows).unwrap();
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+
+        let results = store
+            .search_tantivy_lexical(
+                "probe",
+                "backfillneedle",
+                CLEAN,
+                false,
+                false,
+                &[],
+                "tester",
+            )
+            .await
+            .unwrap()
+            .results;
+        let ids = result_ids(&results);
+        assert_eq!(
+            ids.len(),
+            CLEAN,
+            "the page must backfill past dropped hits, got {ids:?}"
+        );
+        assert!(
+            ids.iter().all(|id| id.starts_with("clean-")),
+            "only clean rows may fill the page, got {ids:?}"
+        );
+    }
+
+    /// #404: a domain-filtered page must keep widening past non-matching
+    /// rows. The first window can be entirely other domains; stopping at
+    /// `limit` raw candidates, or falling back to them, returns rows the
+    /// caller excluded.
+    #[tokio::test]
+    async fn tantivy_domain_filter_widens_past_nonmatching_hits() {
+        let store = retired_test_store().await;
+        for i in 0..6 {
+            store
+                .upsert(
+                    "probe",
+                    &format!("other-{i:02}"),
+                    vec![0.0; 4],
+                    tantivy_exclusion_payload(
+                        "domainfilterneedle domainfilterneedle domainfilterneedle domainfilterneedle",
+                        json!({"domain": "other"}),
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .upsert(
+                "probe",
+                "wanted-00",
+                vec![0.0; 4],
+                tantivy_exclusion_payload(
+                    "domainfilterneedle diluted by a long tail of unrelated filler words",
+                    json!({"domain": "wanted"}),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let outcome = store
+            .search_tantivy_lexical(
+                "probe",
+                "domainfilterneedle",
+                1,
+                false,
+                false,
+                &["wanted".to_string()],
+                "tester",
+            )
+            .await
+            .unwrap();
+        assert!(outcome.domain_filter_applied);
+        assert_eq!(
+            result_ids(&outcome.results),
+            vec!["wanted-00".to_string()],
+            "the filtered page must widen past other-domain hits, not fall back to them"
+        );
+    }
+
+    /// #404: hydration must re-ask the canonical ACL predicate, including the
+    /// object (`{principal, role}`) form of `visible_to`. A stale index entry
+    /// must not widen an object-form ACL that excludes the caller.
+    #[tokio::test]
+    async fn tantivy_hydration_rechecks_acl_object_form() {
+        let store = retired_test_store().await;
+        let restricted_payload = tantivy_exclusion_payload(
+            "aclobjneedle restricted row",
+            json!({"visible_to": [{"principal": "alice", "role": "viewer"}]}),
+        );
+        let public_payload = tantivy_exclusion_payload("aclobjneedle public row", json!({}));
+        for (id, payload) in [
+            ("restricted-row", &restricted_payload),
+            ("public-row", &public_payload),
+        ] {
+            store
+                .upsert("probe", id, vec![0.0; 4], payload.clone())
+                .await
+                .unwrap();
+        }
+
+        // Seed a stale index whose entries carry no ACL metadata. Hydration
+        // must use the store row, not the index entry.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for (id, payload) in [
+            ("restricted-row", &restricted_payload),
+            ("public-row", &public_payload),
+        ] {
+            let mut stale = payload.clone();
+            stale.metadata = json!({});
+            idx.upsert_memory("probe", id, &stale).unwrap();
+        }
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+
+        let alice = store
+            .search_tantivy_lexical("probe", "aclobjneedle", 10, false, false, &[], "alice")
+            .await
+            .unwrap()
+            .results;
+        let alice_ids: std::collections::BTreeSet<&str> =
+            alice.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            alice_ids.contains("restricted-row"),
+            "the ACL principal must read their own row, got {alice_ids:?}"
+        );
+
+        let bob = store
+            .search_tantivy_lexical("probe", "aclobjneedle", 10, false, false, &[], "bob")
+            .await
+            .unwrap()
+            .results;
+        let bob_ids: std::collections::BTreeSet<&str> = bob.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !bob_ids.contains("restricted-row"),
+            "an object-form ACL must still deny a stranger at hydration, got {bob_ids:?}"
+        );
+        assert!(
+            bob_ids.contains("public-row"),
+            "the public row must still surface, got {bob_ids:?}"
+        );
+    }
+
     #[tokio::test]
     async fn legacy_namespace_pointer_without_source_stamp_stays_visible() {
         // Pre-source-split store: the only pointer is keyed by the empty
@@ -33459,6 +34038,435 @@ eurostrata\src\daemon.rs",
             "slot reservation must preserve the 1-hop GOVERNS rule in top-10 despite 10 structural code_ast hits: {:?}",
             result_ids(&top10)
         );
+    }
+
+    /// `#407` Wave 3 Step 2: a store turn is a bounded, typed, recoverable
+    /// wait. A caller that cannot get the turn is told the store is busy
+    /// instead of waiting forever, and a write that was dispatched before its
+    /// caller gave up still leaves the dirty flag set so the next checkpoint
+    /// flushes it.
+    mod store_busy {
+        use super::super::*;
+        use super::{retired_test_payload, retired_test_store, PROBE_SOURCE};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        async fn fresh_store() -> (tempfile::TempDir, LadybugStore) {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let store =
+                LadybugStore::for_testing(dir.path().join("db"), 4).expect("open temp database");
+            (dir, store)
+        }
+
+        fn expected_busy_message(operation: &str) -> String {
+            format!(
+                "the database is busy: {operation} did not finish within 20ms. No statement was dispatched, so retrying is safe."
+            )
+        }
+
+        async fn wait_until(mut condition: impl FnMut() -> bool, limit: Duration) {
+            let deadline = std::time::Instant::now() + limit;
+            while !condition() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "condition did not become true within {limit:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn a_turn_wait_past_its_budget_returns_typed_store_busy() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let err = match store
+                .acquire_write_turn_within("writing a memory", Duration::from_millis(20))
+                .await
+            {
+                Ok(_) => panic!("a held turn must not be acquired within 20ms"),
+                Err(e) => e,
+            };
+
+            assert!(is_store_busy(&err), "{err:?}");
+            assert_eq!(
+                store_busy_message(&err),
+                Some(expected_busy_message("writing a memory"))
+            );
+            assert!(err.to_string().contains("the database is busy"), "{err}");
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn store_busy_is_recoverable_in_under_five_seconds() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let busy = match store
+                .read_with_turn_within("reading a memory", Duration::from_millis(20), |_| Ok(7u8))
+                .await
+            {
+                Ok(_) => panic!("a held turn must not be read within 20ms"),
+                Err(e) => e,
+            };
+            assert!(is_store_busy(&busy), "{busy:?}");
+
+            // The same caller succeeds once the turn is free: busy is a wait,
+            // not a failure of the store.
+            drop(held);
+            // Recovery is the assertion. Scheduler and blocking-pool delays
+            // are not the store's busy condition, so no wall-clock bound here.
+            let value = store
+                .read_with_turn_within("reading a memory", Duration::from_secs(5), |_| Ok(7u8))
+                .await
+                .expect("the read recovers");
+            assert_eq!(value, 7);
+        }
+
+        #[tokio::test]
+        async fn a_read_behind_a_held_turn_reports_busy_not_empty() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+            let busy_before = READ_TURNS_BUSY.load(Ordering::Relaxed);
+
+            let err = match store
+                .read_with_turn_within("reading a memory", Duration::from_millis(20), |_| {
+                    Ok(Vec::<u8>::new())
+                })
+                .await
+            {
+                Ok(empty) => panic!("a read behind a held turn returned {empty:?}"),
+                Err(e) => e,
+            };
+
+            assert!(is_store_busy(&err), "{err:?}");
+            assert_eq!(
+                READ_TURNS_BUSY.load(Ordering::Relaxed),
+                busy_before + 1,
+                "read contention must be visible in engine statistics"
+            );
+            assert!(
+                store_busy_message(&err)
+                    .as_deref()
+                    .is_some_and(|m| m.contains("reading a memory")),
+                "{err}"
+            );
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn active_generations_behind_a_held_turn_report_busy() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let err = match store.active_generations_public("probe").await {
+                Ok(gens) => panic!("a held turn returned generations {gens:?}"),
+                Err(e) => e,
+            };
+
+            assert!(is_store_busy(&err), "{err:?}");
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn mention_symbol_ids_behind_a_held_turn_report_busy() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let err = match store.mention_symbol_ids("probe").await {
+                Ok(ids) => panic!("a held turn returned symbol ids {ids:?}"),
+                Err(e) => e,
+            };
+
+            assert!(is_store_busy(&err), "{err:?}");
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn shape_warnings_behind_a_held_turn_report_busy() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let err = match store.shape_warnings("probe").await {
+                Ok(warnings) => panic!("a held turn returned shape warnings {warnings:?}"),
+                Err(e) => e,
+            };
+
+            assert!(is_store_busy(&err), "{err:?}");
+            drop(held);
+        }
+
+        /// The typed classification must not mistake an ordinary failure for a
+        /// busy store: callers retry a busy store and not a broken one.
+        #[test]
+        fn busy_detection_rejects_an_ordinary_error() {
+            let ordinary = anyhow::anyhow!("the engine refused a duplicate key");
+            assert!(!is_store_busy(&ordinary), "{ordinary:?}");
+            assert_eq!(store_busy_message(&ordinary), None);
+        }
+
+        /// A busy store stays recognisable under the context a caller adds.
+        #[test]
+        fn busy_detection_finds_a_wrapped_busy() {
+            let wrapped = anyhow::Error::new(StoreBusy {
+                operation: "reading a memory".to_string(),
+                budget: Duration::from_secs(3),
+                dispatched: true,
+            })
+            .context("outer context");
+            assert!(is_store_busy(&wrapped), "{wrapped:?}");
+            assert_eq!(
+                store_busy_message(&wrapped).as_deref(),
+                Some(
+                    "the database is busy: reading a memory did not finish within 3s. The statement may still be running, so read the record back before retrying."
+                ),
+                "{wrapped}"
+            );
+        }
+
+        /// A busy refresh must leave the last good list in place: an empty list
+        /// cached here would silently drop every mention the caller checks.
+        #[tokio::test]
+        async fn mention_symbol_ids_keep_their_cache_when_a_refresh_is_busy() {
+            let store = retired_test_store().await;
+            let id = crate::parser::ingest::generation_scoped_id("probe", 1, "src/lib.rs");
+            store
+                .upsert(
+                    "probe",
+                    &id,
+                    vec![0.5; 4],
+                    retired_test_payload("file", "auto-ingestor", json!({})),
+                )
+                .await
+                .expect("store the symbol row");
+            store
+                .publish_generation("probe", PROBE_SOURCE, 1)
+                .await
+                .expect("publish generation 1");
+
+            let seeded = store
+                .mention_symbol_ids("probe")
+                .await
+                .expect("seed the cache");
+            assert_eq!(
+                seeded.as_slice(),
+                std::slice::from_ref(&id),
+                "the seeded cache must hold the symbol"
+            );
+
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+            let err = store
+                .mention_symbol_ids("probe")
+                .await
+                .expect_err("a held turn must report busy, not an empty list");
+            assert!(is_store_busy(&err), "{err:?}");
+            drop(held);
+
+            // The busy refresh inserted nothing: the cached list still holds
+            // the symbol rather than an empty list.
+            let cached = store
+                .mention_symbol_ids
+                .read()
+                .await
+                .get("probe")
+                .cloned()
+                .expect("the cache entry survives a busy refresh");
+            assert_eq!(cached.1.as_slice(), std::slice::from_ref(&id));
+
+            let after = store
+                .mention_symbol_ids("probe")
+                .await
+                .expect("the cache is served cleanly once the turn is free");
+            assert_eq!(after.as_slice(), std::slice::from_ref(&id));
+            assert!(
+                !after.is_empty(),
+                "a busy refresh must not poison the cache with an empty list"
+            );
+        }
+
+        /// `get` is a direct read: behind a held turn it must say busy, never
+        /// report the row as absent.
+        #[tokio::test]
+        async fn get_behind_a_held_turn_reports_busy_not_a_missing_row() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let err = store
+                .get("probe", "missing-row")
+                .await
+                .expect_err("a held turn must report busy, not a missing row");
+            assert!(is_store_busy(&err), "{err:?}");
+            drop(held);
+        }
+
+        /// `write_with_deadline` must bound its wait for the turn: a caller
+        /// behind a held turn hears busy instead of queueing for the default
+        /// thirty seconds, and its statement is never dispatched.
+        #[tokio::test]
+        async fn write_with_deadline_behind_a_held_turn_reports_busy() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+            let _timeout_guard = WriteTimeoutEnvGuard::set("1");
+
+            let outcome = store
+                .write_with_deadline("writing a memory", |_conn| Ok(()))
+                .await;
+            let err =
+                outcome.expect_err("a held turn must report busy, not dispatch the statement");
+            assert!(is_store_busy(&err), "{err:?}");
+            assert!(
+                store_busy_message(&err)
+                    .as_deref()
+                    .is_some_and(|m| m.contains("writing a memory")),
+                "{err}"
+            );
+            drop(held);
+        }
+
+        #[tokio::test]
+        async fn reads_recover_once_the_turn_is_released() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+
+            let busy = match store
+                .read_with_turn_within("reading a memory", Duration::from_millis(20), |_| Ok(42u64))
+                .await
+            {
+                Ok(value) => panic!("a held turn returned {value}"),
+                Err(e) => e,
+            };
+            assert!(is_store_busy(&busy), "{busy:?}");
+
+            drop(held);
+            let value = store
+                .read_with_turn_within("reading a memory", READ_TURN_BUDGET, |_| Ok(42u64))
+                .await
+                .expect("the read recovers once the turn is released");
+            assert_eq!(value, 42);
+        }
+
+        /// Runs `write_with_deadline` until its blocking statement has started,
+        /// then drops the caller future while the statement is still blocked.
+        async fn cancel_after_dispatch(
+            store: &LadybugStore,
+            started: Arc<tokio::sync::Notify>,
+            release_rx: Arc<std::sync::Mutex<mpsc::Receiver<()>>>,
+        ) {
+            let statement = {
+                let started = Arc::clone(&started);
+                move |_conn: &Connection| {
+                    started.notify_one();
+                    let _ = release_rx
+                        .lock()
+                        .expect("release channel lock")
+                        .recv_timeout(Duration::from_secs(5));
+                    Ok(())
+                }
+            };
+            let mut write = Box::pin(store.write_with_deadline("writing a memory", statement));
+            tokio::select! {
+                result = &mut write => panic!("the write finished before it could be cancelled: {result:?}"),
+                _ = started.notified() => {}
+            }
+            drop(write);
+        }
+
+        #[tokio::test]
+        async fn a_dispatched_write_marks_dirty_when_its_caller_is_cancelled() {
+            let (_dir, store) = fresh_store().await;
+            let started = Arc::new(tokio::sync::Notify::new());
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+
+            cancel_after_dispatch(&store, Arc::clone(&started), release_rx).await;
+            release_tx.send(()).expect("release the statement");
+
+            wait_until(|| store.dirty.is_set(), Duration::from_secs(2)).await;
+            assert!(
+                store.dirty.is_set(),
+                "a write dispatched before its caller gave up must still mark dirty"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_write_error_after_mutation_keeps_the_dirty_flag() {
+            let (_dir, store) = fresh_store().await;
+
+            let outcome = store
+                .write_with_deadline("writing a memory", |conn| -> Result<()> {
+                    conn.query("CREATE NODE TABLE StoreBusyProbe(id INT64, PRIMARY KEY(id))")?;
+                    conn.query("CREATE (:StoreBusyProbe {id: 1})")?;
+                    anyhow::bail!("simulated failure after the row landed")
+                })
+                .await;
+
+            assert!(outcome.is_err(), "{outcome:?}");
+            assert!(
+                store.dirty.is_set(),
+                "a write that mutated before failing must keep the dirty flag"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_write_cancelled_before_dispatch_neither_dispatches_nor_marks_dirty() {
+            let (_dir, store) = fresh_store().await;
+            let held = Arc::clone(&store.write_lock).lock_owned().await;
+            let dispatched = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&dispatched);
+
+            let mut write = Box::pin(store.write_with_deadline("writing a memory", move |_| {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+            let queued = tokio::time::timeout(Duration::from_millis(100), &mut write).await;
+            assert!(
+                queued.is_err(),
+                "the write must still be queued behind the held turn"
+            );
+            drop(write);
+            drop(held);
+
+            // No statement was dispatched, so nothing may run or mark itself.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !dispatched.load(Ordering::SeqCst),
+                "a cancelled queued write must not dispatch"
+            );
+            assert!(
+                !store.dirty.is_set(),
+                "a cancelled queued write must not mark dirty"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_cancelled_write_leaves_the_turn_free_once_the_statement_ends() {
+            let (_dir, store) = fresh_store().await;
+            let started = Arc::new(tokio::sync::Notify::new());
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+
+            cancel_after_dispatch(&store, Arc::clone(&started), release_rx).await;
+
+            // The caller is gone, but the statement is still running and must
+            // keep the turn until it actually finishes.
+            assert!(
+                Arc::clone(&store.write_lock).try_lock().is_err(),
+                "the turn was released while the statement was still running"
+            );
+
+            release_tx.send(()).expect("release the statement");
+            wait_until(
+                || Arc::clone(&store.write_lock).try_lock().is_ok(),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                Arc::clone(&store.write_lock).try_lock().is_ok(),
+                "the turn is free once the statement has ended"
+            );
+        }
     }
 }
 
@@ -35813,7 +36821,9 @@ impl LadybugStore {
     /// `OntologyProperty`, `ShaclShape`, `ShaclProperty`, `Namespace`, `RdfNode`, `Statement`),
     /// and returns `ontobug::Catalog::from_database(self.db.clone(), &self.local_path)`.
     pub async fn ontobug_catalog(&self) -> anyhow::Result<ontobug::Catalog> {
-        let _guard = self.write_lock.lock().await;
+        let _guard = self
+            .acquire_write_turn_within("reading the ontobug catalog", write_turn_budget())
+            .await?;
         ontobug::Catalog::from_database(self.db.clone(), &self.local_path)
             .map_err(|e| anyhow::anyhow!(e))
     }
@@ -35824,7 +36834,16 @@ impl LadybugStore {
     where
         F: FnOnce(&mut ontobug::Catalog) -> ontobug::Result<R>,
     {
-        let _guard = self.write_lock.lock().await;
+        let _guard = self
+            .acquire_write_turn_within("updating the ontobug catalog", write_turn_budget())
+            .await?;
+        // Constructed only after the turn is held: a caller that gave up while
+        // queued returns above and marks nothing, while schema init or a caller
+        // mutation that ends in an error still leaves the flag set for a
+        // checkpoint to flush.
+        let _dirty = MarkDirtyOnDrop {
+            dirty: Arc::clone(&self.dirty),
+        };
         let mut catalog = ontobug::Catalog::from_database(self.db.clone(), &self.local_path)
             .map_err(|e| anyhow::anyhow!(e))?;
         f(&mut catalog).map_err(|e| anyhow::anyhow!(e))
@@ -35900,7 +36919,7 @@ impl LadybugStore {
 impl LadybugStore {
     pub async fn refresh_ontology(&self, namespace: &str) {
         let namespace_owned = namespace.to_string();
-        let (metadata, action_rows, concept_rows) = self
+        let loaded = self
             .with_conn(
                 move |conn: &Connection| -> Result<(
                     Option<serde_json::Value>,
@@ -36001,9 +37020,22 @@ impl LadybugStore {
                     Ok((reg_meta, actions, concepts))
                 },
             )
-            .await
-            .ok()
-            .unwrap_or((None, Vec::new(), Vec::new()));
+            .await;
+        let (metadata, action_rows, concept_rows) = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                // A busy or failed read must leave the last good index in
+                // place. Replacing it with a default index would silently drop
+                // custom action types, SHACL shapes, and domains until the
+                // next successful refresh.
+                tracing::warn!(
+                    "keeping the cached ontology for namespace '{}': refresh read failed: {}",
+                    namespace,
+                    error
+                );
+                return;
+            }
+        };
         let mut idx = metadata
             .as_ref()
             .map(|m| crate::rdf::OntologyIndex::from_registry_metadata(m))
