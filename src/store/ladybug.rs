@@ -9248,7 +9248,38 @@ impl LadybugStore {
         principal: &str,
         include_code_ast: bool,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
+        self.search_tantivy_lexical_paged(
+            namespace,
+            query,
+            0,
+            limit,
+            include_tasks,
+            include_archived,
+            domains,
+            principal,
+            include_code_ast,
+        )
+        .await
+    }
+
+    /// Page a Tantivy lexical search. `offset` skips ranked candidates an
+    /// earlier truncated page already consumed; `next_offset` reports where
+    /// the next page resumes.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_tantivy_lexical_paged(
+        &self,
+        namespace: &str,
+        query: &str,
+        offset: usize,
+        limit: usize,
+        include_tasks: bool,
+        include_archived: bool,
+        domains: &[String],
+        principal: &str,
+        include_code_ast: bool,
+    ) -> Result<crate::traits::LexicalSearchOutcome> {
         self.init(namespace).await?;
+        let now = chrono::Utc::now().timestamp();
         if self
             .tantivy_lexical
             .read()
@@ -9272,6 +9303,8 @@ impl LadybugStore {
         } else {
             Some(active.active_generations_u64())
         };
+        let window = limit.max(1) * 4;
+        let fetch = offset.saturating_add(window);
         let hits = {
             let guard = self
                 .tantivy_lexical
@@ -9281,7 +9314,7 @@ impl LadybugStore {
             idx.search_with_active_generations(
                 namespace,
                 query,
-                limit.max(1) * 4,
+                fetch,
                 include_tasks,
                 include_archived,
                 None,
@@ -9289,8 +9322,11 @@ impl LadybugStore {
                 include_code_ast,
             )?
         };
+        // The caller's cursor skips candidates consumed by an earlier page;
+        // `consumed` is how far this call advanced through the ranked list.
+        let consumed = hits.len().saturating_sub(offset.min(hits.len()));
         let mut candidates = Vec::new();
-        for hit in hits {
+        for hit in hits.into_iter().skip(offset) {
             // Defense in depth: the index query already scopes to `namespace`,
             // but a hit whose stored namespace drifted (stale cross-namespace
             // row) must not surface outside its own namespace.
@@ -9337,7 +9373,7 @@ impl LadybugStore {
                 // is_retired_at predicate defined in this module: a non-null
                 // valid_to that does not parse as an integer reads as 0,
                 // i.e. retired.
-                if is_retired_at(&payload.metadata, chrono::Utc::now().timestamp()) {
+                if is_retired_at(&payload.metadata, now) {
                     continue;
                 }
                 if !crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
@@ -9375,11 +9411,33 @@ impl LadybugStore {
         } else {
             candidates
         };
+        // A full candidate window that hydration whittled down to a short page
+        // is not a complete answer: eligible rows may sit just below it.
+        let incomplete = results.len() < limit && consumed >= window;
         results.truncate(limit);
+        // Re-read pointers and payloads at the seam so a concurrent archive or
+        // ACL revoke cannot survive into the response.
+        let recheck_ns = namespace.to_string();
+        let current = self
+            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &recheck_ns)))
+            .await?;
+        let results = revalidate_lexical_results(
+            self,
+            namespace,
+            results,
+            &current,
+            principal,
+            include_tasks,
+            include_archived,
+            include_code_ast,
+            now,
+        )
+        .await?;
         Ok(crate::traits::LexicalSearchOutcome {
             results,
             domain_filter_applied,
-            incomplete: false,
+            incomplete,
+            next_offset: offset.saturating_add(consumed),
         })
     }
 
@@ -10313,6 +10371,230 @@ fn retain_reachable_lexical_results(
         )
     });
     before - results.len()
+}
+
+/// Final visibility gate: re-read every payload immediately before the search
+/// returns and re-apply the full store-side predicate set. A writer that
+/// archives a row or revokes its ACL between hydration and the response must
+/// not leave a revoked row in the page. Refreshed payloads are copied back so
+/// the response never carries pre-revocation metadata.
+async fn revalidate_lexical_results(
+    store: &LadybugStore,
+    namespace: &str,
+    results: Vec<crate::traits::SearchResult>,
+    active: &ActiveGenerations,
+    principal: &str,
+    include_tasks: bool,
+    include_archived: bool,
+    include_code_ast: bool,
+    now: i64,
+) -> Result<Vec<crate::traits::SearchResult>> {
+    let mut kept = Vec::with_capacity(results.len());
+    for mut result in results {
+        let Some((_, payload)) = store.get(namespace, &result.id).await? else {
+            continue;
+        };
+        if !active.reaches_source(
+            &result.id,
+            namespace,
+            &payload.memory_type,
+            row_source_key(&payload.metadata),
+        ) {
+            continue;
+        }
+        if !include_tasks && payload.memory_type == "task" {
+            continue;
+        }
+        if !include_code_ast
+            && (payload.memory_type == "code_ast" || payload.memory_type == "doc_section")
+        {
+            continue;
+        }
+        if !include_archived && is_archived(&payload.metadata) {
+            continue;
+        }
+        if is_registry_row(&payload.metadata) || is_mesh_conflicting(&payload.metadata) {
+            continue;
+        }
+        if is_retired_at(&payload.metadata, now) {
+            continue;
+        }
+        if !crate::rebac::can_read_memory(principal, &payload.user_id, &payload.metadata) {
+            continue;
+        }
+        result.payload = payload;
+        kept.push(result);
+    }
+    Ok(kept)
+}
+
+/// Page an in-house lexical search. `offset` skips ranked candidates an
+/// earlier truncated page already consumed; `next_offset` reports where the
+/// next page resumes. The caller's limit and the bounded scan cap stay
+/// separate so a capped page is never presented as complete.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn search_lexical_paged(
+    store: &LadybugStore,
+    namespace: &str,
+    query: &str,
+    offset: usize,
+    requested_limit: usize,
+    include_tasks: bool,
+    include_archived: bool,
+    domains: &[String],
+    principal: &str,
+    fuzzy_max_distance: usize,
+) -> Result<crate::traits::LexicalSearchOutcome> {
+    store.ensure_lexical_loaded(namespace).await?;
+    let limit = requested_limit.min(MAX_LEXICAL_SCAN_ROWS);
+    let cap_restricted = requested_limit > limit;
+    let ns_owned = namespace.to_string();
+    let mut active = store
+        .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &ns_owned)))
+        .await?;
+    store.refresh_ontology(namespace).await;
+    let ontology = store.get_ontology(namespace);
+    let mut expanded: Vec<String> = Vec::new();
+    for d in domains {
+        if let Some(slug) = ontology.canonical_slug(d) {
+            for e in ontology.expand_domain(&slug) {
+                expanded.push(e);
+            }
+        } else if let Some(s) = crate::domain::normalize_domain_slug(d) {
+            expanded.push(s);
+        }
+    }
+    let now = chrono::Utc::now().timestamp();
+    let mut options = crate::fts::SearchOptions {
+        now,
+        as_of: None,
+        include_tasks,
+        include_archived,
+        principal: principal.to_string(),
+        domains: expanded,
+        fuzzy_max_distance: fuzzy_max_distance.min(2),
+        limit,
+    };
+    // Hydration vetoes (generation reachability, ACL, retirement and the
+    // stale-index backstops) can drop hits after the index filled the page.
+    let cap = MAX_LEXICAL_SCAN_ROWS.max(limit);
+    let mut window = limit.saturating_mul(4).max(limit).min(cap);
+    let mut results = Vec::with_capacity(limit);
+    let mut seen = std::collections::HashSet::new();
+    let mut domain_vetoed = std::collections::HashSet::new();
+    let mut domain_filter_applied = false;
+    let mut last_fetched;
+    loop {
+        options.limit = window;
+        let outcome = store
+            .lexical
+            .read()
+            .expect("lexical index lock")
+            .search(namespace, query, &options);
+        last_fetched = outcome.hits.len();
+        domain_filter_applied = outcome.domain_filter_applied;
+        // Resume below the prefix consumed by an earlier page.
+        let page_hits: Vec<_> = outcome.hits.into_iter().skip(offset).collect();
+        // Honor the index's own verdict: when the fts layer fell back to an
+        // unfiltered search because no row matched the domain, hydration must
+        // not re-apply the veto that the fallback deliberately lifted.
+        let (batch, vetoed) = hydrate_lexical_hits(
+            store,
+            namespace,
+            page_hits,
+            &options,
+            &active,
+            domain_filter_applied,
+            &std::collections::HashSet::new(),
+            &mut seen,
+            limit - results.len(),
+        )
+        .await?;
+        results.extend(batch);
+        domain_vetoed.extend(vetoed);
+        // Revalidate pointers after the async awaits; a publish may have
+        // flipped an active generation in the meantime.
+        let recheck_ns = namespace.to_string();
+        let current = store
+            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &recheck_ns)))
+            .await?;
+        let removed = retain_reachable_lexical_results(&mut results, &current, namespace);
+        active = current;
+        if results.len() >= limit || window >= cap {
+            break;
+        }
+        // A publish race can drop a hit after hydration filled the page. Keep
+        // widening while either vetoes or that revalidation left eligible
+        // candidates below the examined prefix.
+        if last_fetched < window && removed == 0 {
+            break;
+        }
+        window = window.saturating_mul(2).min(cap);
+    }
+
+    let mut incomplete = results.len() < limit && window >= cap;
+    if results.is_empty() && !domain_vetoed.is_empty() && !options.domains.is_empty() {
+        // Stale index domain metadata selected hits whose hydrated payloads
+        // reject the domain: retry unfiltered, but never re-admit those ids.
+        let mut fallback_options = options.clone();
+        fallback_options.domains.clear();
+        fallback_options.limit = cap;
+        let fallback = store.lexical.read().expect("lexical index lock").search(
+            namespace,
+            query,
+            &fallback_options,
+        );
+        let fallback_fetched = fallback.hits.len();
+        let (mut fallback_results, _) = hydrate_lexical_hits(
+            store,
+            namespace,
+            fallback.hits,
+            &fallback_options,
+            &active,
+            false,
+            &domain_vetoed,
+            &mut seen,
+            limit,
+        )
+        .await?;
+        let recheck_ns = namespace.to_string();
+        let current = store
+            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &recheck_ns)))
+            .await?;
+        retain_reachable_lexical_results(&mut fallback_results, &current, namespace);
+        results = fallback_results;
+        active = current;
+        domain_filter_applied = false;
+        incomplete = results.len() < limit && fallback_fetched >= cap;
+    }
+    // A request larger than the scan cap cannot be satisfied even when the
+    // capped page is full: say so instead of implying completion.
+    incomplete |= cap_restricted && results.len() >= limit;
+
+    let recheck_ns = namespace.to_string();
+    let current = store
+        .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &recheck_ns)))
+        .await?;
+    let before_revalidation = results.len();
+    let results = revalidate_lexical_results(
+        store,
+        namespace,
+        results,
+        &current,
+        principal,
+        include_tasks,
+        include_archived,
+        true,
+        now,
+    )
+    .await?;
+    incomplete |= results.len() < before_revalidation;
+    Ok(crate::traits::LexicalSearchOutcome {
+        results,
+        domain_filter_applied,
+        incomplete,
+        next_offset: offset.saturating_add(seen.len()),
+    })
 }
 
 #[async_trait]
@@ -11545,133 +11827,19 @@ impl VectorStore for LadybugStore {
         principal: &str,
         fuzzy_max_distance: usize,
     ) -> Result<crate::traits::LexicalSearchOutcome> {
-        self.ensure_lexical_loaded(namespace).await?;
-        // #149 C2.4: the in-memory partition is filtered at load, but a row
-        // staged after that load (or left by a failed refresh) is re-checked
-        // against the pointers on hydration. Clamp the caller's limit first:
-        // it feeds both the scan window and Vec::with_capacity, so an
-        // untrusted value can otherwise exhaust memory before any work.
-        let limit = limit.min(MAX_LEXICAL_SCAN_ROWS);
-        let ns_owned = namespace.to_string();
-        let mut active = self
-            .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &ns_owned)))
-            .await?;
-        self.refresh_ontology(namespace).await;
-        let ontology = self.get_ontology(namespace);
-        // Domain ontology expansion: expand domain slugs before filtering
-        // (mirrors search_with_domain at ladybug.rs:2895).
-        let mut expanded: Vec<String> = Vec::new();
-        for d in domains {
-            if let Some(slug) = ontology.canonical_slug(d) {
-                for e in ontology.expand_domain(&slug) {
-                    expanded.push(e);
-                }
-            } else if let Some(s) = crate::domain::normalize_domain_slug(d) {
-                expanded.push(s);
-            }
-        }
-        let expanded_domains: Vec<String> = expanded.into_iter().collect();
-        let mut options = crate::fts::SearchOptions {
-            now: chrono::Utc::now().timestamp(),
-            as_of: None,
+        search_lexical_paged(
+            self,
+            namespace,
+            query,
+            0,
+            limit,
             include_tasks,
             include_archived,
-            principal: principal.to_string(),
-            domains: expanded_domains,
-            fuzzy_max_distance: fuzzy_max_distance.min(2),
-            limit,
-        };
-        // Hydration vetoes (generation reachability, ACL, retirement and
-        // the stale-index backstops) can drop hits after the index has
-        // already filled the page. Fetch a wider window and grow it only
-        // while rejects keep starving the page; the cap bounds the work.
-        let cap = MAX_LEXICAL_SCAN_ROWS.max(limit);
-        let mut window = limit.saturating_mul(4).max(limit).min(cap);
-        let mut results = Vec::with_capacity(limit);
-        let mut seen = std::collections::HashSet::new();
-        let mut domain_vetoed = std::collections::HashSet::new();
-        let mut domain_filter_applied;
-        let mut fetched;
-        loop {
-            options.limit = window;
-            let outcome = self
-                .lexical
-                .read()
-                .expect("lexical index lock")
-                .search(namespace, query, &options);
-            fetched = outcome.hits.len();
-            domain_filter_applied = outcome.domain_filter_applied;
-            let (batch, vetoed) = hydrate_lexical_hits(
-                self,
-                namespace,
-                outcome.hits,
-                &options,
-                &active,
-                true,
-                &std::collections::HashSet::new(),
-                &mut seen,
-                limit - results.len(),
-            )
-            .await?;
-            results.extend(batch);
-            domain_vetoed.extend(vetoed);
-            // Revalidate against fresh pointers: a publish may have flipped
-            // the active generation while the hydration awaits were pending.
-            let recheck_ns = namespace.to_string();
-            let current = self
-                .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &recheck_ns)))
-                .await?;
-            retain_reachable_lexical_results(&mut results, &current, namespace);
-            active = current;
-            if results.len() >= limit || fetched < window || window >= cap {
-                break;
-            }
-            window = window.saturating_mul(2).min(cap);
-        }
-
-        // A vetoed prefix can exhaust the cap while eligible hits remain
-        // ranked below it. Report that honestly instead of a short page.
-        let mut incomplete = results.len() < limit && fetched >= window && window >= cap;
-        if results.is_empty() && !domain_vetoed.is_empty() && !options.domains.is_empty() {
-            // Stale index domain metadata selected hits whose hydrated payloads
-            // reject the domain. Preserve the documented no-domain-hits
-            // fallback: retry unfiltered, but never re-admit the stale ids.
-            let mut fallback_options = options.clone();
-            fallback_options.domains.clear();
-            fallback_options.limit = cap;
-            let fallback = self.lexical.read().expect("lexical index lock").search(
-                namespace,
-                query,
-                &fallback_options,
-            );
-            let fallback_fetched = fallback.hits.len();
-            let (mut fallback_results, _) = hydrate_lexical_hits(
-                self,
-                namespace,
-                fallback.hits,
-                &fallback_options,
-                &active,
-                false,
-                &domain_vetoed,
-                &mut seen,
-                limit,
-            )
-            .await?;
-            let recheck_ns = namespace.to_string();
-            let current = self
-                .with_conn(move |conn| Ok(ActiveGenerations::read(conn, &recheck_ns)))
-                .await?;
-            retain_reachable_lexical_results(&mut fallback_results, &current, namespace);
-            results = fallback_results;
-            domain_filter_applied = false;
-            incomplete = results.len() < limit && fallback_fetched >= cap;
-        }
-
-        Ok(crate::traits::LexicalSearchOutcome {
-            results,
-            domain_filter_applied,
-            incomplete,
-        })
+            domains,
+            principal,
+            fuzzy_max_distance,
+        )
+        .await
     }
 
     async fn rebuild_lexical_index(&self, namespace: Option<&str>) -> Result<usize> {
@@ -33894,6 +34062,218 @@ eurostrata\src\daemon.rs",
                 .iter()
                 .map(|r| r.id.clone())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_domain_fallback_keeps_out_of_domain_hits() {
+        let store = retired_test_store().await;
+        for i in 0..3 {
+            let mut payload = retired_test_payload("fact", "owner", json!({"domain": "gamma"}));
+            payload.content = "domainmissfallbacktoken candidate row".to_string();
+            store
+                .upsert("probe", &format!("miss-{i}"), vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let outcome = store
+            .search_lexical(
+                "probe",
+                "domainmissfallbacktoken",
+                3,
+                false,
+                false,
+                &["beta".to_string()],
+                "admin",
+                2,
+            )
+            .await
+            .expect("lexical search as admin");
+        assert_eq!(
+            outcome.results.len(),
+            3,
+            "the documented no-domain-hits fallback must return unfiltered matches, got: {:?}",
+            outcome
+                .results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !outcome.domain_filter_applied,
+            "fallback must report the domain filter as not applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_reports_incomplete_when_request_exceeds_cap() {
+        let store = retired_test_store().await;
+        for i in 0..(MAX_LEXICAL_SCAN_ROWS + 2) {
+            let mut payload = retired_test_payload("fact", "owner", json!({}));
+            payload.content = "captrunctoken candidate row".to_string();
+            store
+                .upsert("probe", &format!("cap-{i:04}"), vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let outcome = store
+            .search_lexical(
+                "probe",
+                "captrunctoken",
+                MAX_LEXICAL_SCAN_ROWS + 4,
+                false,
+                false,
+                &[],
+                "admin",
+                2,
+            )
+            .await
+            .expect("lexical search as admin");
+        assert_eq!(
+            outcome.results.len(),
+            MAX_LEXICAL_SCAN_ROWS,
+            "the scan cap bounds the page"
+        );
+        assert!(
+            outcome.incomplete,
+            "a request larger than the scan cap must be reported as truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_search_paged_offset_continues_below_consumed_prefix() {
+        let store = retired_test_store().await;
+        for i in 0..6 {
+            let mut payload = retired_test_payload("fact", "owner", json!({}));
+            payload.content = format!("pagetoken candidate row {i}");
+            store
+                .upsert("probe", &format!("page-{i}"), vec![0.0; 4], payload)
+                .await
+                .unwrap();
+        }
+        store.ensure_lexical_loaded("probe").await.unwrap();
+        let outcome = search_lexical_paged(
+            &store,
+            "probe",
+            "pagetoken",
+            3,
+            2,
+            false,
+            false,
+            &[],
+            "admin",
+            2,
+        )
+        .await
+        .expect("paged lexical search");
+        let ids = outcome
+            .results
+            .iter()
+            .map(|r| r.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["page-3".to_string(), "page-4".to_string()],
+            "offset must skip candidates consumed by an earlier page"
+        );
+        assert_eq!(
+            outcome.next_offset, 5,
+            "the cursor must resume after the last candidate this page examined"
+        );
+    }
+
+    #[tokio::test]
+    async fn tantivy_short_page_marks_incomplete_after_hydration_vetoes() {
+        let store = retired_test_store().await;
+        let live = "tantivy-live";
+        let live_content = "tantivyshorttoken live row";
+        let live_payload = tantivy_exclusion_payload(live_content, json!({}));
+        store
+            .upsert("probe", live, vec![0.0; 4], live_payload.clone())
+            .await
+            .unwrap();
+        let archived_content = "tantivyshorttoken tantivyshorttoken tantivyshorttoken row";
+        for i in 0..4 {
+            let p = tantivy_exclusion_payload(archived_content, json!({"archived": true}));
+            store
+                .upsert("probe", &format!("tantivy-arch-{i}"), vec![0.0; 4], p)
+                .await
+                .unwrap();
+        }
+        // Index docs claim the archived rows are live, so TopDocs fills its
+        // candidate window with them before hydration reads the real payloads.
+        let idx = crate::lexical::TantivyLexicalIndex::open_in_ram().unwrap();
+        for i in 0..4 {
+            let stale = tantivy_exclusion_payload(archived_content, json!({}));
+            idx.upsert_memory("probe", &format!("tantivy-arch-{i}"), &stale)
+                .unwrap();
+        }
+        idx.upsert_memory("probe", live, &live_payload).unwrap();
+        *store.tantivy_lexical.write().unwrap() = Some(idx);
+
+        let outcome = store
+            .search_tantivy_lexical("probe", "tantivyshorttoken", 1, false, false, &[], "tester")
+            .await
+            .expect("tantivy lexical search");
+        assert!(
+            outcome.results.iter().all(|r| r.id == live),
+            "hydrated archived rows must never surface, got: {:?}",
+            outcome
+                .results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            outcome.incomplete,
+            "a short Tantivy page after hydration vetoes must be marked incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn lexical_revalidation_drops_rows_archived_after_hydration() {
+        let store = retired_test_store().await;
+        let payload = retired_test_payload("fact", "owner", json!({}));
+        store
+            .upsert("probe", "revoked", vec![0.0; 4], payload.clone())
+            .await
+            .unwrap();
+        let (_, hydrated) = store.get("probe", "revoked").await.unwrap().unwrap();
+        let result = crate::traits::SearchResult {
+            id: "revoked".to_string(),
+            score: 0.0,
+            payload: hydrated,
+            evidence: None,
+        };
+        // A writer archives the row between hydration and the return.
+        let mut archived = payload.clone();
+        archived.metadata = json!({"archived": true});
+        store
+            .upsert("probe", "revoked", vec![0.0; 4], archived)
+            .await
+            .unwrap();
+        let active = store
+            .with_conn(|conn| Ok(ActiveGenerations::read(conn, "probe")))
+            .await
+            .unwrap();
+        let kept = revalidate_lexical_results(
+            &store,
+            "probe",
+            vec![result],
+            &active,
+            "owner",
+            false,
+            false,
+            true,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            kept.is_empty(),
+            "a row archived after hydration must be dropped just before return"
         );
     }
 

@@ -18,7 +18,9 @@ use crate::traits::MemoryPayload;
 
 // v3 switches `content`, `symbol`, and `location` to the `"code_text"` custom
 // code-aware sub-tokenizer analyzer (`neurostrata-5xjo`).
-pub const INDEX_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-tantivy-v3");
+// v4 re-encodes the archive tombstone as a nonzero i64; persisted v3 boolean
+// tombstones must be rebuilt on open.
+pub const INDEX_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-tantivy-v4");
 
 /// Custom Tantivy tokenizer that splits code identifiers on path/namespace
 /// separators, snake_case underscores, camelCase/PascalCase boundaries, and
@@ -1731,28 +1733,77 @@ mod tests {
     }
 
     #[test]
-    fn test_search_namespace_filter_applies_before_top_docs() {
-        // fetch_limit is limit*8: with limit=2 the collector takes the top 16
-        // hits globally. If namespace filtering happened only afterwards,
-        // 24 higher-scoring namespace-A rows would exhaust that window and
-        // namespace B's match would never be collected.
+    fn test_search_generation_filter_applies_before_top_docs() {
+        // The old shape put competitors in namespace A and searched namespace B.
+        // The query already scopes by namespace, so A never entered TopDocs and
+        // the assertion could pass even if filtering happened after collection.
+        // Put the competitors in the SAME searched namespace and exclude them
+        // with the generation clause instead: a post-collection filter would
+        // let 24 higher-scoring rows exhaust the limit*8 window and starve the
+        // one eligible row.
         let idx = TantivyLexicalIndex::open_in_ram().unwrap();
         for i in 0..24 {
             let p = payload_typed("sharedtoken sharedtoken sharedtoken", "memory");
-            idx.upsert_memory("A", &format!("a{i}"), &p).unwrap();
+            idx.upsert_memory("ns", &format!("t::9::loser{i}"), &p)
+                .unwrap();
         }
-        let b = payload_typed(
+        let kept = payload_typed(
             "sharedtoken diluted by many unrelated filler words that lengthen this document considerably beyond the others",
             "memory",
         );
-        idx.upsert_memory("B", "b1", &b).unwrap();
+        idx.upsert_memory("ns", "t::3::keep", &kept).unwrap();
 
-        let hits = idx.search("B", "sharedtoken", 2, true, true, None).unwrap();
+        let active = std::collections::HashSet::from([3_u64]);
+        let hits = idx
+            .search_with_active_generations(
+                "ns",
+                "sharedtoken",
+                2,
+                true,
+                true,
+                None,
+                Some(&active),
+                true,
+            )
+            .unwrap();
         assert!(
-            hits.iter().any(|h| h.id == "b1"),
-            "namespace B match must be collected even when A outscores it, got: {:?}",
+            hits.iter().any(|h| h.id == "t::3::keep"),
+            "generation filter must run before TopDocs, got: {:?}",
             hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn archived_encoding_bumps_index_version_and_forces_rebuild() {
+        assert!(
+            INDEX_VERSION.ends_with("-tantivy-v4"),
+            "the archived-encoding change must invalidate v3 indexes, got: {INDEX_VERSION}"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "ns-lexical-version-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index_version.txt"), "0.0.0-tantivy-v3\n").unwrap();
+        std::fs::write(dir.join("stale-tombstone-marker"), b"v3").unwrap();
+        let idx = TantivyLexicalIndex::open_or_create(&dir).expect("reopened index");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("index_version.txt"))
+                .unwrap()
+                .trim(),
+            INDEX_VERSION,
+            "opening a stale index must rewrite the version marker"
+        );
+        assert!(
+            !dir.join("stale-tombstone-marker").exists(),
+            "a v3 index must be cleared so boolean tombstones are re-encoded"
+        );
+        drop(idx);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

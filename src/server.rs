@@ -11567,6 +11567,17 @@ fn finalize_search_report(report: String, arguments: &Value, results: &[SearchRe
     crate::search::append_search_contract_line(report, arguments, ids)
 }
 
+/// Make a bounded lexical scan visible to the caller, together with the
+/// cursor that continues below the vetoed prefix.
+fn append_lexical_page_line(report: String, incomplete: bool, next_offset: usize) -> String {
+    if !incomplete {
+        return report;
+    }
+    format!(
+        "{report}\n\nlexical_page: incomplete — more matches remain; retry with offset={next_offset}"
+    )
+}
+
 async fn handle_search_memory(
     arguments: Value,
     emb: Arc<dyn Embedder>,
@@ -11642,6 +11653,13 @@ async fn handle_search_memory(
     let fuzzy_max_distance = crate::config::Config::from_default_path()
         .map(|config| config.lexical_fuzzy_max_distance.min(2))
         .unwrap_or(2);
+    // Continuation cursor for a previously truncated lexical page. Callers
+    // pass back `next_offset` from the search_contract line.
+    let offset = arguments
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(usize::MAX as u64) as usize;
     let facets_filter: Vec<String> = arguments
         .get("facets")
         .map(|v| {
@@ -11798,9 +11816,10 @@ async fn handle_search_memory(
             if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
                 .downcast_ref::<crate::store::LadybugStore>()
             {
-                ls.search_tantivy_lexical_with_options(
+                ls.search_tantivy_lexical_paged(
                     namespace,
                     &query,
+                    offset,
                     FETCH_LIMIT,
                     include_tasks,
                     include_archived,
@@ -11823,6 +11842,22 @@ async fn handle_search_memory(
                     )
                     .await
             }
+        } else if let Some(ls) = crate::traits::VectorStore::as_any(store.as_ref())
+            .downcast_ref::<crate::store::LadybugStore>()
+        {
+            crate::store::ladybug::search_lexical_paged(
+                ls,
+                namespace,
+                &query,
+                offset,
+                FETCH_LIMIT,
+                include_tasks,
+                include_archived,
+                &slugs,
+                principal,
+                fuzzy_max_distance,
+            )
+            .await
         } else {
             store
                 .search_lexical(
@@ -11848,6 +11883,8 @@ async fn handle_search_memory(
             }
         };
 
+        let lexical_incomplete = outcome.incomplete;
+        let lexical_next_offset = outcome.next_offset;
         let mut results = outcome.results;
         if !facets_filter.is_empty() {
             results.retain(|r| {
@@ -11907,7 +11944,11 @@ async fn handle_search_memory(
 
         if results.is_empty() {
             return finalize_search_report(
-                "No relevant memories found.".to_string(),
+                append_lexical_page_line(
+                    "No relevant memories found.".to_string(),
+                    lexical_incomplete,
+                    lexical_next_offset,
+                ),
                 &arguments,
                 &results,
             );
@@ -11963,7 +12004,11 @@ async fn handle_search_memory(
             ));
         }
         if !domain_requested {
-            return finalize_search_report(report, &arguments, &results);
+            return finalize_search_report(
+                append_lexical_page_line(report, lexical_incomplete, lexical_next_offset),
+                &arguments,
+                &results,
+            );
         }
         let mode_line = if slugs.is_empty() {
             "domain filter: skipped — the domain did not normalize; the results are unfiltered (lexical)"
@@ -11975,7 +12020,11 @@ async fn handle_search_memory(
         return format!(
             "{}\n\n{}",
             mode_line,
-            finalize_search_report(report, &arguments, &results)
+            finalize_search_report(
+                append_lexical_page_line(report, lexical_incomplete, lexical_next_offset),
+                &arguments,
+                &results
+            )
         );
     }
 
@@ -13380,6 +13429,20 @@ mod tests {
     use super::*;
     use crate::events::{RecursionToken, ThalamicBus, ThalamicPulse};
     use crate::guard::testkit::MockStore;
+
+    #[test]
+    fn lexical_page_line_surfaces_truncation_and_cursor() {
+        let complete = append_lexical_page_line("body".to_string(), false, 7);
+        assert_eq!(complete, "body", "complete pages must stay byte-identical");
+        let truncated = append_lexical_page_line("body".to_string(), true, 7);
+        assert!(
+            truncated.contains("incomplete") && truncated.contains("offset=7"),
+            "a truncated page must surface both the verdict and the continuation cursor: {truncated}"
+        );
+        let outcome = crate::traits::LexicalSearchOutcome::new(vec![], false);
+        assert!(!outcome.incomplete && outcome.next_offset == 0);
+    }
+
     /// Focused MCP-surface tests for the watch shims (Task 5). Handlers stay
     /// thin; these prove delegation, J6 refusal, read-only status, and the
     /// ingest-success auto-registration hook through the real dispatch path.
