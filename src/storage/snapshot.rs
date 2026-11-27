@@ -50,23 +50,14 @@ pub struct StorageHygieneConfig {
     pub checkpoint_interval_secs: u64,
     pub wal_warn_bytes: u64,
     pub snapshot_retention_count: usize,
-    /// Deprecated source-compatibility field (#414, #453). The daemon reads
-    /// the legacy JSON key once through `config::legacy_buffer_pool_migration`
-    /// and resolves the pool in bytes; this field is kept so downstream Rust
-    /// code that constructs or reads `StorageHygieneConfig` still compiles for
-    /// one release. Writing it has no effect.
-    #[deprecated(note = "use store.buffer_pool_bytes in bytes instead")]
-    pub buffer_pool_mb: u64,
 }
 
-#[allow(deprecated)] // the compatibility field must still be populated here
 impl Default for StorageHygieneConfig {
     fn default() -> Self {
         Self {
             checkpoint_interval_secs: 2,
             wal_warn_bytes: 64 * 1024 * 1024,
             snapshot_retention_count: 5,
-            buffer_pool_mb: 384,
         }
     }
 }

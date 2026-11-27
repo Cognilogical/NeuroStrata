@@ -90,8 +90,7 @@ absent, and a status payload written before they existed still parses.
    { "store": { "buffer_pool_bytes": 805306368 } }
    ```
 
-   (the deprecated `storage_hygiene.buffer_pool_mb` key is still read once,
-   with a warning, for one release). Or, per process:
+   The pool is configured in bytes only. Or, per process:
 
    ```bash
    NEUROSTRATA_BUFFER_POOL_BYTES=805306368 neurostrata-mcp daemon
