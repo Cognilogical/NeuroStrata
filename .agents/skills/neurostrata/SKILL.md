@@ -33,6 +33,7 @@ NeuroStrata (`neurostrata-mcp`, `neurostrata-lf3p`) is a single compiled Rust bi
 - **Pre-Flight First Action (Zero-Trust Policy):** Your VERY FIRST action on any new session or task MUST be `neurostrata_get_snapshot` (`namespace`, `project_root` — `project_root` is inferred automatically if omitted) or `neurostrata_search_memory`.
 - **Zero-Action Start:** You are strictly blocked from editing files (`write`, `edit`) or running mutating shell commands until a task exists and is claimed by your session:
   1. Check existing work: `neurostrata_task_list` (`namespace`, `ready: true`).
+     To read one task (another session's progress, a finished task, a blocker) without claiming it: `neurostrata_task_get` (`id`, `namespace`).
   2. Create new work if needed: `neurostrata_task_create` (`namespace`, `title`, `description`, `priority`, `task_type`: `"task" | "bug" | "feature" | "epic"` — never `"recurring"`).
   3. Claim exclusively: `neurostrata_task_claim` (`id`, `namespace`, `assignee`, `session_id`). Claims older than 60 minutes are taken over automatically.
 - **Lock 3 — The Breath Working-Memory Prompt:** Every 3–5 mutation steps, pause and append a state summary to the task using `neurostrata_task_update` (`id`, `namespace`, `session_id`, `note`). Note that `status: "done"` is refused by `neurostrata_task_update`.
